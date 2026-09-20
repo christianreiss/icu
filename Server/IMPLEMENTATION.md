@@ -25,17 +25,20 @@ rust-toolchain.toml        # stable, targets windows-gnu (Client) und musl (Serv
 build/win-static/libstdc++.a
 crates/icu-proto/          # Wire-Typen (ControlMsg, EnrollMsg, Header-Encoder/-Decoder, Fehlercodes)
 crates/icu-server/
-  src/main.rs              # CLI-Dispatch (clap)
+  src/lib.rs               # `pub async fn run(Config) -> Handle` — der Server als Bibliothek,
+                           #   damit die Client-Integrationstests ihn in-process starten können
+  src/main.rs              # dünner CLI-Wrapper um lib.rs (clap)
   src/config.rs            # TOML laden/validieren
   src/ca.rs                # CA erzeugen/laden, Leaf signieren, CSR-Handling (rcgen 0.14)
-  src/store.rs             # users.toml: Fingerprint → {name, issued, expires, revoked}, invites.toml
+  src/store.rs             # users.toml (user_id → Name + n Certs), invites.toml, flock auf state.lock
   src/endpoint.rs          # quinn ServerConfig, Bind v4+v6, Accept-Loop, ALPN-Dispatch
   src/enroll.rs            # ALPN icu-enroll/1
   src/session.rs           # Zustandsautomat pro Client, Control-Stream
   src/room.rs              # Teilnehmerliste, Broadcast, Session-ID-Vergabe
   src/relay.rs             # Audio-Datagram-Relay, Video-Stream-Relay
   src/limits.rs            # Token-Bucket je Client/IP
-  src/cli/{invite,users,revoke,status}.rs
+  src/admin.rs             # Unix-Socket /run/icu/admin.sock, JSON-Zeilenprotokoll
+  src/cli/{invite,users,revoke,rename,status}.rs   # sprechen über admin.rs mit dem laufenden Server
 ```
 
 `icu-proto` ist die einzige Stelle, an der Wire-Format definiert wird; Server und Client kompilieren dasselbe Crate.
@@ -47,7 +50,9 @@ crates/icu-server/
 listen = ["0.0.0.0:4711", "[::]:4711"]
 server_name = "icu.example.org"      # SNI im Server-Cert und im Invite-Link
 public_host = "icu.example.org:4711" # was im Invite-Link steht
-max_users = 16
+max_users = 16                       # 1..=64; Server validiert die Obergrenze beim Start
+min_client = "0.1.0"                 # SemVer, geht als Welcome.min_client an die Clients
+admin_socket_group = "icu"           # Gruppe, der /run/icu/admin.sock gehört
 
 [limits]                             # Defaults aus PROTOCOL.md §7, überschreibbar
 audio_datagrams_per_s = 110
@@ -66,7 +71,40 @@ level = "info"                       # tracing-Filter
 format = "text"                      # oder "json"
 ```
 
-State unter `/var/lib/icu/`: `ca.key` (0600), `ca.crt`, `server.key` (0600), `server.crt`, `users.toml`, `invites.toml`. Alle Schreibzugriffe atomar (Tempfile + rename).
+State unter `/var/lib/icu/`: `ca.key` (0600), `ca.crt`, `server.key` (0600), `server.crt`, `users.toml`, `invites.toml`, `state.lock`. Alle Schreibzugriffe atomar (Tempfile + rename) und unter `flock(state.lock)`.
+
+Nutzermodell: ein Nutzer hat eine stabile `user_id` und über die Zeit **mehrere** Zertifikate (Renewal stellt ein neues aus, das alte bleibt bis zum Ablauf gültig). `revoke` setzt `revoked` auf allen Certs des Nutzers.
+
+`users.toml`:
+
+```toml
+schema = 1
+next_user_id = 3
+
+[user.1]
+name = "alice"
+created = "2026-09-20T12:00:00Z"
+
+[[user.1.cert]]
+fingerprint = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"  # SHA-256(Leaf-DER), lowercase hex
+issued  = "2026-09-20T12:00:00Z"
+expires = "2027-09-20T12:00:00Z"
+revoked = false
+```
+
+`invites.toml`:
+
+```toml
+schema = 1
+
+[invite."k3nP8sQ2vL7xR1wY4tZ6bA"]   # Token, base64url ohne Padding, 22 Zeichen
+name    = "bob"
+created = "2026-09-20T12:00:00Z"
+expires = "2026-09-21T12:00:00Z"
+used_by = 0                          # 0 = unbenutzt, sonst die vergebene user_id
+```
+
+Zeitstempel durchgehend RFC 3339 in UTC; Fingerprints lowercase Hex ohne Trenner; `schema` erlaubt spätere Migrationen.
 
 ## 5. CLI
 
@@ -74,26 +112,39 @@ State unter `/var/lib/icu/`: `ca.key` (0600), `ca.crt`, `server.key` (0600), `se
 | --- | --- |
 | `icu-server run [--config PATH]` | Server starten; beim ersten Start CA und Server-Leaf erzeugen. |
 | `icu-server invite --name alice [--ttl 24h]` | Token (128 Bit, base64url) erzeugen, in `invites.toml` mit Ablauf und Name speichern, Invite-Link ausgeben (`icu://host:port/enroll?t=…&ca=…&n=…`). |
-| `icu-server users` | Tabelle: Name, Fingerprint (gekürzt), ausgestellt, läuft ab, revoked, online (über lokalen Unix-Socket `/run/icu/admin.sock` beim laufenden Server abgefragt). |
-| `icu-server revoke <name\|fingerprint>` | `revoked = true` setzen; laufender Server schließt die Verbindung mit `KICKED` (Unix-Socket-Signal, sonst beim nächsten Connect wirksam). |
-| `icu-server rename <name> <new>` | Anzeigename ändern. |
+| `icu-server users` | Tabelle: `user_id`, Name, Fingerprint (gekürzt), ausgestellt, läuft ab, revoked, online. |
+| `icu-server revoke <name\|user_id\|fingerprint>` | `revoked = true` auf **allen** Certs des Nutzers; eine laufende Verbindung wird sofort mit `KICKED` geschlossen. |
+| `icu-server rename <name\|user_id> <new>` | Anzeigename ändern. Kollidiert `<new>` case-insensitive mit einem bestehenden Namen, bricht die CLI mit Fehler ab und ändert nichts. Broadcast `UserRenamed`, wenn der Nutzer online ist. |
 | `icu-server status` | Online-Liste, Uptime, Relay-Zähler. |
 | `icu-server rotate-server-cert` | Neues Server-Leaf von derselben CA; Clients brauchen nichts. |
 
-Admin-Socket: `/run/icu/admin.sock` (`RuntimeDirectory=icu`), Zeilenprotokoll JSON, nur für lokale CLI. Kein Netzwerk-Admin.
+**Wer schreibt den State.** Ein laufender Server ist der alleinige Schreiber von `users.toml` und `invites.toml`. Jedes CLI-Kommando außer `run` geht deshalb über den Admin-Socket; der Server führt die Änderung aus, persistiert sie und wendet sie sofort auf offene Verbindungen an. Nur wenn kein Server läuft (Socket nicht vorhanden oder `ECONNREFUSED`), schreibt die CLI selbst und hält dabei `flock(/var/lib/icu/state.lock)`. Damit wirkt ein frisch erzeugtes Invite-Token sofort statt erst nach dem nächsten Neustart, und CLI und Server können einander keine Änderung überschreiben.
+
+Admin-Socket: `/run/icu/admin.sock` (`RuntimeDirectory=icu`, `RuntimeDirectoryMode=0750`, Gruppe aus `admin_socket_group`), JSON-Zeilenprotokoll, ein Request pro Zeile, eine Response pro Zeile, dann Close. Kein Netzwerk-Admin, keine Authentifizierung außer den Dateirechten des Sockets.
+
+| Kommando | Request | Response |
+| --- | --- | --- |
+| invite | `{"cmd":"invite","name":"bob","ttl_s":86400}` | `{"ok":true,"token":"k3nP…","link":"icu://…","expires":"2026-09-21T12:00:00Z"}` |
+| users | `{"cmd":"users"}` | `{"ok":true,"users":[{"user_id":1,"name":"alice","fingerprint":"9f86d0…","expires":"…","revoked":false,"online":true}]}` |
+| revoke | `{"cmd":"revoke","user":"alice"}` | `{"ok":true,"user_id":1,"closed":1}` |
+| rename | `{"cmd":"rename","user":"alice","new":"alice2"}` | `{"ok":true}` bzw. `{"ok":false,"error":"NAME_TAKEN"}` |
+| status | `{"cmd":"status"}` | `{"ok":true,"uptime_s":3600,"online":3,"relay":{"datagrams_in":…,"datagrams_out":…,"dropped":{…}}}` |
+
+Fehlerform einheitlich `{"ok":false,"error":"<kurzform>","detail":"<text>"}`.
 
 ## 6. Ablauf
 
 ### 6.1 Start
 
-1. Config laden, validieren (Listen-Adressen, `server_name` nicht leer).
+1. Config laden, validieren: Listen-Adressen, `server_name` nicht leer, `1 ≤ max_users ≤ 64`, `min_client` als SemVer parsebar, und `max_users × 100 B + Reserve < 16 KiB` (sonst passt ein volles `Welcome` nicht in ein Control-Frame, `PROTOCOL.md` §7).
 2. CA laden oder erzeugen (`rcgen::CertificateParams` mit `IsCa::Ca(Constrained(0))`, `KeyCertSign|CrlSign`, P-256; Spike 2b).
-3. Server-Leaf laden oder erzeugen (SAN = `server_name` und, falls IP, IP-SAN; EKU ServerAuth); Kette = Leaf + CA.
-4. `users.toml` und `invites.toml` laden; abgelaufene Invites verwerfen.
-5. rustls `ServerConfig`: `WebPkiClientVerifier::builder(roots=[CA]).allow_unauthenticated().build()`, `with_single_cert([leaf, ca], key)`, ALPN `[icu/1, icu-enroll/1]`, `max_early_data_size = 0`.
-6. quinn `ServerConfig`: Transport wie `PROTOCOL.md §1`; `migration(true)`.
+3. Server-Leaf laden oder erzeugen (SAN = `server_name` und, falls IP, IP-SAN; EKU ServerAuth) über `CertificateParams::signed_by(&leaf_key_pair, &issuer)` — in rcgen 0.14 nimmt `signed_by` **Public Key und Issuer**, anders als die CSR-Variante in §6.3; Kette = Leaf + CA.
+4. `flock(state.lock)` nehmen und für die gesamte Laufzeit halten; `users.toml` und `invites.toml` laden (`schema` prüfen); abgelaufene Invites verwerfen. Ab hier ist der Server alleiniger Schreiber des States (§5).
+5. rustls `ServerConfig` in **dieser** Reihenfolge — `builder_with_provider(rustls::crypto::ring::default_provider().into())` liefert `WantsVersions`, der Versionsschritt muss also vor dem Verifier kommen, sonst übersetzt es nicht:
+   `ServerConfig::builder_with_provider(ring_provider)` → `.with_protocol_versions(&[&rustls::version::TLS13])?` → `.with_client_cert_verifier(WebPkiClientVerifier::builder(Arc::new(roots)).allow_unauthenticated().build()?)` → `.with_single_cert(vec![leaf, ca], key)?`; danach `alpn_protocols = [b"icu/1", b"icu-enroll/1"]` und `max_early_data_size = 0`.
+6. quinn `ServerConfig` aus `QuicServerConfig::try_from(rustls_config)`; Transport wie `PROTOCOL.md §1`. Signaturhinweise: `max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(60))?))`, `datagram_receive_buffer_size(Some(64 * 1024))` (Option) gegen `datagram_send_buffer_size(64 * 1024)` (kein Option), `max_concurrent_uni_streams(VarInt::from_u32(2 * max_users + 4))`. `migration(true)` liegt auf `quinn::ServerConfig`, nicht auf `TransportConfig`.
 7. Ein `Endpoint` pro Listen-Adresse; Accept-Loop je Endpoint auf einem tokio-Multi-Thread-Runtime.
-8. Admin-Socket öffnen. SIGTERM → allen `close(SHUTDOWN)`, 1 s warten, Ende.
+8. Admin-Socket öffnen (`/run/icu/admin.sock`, Gruppe aus `admin_socket_group`, Modus 0660). SIGTERM → allen `close(SHUTDOWN)`, 1 s warten, Socket und `state.lock` freigeben, Ende.
 
 ### 6.2 Accept
 
@@ -102,7 +153,9 @@ incoming = endpoint.accept()
   if limits.ip_bucket(remote).exhausted → incoming.refuse()
   if under_load (≥ 32 handshakes in flight) → incoming.retry()      // Adressvalidierung
 connecting = incoming.accept()
-alpn = connecting.handshake_data().await.protocol                   // Spike 2b
+// handshake_data() nimmt &mut self und liefert Box<dyn Any>; Downcast auf quinn::crypto::rustls::HandshakeData
+alpn = connecting.handshake_data().await?
+         .downcast::<quinn::crypto::rustls::HandshakeData>()?.protocol   // Spike 2b: vor Handshake-Ende lesbar
 conn = connecting.await
 match alpn:
   icu-enroll/1 → enroll::handle(conn)
@@ -112,33 +165,47 @@ match alpn:
 ### 6.3 Enrollment (`enroll.rs`)
 
 1. `accept_bi()` mit 5-s-Timeout; Frame lesen (≤ 8 KiB).
-2. `EnrollRequest` decodieren; Token nachschlagen (konstantzeitiger Vergleich, `subtle`), abgelaufen/verbraucht → `close(ENROLL_BAD_TOKEN)`.
-3. `CertificateSigningRequestParams::from_der(csr)`; Fehler → `ENROLL_BAD_CSR`. Server setzt Subject CN = Name aus dem Invite (autoritativ; `EnrollRequest.name` wird nur als initialer Anzeigename übernommen), EKU ClientAuth, `not_before = now − 1 h`, `not_after = now + client_validity_days`, Serial = 16 Zufallsbytes; `signed_by(&issuer)`.
-4. Fingerprint = SHA-256(Leaf-DER); Eintrag in `users.toml` schreiben; Token als verbraucht markieren (beides vor der Antwort persistieren).
+2. `EnrollRequest` decodieren; Token nachschlagen (konstantzeitiger Vergleich, `subtle`) und **unter der State-Sperre als Compare-and-Set verbrauchen**, bevor signiert wird — damit gewinnt bei zwei parallelen Enrollments mit demselben Token genau einer. Unbekannt/abgelaufen/schon verbraucht → `ENROLL_BAD_TOKEN`.
+3. `CertificateSigningRequestParams::from_der(&csr_der)` (Feature `x509-parser`); Parse- oder Signaturfehler → `ENROLL_BAD_CSR`. Ebenso `ENROLL_BAD_CSR`, wenn der CSR-Key nicht P-256 oder P-384 ist. Server setzt Subject CN = Name aus dem Invite (autoritativ; `EnrollRequest.name` wird nur als initialer Anzeigename übernommen), EKU ClientAuth, `not_before = now − 1 h`, `not_after = now + client_validity_days`, Serial = 16 Zufallsbytes; `signed_by(&issuer)` — die CSR-Variante nimmt **nur** den Issuer, der Public Key kommt aus der CSR.
+4. `user_id` = `next_user_id++`. Anzeigename = `EnrollRequest.name`; kollidiert er case-insensitive mit einem bestehenden Namen, hängt der Server `-2`, `-3`, … an, bis er eindeutig ist (`PROTOCOL.md` §2.3). Fingerprint = SHA-256(Leaf-DER), lowercase Hex; Nutzer- und Cert-Eintrag in `users.toml` schreiben, Token als verbraucht markieren — beides atomar und **vor** der Antwort persistieren. Schlägt das Schreiben fehl, wird das Cert nicht ausgeliefert: `Error(ENROLL_BAD_TOKEN, "state write failed")`, Token bleibt unverbraucht.
 5. `EnrollResponse { leaf_der, ca_der, server_name }` senden, `finish()`, `close(NO_ERROR)`.
 
-Ein präsentiertes Client-Cert auf diesem ALPN wird ignoriert.
+Fehlerpfad einheitlich (`PROTOCOL.md` §2.3): erst `EnrollMsg::Error { code, detail }` senden, dann `finish()`, dann `close(code)` mit demselben Code. Ein präsentiertes Client-Cert auf diesem ALPN wird ignoriert.
 
 ### 6.4 Session (`session.rs`)
 
 1. `peer_identity()` → `None` → `close(AUTH_REQUIRED)`. Sonst Leaf-DER → SHA-256 → `users.toml`: unbekannt → `AUTH_UNKNOWN_CERT`, revoked → `AUTH_REVOKED`. (rustls hat Kette und Ablauf schon geprüft.)
-2. `accept_bi()` und erstes Frame binnen 5 s, sonst `HELLO_TIMEOUT`. Muss `Hello` sein. `minor` aushandeln; `name` übernehmen und persistieren, wenn geändert.
-3. `room.join()` → Session-ID (monoton, nie wiederverwendet), `Welcome` senden, `UserJoined` an alle anderen.
+2. `accept_bi()` und erstes Frame binnen 5 s, sonst `HELLO_TIMEOUT`. Muss `Hello` sein. `minor` aushandeln (`min(client, server)`, nicht bedienbar → `VERSION_UNSUPPORTED`). `Hello.name` wird **nur** übernommen, wenn zu dieser `user_id` noch kein Name gespeichert ist; sonst ignoriert (`PROTOCOL.md` §2.2).
+3. Ist der Raum voll (`room.len() >= max_users`), `close(SERVER_FULL)`. Sonst `room.join()` → Session-ID (monoton, nie wiederverwendet), `Welcome { you: UserInfo{user_id, session, name, flags}, users, audio, min_client, minor, caps }` senden, `UserJoined` an alle anderen.
 4. Zwei Tasks pro Client: (a) Control-Reader (Frames → `ControlMsg` → Handler), (b) Datagram-Reader (`read_datagram` → `relay::audio`). Video: `accept_uni` in einem dritten Task → `relay::video`.
 5. Ausgehend: ein `mpsc`-Kanal pro Client für Control-Frames (Broadcasts), ein Writer-Task schreibt auf den Control-Stream. Datagrams werden direkt aus dem Relay per `send_datagram` geschickt (nicht blockierend).
-6. Ende: Verbindung geschlossen oder Fehler → `room.leave()` → `UserLeft` Broadcast; Session-ID bleibt gesperrt.
+6. Ende: Verbindung geschlossen oder Fehler → `room.leave()` → `UserLeft { session, reason }` Broadcast; `reason` = `NO_ERROR` bei sauberem Close, `TIMEOUT` bei Idle-Timeout oder Transportabbruch, sonst der Code, mit dem der Server geschlossen hat. Session-ID bleibt gesperrt.
+
+#### Control-Handler (vollständig, `PROTOCOL.md` §2.2)
+
+| Message | Server tut |
+| --- | --- |
+| `SetState` | mute/deafen/camera_on übernehmen, bit2 (`speaking`) verwerfen (§6.5 leitet es ab), `UserState` an alle inkl. Verursacher; ≤ 20/s, darüber `Error(RATE_LIMITED)`. |
+| `Ping` | unverzüglich `Pong { nonce, server_time_ms }`, `server_time_ms` = Unix-Millisekunden UTC. Zählt gegen das Control-Limit. |
+| `SetName` | Länge 1–32 B, keine Steuerzeichen, serverweit eindeutig (case-insensitive). Kollision → `Error(NAME_TAKEN)`, keine Änderung. Sonst in `users.toml` persistieren und `UserRenamed { session, name }` an alle. |
+| `LossReport` | Maximum je Sprecher fortschreiben, siehe §6.5. |
+| `KeyframeRequest` | an den Sprecher weiterleiten, siehe §6.5. |
+| `RenewRequest` | CSR wie §6.3.3 prüfen und signieren (Subject CN und `user_id` aus dem bestehenden Eintrag, nicht aus der CSR), neuen Cert-Eintrag zu **demselben** Nutzer in `users.toml` anhängen; das alte Cert bleibt bis zu seinem `expires` gültig. `RenewResponse { leaf_der }`. Rate ≤ 1/Tag pro `user_id`, sonst `Error(RENEW_REJECTED)`; ungültige CSR ebenfalls `Error(RENEW_REJECTED)`. |
+| unbekannte Variante / Decode-Fehler | `close(PROTOCOL_VIOLATION)`. |
 
 ### 6.5 Relay (`relay.rs`)
 
-Audio: siehe `PROTOCOL.md §3`. Implementierung: `Bytes` aus `read_datagram`, `BytesMut::from` nur für die 2 Speaker-Bytes, dann `freeze()`; ein `Bytes`-Clone pro Empfänger (Refcount). Zähler pro Empfänger für `TooLarge|Blocked|UnsupportedByPeer`. Zusätzlich setzt der Server `speaking` implizit: erstes Datagram nach ≥ 500 ms Stille → `UserState{speaking=1}` Broadcast, `END`-Flag oder 500 ms ohne Datagram → `speaking=0`. Damit brauchen Clients für den Indicator keine eigene Meldung, das Flag in `SetState` bleibt erlaubt.
+Audio: siehe `PROTOCOL.md §3`. Implementierung: `Bytes` aus `read_datagram`, `BytesMut::from` nur für die 2 Speaker-Bytes, dann `freeze()`; ein `Bytes`-Clone pro Empfänger (Refcount). Zähler pro Empfänger für `TooLarge | UnsupportedByPeer | Disabled | ConnectionLost` — das sind die Varianten von `quinn::SendDatagramError`; ein `Blocked` gibt es nur auf `quinn_proto::SendDatagramError` und nie auf der hier benutzten High-Level-API. Zusätzlich setzt der Server `speaking` implizit: erstes Datagram nach ≥ 500 ms Stille → `UserState{speaking=1}` Broadcast, `END`-Flag oder 500 ms ohne Datagram → `speaking=0`. Damit brauchen Clients für den Indicator keine eigene Meldung; ein von Clients in `SetState` gesetztes bit2 wird ignoriert (`PROTOCOL.md` §2.1: bit2 ist serverseitig autoritativ).
 
-Video: pro Sender ein Task-Slot. Frame-Header lesen, prüfen, `speaker` setzen. Pro Empfänger `open_uni()`, Header schreiben, `read_chunk` → `write_chunk` durchreichen, `finish()`. Wenn für einen Empfänger noch ein Frame desselben Senders offen ist, wird der ältere per `reset(RATE_LIMITED)` verworfen. Bitrate-Limit gleitend über 2 s.
+Video: pro Sender ein Task-Slot. Frame-Header lesen, prüfen, `speaker` setzen. Pro Empfänger `open_uni()`, Header schreiben, `read_chunk(max_len, true)` → `write_chunk` durchreichen, `finish()` (in quinn 0.11 **synchron**, `Result<(), ClosedStream>`; für „zugestellt“ `stopped()` awaiten). Die Drop-Regel gilt **pro Sender-Empfänger-Paar**: hat ein Empfänger noch einen Frame desselben Senders offen, wird der ältere per `reset(RATE_LIMITED)` verworfen — ein langsamer Empfänger bremst die übrigen damit nicht aus. Bitrate-Limit gleitend über 2 s.
 
-`LossReport` → Maximum pro Sprecher über alle Empfänger (verfällt nach 6 s) → `LossHint` an den Sprecher, wenn sich der Wert ändert. `KeyframeRequest` → an den Sprecher mit `speaker = 0`, ≤ 1/s.
+Ist die Empfängermenge leer (niemand sonst `Active`, oder alle `deafened`), wird der eingehende Stream trotzdem geleert — `stop(0x00)` auf dem `RecvStream` oder bis FIN lesen und verwerfen —, sonst läuft die Stream-Flow-Control des Senders voll. Zähler `video_dropped_no_receiver`.
+
+`LossReport` → Maximum pro Sprecher über alle Empfänger (jeder Report verfällt nach 6 s) → `LossHint` an den Sprecher, wenn sich der Wert ändert. **Der Verfall ist eine Änderung:** fallen alle Reports eines Sprechers weg, sendet der Server `LossHint { loss_permille: 0 }`, sonst bliebe der FEC-Overhead beim Sender dauerhaft stehen. `KeyframeRequest` → an den Sprecher mit `speaker = 0`, ≤ 1/s.
 
 ### 6.6 Limits (`limits.rs`)
 
-Token-Buckets pro Client (Control 50/s, Audio 110/s, Video 20/s und 400 kbit/s) und pro IP (Enrollment 5/min, Handshakes 10/s). Überschreitung: Datagram/Frame verwerfen und zählen; bei Control `Error(RATE_LIMITED)`, dreimal in 60 s → `close(RATE_LIMITED)`.
+Token-Buckets pro Client (Control 50/s, Audio 110/s, Video 20/s und 400 kbit/s) und pro IP (Enrollment 5/min, Handshakes 10/s). Überschreitung: Datagram/Frame verwerfen und zählen; bei Control `Error(RATE_LIMITED)` (nicht fatal, Verbindung bleibt), beim dritten Verstoß binnen 60 s `close(RATE_LIMITED_FATAL)` — ein eigener, fataler Code, damit der Client nicht in einen Reconnect-Loop läuft (`PROTOCOL.md` §5/§6).
 
 ## 7. Logging und Metriken
 
@@ -181,13 +248,13 @@ CLI-Aufrufe als root oder als Mitglied der Gruppe, der der Admin-Socket gehört 
 
 | Crate | Version | Lizenz | Zweck |
 | --- | --- | --- | --- |
-| quinn | 0.11.12 | MIT/Apache-2.0 | QUIC |
+| quinn | 0.11.12 (`default-features = false`, features `runtime-tokio`, `rustls-ring`, `log`) | MIT/Apache-2.0 | QUIC. Die Default-Features enthalten `platform-verifier` und ziehen rustls-platform-verifier mit — für den statischen musl-Build abschalten. |
 | rustls | 0.23.45 (`ring`, `std`, ohne Default-Provider) | Apache-2.0/ISC/MIT | TLS |
 | ring | 0.17.14 | Apache-2.0 AND ISC | Crypto |
-| rcgen | 0.14.10 (`x509-parser`) | MIT/Apache-2.0 | CA, CSR |
-| x509-parser | 0.16 | MIT/Apache-2.0 | Fingerprint/CN lesen |
+| rcgen | 0.14.10 (Feature `x509-parser`) | MIT/Apache-2.0 | CA, CSR. Default-Backend ist `ring` (`default = ["crypto","pem","ring"]`), passt also ohne Zutun zur ring-Linie; `CertificateSigningRequestParams::from_der` und `Issuer::from_ca_cert_der` existieren nur mit `x509-parser`. |
+| x509-parser | 0.18 | MIT/Apache-2.0 | Fingerprint/CN lesen. **Nicht 0.16**: rcgen 0.14.10 hängt an `^0.18`, ein 0.16-Pin erzeugt zwei Kopien im Baum mit inkompatiblen Typen an der rcgen-Grenze. |
 | tokio | 1.53.1 | MIT | Runtime |
-| postcard | 1.1.3 (`use-std`) | MIT/Apache-2.0 | Control-Serialisierung |
+| postcard | 1.1.3 (`use-std`) | MIT/Apache-2.0 | Control-Serialisierung. `default = ["heapless-cas"]`, `use-std` also explizit setzen. Eine unbekannte Enum-Variante liefert `Error::SerdeDeCustom` (nicht `DeserializeBadEnum`, das in 1.1.3 toter Code ist) — darauf matcht der `PROTOCOL_VIOLATION`-Pfad. |
 | serde | 1 | MIT/Apache-2.0 | |
 | bytes | 1 | MIT | Datagram-Puffer |
 | clap | 4 | MIT/Apache-2.0 | CLI |
@@ -196,25 +263,32 @@ CLI-Aufrufe als root oder als Mitglied der Gruppe, der der Admin-Socket gehört 
 | subtle | 2 | BSD-3 | Token-Vergleich |
 | base64 | 0.22 | MIT/Apache-2.0 | Token/CA-Hash |
 | sha2 | 0.10 | MIT/Apache-2.0 | Fingerprint (oder ring::digest) |
+| rand | 0.9 | MIT/Apache-2.0 | Invite-Token (128 Bit), Cert-Serial (16 B) |
+| time | 0.3 | MIT/Apache-2.0 | `OffsetDateTime` für rcgen-Validity, RFC-3339 im State |
+| rustix | 1 | Apache-2.0/MIT | `flock` auf `state.lock`, Unix-Socket-Rechte |
 
-Kein libopus, kein Codec, keine GUI auf dem Server. `cargo-deny` mit Allowlist MIT, Apache-2.0, ISC, BSD-2/3, Zlib, Unicode.
+Kein libopus, kein Codec, keine GUI auf dem Server.
+
+Lizenz-Allowlist: **eine** `deny.toml` im Workspace-Root, gültig für Server und Client — MIT, Apache-2.0, ISC, BSD-2-Clause, BSD-3-Clause, Zlib, Unicode-3.0; `IJG` ausschließlich hinter dem Client-Feature `mjpeg`. Alles andere bricht den Build.
+
+Lizenz von ICU selbst: **TBD** (Empfehlung Apache-2.0, siehe `Research/packaging-licensing.md`). Bis zur Entscheidung trägt der Workspace kein `license`-Feld.
 
 ## 10. Tests
 
 | Ebene | Inhalt |
 | --- | --- |
 | Unit (`icu-proto`) | Roundtrip aller `ControlMsg`/`EnrollMsg`; Header-Encode/Decode; unbekannte Variante → `Err`; Framing-Grenzen (0, 16384, 16385). |
-| Unit (`ca.rs`, `store.rs`) | CA-Erzeugung, CSR-Override (Spike 2b), Fingerprint-Stabilität, atomares Schreiben, Revoke-Persistenz. |
-| Integration (in-process, `127.0.0.1:0`) | Enrollment → Connect → Hello/Welcome; Connect ohne Cert → `AUTH_REQUIRED`; unbekanntes Cert → `AUTH_UNKNOWN_CERT`; Revoke während Verbindung → `KICKED`; Relay: 3 Clients, Audio von A kommt bei B und C mit `speaker = A` an, nicht bei A; `deafened` C bekommt nichts; `muted` A wird nicht relayt; Rate-Limits; Video-Relay mit Frame-Verwerfen; `LossReport` → `LossHint`; `KeyframeRequest`-Weiterleitung; Hello-Timeout. |
+| Unit (`ca.rs`, `store.rs`) | CA-Erzeugung, CSR-Override (Spike 2b), Fingerprint-Stabilität, atomares Schreiben, Revoke-Persistenz über **alle** Certs eines Nutzers, `user_id`-Vergabe und -Stabilität über Renewal, Namenskollision mit `-2`/`-3`-Suffix, `schema`-Prüfung beim Laden, `flock`-Verhalten bei parallelem CLI-Zugriff. |
+| Integration (in-process, `127.0.0.1:0`) | Enrollment → Connect → Hello/Welcome; Connect ohne Cert → `AUTH_REQUIRED`; unbekanntes Cert → `AUTH_UNKNOWN_CERT`; Revoke während Verbindung → `KICKED`; Relay: 3 Clients, Audio von A kommt bei B und C mit `speaker = A` an, nicht bei A; `deafened` C bekommt nichts; `muted` A wird nicht relayt; Rate-Limits; Video-Relay mit Frame-Verwerfen; `LossReport` → `LossHint`; `KeyframeRequest`-Weiterleitung; Hello-Timeout; `max_users` erreicht → `SERVER_FULL`; `Ping` → `Pong` mit plausibler `server_time_ms`; `SetName` auf freien Namen → `UserRenamed`, auf belegten → `Error(NAME_TAKEN)`; `Hello.name` bei bereits gespeichertem Namen wird ignoriert; `RenewRequest` → `RenewResponse`, altes und neues Cert verbinden beide; dritter `RATE_LIMITED`-Verstoß → `close(RATE_LIMITED_FATAL)`; Video-Frame ohne Empfänger wird geleert statt zu stauen; Verfall aller `LossReport` → `LossHint{0}`; Invite über den Admin-Socket wirkt ohne Serverneustart. |
 | Last | 16 Clients × 50 Datagrams/s für 60 s: keine Verluste auf Loopback, CPU < 10 % eines Kerns, keine Latenzzunahme (Datagram-Roundtrip p99 < 1 ms). |
 | Netz | `tc netem` 30 ms ± 10 ms, 2 % Verlust: Relay verliert nichts zusätzlich; Keepalive hält die Verbindung über 10 min Stille. |
 
 ## 11. Milestones
 
 1. **M1 Skeleton**: Workspace, `icu-proto` mit allen Typen + Tests, Server startet, erzeugt CA, akzeptiert QUIC, `Hello/Welcome`.
-2. **M2 Enrollment**: `invite`, `icu-enroll/1`, `users.toml`, `revoke`, Integrationstests Auth.
+2. **M2 Enrollment und Admin**: `invite`, `icu-enroll/1`, `users.toml` mit `user_id`-Nutzermodell, `revoke`, `rename`, Renewal (`RenewRequest`/`RenewResponse`), **Admin-Socket** und die CLI darüber, Integrationstests Auth. Der Admin-Socket gehört hierher und nicht nach M5: M2 verlangt `revoke`, und der Integrationstest „Revoke während Verbindung → `KICKED`" (§10) ist ohne ihn nicht ausführbar.
 3. **M3 Audio-Relay**: Datagram-Relay mit `speaker`-Override, Mute/Deafen-Semantik, Speaking-Ableitung, Rate-Limits, Lasttest.
 4. **M4 Video-Relay** und `LossReport/LossHint`, `KeyframeRequest`.
-5. **M5 Betrieb**: systemd-Unit, Admin-Socket, `status`, musl-Build, `scratch`-Image, Checkmk-Local-Check.
+5. **M5 Betrieb**: systemd-Unit, `status`-Zähler, musl-Build, `scratch`-Image, Checkmk-Local-Check.
 
 Jeder Milestone endet mit grünen Tests und einem Eintrag in `../Research/verification.md`, wenn er einen offenen Messpunkt schließt.

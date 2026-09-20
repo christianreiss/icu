@@ -15,7 +15,7 @@ Stand 2026-09-20. Abgeleitet aus `Research/transport.md`, `Research/protocol/wir
 | Idle / Keepalive | `max_idle_timeout` 60 s beidseitig; Client `keep_alive_interval` 15 s. |
 | Migration | quinn-Default (erlaubt). |
 | Datagram-Puffer | Server und Client `datagram_receive_buffer_size` = 64 KiB, `datagram_send_buffer_size` = 64 KiB (klein, damit `send_datagram` alte Frames verwirft statt Latenz aufzubauen). Wert in Implementierung messen. |
-| Streams | Client eröffnet genau einen bidirektionalen Control-Stream. Video: ein unidirektionaler Stream pro Frame, in beide Richtungen. `max_concurrent_uni_streams` = 8 pro Richtung. |
+| Streams | Client eröffnet genau einen bidirektionalen Control-Stream. Video: ein unidirektionaler Stream pro Frame, in beide Richtungen. `max_concurrent_uni_streams` = `2 × max_users + 4` pro Richtung, vom Server aus seiner Config gesetzt und vom Client übernommen (bei `max_users` = 16 also 36). Das Protokoll deckelt die Zahl gleichzeitig aktiver Kameras nicht. |
 | Datagram-Größe | Laufzeitwert `max_datagram_size()` (Spike 2: 1162 B nach Handshake, 1414 B nach MTU-Discovery). Audio-Datagrams sind ≤ 410 B. |
 
 **Verbunden heißt `Welcome` empfangen.** Auf Client-Seite liefert `connect().await` auch dann `Ok`, wenn der Server das Client-Cert gleich darauf ablehnt (Spike 2). Der Client darf vor `Welcome` weder Audio senden noch „verbunden“ anzeigen.
@@ -34,36 +34,42 @@ Framing auf dem Control-Stream in beide Richtungen:
 ### 2.1 Typen
 
 ```
-UserFlags: u8      bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4–7 reserviert (senden 0, lesen ignorieren)
+UserFlags: u8      bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4–7 reserviert
                    bit2 ist serverseitig autoritativ: der Server leitet es aus dem Audio-Datagram-Fluss ab (erstes Datagram nach ≥ 500 ms Stille → 1; END-Flag oder 500 ms ohne Datagram → 0) und broadcastet UserState; ein von Clients in SetState gesendetes bit2 wird ignoriert.
-Session:   u16     serverseitig vergeben, ab 1, pro Server-Laufzeit monoton, nie wiederverwendet; 0 = „unbekannt/ich“
-Name:      String  UTF-8, 1–32 Bytes, keine Steuerzeichen
-UserInfo { session: Session, name: Name, flags: UserFlags }
+Session:   u16     serverseitig vergeben, ab 1, pro Server-Laufzeit monoton, nie wiederverwendet; 0 = „unbekannt/ich“.
+                   Gilt nur innerhalb einer Verbindung: nach einem Server-Neustart beginnt die Vergabe wieder bei 1.
+UserId:    u32     beim Enrollment vergeben, ab 1, monoton, nie wiederverwendet; stabil über Cert-Renewals, Reconnects
+                   und Server-Neustarts hinweg, in `users.toml` persistiert. Schlüssel für alles, was ein Client
+                   dauerhaft je Peer speichert (Lautstärken, Notizen). 0 = „unbekannt“.
+Name:      String  UTF-8, 1–32 Bytes, keine Steuerzeichen; serverweit eindeutig, Vergleich case-insensitive
+UserInfo { user_id: UserId, session: Session, name: Name, flags: UserFlags }
 AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64000 }
 ```
+
+**Reservierte Felder und Bits** — eine Regel für alle Stellen (`UserFlags` bit4–7, Audio-`flags` bit1–7, Video-`flags` bit1–7, Video-Byte 11): der Sender schreibt 0, der Empfänger ignoriert den Inhalt und verwirft deswegen nie eine Nachricht. „= 0“ in den Tabellen ist eine Sendevorschrift, keine Empfangsprüfung; sonst wäre kein additives Minor möglich.
 
 ### 2.2 Messages `ControlMsg`
 
 | Nr | Variante | Richtung | Felder | Semantik |
 | --- | --- | --- | --- | --- |
-| 0 | `Hello` | C→S | `minor: u16`, `caps: u32`, `client: String` (≤ 64 B), `initial: UserFlags`, `name: Name` | Erste Message nach Handshake, binnen 5 s. `name` ist der Anzeigename (Server nimmt ihn, wenn er sich vom gespeicherten unterscheidet, und persistiert ihn zum Fingerprint). |
-| 1 | `Welcome` | S→C | `minor: u16`, `caps: u32`, `you: Session`, `audio: AudioParams`, `users: Vec<UserInfo>` (ohne sich selbst), `min_client: String` | Vollständiger State. `min_client` = niedrigste erlaubte Client-Version (SemVer-String) für den Update-Hinweis. |
+| 0 | `Hello` | C→S | `minor: u16`, `caps: u32`, `client: String` (≤ 64 B, Format `<name>/<semver> <os>`, z. B. `icu/0.1.0 linux`), `initial: UserFlags`, `name: Name` | Erste Message nach Handshake, binnen 5 s. `name` wird **nur** übernommen, wenn der Server zu dieser `user_id` noch keinen Namen gespeichert hat; danach ignoriert er das Feld. Namensänderung läuft ausschließlich über `SetName` (Client) und die CLI `rename` (Admin). |
+| 1 | `Welcome` | S→C | `minor: u16`, `caps: u32`, `you: UserInfo`, `audio: AudioParams`, `users: Vec<UserInfo>` (ohne sich selbst), `min_client: String` | Vollständiger State. `you` ist der eigene Eintrag inklusive `user_id` und dem serverseitig gespeicherten Namen — der Client übernimmt diesen Namen, auch wenn er von seinem `Hello.name` abweicht. `min_client` = niedrigste erlaubte Client-Version als SemVer-String; der Client vergleicht sie in SemVer-Ordnung gegen die eigene Version. |
 | 2 | `UserJoined` | S→C | `user: UserInfo` | |
 | 3 | `UserLeft` | S→C | `session: Session`, `reason: u8` (Fehlercode < 256) | |
 | 4 | `UserState` | S→C | `session: Session`, `flags: UserFlags` | Broadcast nach jeder Änderung, inkl. an den Verursacher. |
 | 5 | `SetState` | C→S | `flags: UserFlags` | Server begrenzt auf 20/s pro Client, darüber `RATE_LIMITED`. |
 | 6 | `Ping` | C→S | `nonce: u64` | Anwendungs-RTT; Intervall 5 s. |
-| 7 | `Pong` | S→C | `nonce: u64`, `server_time_ms: u64` | |
+| 7 | `Pong` | S→C | `nonce: u64`, `server_time_ms: u64` | `server_time_ms` = Unix-Zeit in Millisekunden (UTC). Server antwortet unverzüglich; der Client misst die RTT über `nonce`. |
 | 8 | `Error` | S→C | `code: u32`, `detail: String` | Nicht-fatal. Fatale Fehler gehen über CONNECTION_CLOSE. |
 | 9 | `RenewRequest` | C→S | `csr_der: Vec<u8>` (≤ 2 KiB) | Cert-Renewal über die authentifizierte Verbindung, ab 30 Tage vor Ablauf. |
 | 10 | `RenewResponse` | S→C | `leaf_der: Vec<u8>` | Alter Fingerprint bleibt bis Ablauf gültig. |
 | 11 | `LossReport` | C→S | `speaker: Session`, `loss_permille: u16` | Vom Empfänger gemessener Verlust des Audio-Streams eines Sprechers über die letzten 2 s. Intervall 2 s, nur wenn sich der Wert um ≥ 10 ‰ ändert. |
-| 12 | `LossHint` | S→C | `loss_permille: u16` | Server leitet das Maximum aller `LossReport` für diesen Sprecher weiter; der Client setzt `OPUS_SET_PACKET_LOSS_PERC` (auf ganze Prozent gerundet, ≤ 20). |
+| 12 | `LossHint` | S→C | `loss_permille: u16` | Server leitet das Maximum aller `LossReport` für diesen Sprecher weiter; der Client setzt `OPUS_SET_PACKET_LOSS_PERC` (auf ganze Prozent gerundet, gedeckelt auf 20 — bewusste Festlegung, nicht aus dem Research belegt: oberhalb 20 % kostet LBRR mehr Bitrate als es rettet). Verfallen alle Reports eines Sprechers (6 s ohne neuen Report), sendet der Server `LossHint { loss_permille: 0 }`; der Client setzt dann auch die Jitter-Buffer-Untergrenze zurück. |
 | 13 | `KeyframeRequest` | C→S | `speaker: Session` | Empfänger braucht ein H.264-IDR (Join, Verlust). Server leitet als `KeyframeRequest { speaker: 0 }` an den Sprecher weiter; der erzeugt binnen 100 ms einen IDR. Rate ≤ 1/s pro Sprecher. |
-| 14 | `SetName` | C→S | `name: Name` | Namensänderung; Server broadcastet `UserRenamed`. |
+| 14 | `SetName` | C→S | `name: Name` | Namensänderung. Server prüft Länge, Steuerzeichen und serverweite Eindeutigkeit (case-insensitive); bei Kollision `Error { code: NAME_TAKEN }` und keine Änderung, sonst persistieren und `UserRenamed` an alle broadcasten. |
 | 15 | `UserRenamed` | S→C | `session: Session`, `name: Name` | |
 
-Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. Eine Seite sendet nur Varianten ≥ 11, wenn die Gegenseite dasselbe Minor ≥ 1 gemeldet hat; in v1 ist `minor = 1` und alle 16 Varianten sind Pflicht.
+Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline ist `minor = 1`; ein Minor 0 existiert nicht, und alle 16 Varianten sind in v1 Pflicht. Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
 ### 2.3 Enrollment `EnrollMsg` (nur ALPN `icu-enroll/1`)
 
@@ -71,11 +77,13 @@ Gleiche Framing-Regel, Stream-Limit 8 KiB, ein Request/Response, danach Close.
 
 | Nr | Variante | Richtung | Felder |
 | --- | --- | --- | --- |
-| 0 | `EnrollRequest` | C→S | `token: String` (base64url, 22 Zeichen = 128 Bit), `csr_der: Vec<u8>` (≤ 2 KiB), `name: Name` (gewünschter Anzeigename; der Server nimmt ihn als initialen Anzeigenamen, das Cert-CN kommt immer aus dem Invite) |
+| 0 | `EnrollRequest` | C→S | `token: String` (base64url, 22 Zeichen = 128 Bit), `csr_der: Vec<u8>` (≤ 2 KiB), `name: Name` (gewünschter Anzeigename; der Server nimmt ihn als initialen Anzeigenamen — kollidiert er case-insensitive mit einem bestehenden Namen, hängt der Server `-2`, `-3`, … an, bis er eindeutig ist. Das Cert-CN kommt immer aus dem Invite, nie aus der CSR) |
 | 1 | `EnrollResponse` | S→C | `leaf_der: Vec<u8>`, `ca_der: Vec<u8>`, `server_name: String` (SNI für die Hauptverbindung) |
 | 2 | `Error` | S→C | `code: u32`, `detail: String` |
 
-Server-Pinning beim Enrollment: der Client verifiziert die Serverkette nicht gegen einen Root-Store, sondern per eigenem `ServerCertVerifier`, der SHA-256 des letzten Kettenglieds mit dem `ca`-Wert aus dem Invite-Link vergleicht. Der Server sendet daher immer die Kette Leaf + CA. Server-Seite: CSR-Subject, SAN, EKU und Validity werden vom Server gesetzt, nicht aus der CSR übernommen (Spike 2b).
+Fehlerpfad: der Server sendet **immer zuerst** `Error { code, detail }`, dann `finish()`, dann `close(code)` mit demselben Code — sonst sieht der Nutzer im Enrollment-Dialog nur eine Codenummer ohne Text.
+
+Server-Pinning beim Enrollment: der Client verifiziert die Serverkette nicht gegen einen Root-Store, sondern per eigenem `ServerCertVerifier`. Präzise Regel: `ca` ist base64url **ohne Padding** über SHA-256 des DER des **letzten** Kettenglieds; der Verifier akzeptiert genau Kettenlänge 2 (Leaf + CA), vergleicht nur diesen Hash, ignoriert SNI und Gültigkeitszeitraum (das Leaf ist zu diesem Zeitpunkt noch nicht vertrauenswürdig), muss aber `verify_tls12_signature`/`verify_tls13_signature` an den CryptoProvider delegieren. Der Server sendet daher immer die Kette Leaf + CA. Server-Seite: CSR-Subject, SAN, EKU und Validity werden vom Server gesetzt, nicht aus der CSR übernommen (Spike 2b).
 
 Invite-Link: `icu://<host>:<port>/enroll?t=<token>&ca=<sha256-base64url>&n=<name-urlencoded>`. Token einmalig, 24 h gültig.
 
@@ -92,7 +100,7 @@ Genau ein Opus-Paket pro Datagram. Header 10 Byte, little-endian:
 | 6 | 4 | `ts` | 48-kHz-Sample-Clock des Senders, +960 je 20-ms-Frame (+480 bei 10 ms); springt bei PTT-Pausen, `seq` nicht |
 | 10 | n | `opus` | Opus-Paket (TOC enthalten), 1 ≤ n ≤ 400 |
 
-Regeln: Server verwirft Datagrams < 11 B oder > 410 B; Empfänger unterscheidet Pause (`ts`-Sprung bei lückenloser `seq`) von Verlust (`seq`-Lücke). Opus-Profil: 48 kHz mono, VOIP, Frame 20 ms Default (10 ms Client-Option ohne Protokolländerung, TOC trägt die Dauer), 48 kbit/s constrained VBR, FEC an, DTX aus, Complexity 10.
+Regeln: Server verwirft Datagrams < 11 B oder > 410 B; Empfänger unterscheidet Pause (`ts`-Sprung bei lückenloser `seq`) von Verlust (`seq`-Lücke). **Wrap:** `seq` und `ts` laufen über (bei 20 ms nach ~22 min bzw. ~24,8 h). Alle Vergleiche sind vorzeichenbehaftete Differenzen modulo 2^16 bzw. 2^32 (`(a.wrapping_sub(b)) as i16` bzw. `as i32`); eine Differenz jenseits der halben Wertebereichsbreite ist ein Rücksprung, kein Vorwärtssprung. Jitter-Buffer, Verlusterkennung und Re-Anchor rechnen ausschließlich so. Opus-Profil: 48 kHz mono, VOIP, Frame 20 ms Default (10 ms Client-Option ohne Protokolländerung, TOC trägt die Dauer), 48 kbit/s constrained VBR, FEC an, DTX aus, Complexity 10.
 
 Server-Relay pro Datagram: Länge/`kind` prüfen → Absender `Active` und nicht `muted` → Rate ≤ 110/s → `speaker` setzen → `send_datagram` an alle anderen `Active`, nicht `deafened`; Sendefehler pro Empfänger zählen, nie blockieren.
 
@@ -107,10 +115,10 @@ Header 12 Byte, dann Frame-Bytes bis Stream-FIN. Empfänger `read_to_end(512 KiB
 | 2 | 2 | `speaker` | Client sendet 0, Server setzt |
 | 4 | 2 | `seq` | Frame-Zähler pro Sender |
 | 6 | 4 | `ts` | dieselbe 48-kHz-Clock wie Audio |
-| 10 | 1 | `codec` | `1` = H.264 Constrained Baseline (Annex-B-NALs, SPS/PPS vor jedem IDR), `2` = MJPEG (Baseline JFIF). v1-Clients müssen 1 decodieren, 2 optional. |
+| 10 | 1 | `codec` | `1` = H.264 Constrained Baseline (Annex-B-NALs, SPS/PPS vor jedem IDR), `2` = MJPEG (Baseline JFIF). v1-Clients müssen 1 decodieren; **`2` darf in v1 nicht gesendet werden** (reiner Empfangs-/Debug-Pfad hinter dem Client-Feature `mjpeg`, ohne Aushandlung). |
 | 11 | 1 | reserviert | 0 |
 
-Profil: 320×240 @ 15 fps, Ziel 150 kbit/s, IDR alle 2 s und auf `KeyframeRequest`. Server-Relay: Header lesen, `camera_on` und `Active` prüfen, `speaker` setzen, Chunks durchreichen, `finish()`. Pro Sender max. 1 Frame in Bearbeitung + 1 wartend; älterer wartender Frame wird per `reset(0x09)` verworfen. Video-Streams `set_priority(-1)`, Control-Stream `set_priority(1)`.
+Profil: 320×240 @ 15 fps, Ziel 150 kbit/s, IDR alle 2 s und auf `KeyframeRequest`. Server-Relay: Header lesen, `camera_on` und `Active` prüfen, `speaker` setzen, Chunks durchreichen, `finish()`. Pro **Sender-Empfänger-Paar** max. 1 Frame in Bearbeitung + 1 wartend; der ältere wartende Frame wird per `reset(0x09)` verworfen. Die Drop-Entscheidung fällt je Empfänger, damit ein langsamer Empfänger die übrigen nicht ausbremst. Video-Streams `set_priority(-1)`, Control-Stream `set_priority(1)`.
 
 ## 5. Verbindungsablauf
 
@@ -123,7 +131,9 @@ Incoming ─accept─▶ Handshaking ─ALPN icu/1, TLS ok─▶ Authenticating 
                              Enrolling ─▶ Closed                close(AUTH_*)                close(HELLO_TIMEOUT)
 ```
 
-Client-Sicht: `Connecting → Handshaking → SendHello → AwaitWelcome → Active → Closed`. Reconnect bei jedem nicht-fatalen Close und bei Netzfehlern: Backoff 1, 2, 4, 8, 15 s, dann 15 s, unbegrenzt; lokaler Zustand (Mute, Deafen, Lautstärken) bleibt. Fatal (kein Reconnect, UI-Hinweis) sind genau die in §6 mit „ja“ markierten Codes: PROTOCOL_VIOLATION, VERSION_UNSUPPORTED, AUTH_*, KICKED, ENROLL_*. Alle anderen → Reconnect mit Backoff.
+Client-Sicht: `Connecting → Handshaking → SendHello → AwaitWelcome → Active → Closed`. Reconnect bei jedem nicht-fatalen Close und bei Netzfehlern: Backoff 1, 2, 4, 8, 15 s, dann 15 s, unbegrenzt; lokaler Zustand (Mute, Deafen, Lautstärken) bleibt. Fatal (kein Reconnect, UI-Hinweis) sind genau die in §6 mit „ja“ markierten Codes: PROTOCOL_VIOLATION, VERSION_UNSUPPORTED, AUTH_*, KICKED, RATE_LIMITED_FATAL, ENROLL_*. Alle anderen → Reconnect mit Backoff.
+
+**Zustand beim Reconnect:** jedes `Welcome` ersetzt den vollständigen Peer-Zustand. Session-IDs gelten nur innerhalb einer Verbindung; der Client verwirft bei jedem Reconnect Jitter-Buffer, Decoder, Video-Kacheln und alle Session-Zuordnungen. Dauerhaft je Peer gespeicherte Daten (Lautstärken) hängen an `user_id`, nie an `session`.
 
 ## 6. Fehlercodes
 
@@ -140,8 +150,11 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | 0x06 | `KICKED` | ja | Admin-Aktion (= Revoke mit sofortigem Close) |
 | 0x07 | `HELLO_TIMEOUT` | nein | kein `Hello` binnen 5 s; Client reconnectet mit Backoff |
 | 0x08 | `SHUTDOWN` | nein | Server fährt herunter; Client reconnectet |
-| 0x09 | `RATE_LIMITED` | nein | dreimal in 60 s → fatal |
+| 0x09 | `RATE_LIMITED` | nein | Rate überschritten; als `Error` gesendet, Verbindung bleibt |
 | 0x0A | `AUTH_REQUIRED` | ja | ALPN `icu/1` ohne Client-Cert |
+| 0x0B | `RATE_LIMITED_FATAL` | ja | dritter `RATE_LIMITED`-Verstoß binnen 60 s; Server schließt, Client reconnectet nicht |
+| 0x0C | `TIMEOUT` | nein | Idle-Timeout oder Transportabbruch; auch `UserLeft.reason`, wenn eine Verbindung ohne sauberes Close endet |
+| 0x0D | `NAME_TAKEN` | nein | `SetName` auf einen serverweit schon vergebenen Namen (case-insensitive); nur als `Error`, nie als Close |
 | 0x10 | `ENROLL_BAD_TOKEN` | ja | Token unbekannt/verbraucht/abgelaufen |
 | 0x11 | `ENROLL_BAD_CSR` | ja | CSR nicht parsebar/Signatur ungültig |
 | 0x12 | `ENROLL_RATE_LIMITED` | ja | 5/min pro IP oder 20/min global |
@@ -155,15 +168,17 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | Control-Messages | ≤ 50/s pro Client |
 | Audio-Datagrams | ≤ 110/s pro Client, ≤ 410 B |
 | Video-Frames | ≤ 20/s pro Client, ≤ 512 KiB; nur bei `camera_on` |
-| Video-Bitrate | ≤ 400 kbit/s pro Sender (gleitend über 2 s), darüber Frames verwerfen |
-| Users | `max_users` (Default 16, Obergrenze 64) |
+| Video-Bitrate | ≤ 400 kbit/s pro Sender (gleitend über 2 s), darüber Frames verwerfen. Bewusste Festlegung als Missbrauchs-Deckel, nicht aus dem Research hergeleitet: Zielbitrate ist 150 kbit/s (§4), der Abstand fängt CBR-Spitzen bei 15 fps ab. |
+| Users | `max_users` (Default 16, Obergrenze 64); beim Erreichen `close(SERVER_FULL)` |
+| Uni-Streams | `max_concurrent_uni_streams` = `2 × max_users + 4` je Richtung |
+| `Welcome`-Größe | Server validiert beim Start, dass `max_users` × 100 B + Reserve unter dem 16-KiB-Frame-Limit bleibt |
 | Enrollment | Stream ≤ 8 KiB, 5/min pro IP, 20/min global |
 | Hello | ≤ 5 s nach Handshake |
 
 ## 8. Versionierung
 
 - Major = ALPN-String (`icu/1`). Inkompatible Änderung → `icu/2`, Server bietet ggf. beide.
-- Minor = `Hello.minor` / `Welcome.minor`; Server antwortet mit `min(client, server)`; Varianten oberhalb des ausgehandelten Minors werden nicht gesendet.
+- Minor = `Hello.minor` / `Welcome.minor`; Server antwortet mit `min(client, server)`; Varianten oberhalb des ausgehandelten Minors werden nie gesendet. v1-Baseline ist `minor = 1` (ein Minor 0 gibt es nicht); kann der Server ein gemeldetes Minor nicht bedienen, schließt er mit `VERSION_UNSUPPORTED`.
 - `caps` für optionale Features innerhalb eines Minors.
 - Header-`kind` trägt die Version (`0x01` Audio v1, `0x02` Video v1); ein Audio-v2-Header bekäme `0x03`.
 - Unbekannte Enum-Variante beim Decode ist ein `Err` (Spike 2b) und führt zu `PROTOCOL_VIOLATION`; deshalb nie Varianten senden, die die Gegenseite nicht kennt.
