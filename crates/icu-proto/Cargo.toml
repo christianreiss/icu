@@ -1,0 +1,13 @@
+[package]
+name = "icu-proto"
+description = "ICU Wire-Protokoll v1 — Typen, Framing und Header-Codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+
+[lints.rust]
+missing_docs = "warn"

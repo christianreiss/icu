@@ -1,0 +1,55 @@
+# cargo-deny Konfiguration fuer den gesamten ICU-Workspace (Server und Client).
+# Allowlist aus Server/IMPLEMENTATION.md §9 / Client/IMPLEMENTATION.md §12.
+# Schema: cargo-deny v2 (`[licenses] version = 2`).
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-unknown-linux-musl" },
+    { triple = "x86_64-pc-windows-gnu" },
+]
+all-features = false
+
+[licenses]
+version = 2
+# Alles, was hier nicht steht, bricht den Build.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+# `IJG` gilt ausschliesslich fuer den MJPEG-Fallback des Clients
+# (Feature `mjpeg`, Crate `jpeg-encoder`). cargo-deny kann eine Ausnahme nicht
+# an ein Cargo-Feature binden; deshalb ein Crate-Pin statt eines globalen
+# Allow-Eintrags. Wird `mjpeg` nicht gebaut, ist das Crate nicht im Graph und
+# die Ausnahme wirkungslos.
+[[licenses.exceptions]]
+name = "jpeg-encoder"
+allow = ["IJG"]
+
+# ring ist "Apache-2.0 AND ISC" mit zusaetzlichen Dateien ohne SPDX-Header;
+# beide Lizenzen stehen in der Allowlist.
+[[licenses.clarify]]
+name = "ring"
+expression = "Apache-2.0 AND ISC"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

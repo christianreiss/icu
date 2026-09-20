@@ -1,0 +1,44 @@
+[package]
+name = "icu-server"
+description = "ICU voice server — QUIC/mTLS relay, own CA, admin CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+default-run = "icu-server"
+
+[lib]
+name = "icu_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "icu-server"
+path = "src/main.rs"
+
+[dependencies]
+icu-proto.workspace = true
+
+quinn.workspace = true
+rustls.workspace = true
+ring.workspace = true
+rcgen.workspace = true
+x509-parser.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+clap.workspace = true
+toml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+subtle.workspace = true
+base64.workspace = true
+sha2.workspace = true
+rand.workspace = true
+time.workspace = true
+rustix.workspace = true
+socket2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+postcard.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process"] }
