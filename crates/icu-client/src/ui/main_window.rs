@@ -13,12 +13,11 @@ use crate::{
     config::{Identity, Paths},
     dsp::gate::Mode,
     engine::{AppState, Command, ConnStatus, Engine},
-    hotkey::Hotkeys,
     net::enroll::{enroll, InviteLink},
 };
 
 /// Runs the main window.
-pub fn run(engine: Engine, hotkeys: Option<Hotkeys>, debug_stats: bool) -> Result<(), String> {
+pub fn run(engine: Engine, debug_stats: bool) -> Result<(), String> {
     let start_minimized = engine.snapshot().settings.ui.start_minimized;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -33,7 +32,7 @@ pub fn run(engine: Engine, hotkeys: Option<Hotkeys>, debug_stats: bool) -> Resul
     eframe::run_native(
         "ICU",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, engine_for_app, hotkeys, debug_stats)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, engine_for_app, debug_stats)))),
     )
     .map_err(|e| e.to_string())?;
     if let Some(engine) = engine.lock().unwrap().take() {
@@ -47,7 +46,6 @@ struct App {
     state_rx: tokio::sync::watch::Receiver<AppState>,
     cmd: tokio::sync::mpsc::UnboundedSender<Command>,
     settings: Option<SettingsView>,
-    hotkey_backend: String,
     debug_stats: bool,
     last_stats: Instant,
     stats_text: String,
@@ -62,13 +60,13 @@ struct App {
     camera: Option<crate::camera::CameraHandle>,
     #[cfg_attr(not(feature = "tray"), allow(dead_code))]
     hidden: bool,
+    quit_requested: bool,
 }
 
 impl App {
     fn new(
         cc: &eframe::CreationContext<'_>,
         engine: Arc<Mutex<Option<Engine>>>,
-        hotkeys: Option<Hotkeys>,
         debug_stats: bool,
     ) -> App {
         let (state_rx, cmd, stats, theme_name) = {
@@ -115,10 +113,6 @@ impl App {
             state_rx,
             cmd,
             settings: None,
-            hotkey_backend: hotkeys
-                .as_ref()
-                .map(|h| h.backend.clone())
-                .unwrap_or_else(|| "none".into()),
             debug_stats,
             last_stats: Instant::now(),
             stats_text: String::new(),
@@ -132,6 +126,7 @@ impl App {
             #[cfg(feature = "camera")]
             camera,
             hidden: false,
+            quit_requested: false,
         }
     }
 
@@ -141,10 +136,14 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = &root.ctx().clone();
-        ctx.request_repaint_after(Duration::from_millis(33));
-        let state = self.state_rx.borrow_and_update().clone();
+    /// Runs before every `ui` pass and also while the window is hidden (on
+    /// `request_repaint`): tray events, camera state, close handling.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg_attr(
+            not(any(feature = "tray", feature = "camera")),
+            allow(unused_variables)
+        )]
+        let state = self.state_rx.borrow().clone();
 
         #[cfg(feature = "tray")]
         if let Some(tray) = &self.tray {
@@ -155,6 +154,7 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 Some(crate::tray::TrayEvent::Quit) => {
+                    self.quit_requested = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 None => {}
@@ -166,7 +166,7 @@ impl eframe::App for App {
             camera.sync(&state);
         }
 
-        if ctx.input(|i| i.viewport().close_requested()) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested {
             #[cfg(feature = "tray")]
             if self.tray.is_some() && !self.hidden && !ctx.input(|i| i.modifiers.shift) {
                 // Close = hide to tray; Shift+close or the tray menu quits.
@@ -175,6 +175,12 @@ impl eframe::App for App {
                 self.hidden = true;
             }
         }
+    }
+
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = &root.ctx().clone();
+        ctx.request_repaint_after(Duration::from_millis(33));
+        let state = self.state_rx.borrow_and_update().clone();
 
         if self.debug_stats && self.last_stats.elapsed() > Duration::from_secs(2) {
             self.last_stats = Instant::now();
@@ -329,7 +335,7 @@ impl eframe::App for App {
                 {
                     self.settings = match self.settings.take() {
                         Some(_) => None,
-                        None => Some(SettingsView::new(&state, self.hotkey_backend.clone())),
+                        None => Some(SettingsView::new(&state, state.hotkey_backend.clone())),
                     };
                 }
             });

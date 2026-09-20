@@ -1,7 +1,7 @@
 //! Tray icon (tray-icon 0.25, ksni on Linux): status icon, menu with
 //! Mute/Deafen/Fenster/Beenden.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
 use tray_icon::{
@@ -28,7 +28,8 @@ pub struct Tray {
     show_id: MenuId,
     quit_id: MenuId,
     cmd: UnboundedSender<Command>,
-    ctx: egui::Context,
+    menu_rx: mpsc::Receiver<MenuId>,
+    tray_rx: mpsc::Receiver<TrayIconEvent>,
     last: Arc<Mutex<Option<(bool, bool, bool)>>>,
 }
 
@@ -52,12 +53,22 @@ impl Tray {
             .with_icon(render_icon([0x9e, 0x9e, 0x9e], false))
             .build()
             .map_err(|e| e.to_string())?;
-        // Repaint the window whenever the tray produces an event, so `poll`
-        // runs promptly.
+        // With a handler installed, muda/tray-icon deliver events to the
+        // handler *instead of* the global receiver; forward them into our
+        // own channel and wake the window so `poll` runs promptly (also
+        // while the window is hidden, via `App::logic`).
+        let (menu_tx, menu_rx) = mpsc::channel();
         let ctx_menu = ctx.clone();
-        MenuEvent::set_event_handler(Some(move |_| ctx_menu.request_repaint()));
+        MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
+            let _ = menu_tx.send(ev.id);
+            ctx_menu.request_repaint();
+        }));
+        let (tray_tx, tray_rx) = mpsc::channel();
         let ctx_tray = ctx.clone();
-        TrayIconEvent::set_event_handler(Some(move |_| ctx_tray.request_repaint()));
+        TrayIconEvent::set_event_handler(Some(move |ev: TrayIconEvent| {
+            let _ = tray_tx.send(ev);
+            ctx_tray.request_repaint();
+        }));
         Ok(Tray {
             icon,
             show_id: show.id().clone(),
@@ -65,7 +76,8 @@ impl Tray {
             mute,
             deafen,
             cmd,
-            ctx,
+            menu_rx,
+            tray_rx,
             last: Arc::new(Mutex::new(None)),
         })
     }
@@ -73,25 +85,24 @@ impl Tray {
     /// Drains pending events; menu actions are turned into commands here.
     pub fn poll(&self) -> Option<TrayEvent> {
         let mut out = None;
-        while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if ev.id == self.show_id {
+        while let Ok(id) = self.menu_rx.try_recv() {
+            if id == self.show_id {
                 out = Some(TrayEvent::ShowWindow);
-            } else if ev.id == self.quit_id {
+            } else if id == self.quit_id {
                 out = Some(TrayEvent::Quit);
-            } else if ev.id == *self.mute.id() {
+            } else if id == *self.mute.id() {
                 let _ = self.cmd.send(Command::SetMuted(self.mute.is_checked()));
-            } else if ev.id == *self.deafen.id() {
+            } else if id == *self.deafen.id() {
                 let _ = self
                     .cmd
                     .send(Command::SetDeafened(self.deafen.is_checked()));
             }
         }
-        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+        while let Ok(ev) = self.tray_rx.try_recv() {
             if let TrayIconEvent::DoubleClick { .. } = ev {
                 out = Some(TrayEvent::ShowWindow);
             }
         }
-        let _ = &self.ctx;
         out
     }
 

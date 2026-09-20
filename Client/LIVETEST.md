@@ -53,6 +53,8 @@ Jeder Aufruf druckt einen Link `icu://127.0.0.1:4711/enroll?t=…&ca=…&n=chris
 
 (Link in Anführungszeichen, wegen `&`.) Der erste Aufruf enrollt (`identity/` im Config-Dir) und startet danach sofort das Fenster; spätere Starts brauchen nur noch `icu --config-dir ~/icu-live/c1`.
 
+Beim ersten Start fragt KDE (Portal GlobalShortcuts) nach den Kurzbefehlen für ICU; das Fenster erscheint unabhängig davon sofort. „Abbrechen“ im Dialog ⇒ der Client fällt auf evdev zurück (⚙ → Hotkeys zeigt das aktive Backend, sobald es feststeht).
+
 `--no-hotkeys` bei Client 2: beide Instanzen würden sonst dieselbe evdev-PTT-Taste (Default `KEY_RIGHTCTRL`) sehen und gleichzeitig senden. Alternativ in `~/icu-live/c2/settings.toml` unter `[hotkeys]` `ptt = { key = "KEY_RIGHTALT" }` eintragen oder Client 2 auf VAD stellen (Rechtsklick auf den PTT-Button).
 
 Ohne `--no-uri-handler` schreibt der Client beim Start `~/.local/share/applications/icu.desktop` und ruft `xdg-mime default icu.desktop x-scheme-handler/icu` auf — danach öffnen `icu://`-Links in Browser/Chat direkt ICU. Abschaltbar in den Einstellungen („icu://-Links mit ICU öffnen“) oder per `--no-uri-handler`.

@@ -147,19 +147,21 @@ fn run(cli: Cli) -> Result<(), String> {
     cfg.test_tone = cli.test_tone;
     let engine = Engine::start(cfg, backend).map_err(|e| e.to_string())?;
 
-    let hotkeys = if cli.no_hotkeys {
-        None
-    } else {
+    // Hotkeys come up in the background: the Portal may show a dialog and
+    // the window must not wait for it. The guard lives on the runtime.
+    if !cli.no_hotkeys {
         let cmd = engine.command_sender();
         let hk_settings = settings.hotkeys.clone();
-        Some(
-            engine
-                .runtime()
-                .block_on(icu_client::hotkey::start(&hk_settings, cmd)),
-        )
-    };
-    if let Some(h) = &hotkeys {
-        tracing::info!(backend = %h.backend, "hotkeys");
+        engine.runtime().spawn(async move {
+            let hotkeys = icu_client::hotkey::start(&hk_settings, cmd.clone()).await;
+            tracing::info!(backend = %hotkeys.backend, "hotkeys");
+            let _ = cmd.send(icu_client::engine::Command::HotkeyBackend(
+                hotkeys.backend.clone(),
+            ));
+            // Keep the guard alive for the lifetime of the runtime.
+            std::future::pending::<()>().await;
+            drop(hotkeys);
+        });
     }
 
     if cli.headless {
@@ -167,8 +169,7 @@ fn run(cli: Cli) -> Result<(), String> {
     } else {
         #[cfg(feature = "gui")]
         {
-            icu_client::ui::run_main_window(engine, hotkeys, cli.debug_stats)
-                .map_err(|e| e.to_string())
+            icu_client::ui::run_main_window(engine, cli.debug_stats).map_err(|e| e.to_string())
         }
         #[cfg(not(feature = "gui"))]
         {

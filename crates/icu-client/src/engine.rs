@@ -193,6 +193,8 @@ pub enum Command {
     DismissBanner,
     /// Force an IDR (from a `KeyframeRequest`, or tests).
     ForceKeyframe,
+    /// The hotkey backend that came up (for the settings view).
+    HotkeyBackend(String),
     /// Stop everything.
     Quit,
 }
@@ -1315,6 +1317,9 @@ impl LocalState {
             }
             Command::ForceKeyframe => {
                 shared.keyframe_request.store(true, Ordering::Relaxed);
+            }
+            Command::HotkeyBackend(name) => {
+                shared.state.send_modify(|s| s.hotkey_backend = name);
             }
             Command::SetName(_) | Command::Quit => {}
         }

@@ -10,16 +10,11 @@ use std::net::SocketAddr;
 use crate::{
     config::{Identity, Paths},
     engine::Engine,
-    hotkey::Hotkeys,
 };
 
 /// Runs the main window until the user quits. Owns the engine.
-pub fn run_main_window(
-    engine: Engine,
-    hotkeys: Option<Hotkeys>,
-    debug_stats: bool,
-) -> Result<(), String> {
-    main_window::run(engine, hotkeys, debug_stats)
+pub fn run_main_window(engine: Engine, debug_stats: bool) -> Result<(), String> {
+    main_window::run(engine, debug_stats)
 }
 
 /// Shows the enrollment window; returns the identity once enrolled (and
