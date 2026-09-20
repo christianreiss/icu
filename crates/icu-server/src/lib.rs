@@ -187,6 +187,9 @@ impl Handle {
     /// releases the state lock (§6.1.8).
     pub async fn shutdown(self) {
         let _ = self.server.shutdown.send(true);
+        self.server
+            .room
+            .mark_all_closing(icu_proto::error::SHUTDOWN);
         for conn in self.server.room.connections() {
             conn.close(
                 quinn::VarInt::from_u32(icu_proto::error::SHUTDOWN),

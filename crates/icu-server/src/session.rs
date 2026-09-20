@@ -197,7 +197,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     datagrams.abort();
     uni.abort();
     writer.abort();
-    server.room.leave(session);
+    let member = server.room.leave(session);
     let hints = server
         .loss
         .lock()
@@ -214,9 +214,14 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         .unwrap_or_else(|e| e.into_inner())
         .remove(&session);
 
+    // `UserLeft.reason` (§6.4.6): the code the server closed with if it was the
+    // server, otherwise the peer's application close code, otherwise TIMEOUT
+    // for an idle timeout or a transport abort.
     let reason = match &outcome {
-        Ok(()) => ec::NO_ERROR,
         Err(e) => e.code().unwrap_or(ec::TIMEOUT),
+        Ok(()) => member
+            .and_then(|m| m.close_code)
+            .unwrap_or_else(|| peer_close_code(conn)),
     };
     server.room.broadcast(&ControlMsg::UserLeft {
         session,
@@ -491,12 +496,33 @@ async fn handle_renew(server: &Arc<Server>, session: Session, user_id: UserId, c
     );
 }
 
+/// The code the peer closed with, reduced to the `UserLeft.reason` range.
+///
+/// Anything that is not a clean application close — idle timeout, reset,
+/// transport error — is `TIMEOUT` (`PROTOCOL.md` §6).
+fn peer_close_code(conn: &quinn::Connection) -> u32 {
+    match conn.close_reason() {
+        Some(quinn::ConnectionError::ApplicationClosed(closed)) => {
+            let code = u64::from(closed.error_code);
+            if code < 256 {
+                code as u32
+            } else {
+                ec::TIMEOUT
+            }
+        }
+        _ => ec::TIMEOUT,
+    }
+}
+
 /// Closes every connection of a user with `KICKED` (`revoke`, §5).
 pub fn kick_user(server: &Arc<Server>, user_id: UserId) -> usize {
     let sessions = server.room.sessions_of_user(user_id);
     let mut closed = 0;
     for session in sessions {
         if let Some(member) = server.room.member(session) {
+            // Mark before closing, so the `UserLeft` broadcast says KICKED and
+            // not "the peer went away".
+            server.room.mark_closing(session, ec::KICKED);
             member.conn.close(
                 quinn::VarInt::from_u32(ec::KICKED),
                 ec::name(ec::KICKED).as_bytes(),

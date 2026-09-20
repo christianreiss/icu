@@ -87,6 +87,10 @@ pub struct Member {
     pub out: mpsc::UnboundedSender<Vec<u8>>,
     /// Talk spurt tracking.
     pub speak: Speaking,
+    /// Set just before the server closes this connection itself, so that
+    /// `UserLeft.reason` carries the code the server closed with
+    /// (`Server/IMPLEMENTATION.md` §6.4.6).
+    pub close_code: Option<u32>,
 }
 
 impl Member {
@@ -180,9 +184,24 @@ impl Room {
                 conn,
                 out,
                 speak: Speaking::default(),
+                close_code: None,
             },
         );
         Ok(session)
+    }
+
+    /// Records the code the server is about to close this connection with.
+    pub fn mark_closing(&self, session: Session, code: u32) {
+        if let Some(member) = self.lock().members.get_mut(&session) {
+            member.close_code = Some(code);
+        }
+    }
+
+    /// Records the close code for every participant, for shutdown.
+    pub fn mark_all_closing(&self, code: u32) {
+        for member in self.lock().members.values_mut() {
+            member.close_code = Some(code);
+        }
     }
 
     /// Removes a participant.
