@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/icu-proto", "crates/icu-server"]
+members = ["crates/icu-proto", "crates/icu-server", "crates/icu-client"]
 # Die Spikes unter Research/spikes/ sind eigenstaendige Pakete und gehoeren nicht
 # in diesen Workspace; ohne exclude meldet cargo dort "believes it's in a workspace".
 exclude = ["Research/spikes/*"]

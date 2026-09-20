@@ -363,3 +363,33 @@ Weitere Befunde aus der Implementierung:
 | Unix-Socket-Pfadlänge | `/run/icu/admin.sock` ist unkritisch, aber ein Pfad ≥ 108 Byte (`SUN_LEN`) lässt den Admin-Socket scheitern. Der Server läuft dann weiter und warnt; die CLI fällt auf den Dateipfad zurück und bricht dort korrekt an `flock` ab. |
 
 Nicht geprüft: echtes Netz statt Loopback, mehr als 16 gleichzeitige Sprecher, Video-Relay unter Last, `tc netem` (der Test `netem` in derselben Datei ist `#[ignore]` und braucht root für `tc qdisc add dev lo`), Keepalive über 10 min Stille (Test `keepalive_holds_over_ten_minutes_of_silence`, ebenfalls `#[ignore]`), Verhalten über Consumer-NAT.
+
+## Spike 8: pipewire-rs
+
+Nachgetragen am 2026-09-20 als M0 der Client-Implementierung (`Client/IMPLEMENTATION.md` §15). Angehängt, ohne die Abschnitte davor zu verändern. Quellcode ist kein Wegwerf-Spike, sondern das Backend `crates/icu-client/src/audio/pipewire.rs` plus das Beispiel `crates/icu-client/examples/pw_spike.rs` (`cargo run -p icu-client --example pw_spike -- <sekunden> [capture-node-name]`).
+
+Stack: `pipewire` 0.10.1 (Feature `v0_3_49` für `Buffer::requested`), libspa 0.10.1, gegen PipeWire 1.4.11 (`pipewire-devel` 1.4.11, clang 21). Build-Host brauchte keine weiteren Pakete; `pipewire-devel` und `clang-devel` waren vorhanden. Der erste `cargo build` mit dem vollständigen Client-Dependency-Satz (inkl. webrtc-audio-processing bundled, openh264 source, libopus via opusic-sys, eframe) lief durch.
+
+Aufbau: eigener Thread mit `MainLoopRc` + `ContextRc` + `CoreRc`, Kommandos über `pipewire::channel`, drei `StreamRc` in einer `node.group = icu` mit `node.latency = 240/48000`, `node.rate = 1/48000`, `media.role = Communication`, Format F32LE mono 48 kHz (`AudioInfoRaw` → `Pod`), Flags `AUTOCONNECT | MAP_BUFFERS | RT_PROCESS`. Referenzstream: `stream.capture.sink = true`, kein `target.object` (PipeWire hängt ihn an die Monitor-Ports des Default-Sinks). Geräteliste über `core.get_registry_rc()` + `add_listener_local().global(..)/.global_remove(..)` auf Nodes mit `media.class` `Audio/Source`/`Audio/Sink`; die erste Liste ist nach `core.sync(0)` + `done` vollständig, bevor `PipeWireBackend::new()` zurückkehrt. Playback schreibt `requested` Frames (Feature `v0_3_49`), Fallback 240.
+
+| Messung (Playback-Ton 440 Hz bei −20 dBFS auf dem Default-Sink Jabra, Capture Default-Source C-Media, 8 s) | Ergebnis |
+| --- | --- |
+| Build `pipewire` 0.10.1 gegen 1.4.11 | **PASS**, `StreamRc::new(CoreRc, &str, PropertiesBox)` wie in `review-specs` A13 beschrieben |
+| Geräteliste aus der Registry | 3 Sources (Jabra Mono, C-Media Stereo, Webcam C270 Mono), 2 Sinks (Jabra, C-Media); Namen = `node.name`, Anzeige = `node.description` |
+| Capture-Callback | 2 990 Blöcke, **immer 128 Samples**, Intervall p50 2,67 ms, p99 2,69 ms, max 2,95 ms |
+| Referenz-Callback (`stream.capture.sink`) | 2 968 Blöcke à 128, p50 2,67 ms, p99 2,70 ms; **mittlere RMS 0,0706 = exakt der Playback-Ton (0,1/√2)** → der Monitor liefert den Sink-Mix, `aec.md` A4 **bestätigt** |
+| Playback-Callback | 2 967 Blöcke à 128 (`requested` = 128), p50 2,67 ms, p99 2,69 ms |
+| `pw-top` während des Laufs | Unsere drei Nodes zeigen QUANT 240/48000 (angefordert) und folgen dem Treiber `alsa_output…Jabra`; der Treiber `alsa_input…C-Media` läuft mit **128/48000**. `pw-metadata`: `clock.quantum 1024`, `clock.min-quantum 32`, `clock.force-quantum 0`; kein anderer Node setzt `node.latency`. |
+| Capture-Node explizit auf Jabra-Mono (gleicher ALSA-Treiber wie der Sink) | identisch: 128 Samples, 2,67 ms; der Jabra-Capture-Treiber läuft ebenfalls mit 128 |
+| Sauberes Beenden | `close()` aller Streams, `Drop` → `Quit` → `mainloop.quit()` → Thread-Join, Exit 0 |
+
+Befunde:
+- **`node.latency` ist eine Obergrenze, keine feste Periode.** PipeWire wählt das Graph-Quantum als Minimum der Wünsche aller Nodes; auf diesem Host läuft der ALSA-Capture-Treiber mit 128 Samples, also kommen die Callbacks mit 128 Samples (2,67 ms) statt 240 (5 ms). Das ist *kleiner* als angefordert, die Latenz bleibt damit ≤ 5 ms je Richtung — kontrollierbar im Sinne von „nicht größer als gewünscht“. Konsequenz für den Client: das Backend liefert Blöcke beliebiger Größe, die Engine sammelt sie in Ringpuffern zu 480er-DSP-Blöcken (war so geplant, ist jetzt Pflicht). Spike 3 (cpal) hatte dieselben 128 gesehen; pipewire-rs bringt gegenüber cpal also die Geräteliste, den Monitor-Stream und die Gruppe, nicht eine andere Periode.
+- Die Callback-Intervalle sind mit p99 = p50 + 0,03 ms extrem stabil; Timing-Jitter kommt aus diesem Backend nicht.
+- Capture und Referenz laufen im selben Graph, `node.group` hält alle drei Streams an einem Treiber (pw-top: alle drei unter `alsa_output…Jabra`); ein Capture-Gerät an einem anderen ALSA-Treiber (C-Media) wird von PipeWire per Async-Link angebunden, für den Client transparent.
+- Der Jabra-Mikrofon-Stream lieferte RMS 0,0000 (Headset nicht getragen bzw. Mute-Taste) — kein Software-Befund, aber für den Live-Test relevant: Default-Source ist die C-Media-Karte.
+- Falle beim Bauen: `Buffer::requested()` existiert nur mit Feature `v0_3_49`; ohne Feature muss die Playback-Blockgröße aus der Puffergröße geraten werden.
+
+Nicht geprüft: Hot-Plug zur Laufzeit (Registry-Events sind verdrahtet, aber kein Gerät wurde gezogen), Sink-Wechsel während der Referenz läuft (A4 zweiter Teil), Drift Mikrofon↔Monitor über 10 min (A5), Verhalten bei `clock.force-quantum`.
+
+**Spike 8: PASS.** pipewire-rs 0.10.1 baut und läuft gegen PipeWire 1.4.11, drei Streams in einer Gruppe, Monitor-Referenz liefert den Systemmix, Blockgröße 128 (≤ 240 angefordert), kein Fallback auf cpal nötig. §6 „Backend Linux“ in `Client/IMPLEMENTATION.md` ist damit festgeschrieben (mit dem Zusatz „Blockgröße = Graph-Quantum ≤ node.latency“).

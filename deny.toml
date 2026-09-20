@@ -21,6 +21,15 @@ allow = [
     "BSD-3-Clause",
     "Zlib",
     "Unicode-3.0",
+    # Client (M1/M2/M4, 2026-09-20): egui-Default-Fonts (OFL-1.1 + Ubuntu-font),
+    # ksni (Unlicense), clipboard-win/error-code (BSL-1.0), option-ext via
+    # directories (MPL-2.0, nur Datei-Copyleft). cargo-deny selbst war auf dem
+    # Build-Host nicht installiert; Liste aus `cargo metadata` abgeleitet.
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "Unlicense",
+    "BSL-1.0",
+    "MPL-2.0",
 ]
 confidence-threshold = 0.9
 
@@ -32,6 +41,35 @@ confidence-threshold = 0.9
 [[licenses.exceptions]]
 name = "jpeg-encoder"
 allow = ["IJG"]
+
+# nokhwa (Default-Feature `decoding`) dekodiert MJPEG ueber mozjpeg; IJG ist
+# die libjpeg-Lizenz und gilt nur fuer diese beiden Crates (Client, Feature
+# `camera`).
+[[licenses.exceptions]]
+name = "mozjpeg"
+allow = ["IJG"]
+
+[[licenses.exceptions]]
+name = "mozjpeg-sys"
+allow = ["IJG"]
+
+# webrtc-audio-processing 2.1 traegt `license-file = COPYING` statt eines
+# SPDX-Ausdrucks; der Text ist woertlich die Google-BSD-3-Clause
+# (Research/aec.md E6).
+[[licenses.clarify]]
+name = "webrtc-audio-processing"
+expression = "BSD-3-Clause"
+license-files = [{ path = "COPYING", hash = 0 }]
+
+[[licenses.clarify]]
+name = "webrtc-audio-processing-config"
+expression = "BSD-3-Clause"
+license-files = [{ path = "COPYING", hash = 0 }]
+
+[[licenses.clarify]]
+name = "webrtc-audio-processing-sys"
+expression = "BSD-3-Clause"
+license-files = [{ path = "COPYING", hash = 0 }]
 
 # ring ist "Apache-2.0 AND ISC" mit zusaetzlichen Dateien ohne SPDX-Header;
 # beide Lizenzen stehen in der Allowlist.
