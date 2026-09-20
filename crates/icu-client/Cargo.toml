@@ -15,7 +15,7 @@ name = "icu"
 path = "src/main.rs"
 
 [features]
-default = ["aec", "gui"]
+default = ["aec", "gui", "tray"]
 # AEC3 via webrtc-audio-processing (bundled). Needs meson, ninja, clang,
 # abseil headers and the rust-objcopy symlink (Client/IMPLEMENTATION.md §12).
 aec = ["dep:webrtc-audio-processing", "dep:webrtc-audio-processing-config"]
