@@ -1,0 +1,65 @@
+#!/bin/sh
+# Checkmk local check for the ICU voice server.
+#
+# Install as /usr/lib/check_mk_agent/local/icu_server (mode 0755). The agent
+# user needs read/write access to /run/icu/admin.sock, i.e. membership in the
+# group from `server.admin_socket_group`.
+#
+# Output format: <status> <item> <metrics> <text>
+# 0 = OK, 1 = WARN, 2 = CRIT, 3 = UNKNOWN.
+
+BIN=${ICU_SERVER_BIN:-/usr/local/bin/icu-server}
+CONFIG=${ICU_SERVER_CONFIG:-/etc/icu/server.toml}
+SOCKET=${ICU_ADMIN_SOCKET:-/run/icu/admin.sock}
+
+if [ ! -x "$BIN" ]; then
+    echo "3 ICU_Server - icu-server binary not found at $BIN"
+    exit 0
+fi
+
+# Without the admin socket there is no running server. `status` would still
+# succeed by reading the state files directly (the CLI fallback of §5), and
+# report an uptime of 0 — which is exactly the wrong answer for monitoring.
+if [ ! -S "$SOCKET" ]; then
+    echo "2 ICU_Server - no admin socket at $SOCKET, the server is not running"
+    exit 0
+fi
+
+JSON=$("$BIN" status --config "$CONFIG" --json 2>&1)
+if [ $? -ne 0 ] || [ -z "$JSON" ]; then
+    echo "2 ICU_Server - icu-server is not reachable: $(echo "$JSON" | head -1)"
+    exit 0
+fi
+
+# Small JSON fields, read without a JSON parser: the values are plain integers.
+field() {
+    echo "$JSON" | sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p" | head -1
+}
+nested() {
+    echo "$JSON" | sed -n "s/.*\"$1\":{\([^}]*\)}.*/\1/p" | head -1 |
+        sed -n "s/.*\"$2\":\([0-9]*\).*/\1/p" | head -1
+}
+
+ONLINE=$(field online)
+MAX=$(field max_users)
+UPTIME=$(field uptime_s)
+CONNECTIONS=$(field connections)
+IN=$(nested relay datagrams_in)
+OUT=$(nested relay datagrams_out)
+
+[ -n "$ONLINE" ] || ONLINE=0
+[ -n "$MAX" ] || MAX=0
+[ -n "$UPTIME" ] || UPTIME=0
+[ -n "$CONNECTIONS" ] || CONNECTIONS=0
+[ -n "$IN" ] || IN=0
+[ -n "$OUT" ] || OUT=0
+
+# WARN when the room is full: nobody else can join.
+STATUS=0
+TEXT="up ${UPTIME}s, ${ONLINE}/${MAX} online, ${CONNECTIONS} connections, relay ${IN} in / ${OUT} out"
+if [ "$MAX" -gt 0 ] && [ "$ONLINE" -ge "$MAX" ]; then
+    STATUS=1
+    TEXT="room is full — $TEXT"
+fi
+
+echo "$STATUS ICU_Server online=$ONLINE;;;0;$MAX|uptime=$UPTIME|connections=$CONNECTIONS|datagrams_in=$IN|datagrams_out=$OUT $TEXT"

@@ -1,0 +1,36 @@
+[Unit]
+Description=ICU voice server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/icu-server run --config /etc/icu/server.toml
+DynamicUser=yes
+# The admin socket is chgrp'ed to `server.admin_socket_group`. Changing only
+# the group of a file one owns needs no capability as long as the process is a
+# member of the target group, which is what SupplementaryGroups provides — the
+# empty CapabilityBoundingSet below rules out CAP_CHOWN.
+SupplementaryGroups=icu
+StateDirectory=icu
+RuntimeDirectory=icu
+RuntimeDirectoryMode=0750
+ConfigurationDirectory=icu
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+Restart=on-failure
+RestartSec=2
+
+# For a port below 1024, drop the empty CapabilityBoundingSet and add:
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

@@ -327,3 +327,39 @@ Algorithmische Verzögerung: **0 Samples = 0,00 ms**.
 **Spike 6: PASS.** `webrtc-audio-processing` 2.1.0 baut nativ auf Fedora 43 (mit objcopy-Workaround), erreicht 34–39 dB ERLE bei 0,47 % eines Kerns und 8,96 ms algorithmischer Verzögerung, ist gegen falsche Delay-Angaben, wechselnde Echopfade und langsamen Clock-Drift (100 ppm über 10 min: −0,4 dB) unempfindlich, und schlägt Speex in jeder gemessenen Qualitätsdimension bei halbem CPU-Verbrauch. Zwei Einschränkungen: der Windows-Cross-Build funktioniert nicht, und ohne Systemmix-Referenz fällt die ERLE von 38,8 auf 7,7 dB.
 
 Entscheidung und Design in `Research/aec.md`. Offene Punkte dort unter A1–A12; A1 (Windows-Build) ist blockierend.
+
+## Spike 7: Server-Lasttest
+
+Nachgetragen am 2026-09-20 bei der Implementierung des Servers (M3/M5). Angehängt, ohne die Abschnitte davor zu verändern — die Tabelle unter „Zusammenfassung" führt Spike 6 und 7 daher noch nicht. Quellcode ist kein Wegwerf-Spike mehr, sondern der Test `crates/icu-server/tests/load.rs` (`#[ignore]`), gestartet mit
+
+```
+ICU_LOAD_SECONDS=60 cargo test --release -p icu-server --test load -- --ignored --nocapture datagram_load
+```
+
+Stack: quinn 0.11.12, rustls 0.23.45 (ring 0.17.14), rcgen 0.14.10, postcard 1.1.3, tokio 1.53.1 — also genau der in Spike 2/2b belegte Satz. Release-Profil (`lto = "fat"`, `codegen-units = 1`). Aufbau: ein Server und 16 Clients **im selben Prozess** auf 127.0.0.1:0, jeder Client sendet 50 Audio-Datagrams/s à 90 Byte (10 B Header + 80 B Nutzlast, wie ein Opus-Frame bei 48 kbit/s), der Server relayt jedes an die übrigen 15. Latenz ist die Zeit vom `send_datagram` des Senders bis zum `read_datagram` des Empfängers, gemessen über eine gemeinsame `Instant`-Uhr im selben Prozess; sie enthält Loopback-UDP zweimal, den Relay und die tokio-Zustellung.
+
+| Messung | 10 s | 60 s |
+| --- | --- | --- |
+| Datagrams rein | 8 016 | 48 016 |
+| Datagrams raus | 120 240 | 720 240 |
+| erwartet raus (rein × 15) | 120 240 | 720 240 |
+| verworfen (Rate/Format) | 0 | 0 |
+| Sendefehler (`SendDatagramError`) | 0 | 0 |
+| Relay-Latenz p50 | 0,259 ms | 0,275 ms |
+| Relay-Latenz p99 | 0,372 ms | 0,541 ms |
+| Relay-Latenz max | 0,495 ms | 3,594 ms |
+| CPU (Server **und** 16 Clients) | 0,65 s = 6,5 % eines Kerns | 4,42 s = 7,4 % eines Kerns |
+
+Bewertung gegen die Vorgabe aus `Server/IMPLEMENTATION.md` §10 („keine Verluste auf Loopback, CPU < 10 % eines Kerns, Datagram-Roundtrip p99 < 1 ms"): **PASS** in allen drei Punkten, mit Reserve. Der CPU-Wert ist eine Obergrenze — er enthält die 16 Testclients, die selbst verschlüsseln, entschlüsseln und 720 240 Datagrams lesen; der Serveranteil daran ist deutlich kleiner, aber in diesem Aufbau nicht trennbar. Kein einziges Datagram ging verloren: `datagrams_out` ist exakt das 15-fache von `datagrams_in`, und die Clients haben genau so viele gelesen.
+
+Weitere Befunde aus der Implementierung:
+
+| Punkt | Befund |
+| --- | --- |
+| In-place-`speaker`-Write ohne Kopie bei 16 Empfängern (offener Messpunkt aus `PROTOCOL.md` §9) | **Bestätigt.** `Bytes::try_into_mut()` liefert direkt nach `read_datagram` den alleinigen Besitz, die zwei Speaker-Bytes werden ohne Kopie überschrieben, danach geht pro Empfänger nur ein `Bytes`-Clone (Refcount) raus. Bei 15 Empfängern und 60 s sind das 0 zusätzliche Nutzlast-Kopien. |
+| Dual-Stack-Bind (`PROTOCOL.md` §1) | Zwei Endpoints auf demselben Port brauchen `IPV6_V6ONLY` auf dem v6-Socket; ohne das scheitert das Default-`listen = ["0.0.0.0:4711", "[::]:4711"]` unter Linux mit EADDRINUSE. quinns `Endpoint::server` setzt die Option nicht, also wird der Socket mit socket2 gebaut und per `Endpoint::new` übergeben. Verifiziert: `ss -lunp` zeigt beide Sockets auf Port 47111. |
+| `close()` verwirft unbestätigte Stream-Daten | Beim Enrollment gehen Antwort **und** Fehlermeldung verloren, wenn direkt nach `finish()` geschlossen wird. Nötig ist ein `stopped()` mit Timeout davor (A5: `finish()` ist in quinn 0.11 synchron und heißt nicht „zugestellt"). Betrifft auch `Error(RATE_LIMITED)` unmittelbar vor `close(RATE_LIMITED_FATAL)`: die Meldung kommt dann nicht mehr an, der Close-Code schon. |
+| musl-Static-Build (offener Punkt aus `cross-compile.md`) | **PASS** über den Container, ohne rustup auf dem Host: `podman run --rm -e CARGO_TARGET_DIR=/src/target/musl -v "$PWD":/src:Z -w /src docker.io/rust:1-alpine sh -c 'apk add --no-cache musl-dev && cargo build --release -p icu-server --target x86_64-unknown-linux-musl'`. Ergebnis 4 602 368 B, `file` meldet `static-pie linked`, `ldd` meldet `statically linked`, das Binary läuft auf dem Fedora-Host. rustls/ring brauchen auf Alpine nur `musl-dev`. |
+| Unix-Socket-Pfadlänge | `/run/icu/admin.sock` ist unkritisch, aber ein Pfad ≥ 108 Byte (`SUN_LEN`) lässt den Admin-Socket scheitern. Der Server läuft dann weiter und warnt; die CLI fällt auf den Dateipfad zurück und bricht dort korrekt an `flock` ab. |
+
+Nicht geprüft: echtes Netz statt Loopback, mehr als 16 gleichzeitige Sprecher, Video-Relay unter Last, `tc netem` (der Test `netem` in derselben Datei ist `#[ignore]` und braucht root für `tc qdisc add dev lo`), Keepalive über 10 min Stille (Test `keepalive_holds_over_ten_minutes_of_silence`, ebenfalls `#[ignore]`), Verhalten über Consumer-NAT.
