@@ -60,6 +60,7 @@ Tabelle „Feature | v1 | Grund". „Perfekt" = das Kriterium in der Grund-Spalt
 | Eigene Input-/Output-Device-Wahl | ja | Geräteliste live (Hot-Plug: neues Gerät erscheint, entferntes Gerät fällt ohne Absturz auf Default zurück); Auswahl persistent per Gerätename; Wechsel ohne Reconnect; Default-Gerät des Systems als Option „System-Standard". |
 | Input-Pegel-Anzeige | ja | Peak/RMS-Meter ≥ 30 Hz Aktualisierung, mit eingezeichneter VAD-Schwelle und Clipping-Markierung; sichtbar im Hauptfenster und im Settings-Dialog; Loopback-Test (eigene Stimme lokal hören) als Teil davon. |
 | Rauschunterdrückung | ja (Attribut Audio) | RNNoise (nnnoiseless) standardmäßig an, abschaltbar; kein weiteres Verfahren. Mumble bietet Speex/RNNoise/Both — ICU nur RNNoise. |
+| Echo Cancellation | ja (**Revidiert 2026-09-20 (AEC)**) | WebRTC AEC3 (`webrtc-audio-processing` ~2.1) als erste Stufe der Capture-Kette, vor der Rauschunterdrückung; Default an, ein Schalter im Settings-Dialog. „Perfekt“ heißt: eingeschwungene **ERLE ≥ 30 dB** im Single-Talk, **≥ 25 dB** in den Sprechpausen während Double-Talk, **≥ 30 dB nach 10 min** bei 100 ppm Gerätedrift, und das **auch neben einem laufenden Spiel** — dafür ist das Referenzsignal der komplette Systemmix (Linux: Sink-Monitor über `stream.capture.sink`; Windows: WASAPI-Loopback, Pfad offen), nicht nur die eigene Wiedergabe. Preis: 8,96 ms Sendelatenz, 0,47 % eines Kerns. Mumble bietet Disabled/Mixed/Multichannel — ICU hat nur an/aus, weil die Kanalwahl aus dem Backend folgt. Belege in `aec.md`. |
 | Jitter-Puffer / Playout | ja (Attribut Audio) | Adaptiver Jitter-Puffer mit Opus-PLC/FEC; Zielwert Playout-Delay im LAN-nahen Fall ≤ 40 ms, Messwerte in Step 3. Unsichtbar für den Nutzer, kein Einstellknopf. |
 | Kamera an/aus | ja | Ein Toggle (Hotkey-fähig); feste kleine Auflösung/Framerate (Vorschlag 320×240 @ 15 fps, final im Codec-Dokument); Vorschau vor dem Einschalten; Voice-Latenz und -Qualität messbar unverändert, ob Kamera an oder aus (separater Stream/Datagramm-Priorität). |
 | Overlay an/aus mit Position | ja | Nur für Borderless-Windowed-Spiele: eigenes transparentes Always-on-top-Fenster, click-through, zeigt sprechende Teilnehmer (Name + Kamerabild, falls an); Position: vier Ecken + Offset, per Drag im Bearbeitungsmodus; Linux: Wayland layer-shell auf KDE/wlroots, GNOME dokumentiert nicht unterstützt (Overview-Record). Kein Hooking. |
@@ -88,7 +89,7 @@ Tabelle „Feature | v1 | Grund". „Perfekt" = das Kriterium in der Grund-Spalt
 | Mobile | nein | README-Nicht-Ziel; Hintergrundaudio/Push auf Mobilplattformen ist eigener Aufwand. |
 | Server-Mixing | nein | Server bleibt Relay ohne Decoding (Overview-Record, SFU); Mixing würde Server-CPU, Latenz und Schlüsselmaterial für Audio auf den Server bringen. |
 | Rollen-Admin-UI | nein | Admin = CLI auf dem Server (Zertifikate ausstellen/widerrufen, Kick = Widerruf); keine Admin-Rolle im Protokoll. |
-| Echo Cancellation | nein | Annahme Headset-Nutzung in einer Gaming-Gruppe; AEC ist DSP-Aufwand mit Qualitätsrisiko. Wird ein Lautsprecher-Nutzer nachgewiesen, ist es v2. |
+| ~~Echo Cancellation~~ | **ja, siehe „Enthalten“** | **Revidiert 2026-09-20 (AEC).** Die Headset-Annahme ist vom Auftraggeber gekippt worden. Begründung, Kandidatenvergleich und Messungen in `aec.md`. |
 | Attenuation anderer Apps beim Sprechen | nein | Systemweite Lautstärkeeingriffe (Ducking) sind plattformspezifisch und überraschend; Spiel-Lautstärke regelt das OS. |
 | Idle-Auto-Mute/Deafen | nein | Mit PTT irrelevant, mit VAD wird Stille ohnehin nicht gesendet. |
 | Text-to-Speech, Avatare, Themes, Fonts | nein | Kosmetik bzw. Barrierefreiheitsfeature ohne Nachfrage in der Gruppe; Themes folgen dem System (hell/dunkel). |
@@ -110,7 +111,9 @@ Tabelle „Feature | v1 | Grund". „Perfekt" = das Kriterium in der Grund-Spalt
 
 ## Verworfen, mit Grund
 
-Siehe Tabellen „Ausdrücklich abgelehnt" und „Grauzone": Channels, Rechte/Rollen, Text-Chat, Server-Browser, Dateitransfer, Bots/Plugins, Soundboard, Musik-Bot, Aufzeichnung, Screen-Share, Spatial Audio, Web-Client, Mobile, Server-Mixing, Rollen-Admin-UI, Echo Cancellation, App-Attenuation, Idle-Auto-Mute, TTS/Avatare/Themes, Zertifikats-UI, Overlay-Extras, Whisper, Priority Speaker, Server-Passwort, mobiler Push, AGC. Gemeinsamer Nenner: jedes davon führt entweder Hierarchie (Channels, Rollen, Priority, Whisper), ein zweites Produkt (Chat, Dateien, Screen-Share, Musik, Aufzeichnung) oder plattformspezifische Systemeingriffe (Ducking, AEC, Hooking) ein, ohne dass die feste Gruppe es braucht.
+Siehe Tabellen „Ausdrücklich abgelehnt" und „Grauzone": Channels, Rechte/Rollen, Text-Chat, Server-Browser, Dateitransfer, Bots/Plugins, Soundboard, Musik-Bot, Aufzeichnung, Screen-Share, Spatial Audio, Web-Client, Mobile, Server-Mixing, Rollen-Admin-UI, App-Attenuation, Idle-Auto-Mute, TTS/Avatare/Themes, Zertifikats-UI, Overlay-Extras, Whisper, Priority Speaker, Server-Passwort, mobiler Push, AGC. Gemeinsamer Nenner: jedes davon führt entweder Hierarchie (Channels, Rollen, Priority, Whisper), ein zweites Produkt (Chat, Dateien, Screen-Share, Musik, Aufzeichnung) oder plattformspezifische Systemeingriffe (Ducking, Hooking) ein, ohne dass die feste Gruppe es braucht.
+
+**Revidiert 2026-09-20 (AEC):** Echo Cancellation steht nicht mehr in dieser Liste. Sie ist jetzt enthalten — und zwar ausdrücklich **ohne** den plattformspezifischen Systemeingriff, der sie ursprünglich mit disqualifiziert hat: ICU nutzt gerade **nicht** die OS-AEC über `AudioCategory_Communications`, weil die als Nebenwirkung alle anderen Streams um standardmäßig 80 % dämpfen würde. Das Ducking bleibt abgelehnt, das AEC nicht. Siehe `aec.md`.
 
 ## Offene Punkte für Step 3
 
@@ -122,7 +125,7 @@ Siehe Tabellen „Ausdrücklich abgelehnt" und „Grauzone": Channels, Rechte/Ro
 6. Hot-Plug-Verhalten von cpal auf beiden Plattformen (Gerät ziehen während des Streams).
 7. Kamera-Stream darf Voice nicht beeinflussen: Voice-Latenz und Paketverlust mit und ohne Kamera messen.
 8. Whisper/Priority-Speaker-Beschreibung gegen erreichbare Mumble-Doku nachziehen, falls die Seiten wieder verfügbar sind (aktuell Redirect auf Doku-Index).
-9. Bedarf an Echo Cancellation in der Gruppe abfragen (Headset-Annahme verifizieren).
+9. ~~Bedarf an Echo Cancellation in der Gruppe abfragen (Headset-Annahme verifizieren).~~ **Erledigt 2026-09-20 (AEC)**: vom Auftraggeber entschieden, AEC ist verbindlich. Die verbleibenden Prüfungen stehen als A1–A12 in `aec.md`; A1 (Windows-Build-Pfad) ist blockierend.
 
 ## Verified against
 

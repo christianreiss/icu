@@ -1,0 +1,15 @@
+[package]
+name = "spike-aec"
+version = "0.1.0"
+edition = "2021"
+
+# Eigenständiges Wegwerf-Projekt: leere [workspace]-Tabelle, damit ein späterer
+# Root-Workspace dieses Verzeichnis nicht einsammelt.
+[workspace]
+
+[dependencies]
+webrtc-audio-processing = { version = "2.1", features = ["bundled"] }
+webrtc-audio-processing-config = "2.1"
+
+[profile.release]
+debug = true

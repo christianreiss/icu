@@ -158,7 +158,172 @@ Nicht geprüft: MSMF (Windows), 15 fps unter Tageslicht, Decoder-Seite, Latenz K
 | 4a PTT-Hotkey | evdev PASS, Portal OFFEN (interaktiv nötig) |
 | 4b Overlay Layer-Shell | PASS (KWin 6.7.5, Screenshot) |
 | 5 Kamera + H.264 | PASS mit Einschränkung (Kamera lichtbedingt 4–6 fps) |
+| 6 Echo Cancellation (AEC3 vs. Speex, offline) | PASS (AEC3: ERLE 37 dB, 47 µs/Frame, +9 ms; Cross-Build nach Windows-gnu FAIL, siehe `aec.md` A1) |
 
 ## Nicht von diesem Host verifizierbar
 
 Windows-Audio (WASAPI), Windows-Overlay, Windows-Hotkeys. Wine ist nur Smoke-Test für Start und Netz. Braucht echte Windows-Hardware in einem späteren Schritt.
+
+## Spike 6: Echo Cancellation
+
+Nachgetragen am 2026-09-20, nachdem die Headset-Annahme aus `audio-io.md` und `feature-freeze.md` gekippt wurde und AEC für Lautsprecher-Nutzer verbindlich geworden ist. Vollständige Recherche, Entscheidung und alle Belege in `Research/aec.md`; Quellcode in `Research/spikes/spike-aec/` (`cargo run --release` für WebRTC, `cargo run --release --bin speex` für Speex). Angehängt, ohne die Abschnitte davor zu verändern — die Tabelle unter „Zusammenfassung" führt Spike 6 daher noch nicht.
+
+### Host-Befunde (read-only, 2026-09-20)
+
+| Prüfung | Ergebnis |
+| --- | --- |
+| `pactl list modules short \| grep -i echo` | keine Treffer — kein Echo-Cancel-Modul geladen |
+| `pw-cli ls Node \| grep -i echo` | keine Treffer — keine Echo-Cancel-Nodes im Graph |
+| `/usr/lib64/pipewire-0.3/libpipewire-module-echo-cancel.so` | vorhanden (94 512 B), aus `pipewire-libs-1.4.11-1.fc43` |
+| SPA-Backends `/usr/lib64/spa-0.2/aec/` | `libspa-aec-webrtc.so` **und** `libspa-aec-null.so` vorhanden, ebenfalls aus `pipewire-libs` |
+| Welche APM-Generation nutzt das PipeWire-Backend? | `ldd libspa-aec-webrtc.so` → `libwebrtc-audio-processing-1.so.3`, also **APM 1.3**, nicht die vom Crate gebündelte 2.1 |
+| PipeWire-Version | **1.4.11** (`pipewire --version`, Paket `pipewire-1.4.11-1.fc43`) |
+| Fedora-Paketlage | `webrtc-audio-processing` 1.3 installiert (Abhängigkeit von `pipewire-libs`), `webrtc-audio-processing0.3` 0.3.1 verfügbar. **Kein Paket `webrtc-audio-processing-2`** → das Crate 2.x kann nicht dynamisch gegen ein Systempaket linken, `bundled` ist Pflicht. |
+
+Der laufende Graph wurde bewusst nicht verändert (kein `pw-cli load-module`); ob das als unprivilegierter User zur Laufzeit funktioniert, bleibt offen.
+
+### Installierte Pakete für diesen Spike
+
+`sudo dnf -y install meson abseil-cpp-devel speexdsp-devel` → installiert: **meson** 1.8.5-3.fc43, **abseil-cpp-devel** 20250814.2-2.fc43, **speexdsp-devel** 1.2.1-9.fc43, als Abhängigkeiten **abseil-cpp-testing** 20250814.2-2.fc43, **gmock** 1.15.2-4.fc43, **gtest** 1.15.2-4.fc43. Bereits vorhanden und nicht nachinstalliert: `ninja-build` 1.13.1, `clang` 21.1.8, `llvm` 21.1.8, `binutils` 2.45.1, `pkgconf-pkg-config` 2.3.0, `mingw64-gcc(-c++)` 15.2.1.
+
+Zusätzliche Host-Änderung (kein Paket): `sudo mkdir -p /usr/lib/rustlib/x86_64-unknown-linux-gnu/bin && sudo ln -sfn /usr/bin/llvm-objcopy /usr/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-objcopy` (rustc meldet `/usr` als Sysroot; GNU- und LLVM-objcopy beherrschen beide `--redefine-sym` und `@file`). Rückgängig mit `sudo rm /usr/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-objcopy`.
+
+### Build-Gate `webrtc-audio-processing` 2.1.0 (`bundled`) — **PASS mit Workaround**
+
+| Prüfung | Ergebnis |
+| --- | --- |
+| Target `x86_64-unknown-linux-gnu` | **PASS** nach `meson` + `abseil-cpp-devel` + objcopy-Symlink |
+| Erster Versuch ohne Symlink | **FAIL**: `rust-objcopy not found at "/usr/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-objcopy"`, danach `Error: Failed to execute … No such file or directory (os error 2)`. `build.rs::determine_objcopy_path()` baut diesen Pfad hart und bietet **keine** Env-Variable zum Überschreiben. Fedoras `rust`-Paket liefert die Komponente nicht (kein rustup, kein `llvm-tools`). |
+| Bundled-Quellen | im veröffentlichten `.crate` enthalten (5,3 MB, `meson.build` meldet `version : '2.1'`) — der README-Satz über das Git-Submodul gilt nur fürs Repo. meson+ninja bauen die Bibliothek, danach werden 3 827 Symbole mit `v2_` präfixt. |
+| Target `x86_64-pc-windows-gnu` | **FAIL, strukturell.** Abbruch bei `src/wrapper.cpp`: `fatal error: absl/base/config.h: No such file or directory` (Include-Pfad zeigt auf das nie entpackte meson-Subproject `subprojects/abseil-cpp-20240722.0`; vorhanden ist nur `abseil-cpp.wrap`). Ursache tiefer: `build.rs` ruft `meson setup` **ohne `--cross-file`** — die im Windows-Target-Verzeichnis erzeugte `libwebrtc-audio-processing-2.a` (54 MB) enthält **ELF-x86-64-Objekte** (`file` auf `aec3_adaptive_fir_filter_avx2.cc.o`: „ELF 64-bit LSB relocatable, x86-64"). Selbst mit korrigiertem Include-Pfad würde der Link scheitern. |
+
+Konsequenz: Der Windows-Build von ICU braucht einen `build.rs`-Patch (meson-Cross-File + mingw-abseil), einen nativen Windows-Build-Host oder den OS-AEC-Pfad. Abweichung vom Cross-Only-Rezept aus `cross-compile.md`, vor der Implementierung zu entscheiden.
+
+### Messaufbau
+
+48 kHz mono, 10-ms-Frames (480 Samples), 10 s je Lauf, offline ohne Mikrofon. Far-End und Near-End sind unabhängig erzeugte sprachähnliche Signale (gefärbtes Rauschen, zwei Formant-Resonatoren, silbenartige Hüllkurve 3,3 bzw. 2,7 Hz, Satzpausen) — bewusst kein weißes Rauschen, das einen adaptiven Filter unrealistisch schnell konvergieren ließe. Echopfad: Direktschall nach *D* ms mit ERL ≈ 6 dB plus 80 ms abklingende Nachhall-IR, optional Soft-Clipping als Lautsprecher-Nichtlinearität, optional Clock-Drift per Resampling. Mikrofonrauschen −50 dBFS. Zeitplan: 0–4 s nur Far-End, 4–7 s Double-Talk, 7–10 s nur Far-End. Reihenfolge je Tick: Render-Frame, dann Capture-Frame. Double-Talk-Metriken sind um die gemessene algorithmische Verzögerung ausgerichtet.
+
+**Vorbehalt 1**: Das Rauschen bei −50 dBFS deckelt die messbare ERLE auf ≈ 42 dB. Werte um 39 dB bedeuten „Restecho am Rauschteppich", nicht „genau 39 dB". **Vorbehalt 2**: Das synthetische Near-End ist rauschähnlich; für die Bewertung des Spracherhalts im Double-Talk braucht es echte Sprachaufnahmen (offener Punkt A3 in `aec.md`).
+
+### Ergebnisse WebRTC AEC3
+
+| Messung | Ergebnis |
+| --- | --- |
+| Algorithmische Verzögerung (Impuls, Render still) | **430 Samples = 8,96 ms** (Spitze 0,446 von 0,500) |
+| ERLE Single-Talk eingeschwungen (linear, *D* = 80 ms) | **39,3 dB** (2–4 s) / **36,8 dB** (8–10 s) |
+| Konvergenz (ERLE je Sekunde) | 37,5 · 35,4 · 38,2 · 40,6 · 4,1 (DT) · 10,8 · 21,7 · 30,4 · 41,5 · 31,5 |
+| CPU je 10-ms-Frame | capture mean **43 µs** (p99 61), render mean **4 µs** (p99 6) → **47 µs = 0,47 % eines Kerns** |
+| Double-Talk, Near-End-Pausen | ERLE **31,7 dB** (unbearbeitet 0,0 dB) |
+| Double-Talk, Near-End aktiv | SI-SDR 0,6 dB gegen Baseline (dasselbe APM ohne Far-End), Korrelation 0,536; rohes Mikrofon 7,2 dB / 0,709 |
+| Delay-Sprung 80 → 140 ms bei *t* = 5 s | ERLE fällt auf 10,1 dB, ist nach **rund 1 s** wieder bei 38,6 dB |
+
+Lautsprecher-Nichtlinearität (Soft-Clipping):
+
+| drive | ERLE 2–4 s | ERLE 8–10 s | DT-Pausen-ERLE |
+| --- | --- | --- | --- |
+| 0 (linear) | 39,3 dB | 36,8 dB | 31,7 dB |
+| 2 | 38,6 dB | 36,0 dB | 31,5 dB |
+| 5 | 35,3 dB | 34,3 dB | 31,5 dB |
+| 10 | 18,1 dB | 31,1 dB | 28,9 dB |
+
+`set_stream_delay_ms` bei AEC3 Full, wahres Delay 80 ms — **wirkungslos**:
+
+| stream_delay_ms | None | 0 | 50 | 80 | 110 | 200 |
+| --- | --- | --- | --- | --- | --- | --- |
+| ERLE 2–4 s | 39,3 | 39,3 | 39,5 | 39,2 | 39,6 | 39,3 dB |
+| ERLE 8–10 s | 36,8 | 36,9 | 36,7 | 36,8 | 36,9 | 36,9 dB |
+
+Ursache im Upstream-Quelltext belegt: `echo_canceller3_config.h` hat `use_external_delay_estimator = false` als Default, und `block_processor.cc` nutzt den extern gesetzten Delay nur, wenn dieses Flag gesetzt ist. Gegenprobe mit `EchoCanceller::Mobile` (AECM), wo der Parameter Pflicht ist — dort wirkt er sehr wohl, der Wert kommt also an:
+
+| stream_delay_ms (AECM) | 0 | 50 | 80 | 110 | 200 |
+| --- | --- | --- | --- | --- | --- |
+| ERLE 2–4 s | 42,6 | 44,9 | 32,0 | 24,3 | 23,6 dB |
+| ERLE 8–10 s | 43,9 | 44,4 | 39,4 | 35,9 | 26,4 dB |
+
+Wahres Echopfad-Delay (AEC3, auto) — flach über den ganzen Bereich:
+
+| wahres Delay | 40 ms | 80 ms | 120 ms | 200 ms | 400 ms |
+| --- | --- | --- | --- | --- | --- |
+| ERLE 8–10 s | 36,5 | 36,8 | 37,0 | 36,5 | 37,5 dB |
+
+Clock-Drift zwischen Capture- und Playback-Uhr, 10-s-Lauf:
+
+| Drift | 0 ppm | 10 ppm | 100 ppm | 1 000 ppm | 5 000 ppm |
+| --- | --- | --- | --- | --- | --- |
+| ERLE 8–10 s, linear | 36,8 | 37,0 | 36,9 | 35,9 | **10,9** dB |
+| ERLE 8–10 s, drive 5 | 34,3 | 34,3 | 34,0 | 33,2 | **11,3** dB |
+
+Diese Tabelle allein ist irreführend und wurde deshalb nachgemessen: 100 ppm ergeben in 10 s nur **48 Samples** Schlupf, weniger als ein AEC3-Block (64 Samples bei 16 kHz Bandrate, 192 bei 48 kHz). In diesem Lauf findet also gar keine Neuausrichtung statt — „kein Verlust" ist trivial wahr. Langer Lauf ohne Double-Talk, drive 5:
+
+| Drift | Dauer | Schlupf am Ende | ERLE 2–10 s | ERLE letzte 10 s |
+| --- | --- | --- | --- | --- |
+| 0 ppm | 60 s | 0 Samples / 0,0 ms | 34,2 dB | 34,7 dB |
+| 100 ppm | 60 s | 288 Samples / 6,0 ms | 34,1 dB | 34,3 dB |
+| 500 ppm | 60 s | 1 440 Samples / 30,0 ms | 33,7 dB | **17,4 dB** |
+| 1 000 ppm | 60 s | **2 880 Samples / 60,0 ms** | 17,7 dB | **8,0 dB** |
+| 100 ppm | 300 s | 1 440 Samples / 30,0 ms | 34,1 dB | 34,2 dB |
+| 100 ppm | 600 s | **2 880 Samples / 60,0 ms** | 34,1 dB | **33,8 dB** |
+| 20 ppm | 600 s | 576 Samples / 12,0 ms | 34,3 dB | 34,6 dB |
+
+Die beiden fett gesetzten Schlupf-Zeilen sind identisch (2 880 Samples) und unterscheiden sich um **26 dB**. **Entscheidend ist die Driftrate, nicht der aufsummierte Schlupf:** AEC3 richtet laufend nach und folgt langsamem Drift zeitlich unbegrenzt, bei schnellem Drift überholt der Schlupf die Nachführung. Die Grenze liegt zwischen 100 und 500 ppm. Für das Design heißt das: die Windows-Loopback-Referenz (eigener Geräteclock) ist tragfähig, solange der reale Gerätedrift unter ~100 ppm bleibt — nachzumessen auf echter Hardware (A6 in `aec.md`).
+
+APM-Kombinationen (Szene mit drive 5):
+
+| Konfiguration | ERLE 8–10 s | DT SI-SDR vs. Baseline | DT-Pausen-ERLE | CPU je 10 ms |
+| --- | --- | --- | --- | --- |
+| AEC allein | 34,3 dB | 0,7 dB | 31,5 dB | 46 µs (0,46 % Kern) |
+| AEC + HPF + NS | 41,0 dB | 6,2 dB | 28,1 dB | 53 µs (0,53 % Kern) |
+| AEC + HPF + NS + AGC2 | 41,0 dB | 6,2 dB | 28,1 dB | 54 µs (0,54 % Kern) |
+
+**Die produktentscheidende Messung.** Das Mikrofon hört Voice-Echo *und* Spielton aus demselben Lautsprecher; die Referenz kennt einmal nur die eigene Wiedergabe, einmal den Systemmix:
+
+| Referenzsignal | ERLE 2–4 s | ERLE 8–10 s |
+| --- | --- | --- |
+| nur eigener Voice-Playback | **8,7 dB** | **7,7 dB** |
+| Systemmix (Voice + Spielton) | **40,9 dB** | **38,8 dB** |
+
+Ein In-Process-AEC sieht per Konstruktion nur den eigenen Render-Stream. Für ein Voice-Tool neben einem Spiel ist Loopback-Capture des Systemmix (WASAPI Loopback bzw. PipeWire-Monitor) damit **keine Option, sondern Voraussetzung**.
+
+### Ergebnisse Speex-AEC (Spike 6b, libspeexdsp 1.2.1, identische Signale)
+
+Kein gepflegtes Rust-Binding vorhanden (`speexdsp-sys` 0.1.2 von 2018, `speexdsp` 0.1.2 von 2022), deshalb vier handgeschriebene `extern "C"`-Deklarationen gegen die Systembibliothek.
+
+Algorithmische Verzögerung: **0 Samples = 0,00 ms**.
+
+| filter_length | ERLE 2–4 s | ERLE 8–10 s | DT-Pausen-ERLE | CPU/Frame |
+| --- | --- | --- | --- | --- |
+| 100 ms | 26,6 dB | 29,2 dB | 26,9 dB | 56 µs |
+| 200 ms | 27,1 dB | 32,1 dB | 28,8 dB | 75 µs |
+| 300 ms | 24,5 dB | 30,8 dB | 27,8 dB | 93 µs |
+| 500 ms | 23,4 dB | 25,2 dB | 23,5 dB | 128 µs |
+
+| Szenario (Frame 10 ms, filter 300 ms) | ERLE 2–4 s | ERLE 8–10 s |
+| --- | --- | --- |
+| linear, kein Drift | 24,5 dB | 30,8 dB |
+| drive 5 | 25,0 dB | 27,8 dB |
+| drive 10 | 23,7 dB | 25,1 dB |
+| Drift 100 ppm | 22,8 dB | **20,1 dB** |
+| Drift 1 000 ppm | 19,5 dB | 20,4 dB |
+| Drift 5 000 ppm | 19,7 dB | 20,2 dB |
+
+| wahres Delay | 40 ms | 80 ms | 120 ms | 200 ms | 400 ms |
+| --- | --- | --- | --- | --- | --- |
+| ERLE 8–10 s | 32,3 | 30,8 | **24,2** | 25,4 | **20,6** dB |
+
+### Direktvergleich und Ergebnis
+
+| Kriterium | WebRTC AEC3 2.1.0 | Speex MDF 1.2.1 |
+| --- | --- | --- |
+| ERLE eingeschwungen, linear, 80 ms | **36,8 dB** | 30,8 dB |
+| ERLE bei starker Lautsprecherverzerrung | **31,1 dB** | 25,1 dB |
+| ERLE bei 120 ms Echopfad | **37,0 dB** | 24,2 dB |
+| ERLE bei 100 ppm Clock-Drift (10 s) | **36,9 dB** | 20,1 dB |
+| ERLE bei 100 ppm Clock-Drift nach 600 s | **33,8 dB** | nicht gemessen |
+| CPU je 10-ms-Frame | **47 µs** | 93 µs |
+| Algorithmische Verzögerung | 8,96 ms | **0,00 ms** |
+| Rust-Binding gepflegt | ja (2026-05) | nein (2018/2022) |
+| Cross nach Windows-gnu | nein (struktureller Crate-Mangel) | ungetestet |
+
+**Spike 6: PASS.** `webrtc-audio-processing` 2.1.0 baut nativ auf Fedora 43 (mit objcopy-Workaround), erreicht 34–39 dB ERLE bei 0,47 % eines Kerns und 8,96 ms algorithmischer Verzögerung, ist gegen falsche Delay-Angaben, wechselnde Echopfade und langsamen Clock-Drift (100 ppm über 10 min: −0,4 dB) unempfindlich, und schlägt Speex in jeder gemessenen Qualitätsdimension bei halbem CPU-Verbrauch. Zwei Einschränkungen: der Windows-Cross-Build funktioniert nicht, und ohne Systemmix-Referenz fällt die ERLE von 38,8 auf 7,7 dB.
+
+Entscheidung und Design in `Research/aec.md`. Offene Punkte dort unter A1–A12; A1 (Windows-Build) ist blockierend.

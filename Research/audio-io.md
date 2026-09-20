@@ -14,7 +14,8 @@ Welcher Audio-Pfad liefert auf Windows (WASAPI shared vs. exclusive, IAudioClien
 | Resampling | PipeWire-/WASAPI-Engine-Resampler, `rubato` 5.0 (Async, Fft, Slip) |
 | VAD | Energie/Schwellwert, RNNoise-VAD-Ausgang, WebRTC-VAD (`webrtc-vad` 0.4), `earshot` 1.2, Silero (`voice_activity_detector` 0.2, onnxruntime) |
 | Noise Suppression | RNNoise via `nnnoiseless` 0.5 (pure Rust), WebRTC-NS via `webrtc-audio-processing` 2.1, OS-APO (Windows Communications-Modus) |
-| AEC | keine (Headset), `webrtc-audio-processing` AEC3, Windows-APO |
+| AEC | keine (Headset), `webrtc-audio-processing` AEC3 in-process, Windows-APO, PipeWire `module-echo-cancel` |
+| AEC-Referenz | eigener Playback-Mix, Systemmix (WASAPI Loopback bzw. PipeWire Monitor/`stream.capture.sink`) |
 | AGC | keine, `webrtc-audio-processing` AGC, einfacher Limiter |
 
 ## Primärquellen
@@ -159,6 +160,8 @@ Abrufdatum aller Quellen: 2026-09-20.
 
 ## Entscheidung
 
+**Revidiert 2026-09-20 (AEC).** Die Zeile „AEC | keine in v1" unten ist überholt. Der Auftraggeber hat die Headset-Annahme gekippt: AEC muss für Lautsprecher-Nutzer sehr gut funktionieren. Die vollständige Recherche samt Kandidatenvergleich, Primärquellen und Messungen steht in `aec.md`; Kurzfassung: In-Process-AEC3 über `webrtc-audio-processing` ~2.1 (`bundled`) als **erste** Stufe der Capture-Kette, vor RNNoise, mit 10-ms-/480-Sample-Frames, ohne `set_stream_delay_ms` und ohne AGC. Entscheidend ist das Referenzsignal: ein In-Process-AEC sieht nur den eigenen Render-Stream, nicht den Spielton — mit unvollständiger Referenz bleiben 7,7 dB statt 38,8 dB Echodämpfung übrig. Unter Linux liefert deshalb ein zweiter Capture-Stream mit `stream.capture.sink = true` den Systemmix (gleicher Graph-Clock, kein Drift, kein Root). Die Entscheidungen zu Backend, Frame-Größe, VAD und Noise Suppression bleiben davon unberührt; RNNoise bleibt der Denoiser und läuft **nach** dem AEC. Kosten: +8,96 ms im Sendepfad, 0,47 % eines Kerns.
+
 | Punkt | Entscheidung | Begründung |
 | --- | --- | --- |
 | Windows-Modus | **WASAPI shared, event-driven, IAudioClient3 `InitializeSharedAudioStream`** mit `PeriodInFrames` = kleinstes Vielfaches der Fundamental-Periode ≥ max(MinPeriod, 240 Frames = 5 ms); Fallback `IAudioClient::Initialize` shared (10 ms) | Exclusive nimmt dem Spiel den Endpoint (A1, A3) — Ausschluss unabhängig von der Latenz; IAudioClient3 liefert "latency comparable to exclusive mode while preserving system sound mixing" (A1); 5 ms statt Treiber-Minimum, um nicht alle Apps am Endpoint auf 2.66 ms zu zwingen (A3) |
@@ -171,7 +174,7 @@ Abrufdatum aller Quellen: 2026-09-20.
 | Hot-Plug | Windows: Default-Endpoint-Wechsel folgen (Rerouting wie cpal 0.18, A28) — Implementierung über `IMMNotificationClient` (**unbelegt**, Step 3); PipeWire: Registry-Events, `target.object` neu setzen | A28, A12 |
 | VAD | **RNNoise-VAD-Ausgang** (wenn NS aktiv) mit Schwellwert + Hangover (200 ms) + Hysterese; ohne NS: **Energie-Gate** (RMS über 10 ms, Schwellwert in dBFS, gleiches Hangover) | Kein zusätzliches Modell/Resampling; `earshot` bräuchte 16 kHz/16-ms-Frames (A46); Silero bräuchte onnxruntime-Download (A48) |
 | Noise Suppression | **`nnnoiseless`, per Nutzer-Schalter, Default an** | Pure Rust, BSD-3, 10-ms-Frames passen zu 480-Sample-Blöcken (A37); OS-NS wird via RAW abgeschaltet |
-| AEC | **keine** in v1 | Headset-Annahme; bei Lautsprechern wäre `webrtc-audio-processing` nötig (meson/ninja/clang/abseil-Build, Windows-Support unbelegt, A43) |
+| AEC | **`webrtc-audio-processing` ~2.1 (AEC3) in-process, Default an**, Referenz = Systemmix (Linux: zweiter Capture-Stream mit `stream.capture.sink = true`; Windows: WASAPI-Loopback, Pfad noch offen) | **Revidiert 2026-09-20 (AEC)**, Herleitung und Messungen in `aec.md` |
 | AGC | **keine**; nur Soft-Clip/Limiter nach dem Mix | AGC verändert Dynamik ("glasklar" = unverfälscht); Nutzer stellt Mikrofon-Gain |
 | Minimale Kette | Capture 48 kHz mono f32 → Blöcke à 480 → [nnnoiseless] → VAD/PTT-Gate → Opus-Encoder (VOIP hat eigenen HPF, Q4 in `codec.md`); Empfang: N−1 Decoder → Summe f32 → Limiter → Playback | — |
 
@@ -187,7 +190,7 @@ Abrufdatum aller Quellen: 2026-09-20.
 | `webrtc-vad` | Letzte Version 2019 (A45) |
 | `voice_activity_detector` (Silero) | onnxruntime-Binary-Download/Dynamic-Load (A48), Lizenz "Non-standard" (A49) |
 | `earshot` | 16 kHz/16-ms-Raster passt nicht zum 48-kHz/10-ms-Raster; RNNoise liefert VAD mit |
-| `webrtc-audio-processing` | Nur für AEC nötig; schwerer Build (A43); Windows unbelegt |
+| ~~`webrtc-audio-processing`~~ | **Revidiert 2026-09-20 (AEC)**: nicht mehr verworfen, sondern Entscheidung — siehe `aec.md`. Der schwere Build ist real (meson/ninja/clang/abseil plus ein objcopy-Workaround), der Windows-Cross-Build scheitert tatsächlich; beides ist dort dokumentiert. |
 | Windows `AudioCategory_Communications` | Dämpft andere Streams (A11), zieht OEM-APOs (A11) |
 | OS-seitige NS/AGC | Nicht kontrollierbar, App sieht Modus nicht (A11) |
 

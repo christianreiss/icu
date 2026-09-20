@@ -9,3 +9,4 @@ Wegwerf-Code der empirischen Prüfungen vom 2026-09-20; Ergebnisse in `../verifi
 | `spike-audio/` | 3 Audio-Loopback | `cargo run`, optional `PIPEWIRE_LATENCY=480/48000` |
 | `spike-wayland/` | 4a Hotkey (`src/bin/hotkey.rs`, interaktiv: KDE-Dialog bestätigen), 4b Overlay (`src/bin/overlay.rs`) | `cargo run --bin hotkey`, `cargo run --bin overlay` |
 | `spike-camera/` | 5 Kamera + H.264 | `cargo run` |
+| `spike-aec/` | 6 Echo Cancellation (`src/main.rs` = WebRTC AEC3), 6b Speex-Vergleich (`src/bin/speex.rs`) | `cargo run --release`, `cargo run --release --bin speex`. Braucht `meson`, `ninja-build`, `clang`, `abseil-cpp-devel`, `speexdsp-devel` und einmalig den `rust-objcopy`-Symlink aus `Client/IMPLEMENTATION.md` §12. Release-Profil nötig, sonst dauern die 60–600-s-Driftläufe zu lange. |

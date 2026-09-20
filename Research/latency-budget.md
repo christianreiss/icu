@@ -85,6 +85,7 @@ Spalten: LAN best (PipeWire 5-ms-Quantum bzw. IAudioClient3 240 Frames, NS aus, 
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Mikrofon/ADC/Treiber | 1 | 2 | 1 | 2 | 1 | 2 | 1 | 2 | Annahme (unbelegt) |
 | Capture-Puffer | 5 | 10 | 5 | 10 | 5 | 10 | 5 | 10 | L12, L13, L14 |
+| AEC (WebRTC AEC3) | 9 | 9 | 9 | 9 | 9 | 9 | 9 | 9 | **Revidiert 2026-09-20 (AEC)**: gemessen 8,96 ms (Impulsantwort, Spike 6); nur bei aktivem AEC, sonst 0 |
 | RNNoise-Block (10 ms) | 0 | 10 | 0 | 10 | 0 | 10 | 0 | 10 | L15; 10 = konservative Annahme für Fensterverzögerung (unbelegt) |
 | Opus-Frame füllen | 20 | 20 | 20 | 20 | 10 | 10 | 10 | 10 | L2 |
 | Encoder-Lookahead | 6.5 | 6.5 | 6.5 | 6.5 | 6.5 | 6.5 | 6.5 | 6.5 | L3 |
@@ -96,18 +97,19 @@ Spalten: LAN best (PipeWire 5-ms-Quantum bzw. IAudioClient3 240 Frames, NS aus, 
 | Mix | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 | 0.1 | Annahme |
 | Playback-Puffer | 5 | 10 | 5 | 10 | 5 | 10 | 5 | 10 | L12, L14 |
 | DAC/Treiber | 1 | 2 | 1 | 2 | 1 | 2 | 1 | 2 | Annahme (unbelegt) |
-| **Summe** | **45.6** | **85.1** | **79.6** | **143.1** | **35.6** | **65.1** | **59.6** | **123.1** | abgeleitet |
+| **Summe ohne AEC** | **45.6** | **85.1** | **79.6** | **143.1** | **35.6** | **65.1** | **59.6** | **123.1** | abgeleitet |
+| **Summe mit AEC** | **54.6** | **94.1** | **88.6** | **152.1** | **44.6** | **74.1** | **68.6** | **132.1** | abgeleitet (+9 ms) |
 
 Ableitung 10 ms vs. 20 ms: der Frame-Wechsel spart genau 10 ms Frame-Füllzeit plus feinere Jitter-Buffer-Schritte (5–10 ms weniger Ziel-Tiefe bei gleicher Jitter-Toleranz in Frames), bei +35 % Draht-Bandbreite (siehe `codec.md`). Der Lookahead bleibt 6.5 ms (L3).
 
 Zielwerte:
 
-| Szenario | Ziel v1 | Herleitung |
-| --- | --- | --- |
-| LAN, 20 ms | ≤ 60 ms best, ≤ 90 ms typisch | Tabelle |
-| LAN, 10 ms | ≤ 45 ms best, ≤ 70 ms typisch | Tabelle |
-| WAN (20–40 ms Netz), 20 ms | ≤ 85 ms best, ≤ 150 ms typisch | Tabelle; unter G.114-Planungsgrenze 400 ms (L11) |
-| WAN, 10 ms | ≤ 65 ms best, ≤ 130 ms typisch | Tabelle |
+| Szenario | Ziel v1 ohne AEC | Ziel v1 mit AEC | Herleitung |
+| --- | --- | --- | --- |
+| LAN, 20 ms | ≤ 60 ms best, ≤ 90 ms typisch | ≤ 69 ms best, ≤ 99 ms typisch | Tabelle |
+| LAN, 10 ms | ≤ 45 ms best, ≤ 70 ms typisch | ≤ 54 ms best, ≤ 79 ms typisch | Tabelle |
+| WAN (20–40 ms Netz), 20 ms | ≤ 85 ms best, ≤ 150 ms typisch | ≤ 94 ms best, ≤ 160 ms typisch | Tabelle; unter G.114-Planungsgrenze 400 ms (L11) |
+| WAN, 10 ms | ≤ 65 ms best, ≤ 130 ms typisch | ≤ 74 ms best, ≤ 140 ms typisch | Tabelle |
 
 ### Jitter-Buffer-Design, Kandidaten
 
@@ -125,6 +127,10 @@ Zielwerte:
 - Time-Stretching ist erst nötig, wenn lange, pausenlose Sprache über stark schwankendes WAN läuft — Nicht-Ziel für v1.
 
 ## Entscheidung
+
+**Revidiert 2026-09-20 (AEC).** Das Budget enthält seit heute eine Stufe „AEC (WebRTC AEC3)" mit **9 ms** im Sendepfad (gemessen 8,96 ms per Impulsantwort, Spike 6). Der Empfangspfad bleibt unverändert: `process_render_frame` verändert den Frame nicht. Die 9 ms fallen nur bei aktivem AEC an — für Headset-Nutzer, die es abschalten, gelten weiter die Werte ohne AEC. Die Zielwerte wurden entsprechend verdoppelt (mit/ohne), nicht angehoben: eine Zielverfehlung ist das nicht, sondern ein bewusst bezahlter Preis für Lautsprecherbetrieb. Alle Spalten bleiben weit unter der G.114-Planungsgrenze von 400 ms (L11). Herleitung und Messungen in `aec.md`.
+
+Nebenbefund für die Drift-Zeilen unten: AEC3 toleriert Clock-Drift zwischen Mikrofon und Referenzsignal nur bis zu einer **Rate** von rund 100 ppm — der aufsummierte Schlupf ist dabei egal (100 ppm über 600 s kosten 0,4 dB, 1 000 ppm über 60 s bei identischem Schlupf brechen auf 8 dB ein). Für Linux ist das folgenlos, weil Mikrofon- und Monitor-Stream am selben PipeWire-Graph-Clock hängen. Für den Windows-Loopback-Pfad ist es eine Anforderung an die Hardware und in M3 zu messen (`aec.md` A6).
 
 | Punkt | Entscheidung |
 | --- | --- |
