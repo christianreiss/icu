@@ -193,7 +193,7 @@ Auf Windows (später):
 
 - [x] Step 3 am 2026-09-20 (Details in `verification.md`):
   - Spike 4a **bestätigt** evdev: alle 21 `/dev/input/event*` als uid 1000 (Gruppe `input`) lesbar, Tastatur und Maus mit `BTN_SIDE` erkannt, kein root nötig.
-  - Spike 4a **offen** für das Portal: `CreateSession` ok, `BindShortcuts` (ashpd 0.11.1, `preferred_trigger CTRL+SHIFT+F12`) kam in der unbeaufsichtigten Session sofort mit `Cancelled` zurück. Punkt 1–3 der Step-3-Liste müssen interaktiv von Chris ausgeführt werden (Binary liegt im Session-Scratchpad `spike-wayland/target/debug/hotkey`).
+  - Spike 4a **offen** für das Portal: `CreateSession` ok, `BindShortcuts` (ashpd 0.11.1, `preferred_trigger CTRL+SHIFT+F12`) kam in der unbeaufsichtigten Session sofort mit `Cancelled` zurück. Punkt 1–3 der Step-3-Liste müssen interaktiv von Chris ausgeführt werden (Quelle: `Research/spikes/spike-wayland/`, `cargo run --bin hotkey`).
   - **Korrektur**: die lokale Portal-Version ist **1**, nicht 2 (`busctl --user get-property … GlobalShortcuts version` → `u 1`, geprüft 2026-09-20). `ConfigureShortcuts` steht damit lokal nicht zur Verfügung; für PTT irrelevant.
   - Entscheidung bleibt: Portal primär, evdev opt-in; die Backend-Auswahl zur Laufzeit muss `Cancelled` als „Portal nicht nutzbar“ werten und auf evdev fallen, wenn `/dev/input` lesbar ist.
 

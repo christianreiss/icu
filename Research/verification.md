@@ -34,7 +34,7 @@ Korrekturen aus dem Abgleich (im jeweiligen Dokument eingearbeitet):
 
 ## B. Spikes
 
-Reihenfolge: 1 Cross-Compile-Gate, 2 QUIC-Handshake mit Client-Cert, 3 Audio-Loopback-Latenz, 4 Wayland-Hotkey und Overlay, 5 Kamera-Capture und Encode. Code liegt im Session-Scratchpad (`spike-*`), wird nicht eingecheckt.
+Reihenfolge: 1 Cross-Compile-Gate, 2 QUIC-Handshake mit Client-Cert, 3 Audio-Loopback-Latenz, 4 Wayland-Hotkey und Overlay, 5 Kamera-Capture und Encode. Quellcode der Spikes liegt unter `Research/spikes/` (ohne `target/`).
 
 ### Spike 1: Cross-Compile-Gate Fedora → Windows — **PASS** (2026-09-20)
 
@@ -119,7 +119,7 @@ Stack: evdev 0.13.2, ashpd 0.11.1 (tokio).
 | Weg | Ergebnis |
 | --- | --- |
 | evdev direkt | **PASS.** Als uid 1000 (Gruppe `input`) sind alle 21 `/dev/input/event*` ohne root lesbar; Tastatur (`FSC KBPC PX`) und Maus (`Logitech USB-PS/2 Optical Mouse`, mit `BTN_SIDE`) erkannt. Liefert Press und Release, unabhängig vom Fokus und vom Compositor. |
-| XDG GlobalShortcuts-Portal | **OFFEN.** `CreateSession` ok. `BindShortcuts` mit `preferred_trigger CTRL+SHIFT+F12` kam sofort mit `Portal request didn't succeed: Cancelled` zurück, ohne dass ein Dialog bestätigt wurde (unbeaufsichtigte Session). Muss von Chris interaktiv wiederholt werden: `spike-wayland/target/debug/hotkey` starten, KDE-Dialog bestätigen, dann Taste drücken und auf `Activated`/`Deactivated` prüfen. |
+| XDG GlobalShortcuts-Portal | **OFFEN.** `CreateSession` ok. `BindShortcuts` mit `preferred_trigger CTRL+SHIFT+F12` kam sofort mit `Portal request didn't succeed: Cancelled` zurück, ohne dass ein Dialog bestätigt wurde (unbeaufsichtigte Session). Muss von Chris interaktiv wiederholt werden: in `Research/spikes/spike-wayland/` `cargo run --bin hotkey`, KDE-Dialog bestätigen, dann Taste drücken und auf `Activated`/`Deactivated` prüfen. |
 
 Konsequenz: evdev ist der verlässliche Linux-Pfad für PTT und ist auf diesem Host ohne Konfiguration nutzbar. Das Portal bleibt die saubere Variante für Hosts, deren User nicht in `input` ist; die Entscheidung in `hotkey-wayland.md` muss beide vorsehen.
 

@@ -1,0 +1,13 @@
+[package]
+name = "spike-wayland"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+evdev = "0.13"
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+anyhow = "1"
+futures-util = "0.3"

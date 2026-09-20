@@ -1,0 +1,17 @@
+[package]
+name = "spike-xwin"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+tokio = { version = "1", features = ["full"] }
+opus = "0.3"
+nnnoiseless = { version = "0.5", default-features = false }
+cpal = "0.16"
+eframe = { version = "0.33", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+nokhwa = { version = "0.10", features = ["input-native"] }
+openh264 = { version = "0.9", features = ["source"] }
+anyhow = "1"

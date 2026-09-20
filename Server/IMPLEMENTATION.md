@@ -113,7 +113,7 @@ match alpn:
 
 1. `accept_bi()` mit 5-s-Timeout; Frame lesen (≤ 8 KiB).
 2. `EnrollRequest` decodieren; Token nachschlagen (konstantzeitiger Vergleich, `subtle`), abgelaufen/verbraucht → `close(ENROLL_BAD_TOKEN)`.
-3. `CertificateSigningRequestParams::from_der(csr)`; Fehler → `ENROLL_BAD_CSR`. Server setzt Subject CN = Name, EKU ClientAuth, `not_before = now − 1 h`, `not_after = now + client_validity_days`, Serial = 16 Zufallsbytes; `signed_by(&issuer)`.
+3. `CertificateSigningRequestParams::from_der(csr)`; Fehler → `ENROLL_BAD_CSR`. Server setzt Subject CN = Name aus dem Invite (autoritativ; `EnrollRequest.name` wird nur als initialer Anzeigename übernommen), EKU ClientAuth, `not_before = now − 1 h`, `not_after = now + client_validity_days`, Serial = 16 Zufallsbytes; `signed_by(&issuer)`.
 4. Fingerprint = SHA-256(Leaf-DER); Eintrag in `users.toml` schreiben; Token als verbraucht markieren (beides vor der Antwort persistieren).
 5. `EnrollResponse { leaf_der, ca_der, server_name }` senden, `finish()`, `close(NO_ERROR)`.
 

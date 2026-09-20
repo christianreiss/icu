@@ -1,5 +1,7 @@
 # Wire-Protokoll (Entwurf 1)
 
+> **Abgelöst durch `/PROTOCOL.md`** (2026-09-20). Diese Datei bleibt als Entwurfs- und Begründungsprotokoll; bei Abweichungen (Fehlercode-Fatalität, Backoff 15 s, `AUTH_REQUIRED`, `Hello.name`, `Welcome.min_client`, `LossReport`/`LossHint`/`KeyframeRequest`/`SetName`/`UserRenamed`) gilt `PROTOCOL.md`.
+
 ## Frage
 
 Wie sieht das ICU-Protokoll über QUIC (Entscheidung in `../transport.md`) auf Byte-Ebene aus: Control-Kanal (Framing, Serialisierung), Audio-Datagram-Header, Video-Frames, Message-Liste, Verbindungs-State-Machine, Versionierung, Fehlercodes — und was muss der Server beim Relay tun, insbesondere: setzt er die Speaker-ID oder vertraut er dem Client?

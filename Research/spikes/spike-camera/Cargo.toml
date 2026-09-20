@@ -1,0 +1,9 @@
+[package]
+name = "spike-camera"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nokhwa = { version = "0.10", features = ["input-native"] }
+openh264 = { version = "0.9", features = ["source"] }
+anyhow = "1"

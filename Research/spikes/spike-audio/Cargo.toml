@@ -1,0 +1,11 @@
+[package]
+name = "spike-audio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cpal = "0.16"
+opus = "0.3"
+nnnoiseless = { version = "0.5", default-features = false }
+anyhow = "1"
+ringbuf = "0.4"

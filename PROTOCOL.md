@@ -35,6 +35,7 @@ Framing auf dem Control-Stream in beide Richtungen:
 
 ```
 UserFlags: u8      bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4–7 reserviert (senden 0, lesen ignorieren)
+                   bit2 ist serverseitig autoritativ: der Server leitet es aus dem Audio-Datagram-Fluss ab (erstes Datagram nach ≥ 500 ms Stille → 1; END-Flag oder 500 ms ohne Datagram → 0) und broadcastet UserState; ein von Clients in SetState gesendetes bit2 wird ignoriert.
 Session:   u16     serverseitig vergeben, ab 1, pro Server-Laufzeit monoton, nie wiederverwendet; 0 = „unbekannt/ich“
 Name:      String  UTF-8, 1–32 Bytes, keine Steuerzeichen
 UserInfo { session: Session, name: Name, flags: UserFlags }
@@ -70,7 +71,7 @@ Gleiche Framing-Regel, Stream-Limit 8 KiB, ein Request/Response, danach Close.
 
 | Nr | Variante | Richtung | Felder |
 | --- | --- | --- | --- |
-| 0 | `EnrollRequest` | C→S | `token: String` (base64url, 22 Zeichen = 128 Bit), `csr_der: Vec<u8>` (≤ 2 KiB), `name: Name` |
+| 0 | `EnrollRequest` | C→S | `token: String` (base64url, 22 Zeichen = 128 Bit), `csr_der: Vec<u8>` (≤ 2 KiB), `name: Name` (gewünschter Anzeigename; der Server nimmt ihn als initialen Anzeigenamen, das Cert-CN kommt immer aus dem Invite) |
 | 1 | `EnrollResponse` | S→C | `leaf_der: Vec<u8>`, `ca_der: Vec<u8>`, `server_name: String` (SNI für die Hauptverbindung) |
 | 2 | `Error` | S→C | `code: u32`, `detail: String` |
 
@@ -122,7 +123,7 @@ Incoming ─accept─▶ Handshaking ─ALPN icu/1, TLS ok─▶ Authenticating 
                              Enrolling ─▶ Closed                close(AUTH_*)                close(HELLO_TIMEOUT)
 ```
 
-Client-Sicht: `Connecting → Handshaking → SendHello → AwaitWelcome → Active → Closed`. Reconnect bei jedem nicht-fatalen Close und bei Netzfehlern: Backoff 1, 2, 4, 8, 15 s, dann 15 s, unbegrenzt; lokaler Zustand (Mute, Deafen, Lautstärken) bleibt. Fatale Codes (AUTH_*, VERSION_UNSUPPORTED, KICKED) → kein Reconnect, UI-Hinweis.
+Client-Sicht: `Connecting → Handshaking → SendHello → AwaitWelcome → Active → Closed`. Reconnect bei jedem nicht-fatalen Close und bei Netzfehlern: Backoff 1, 2, 4, 8, 15 s, dann 15 s, unbegrenzt; lokaler Zustand (Mute, Deafen, Lautstärken) bleibt. Fatal (kein Reconnect, UI-Hinweis) sind genau die in §6 mit „ja“ markierten Codes: PROTOCOL_VIOLATION, VERSION_UNSUPPORTED, AUTH_*, KICKED, ENROLL_*. Alle anderen → Reconnect mit Backoff.
 
 ## 6. Fehlercodes
 
@@ -131,13 +132,13 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | Code | Name | Fatal | Bedeutung |
 | --- | --- | --- | --- |
 | 0x00 | `NO_ERROR` | – | normales Close |
-| 0x01 | `PROTOCOL_VIOLATION` | ja | Framing/Decode-Fehler, falsche erste Message, Limit überschritten |
+| 0x01 | `PROTOCOL_VIOLATION` | ja | Framing/Decode-Fehler, falsche erste Message, Limit überschritten; kein Reconnect (würde loopen) |
 | 0x02 | `VERSION_UNSUPPORTED` | ja | `Hello.minor` nicht bedienbar |
 | 0x03 | `AUTH_UNKNOWN_CERT` | ja | Cert gültig gegen CA, Fingerprint unbekannt |
 | 0x04 | `AUTH_REVOKED` | ja | Fingerprint revoked |
-| 0x05 | `SERVER_FULL` | ja | `max_users` erreicht |
+| 0x05 | `SERVER_FULL` | nein | `max_users` erreicht; Client reconnectet mit Backoff |
 | 0x06 | `KICKED` | ja | Admin-Aktion (= Revoke mit sofortigem Close) |
-| 0x07 | `HELLO_TIMEOUT` | ja | kein `Hello` binnen 5 s |
+| 0x07 | `HELLO_TIMEOUT` | nein | kein `Hello` binnen 5 s; Client reconnectet mit Backoff |
 | 0x08 | `SHUTDOWN` | nein | Server fährt herunter; Client reconnectet |
 | 0x09 | `RATE_LIMITED` | nein | dreimal in 60 s → fatal |
 | 0x0A | `AUTH_REQUIRED` | ja | ALPN `icu/1` ohne Client-Cert |
