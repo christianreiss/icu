@@ -26,10 +26,15 @@ Minimales Voice-System für eine feste Gruppe. Ein Server, ein Raum, keine Chann
 | --- | --- |
 | `Research/` | Recherche je Thema, Entscheidungen mit Primärquellen |
 | `Research/protocol/` | Entwurf des Wire-Protokolls |
-| `Research/verification.md` | Ergebnisse der empirischen Spikes |
-| `Server/` | Server-Spezifikation, später Implementierung |
-| `Client/` | Client-Spezifikation, später Implementierung |
+| `Research/verification.md` | Claim-Check und Ergebnisse der empirischen Spikes |
+| `PROTOCOL.md` | Normatives Wire-Protokoll v1 |
+| `Server/IMPLEMENTATION.md` | Server-Spezifikation, später Implementierung |
+| `Client/IMPLEMENTATION.md` | Client-Spezifikation, später Implementierung |
 
 ## Status
 
-Phase: Research und Spezifikation. Keine Implementierung.
+Phase: Research und Spezifikation abgeschlossen (2026-09-20). Implementierung nicht begonnen.
+
+Stack (belegt in `Research/`, verifiziert in `Research/verification.md`): Rust; QUIC (quinn + rustls/ring) mit Datagrams für Audio; mutual TLS mit server-eigener CA und Invite-Link-Enrollment; Opus 48 kHz mono 20 ms; Server als reiner Relay; Client mit PipeWire (Linux) bzw. WASAPI IAudioClient3 (Windows), RNNoise, adaptivem Jitter-Buffer, egui-UI, Portal/evdev bzw. Raw-Input-Hotkeys, Layer-Shell bzw. Layered-Window-Overlay, H.264 über openh264.
+
+Offen bis zur Implementierung: echte Windows-Hardware (WASAPI, Raw Input, Overlay, SmartScreen), interaktiver Portal-Hotkey-Test auf KDE, Kamera-Bitrate bei 15 fps.
