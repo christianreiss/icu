@@ -203,14 +203,34 @@ impl SettingsView {
                     ],
                 )
             });
-            widgets::slider_row(
-                ui,
-                true,
-                "VAD-Schwelle",
-                &mut self.draft.audio.vad_threshold,
-                0.0..=1.0,
-                "",
-            );
+            ui.add_enabled_ui(!self.draft.audio.vad_auto, |ui| {
+                widgets::slider_row(
+                    ui,
+                    true,
+                    "VAD-Schwelle",
+                    &mut self.draft.audio.vad_threshold,
+                    0.0..=1.0,
+                    "",
+                )
+            });
+            ui.add_enabled_ui(self.draft.audio.denoise, |ui| {
+                widgets::setting_row(
+                    ui,
+                    true,
+                    "VAD automatisch",
+                    Some("Kalibriert die Schwelle laufend auf den Umgebungspegel; benötigt Rauschunterdrückung."),
+                    |ui| widgets::toggle(ui, &mut self.draft.audio.vad_auto),
+                )
+            });
+            if self.draft.audio.vad_auto {
+                widgets::setting_row(ui, true, "Aktuelle Schwelle", None, |ui| {
+                    ui.label(
+                        RichText::new(format!("{:.2}", state.vad_threshold))
+                            .monospace()
+                            .color(theme::tokens(ui.visuals()).dim_text),
+                    )
+                });
+            }
             widgets::slider_row(
                 ui,
                 true,
@@ -539,10 +559,7 @@ impl SettingsView {
         } else {
             "aktiv"
         };
-        let help = format!(
-            "{status}{}",
-            if user.is_admin { " · Admin" } else { "" }
-        );
+        let help = format!("{status}{}", if user.is_admin { " · Admin" } else { "" });
         widgets::setting_row(ui, divider, &user.name, Some(&help), |ui| {
             ui.horizontal(|ui| {
                 let role_label = if user.is_admin {
@@ -559,7 +576,11 @@ impl SettingsView {
                         is_admin: !user.is_admin,
                     });
                 }
-                let disable_label = if user.disabled { "Aktivieren" } else { "Deaktivieren" };
+                let disable_label = if user.disabled {
+                    "Aktivieren"
+                } else {
+                    "Deaktivieren"
+                };
                 if ui
                     .add_enabled(!is_self, egui::Button::new(disable_label))
                     .clicked()
@@ -673,7 +694,11 @@ impl SettingsView {
                     .button(format!(
                         "{} Debug-Fenster {}",
                         icon::BUG,
-                        if self.debug_window_open { "schließen" } else { "öffnen" }
+                        if self.debug_window_open {
+                            "schließen"
+                        } else {
+                            "öffnen"
+                        }
                     ))
                     .clicked()
                 {
@@ -779,33 +804,34 @@ fn rail_button(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
 fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
     let tok = theme::tokens(ui.visuals());
     let swatch = egui::vec2(46.0, 46.0);
-    let mut button = |ui: &mut Ui, value: Corner, tile_rect_fn: &dyn Fn(egui::Rect) -> egui::Rect| {
-        let selected = *corner == value;
-        let (rect, resp) = ui.allocate_exact_size(swatch, egui::Sense::click());
-        if ui.is_rect_visible(rect) {
-            let painter = ui.painter();
-            painter.rect_filled(
-                rect,
-                egui::CornerRadius::same(8),
-                ui.visuals().extreme_bg_color,
-            );
-            painter.rect_stroke(
-                rect,
-                egui::CornerRadius::same(8),
-                egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
-                egui::StrokeKind::Inside,
-            );
-            let tile_color = if selected {
-                tok.accent
-            } else {
-                ui.visuals().widgets.inactive.bg_stroke.color
-            };
-            painter.rect_filled(tile_rect_fn(rect), 2.0, tile_color);
-        }
-        if resp.clicked() {
-            *corner = value;
-        }
-    };
+    let mut button =
+        |ui: &mut Ui, value: Corner, tile_rect_fn: &dyn Fn(egui::Rect) -> egui::Rect| {
+            let selected = *corner == value;
+            let (rect, resp) = ui.allocate_exact_size(swatch, egui::Sense::click());
+            if ui.is_rect_visible(rect) {
+                let painter = ui.painter();
+                painter.rect_filled(
+                    rect,
+                    egui::CornerRadius::same(8),
+                    ui.visuals().extreme_bg_color,
+                );
+                painter.rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(8),
+                    egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+                    egui::StrokeKind::Inside,
+                );
+                let tile_color = if selected {
+                    tok.accent
+                } else {
+                    ui.visuals().widgets.inactive.bg_stroke.color
+                };
+                painter.rect_filled(tile_rect_fn(rect), 2.0, tile_color);
+            }
+            if resp.clicked() {
+                *corner = value;
+            }
+        };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for (value, dx, dy) in [

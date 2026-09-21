@@ -293,7 +293,8 @@ impl eframe::App for App {
                     // logo doesn't out-shout the rest of the row.
                     let (badge, _) =
                         ui.allocate_exact_size(egui::vec2(ROW, ROW), egui::Sense::hover());
-                    ui.painter().rect_filled(badge, 8, ui.visuals().faint_bg_color);
+                    ui.painter()
+                        .rect_filled(badge, 8, ui.visuals().faint_bg_color);
                     ui.painter().text(
                         badge.center(),
                         egui::Align2::CENTER_CENTER,
@@ -322,12 +323,10 @@ impl eframe::App for App {
                     };
                     // No RTT trailing value here — it's noise in the header;
                     // still available in Settings → Über → Diagnose.
-                    widgets::status_pill(ui, color, &text, None).on_hover_text(
-                        match &state.me {
-                            Some(me) => format!("user_id {}", me.user_id),
-                            None => String::new(),
-                        },
-                    );
+                    widgets::status_pill(ui, color, &text, None).on_hover_text(match &state.me {
+                        Some(me) => format!("user_id {}", me.user_id),
+                        None => String::new(),
+                    });
 
                     // Own outgoing video quality tier, set by
                     // `crate::quality::QualityController`. Automatic, no
@@ -355,15 +354,14 @@ impl eframe::App for App {
                         egui::vec2(ui.available_width(), ROW),
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            let gear =
-                                egui::Button::new(RichText::new(icon::GEAR_FINE).size(16.0))
-                                    .fill(if self.settings.is_some() {
-                                        ui.visuals().faint_bg_color
-                                    } else {
-                                        Color32::TRANSPARENT
-                                    })
-                                    .corner_radius(egui::CornerRadius::same(8))
-                                    .min_size(egui::vec2(ROW, ROW));
+                            let gear = egui::Button::new(RichText::new(icon::GEAR_FINE).size(16.0))
+                                .fill(if self.settings.is_some() {
+                                    ui.visuals().faint_bg_color
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .min_size(egui::vec2(ROW, ROW));
                             if ui.add(gear).on_hover_text("Einstellungen").clicked() {
                                 self.settings = match self.settings.take() {
                                     Some(_) => None,
@@ -441,12 +439,15 @@ impl eframe::App for App {
                             );
                             widgets::speaking_bars(ui);
                         } else if state.mode == Mode::Vad {
-                            ui.label(
-                                RichText::new(format!("VAD {:.2}", state.vad_prob))
-                                    .monospace()
-                                    .small()
-                                    .color(tok.dim_text),
-                            );
+                            let text = if state.settings.audio.vad_auto {
+                                format!(
+                                    "VAD {:.2} (auto {:.2})",
+                                    state.vad_prob, state.vad_threshold
+                                )
+                            } else {
+                                format!("VAD {:.2}", state.vad_prob)
+                            };
+                            ui.label(RichText::new(text).monospace().small().color(tok.dim_text));
                         }
                     },
                 );
@@ -532,8 +533,13 @@ impl eframe::App for App {
 
             ui.add_space(6.0);
             ui.columns(4, |cols| {
-                if control_button(&mut cols[0], icon::MICROPHONE_SLASH, "Mute", state.muted, false)
-                {
+                if control_button(
+                    &mut cols[0],
+                    icon::MICROPHONE_SLASH,
+                    "Mute",
+                    state.muted,
+                    false,
+                ) {
                     self.send(Command::SetMuted(!state.muted));
                 }
                 if control_button(
@@ -750,7 +756,11 @@ fn control_button(
         let t = ui.input(|i| i.time);
         let pulse = ((t * 2.4).sin() as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
         let pos = egui::pos2(rect.right() - 12.0, rect.top() + 12.0);
-        painter.circle_filled(pos, 5.0 + pulse * 2.0, tok.error.gamma_multiply(0.18 + pulse * 0.12));
+        painter.circle_filled(
+            pos,
+            5.0 + pulse * 2.0,
+            tok.error.gamma_multiply(0.18 + pulse * 0.12),
+        );
         painter.circle_filled(pos, 3.5, tok.error);
     }
     resp.clicked()

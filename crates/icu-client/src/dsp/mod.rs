@@ -9,3 +9,4 @@ pub mod mixer;
 pub mod opus;
 pub mod testsignal;
 pub mod vad;
+pub mod vad_auto;

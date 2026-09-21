@@ -38,7 +38,7 @@ use crate::{
         gate::{Decision, Gate, Mode},
         jitter::{JitterBuffer, JitterConfig, Packet, Pop},
         meter::{self, Level},
-        mixer, opus, vad,
+        mixer, opus, vad, vad_auto,
     },
     net::{
         conn::{self, ConnectError},
@@ -142,6 +142,9 @@ pub struct AppState {
     pub level: Level,
     /// RNNoise voice probability.
     pub vad_prob: f32,
+    /// The VAD threshold currently in effect (manual, or auto-calibrated
+    /// when `vad_auto` is on).
+    pub vad_threshold: f32,
     /// Last RTT.
     pub rtt_ms: Option<f32>,
     /// `Welcome.min_client` is above our version.
@@ -256,6 +259,8 @@ pub struct DspControl {
     denoise: AtomicBool,
     aec: AtomicBool,
     vad_threshold_bits: AtomicU32,
+    vad_auto: AtomicBool,
+    vad_effective_threshold_bits: AtomicU32,
     gain_bits: AtomicU32,
     release_ms: AtomicU32,
     hangover_ms: AtomicU32,
@@ -282,6 +287,8 @@ impl DspControl {
             denoise: AtomicBool::new(false),
             aec: AtomicBool::new(false),
             vad_threshold_bits: AtomicU32::new(0),
+            vad_auto: AtomicBool::new(false),
+            vad_effective_threshold_bits: AtomicU32::new(0),
             gain_bits: AtomicU32::new(0),
             release_ms: AtomicU32::new(0),
             hangover_ms: AtomicU32::new(0),
@@ -309,6 +316,7 @@ impl DspControl {
         self.aec.store(s.audio.aec && !test_tone, Ordering::Relaxed);
         self.vad_threshold_bits
             .store(s.audio.vad_threshold.to_bits(), Ordering::Relaxed);
+        self.vad_auto.store(s.audio.vad_auto, Ordering::Relaxed);
         self.gain_bits
             .store(meter::from_db(s.audio.gain_db).to_bits(), Ordering::Relaxed);
         self.release_ms.store(s.audio.release_ms, Ordering::Relaxed);
@@ -459,6 +467,7 @@ impl Engine {
             sending: false,
             level: Level::default(),
             vad_prob: 0.0,
+            vad_threshold: settings.audio.vad_threshold,
             rtt_ms: None,
             update_required: None,
             banner: None,
@@ -760,6 +769,7 @@ fn dsp_thread(
             return;
         }
     };
+    let mut auto_threshold = vad_auto::AutoThreshold::new(Instant::now());
     let mut gate = Gate::new(
         if ctl.vad_mode.load(Ordering::Relaxed) {
             Mode::Vad
@@ -891,7 +901,16 @@ fn dsp_thread(
             .store(level.rms_db.to_bits(), Ordering::Relaxed);
         ctl.vad_prob_bits
             .store(prob.unwrap_or(0.0).to_bits(), Ordering::Relaxed);
-        let threshold = f32::from_bits(ctl.vad_threshold_bits.load(Ordering::Relaxed));
+        let threshold = if ctl.vad_auto.load(Ordering::Relaxed) {
+            if let Some(p) = prob {
+                auto_threshold.update(t_block, gate.is_open(), p);
+            }
+            auto_threshold.threshold()
+        } else {
+            f32::from_bits(ctl.vad_threshold_bits.load(Ordering::Relaxed))
+        };
+        ctl.vad_effective_threshold_bits
+            .store(threshold.to_bits(), Ordering::Relaxed);
         let voice = vad::is_voice(vad::VadSource::Rnnoise { threshold }, prob, level);
         voice_in_frame |= voice;
 
@@ -974,9 +993,12 @@ fn dsp_thread(
             let sending = ctl.sending.load(Ordering::Relaxed);
             let ptt = ctl.ptt_down.load(Ordering::Relaxed);
             let p = f32::from_bits(ctl.vad_prob_bits.load(Ordering::Relaxed));
+            let vad_threshold =
+                f32::from_bits(ctl.vad_effective_threshold_bits.load(Ordering::Relaxed));
             shared.state.send_modify(|s| {
                 s.level = level;
                 s.vad_prob = p;
+                s.vad_threshold = vad_threshold;
                 s.sending = sending;
                 s.ptt_down = ptt;
             });

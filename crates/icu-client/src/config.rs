@@ -76,6 +76,9 @@ pub struct AudioSettings {
     pub mode: ModeSetting,
     /// RNNoise voice probability threshold.
     pub vad_threshold: f32,
+    /// Auto-calibrate the VAD threshold to the ambient noise floor instead
+    /// of using `vad_threshold` directly. Requires `denoise`.
+    pub vad_auto: bool,
     /// Microphone gain in dB.
     pub gain_db: f32,
     /// RNNoise on.
@@ -105,6 +108,7 @@ impl Default for AudioSettings {
             output_device: None,
             mode: ModeSetting::Ptt,
             vad_threshold: 0.5,
+            vad_auto: false,
             gain_db: 0.0,
             denoise: true,
             aec: true,
@@ -457,6 +461,7 @@ mod tests {
         let mut s = Settings::default();
         s.audio.mode = ModeSetting::Vad;
         s.audio.vad_threshold = 0.7;
+        s.audio.vad_auto = true;
         s.audio.input_device = Some("alsa_input.foo".into());
         s.hotkeys.ptt.key = "BTN_SIDE".into();
         s.overlay.corner = Corner::BottomLeft;
