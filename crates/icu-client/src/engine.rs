@@ -1240,6 +1240,7 @@ impl LocalState {
                 return Box::pin(self.handle_local(Command::SetMode(mode), shared, send)).await;
             }
             Command::Ptt(down) => {
+                tracing::debug!(down, "ptt");
                 shared.dsp.ptt_down.store(down, Ordering::Relaxed);
                 shared.state.send_modify(|s| s.ptt_down = down);
             }

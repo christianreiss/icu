@@ -261,7 +261,7 @@ impl Default for UiSettings {
             name: None,
             start_minimized: false,
             register_uri_handler: true,
-            theme: "system".into(),
+            theme: "dark".into(),
         }
     }
 }

@@ -7,8 +7,9 @@ use std::{
 };
 
 use egui::{Color32, RichText};
+use egui_phosphor::regular as icon;
 
-use super::{settings::SettingsView, theme};
+use super::{fonts, settings::SettingsView, theme};
 use crate::{
     config::{Identity, Paths},
     dsp::gate::Mode,
@@ -22,8 +23,10 @@ pub fn run(engine: Engine, debug_stats: bool) -> Result<(), String> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ICU")
-            .with_inner_size([340.0, 520.0])
-            .with_min_inner_size([300.0, 380.0])
+            .with_app_id("icu")
+            .with_inner_size([420.0, 680.0])
+            .with_min_inner_size([360.0, 480.0])
+            .with_resizable(true)
             .with_visible(!start_minimized),
         ..Default::default()
     };
@@ -79,6 +82,7 @@ impl App {
                 e.snapshot().settings.ui.theme.clone(),
             )
         };
+        fonts::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, &theme_name);
         #[cfg(feature = "tray")]
         let tray = crate::tray::Tray::start(cmd.clone(), cc.egui_ctx.clone()).ok();
@@ -199,8 +203,14 @@ impl eframe::App for App {
                     ),
                     ConnStatus::Fatal(reason) => (theme::ERROR, format!("Fehler: {reason}")),
                 };
-                ui.label(RichText::new("●").color(color).size(16.0));
-                ui.label(RichText::new("ICU").strong());
+                let (dot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot_rect.center(), 5.0, color);
+                ui.label(
+                    RichText::new("ICU")
+                        .font(egui::FontId::new(16.0, fonts::semibold()))
+                        .strong(),
+                );
                 ui.label(RichText::new(&state.server).small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(rtt) = state.rtt_ms {
@@ -225,7 +235,7 @@ impl eframe::App for App {
             if let Some(banner) = &state.banner {
                 ui.horizontal(|ui| {
                     ui.colored_label(theme::ERROR, banner);
-                    if ui.small_button("×").clicked() {
+                    if ui.small_button(icon::X).clicked() {
                         self.send(Command::DismissBanner);
                     }
                 });
@@ -270,15 +280,25 @@ impl eframe::App for App {
                     Mode::Ptt => "PTT (halten)",
                     Mode::Vad => "VAD",
                 };
-                let ptt = ui.add_sized(
-                    [100.0, 28.0],
-                    egui::Button::new(ptt_label).fill(if state.ptt_down {
-                        theme::SPEAKING
-                    } else {
-                        ui.visuals().widgets.inactive.bg_fill
-                    }),
-                );
-                let held = ptt.is_pointer_button_down_on();
+                let mut ptt_btn = egui::Button::new(ptt_label);
+                if state.ptt_down {
+                    ptt_btn = ptt_btn.fill(theme::SPEAKING);
+                }
+                let ptt = ui.add_sized([100.0, 28.0], ptt_btn);
+                // Hold semantics: a press that starts on the button keeps the gate
+                // open until the primary button is released anywhere, even if the
+                // pointer drifts off the widget or egui stops treating it as
+                // "down on" (observed in the live test: transmission ended after a
+                // few seconds while the button was still held).
+                let primary_down = ui.input(|i| i.pointer.primary_down());
+                let held = if self.ptt_held {
+                    primary_down
+                } else {
+                    ptt.is_pointer_button_down_on() && primary_down
+                };
+                if held {
+                    ui.ctx().request_repaint();
+                }
                 if held != self.ptt_held {
                     self.ptt_held = held;
                     if state.mode == Mode::Ptt {
@@ -290,32 +310,24 @@ impl eframe::App for App {
                 }
                 ptt.on_hover_text("Rechtsklick: PTT/VAD umschalten");
 
-                let mute = ui.add_sized(
-                    [70.0, 28.0],
-                    egui::Button::new(if state.muted { "Mute ✓" } else { "Mute" }).fill(
-                        if state.muted {
-                            theme::MUTED
-                        } else {
-                            ui.visuals().widgets.inactive.bg_fill
-                        },
-                    ),
-                );
+                let mut mute_btn =
+                    egui::Button::new(if state.muted { "Mute ✓" } else { "Mute" });
+                if state.muted {
+                    mute_btn = mute_btn.fill(theme::MUTED);
+                }
+                let mute = ui.add_sized([70.0, 28.0], mute_btn);
                 if mute.clicked() {
                     self.send(Command::SetMuted(!state.muted));
                 }
-                let deafen = ui.add_sized(
-                    [80.0, 28.0],
-                    egui::Button::new(if state.deafened {
-                        "Deafen ✓"
-                    } else {
-                        "Deafen"
-                    })
-                    .fill(if state.deafened {
-                        theme::MUTED
-                    } else {
-                        ui.visuals().widgets.inactive.bg_fill
-                    }),
-                );
+                let mut deafen_btn = egui::Button::new(if state.deafened {
+                    "Deafen ✓"
+                } else {
+                    "Deafen"
+                });
+                if state.deafened {
+                    deafen_btn = deafen_btn.fill(theme::MUTED);
+                }
+                let deafen = ui.add_sized([80.0, 28.0], deafen_btn);
                 if deafen.clicked() {
                     self.send(Command::SetDeafened(!state.deafened));
                 }
@@ -330,7 +342,10 @@ impl eframe::App for App {
                     self.send(Command::SetOverlay(!state.overlay_on));
                 }
                 if ui
-                    .selectable_label(self.settings.is_some(), "⚙ Einstellungen")
+                    .selectable_label(
+                        self.settings.is_some(),
+                        format!("{} Einstellungen", icon::GEAR),
+                    )
                     .clicked()
                 {
                     self.settings = match self.settings.take() {
@@ -343,6 +358,34 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(root, |ui| {
+            if self.settings.is_some() {
+                let mut close = false;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Einstellungen")
+                            .font(egui::FontId::new(20.0, fonts::semibold())),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(icon::X).clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                if close {
+                    self.settings = None;
+                } else {
+                    ui.separator();
+                    let view = self.settings.as_mut().expect("checked above");
+                    let cmds = view.ui(ui, &state);
+                    for c in cmds {
+                        if let Command::UpdateSettings(s) = &c {
+                            theme::apply(ctx, &s.ui.theme);
+                        }
+                        self.send(c);
+                    }
+                }
+                return;
+            }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if let Some(me) = &state.me {
                     participant_row(
@@ -389,26 +432,6 @@ impl eframe::App for App {
                 }
             });
         });
-
-        if let Some(view) = self.settings.as_mut() {
-            let mut open = true;
-            let mut cmds = Vec::new();
-            egui::Window::new("Einstellungen")
-                .open(&mut open)
-                .default_size([320.0, 480.0])
-                .show(ctx, |ui| {
-                    cmds = view.ui(ui, &state);
-                });
-            for c in cmds {
-                if let Command::UpdateSettings(s) = &c {
-                    theme::apply(ctx, &s.ui.theme);
-                }
-                self.send(c);
-            }
-            if !open {
-                self.settings = None;
-            }
-        }
     }
 
     fn on_exit(&mut self) {
@@ -456,13 +479,13 @@ fn participant_row(
         }
         ui.label(text);
         if camera {
-            ui.label("🎥");
+            ui.label(icon::VIDEO_CAMERA);
         }
         if muted {
-            ui.colored_label(theme::MUTED, "🔇");
+            ui.colored_label(theme::MUTED, icon::MICROPHONE_SLASH);
         }
         if deafened {
-            ui.colored_label(theme::MUTED, "🔈");
+            ui.colored_label(theme::MUTED, icon::SPEAKER_SLASH);
         }
         if let Some((user_id, vol)) = volume {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -510,14 +533,16 @@ pub fn run_enroll(
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ICU — Einladung")
-            .with_inner_size([420.0, 200.0]),
+            .with_app_id("icu")
+            .with_inner_size([460.0, 240.0]),
         ..Default::default()
     };
     eframe::run_native(
         "ICU",
         options,
         Box::new(move |cc| {
-            theme::apply(&cc.egui_ctx, "system");
+            fonts::install(&cc.egui_ctx);
+            theme::apply(&cc.egui_ctx, "dark");
             Ok(Box::new(EnrollApp {
                 paths,
                 server_addr,

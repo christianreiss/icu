@@ -85,8 +85,18 @@ pub async fn start(
     .await
     .map_err(|_| "bind_shortcuts: no answer in 60 s".to_string())?
     .map_err(|e| format!("bind_shortcuts: {e}"))?;
+    let mut any_key = false;
     for s in bind.shortcuts() {
         tracing::info!(id = s.id(), trigger = ?s.trigger_description(), "portal shortcut bound");
+        if !s.trigger_description().trim().is_empty() {
+            any_key = true;
+        }
+    }
+    if !any_key {
+        // KDE accepts the binding but stores `none` as the active key when the
+        // user does not assign one in the dialog; the portal then never fires.
+        // Treat that as "not available" so the caller falls back to evdev.
+        return Err("portal bound the shortcuts without any key".into());
     }
     let mut activated = portal
         .receive_activated()
@@ -109,6 +119,7 @@ pub async fn start(
                 Some(d) = deactivated.next() => (d.shortcut_id().to_string(), false),
                 else => return,
             };
+            tracing::debug!(id, pressed, "portal shortcut event");
             for (bound, action) in &actions {
                 if *bound == id {
                     if let Some(c) = action.command(pressed) {
