@@ -15,9 +15,10 @@ pub fn semibold() -> egui::FontFamily {
 pub fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
-    fonts
-        .font_data
-        .insert("Inter".into(), egui::FontData::from_static(INTER_REGULAR).into());
+    fonts.font_data.insert(
+        "Inter".into(),
+        egui::FontData::from_static(INTER_REGULAR).into(),
+    );
     fonts.font_data.insert(
         "Inter-SemiBold".into(),
         egui::FontData::from_static(INTER_SEMIBOLD).into(),

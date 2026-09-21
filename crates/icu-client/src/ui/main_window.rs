@@ -351,7 +351,10 @@ impl eframe::App for App {
             if widgets::segmented(
                 ui,
                 &mut mode_choice,
-                &[(Mode::Ptt, "Push-to-Talk"), (Mode::Vad, "Sprachaktivierung")],
+                &[
+                    (Mode::Ptt, "Push-to-Talk"),
+                    (Mode::Vad, "Sprachaktivierung"),
+                ],
             )
             .changed()
             {
@@ -421,7 +424,12 @@ impl eframe::App for App {
                     self.send(Command::SetCamera(!state.camera_on));
                 }
                 #[cfg(feature = "overlay")]
-                if control_button(&mut cols[3], icon::SQUARES_FOUR, "Overlay", state.overlay_on) {
+                if control_button(
+                    &mut cols[3],
+                    icon::SQUARES_FOUR,
+                    "Overlay",
+                    state.overlay_on,
+                ) {
                     self.send(Command::SetOverlay(!state.overlay_on));
                 }
             });
@@ -467,7 +475,12 @@ impl eframe::App for App {
                         state.muted,
                         state.deafened,
                         state.camera_on,
-                        participant_subtitle(state.sending, state.muted, state.camera_on, Some(state.mode)),
+                        participant_subtitle(
+                            state.sending,
+                            state.muted,
+                            state.camera_on,
+                            Some(state.mode),
+                        ),
                         None,
                         &mut self.volume_open,
                         &self.cmd,
@@ -503,7 +516,11 @@ impl eframe::App for App {
                         ui.add_space(24.0);
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(52.0, 52.0), egui::Sense::hover());
-                        ui.painter().circle_filled(rect.center(), 26.0, ui.visuals().faint_bg_color);
+                        ui.painter().circle_filled(
+                            rect.center(),
+                            26.0,
+                            ui.visuals().faint_bg_color,
+                        );
                         ui.painter().text(
                             rect.center(),
                             egui::Align2::CENTER_CENTER,
@@ -514,9 +531,11 @@ impl eframe::App for App {
                         ui.add_space(8.0);
                         ui.label(RichText::new("Niemand sonst ist da").strong());
                         ui.label(
-                            RichText::new("Teile den Einladungslink, um jemanden hierher zu holen.")
-                                .small()
-                                .color(tok.dim_text),
+                            RichText::new(
+                                "Teile den Einladungslink, um jemanden hierher zu holen.",
+                            )
+                            .small()
+                            .color(tok.dim_text),
                         );
                     });
                 }
@@ -570,7 +589,12 @@ impl eframe::App for App {
 /// Second line under a participant's name: what they're currently doing,
 /// derived only from state already available (never invented). `mode` is
 /// `Some` only for the local user, since it's a client-local setting.
-fn participant_subtitle(speaking: bool, muted: bool, camera: bool, mode: Option<Mode>) -> Option<String> {
+fn participant_subtitle(
+    speaking: bool,
+    muted: bool,
+    camera: bool,
+    mode: Option<Mode>,
+) -> Option<String> {
     if speaking {
         Some(match mode {
             Some(Mode::Ptt) => "sendet · Push-to-Talk".to_string(),
@@ -687,7 +711,9 @@ fn participant_row(
                             .corner_radius(egui::CornerRadius::same(7))
                             .inner_margin(egui::Margin::symmetric(7, 3))
                             .show(ui, |ui| {
-                                ui.label(RichText::new(format!("{vol:.0} %")).monospace().size(11.0))
+                                ui.label(
+                                    RichText::new(format!("{vol:.0} %")).monospace().size(11.0),
+                                )
                             });
                         if chip.response.interact(egui::Sense::click()).clicked() {
                             *volume_open = if *volume_open == Some(user_id) {

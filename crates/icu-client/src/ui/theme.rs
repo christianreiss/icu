@@ -110,11 +110,17 @@ pub fn apply(ctx: &egui::Context, theme: &str) {
 fn text_styles() -> BTreeMap<TextStyle, FontId> {
     let semibold = super::fonts::semibold();
     BTreeMap::from([
-        (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+        (
+            TextStyle::Small,
+            FontId::new(11.0, FontFamily::Proportional),
+        ),
         (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
         (TextStyle::Button, FontId::new(13.5, semibold.clone())),
         (TextStyle::Heading, FontId::new(17.0, semibold)),
-        (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+        (
+            TextStyle::Monospace,
+            FontId::new(13.0, FontFamily::Monospace),
+        ),
     ])
 }
 
@@ -244,7 +250,10 @@ mod tests {
             let v = make();
             let t = tokens(&v);
             let ratio = contrast_ratio(t.muted_text, v.panel_fill);
-            assert!(ratio >= 4.5, "{name}: muted_text/panel contrast {ratio:.2} < 4.5");
+            assert!(
+                ratio >= 4.5,
+                "{name}: muted_text/panel contrast {ratio:.2} < 4.5"
+            );
         }
     }
 
@@ -254,7 +263,10 @@ mod tests {
             let v = make();
             let t = tokens(&v);
             let ratio = contrast_ratio(t.dim_text, v.panel_fill);
-            assert!(ratio >= 3.0, "{name}: dim_text/panel contrast {ratio:.2} < 3.0");
+            assert!(
+                ratio >= 3.0,
+                "{name}: dim_text/panel contrast {ratio:.2} < 3.0"
+            );
         }
     }
 
@@ -264,7 +276,10 @@ mod tests {
             let v = make();
             let t = tokens(&v);
             let ratio = contrast_ratio(t.on_accent, t.accent);
-            assert!(ratio >= 4.5, "{name}: on_accent/accent contrast {ratio:.2} < 4.5");
+            assert!(
+                ratio >= 4.5,
+                "{name}: on_accent/accent contrast {ratio:.2} < 4.5"
+            );
         }
     }
 
@@ -279,7 +294,10 @@ mod tests {
                 ("error", t.error),
             ] {
                 let ratio = contrast_ratio(c, v.panel_fill);
-                assert!(ratio >= 3.0, "{name}: {label}/panel contrast {ratio:.2} < 3.0");
+                assert!(
+                    ratio >= 3.0,
+                    "{name}: {label}/panel contrast {ratio:.2} < 3.0"
+                );
             }
         }
     }

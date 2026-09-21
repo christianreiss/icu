@@ -67,7 +67,10 @@ pub fn segmented<T: PartialEq + Copy>(
     let mut changed = false;
     let inner = Frame::new()
         .fill(ui.visuals().extreme_bg_color)
-        .stroke(Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color))
+        .stroke(Stroke::new(
+            1.0,
+            ui.visuals().widgets.inactive.bg_stroke.color,
+        ))
         .corner_radius(CornerRadius::same(9))
         .inner_margin(3)
         .show(ui, |ui| {
@@ -131,14 +134,18 @@ pub fn level_meter(
             } else {
                 tok.level
             };
-            let seg_rect = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(seg_w, seg_h));
+            let seg_rect =
+                egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(seg_w, seg_h));
             painter.rect_filled(seg_rect, 1.5, color);
             x += seg_w + gap;
         }
         if let Some(th) = vad_threshold {
             let tx = rect.left() + rect.width() * th.clamp(0.0, 1.0);
             painter.line_segment(
-                [egui::pos2(tx, rect.top() - 3.0), egui::pos2(tx, rect.bottom() + 3.0)],
+                [
+                    egui::pos2(tx, rect.top() - 3.0),
+                    egui::pos2(tx, rect.bottom() + 3.0),
+                ],
                 Stroke::new(2.0, ui.visuals().text_color()),
             );
         }
@@ -147,25 +154,67 @@ pub fn level_meter(
 }
 
 const AVATAR_DARK: [(Color32, Color32); 6] = [
-    (Color32::from_rgb(0x20, 0x30, 0x3f), Color32::from_rgb(0x8c, 0xc6, 0xf5)),
-    (Color32::from_rgb(0x2b, 0x24, 0x38), Color32::from_rgb(0xc5, 0xa8, 0xe6)),
-    (Color32::from_rgb(0x1f, 0x33, 0x29), Color32::from_rgb(0x8f, 0xd3, 0xac)),
-    (Color32::from_rgb(0x3a, 0x2a, 0x22), Color32::from_rgb(0xe5, 0xb0, 0x8c)),
-    (Color32::from_rgb(0x2c, 0x2b, 0x1e), Color32::from_rgb(0xdb, 0xd0, 0x8a)),
-    (Color32::from_rgb(0x25, 0x30, 0x3a), Color32::from_rgb(0x9f, 0xb8, 0xcc)),
+    (
+        Color32::from_rgb(0x20, 0x30, 0x3f),
+        Color32::from_rgb(0x8c, 0xc6, 0xf5),
+    ),
+    (
+        Color32::from_rgb(0x2b, 0x24, 0x38),
+        Color32::from_rgb(0xc5, 0xa8, 0xe6),
+    ),
+    (
+        Color32::from_rgb(0x1f, 0x33, 0x29),
+        Color32::from_rgb(0x8f, 0xd3, 0xac),
+    ),
+    (
+        Color32::from_rgb(0x3a, 0x2a, 0x22),
+        Color32::from_rgb(0xe5, 0xb0, 0x8c),
+    ),
+    (
+        Color32::from_rgb(0x2c, 0x2b, 0x1e),
+        Color32::from_rgb(0xdb, 0xd0, 0x8a),
+    ),
+    (
+        Color32::from_rgb(0x25, 0x30, 0x3a),
+        Color32::from_rgb(0x9f, 0xb8, 0xcc),
+    ),
 ];
 const AVATAR_LIGHT: [(Color32, Color32); 6] = [
-    (Color32::from_rgb(0xdd, 0xeb, 0xfa), Color32::from_rgb(0x17, 0x5a, 0x96)),
-    (Color32::from_rgb(0xeb, 0xe2, 0xf7), Color32::from_rgb(0x5b, 0x3d, 0x8c)),
-    (Color32::from_rgb(0xdd, 0xf0, 0xe5), Color32::from_rgb(0x18, 0x63, 0x43)),
-    (Color32::from_rgb(0xf8, 0xe7, 0xda), Color32::from_rgb(0x8a, 0x4b, 0x22)),
-    (Color32::from_rgb(0xf3, 0xef, 0xd8), Color32::from_rgb(0x6e, 0x61, 0x15)),
-    (Color32::from_rgb(0xe4, 0xea, 0xf0), Color32::from_rgb(0x3b, 0x4f, 0x61)),
+    (
+        Color32::from_rgb(0xdd, 0xeb, 0xfa),
+        Color32::from_rgb(0x17, 0x5a, 0x96),
+    ),
+    (
+        Color32::from_rgb(0xeb, 0xe2, 0xf7),
+        Color32::from_rgb(0x5b, 0x3d, 0x8c),
+    ),
+    (
+        Color32::from_rgb(0xdd, 0xf0, 0xe5),
+        Color32::from_rgb(0x18, 0x63, 0x43),
+    ),
+    (
+        Color32::from_rgb(0xf8, 0xe7, 0xda),
+        Color32::from_rgb(0x8a, 0x4b, 0x22),
+    ),
+    (
+        Color32::from_rgb(0xf3, 0xef, 0xd8),
+        Color32::from_rgb(0x6e, 0x61, 0x15),
+    ),
+    (
+        Color32::from_rgb(0xe4, 0xea, 0xf0),
+        Color32::from_rgb(0x3b, 0x4f, 0x61),
+    ),
 ];
 
 /// A circular avatar with a hash-picked fill and the name's initials;
 /// `speaking` draws an accent ring around it.
-pub fn avatar(ui: &mut Ui, name: &str, user_id: icu_proto::UserId, speaking: bool, size: f32) -> egui::Response {
+pub fn avatar(
+    ui: &mut Ui,
+    name: &str,
+    user_id: icu_proto::UserId,
+    speaking: bool,
+    size: f32,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
     if ui.is_rect_visible(rect) {
         let palette = if ui.visuals().dark_mode {
@@ -225,7 +274,9 @@ pub fn speaking_bars(ui: &mut Ui, speaking: bool) -> egui::Response {
 pub fn kbd(ui: &mut Ui, text: &str) -> egui::Response {
     let tok = theme::tokens(ui.visuals());
     let font = FontId::new(10.5, egui::FontFamily::Monospace);
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font, tok.dim_text);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font, tok.dim_text);
     let padding = egui::vec2(6.0, 3.0);
     let size = galley.size() + padding * 2.0;
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
@@ -244,7 +295,12 @@ pub fn kbd(ui: &mut Ui, text: &str) -> egui::Response {
 }
 
 /// A rounded status pill: dot + text, with an optional `· trailing` value.
-pub fn status_pill(ui: &mut Ui, color: Color32, text: &str, trailing: Option<&str>) -> egui::Response {
+pub fn status_pill(
+    ui: &mut Ui,
+    color: Color32,
+    text: &str,
+    trailing: Option<&str>,
+) -> egui::Response {
     let tok = theme::tokens(ui.visuals());
     Frame::new()
         .fill(color.gamma_multiply(0.16))
@@ -330,7 +386,10 @@ pub fn group_card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui
     let mut result = None;
     Frame::new()
         .fill(ui.visuals().faint_bg_color)
-        .stroke(Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color))
+        .stroke(Stroke::new(
+            1.0,
+            ui.visuals().widgets.inactive.bg_stroke.color,
+        ))
         .corner_radius(CornerRadius::same(12))
         .show(ui, |ui| {
             result = Some(add_contents(ui));
@@ -392,10 +451,15 @@ pub fn slider_row(
                     let chip = format!("{value:.1}{suffix}");
                     Frame::new()
                         .fill(ui.visuals().extreme_bg_color)
-                        .stroke(Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color))
+                        .stroke(Stroke::new(
+                            1.0,
+                            ui.visuals().widgets.inactive.bg_stroke.color,
+                        ))
                         .corner_radius(CornerRadius::same(7))
                         .inner_margin(egui::Margin::symmetric(6, 2))
-                        .show(ui, |ui| ui.label(RichText::new(chip).monospace().size(11.5)));
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(chip).monospace().size(11.5))
+                        });
                 });
             });
             let resp = ui.add(egui::Slider::new(value, range.clone()).show_value(false));
