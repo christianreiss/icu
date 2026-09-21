@@ -773,19 +773,23 @@ fn binding_row(
                 );
                 widgets::kbd(ui, &binding.key);
                 widgets::kbd(ui, binding.trigger.as_deref().unwrap_or("—"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let is_open = expanded.contains(label);
-                    if ui
-                        .small_button(if is_open { "Fertig" } else { "Ändern" })
-                        .clicked()
-                    {
-                        if is_open {
-                            expanded.remove(label);
-                        } else {
-                            expanded.insert(label);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 24.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let is_open = expanded.contains(label);
+                        if ui
+                            .small_button(if is_open { "Fertig" } else { "Ändern" })
+                            .clicked()
+                        {
+                            if is_open {
+                                expanded.remove(label);
+                            } else {
+                                expanded.insert(label);
+                            }
                         }
-                    }
-                });
+                    },
+                );
             });
             if expanded.contains(label) {
                 ui.horizontal(|ui| {

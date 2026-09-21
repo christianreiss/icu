@@ -367,11 +367,15 @@ pub fn banner<F1: FnOnce(), F2: FnOnce()>(
                     }
                 });
                 if let Some(dismiss) = on_dismiss {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        if ui.small_button(icon::X).clicked() {
-                            dismiss();
-                        }
-                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 22.0),
+                        egui::Layout::right_to_left(egui::Align::TOP),
+                        |ui| {
+                            if ui.small_button(icon::X).clicked() {
+                                dismiss();
+                            }
+                        },
+                    );
                 }
             });
         });
@@ -421,9 +425,16 @@ pub fn setting_row<R>(
                         ui.label(RichText::new(h).size(11.5).color(tok.dim_text));
                     }
                 });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    result = Some(control(ui));
-                });
+                // Explicit height: plain `with_layout` would claim the
+                // parent's whole remaining height and, with `Align::Center`,
+                // blow the row up to that size (see `main_window.rs`).
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 30.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        result = Some(control(ui));
+                    },
+                );
             });
         });
     result.expect("control closure always runs")
@@ -447,20 +458,24 @@ pub fn slider_row(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(label).size(13.5));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let chip = format!("{value:.1}{suffix}");
-                    Frame::new()
-                        .fill(ui.visuals().extreme_bg_color)
-                        .stroke(Stroke::new(
-                            1.0,
-                            ui.visuals().widgets.inactive.bg_stroke.color,
-                        ))
-                        .corner_radius(CornerRadius::same(7))
-                        .inner_margin(egui::Margin::symmetric(6, 2))
-                        .show(ui, |ui| {
-                            ui.label(RichText::new(chip).monospace().size(11.5))
-                        });
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 24.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let chip = format!("{value:.1}{suffix}");
+                        Frame::new()
+                            .fill(ui.visuals().extreme_bg_color)
+                            .stroke(Stroke::new(
+                                1.0,
+                                ui.visuals().widgets.inactive.bg_stroke.color,
+                            ))
+                            .corner_radius(CornerRadius::same(7))
+                            .inner_margin(egui::Margin::symmetric(6, 2))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(chip).monospace().size(11.5))
+                            });
+                    },
+                );
             });
             let resp = ui.add(egui::Slider::new(value, range.clone()).show_value(false));
             ui.horizontal(|ui| {
@@ -470,14 +485,18 @@ pub fn slider_row(
                         .size(10.0)
                         .color(tok.dim_text),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!("{:.0}{suffix}", range.end()))
-                            .monospace()
-                            .size(10.0)
-                            .color(tok.dim_text),
-                    );
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 14.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.label(
+                            RichText::new(format!("{:.0}{suffix}", range.end()))
+                                .monospace()
+                                .size(10.0)
+                                .color(tok.dim_text),
+                        );
+                    },
+                );
             });
             resp
         })

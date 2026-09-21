@@ -266,69 +266,78 @@ impl eframe::App for App {
                     );
                 });
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let gear = egui::Button::new(RichText::new(icon::GEAR_FINE).size(16.0))
-                        .fill(if self.settings.is_some() {
-                            ui.visuals().faint_bg_color
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .corner_radius(egui::CornerRadius::same(9))
-                        .min_size(egui::vec2(36.0, 36.0));
-                    if ui.add(gear).on_hover_text("Einstellungen").clicked() {
-                        self.settings = match self.settings.take() {
-                            Some(_) => None,
-                            None => {
-                                let paths = self
-                                    .engine
-                                    .lock()
-                                    .unwrap()
-                                    .as_ref()
-                                    .map(|e| e.paths())
-                                    .unwrap_or_else(|| Paths::new(None));
-                                Some(SettingsView::new(
-                                    &state,
-                                    state.hotkey_backend.clone(),
-                                    self.stats.clone(),
-                                    paths,
-                                ))
-                            }
-                        };
-                    }
-
-                    let bug = egui::Button::new(RichText::new(icon::BUG).size(16.0))
-                        .fill(if self.debug_window_open {
-                            ui.visuals().faint_bg_color
-                        } else {
-                            Color32::TRANSPARENT
-                        })
-                        .corner_radius(egui::CornerRadius::same(9))
-                        .min_size(egui::vec2(36.0, 36.0));
-                    if ui.add(bug).on_hover_text("Debug-Fenster").clicked() {
-                        self.debug_window_open = !self.debug_window_open;
-                        if self.debug_window_open {
-                            self.stats_text = self.stats.report();
-                            self.last_stats = Instant::now();
+                // `allocate_ui_with_layout` with an explicit height, not
+                // `with_layout`: the latter claims the parent's *entire*
+                // remaining height, and `Align::Center` then centers the
+                // content inside that tall rect, which balloons the row's
+                // `min_rect` and pushes everything after it off-screen.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 36.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let gear = egui::Button::new(RichText::new(icon::GEAR_FINE).size(16.0))
+                            .fill(if self.settings.is_some() {
+                                ui.visuals().faint_bg_color
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(egui::CornerRadius::same(9))
+                            .min_size(egui::vec2(36.0, 36.0));
+                        if ui.add(gear).on_hover_text("Einstellungen").clicked() {
+                            self.settings = match self.settings.take() {
+                                Some(_) => None,
+                                None => {
+                                    let paths = self
+                                        .engine
+                                        .lock()
+                                        .unwrap()
+                                        .as_ref()
+                                        .map(|e| e.paths())
+                                        .unwrap_or_else(|| Paths::new(None));
+                                    Some(SettingsView::new(
+                                        &state,
+                                        state.hotkey_backend.clone(),
+                                        self.stats.clone(),
+                                        paths,
+                                    ))
+                                }
+                            };
                         }
-                    }
 
-                    // Own outgoing video quality tier, set by
-                    // `crate::quality::QualityController`. Automatic, no
-                    // settings toggle (`Research/feature-freeze.md`'s bias
-                    // against exposing adaptive behavior as a dial) — but
-                    // shown, since a tier-down is visible to other people as
-                    // this client's video degrading.
-                    let tier =
-                        VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8);
-                    let label = match tier {
-                        VideoTier::T0 => None,
-                        VideoTier::T4 => Some("Video pausiert (Netz)"),
-                        _ => Some("Video reduziert"),
-                    };
-                    if let Some(label) = label {
-                        ui.label(RichText::new(label).small().color(tok.connecting));
-                    }
-                });
+                        let bug = egui::Button::new(RichText::new(icon::BUG).size(16.0))
+                            .fill(if self.debug_window_open {
+                                ui.visuals().faint_bg_color
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(egui::CornerRadius::same(9))
+                            .min_size(egui::vec2(36.0, 36.0));
+                        if ui.add(bug).on_hover_text("Debug-Fenster").clicked() {
+                            self.debug_window_open = !self.debug_window_open;
+                            if self.debug_window_open {
+                                self.stats_text = self.stats.report();
+                                self.last_stats = Instant::now();
+                            }
+                        }
+
+                        // Own outgoing video quality tier, set by
+                        // `crate::quality::QualityController`. Automatic, no
+                        // settings toggle (`Research/feature-freeze.md`'s bias
+                        // against exposing adaptive behavior as a dial) — but
+                        // shown, since a tier-down is visible to other people as
+                        // this client's video degrading.
+                        let tier =
+                            VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8);
+                        let label = match tier {
+                            VideoTier::T0 => None,
+                            VideoTier::T4 => Some("Video pausiert (Netz)"),
+                            _ => Some("Video reduziert"),
+                        };
+                        if let Some(label) = label {
+                            ui.label(RichText::new(label).small().color(tok.connecting));
+                        }
+                    },
+                );
             });
 
             if let Some(min) = &state.update_required {
@@ -374,24 +383,28 @@ impl eframe::App for App {
                         .small()
                         .color(tok.dim_text),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if state.sending {
-                        ui.label(
-                            RichText::new("SENDET")
-                                .size(11.0)
-                                .color(tok.accent)
-                                .font(egui::FontId::new(11.0, fonts::semibold())),
-                        );
-                        widgets::speaking_bars(ui, true);
-                    } else if state.mode == Mode::Vad {
-                        ui.label(
-                            RichText::new(format!("VAD {:.2}", state.vad_prob))
-                                .monospace()
-                                .small()
-                                .color(tok.dim_text),
-                        );
-                    }
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 16.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if state.sending {
+                            ui.label(
+                                RichText::new("SENDET")
+                                    .size(11.0)
+                                    .color(tok.accent)
+                                    .font(egui::FontId::new(11.0, fonts::semibold())),
+                            );
+                            widgets::speaking_bars(ui, true);
+                        } else if state.mode == Mode::Vad {
+                            ui.label(
+                                RichText::new(format!("VAD {:.2}", state.vad_prob))
+                                    .monospace()
+                                    .small()
+                                    .color(tok.dim_text),
+                            );
+                        }
+                    },
+                );
             });
 
             ui.add_space(6.0);
@@ -415,25 +428,32 @@ impl eframe::App for App {
             };
             // Right-to-left: the small PTT/VAD toggle claims its natural
             // width first (rightmost), then the speak button fills whatever
-            // remains to its left — avoids guessing the toggle's width.
+            // remains to its left — avoids guessing the toggle's width. The
+            // height is allocated explicitly (see the header comment above:
+            // plain `with_layout` would claim the panel's whole remaining
+            // height and push the buttons below it out of the window).
             let ptt = ui
-                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut mode_choice = state.mode;
-                    if widgets::segmented(
-                        ui,
-                        &mut mode_choice,
-                        &[(Mode::Ptt, "PTT"), (Mode::Vad, "VAD")],
-                    )
-                    .changed()
-                    {
-                        self.send(Command::ToggleMode);
-                    }
-                    let btn = egui::Button::new(RichText::new(label).color(text_color))
-                        .fill(fill)
-                        .corner_radius(egui::CornerRadius::same(11))
-                        .min_size(egui::vec2(ui.available_width(), 46.0));
-                    ui.add(btn)
-                })
+                .allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 46.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let mut mode_choice = state.mode;
+                        if widgets::segmented(
+                            ui,
+                            &mut mode_choice,
+                            &[(Mode::Ptt, "PTT"), (Mode::Vad, "VAD")],
+                        )
+                        .changed()
+                        {
+                            self.send(Command::ToggleMode);
+                        }
+                        let btn = egui::Button::new(RichText::new(label).color(text_color))
+                            .fill(fill)
+                            .corner_radius(egui::CornerRadius::same(11))
+                            .min_size(egui::vec2(ui.available_width(), 46.0));
+                        ui.add(btn)
+                    },
+                )
                 .inner;
             if state.mode == Mode::Ptt {
                 ptt.clone().on_hover_ui(|ui| {
@@ -494,11 +514,15 @@ impl eframe::App for App {
                         RichText::new("Einstellungen")
                             .font(egui::FontId::new(20.0, fonts::semibold())),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(icon::X).clicked() {
-                            close = true;
-                        }
-                    });
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 30.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.button(icon::X).clicked() {
+                                close = true;
+                            }
+                        },
+                    );
                 });
                 if close {
                     self.settings = None;
@@ -515,105 +539,108 @@ impl eframe::App for App {
                 }
                 return;
             }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                if let Some(me) = &state.me {
-                    participant_row(
-                        ui,
-                        &me.name,
-                        me.user_id,
-                        state.sending,
-                        state.muted,
-                        state.deafened,
-                        state.camera_on,
-                        participant_subtitle(
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if let Some(me) = &state.me {
+                        participant_row(
+                            ui,
+                            &me.name,
+                            me.user_id,
                             state.sending,
                             state.muted,
+                            state.deafened,
                             state.camera_on,
-                            Some(state.mode),
-                        ),
-                        None,
-                        &mut self.volume_open,
-                        &self.cmd,
-                        true,
-                    );
-                }
-                let mut peers = state.peers.clone();
-                peers.sort_by_key(|a| a.info.name.to_lowercase());
-                for p in &peers {
-                    participant_row(
-                        ui,
-                        &p.info.name,
-                        p.info.user_id,
-                        p.speaking,
-                        p.info.flags.muted(),
-                        p.info.flags.deafened(),
-                        p.info.flags.camera_on(),
-                        participant_subtitle(
+                            participant_subtitle(
+                                state.sending,
+                                state.muted,
+                                state.camera_on,
+                                Some(state.mode),
+                            ),
+                            None,
+                            &mut self.volume_open,
+                            &self.cmd,
+                            true,
+                        );
+                    }
+                    let mut peers = state.peers.clone();
+                    peers.sort_by_key(|a| a.info.name.to_lowercase());
+                    for p in &peers {
+                        participant_row(
+                            ui,
+                            &p.info.name,
+                            p.info.user_id,
                             p.speaking,
                             p.info.flags.muted(),
+                            p.info.flags.deafened(),
                             p.info.flags.camera_on(),
-                            None,
-                        ),
-                        Some((p.info.user_id, p.volume)),
-                        &mut self.volume_open,
-                        &self.cmd,
-                        false,
-                    );
-                }
-                if state.peers.is_empty() && state.conn == ConnStatus::Connected {
-                    let tok = theme::tokens(ui.visuals());
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(24.0);
-                        let (rect, _) =
-                            ui.allocate_exact_size(egui::vec2(52.0, 52.0), egui::Sense::hover());
-                        ui.painter().circle_filled(
-                            rect.center(),
-                            26.0,
-                            ui.visuals().faint_bg_color,
+                            participant_subtitle(
+                                p.speaking,
+                                p.info.flags.muted(),
+                                p.info.flags.camera_on(),
+                                None,
+                            ),
+                            Some((p.info.user_id, p.volume)),
+                            &mut self.volume_open,
+                            &self.cmd,
+                            false,
                         );
-                        ui.painter().text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            icon::USERS,
-                            egui::FontId::new(22.0, egui::FontFamily::Proportional),
-                            tok.dim_text,
-                        );
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Niemand sonst ist da").strong());
-                        ui.label(
-                            RichText::new(
-                                "Teile den Einladungslink, um jemanden hierher zu holen.",
-                            )
-                            .small()
-                            .color(tok.dim_text),
-                        );
-                    });
-                }
-                #[cfg(feature = "camera")]
-                if let Some(camera) = self.camera.as_mut() {
-                    if state.camera_on && state.settings.camera.show_self_preview {
-                        ui.add_space(4.0);
-                        let tok = theme::tokens(ui.visuals());
-                        egui::Frame::new()
-                            .fill(ui.visuals().faint_bg_color)
-                            .stroke(egui::Stroke::new(
-                                1.0,
-                                ui.visuals().widgets.inactive.bg_stroke.color,
-                            ))
-                            .corner_radius(egui::CornerRadius::same(12))
-                            .inner_margin(6)
-                            .show(ui, |ui| {
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::TOP),
-                                    |ui| {
-                                        widgets::status_pill(ui, tok.error, "LIVE", None);
-                                    },
-                                );
-                                camera.preview(ui);
-                            });
                     }
-                }
-            });
+                    if state.peers.is_empty() && state.conn == ConnStatus::Connected {
+                        let tok = theme::tokens(ui.visuals());
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(24.0);
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(52.0, 52.0), egui::Sense::hover());
+                            ui.painter().circle_filled(
+                                rect.center(),
+                                26.0,
+                                ui.visuals().faint_bg_color,
+                            );
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                icon::USERS,
+                                egui::FontId::new(22.0, egui::FontFamily::Proportional),
+                                tok.dim_text,
+                            );
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Niemand sonst ist da").strong());
+                            ui.label(
+                                RichText::new(
+                                    "Teile den Einladungslink, um jemanden hierher zu holen.",
+                                )
+                                .small()
+                                .color(tok.dim_text),
+                            );
+                        });
+                    }
+                    #[cfg(feature = "camera")]
+                    if let Some(camera) = self.camera.as_mut() {
+                        if state.camera_on && state.settings.camera.show_self_preview {
+                            ui.add_space(4.0);
+                            let tok = theme::tokens(ui.visuals());
+                            egui::Frame::new()
+                                .fill(ui.visuals().faint_bg_color)
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    ui.visuals().widgets.inactive.bg_stroke.color,
+                                ))
+                                .corner_radius(egui::CornerRadius::same(12))
+                                .inner_margin(6)
+                                .show(ui, |ui| {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(ui.available_width(), 22.0),
+                                        egui::Layout::right_to_left(egui::Align::TOP),
+                                        |ui| {
+                                            widgets::status_pill(ui, tok.error, "LIVE", None);
+                                        },
+                                    );
+                                    camera.preview(ui);
+                                });
+                        }
+                    }
+                });
         });
     }
 
@@ -746,39 +773,43 @@ fn participant_row(
                         ui.label(RichText::new(subtitle).size(11.5).color(tok.dim_text));
                     }
                 });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some((user_id, vol)) = volume {
-                        let chip = egui::Frame::new()
-                            .fill(ui.visuals().extreme_bg_color)
-                            .stroke(egui::Stroke::new(
-                                1.0,
-                                ui.visuals().widgets.inactive.bg_stroke.color,
-                            ))
-                            .corner_radius(egui::CornerRadius::same(7))
-                            .inner_margin(egui::Margin::symmetric(7, 3))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(format!("{vol:.0} %")).monospace().size(11.0),
-                                )
-                            });
-                        if chip.response.interact(egui::Sense::click()).clicked() {
-                            *volume_open = if *volume_open == Some(user_id) {
-                                None
-                            } else {
-                                Some(user_id)
-                            };
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 34.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        if let Some((user_id, vol)) = volume {
+                            let chip = egui::Frame::new()
+                                .fill(ui.visuals().extreme_bg_color)
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    ui.visuals().widgets.inactive.bg_stroke.color,
+                                ))
+                                .corner_radius(egui::CornerRadius::same(7))
+                                .inner_margin(egui::Margin::symmetric(7, 3))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(format!("{vol:.0} %")).monospace().size(11.0),
+                                    )
+                                });
+                            if chip.response.interact(egui::Sense::click()).clicked() {
+                                *volume_open = if *volume_open == Some(user_id) {
+                                    None
+                                } else {
+                                    Some(user_id)
+                                };
+                            }
                         }
-                    }
-                    if deafened {
-                        ui.colored_label(tok.error, icon::SPEAKER_SLASH);
-                    }
-                    if muted {
-                        ui.colored_label(tok.error, icon::MICROPHONE_SLASH);
-                    }
-                    if camera {
-                        ui.colored_label(tok.muted_text, icon::VIDEO_CAMERA);
-                    }
-                });
+                        if deafened {
+                            ui.colored_label(tok.error, icon::SPEAKER_SLASH);
+                        }
+                        if muted {
+                            ui.colored_label(tok.error, icon::MICROPHONE_SLASH);
+                        }
+                        if camera {
+                            ui.colored_label(tok.muted_text, icon::VIDEO_CAMERA);
+                        }
+                    },
+                );
             });
         });
     if let Some((user_id, vol)) = volume {
