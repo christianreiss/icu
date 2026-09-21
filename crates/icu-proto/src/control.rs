@@ -49,6 +49,8 @@ pub enum ControlMsg {
         users: Vec<UserInfo>,
         /// Lowest allowed client version, SemVer.
         min_client: String,
+        /// Whether `you` may send `CreateInviteRequest`.
+        is_admin: bool,
     },
     /// 2, S→C.
     UserJoined {
@@ -138,6 +140,21 @@ pub enum ControlMsg {
         /// Per mille of frames displaced in a receiver's slot before delivery.
         drop_permille: u16,
     },
+    /// 17, C→S. Admin only (`Welcome.is_admin`); rejected with `Error{NOT_ADMIN}`
+    /// otherwise. Non fatal either way.
+    CreateInviteRequest {
+        /// Name the certificate CN will carry.
+        name: String,
+        /// Lifetime in seconds. `0` means the default (`limits::INVITE_TTL_S`).
+        ttl_s: u64,
+    },
+    /// 18, S→C.
+    CreateInviteResponse {
+        /// Self-contained ASCII-armored invite, `ICU1-…`.
+        blob: String,
+        /// When the underlying invite expires, RFC 3339 UTC.
+        expires: String,
+    },
 }
 
 impl ControlMsg {
@@ -176,6 +193,8 @@ impl ControlMsg {
             ControlMsg::SetName { .. } => "SetName",
             ControlMsg::UserRenamed { .. } => "UserRenamed",
             ControlMsg::VideoCongestionHint { .. } => "VideoCongestionHint",
+            ControlMsg::CreateInviteRequest { .. } => "CreateInviteRequest",
+            ControlMsg::CreateInviteResponse { .. } => "CreateInviteResponse",
         }
     }
 
@@ -190,6 +209,7 @@ impl ControlMsg {
                 | ControlMsg::LossReport { .. }
                 | ControlMsg::KeyframeRequest { .. }
                 | ControlMsg::SetName { .. }
+                | ControlMsg::CreateInviteRequest { .. }
         )
     }
 }
@@ -269,6 +289,7 @@ mod tests {
                 audio: AudioParams::default(),
                 users: vec![user(2, 2, "bob"), user(3, 3, "carol")],
                 min_client: "0.1.0".into(),
+                is_admin: true,
             },
             ControlMsg::UserJoined {
                 user: user(4, 4, "dave"),
@@ -313,6 +334,14 @@ mod tests {
                 name: "alice2".into(),
             },
             ControlMsg::VideoCongestionHint { drop_permille: 50 },
+            ControlMsg::CreateInviteRequest {
+                name: "eve".into(),
+                ttl_s: 3600,
+            },
+            ControlMsg::CreateInviteResponse {
+                blob: "ICU1-abc".into(),
+                expires: "2026-09-22T00:00:00Z".into(),
+            },
         ]
     }
 
@@ -320,7 +349,7 @@ mod tests {
     #[test]
     fn roundtrip_all_control_variants() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 17, "v1 has exactly 17 control variants");
+        assert_eq!(variants.len(), 19, "v1 has exactly 19 control variants");
         for msg in variants {
             let frame = msg.encode().unwrap();
             let body = framing::split_frame(&frame, MAX_CONTROL_FRAME)
@@ -398,8 +427,8 @@ mod tests {
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
     #[test]
     fn unknown_variant_is_an_error() {
-        // Discriminant 17 does not exist in v1.
-        let body = [17u8, 0, 0];
+        // Discriminant 19 does not exist in v1.
+        let body = [19u8, 0, 0];
         let err = ControlMsg::decode(&body).unwrap_err();
         assert!(
             matches!(err, ProtoError::UnknownVariant),
@@ -431,6 +460,16 @@ mod tests {
         assert!(ControlMsg::LossReport {
             speaker: 1,
             loss_permille: 0
+        }
+        .is_client_to_server());
+        assert!(ControlMsg::CreateInviteRequest {
+            name: "eve".into(),
+            ttl_s: 0
+        }
+        .is_client_to_server());
+        assert!(!ControlMsg::CreateInviteResponse {
+            blob: String::new(),
+            expires: String::new()
         }
         .is_client_to_server());
     }

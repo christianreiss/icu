@@ -16,28 +16,64 @@ use crate::config::{Identity, ServerInfo};
 
 use super::{read_frame, resolve, NetError};
 
-/// A parsed `icu://host:port/enroll?t=…&ca=…&n=…` link.
+/// A parsed invite, in one of three shapes (`PROTOCOL.md` §2.3, §2.3.1):
+/// an `icu://…` link, a self-contained `ICU1-…` blob, or a bare `host[:port]`
+/// for the one-time bootstrap enrollment against a fresh server.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InviteLink {
-    /// Host (DNS name or IP literal).
-    pub host: String,
-    /// Port.
-    pub port: u16,
-    /// Token, 22 base64url characters.
-    pub token: String,
-    /// CA pin, base64url without padding of SHA-256(CA DER).
-    pub ca_pin: String,
-    /// Display name.
-    pub name: String,
+pub enum InviteLink {
+    /// `icu://host:port/enroll?t=…&ca=…&n=…`.
+    Link {
+        /// Host (DNS name or IP literal).
+        host: String,
+        /// Port.
+        port: u16,
+        /// Token, 22 base64url characters.
+        token: String,
+        /// CA pin, base64url without padding of SHA-256(CA DER).
+        ca_pin: String,
+        /// Display name, carried by the link itself.
+        name: String,
+    },
+    /// `ICU1-…`, minted by an admin via `CreateInviteRequest`.
+    Blob {
+        /// Host (DNS name or IP literal).
+        host: String,
+        /// Port.
+        port: u16,
+        /// The server's CA certificate, DER, carried in full.
+        ca_der: Vec<u8>,
+        /// The blob's body, re-encoded, relayed opaquely as
+        /// `EnrollRequest.token`.
+        passthrough_token: String,
+        /// SNI the blob was minted for, for display only.
+        server_name_hint: String,
+    },
+    /// Bare `host[:port]`, no token: enrollment against a store with no
+    /// users yet (`ENROLL_BOOTSTRAP_CLOSED` once one exists).
+    Bootstrap {
+        /// Host (DNS name or IP literal).
+        host: String,
+        /// Port.
+        port: u16,
+    },
 }
 
 impl InviteLink {
-    /// Parses a link. Accepts a missing port (default 4711).
+    /// Parses any of the three accepted shapes. Accepts a missing port
+    /// (default 4711).
     pub fn parse(link: &str) -> Result<InviteLink, NetError> {
-        let rest = link
-            .trim()
-            .strip_prefix("icu://")
-            .ok_or_else(|| NetError::BadLink("missing icu:// scheme".into()))?;
+        let link = link.trim();
+        if let Some(rest) = link.strip_prefix("icu://") {
+            return Self::parse_link(rest);
+        }
+        if link.starts_with(icu_proto::invite_blob::ARMOR_PREFIX) {
+            return Self::parse_blob(link);
+        }
+        let (host, port) = split_host_port(link)?;
+        Ok(InviteLink::Bootstrap { host, port })
+    }
+
+    fn parse_link(rest: &str) -> Result<InviteLink, NetError> {
         let (authority, path_query) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
             None => return Err(NetError::BadLink("missing /enroll path".into())),
@@ -69,13 +105,35 @@ impl InviteLink {
         let ca_pin = ca_pin.ok_or_else(|| NetError::BadLink("missing ca=".into()))?;
         let name = name.ok_or_else(|| NetError::BadLink("missing n=".into()))?;
         icu_proto::validate_name(&name).map_err(|e| NetError::BadLink(e.to_string()))?;
-        Ok(InviteLink {
+        Ok(InviteLink::Link {
             host,
             port,
             token,
             ca_pin,
             name,
         })
+    }
+
+    fn parse_blob(armored: &str) -> Result<InviteLink, NetError> {
+        let blob = icu_proto::invite_blob::InviteBlob::decode(armored)
+            .map_err(|e| NetError::BadLink(e.to_string()))?;
+        let (host, port) = split_host_port(&blob.host_port)?;
+        Ok(InviteLink::Blob {
+            host,
+            port,
+            ca_der: blob.ca_der.clone(),
+            passthrough_token: blob.body_base64(),
+            server_name_hint: blob.server_name,
+        })
+    }
+
+    /// Host and port to dial, regardless of shape.
+    pub fn host_port(&self) -> (&str, u16) {
+        match self {
+            InviteLink::Link { host, port, .. }
+            | InviteLink::Blob { host, port, .. }
+            | InviteLink::Bootstrap { host, port } => (host.as_str(), *port),
+        }
     }
 }
 
@@ -126,16 +184,34 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// How a [`PinVerifier`] decides whether to trust the CA presented during
+/// enrollment.
+#[derive(Debug)]
+enum Pin {
+    /// SHA-256 of the CA DER must match (the `icu://…?ca=` link).
+    Hash(Vec<u8>),
+    /// The CA DER must match byte for byte (an `ICU1-…` blob, which already
+    /// carries the full certificate).
+    FullDer(Vec<u8>),
+    /// Accept any length-2 chain unconditionally: zero-prior
+    /// trust-on-first-use, only for [`InviteLink::Bootstrap`] where no prior
+    /// secret can exist yet by construction. Not a regression versus the
+    /// other two modes — an `icu://` link already puts 100% of the trust on
+    /// whoever handed it out; this just makes that explicit for the one
+    /// unavoidable case where no such out-of-band channel exists at all.
+    TrustFirst,
+}
+
 /// The pinning verifier: accepts exactly a chain of length 2 whose last
-/// element hashes to the pin. Ignores SNI and validity.
+/// element matches the configured [`Pin`]. Ignores SNI and validity.
 #[derive(Debug)]
 pub struct PinVerifier {
-    pin: Vec<u8>,
+    pin: Pin,
     provider: Arc<CryptoProvider>,
 }
 
 impl PinVerifier {
-    /// From the base64url (unpadded) pin of the link.
+    /// From the base64url (unpadded) SHA-256 pin of an `icu://` link.
     pub fn new(ca_pin: &str, provider: Arc<CryptoProvider>) -> Result<PinVerifier, NetError> {
         use base64::Engine;
         let pin = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -144,7 +220,26 @@ impl PinVerifier {
         if pin.len() != 32 {
             return Err(NetError::BadLink("ca= is not a SHA-256".into()));
         }
-        Ok(PinVerifier { pin, provider })
+        Ok(PinVerifier {
+            pin: Pin::Hash(pin),
+            provider,
+        })
+    }
+
+    /// From the full CA DER carried by an `ICU1-…` blob.
+    pub fn from_ca_der(ca_der: Vec<u8>, provider: Arc<CryptoProvider>) -> PinVerifier {
+        PinVerifier {
+            pin: Pin::FullDer(ca_der),
+            provider,
+        }
+    }
+
+    /// Zero-prior trust-on-first-use, for [`InviteLink::Bootstrap`] only.
+    pub fn trust_first(provider: Arc<CryptoProvider>) -> PinVerifier {
+        PinVerifier {
+            pin: Pin::TrustFirst,
+            provider,
+        }
     }
 }
 
@@ -163,11 +258,23 @@ impl ServerCertVerifier for PinVerifier {
                 intermediates.len() + 1
             )));
         }
-        let hash = sha2::Sha256::digest(intermediates[0].as_ref());
-        if hash.as_slice() != self.pin.as_slice() {
-            return Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::UnknownIssuer,
-            ));
+        match &self.pin {
+            Pin::Hash(expected) => {
+                let hash = sha2::Sha256::digest(intermediates[0].as_ref());
+                if hash.as_slice() != expected.as_slice() {
+                    return Err(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::UnknownIssuer,
+                    ));
+                }
+            }
+            Pin::FullDer(expected) => {
+                if intermediates[0].as_ref() != expected.as_slice() {
+                    return Err(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::UnknownIssuer,
+                    ));
+                }
+            }
+            Pin::TrustFirst => {}
         }
         Ok(ServerCertVerified::assertion())
     }
@@ -209,14 +316,38 @@ impl ServerCertVerifier for PinVerifier {
 
 /// Runs the enrollment and returns the identity to store.
 ///
-/// `addr_override` replaces the DNS lookup of the link host (tests bind
-/// ephemeral ports).
+/// `display_name` is used as `EnrollRequest.name` for [`InviteLink::Blob`]
+/// and [`InviteLink::Bootstrap`], which carry no name of their own (unlike
+/// [`InviteLink::Link`], whose `n=` already fixes it — `display_name` is
+/// ignored in that case). `addr_override` replaces the DNS lookup of the
+/// link host (tests bind ephemeral ports).
 pub async fn enroll(
     link: &InviteLink,
+    display_name: &str,
     addr_override: Option<SocketAddr>,
 ) -> Result<Identity, NetError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = Arc::new(PinVerifier::new(&link.ca_pin, provider.clone())?);
+    let verifier = Arc::new(match link {
+        InviteLink::Link { ca_pin, .. } => PinVerifier::new(ca_pin, provider.clone())?,
+        InviteLink::Blob { ca_der, .. } => PinVerifier::from_ca_der(ca_der.clone(), provider.clone()),
+        InviteLink::Bootstrap { .. } => PinVerifier::trust_first(provider.clone()),
+    });
+    let (host, port) = link.host_port();
+    let token = match link {
+        InviteLink::Link { token, .. } => token.clone(),
+        InviteLink::Blob {
+            passthrough_token, ..
+        } => passthrough_token.clone(),
+        InviteLink::Bootstrap { .. } => String::new(),
+    };
+    let cn = match link {
+        InviteLink::Link { name, .. } => name.clone(),
+        InviteLink::Blob { .. } | InviteLink::Bootstrap { .. } => {
+            icu_proto::validate_name(display_name).map_err(|e| NetError::BadLink(e.to_string()))?;
+            display_name.to_string()
+        }
+    };
+
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| NetError::Tls(e.to_string()))?
@@ -227,7 +358,7 @@ pub async fn enroll(
 
     let addr = match addr_override {
         Some(a) => a,
-        None => resolve(&link.host, link.port).await?,
+        None => resolve(host, port).await?,
     };
     let endpoint = super::bind_endpoint(addr)?;
     let mut config = quinn::ClientConfig::new(Arc::new(
@@ -242,13 +373,13 @@ pub async fn enroll(
     let mut params = rcgen::CertificateParams::default();
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, link.name.clone());
+        .push(rcgen::DnType::CommonName, cn.clone());
     let csr = params
         .serialize_request(&key)
         .map_err(|e| NetError::Other(e.to_string()))?;
 
     let connecting = endpoint
-        .connect_with(config, addr, &server_name_for(&link.host))
+        .connect_with(config, addr, &server_name_for(host))
         .map_err(|e| NetError::Connect(e.to_string()))?;
     let conn = tokio::time::timeout(Duration::from_secs(10), connecting)
         .await
@@ -259,9 +390,9 @@ pub async fn enroll(
         .await
         .map_err(|e| NetError::Connect(e.to_string()))?;
     let request = EnrollMsg::EnrollRequest {
-        token: link.token.clone(),
+        token,
         csr_der: csr.der().to_vec(),
-        name: link.name.clone(),
+        name: cn.clone(),
     };
     send.write_all(
         &request
@@ -295,10 +426,10 @@ pub async fn enroll(
             leaf_der,
             ca_der,
             server: ServerInfo {
-                host: link.host.clone(),
-                port: link.port,
+                host: host.to_string(),
+                port,
                 server_name,
-                name: link.name.clone(),
+                name: cn.clone(),
             },
         }),
         EnrollMsg::Error { code, detail } => Err(NetError::Rejected { code, detail }),
@@ -329,21 +460,72 @@ mod tests {
             "icu://icu.example.org:4711/enroll?t=k3nP8sQ2vL7xR1wY4tZ6bA&ca=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08&n=b%C3%B6b",
         )
         .unwrap();
-        assert_eq!(l.host, "icu.example.org");
-        assert_eq!(l.port, 4711);
-        assert_eq!(l.token, "k3nP8sQ2vL7xR1wY4tZ6bA");
-        assert_eq!(l.name, "böb");
+        let InviteLink::Link {
+            host,
+            port,
+            token,
+            name,
+            ..
+        } = l
+        else {
+            panic!("expected Link");
+        };
+        assert_eq!(host, "icu.example.org");
+        assert_eq!(port, 4711);
+        assert_eq!(token, "k3nP8sQ2vL7xR1wY4tZ6bA");
+        assert_eq!(name, "böb");
 
         let l =
             InviteLink::parse("icu://[::1]:5000/enroll?t=k3nP8sQ2vL7xR1wY4tZ6bA&ca=x&n=a").unwrap();
-        assert_eq!((l.host.as_str(), l.port), ("::1", 5000));
+        assert_eq!(l.host_port(), ("::1", 5000));
         let l = InviteLink::parse("icu://host/enroll?t=k3nP8sQ2vL7xR1wY4tZ6bA&ca=x&n=a").unwrap();
-        assert_eq!(l.port, 4711);
+        assert_eq!(l.host_port().1, 4711);
 
         assert!(InviteLink::parse("https://x/enroll?t=1&ca=2&n=3").is_err());
         assert!(InviteLink::parse("icu://x/other?t=k3nP8sQ2vL7xR1wY4tZ6bA&ca=2&n=3").is_err());
         assert!(InviteLink::parse("icu://x/enroll?t=short&ca=2&n=3").is_err());
         assert!(InviteLink::parse("icu://x/enroll?t=k3nP8sQ2vL7xR1wY4tZ6bA&ca=2").is_err());
+    }
+
+    #[test]
+    fn parses_bootstrap() {
+        let l = InviteLink::parse("icu.example.org:4711").unwrap();
+        assert_eq!(l.host_port(), ("icu.example.org", 4711));
+        assert!(matches!(l, InviteLink::Bootstrap { .. }));
+
+        let l = InviteLink::parse("  icu.example.org  ").unwrap();
+        assert_eq!(l.host_port(), ("icu.example.org", icu_proto::limits::DEFAULT_PORT));
+    }
+
+    #[test]
+    fn parses_blob() {
+        let blob = icu_proto::invite_blob::InviteBlob {
+            host_port: "icu.example.org:4711".into(),
+            server_name: "icu.example.org".into(),
+            ca_der: vec![0x30, 0x82, 0x01],
+            expires: "2026-09-22T00:00:00Z".into(),
+            nonce: [1u8; 12],
+            sealed: vec![9, 9, 9],
+        };
+        let armored = blob.encode();
+        let l = InviteLink::parse(&armored).unwrap();
+        let InviteLink::Blob {
+            host,
+            port,
+            ca_der,
+            passthrough_token,
+            server_name_hint,
+        } = l
+        else {
+            panic!("expected Blob");
+        };
+        assert_eq!(host, "icu.example.org");
+        assert_eq!(port, 4711);
+        assert_eq!(ca_der, vec![0x30, 0x82, 0x01]);
+        assert_eq!(server_name_hint, "icu.example.org");
+        assert_eq!(passthrough_token, blob.body_base64());
+
+        assert!(InviteLink::parse("ICU1-not valid base64!!").is_err());
     }
 
     #[test]
@@ -354,5 +536,46 @@ mod tests {
         let ok =
             base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [7u8; 32]);
         assert!(PinVerifier::new(&ok, p).is_ok());
+    }
+
+    #[test]
+    fn from_ca_der_matches_byte_exact_only() {
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = PinVerifier::from_ca_der(vec![1, 2, 3], p);
+        let ok = verifier.verify_server_cert(
+            &CertificateDer::from(vec![9]),
+            &[CertificateDer::from(vec![1, 2, 3])],
+            &ServerName::try_from("localhost").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(ok.is_ok());
+        let bad = verifier.verify_server_cert(
+            &CertificateDer::from(vec![9]),
+            &[CertificateDer::from(vec![9, 9, 9])],
+            &ServerName::try_from("localhost").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn trust_first_accepts_any_length_2_chain_but_not_others() {
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = PinVerifier::trust_first(p);
+        let name = ServerName::try_from("localhost").unwrap();
+        assert!(verifier
+            .verify_server_cert(
+                &CertificateDer::from(vec![9]),
+                &[CertificateDer::from(vec![1, 2, 3])],
+                &name,
+                &[],
+                UnixTime::now(),
+            )
+            .is_ok());
+        assert!(verifier
+            .verify_server_cert(&CertificateDer::from(vec![9]), &[], &name, &[], UnixTime::now())
+            .is_err());
     }
 }

@@ -71,9 +71,9 @@ level = "info"                       # tracing-Filter
 format = "text"                      # oder "json"
 ```
 
-State unter `/var/lib/icu/`: `ca.key` (0600), `ca.crt`, `server.key` (0600), `server.crt`, `users.toml`, `invites.toml`, `state.lock`. Alle Schreibzugriffe atomar (Tempfile + rename) und unter `flock(state.lock)`.
+State unter `/var/lib/icu/`: `ca.key` (0600), `ca.crt`, `invite.key` (0600), `server.key` (0600), `server.crt`, `users.toml`, `invites.toml`, `state.lock`. Alle Schreibzugriffe atomar (Tempfile + rename) und unter `flock(state.lock)`.
 
-Nutzermodell: ein Nutzer hat eine stabile `user_id` und über die Zeit **mehrere** Zertifikate (Renewal stellt ein neues aus, das alte bleibt bis zum Ablauf gültig). `revoke` setzt `revoked` auf allen Certs des Nutzers.
+Nutzermodell: ein Nutzer hat eine stabile `user_id` und über die Zeit **mehrere** Zertifikate (Renewal stellt ein neues aus, das alte bleibt bis zum Ablauf gültig). `revoke` setzt `revoked` auf allen Certs des Nutzers. `is_admin` erlaubt `CreateInviteRequest` (`PROTOCOL.md` §2.2/§2.3.1); gesetzt wird es einmalig bei der ersten Anmeldung, die gegen einen leeren `users.toml`-Bestand erfolgreich abschließt (§6.3), danach nur noch manuell — `is_admin` fehlt in älteren `users.toml`-Dateien und deserialisiert dann als `false` (`#[serde(default)]`), keine Migration nötig.
 
 `users.toml`:
 
@@ -84,6 +84,7 @@ next_user_id = 3
 [user.1]
 name = "alice"
 created = "2026-09-20T12:00:00Z"
+is_admin = true
 
 [[user.1.cert]]
 fingerprint = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"  # SHA-256(Leaf-DER), lowercase hex
@@ -118,6 +119,8 @@ Zeitstempel durchgehend RFC 3339 in UTC; Fingerprints lowercase Hex ohne Trenner
 | `icu-server status` | Online-Liste, Uptime, Relay-Zähler. |
 | `icu-server rotate-server-cert` | Neues Server-Leaf von derselben CA; Clients brauchen nichts. |
 
+Invite-Erstellung ist seit `CreateInviteRequest` (`PROTOCOL.md` §2.2/§2.3.1) auch über die authentifizierte `icu/1`-Verbindung möglich — ein eingeloggter Admin braucht dafür weder CLI noch Host-Zugriff, nur `Welcome.is_admin`. CLI und Admin-Socket bleiben unverändert für headless/skriptgesteuerte Deployments; beide Pfade laufen über dieselben `store.create_invite`/`peek_invite`/`consume_invite`, kein eigener Invite-Lebenszyklus.
+
 **Wer schreibt den State.** Ein laufender Server ist der alleinige Schreiber von `users.toml` und `invites.toml`. Jedes CLI-Kommando außer `run` geht deshalb über den Admin-Socket; der Server führt die Änderung aus, persistiert sie und wendet sie sofort auf offene Verbindungen an. Nur wenn kein Server läuft (Socket nicht vorhanden oder `ECONNREFUSED`), schreibt die CLI selbst und hält dabei `flock(/var/lib/icu/state.lock)`. Damit wirkt ein frisch erzeugtes Invite-Token sofort statt erst nach dem nächsten Neustart, und CLI und Server können einander keine Änderung überschreiben.
 
 Admin-Socket: `/run/icu/admin.sock` (`RuntimeDirectory=icu`, `RuntimeDirectoryMode=0750`, Gruppe aus `admin_socket_group`), JSON-Zeilenprotokoll, ein Request pro Zeile, eine Response pro Zeile, dann Close. Kein Netzwerk-Admin, keine Authentifizierung außer den Dateirechten des Sockets.
@@ -125,7 +128,7 @@ Admin-Socket: `/run/icu/admin.sock` (`RuntimeDirectory=icu`, `RuntimeDirectoryMo
 | Kommando | Request | Response |
 | --- | --- | --- |
 | invite | `{"cmd":"invite","name":"bob","ttl_s":86400}` | `{"ok":true,"token":"k3nP…","link":"icu://…","expires":"2026-09-21T12:00:00Z"}` |
-| users | `{"cmd":"users"}` | `{"ok":true,"users":[{"user_id":1,"name":"alice","fingerprint":"9f86d0…","expires":"…","revoked":false,"online":true}]}` |
+| users | `{"cmd":"users"}` | `{"ok":true,"users":[{"user_id":1,"name":"alice","fingerprint":"9f86d0…","expires":"…","revoked":false,"online":true,"is_admin":true}]}` |
 | revoke | `{"cmd":"revoke","user":"alice"}` | `{"ok":true,"user_id":1,"closed":1}` |
 | rename | `{"cmd":"rename","user":"alice","new":"alice2"}` | `{"ok":true}` bzw. `{"ok":false,"error":"NAME_TAKEN"}` |
 | status | `{"cmd":"status"}` | `{"ok":true,"uptime_s":3600,"online":3,"relay":{"datagrams_in":…,"datagrams_out":…,"dropped":{…}}}` |
@@ -137,7 +140,7 @@ Fehlerform einheitlich `{"ok":false,"error":"<kurzform>","detail":"<text>"}`.
 ### 6.1 Start
 
 1. Config laden, validieren: Listen-Adressen, `server_name` nicht leer, `1 ≤ max_users ≤ 64`, `min_client` als SemVer parsebar, und `max_users × 100 B + Reserve < 16 KiB` (sonst passt ein volles `Welcome` nicht in ein Control-Frame, `PROTOCOL.md` §7).
-2. CA laden oder erzeugen (`rcgen::CertificateParams` mit `IsCa::Ca(Constrained(0))`, `KeyCertSign|CrlSign`, P-256; Spike 2b).
+2. CA laden oder erzeugen (`rcgen::CertificateParams` mit `IsCa::Ca(Constrained(0))`, `KeyCertSign|CrlSign`, P-256; Spike 2b). Danach `invite.key` laden oder erzeugen (`invite_key.rs`, 32 Zufallsbytes, hex in einer Datei mit Modus 0600 neben `ca.key`, eigener Zweck also eigener Schlüssel statt CA-Key-Wiederverwendung) — versiegelt/öffnet ausschließlich das Bearer-Token in einem `InviteBlob` (`PROTOCOL.md` §2.3.1), rotiert in v1 nie.
 3. Server-Leaf laden oder erzeugen (SAN = `server_name` und, falls IP, IP-SAN; EKU ServerAuth) über `CertificateParams::signed_by(&leaf_key_pair, &issuer)` — in rcgen 0.14 nimmt `signed_by` **Public Key und Issuer**, anders als die CSR-Variante in §6.3; Kette = Leaf + CA.
 4. `flock(state.lock)` nehmen und für die gesamte Laufzeit halten; `users.toml` und `invites.toml` laden (`schema` prüfen); abgelaufene Invites verwerfen. Ab hier ist der Server alleiniger Schreiber des States (§5).
 5. rustls `ServerConfig` in **dieser** Reihenfolge — `builder_with_provider(rustls::crypto::ring::default_provider().into())` liefert `WantsVersions`, der Versionsschritt muss also vor dem Verifier kommen, sonst übersetzt es nicht:
@@ -165,9 +168,14 @@ match alpn:
 ### 6.3 Enrollment (`enroll.rs`)
 
 1. `accept_bi()` mit 5-s-Timeout; Frame lesen (≤ 8 KiB).
-2. `EnrollRequest` decodieren; Token nachschlagen (konstantzeitiger Vergleich, `subtle`) und **unter der State-Sperre als Compare-and-Set verbrauchen**, bevor signiert wird — damit gewinnt bei zwei parallelen Enrollments mit demselben Token genau einer. Unbekannt/abgelaufen/schon verbraucht → `ENROLL_BAD_TOKEN`.
-3. `CertificateSigningRequestParams::from_der(&csr_der)` (Feature `x509-parser`); Parse- oder Signaturfehler → `ENROLL_BAD_CSR`. Ebenso `ENROLL_BAD_CSR`, wenn der CSR-Key nicht P-256 oder P-384 ist. Server setzt Subject CN = Name aus dem Invite (autoritativ; `EnrollRequest.name` wird nur als initialer Anzeigename übernommen), EKU ClientAuth, `not_before = now − 1 h`, `not_after = now + client_validity_days`, Serial = 16 Zufallsbytes; `signed_by(&issuer)` — die CSR-Variante nimmt **nur** den Issuer, der Public Key kommt aus der CSR.
-4. `user_id` = `next_user_id++`. Anzeigename = `EnrollRequest.name`; kollidiert er case-insensitive mit einem bestehenden Namen, hängt der Server `-2`, `-3`, … an, bis er eindeutig ist (`PROTOCOL.md` §2.3). Fingerprint = SHA-256(Leaf-DER), lowercase Hex; Nutzer- und Cert-Eintrag in `users.toml` schreiben, Token als verbraucht markieren — beides atomar und **vor** der Antwort persistieren. Schlägt das Schreiben fehl, wird das Cert nicht ausgeliefert: `Error(ENROLL_BAD_TOKEN, "state write failed")`, Token bleibt unverbraucht.
+2. `EnrollRequest` decodieren. `token` wird allein über seine Länge in drei Formen unterschieden (`PROTOCOL.md` §2.3), alles unter derselben State-Sperre, die auch den bisherigen Compare-and-Set hält:
+   - **leer** (Bootstrap): nur zulässig, solange `store.is_empty()`; sonst `ENROLL_BOOTSTRAP_CLOSED`. `EnrollRequest.name` wird validiert und wird direkt zum Cert-CN — der einzige Fall, in dem das CN nicht aus einem Invite kommt, weil bei der allerersten Anmeldung noch keiner existieren kann.
+   - **22 Zeichen** (Plain-Token): wie bisher `peek_invite` (konstantzeitiger Vergleich, `subtle`).
+   - **länger** (Blob-Passthrough): Base64url dekodieren, `InviteBlob` per postcard parsen, AAD aus den Klartextfeldern neu berechnen, mit `invite_key.open()` öffnen (`ChaCha20-Poly1305`) → das gewonnene Plain-Token läuft anschließend durch denselben `peek_invite`-Pfad. Fehlschlagendes Öffnen (Manipulation an `sealed`/`nonce` oder an einem AAD-Feld) → `ENROLL_BAD_TOKEN`.
+
+   In allen drei Fällen wird der Invite (falls vorhanden) erst **unter derselben Sperre** per Compare-and-Set verbraucht, nachdem `is_first = store.is_empty()` gelesen wurde — damit gewinnt bei zwei parallelen Enrollments (gleiches Token oder beide leer) genau eines, und `is_first` ist über alle drei Pfade hinweg race-sicher.
+3. `CertificateSigningRequestParams::from_der(&csr_der)` (Feature `x509-parser`); Parse- oder Signaturfehler → `ENROLL_BAD_CSR`. Ebenso `ENROLL_BAD_CSR`, wenn der CSR-Key nicht P-256 oder P-384 ist. Server setzt Subject CN wie in Schritt 2 bestimmt, EKU ClientAuth, `not_before = now − 1 h`, `not_after = now + client_validity_days`, Serial = 16 Zufallsbytes; `signed_by(&issuer)` — die CSR-Variante nimmt **nur** den Issuer, der Public Key kommt aus der CSR.
+4. `user_id` = `next_user_id++`. Anzeigename = `EnrollRequest.name`, sofern gültig und es kein Bootstrap ist, sonst das CN aus Schritt 2; kollidiert er case-insensitive mit einem bestehenden Namen, hängt der Server `-2`, `-3`, … an, bis er eindeutig ist (`PROTOCOL.md` §2.3). Fingerprint = SHA-256(Leaf-DER), lowercase Hex; Nutzer- und Cert-Eintrag in `users.toml` schreiben (`is_admin = is_first` aus Schritt 2 — **jede** erste erfolgreiche Anmeldung gegen einen leeren Bestand wird Admin, nicht nur der Bootstrap-Pfad), Token als verbraucht markieren — beides atomar und **vor** der Antwort persistieren. Schlägt das Schreiben fehl, wird das Cert nicht ausgeliefert: `Error(ENROLL_BAD_TOKEN, "state write failed")`, Token (falls vorhanden) bleibt unverbraucht.
 5. `EnrollResponse { leaf_der, ca_der, server_name }` senden, `finish()`, `close(NO_ERROR)`.
 
 Fehlerpfad einheitlich (`PROTOCOL.md` §2.3): erst `EnrollMsg::Error { code, detail }` senden, dann `finish()`, dann `close(code)` mit demselben Code. Ein präsentiertes Client-Cert auf diesem ALPN wird ignoriert.
@@ -176,7 +184,7 @@ Fehlerpfad einheitlich (`PROTOCOL.md` §2.3): erst `EnrollMsg::Error { code, det
 
 1. `peer_identity()` → `None` → `close(AUTH_REQUIRED)`. Sonst Leaf-DER → SHA-256 → `users.toml`: unbekannt → `AUTH_UNKNOWN_CERT`, revoked → `AUTH_REVOKED`. (rustls hat Kette und Ablauf schon geprüft.)
 2. `accept_bi()` und erstes Frame binnen 5 s, sonst `HELLO_TIMEOUT`. Muss `Hello` sein. `minor` aushandeln (`min(client, server)`, nicht bedienbar → `VERSION_UNSUPPORTED`). `Hello.name` wird **nur** übernommen, wenn zu dieser `user_id` noch kein Name gespeichert ist; sonst ignoriert (`PROTOCOL.md` §2.2).
-3. Ist der Raum voll (`room.len() >= max_users`), `close(SERVER_FULL)`. Sonst `room.join()` → Session-ID (monoton, nie wiederverwendet), `Welcome { you: UserInfo{user_id, session, name, flags}, users, audio, min_client, minor, caps }` senden, `UserJoined` an alle anderen.
+3. Ist der Raum voll (`room.len() >= max_users`), `close(SERVER_FULL)`. Sonst `room.join()` → Session-ID (monoton, nie wiederverwendet), `Welcome { you: UserInfo{user_id, session, name, flags}, users, audio, min_client, minor, caps, is_admin }` senden (`is_admin` aus `store.is_admin(user_id)`, unter derselben Sperre wie `set_initial_name` gelesen), `UserJoined` an alle anderen.
 4. Zwei Tasks pro Client: (a) Control-Reader (Frames → `ControlMsg` → Handler), (b) Datagram-Reader (`read_datagram` → `relay::audio`). Video: `accept_uni` in einem dritten Task → `relay::video`.
 5. Ausgehend: ein `mpsc`-Kanal pro Client für Control-Frames (Broadcasts), ein Writer-Task schreibt auf den Control-Stream. Datagrams werden direkt aus dem Relay per `send_datagram` geschickt (nicht blockierend).
 6. Ende: Verbindung geschlossen oder Fehler → `room.leave()` → `UserLeft { session, reason }` Broadcast; `reason` = `NO_ERROR` bei sauberem Close, `TIMEOUT` bei Idle-Timeout oder Transportabbruch, sonst der Code, mit dem der Server geschlossen hat. Session-ID bleibt gesperrt.
@@ -191,6 +199,7 @@ Fehlerpfad einheitlich (`PROTOCOL.md` §2.3): erst `EnrollMsg::Error { code, det
 | `LossReport` | Maximum je Sprecher fortschreiben, siehe §6.5. |
 | `KeyframeRequest` | an den Sprecher weiterleiten, siehe §6.5. |
 | `RenewRequest` | CSR wie §6.3.3 prüfen und signieren (Subject CN und `user_id` aus dem bestehenden Eintrag, nicht aus der CSR), neuen Cert-Eintrag zu **demselben** Nutzer in `users.toml` anhängen; das alte Cert bleibt bis zu seinem `expires` gültig. `RenewResponse { leaf_der }`. Rate ≤ 1/Tag pro `user_id`, sonst `Error(RENEW_REJECTED)`; ungültige CSR ebenfalls `Error(RENEW_REJECTED)`. |
+| `CreateInviteRequest` | Nur wenn `store.is_admin(user_id)`, sonst `Error(NOT_ADMIN)` und nichts weiter. Sonst `store.create_invite` (unverändert) aufrufen, das Ergebnis als `InviteBlob` mit `invite_key.seal()` versiegeln (`PROTOCOL.md` §2.3.1) und als `CreateInviteResponse { blob, expires }` zurücksenden. |
 | unbekannte Variante / Decode-Fehler | `close(PROTOCOL_VIOLATION)`. |
 
 ### 6.5 Relay (`relay.rs`)

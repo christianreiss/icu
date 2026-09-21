@@ -128,9 +128,11 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     let minor = minor.min(icu_proto::MINOR);
 
     // `Hello.name` only counts when nothing is stored yet (§6.4.2).
-    let stored_name = {
+    let (stored_name, is_admin) = {
         let mut store = server.store.lock().await;
-        store.set_initial_name(identity.user_id, &name)?
+        let stored_name = store.set_initial_name(identity.user_id, &name)?;
+        let is_admin = store.is_admin(identity.user_id);
+        (stored_name, is_admin)
     };
 
     // 3. Join, `Welcome`, `UserJoined`.
@@ -165,6 +167,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         audio: AudioParams::default(),
         users: server.room.users_except(session),
         min_client: server.config.server.min_client.clone(),
+        is_admin,
     };
     server.room.send_to(session, &welcome);
     server.room.broadcast_except(
@@ -369,6 +372,9 @@ async fn control_loop(
             ControlMsg::RenewRequest { csr_der } => {
                 handle_renew(server, session, user_id, &csr_der).await;
             }
+            ControlMsg::CreateInviteRequest { name, ttl_s } => {
+                handle_create_invite(server, session, user_id, &name, ttl_s).await;
+            }
             other => {
                 return Err(Error::coded(
                     ec::PROTOCOL_VIOLATION,
@@ -492,6 +498,68 @@ async fn handle_renew(server: &Arc<Server>, session: Session, user_id: UserId, c
         session,
         &ControlMsg::RenewResponse {
             leaf_der: leaf.to_vec(),
+        },
+    );
+}
+
+/// Mints an invite and returns it as a self-contained blob (`CreateInviteRequest`,
+/// `PROTOCOL.md` §2.3.1). Admin only; rejected non-fatally otherwise.
+async fn handle_create_invite(
+    server: &Arc<Server>,
+    session: Session,
+    user_id: UserId,
+    name: &str,
+    ttl_s: u64,
+) {
+    let reject = |code: u32, detail: String| ControlMsg::Error { code, detail };
+
+    let mut store = server.store.lock().await;
+    if !store.is_admin(user_id) {
+        server
+            .room
+            .send_to(session, &reject(ec::NOT_ADMIN, "not an admin".into()));
+        return;
+    }
+    let ttl = Duration::from_secs(if ttl_s == 0 {
+        pl::INVITE_TTL_S
+    } else {
+        ttl_s
+    });
+    let (token, record) = match store.create_invite(name, ttl) {
+        Ok(v) => v,
+        Err(e) => {
+            server.room.send_to(
+                session,
+                &reject(e.code().unwrap_or(ec::NAME_TAKEN), e.to_string()),
+            );
+            return;
+        }
+    };
+    drop(store);
+
+    let ca_der = server.ca.read().await.ca_der().to_vec();
+    let aad_blob = icu_proto::invite_blob::InviteBlob {
+        host_port: server.config.public_host(),
+        server_name: server.config.server.server_name.clone(),
+        ca_der,
+        expires: record.expires.clone(),
+        nonce: [0u8; 12],
+        sealed: Vec::new(),
+    };
+    let aad = aad_blob.aad();
+    let (nonce, sealed) = server.invite_key.seal(&token, &aad);
+    let blob = icu_proto::invite_blob::InviteBlob {
+        nonce,
+        sealed,
+        ..aad_blob
+    };
+
+    tracing::info!(user_id, name, "invite blob minted");
+    server.room.send_to(
+        session,
+        &ControlMsg::CreateInviteResponse {
+            blob: blob.encode(),
+            expires: record.expires,
         },
     );
 }

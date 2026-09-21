@@ -76,7 +76,9 @@ impl TestServer {
     /// Enrolls through the real client code into a fresh config directory.
     pub async fn enroll(&self, name: &str) -> (Identity, Paths, tempfile::TempDir) {
         let link = InviteLink::parse(&self.invite_link(name).await).expect("link parses");
-        let identity = enroll(&link, Some(self.addr())).await.expect("enrollment");
+        let identity = enroll(&link, "", Some(self.addr()))
+            .await
+            .expect("enrollment");
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(dir.path().to_path_buf()));
         identity.save(&paths).expect("identity saved");

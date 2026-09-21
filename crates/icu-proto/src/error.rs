@@ -40,6 +40,12 @@ pub const ENROLL_BAD_CSR: u32 = 0x11;
 pub const ENROLL_RATE_LIMITED: u32 = 0x12;
 /// Renewal CSR rejected. Not fatal.
 pub const RENEW_REJECTED: u32 = 0x13;
+/// Bootstrap enrollment (empty token) attempted while the server already has
+/// at least one user. Fatal.
+pub const ENROLL_BOOTSTRAP_CLOSED: u32 = 0x14;
+/// `CreateInviteRequest` from a non-admin user. Only ever sent as `Error`. Not
+/// fatal.
+pub const NOT_ADMIN: u32 = 0x15;
 
 /// All codes defined by v1, in ascending order.
 pub const ALL_CODES: &[u32] = &[
@@ -61,6 +67,8 @@ pub const ALL_CODES: &[u32] = &[
     ENROLL_BAD_CSR,
     ENROLL_RATE_LIMITED,
     RENEW_REJECTED,
+    ENROLL_BOOTSTRAP_CLOSED,
+    NOT_ADMIN,
 ];
 
 /// Fatal codes (`PROTOCOL.md` §5/§6): the client must not reconnect.
@@ -79,6 +87,7 @@ pub fn is_fatal(code: u32) -> bool {
             | ENROLL_BAD_TOKEN
             | ENROLL_BAD_CSR
             | ENROLL_RATE_LIMITED
+            | ENROLL_BOOTSTRAP_CLOSED
     )
 }
 
@@ -103,6 +112,8 @@ pub fn name(code: u32) -> &'static str {
         ENROLL_BAD_CSR => "ENROLL_BAD_CSR",
         ENROLL_RATE_LIMITED => "ENROLL_RATE_LIMITED",
         RENEW_REJECTED => "RENEW_REJECTED",
+        ENROLL_BOOTSTRAP_CLOSED => "ENROLL_BOOTSTRAP_CLOSED",
+        NOT_ADMIN => "NOT_ADMIN",
         _ => "UNKNOWN",
     }
 }
@@ -124,6 +135,7 @@ mod tests {
             ENROLL_BAD_TOKEN,
             ENROLL_BAD_CSR,
             ENROLL_RATE_LIMITED,
+            ENROLL_BOOTSTRAP_CLOSED,
         ];
         for code in ALL_CODES {
             assert_eq!(

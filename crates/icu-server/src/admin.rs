@@ -107,6 +107,8 @@ pub struct AdminUser {
     pub revoked: bool,
     /// Whether the user is connected right now.
     pub online: bool,
+    /// Whether the user may send `CreateInviteRequest`.
+    pub is_admin: bool,
 }
 
 impl AdminResponse {
@@ -192,6 +194,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     expires: newest.map(|c| c.expires.clone()).unwrap_or_default(),
                     revoked: !record.certs.is_empty() && record.certs.iter().all(|c| c.revoked),
                     online: !server.room.sessions_of_user(user_id).is_empty(),
+                    is_admin: record.is_admin,
                 });
             }
             AdminResponse::Users(users)

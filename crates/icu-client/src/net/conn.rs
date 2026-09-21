@@ -64,6 +64,8 @@ pub struct Welcome {
     pub users: Vec<icu_proto::UserInfo>,
     /// Lowest allowed client version.
     pub min_client: String,
+    /// Whether this client may send `CreateInviteRequest`.
+    pub is_admin: bool,
 }
 
 /// An established, welcomed connection.
@@ -127,6 +129,7 @@ pub async fn connect(
             audio,
             users,
             min_client,
+            is_admin,
             ..
         } => Ok(Session {
             conn,
@@ -138,6 +141,7 @@ pub async fn connect(
                 audio,
                 users,
                 min_client,
+                is_admin,
             },
         }),
         other => Err(ConnectError::Protocol(format!(

@@ -2549,6 +2549,7 @@ dependencies = [
 name = "icu-proto"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "postcard",
  "serde",
 ]

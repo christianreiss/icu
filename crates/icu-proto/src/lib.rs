@@ -12,6 +12,7 @@
 //! * [`header`] — audio and video headers plus the wrap arithmetic helpers
 //! * [`error`] — error codes and the fatality table
 //! * [`limits`] — the numbers from `PROTOCOL.md` §7 as constants
+//! * [`invite_blob`] — the self-contained `ICU1-…` invite format (§2.3.1)
 
 #![forbid(unsafe_code)]
 
@@ -19,6 +20,7 @@ pub mod control;
 pub mod error;
 pub mod framing;
 pub mod header;
+pub mod invite_blob;
 pub mod limits;
 pub mod types;
 

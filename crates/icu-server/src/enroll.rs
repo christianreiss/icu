@@ -5,7 +5,9 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use icu_proto::{error as ec, limits as pl, validate_name, EnrollMsg, MAX_ENROLL_FRAME};
+use icu_proto::{
+    error as ec, invite_blob::InviteBlob, limits as pl, validate_name, EnrollMsg, MAX_ENROLL_FRAME,
+};
 
 use crate::{
     error::{Error, Result},
@@ -112,36 +114,76 @@ async fn run(
             "first message must be EnrollRequest",
         ));
     };
-    if token.len() != EnrollMsg::TOKEN_LEN {
-        return Err(Error::coded(ec::ENROLL_BAD_TOKEN, "malformed token"));
+    // `token` has three shapes (`PROTOCOL.md` §2.3):
+    //  - empty: bootstrap, only while the store has no users at all yet;
+    //  - `EnrollMsg::TOKEN_LEN` chars: a plain invite token;
+    //  - anything longer: the base64url body of a sealed `InviteBlob`
+    //    (`§2.3.1`), relayed back opaquely by the client.
+    enum TokenKind {
+        Bootstrap,
+        Invite(String),
     }
 
     let mut store = server.store.lock().await;
-    let (_, invite) = store
-        .peek_invite(&token)
-        .ok_or_else(|| Error::coded(ec::ENROLL_BAD_TOKEN, "token unknown, used or expired"))?;
 
-    // The CN always comes from the invite, never from the CSR or the request
-    // (`PROTOCOL.md` §2.3).
+    let kind = if token.is_empty() {
+        if !store.is_empty() {
+            return Err(Error::coded(
+                ec::ENROLL_BOOTSTRAP_CLOSED,
+                "an admin is already enrolled; ask them for an invite",
+            ));
+        }
+        TokenKind::Bootstrap
+    } else if token.len() == EnrollMsg::TOKEN_LEN {
+        TokenKind::Invite(token.clone())
+    } else {
+        let blob = InviteBlob::decode_body_base64(&token)
+            .map_err(|e| Error::coded(ec::ENROLL_BAD_TOKEN, format!("malformed invite blob: {e}")))?;
+        let aad = blob.aad();
+        let mut sealed = blob.sealed.clone();
+        let real_token = server.invite_key.open(blob.nonce, &mut sealed, &aad)?;
+        TokenKind::Invite(real_token)
+    };
+
+    // The CN comes from the invite when there is one, never from the CSR
+    // (`PROTOCOL.md` §2.3). Bootstrap is the one case with no invite to draw
+    // it from, so it falls back to the (validated) requested name.
+    let cn = match &kind {
+        TokenKind::Bootstrap => {
+            validate_name(&name)
+                .map_err(|e| Error::coded(ec::ENROLL_BAD_TOKEN, format!("bad name: {e}")))?;
+            name.clone()
+        }
+        TokenKind::Invite(real_token) => {
+            let (_, invite) = store.peek_invite(real_token).ok_or_else(|| {
+                Error::coded(ec::ENROLL_BAD_TOKEN, "token unknown, used or expired")
+            })?;
+            invite.name.clone()
+        }
+    };
+
     let leaf = {
         let ca = server.ca.read().await;
-        ca.sign_client_csr(
-            &csr_der,
-            &invite.name,
-            server.config.tls.client_validity_days,
-        )?
+        ca.sign_client_csr(&csr_der, &cn, server.config.tls.client_validity_days)?
     };
 
     // Compare-and-set under the state lock: two parallel enrollments with the
-    // same token, exactly one wins (§6.3.2).
+    // same token, exactly one wins (§6.3.2). The same lock makes the bootstrap
+    // check above and `is_first` below race-safe against each other and
+    // against a concurrent invite redemption: whichever `add_user` lands
+    // first is the one that makes the store non-empty.
     let reserved = store.peek_next_user_id();
-    store.consume_invite(&token, reserved)?;
+    let is_first = store.is_empty();
+
+    if let TokenKind::Invite(real_token) = &kind {
+        store.consume_invite(real_token, reserved)?;
+    }
 
     // The display name may come from the request; a collision gets a suffix.
-    let desired = if validate_name(&name).is_ok() {
+    let desired = if !matches!(kind, TokenKind::Bootstrap) && validate_name(&name).is_ok() {
         name.as_str()
     } else {
-        invite.name.as_str()
+        cn.as_str()
     };
     let display_name = store.unique_name(desired);
 
@@ -154,11 +196,16 @@ async fn run(
         ),
         revoked: false,
     };
-    let user_id = match store.add_user(&display_name, cert) {
+    // Any first successful enrollment against an empty store grants admin,
+    // whichever of the three paths above it took (clarified requirement,
+    // not just the no-token bootstrap path).
+    let user_id = match store.add_user(&display_name, cert, is_first) {
         Ok(id) => id,
         Err(e) => {
             // Nothing was delivered, so the token goes back (§6.3.4).
-            let _ = store.release_invite(&token);
+            if let TokenKind::Invite(real_token) = &kind {
+                let _ = store.release_invite(real_token);
+            }
             return Err(Error::coded(
                 ec::ENROLL_BAD_TOKEN,
                 format!("state write failed: {e}"),
@@ -175,6 +222,6 @@ async fn run(
         server_name: server.config.server.server_name.clone(),
     };
     wire::write_frame(send, &response.encode()?).await?;
-    tracing::info!(user_id, name = %display_name, %remote, "enrolled");
+    tracing::info!(user_id, name = %display_name, is_admin = is_first, %remote, "enrolled");
     Ok(())
 }

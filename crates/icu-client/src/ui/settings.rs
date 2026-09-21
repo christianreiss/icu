@@ -27,6 +27,8 @@ pub struct SettingsView {
     pub draft: Settings,
     /// Name field (applied with the button, not on every keystroke).
     pub name: String,
+    /// Display name for the next invite to mint (admin only).
+    pub invite_name: String,
     /// Hotkey backend in use, for display.
     pub hotkey_backend: String,
     /// Portal hint shown once.
@@ -45,6 +47,7 @@ impl SettingsView {
                 .as_ref()
                 .map(|m| m.name.clone())
                 .unwrap_or_default(),
+            invite_name: String::new(),
             hotkey_backend,
             show_portal_hint: true,
             tab: Tab::Audio,
@@ -255,6 +258,32 @@ impl SettingsView {
         });
         if let Some(err) = &state.name_error {
             ui.colored_label(super::theme::ERROR, err);
+        }
+        if state.is_admin {
+            ui.separator();
+            ui.label("Einladung erzeugen");
+            ui.horizontal(|ui| {
+                ui.label("Name der eingeladenen Person");
+                ui.text_edit_singleline(&mut self.invite_name);
+                if ui.button("Erzeugen").clicked() {
+                    cmds.push(Command::CreateInvite {
+                        name: self.invite_name.trim().to_string(),
+                        ttl_s: 0,
+                    });
+                }
+            });
+            if let Some(err) = &state.invite_error {
+                ui.colored_label(super::theme::ERROR, err);
+            }
+            if let Some((blob, expires)) = &state.last_invite {
+                ui.label(format!("Gültig bis {expires}, einmal einfügbar:"));
+                let mut copy = blob.clone();
+                ui.add(
+                    egui::TextEdit::multiline(&mut copy)
+                        .desired_rows(3)
+                        .font(egui::TextStyle::Monospace),
+                );
+            }
         }
         ui.checkbox(&mut self.draft.ui.start_minimized, "Minimiert starten");
         ui.checkbox(

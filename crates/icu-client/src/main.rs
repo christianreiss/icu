@@ -18,8 +18,13 @@ use icu_client::{
 #[derive(Debug, Parser)]
 #[command(name = "icu", version, about, long_about = None)]
 struct Cli {
-    /// Invite link `icu://host:port/enroll?t=…&ca=…&n=…` to enroll with.
+    /// Invite to enroll with: an `icu://host:port/enroll?t=…&ca=…&n=…` link,
+    /// an `ICU1-…` blob, or a bare `host[:port]` for first-run bootstrap.
     link: Option<String>,
+    /// Display name. Required for an `ICU1-…` blob or a bootstrap
+    /// `host[:port]`; ignored for an `icu://` link, which carries its own.
+    #[arg(long)]
+    name: Option<String>,
     /// Configuration directory (default `$XDG_CONFIG_HOME/icu`).
     #[arg(long)]
     config_dir: Option<PathBuf>,
@@ -81,16 +86,24 @@ fn run(cli: Cli) -> Result<(), String> {
 
     if let Some(link) = &cli.link {
         let link = InviteLink::parse(link).map_err(|e| e.to_string())?;
+        let name = match (&link, &cli.name) {
+            (InviteLink::Link { .. }, _) => String::new(),
+            (_, Some(name)) => name.clone(),
+            (_, None) => {
+                return Err(
+                    "this invite needs --name <display name> (it carries none itself)".into(),
+                )
+            }
+        };
         let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
         let identity = rt
-            .block_on(enroll(&link, cli.server_addr))
+            .block_on(enroll(&link, &name, cli.server_addr))
             .map_err(|e| e.to_string())?;
         identity.save(&paths).map_err(|e| e.to_string())?;
+        let (host, port) = link.host_port();
         eprintln!(
-            "icu: enrolled as {} at {}:{}, identity stored in {}",
-            link.name,
-            link.host,
-            link.port,
+            "icu: enrolled as {} at {host}:{port}, identity stored in {}",
+            identity.server.name,
             paths.identity_dir().display()
         );
     }

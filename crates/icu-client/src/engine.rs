@@ -147,6 +147,12 @@ pub struct AppState {
     pub banner: Option<String>,
     /// `SetName` error.
     pub name_error: Option<String>,
+    /// `Welcome.is_admin`: whether `CreateInviteRequest` is allowed.
+    pub is_admin: bool,
+    /// The most recently minted invite blob and its expiry, if any.
+    pub last_invite: Option<(String, String)>,
+    /// `CreateInviteRequest` error.
+    pub invite_error: Option<String>,
     /// Devices.
     pub devices: Vec<DeviceInfo>,
     /// Backend name.
@@ -186,6 +192,14 @@ pub enum Command {
     SetVolume(UserId, f32),
     /// Rename.
     SetName(String),
+    /// Mint an invite blob. Admin only (`AppState.is_admin`); a non-admin
+    /// send is rejected by the server, non-fatally.
+    CreateInvite {
+        /// Name the new certificate CN will carry.
+        name: String,
+        /// Lifetime in seconds. `0` means the server default.
+        ttl_s: u64,
+    },
     /// Replace the settings (device change, thresholds, …); effective at once.
     UpdateSettings(Box<Settings>),
     /// Camera on/off.
@@ -408,6 +422,9 @@ impl Engine {
             update_required: None,
             banner: None,
             name_error: None,
+            is_admin: false,
+            last_invite: None,
+            invite_error: None,
             devices: backend.devices(),
             backend: backend_name,
             aec_available: false,
@@ -1328,6 +1345,7 @@ impl LocalState {
                 shared.state.send_modify(|s| {
                     s.banner = None;
                     s.name_error = None;
+                    s.invite_error = None;
                 });
             }
             Command::ForceKeyframe => {
@@ -1336,7 +1354,7 @@ impl LocalState {
             Command::HotkeyBackend(name) => {
                 shared.state.send_modify(|s| s.hotkey_backend = name);
             }
-            Command::SetName(_) | Command::Quit => {}
+            Command::SetName(_) | Command::CreateInvite { .. } | Command::Quit => {}
         }
         set_state
     }
@@ -1461,6 +1479,7 @@ async fn run_session(
             s.me = Some(me);
             s.peers = peers;
             s.update_required = update_required;
+            s.is_admin = welcome.is_admin;
         });
     }
     *shared.conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection.clone());
@@ -1531,6 +1550,13 @@ async fn run_session(
                         if let Err(e) = icu_proto::validate_name(&name) {
                             shared.state.send_modify(|s| s.name_error = Some(e.to_string()));
                         } else if conn::write_msg(&mut send, &ControlMsg::SetName { name }).await.is_err() {
+                            break SessionEnd::Retry("send failed".into());
+                        }
+                    }
+                    Command::CreateInvite { name, ttl_s } => {
+                        if let Err(e) = icu_proto::validate_name(&name) {
+                            shared.state.send_modify(|s| s.invite_error = Some(e.to_string()));
+                        } else if conn::write_msg(&mut send, &ControlMsg::CreateInviteRequest { name, ttl_s }).await.is_err() {
                             break SessionEnd::Retry("send failed".into());
                         }
                     }
@@ -1817,6 +1843,8 @@ async fn handle_control(
             tracing::warn!(code, %detail, "server error");
             if code == codes::NAME_TAKEN {
                 shared.state.send_modify(|s| s.name_error = Some(detail));
+            } else if code == codes::NOT_ADMIN {
+                shared.state.send_modify(|s| s.invite_error = Some(detail));
             } else {
                 shared
                     .state
@@ -1883,6 +1911,12 @@ async fn handle_control(
             });
         }
         ControlMsg::RenewResponse { .. } => {}
+        ControlMsg::CreateInviteResponse { blob, expires } => {
+            shared.state.send_modify(|s| {
+                s.last_invite = Some((blob, expires));
+                s.invite_error = None;
+            });
+        }
         ControlMsg::Welcome { .. } => {
             return Some(SessionEnd::Fatal("second Welcome".into()));
         }
@@ -1891,7 +1925,8 @@ async fn handle_control(
         | ControlMsg::Ping { .. }
         | ControlMsg::RenewRequest { .. }
         | ControlMsg::LossReport { .. }
-        | ControlMsg::SetName { .. } => {
+        | ControlMsg::SetName { .. }
+        | ControlMsg::CreateInviteRequest { .. } => {
             return Some(SessionEnd::Fatal(format!(
                 "server sent client message {}",
                 msg.variant()

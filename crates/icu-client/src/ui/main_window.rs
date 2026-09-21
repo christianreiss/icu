@@ -563,6 +563,7 @@ pub fn run_enroll(
                 paths,
                 server_addr,
                 link: String::new(),
+                name: String::new(),
                 status: String::new(),
                 busy: Arc::new(Mutex::new(None)),
                 result: result_app,
@@ -578,6 +579,9 @@ struct EnrollApp {
     paths: Paths,
     server_addr: Option<SocketAddr>,
     link: String,
+    /// Only used for a `ICU1-…` blob or a bare `host[:port]` bootstrap — an
+    /// `icu://` link already carries its own name.
+    name: String,
     status: String,
     busy: Arc<Mutex<Option<Result<Identity, String>>>>,
     result: Arc<Mutex<Option<Identity>>>,
@@ -600,18 +604,27 @@ impl eframe::App for EnrollApp {
             }
         }
         egui::CentralPanel::default().show(root, |ui| {
-            ui.heading("Einladungslink");
-            ui.label("icu://host:port/enroll?t=…&ca=…&n=…");
+            ui.heading("Einladung");
+            ui.label("icu://host:port/enroll?t=…&ca=…&n=…, ICU1-… oder host:port");
             ui.text_edit_singleline(&mut self.link);
+            let needs_name = !self.link.trim_start().starts_with("icu://");
+            if needs_name {
+                ui.label("Dein Name");
+                ui.text_edit_singleline(&mut self.name);
+            }
             if ui.button("Beitreten").clicked() {
                 match InviteLink::parse(&self.link) {
                     Ok(link) => {
-                        self.status = format!("Verbinde mit {}:{}…", link.host, link.port);
+                        let (host, port) = link.host_port();
+                        self.status = format!("Verbinde mit {host}:{port}…");
                         let busy = self.busy.clone();
                         let addr = self.server_addr;
+                        let name = self.name.clone();
                         std::thread::spawn(move || {
                             let rt = tokio::runtime::Runtime::new().expect("runtime");
-                            let r = rt.block_on(enroll(&link, addr)).map_err(|e| e.to_string());
+                            let r = rt
+                                .block_on(enroll(&link, &name, addr))
+                                .map_err(|e| e.to_string());
                             *busy.lock().unwrap() = Some(r);
                         });
                     }

@@ -98,6 +98,11 @@ pub struct UserRecord {
     /// All certificates ever issued to this user.
     #[serde(default, rename = "cert")]
     pub certs: Vec<CertRecord>,
+    /// Grants `CreateInviteRequest` and other admin actions. Set once, at the
+    /// first enrollment that completes against an empty store; never granted
+    /// afterwards by enrollment alone.
+    #[serde(default)]
+    pub is_admin: bool,
 }
 
 /// `users.toml`
@@ -225,6 +230,16 @@ impl Store {
         self.users.users.get(&id.to_string())
     }
 
+    /// Whether `id` is an admin. `false` for an unknown id.
+    pub fn is_admin(&self, id: UserId) -> bool {
+        self.user(id).map(|u| u.is_admin).unwrap_or(false)
+    }
+
+    /// Whether the store has no users at all yet (bootstrap gate, §6.3).
+    pub fn is_empty(&self) -> bool {
+        self.users.users.is_empty()
+    }
+
     /// Resolves a certificate fingerprint to its user and certificate.
     pub fn by_fingerprint(&self, fp: &str) -> Option<(UserId, &UserRecord, &CertRecord)> {
         for (id, user) in self.users() {
@@ -294,7 +309,7 @@ impl Store {
     }
 
     /// Adds a new user with its first certificate. Returns the new `user_id`.
-    pub fn add_user(&mut self, name: &str, cert: CertRecord) -> Result<UserId> {
+    pub fn add_user(&mut self, name: &str, cert: CertRecord, is_admin: bool) -> Result<UserId> {
         validate_name(name)?;
         let id = self.users.next_user_id;
         self.users.next_user_id = id
@@ -307,6 +322,7 @@ impl Store {
                 created: rfc3339(now()),
                 last_renew: None,
                 certs: vec![cert],
+                is_admin,
             },
         );
         self.save_users()?;
@@ -569,8 +585,8 @@ mod tests {
     #[test]
     fn user_ids_are_monotonic_and_stable_across_renewal() {
         let (_dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa")).unwrap();
-        let bob = s.add_user("bob", cert("bb")).unwrap();
+        let alice = s.add_user("alice", cert("aa"), false).unwrap();
+        let bob = s.add_user("bob", cert("bb"), false).unwrap();
         assert_eq!((alice, bob), (1, 2));
 
         s.add_cert(alice, cert("cc"), true).unwrap();
@@ -581,7 +597,7 @@ mod tests {
 
         // Ids are never reused: removing is not even offered, and next_user_id
         // only grows.
-        let carol = s.add_user("carol", cert("dd")).unwrap();
+        let carol = s.add_user("carol", cert("dd"), false).unwrap();
         assert_eq!(carol, 3);
     }
 
@@ -589,7 +605,7 @@ mod tests {
     #[test]
     fn revoke_marks_every_certificate_and_persists() {
         let (dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa")).unwrap();
+        let alice = s.add_user("alice", cert("aa"), false).unwrap();
         s.add_cert(alice, cert("bb"), true).unwrap();
         assert!(s.revoke(alice).unwrap());
         assert!(!s.revoke(alice).unwrap(), "second revoke changes nothing");
@@ -605,13 +621,13 @@ mod tests {
     #[test]
     fn unique_name_appends_suffixes() {
         let (_dir, mut s) = store();
-        s.add_user("alice", cert("aa")).unwrap();
+        s.add_user("alice", cert("aa"), false).unwrap();
         assert_eq!(s.unique_name("bob"), "bob");
         assert_eq!(s.unique_name("alice"), "alice-2");
         // The collision check is case-insensitive, the returned name keeps the
         // requested spelling.
         assert_eq!(s.unique_name("ALICE"), "ALICE-2");
-        s.add_user("alice-2", cert("bb")).unwrap();
+        s.add_user("alice-2", cert("bb"), false).unwrap();
         assert_eq!(s.unique_name("alice"), "alice-3");
     }
 
@@ -619,7 +635,7 @@ mod tests {
     fn unique_name_truncates_on_a_char_boundary() {
         let (_dir, mut s) = store();
         let long = "ä".repeat(16); // 32 bytes
-        s.add_user(&long, cert("aa")).unwrap();
+        s.add_user(&long, cert("aa"), false).unwrap();
         let unique = s.unique_name(&long);
         assert!(unique.len() <= icu_proto::types::NAME_MAX_LEN, "{unique}");
         assert!(validate_name(&unique).is_ok());
@@ -629,8 +645,8 @@ mod tests {
     #[test]
     fn rename_rejects_collisions() {
         let (_dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa")).unwrap();
-        s.add_user("bob", cert("bb")).unwrap();
+        let alice = s.add_user("alice", cert("aa"), false).unwrap();
+        s.add_user("bob", cert("bb"), false).unwrap();
         let err = s.rename(alice, "BOB").unwrap_err();
         assert_eq!(err.code(), Some(ec::NAME_TAKEN));
         assert_eq!(s.user(alice).unwrap().name, "alice");
@@ -642,7 +658,7 @@ mod tests {
     #[test]
     fn resolve_by_id_name_and_fingerprint() {
         let (_dir, mut s) = store();
-        let alice = s.add_user("alice", cert("9f86d0")).unwrap();
+        let alice = s.add_user("alice", cert("9f86d0"), false).unwrap();
         assert_eq!(s.resolve("1"), Some(alice));
         assert_eq!(s.resolve("ALICE"), Some(alice));
         assert_eq!(s.resolve("9f86d0"), Some(alice));
@@ -656,7 +672,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut s = Store::open(dir.path()).unwrap();
-            let id = s.add_user("alice", cert("aa")).unwrap();
+            let id = s.add_user("alice", cert("aa"), false).unwrap();
             s.create_invite("bob", Duration::from_secs(60)).unwrap();
             assert_eq!(id, 1);
         }
@@ -747,7 +763,7 @@ mod tests {
     #[test]
     fn hello_name_only_applies_when_none_is_stored() {
         let (_dir, mut s) = store();
-        let id = s.add_user("alice", cert("aa")).unwrap();
+        let id = s.add_user("alice", cert("aa"), false).unwrap();
         assert_eq!(s.set_initial_name(id, "mallory").unwrap(), "alice");
 
         // A user without a name (should not happen through enrollment, but the
