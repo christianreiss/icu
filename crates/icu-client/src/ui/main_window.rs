@@ -438,6 +438,8 @@ impl eframe::App for App {
                                 camera: state.camera_on,
                                 mode: Some(state.mode),
                                 volume: None,
+                                is_admin: state.is_admin,
+                                rtt_ms: state.rtt_ms.map(|ms| ms.round() as u16),
                             },
                             volume_open,
                             &send,
@@ -455,6 +457,8 @@ impl eframe::App for App {
                                 camera: p.info.flags.camera_on(),
                                 mode: None,
                                 volume: Some(p.volume),
+                                is_admin: p.info.flags.is_admin(),
+                                rtt_ms: p.rtt_ms,
                             },
                             volume_open,
                             &send,
@@ -845,6 +849,10 @@ struct Participant<'a> {
     camera: bool,
     mode: Option<Mode>,
     volume: Option<f32>,
+    is_admin: bool,
+    /// Server-measured RTT, milliseconds. `None` until the first
+    /// `UserRtt` arrives (`PROTOCOL.md` §2.2).
+    rtt_ms: Option<u16>,
 }
 
 impl Participant<'_> {
@@ -934,6 +942,16 @@ fn participant_row(
                         if on {
                             ui.label(RichText::new(glyph).size(15.0).color(color));
                         }
+                    }
+                    if p.is_admin {
+                        ui.label(RichText::new(icon::SHIELD_STAR).size(15.0).color(tok.accent))
+                            .on_hover_text("Admin");
+                    }
+                    // Server-measured RTT (`PROTOCOL.md` §2.2 `UserRtt`), not
+                    // a client self-report: every viewer sees the same
+                    // number for a given peer.
+                    if let Some(ms) = p.rtt_ms {
+                        widgets::chip(ui, &format!("{ms} ms"), 0.0);
                     }
                 });
             });

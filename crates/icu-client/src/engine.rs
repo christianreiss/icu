@@ -112,6 +112,9 @@ pub struct Peer {
     pub speaking: bool,
     /// Volume in percent.
     pub volume: f32,
+    /// Server-measured RTT to this peer, milliseconds. `None` until the
+    /// first `ControlMsg::UserRtt` arrives (`PROTOCOL.md` §2.2).
+    pub rtt_ms: Option<u16>,
 }
 
 /// Everything the UI renders.
@@ -1540,6 +1543,7 @@ async fn run_session(
                 info: u.clone(),
                 speaking: u.flags.speaking(),
                 volume: volumes.get(&u.user_id).copied().unwrap_or(100.0),
+                rtt_ms: None,
             })
             .collect();
         let me = welcome.you.clone();
@@ -1572,7 +1576,11 @@ async fn run_session(
 
     // Flags may have changed while the handshake was in flight (a command
     // handled during `connect`); the server only knows `Hello.initial`.
-    if local.flags.sanitized() != welcome.you.flags.with_speaking(false) {
+    // Compare only the client-settable bits: `welcome.you.flags` may carry
+    // server-authoritative `SPEAKING`/`ADMIN` bits `local.flags` never has,
+    // which would otherwise trigger a spurious `SetState` on every connect.
+    let settable = UserFlags::CLIENT_SETTABLE;
+    if local.flags.sanitized().0 & settable != welcome.you.flags.0 & settable {
         let msg = ControlMsg::SetState {
             flags: local.flags.sanitized(),
         };
@@ -1884,6 +1892,7 @@ async fn handle_control(
                     speaking: user.flags.speaking(),
                     info: user,
                     volume,
+                    rtt_ms: None,
                 });
                 tracing::info!(peers = s.peers.len(), "user joined: peer list updated");
             });
@@ -1929,6 +1938,17 @@ async fn handle_control(
                     .state
                     .send_modify(|s| s.rtt_ms = Some(rtt.as_secs_f32() * 1000.0));
             }
+        }
+        ControlMsg::UserRtt { rtts } => {
+            shared.state.send_modify(|s| {
+                for (session, ms) in &rtts {
+                    for p in s.peers.iter_mut() {
+                        if p.info.session == *session {
+                            p.rtt_ms = Some(*ms);
+                        }
+                    }
+                }
+            });
         }
         ControlMsg::Error { code, detail } => {
             tracing::warn!(code, %detail, "server error");

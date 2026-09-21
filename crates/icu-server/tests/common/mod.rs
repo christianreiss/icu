@@ -281,10 +281,22 @@ impl Client {
         }
     }
 
-    /// Asserts that nothing arrives for a short while.
+    /// Asserts that nothing arrives for a short while, other than the
+    /// periodic `UserRtt` background broadcast (every ~2 s whenever the room
+    /// has 2+ participants) — expected noise, not a signal any test cares
+    /// about.
     pub async fn expect_silence(&mut self) {
-        if let Some(msg) = self.recv_timeout(BRIEFLY).await {
-            panic!("expected silence, got {msg:?}");
+        let deadline = tokio::time::Instant::now() + BRIEFLY;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            match self.recv_timeout(left).await {
+                Some(ControlMsg::UserRtt { .. }) => continue,
+                Some(msg) => panic!("expected silence, got {msg:?}"),
+                None => return,
+            }
         }
     }
 

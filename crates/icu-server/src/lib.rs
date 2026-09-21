@@ -332,6 +332,18 @@ async fn housekeeping(server: Arc<Server>) {
         }
 
         prune_counter += 1;
+
+        // Every 2 s (20 ticks of 100 ms): server-measured RTT per participant
+        // (`PROTOCOL.md` §2.2 `UserRtt`), broadcast to the whole room.
+        if prune_counter.is_multiple_of(20) {
+            let rtts = server.room.rtt_snapshot();
+            if !rtts.is_empty() {
+                server
+                    .room
+                    .broadcast(&icu_proto::ControlMsg::UserRtt { rtts });
+            }
+        }
+
         if prune_counter.is_multiple_of(600) {
             server
                 .ip_limits

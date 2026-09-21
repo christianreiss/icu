@@ -60,8 +60,9 @@ pub fn name_key(name: &str) -> String {
 
 /// Per-user state bits (`PROTOCOL.md` §2.1).
 ///
-/// bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4–7 reserved.
-/// Reserved bits are written as 0 by the sender and ignored by the receiver.
+/// bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4 admin,
+/// bit5–7 reserved. Reserved bits are written as 0 by the sender and ignored
+/// by the receiver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UserFlags(pub u8);
@@ -75,11 +76,17 @@ impl UserFlags {
     pub const SPEAKING: u8 = 1 << 2;
     /// bit3 — the user's camera is on.
     pub const CAMERA_ON: u8 = 1 << 3;
-    /// bit4–7 — reserved, sender writes 0.
-    pub const RESERVED: u8 = 0xF0;
-    /// Bits a client may set through `SetState`: everything but `SPEAKING`
-    /// and the reserved range.
+    /// bit4 — the user holds the admin role. Server authoritative, mirrors
+    /// `Store::is_admin`; rides the existing roster broadcasts
+    /// (`Welcome`/`UserJoined`/`UserState`) instead of a dedicated message.
+    pub const ADMIN: u8 = 1 << 4;
+    /// bit5–7 — reserved, sender writes 0.
+    pub const RESERVED: u8 = 0xE0;
+    /// Bits a client may set through `SetState`: everything but `SPEAKING`,
+    /// `ADMIN` and the reserved range.
     pub const CLIENT_SETTABLE: u8 = Self::MUTED | Self::DEAFENED | Self::CAMERA_ON;
+    /// Bits the server keeps regardless of what a client requests.
+    const SERVER_AUTHORITATIVE: u8 = Self::SPEAKING | Self::ADMIN;
 
     /// All bits cleared.
     pub const NONE: UserFlags = UserFlags(0);
@@ -100,6 +107,10 @@ impl UserFlags {
     pub fn camera_on(self) -> bool {
         self.0 & Self::CAMERA_ON != 0
     }
+    /// Whether the user holds the admin role.
+    pub fn is_admin(self) -> bool {
+        self.0 & Self::ADMIN != 0
+    }
 
     /// Returns a copy with `SPEAKING` set or cleared.
     pub fn with_speaking(self, on: bool) -> UserFlags {
@@ -116,11 +127,11 @@ impl UserFlags {
     }
 
     /// Applies a client requested state: takes the client settable bits from
-    /// `requested`, keeps the server authoritative `SPEAKING` bit and drops
-    /// everything reserved (`PROTOCOL.md` §2.1, `Server/IMPLEMENTATION.md`
+    /// `requested`, keeps the server authoritative `SPEAKING`/`ADMIN` bits and
+    /// drops everything reserved (`PROTOCOL.md` §2.1, `Server/IMPLEMENTATION.md`
     /// §6.4).
     pub fn apply_client_request(self, requested: UserFlags) -> UserFlags {
-        UserFlags((requested.0 & Self::CLIENT_SETTABLE) | (self.0 & Self::SPEAKING))
+        UserFlags((requested.0 & Self::CLIENT_SETTABLE) | (self.0 & Self::SERVER_AUTHORITATIVE))
     }
 
     /// Clears the reserved bits. Used on the sending side only; receivers must
@@ -289,6 +300,19 @@ mod tests {
         // A client clearing everything does not clear SPEAKING.
         let out = current.apply_client_request(UserFlags::NONE);
         assert_eq!(out, UserFlags(UserFlags::SPEAKING));
+    }
+
+    #[test]
+    fn client_request_cannot_set_or_clear_admin() {
+        // An admin's own SetState, however crafted, can never strip ADMIN...
+        let admin = UserFlags(UserFlags::ADMIN);
+        let out = admin.apply_client_request(UserFlags::NONE);
+        assert!(out.is_admin(), "server authoritative bit is kept");
+
+        // ...and a non-admin cannot grant it to themselves either.
+        let non_admin = UserFlags::NONE;
+        let out = non_admin.apply_client_request(UserFlags(0xFF));
+        assert!(!out.is_admin(), "a client cannot set ADMIN via SetState");
     }
 
     #[test]

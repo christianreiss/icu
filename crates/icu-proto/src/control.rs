@@ -12,7 +12,9 @@ use crate::{
 };
 
 /// Protocol minor version of this implementation. v1 baseline is 1; a minor 0
-/// does not exist (`PROTOCOL.md` §2.2, §8).
+/// does not exist (`PROTOCOL.md` §2.2, §8). New mandatory variants (like
+/// `UserRtt`) ship without a minor bump: client and server are always
+/// deployed in lockstep in this project (`PROTOCOL.md` §2.2).
 pub const MINOR: u16 = 1;
 
 /// Capability bits. All zero in v1, reserved for later extensions.
@@ -223,6 +225,16 @@ pub enum ControlMsg {
         /// Human readable detail.
         detail: String,
     },
+    /// 29, S→C. Broadcast periodically (every ~2 s) while the room has at
+    /// least two participants. One entry per online participant with its
+    /// current server-measured QUIC path RTT to the server, in milliseconds
+    /// (saturating). This is the server's own view of the connection, not a
+    /// client's self-reported `Ping`/`Pong` round trip, so every viewer sees
+    /// the same number for a given peer.
+    UserRtt {
+        /// `(session, rtt_ms)` pairs, one per online participant.
+        rtts: Vec<(Session, u16)>,
+    },
 }
 
 impl ControlMsg {
@@ -273,6 +285,7 @@ impl ControlMsg {
             ControlMsg::UserListRequest => "UserListRequest",
             ControlMsg::UserListResponse { .. } => "UserListResponse",
             ControlMsg::AdminActionError { .. } => "AdminActionError",
+            ControlMsg::UserRtt { .. } => "UserRtt",
         }
     }
 
@@ -463,6 +476,9 @@ mod tests {
                 code: crate::error::LAST_ADMIN,
                 detail: "cannot demote the last admin".into(),
             },
+            ControlMsg::UserRtt {
+                rtts: vec![(2, 34), (3, 128)],
+            },
         ]
     }
 
@@ -470,7 +486,7 @@ mod tests {
     #[test]
     fn roundtrip_all_control_variants() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 29, "v1 has exactly 29 control variants");
+        assert_eq!(variants.len(), 30, "v1 has exactly 30 control variants");
         for msg in variants {
             let frame = msg.encode().unwrap();
             let body = framing::split_frame(&frame, MAX_CONTROL_FRAME)
@@ -548,8 +564,8 @@ mod tests {
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
     #[test]
     fn unknown_variant_is_an_error() {
-        // Discriminant 29 does not exist in v1.
-        let body = [29u8, 0, 0];
+        // Discriminant 30 does not exist yet.
+        let body = [30u8, 0, 0];
         let err = ControlMsg::decode(&body).unwrap_err();
         assert!(
             matches!(err, ProtoError::UnknownVariant),
@@ -607,5 +623,6 @@ mod tests {
         assert!(ControlMsg::UserListRequest.is_client_to_server());
         assert!(!ControlMsg::UserAdminChanged { is_admin: true }.is_client_to_server());
         assert!(!ControlMsg::UserListResponse { users: vec![] }.is_client_to_server());
+        assert!(!ControlMsg::UserRtt { rtts: vec![] }.is_client_to_server());
     }
 }

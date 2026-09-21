@@ -146,6 +146,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         identity.user_id,
         stored_name.clone(),
         initial,
+        is_admin,
         conn.clone(),
         out_tx,
     ) {
@@ -627,7 +628,9 @@ async fn admin_action(
 }
 
 /// `AdminSetRole`: `UserAdminChanged` goes to every one of the target's own
-/// sessions, so their cached `is_admin` updates without a reconnect.
+/// sessions, so their cached `is_admin` updates without a reconnect; the
+/// `UserState` broadcast that follows is what puts the admin badge live on
+/// everybody else's roster.
 async fn handle_admin_set_role(
     server: &Arc<Server>,
     session: Session,
@@ -646,6 +649,13 @@ async fn handle_admin_set_role(
                 server
                     .room
                     .send_to(s, &ControlMsg::UserAdminChanged { is_admin });
+            }
+            for s in server.room.set_admin_flag(target, is_admin) {
+                if let Some(flags) = server.room.flags(s) {
+                    server
+                        .room
+                        .broadcast(&ControlMsg::UserState { session: s, flags });
+                }
             }
             tracing::info!(actor, target, is_admin, "admin role changed");
             ControlMsg::AdminSetRoleOk {

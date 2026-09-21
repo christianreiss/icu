@@ -179,3 +179,127 @@ async fn last_admin_guard_applies_to_the_in_band_path() {
     );
     server.shutdown().await;
 }
+
+/// The live roster (`UserFlags::ADMIN`, not the admin-only `UserSummary`
+/// list) shows the bootstrap admin's role to itself on `Welcome`, and to a
+/// peer both in `Welcome.users` and live in `UserJoined` once they connect.
+#[tokio::test]
+async fn the_admin_flag_bit_rides_the_live_roster() {
+    let server = TestServer::start().await;
+    let alice_id = server.enroll("alice").await;
+    let mut alice = server.connect(&alice_id).await.expect("connect");
+    let welcome = alice.hello("alice").await; // sole bootstrap admin
+    let ControlMsg::Welcome { you, .. } = welcome else {
+        panic!("expected Welcome, got {welcome:?}");
+    };
+    assert!(you.flags.is_admin(), "the bootstrap admin sees its own bit");
+
+    let bob_id = server.enroll("bob").await;
+    let mut bob = server.connect(&bob_id).await.expect("connect");
+    let bob_welcome = bob.hello("bob").await;
+    let ControlMsg::Welcome { users, .. } = bob_welcome else {
+        panic!("expected Welcome, got {bob_welcome:?}");
+    };
+    let alice_row = users.iter().find(|u| u.name == "alice").unwrap();
+    assert!(
+        alice_row.flags.is_admin(),
+        "bob's own Welcome.users shows alice's badge"
+    );
+
+    let joined = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserJoined { .. }))
+        .await;
+    let Some(ControlMsg::UserJoined { user }) = joined else {
+        panic!("expected UserJoined, got {joined:?}");
+    };
+    assert!(!user.flags.is_admin(), "bob is not an admin");
+    server.shutdown().await;
+}
+
+/// `AdminSetRole` broadcasts a `UserState` for the target to every connected
+/// peer (not just a unicast `UserAdminChanged` to the target itself), so the
+/// live badge updates without a reconnect.
+#[tokio::test]
+async fn promoting_a_peer_broadcasts_the_admin_bit_to_everyone() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await; // sole bootstrap admin
+    let mut bob = server.client("bob").await;
+    let _ = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserJoined { .. }))
+        .await;
+
+    alice
+        .send_msg(&ControlMsg::AdminSetRole {
+            user_id: bob.user_id,
+            is_admin: true,
+        })
+        .await;
+
+    // Bob's own unicast notification...
+    let pushed = bob
+        .recv_matching(|m| matches!(m, ControlMsg::UserAdminChanged { .. }))
+        .await;
+    assert!(matches!(
+        pushed,
+        Some(ControlMsg::UserAdminChanged { is_admin: true })
+    ));
+
+    // ...and alice, who is not the target, also sees Bob's UserState flip.
+    let state = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob.session))
+        .await;
+    let Some(ControlMsg::UserState { flags, .. }) = state else {
+        panic!("expected UserState, got {state:?}");
+    };
+    assert!(flags.is_admin(), "alice's own roster sees bob's new badge");
+    server.shutdown().await;
+}
+
+/// `UserRtt` (`PROTOCOL.md` §2.2) arrives within a few seconds once two
+/// clients share the room, carrying a server-measured RTT for each — a
+/// mandatory v1 variant, not gated behind any minor negotiation (client and
+/// server ship in lockstep in this project).
+#[tokio::test]
+async fn user_rtt_is_broadcast_once_two_clients_share_the_room() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let mut bob = server.client("bob").await;
+
+    let msg = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserRtt { .. }))
+        .await;
+    let Some(ControlMsg::UserRtt { rtts }) = msg else {
+        panic!("expected UserRtt within the timeout, got {msg:?}");
+    };
+    assert_eq!(rtts.len(), 2, "one entry per online participant");
+    assert!(
+        rtts.iter().any(|(s, _)| *s == alice.session)
+            && rtts.iter().any(|(s, _)| *s == bob.session),
+        "{rtts:?}"
+    );
+
+    let _ = bob
+        .recv_matching(|m| matches!(m, ControlMsg::UserRtt { .. }))
+        .await
+        .expect("bob gets it too");
+    server.shutdown().await;
+}
+
+/// A lone participant has nobody to show a ping to: `Room::rtt_snapshot`
+/// stays empty and no `UserRtt` is ever broadcast for a room of one.
+#[tokio::test]
+async fn a_lone_participant_never_receives_user_rtt() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+
+    // One tick is 2 s; wait past it without using the 5 s `SOON` a positive
+    // assertion would need.
+    let msg = alice
+        .recv_timeout(std::time::Duration::from_millis(2500))
+        .await;
+    assert!(
+        !matches!(msg, Some(ControlMsg::UserRtt { .. })),
+        "a room of one must never see UserRtt, got {msg:?}"
+    );
+    server.shutdown().await;
+}

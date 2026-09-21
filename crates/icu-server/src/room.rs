@@ -161,6 +161,7 @@ impl Room {
         user_id: UserId,
         name: String,
         flags: UserFlags,
+        is_admin: bool,
         conn: quinn::Connection,
         out: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<Session, JoinError> {
@@ -173,14 +174,17 @@ impl Room {
             return Err(JoinError::SessionSpaceExhausted);
         }
         state.next_session += 1;
+        // A client cannot announce itself as speaking or admin; the admin
+        // bit comes from the store, looked up by the caller before join.
+        let mut initial = UserFlags::NONE.apply_client_request(flags);
+        initial = initial.with_bit(UserFlags::ADMIN, is_admin);
         state.members.insert(
             session,
             Member {
                 session,
                 user_id,
                 name,
-                // A client cannot announce itself as speaking.
-                flags: UserFlags::NONE.apply_client_request(flags),
+                flags: initial,
                 conn,
                 out,
                 speak: Speaking::default(),
@@ -296,6 +300,46 @@ impl Room {
         if let Some(member) = self.lock().members.get_mut(&session) {
             member.name = name.to_string();
         }
+    }
+
+    /// Sets or clears `ADMIN` on every live session of `user_id`. Returns the
+    /// sessions whose flags actually changed, so the caller can broadcast
+    /// `UserState` for each — a user can in principle hold more than one
+    /// session (`sessions_of_user`), and every one of them must show the same
+    /// badge to everybody else.
+    pub fn set_admin_flag(&self, user_id: UserId, is_admin: bool) -> Vec<Session> {
+        let mut state = self.lock();
+        let mut changed = Vec::new();
+        for member in state.members.values_mut() {
+            if member.user_id != user_id {
+                continue;
+            }
+            let new = member.flags.with_bit(UserFlags::ADMIN, is_admin);
+            if new != member.flags {
+                member.flags = new;
+                changed.push(member.session);
+            }
+        }
+        changed
+    }
+
+    /// One `(session, rtt_ms)` pair per member, from the server's own QUIC
+    /// path RTT measurement — not a client self-reported value
+    /// (`PROTOCOL.md` §2.2 `UserRtt`). Empty when fewer than two members are
+    /// present: a lone participant has nobody to show a ping to.
+    pub fn rtt_snapshot(&self) -> Vec<(Session, u16)> {
+        let state = self.lock();
+        if state.members.len() < 2 {
+            return Vec::new();
+        }
+        state
+            .members
+            .values()
+            .map(|m| {
+                let ms = m.conn.stats().path.rtt.as_millis().min(u128::from(u16::MAX));
+                (m.session, ms as u16)
+            })
+            .collect()
     }
 
     /// Records an incoming audio datagram and derives the `speaking` bit

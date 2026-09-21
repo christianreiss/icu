@@ -34,8 +34,9 @@ Framing auf dem Control-Stream in beide Richtungen:
 ### 2.1 Typen
 
 ```
-UserFlags: u8      bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4–7 reserviert
+UserFlags: u8      bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4 admin, bit5–7 reserviert
                    bit2 ist serverseitig autoritativ: der Server leitet es aus dem Audio-Datagram-Fluss ab (erstes Datagram nach ≥ 500 ms Stille → 1; END-Flag oder 500 ms ohne Datagram → 0) und broadcastet UserState; ein von Clients in SetState gesendetes bit2 wird ignoriert.
+                   bit4 ist ebenfalls serverseitig autoritativ und spiegelt Store::is_admin: reitet kostenlos auf Welcome/UserJoined/UserState statt einer eigenen Variante; ein von Clients in SetState gesendetes bit4 wird ignoriert. AdminSetRole broadcastet zusätzlich zum bisherigen Unicast UserAdminChanged ein UserState für jede betroffene Sitzung, damit das Abzeichen bei jedem Betrachter live kippt.
 Session:   u16     serverseitig vergeben, ab 1, pro Server-Laufzeit monoton, nie wiederverwendet; 0 = „unbekannt/ich“.
                    Gilt nur innerhalb einer Verbindung: nach einem Server-Neustart beginnt die Vergabe wieder bei 1.
 UserId:    u32     beim Enrollment vergeben, ab 1, monoton, nie wiederverwendet; stabil über Cert-Renewals, Reconnects
@@ -46,7 +47,7 @@ UserInfo { user_id: UserId, session: Session, name: Name, flags: UserFlags }
 AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64000 }
 ```
 
-**Reservierte Felder und Bits** — eine Regel für alle Stellen (`UserFlags` bit4–7, Audio-`flags` bit1–7, Video-`flags` bit1–7, Video-Byte 11): der Sender schreibt 0, der Empfänger ignoriert den Inhalt und verwirft deswegen nie eine Nachricht. „= 0“ in den Tabellen ist eine Sendevorschrift, keine Empfangsprüfung; sonst wäre kein additives Minor möglich.
+**Reservierte Felder und Bits** — eine Regel für alle Stellen (`UserFlags` bit5–7, Audio-`flags` bit1–7, Video-`flags` bit1–7, Video-Byte 11): der Sender schreibt 0, der Empfänger ignoriert den Inhalt und verwirft deswegen nie eine Nachricht. „= 0“ in den Tabellen ist eine Sendevorschrift, keine Empfangsprüfung; sonst wäre kein additives Minor möglich.
 
 ### 2.2 Messages `ControlMsg`
 
@@ -81,10 +82,11 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | 26 | `UserListRequest` | C→S | – | Nur Admins, sonst `AdminActionError { code: NOT_ADMIN }`. |
 | 27 | `UserListResponse` | S→C | `users: Vec<UserSummary>` | Jeder registrierte Nutzer, online oder nicht. `UserSummary { user_id, name, created, is_admin, disabled, revoked, online }`. Größe durch `MAX_CONTROL_FRAME` begrenzt (§7): ~230 Nutzer passen in einen Frame, keine Paginierung gebaut. |
 | 28 | `AdminActionError` | S→C | `user_id: UserId`, `code: u32`, `detail: String` | Ablehnung von Variante 19/22/24/26. `user_id = 0` bei einem `UserListRequest`-Fehler, da kein einzelnes Ziel benannt ist. Eigene Variante statt der generischen `Error`, damit `NOT_ADMIN` nicht zwischen Einladung und Nutzerverwaltung mehrdeutig wird. |
+| 29 | `UserRtt` | S→C | `rtts: Vec<(Session, u16)>` | Broadcast alle ~2 s, solange der Raum ≥ 2 Teilnehmer hat: ein Eintrag je Online-Teilnehmer mit dessen serverseitig gemessener QUIC-Pfad-RTT in Millisekunden (`Connection::stats().path.rtt`, gesättigt auf `u16::MAX`). Das ist die Sicht des Servers, kein vom Client selbst gemeldeter `Ping`/`Pong`-Wert — jeder Betrachter sieht für einen gegebenen Peer dieselbe Zahl. Bei einem Raum mit nur einem Teilnehmer entfällt der Broadcast. |
 
 Varianten 19–28 sind die ersten C→S-Nachrichten, bei denen der sendende Client eine **andere** `user_id` benennt als seine eigene.
 
-Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline ist `minor = 1`; ein Minor 0 existiert nicht, und alle 29 Varianten sind in v1 Pflicht (Varianten 19–28 wie zuvor `VideoCongestionHint`: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
+Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline ist `minor = 1`; ein Minor 0 existiert nicht, und alle 30 Varianten sind in v1 Pflicht (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt`: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
 ### 2.3 Enrollment `EnrollMsg` (nur ALPN `icu-enroll/1`)
 
