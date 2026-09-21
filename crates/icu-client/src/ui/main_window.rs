@@ -541,7 +541,7 @@ impl eframe::App for App {
                 }
                 #[cfg(feature = "camera")]
                 if let Some(camera) = self.camera.as_mut() {
-                    if state.camera_on {
+                    if state.camera_on && state.settings.camera.show_self_preview {
                         ui.add_space(4.0);
                         let tok = theme::tokens(ui.visuals());
                         egui::Frame::new()

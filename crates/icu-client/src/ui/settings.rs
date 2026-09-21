@@ -325,6 +325,9 @@ impl SettingsView {
             widgets::setting_row(ui, false, "Beim Start einschalten", None, |ui| {
                 widgets::toggle(ui, &mut self.draft.camera.enabled)
             });
+            widgets::setting_row(ui, true, "Eigene Vorschau anzeigen", None, |ui| {
+                widgets::toggle(ui, &mut self.draft.camera.show_self_preview)
+            });
             let mut dev = self.draft.camera.device.clone().unwrap_or_default();
             widgets::setting_row(ui, true, "Gerät (Index)", None, |ui| {
                 let r = ui.add(egui::TextEdit::singleline(&mut dev).desired_width(120.0));
@@ -366,6 +369,9 @@ impl SettingsView {
                     &mut self.draft.overlay.size,
                     &[(TileSize::Small, "klein"), (TileSize::Medium, "mittel")],
                 )
+            });
+            widgets::setting_row(ui, true, "Stille Teilnehmer abdunkeln", None, |ui| {
+                widgets::toggle(ui, &mut self.draft.overlay.dim_non_speaking)
             });
         });
     }

@@ -112,7 +112,8 @@ icu stats: sent=498 recv=500 bad=0 decoded=499 fec=0 plc=0 played=480960 dsp_blo
 - **Nicht unbeaufsichtigt prüfbar, bleibt für diesen Test:** Portal-Hotkey-Dialog (KDE fragt beim ersten Binden; bei „Abbrechen“ fällt der Client auf evdev zurück), Tastendruck, echte Sprache/Echo, Overlay über einem Vollbild-Spiel, Klick-Durchlässigkeit des Overlays.
 - Beide Instanzen teilen sich Default-Mikrofon und Default-Sink; Gerätewahl in ⚙ → Audio.
 - Hotkey-Änderungen in den Einstellungen gelten erst nach Neustart des Clients (Bindungen werden beim Start gelesen).
-- Das Overlay zeigt Kamerakacheln (Rahmen blau = spricht), aber keine Namen (kein Textrenderer im Overlay); Teilnehmer ohne Kamera erscheinen nicht.
+- Das Overlay zeigt Kamerakacheln (Rahmen orange = spricht), aber keine Namen (kein Textrenderer im Overlay); Teilnehmer ohne Kamera erscheinen nicht.
+- Neu: „Stille Teilnehmer abdunkeln" (⚙ → Kamera → Overlay, Standard: an) dimmt Kacheln nicht sprechender Teilnehmer auf ~50 % Helligkeit; „Eigene Vorschau anzeigen" (⚙ → Kamera, Standard: an) blendet die eigene Kamera-Vorschau im Hauptfenster aus, ohne das Senden der Kamera zu beeinflussen.
 - Kamera: `/dev/video0` (C270) braucht ~3 s bis zum ersten Bild (Auto-Belichtung); bei wenig Licht 4–6 fps statt 15 (Spike 5).
 - Windows-Pfade (WASAPI, Raw Input, Layered Window, DPAPI) sind Stubs mit `Unsupported` — M3.
 - Zertifikats-Renewal (`RenewRequest`) ist nicht implementiert (Leaf gilt 365 Tage).

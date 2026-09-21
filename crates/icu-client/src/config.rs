@@ -181,13 +181,26 @@ impl Default for HotkeySettings {
 }
 
 /// `[camera]`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CameraSettings {
     /// Camera index or name.
     pub device: Option<String>,
     /// Start with the camera on.
     pub enabled: bool,
+    /// Show the local self-preview in the main window while the camera is
+    /// on. Does not affect whether the camera is captured/sent to peers.
+    pub show_self_preview: bool,
+}
+
+impl Default for CameraSettings {
+    fn default() -> Self {
+        CameraSettings {
+            device: None,
+            enabled: false,
+            show_self_preview: true,
+        }
+    }
 }
 
 /// Overlay corner.
@@ -228,6 +241,8 @@ pub struct OverlaySettings {
     pub offset: [u32; 2],
     /// Tile size.
     pub size: TileSize,
+    /// Dim tiles of peers who aren't currently speaking.
+    pub dim_non_speaking: bool,
 }
 
 impl Default for OverlaySettings {
@@ -237,6 +252,7 @@ impl Default for OverlaySettings {
             corner: Corner::TopRight,
             offset: [40, 40],
             size: TileSize::Small,
+            dim_non_speaking: true,
         }
     }
 }
@@ -447,6 +463,8 @@ mod tests {
         s.audio.input_device = Some("alsa_input.foo".into());
         s.hotkeys.ptt.key = "BTN_SIDE".into();
         s.overlay.corner = Corner::BottomLeft;
+        s.overlay.dim_non_speaking = false;
+        s.camera.show_self_preview = false;
         s.set_volume(7, 120.0);
         s.set_volume(9, 100.0);
         s.ui.name = Some("chris".into());
@@ -457,6 +475,8 @@ mod tests {
         assert_eq!(back.volume(7), 120.0);
         assert_eq!(back.volume(9), 100.0, "100 % is not stored");
         assert!(!back.volumes.contains_key("9"));
+        assert!(!back.overlay.dim_non_speaking);
+        assert!(!back.camera.show_self_preview);
 
         let text = fs::read_to_string(paths.settings()).unwrap();
         assert!(text.contains("mode = \"vad\""));
@@ -469,6 +489,8 @@ mod tests {
         let s: Settings = toml::from_str("[audio]\nmode = \"vad\"\n[future]\nx = 1\n").unwrap();
         assert_eq!(s.audio.mode, ModeSetting::Vad);
         assert_eq!(s.audio.release_ms, 150);
+        assert!(s.overlay.dim_non_speaking, "old settings.toml default on");
+        assert!(s.camera.show_self_preview, "old settings.toml default on");
     }
 
     #[test]

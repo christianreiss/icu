@@ -51,6 +51,8 @@ use crate::{
 
 const GAP: u32 = 8;
 const BORDER: u32 = 3;
+/// Brightness multiplier (out of 256) applied to dimmed, non-speaking tiles.
+const DIM_MUL: u32 = 128;
 
 /// Owns the overlay thread.
 pub struct OverlayHandle {
@@ -95,6 +97,7 @@ impl Drop for OverlayHandle {
 struct Tile {
     rgba: Option<(usize, usize, Vec<u8>)>,
     speaking: bool,
+    dim: bool,
 }
 
 struct App {
@@ -254,6 +257,7 @@ impl App {
                     .find(|(s, _)| *s == p.info.session)
                     .map(|(_, f)| (f.width, f.height, f.rgba.clone())),
                 speaking: p.speaking,
+                dim: settings.dim_non_speaking && !p.speaking,
             })
             .collect();
 
@@ -337,6 +341,7 @@ impl App {
             };
             let outer_w = tw + 2 * BORDER;
             let outer_h = th + 2 * BORDER;
+            let mul = if tile.dim { DIM_MUL } else { 256 };
             for y in 0..outer_h {
                 for x in 0..outer_w {
                     let inside = x >= BORDER && x < BORDER + tw && y >= BORDER && y < BORDER + th;
@@ -346,7 +351,12 @@ impl App {
                                 let sx = ((x - BORDER) as usize * fw) / tw as usize;
                                 let sy = ((y - BORDER) as usize * fh) / th as usize;
                                 let i = (sy * fw + sx) * 4;
-                                [rgba[i + 2], rgba[i + 1], rgba[i], 0xff]
+                                [
+                                    ((rgba[i + 2] as u32 * mul) >> 8) as u8,
+                                    ((rgba[i + 1] as u32 * mul) >> 8) as u8,
+                                    ((rgba[i] as u32 * mul) >> 8) as u8,
+                                    0xff,
+                                ]
                             }
                             None => [0x20, 0x20, 0x20, 0xc0],
                         }
