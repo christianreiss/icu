@@ -9,7 +9,10 @@ use icu_proto::error as ec;
 #[tokio::test]
 async fn empty_token_on_a_fresh_store_enrolls_as_admin() {
     let server = TestServer::start().await;
-    let identity = server.enroll_with_token("", "admin").await.expect("bootstrap enrolls");
+    let identity = server
+        .enroll_with_token("", "admin")
+        .await
+        .expect("bootstrap enrolls");
     let mut client = server.connect(&identity).await.expect("connect");
     let welcome = client.hello("admin").await;
     match welcome {

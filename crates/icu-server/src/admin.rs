@@ -299,9 +299,10 @@ async fn set_role(server: &Arc<Server>, user: &str, is_admin: bool) -> AdminResp
         Ok(_) => {
             drop(store);
             for session in server.room.sessions_of_user(user_id) {
-                server
-                    .room
-                    .send_to(session, &icu_proto::ControlMsg::UserAdminChanged { is_admin });
+                server.room.send_to(
+                    session,
+                    &icu_proto::ControlMsg::UserAdminChanged { is_admin },
+                );
             }
             tracing::info!(user_id, is_admin, "admin role changed");
             AdminResponse::Ok
@@ -446,13 +447,9 @@ fn chgrp(path: &std::path::Path, group: &str) -> Result<()> {
             (name == group).then(|| gid.parse::<u32>().ok())?
         })
         .ok_or_else(|| Error::msg(format!("no group {group:?} in /etc/group")))?;
-    rustix::fs::chown(path, None, Some(unsafe_gid(gid)))?;
-    Ok(())
-}
-
-fn unsafe_gid(gid: u32) -> rustix::fs::Gid {
     // `Gid::from_raw` is safe in rustix 1; the name is historical.
-    rustix::fs::Gid::from_raw(gid)
+    rustix::fs::chown(path, None, Some(rustix::fs::Gid::from_raw(gid)))?;
+    Ok(())
 }
 
 async fn serve(server: Arc<Server>, listener: UnixListener) {

@@ -18,7 +18,7 @@ use crate::{
     limits::{TokenBucket, ViolationCounter},
     relay::{self, VideoSender},
     room::{Counters, JoinError},
-    store::{fingerprint, now, rfc3339, unix_millis, CertRecord},
+    store::{fingerprint, now, rfc3339, unix_millis, CertRecord, Store},
     wire, Server,
 };
 
@@ -249,12 +249,19 @@ async fn writer_task(mut send: quinn::SendStream, mut rx: mpsc::UnboundedReceive
     let _ = send.finish();
 }
 
-/// Reads audio datagrams and hands them to the relay.
+/// Reads audio datagrams and hands them to the relay. The receiver buffer
+/// lives here so that the relay allocates nothing per datagram.
 async fn datagram_task(server: Arc<Server>, conn: quinn::Connection, session: Session) {
     let mut bucket = TokenBucket::per_second(server.config.limits.audio_datagrams_per_s);
+    let mut receivers = Vec::with_capacity(usize::from(server.config.server.max_users));
     loop {
         match conn.read_datagram().await {
-            Ok(datagram) => relay::audio(&server, session, datagram, &mut bucket),
+            Ok(datagram) => {
+                relay::audio(&server, session, datagram, &mut bucket, &mut receivers);
+                // Keep the capacity, hold no peer connection across the wait
+                // for the next datagram.
+                receivers.clear();
+            }
             Err(_) => return,
         }
     }
@@ -543,11 +550,7 @@ async fn handle_create_invite(
             .send_to(session, &reject(ec::NOT_ADMIN, "not an admin".into()));
         return;
     }
-    let ttl = Duration::from_secs(if ttl_s == 0 {
-        pl::INVITE_TTL_S
-    } else {
-        ttl_s
-    });
+    let ttl = Duration::from_secs(if ttl_s == 0 { pl::INVITE_TTL_S } else { ttl_s });
     let (token, record) = match store.create_invite(name, ttl) {
         Ok(v) => v,
         Err(e) => {
@@ -587,21 +590,44 @@ async fn handle_create_invite(
     );
 }
 
-/// Sends `AdminActionError` to the acting admin's session.
-fn send_admin_error(server: &Arc<Server>, session: Session, user_id: UserId, code: u32, detail: String) {
-    server.room.send_to(
-        session,
-        &ControlMsg::AdminActionError {
-            user_id,
-            code,
-            detail,
+/// Shared body of the in-band admin actions (`PROTOCOL.md` §2.2).
+///
+/// All three have the same shape: under the store lock, check that the actor
+/// is still an admin and that the target exists, then apply `change`. Only on
+/// success does `done` run, and it runs **outside** the lock, because it kicks
+/// connections and sends control frames. Any failure answers with
+/// `AdminActionError` and changes nothing.
+async fn admin_action(
+    server: &Arc<Server>,
+    session: Session,
+    actor: UserId,
+    target: UserId,
+    change: impl FnOnce(&mut Store) -> Result<bool>,
+    done: impl FnOnce() -> ControlMsg,
+) {
+    let outcome = {
+        let mut store = server.store.lock().await;
+        if !store.is_admin(actor) {
+            Err(Error::coded(ec::NOT_ADMIN, "not an admin"))
+        } else if store.user(target).is_none() {
+            Err(Error::coded(ec::NO_SUCH_USER, "unknown user"))
+        } else {
+            change(&mut store)
+        }
+    };
+    let answer = match outcome {
+        Ok(_) => done(),
+        Err(e) => ControlMsg::AdminActionError {
+            user_id: target,
+            code: e.code().unwrap_or(ec::LAST_ADMIN),
+            detail: e.to_string(),
         },
-    );
+    };
+    server.room.send_to(session, &answer);
 }
 
-/// `AdminSetRole` (`PROTOCOL.md` §2.2). Admin only; on success, pushes
-/// `UserAdminChanged` live to every one of the target's own sessions, so
-/// their own cached `is_admin` updates without a reconnect.
+/// `AdminSetRole`: `UserAdminChanged` goes to every one of the target's own
+/// sessions, so their cached `is_admin` updates without a reconnect.
 async fn handle_admin_set_role(
     server: &Arc<Server>,
     session: Session,
@@ -609,40 +635,30 @@ async fn handle_admin_set_role(
     target: UserId,
     is_admin: bool,
 ) {
-    let mut store = server.store.lock().await;
-    if !store.is_admin(actor) {
-        drop(store);
-        send_admin_error(server, session, target, ec::NOT_ADMIN, "not an admin".into());
-        return;
-    }
-    if store.user(target).is_none() {
-        drop(store);
-        send_admin_error(server, session, target, ec::NO_SUCH_USER, "unknown user".into());
-        return;
-    }
-    match store.set_admin(target, is_admin) {
-        Ok(_) => {
-            drop(store);
-            server
-                .room
-                .send_to(session, &ControlMsg::AdminSetRoleOk { user_id: target, is_admin });
+    admin_action(
+        server,
+        session,
+        actor,
+        target,
+        |store| store.set_admin(target, is_admin),
+        || {
             for s in server.room.sessions_of_user(target) {
                 server
                     .room
                     .send_to(s, &ControlMsg::UserAdminChanged { is_admin });
             }
             tracing::info!(actor, target, is_admin, "admin role changed");
-        }
-        Err(e) => {
-            drop(store);
-            send_admin_error(server, session, target, e.code().unwrap_or(ec::LAST_ADMIN), e.to_string());
-        }
-    }
+            ControlMsg::AdminSetRoleOk {
+                user_id: target,
+                is_admin,
+            }
+        },
+    )
+    .await
 }
 
-/// `AdminSetDisabled` (`PROTOCOL.md` §2.2). Admin only; disabling an online
-/// user kicks it immediately with `AUTH_DISABLED` — the close itself is the
-/// notification, no separate push is sent.
+/// `AdminSetDisabled`: disabling an online user kicks it immediately with
+/// `AUTH_DISABLED` — the close itself is the notification, no separate push.
 async fn handle_admin_set_disabled(
     server: &Arc<Server>,
     session: Session,
@@ -650,71 +666,50 @@ async fn handle_admin_set_disabled(
     target: UserId,
     disabled: bool,
 ) {
-    let mut store = server.store.lock().await;
-    if !store.is_admin(actor) {
-        drop(store);
-        send_admin_error(server, session, target, ec::NOT_ADMIN, "not an admin".into());
-        return;
-    }
-    if store.user(target).is_none() {
-        drop(store);
-        send_admin_error(server, session, target, ec::NO_SUCH_USER, "unknown user".into());
-        return;
-    }
-    match store.set_disabled(target, disabled) {
-        Ok(_) => {
-            drop(store);
+    admin_action(
+        server,
+        session,
+        actor,
+        target,
+        |store| store.set_disabled(target, disabled),
+        || {
             if disabled {
                 kick_user(server, target, ec::AUTH_DISABLED);
             }
-            server.room.send_to(
-                session,
-                &ControlMsg::AdminSetDisabledOk {
-                    user_id: target,
-                    disabled,
-                },
-            );
             tracing::info!(actor, target, disabled, "admin disabled state changed");
-        }
-        Err(e) => {
-            drop(store);
-            send_admin_error(server, session, target, e.code().unwrap_or(ec::LAST_ADMIN), e.to_string());
-        }
-    }
+            ControlMsg::AdminSetDisabledOk {
+                user_id: target,
+                disabled,
+            }
+        },
+    )
+    .await
 }
 
-/// `AdminRevokeUser` (`PROTOCOL.md` §2.2). Admin only; revokes every
-/// certificate of `target` and kicks any live connection with `KICKED`.
-async fn handle_admin_revoke_user(server: &Arc<Server>, session: Session, actor: UserId, target: UserId) {
-    let mut store = server.store.lock().await;
-    if !store.is_admin(actor) {
-        drop(store);
-        send_admin_error(server, session, target, ec::NOT_ADMIN, "not an admin".into());
-        return;
-    }
-    if store.user(target).is_none() {
-        drop(store);
-        send_admin_error(server, session, target, ec::NO_SUCH_USER, "unknown user".into());
-        return;
-    }
-    match store.revoke(target) {
-        Ok(_) => {
-            drop(store);
+/// `AdminRevokeUser`: revokes every certificate of `target` and kicks any live
+/// connection with `KICKED`.
+async fn handle_admin_revoke_user(
+    server: &Arc<Server>,
+    session: Session,
+    actor: UserId,
+    target: UserId,
+) {
+    admin_action(
+        server,
+        session,
+        actor,
+        target,
+        |store| store.revoke(target),
+        || {
             let closed = kick_user(server, target, ec::KICKED) as u32;
-            server.room.send_to(
-                session,
-                &ControlMsg::AdminRevokeUserOk {
-                    user_id: target,
-                    closed,
-                },
-            );
             tracing::info!(actor, target, closed, "admin revoked user");
-        }
-        Err(e) => {
-            drop(store);
-            send_admin_error(server, session, target, e.code().unwrap_or(ec::LAST_ADMIN), e.to_string());
-        }
-    }
+            ControlMsg::AdminRevokeUserOk {
+                user_id: target,
+                closed,
+            }
+        },
+    )
+    .await
 }
 
 /// `UserListRequest` (`PROTOCOL.md` §2.2). Admin only; every registered user,
@@ -723,7 +718,15 @@ async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor:
     let store = server.store.lock().await;
     if !store.is_admin(actor) {
         drop(store);
-        send_admin_error(server, session, 0, ec::NOT_ADMIN, "not an admin".into());
+        // No target to name, so `user_id` stays 0.
+        server.room.send_to(
+            session,
+            &ControlMsg::AdminActionError {
+                user_id: 0,
+                code: ec::NOT_ADMIN,
+                detail: "not an admin".into(),
+            },
+        );
         return;
     }
     let users = store

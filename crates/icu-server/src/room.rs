@@ -235,15 +235,31 @@ impl Room {
             .collect()
     }
 
-    /// Connections to hand an audio datagram to: everybody else who is not
-    /// deafened (`PROTOCOL.md` §3).
-    pub fn audio_receivers(&self, sender: Session) -> Vec<(Session, quinn::Connection)> {
-        self.lock()
-            .members
-            .values()
-            .filter(|m| m.session != sender && !m.flags.deafened())
-            .map(|m| (m.session, m.conn.clone()))
-            .collect()
+    /// Everything the audio relay needs from the room, in **one** lock: the
+    /// sender's flags, and — unless it is muted — the connections to fan the
+    /// datagram out to, which is everybody else who is not deafened
+    /// (`PROTOCOL.md` §3). Returns `None` when the sender has already left.
+    ///
+    /// `out` is owned by the caller and reused across datagrams, so this, the
+    /// only truly hot path in the server, allocates nothing.
+    pub fn audio_fanout(
+        &self,
+        sender: Session,
+        out: &mut Vec<(Session, quinn::Connection)>,
+    ) -> Option<UserFlags> {
+        out.clear();
+        let state = self.lock();
+        let flags = state.members.get(&sender)?.flags;
+        if !flags.muted() {
+            out.extend(
+                state
+                    .members
+                    .values()
+                    .filter(|m| m.session != sender && !m.flags.deafened())
+                    .map(|m| (m.session, m.conn.clone())),
+            );
+        }
+        Some(flags)
     }
 
     /// Connections to hand a video frame to: everybody else. Deafened only

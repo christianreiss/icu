@@ -116,13 +116,6 @@ impl LossTracker {
     }
 }
 
-/// Converts a per mille value into the percentage handed to
-/// `OPUS_SET_PACKET_LOSS_PERC`, rounded and capped at 20 (`PROTOCOL.md` §2.2).
-pub fn permille_to_capped_percent(permille: u16) -> u16 {
-    let percent = (u32::from(permille) + 5) / 10;
-    (percent as u16).min(icu_proto::limits::LOSS_HINT_MAX_PERCENT)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,16 +193,5 @@ mod tests {
         );
         assert!(tracker.reports.is_empty());
         assert_eq!(tracker.report_at(1, 3, 90, TTL, t0), Some(90));
-    }
-
-    #[test]
-    fn permille_becomes_capped_percent() {
-        assert_eq!(permille_to_capped_percent(0), 0);
-        assert_eq!(permille_to_capped_percent(4), 0);
-        assert_eq!(permille_to_capped_percent(5), 1);
-        assert_eq!(permille_to_capped_percent(14), 1);
-        assert_eq!(permille_to_capped_percent(15), 2);
-        assert_eq!(permille_to_capped_percent(200), 20);
-        assert_eq!(permille_to_capped_percent(1000), 20, "capped at 20 %");
     }
 }

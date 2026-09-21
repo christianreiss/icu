@@ -576,11 +576,6 @@ impl Store {
         self.save_invites()
     }
 
-    /// Path of the state directory.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     fn save_users(&self) -> Result<()> {
         write_atomic(&self.dir.join(USERS_FILE), &toml::to_string(&self.users)?)
     }

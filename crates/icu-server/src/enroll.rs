@@ -147,8 +147,9 @@ async fn run(
     } else if token.len() == EnrollMsg::TOKEN_LEN {
         TokenKind::Invite(token.clone())
     } else {
-        let blob = InviteBlob::decode_body_base64(&token)
-            .map_err(|e| Error::coded(ec::ENROLL_BAD_TOKEN, format!("malformed invite blob: {e}")))?;
+        let blob = InviteBlob::decode_body_base64(&token).map_err(|e| {
+            Error::coded(ec::ENROLL_BAD_TOKEN, format!("malformed invite blob: {e}"))
+        })?;
         let aad = blob.aad();
         let mut sealed = blob.sealed.clone();
         let real_token = server.invite_key.open(blob.nonce, &mut sealed, &aad)?;

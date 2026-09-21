@@ -7,7 +7,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -26,7 +29,19 @@ use crate::{limits::TokenBucket, room::Counters, Server};
 /// muted, rate limit, set `speaker`, then `send_datagram` to every other
 /// active, non-deafened peer. Send errors are counted per receiver and never
 /// block.
-pub fn audio(server: &Arc<Server>, sender: Session, datagram: Bytes, bucket: &mut TokenBucket) {
+///
+/// This is the one hot path in the server — 16 clients at 50 packets/s mean
+/// 800 calls a second, each fanning out to 15 peers. It therefore takes the
+/// room lock exactly twice (the fan-out, then the talk spurt bookkeeping) and
+/// reuses the caller's `receivers` buffer instead of allocating one per
+/// datagram.
+pub fn audio(
+    server: &Arc<Server>,
+    sender: Session,
+    datagram: Bytes,
+    bucket: &mut TokenBucket,
+    receivers: &mut Vec<(Session, quinn::Connection)>,
+) {
     Counters::inc(&server.counters.datagrams_in);
 
     let Ok((audio_header, _)) = AudioHeader::decode(&datagram) else {
@@ -34,7 +49,7 @@ pub fn audio(server: &Arc<Server>, sender: Session, datagram: Bytes, bucket: &mu
         return;
     };
 
-    let Some(flags) = server.room.flags(sender) else {
+    let Some(flags) = server.room.audio_fanout(sender, receivers) else {
         Counters::inc(&server.counters.dropped_malformed);
         return;
     };
@@ -60,7 +75,7 @@ pub fn audio(server: &Arc<Server>, sender: Session, datagram: Bytes, bucket: &mu
     }
     let out = buf.freeze();
 
-    for (session, conn) in server.room.audio_receivers(sender) {
+    for (session, conn) in receivers.iter() {
         // One refcount bump per receiver, no copy.
         match conn.send_datagram(out.clone()) {
             Ok(()) => Counters::inc(&server.counters.datagrams_out),
@@ -180,11 +195,25 @@ impl VideoSender {
     }
 }
 
+impl Drop for VideoSender {
+    /// The sender is gone (its `uni_task` was aborted), so every forwarder it
+    /// spawned has to end too — otherwise it would park on a slot nobody will
+    /// ever fill again, for as long as its receiver stays connected.
+    fn drop(&mut self) {
+        for slot in self.slots.values() {
+            slot.close();
+        }
+    }
+}
+
 /// One sender-receiver pair: at most one frame in flight plus one waiting
 /// (`PROTOCOL.md` §4).
 pub struct Slot {
     waiting: Mutex<Option<Bytes>>,
     notify: tokio::sync::Notify,
+    /// Set when nothing will fill this slot again, so that the forwarder
+    /// stops waiting instead of parking forever.
+    closed: AtomicBool,
 }
 
 impl Slot {
@@ -192,6 +221,7 @@ impl Slot {
         Slot {
             waiting: Mutex::new(None),
             notify: tokio::sync::Notify::new(),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -209,6 +239,18 @@ impl Slot {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    /// Retires the slot: drops whatever is still waiting and wakes the
+    /// forwarder so it can end.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        *self.waiting.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.notify.notify_one();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
     }
 }
 
@@ -271,41 +313,52 @@ pub async fn video(
     // the refcount.
     let out = Bytes::from(frame);
 
-    // One clock read for the whole fan-out instead of one per receiver.
+    // One clock read and one lock for the whole fan-out.
     let now = Instant::now();
-    for (session, conn) in receivers {
-        let slot = {
-            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-            state
+    let mut hint = None;
+    {
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        // Receivers that left take their slot with them. Session ids are never
+        // reused, so without this the map — and a held-back frame in each
+        // entry — would grow for as long as the sender stays connected.
+        state.slots.retain(|session, slot| {
+            let keep = receivers.iter().any(|(r, _)| r == session);
+            if !keep {
+                slot.close();
+            }
+            keep
+        });
+        for (session, conn) in &receivers {
+            let slot = state
                 .slots
-                .entry(session)
+                .entry(*session)
                 .or_insert_with(|| {
                     let slot = Arc::new(Slot::new());
                     tokio::spawn(forward_frames(
                         server.clone(),
                         conn.clone(),
                         slot.clone(),
-                        session,
+                        *session,
                     ));
                     slot
                 })
-                .clone()
-        };
-        let displaced = slot.offer(out.clone());
-        if displaced {
-            // The older waiting frame is dropped. It never had a stream of its
-            // own, so nothing has to be reset.
-            Counters::inc(&server.counters.video_dropped_slow_receiver);
+                .clone();
+            let displaced = slot.offer(out.clone());
+            if displaced {
+                // The older waiting frame is dropped. It never had a stream of
+                // its own, so nothing has to be reset.
+                Counters::inc(&server.counters.video_dropped_slow_receiver);
+            }
+            // At most one window closes per frame, so at most one hint.
+            hint = state
+                .record_and_maybe_hint_at(*session, displaced, now)
+                .or(hint);
         }
-        let hint = {
-            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-            state.record_and_maybe_hint_at(session, displaced, now)
-        };
-        if let Some(drop_permille) = hint {
-            server
-                .room
-                .send_to(sender, &ControlMsg::VideoCongestionHint { drop_permille });
-        }
+    }
+    if let Some(drop_permille) = hint {
+        server
+            .room
+            .send_to(sender, &ControlMsg::VideoCongestionHint { drop_permille });
     }
 }
 
@@ -319,6 +372,7 @@ async fn forward_frames(
     loop {
         let frame = match slot.take() {
             Some(frame) => frame,
+            None if slot.is_closed() => return,
             None => {
                 tokio::select! {
                     _ = slot.notify.notified() => continue,
@@ -368,7 +422,7 @@ pub fn keyframe_request(server: &Arc<Server>, speaker: Session) -> bool {
 }
 
 #[cfg(test)]
-mod congestion_tests {
+mod tests {
     use super::*;
 
     fn sender() -> VideoSender {
@@ -383,6 +437,26 @@ mod congestion_tests {
     }
 
     const WINDOW: Duration = Duration::from_secs(icu_proto::limits::VIDEO_CONGESTION_WINDOW_S);
+
+    #[test]
+    fn closing_a_slot_drops_the_waiting_frame() {
+        let slot = Slot::new();
+        assert!(!slot.offer(Bytes::from_static(b"frame")));
+        slot.close();
+        assert!(slot.is_closed());
+        assert!(slot.take().is_none(), "nothing is written after a close");
+    }
+
+    /// The sender left: every forwarder it spawned must be able to end
+    /// instead of parking on a slot nobody will fill again.
+    #[test]
+    fn dropping_a_video_sender_closes_its_slots() {
+        let slot = Arc::new(Slot::new());
+        let mut vs = sender();
+        vs.slots.insert(7, slot.clone());
+        drop(vs);
+        assert!(slot.is_closed());
+    }
 
     #[test]
     fn no_hint_before_the_window_closes() {

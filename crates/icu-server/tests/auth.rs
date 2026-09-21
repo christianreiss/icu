@@ -93,9 +93,7 @@ async fn revoke_during_a_connection_kicks_with_kicked() {
 
     let response = server
         .handle
-        .admin(AdminRequest::Revoke {
-            user: "bob".into(),
-        })
+        .admin(AdminRequest::Revoke { user: "bob".into() })
         .await;
     match response {
         AdminResponse::Revoke { user_id, closed } => {
@@ -124,9 +122,7 @@ async fn a_revoked_certificate_cannot_reconnect() {
     let identity = server.enroll("bob").await;
     server
         .handle
-        .admin(AdminRequest::Revoke {
-            user: "bob".into(),
-        })
+        .admin(AdminRequest::Revoke { user: "bob".into() })
         .await;
     let client = server.connect(&identity).await.expect("connect");
     assert_eq!(client.closed_code().await, Some(ec::AUTH_REVOKED));
@@ -164,9 +160,7 @@ async fn a_disabled_user_cannot_reconnect_with_auth_disabled() {
 
     let response = server
         .handle
-        .admin(AdminRequest::Disable {
-            user: "bob".into(),
-        })
+        .admin(AdminRequest::Disable { user: "bob".into() })
         .await;
     assert!(matches!(response, AdminResponse::Disable { closed: 0, .. }));
 
@@ -183,9 +177,7 @@ async fn disabling_an_online_user_kicks_immediately() {
 
     let response = server
         .handle
-        .admin(AdminRequest::Disable {
-            user: "bob".into(),
-        })
+        .admin(AdminRequest::Disable { user: "bob".into() })
         .await;
     match response {
         AdminResponse::Disable { user_id, closed } => {
@@ -215,15 +207,11 @@ async fn enabling_restores_login_without_reenrollment() {
 
     server
         .handle
-        .admin(AdminRequest::Disable {
-            user: "bob".into(),
-        })
+        .admin(AdminRequest::Disable { user: "bob".into() })
         .await;
     server
         .handle
-        .admin(AdminRequest::Enable {
-            user: "bob".into(),
-        })
+        .admin(AdminRequest::Enable { user: "bob".into() })
         .await;
 
     let mut client = server.connect(&identity).await.expect("connect");

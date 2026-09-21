@@ -164,11 +164,6 @@ impl Handle {
             .unwrap_or_default()
     }
 
-    /// The SNI name the server certificate carries.
-    pub fn server_name(&self) -> String {
-        self.server.config.server.server_name.clone()
-    }
-
     /// The shared state, for tests and for the admin socket.
     pub fn server(&self) -> &Arc<Server> {
         &self.server

@@ -25,13 +25,7 @@ async fn admin_set_role_over_the_wire_updates_and_pushes() {
         .recv_matching(|m| matches!(m, ControlMsg::AdminSetRoleOk { .. }))
         .await;
     assert!(
-        matches!(
-            ok,
-            Some(ControlMsg::AdminSetRoleOk {
-                is_admin: true,
-                ..
-            })
-        ),
+        matches!(ok, Some(ControlMsg::AdminSetRoleOk { is_admin: true, .. })),
         "{ok:?}"
     );
 
@@ -39,7 +33,10 @@ async fn admin_set_role_over_the_wire_updates_and_pushes() {
         .recv_matching(|m| matches!(m, ControlMsg::UserAdminChanged { .. }))
         .await;
     assert!(
-        matches!(pushed, Some(ControlMsg::UserAdminChanged { is_admin: true })),
+        matches!(
+            pushed,
+            Some(ControlMsg::UserAdminChanged { is_admin: true })
+        ),
         "{pushed:?}"
     );
     server.shutdown().await;
@@ -117,10 +114,7 @@ async fn admin_set_disabled_over_the_wire_kicks_with_auth_disabled() {
     assert!(
         matches!(
             ok,
-            Some(ControlMsg::AdminSetDisabledOk {
-                disabled: true,
-                ..
-            })
+            Some(ControlMsg::AdminSetDisabledOk { disabled: true, .. })
         ),
         "{ok:?}"
     );
