@@ -5,6 +5,7 @@ pub mod fonts;
 pub mod main_window;
 pub mod settings;
 pub mod theme;
+pub mod widgets;
 
 use std::net::SocketAddr;
 

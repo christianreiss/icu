@@ -257,7 +257,7 @@ impl SettingsView {
             }
         });
         if let Some(err) = &state.name_error {
-            ui.colored_label(super::theme::ERROR, err);
+            ui.colored_label(super::theme::tokens(ui.visuals()).error, err);
         }
         if state.is_admin {
             ui.separator();
@@ -273,7 +273,7 @@ impl SettingsView {
                 }
             });
             if let Some(err) = &state.invite_error {
-                ui.colored_label(super::theme::ERROR, err);
+                ui.colored_label(super::theme::tokens(ui.visuals()).error, err);
             }
             if let Some((blob, expires)) = &state.last_invite {
                 ui.label(format!("Gültig bis {expires}, einmal einfügbar:"));
