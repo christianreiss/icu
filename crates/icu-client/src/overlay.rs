@@ -45,7 +45,7 @@ use wayland_client::{
 };
 
 use crate::{
-    config::{Corner, TileSize},
+    config::{Corner, Expand, TileSize},
     engine::{AppState, VideoFrames},
 };
 
@@ -114,6 +114,7 @@ struct App {
     corner: Corner,
     offset: [u32; 2],
     size: TileSize,
+    expand: Expand,
     tiles: Vec<Tile>,
     state: watch::Receiver<AppState>,
     frames: VideoFrames,
@@ -207,6 +208,7 @@ fn overlay_thread(
         corner: settings.corner,
         offset: settings.offset,
         size: settings.size,
+        expand: settings.expand,
         tiles: Vec::new(),
         state,
         frames,
@@ -231,15 +233,26 @@ impl App {
         }
     }
 
+    /// `Top`/`Bottom` are always laid out horizontally (and centered by the
+    /// compositor); other positions follow the configured expand direction.
+    fn effective_expand(&self) -> Expand {
+        match self.corner {
+            Corner::Top | Corner::Bottom => Expand::Horizontal,
+            _ => self.expand,
+        }
+    }
+
     fn tick(&mut self) {
         let state = self.state.borrow().clone();
         let settings = &state.settings.overlay;
         let layout_changed = settings.corner != self.corner
             || settings.offset != self.offset
-            || settings.size != self.size;
+            || settings.size != self.size
+            || settings.expand != self.expand;
         self.corner = settings.corner;
         self.offset = settings.offset;
         self.size = settings.size;
+        self.expand = settings.expand;
 
         // Tiles: every peer with the camera on, in name order.
         let frames = self.frames.latest();
@@ -270,8 +283,10 @@ impl App {
         }
         let (tw, th) = self.tile_dims();
         let n = self.tiles.len() as u32;
-        let width = tw + 2 * BORDER;
-        let height = n * (th + 2 * BORDER) + (n - 1) * GAP;
+        let (width, height) = match self.effective_expand() {
+            Expand::Vertical => (tw + 2 * BORDER, n * (th + 2 * BORDER) + (n - 1) * GAP),
+            Expand::Horizontal => (n * (tw + 2 * BORDER) + (n - 1) * GAP, th + 2 * BORDER),
+        };
         let size_changed = width != self.width || height != self.height;
         self.width = width;
         self.height = height;
@@ -291,6 +306,10 @@ impl App {
                 Corner::TopRight => Anchor::TOP | Anchor::RIGHT,
                 Corner::BottomLeft => Anchor::BOTTOM | Anchor::LEFT,
                 Corner::BottomRight => Anchor::BOTTOM | Anchor::RIGHT,
+                // No LEFT/RIGHT: wlr-layer-shell centers the surface on the
+                // horizontal axis when neither of its edges is anchored.
+                Corner::Top => Anchor::TOP,
+                Corner::Bottom => Anchor::BOTTOM,
             };
             layer.set_anchor(anchor);
             let (ox, oy) = (self.offset[0] as i32, self.offset[1] as i32);
@@ -325,6 +344,7 @@ impl App {
         }
         let stride = w * 4;
         let (tw, th) = self.tile_dims();
+        let horizontal = self.effective_expand() == Expand::Horizontal;
         let Ok((buffer, canvas)) = self
             .pool
             .create_buffer(w, h, stride, wl_shm::Format::Argb8888)
@@ -332,6 +352,7 @@ impl App {
             return;
         };
         canvas.fill(0);
+        let mut x0 = 0u32;
         let mut y0 = 0u32;
         for tile in &self.tiles {
             let border = if tile.speaking {
@@ -363,11 +384,15 @@ impl App {
                     } else {
                         border
                     };
-                    let i = (((y0 + y) as i32 * stride) + (x as i32 * 4)) as usize;
+                    let i = (((y0 + y) as i32 * stride) + ((x0 + x) as i32 * 4)) as usize;
                     canvas[i..i + 4].copy_from_slice(&px);
                 }
             }
-            y0 += outer_h + GAP;
+            if horizontal {
+                x0 += outer_w + GAP;
+            } else {
+                y0 += outer_h + GAP;
+            }
         }
         layer.wl_surface().damage_buffer(0, 0, w, h);
         if buffer.attach_to(layer.wl_surface()).is_ok() {

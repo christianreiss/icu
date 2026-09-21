@@ -203,7 +203,9 @@ impl Default for CameraSettings {
     }
 }
 
-/// Overlay corner.
+/// Overlay screen position: a corner, or a full top/bottom edge (which is
+/// always centered by the compositor and always lays tiles out
+/// horizontally, regardless of [`Expand`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Corner {
@@ -216,6 +218,10 @@ pub enum Corner {
     BottomLeft,
     /// Bottom right.
     BottomRight,
+    /// Top edge, centered.
+    Top,
+    /// Bottom edge, centered.
+    Bottom,
 }
 
 /// Overlay tile size.
@@ -229,18 +235,32 @@ pub enum TileSize {
     Medium,
 }
 
+/// Direction the tile stack grows in for a corner position. Ignored for
+/// [`Corner::Top`] / [`Corner::Bottom`], which are always horizontal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Expand {
+    /// Stack downward/upward (one column).
+    #[default]
+    Vertical,
+    /// Stack sideways (one row).
+    Horizontal,
+}
+
 /// `[overlay]`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OverlaySettings {
     /// Overlay on.
     pub enabled: bool,
-    /// Which corner.
+    /// Which corner (or edge).
     pub corner: Corner,
     /// Offset from the corner in pixels.
     pub offset: [u32; 2],
     /// Tile size.
     pub size: TileSize,
+    /// Stack direction for corner positions.
+    pub expand: Expand,
     /// Dim tiles of peers who aren't currently speaking.
     pub dim_non_speaking: bool,
 }
@@ -252,6 +272,7 @@ impl Default for OverlaySettings {
             corner: Corner::TopRight,
             offset: [40, 40],
             size: TileSize::Small,
+            expand: Expand::Vertical,
             dim_non_speaking: true,
         }
     }
@@ -463,6 +484,7 @@ mod tests {
         s.audio.input_device = Some("alsa_input.foo".into());
         s.hotkeys.ptt.key = "BTN_SIDE".into();
         s.overlay.corner = Corner::BottomLeft;
+        s.overlay.expand = Expand::Horizontal;
         s.overlay.dim_non_speaking = false;
         s.camera.show_self_preview = false;
         s.set_volume(7, 120.0);

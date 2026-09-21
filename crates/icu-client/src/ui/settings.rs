@@ -15,7 +15,7 @@ use icu_proto::UserId;
 use super::{theme, widgets};
 use crate::{
     audio::DeviceKind,
-    config::{Corner, HotkeyBackend, ModeSetting, Paths, Settings, TileSize},
+    config::{Corner, Expand, HotkeyBackend, ModeSetting, Paths, Settings, TileSize},
     engine::{AppState, Command},
     stats::DebugStats,
 };
@@ -374,6 +374,20 @@ impl SettingsView {
             });
             widgets::setting_row(ui, true, "Ecke", None, |ui| {
                 corner_picker(ui, &mut self.draft.overlay.corner);
+            });
+            let edge = matches!(self.draft.overlay.corner, Corner::Top | Corner::Bottom);
+            widgets::setting_row(ui, true, "Ausrichtung", None, |ui| {
+                ui.add_enabled_ui(!edge, |ui| {
+                    widgets::segmented(
+                        ui,
+                        &mut self.draft.overlay.expand,
+                        &[
+                            (Expand::Vertical, "vertikal"),
+                            (Expand::Horizontal, "horizontal"),
+                        ],
+                    )
+                })
+                .inner
             });
             widgets::setting_row(ui, true, "Abstand", None, |ui| {
                 ui.horizontal(|ui| {
@@ -750,10 +764,38 @@ fn rail_button(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
     resp.clicked()
 }
 
-/// A 2x2 grid of corner buttons, each drawing a small anchored rectangle to
-/// preview where the overlay tile stack would sit.
+/// A row of position buttons — the 4 corners plus centered top/bottom edges
+/// — each drawing a small preview of where the overlay tile stack would sit.
 fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
     let tok = theme::tokens(ui.visuals());
+    let swatch = egui::vec2(46.0, 46.0);
+    let mut button = |ui: &mut Ui, value: Corner, tile_rect_fn: &dyn Fn(egui::Rect) -> egui::Rect| {
+        let selected = *corner == value;
+        let (rect, resp) = ui.allocate_exact_size(swatch, egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let painter = ui.painter();
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius::same(8),
+                ui.visuals().extreme_bg_color,
+            );
+            painter.rect_stroke(
+                rect,
+                egui::CornerRadius::same(8),
+                egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+                egui::StrokeKind::Inside,
+            );
+            let tile_color = if selected {
+                tok.accent
+            } else {
+                ui.visuals().widgets.inactive.bg_stroke.color
+            };
+            painter.rect_filled(tile_rect_fn(rect), 2.0, tile_color);
+        }
+        if resp.clicked() {
+            *corner = value;
+        }
+    };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for (value, dx, dy) in [
@@ -762,37 +804,25 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
             (Corner::BottomLeft, 0.0, 1.0),
             (Corner::BottomRight, 1.0, 1.0),
         ] {
-            let selected = *corner == value;
-            let (rect, resp) = ui.allocate_exact_size(egui::vec2(46.0, 46.0), egui::Sense::click());
-            if ui.is_rect_visible(rect) {
-                let painter = ui.painter();
-                painter.rect_filled(
-                    rect,
-                    egui::CornerRadius::same(8),
-                    ui.visuals().extreme_bg_color,
-                );
-                painter.rect_stroke(
-                    rect,
-                    egui::CornerRadius::same(8),
-                    egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
-                    egui::StrokeKind::Inside,
-                );
-                let tile = egui::vec2(22.0, 14.0);
+            let tile = egui::vec2(22.0, 14.0);
+            button(ui, value, &|rect| {
                 let pos = egui::pos2(
                     rect.left() + 4.0 + dx * (rect.width() - tile.x - 8.0),
                     rect.top() + 4.0 + dy * (rect.height() - tile.y - 8.0),
                 );
-                let tile_rect = egui::Rect::from_min_size(pos, tile);
-                let tile_color = if selected {
-                    tok.accent
-                } else {
-                    ui.visuals().widgets.inactive.bg_stroke.color
-                };
-                painter.rect_filled(tile_rect, 2.0, tile_color);
-            }
-            if resp.clicked() {
-                *corner = value;
-            }
+                egui::Rect::from_min_size(pos, tile)
+            });
+        }
+        ui.add_space(6.0);
+        for (value, dy) in [(Corner::Top, 0.0), (Corner::Bottom, 1.0)] {
+            let tile = egui::vec2(30.0, 8.0);
+            button(ui, value, &|rect| {
+                let pos = egui::pos2(
+                    rect.center().x - tile.x / 2.0,
+                    rect.top() + 4.0 + dy * (rect.height() - tile.y - 8.0),
+                );
+                egui::Rect::from_min_size(pos, tile)
+            });
         }
     });
 }
