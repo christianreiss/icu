@@ -1,6 +1,6 @@
-//! Settings panel, shown as a `CentralPanel` takeover with an icon rail
-//! (`main_window.rs`). Every change is applied at once through
-//! `Command::UpdateSettings`.
+//! Settings panel content: an icon rail plus tab content, drawn into its own
+//! `egui` viewport window (`main_window.rs`, mirrors the Debug window).
+//! Every change is applied at once through `Command::UpdateSettings`.
 
 use std::{
     sync::{atomic::Ordering, Arc},

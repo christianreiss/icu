@@ -225,6 +225,37 @@ impl eframe::App for App {
             self.debug_window_open = still_open;
         }
 
+        if self.settings.is_some() {
+            let mut still_open = true;
+            let mut cmds = Vec::new();
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("icu-settings"),
+                egui::ViewportBuilder::default()
+                    .with_title("ICU — Einstellungen")
+                    .with_inner_size([620.0, 560.0])
+                    .with_min_inner_size([480.0, 420.0])
+                    .with_resizable(true),
+                |vctx, _class| {
+                    egui::CentralPanel::default().show(vctx, |ui| {
+                        let view = self.settings.as_mut().expect("checked above");
+                        cmds = view.ui(ui, &state);
+                    });
+                    if vctx.input(|i| i.viewport().close_requested()) {
+                        still_open = false;
+                    }
+                },
+            );
+            for c in cmds {
+                if let Command::UpdateSettings(s) = &c {
+                    theme::apply(ctx, &s.ui.theme);
+                }
+                self.send(c);
+            }
+            if !still_open {
+                self.settings = None;
+            }
+        }
+
         egui::Panel::top("status").show(root, |ui| {
             let tok = theme::tokens(ui.visuals());
             ui.add_space(2.0);
@@ -511,38 +542,6 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(root, |ui| {
-            if self.settings.is_some() {
-                let mut close = false;
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Einstellungen")
-                            .font(egui::FontId::new(20.0, fonts::semibold())),
-                    );
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 30.0),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.button(icon::X).clicked() {
-                                close = true;
-                            }
-                        },
-                    );
-                });
-                if close {
-                    self.settings = None;
-                } else {
-                    ui.separator();
-                    let view = self.settings.as_mut().expect("checked above");
-                    let cmds = view.ui(ui, &state);
-                    for c in cmds {
-                        if let Command::UpdateSettings(s) = &c {
-                            theme::apply(ctx, &s.ui.theme);
-                        }
-                        self.send(c);
-                    }
-                }
-                return;
-            }
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
