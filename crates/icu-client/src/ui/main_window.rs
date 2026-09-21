@@ -9,7 +9,7 @@ use std::{
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icon;
 
-use super::{fonts, settings::SettingsView, theme};
+use super::{fonts, settings::SettingsView, theme, widgets};
 use crate::{
     config::{Identity, Paths},
     dsp::gate::Mode,
@@ -194,29 +194,76 @@ impl eframe::App for App {
         }
 
         egui::Panel::top("status").show(root, |ui| {
+            let tok = theme::tokens(ui.visuals());
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                let (color, text) = match &state.conn {
-                    ConnStatus::Connected => (theme::CONNECTED, "verbunden".to_string()),
-                    ConnStatus::Connecting => (theme::CONNECTING, "verbinde…".to_string()),
-                    ConnStatus::Disconnected { reason, attempt } => (
-                        theme::CONNECTING,
-                        format!("getrennt ({reason}), Versuch {attempt}"),
-                    ),
-                    ConnStatus::Fatal(reason) => (theme::ERROR, format!("Fehler: {reason}")),
-                };
-                let (dot_rect, _) =
-                    ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                ui.painter().circle_filled(dot_rect.center(), 5.0, color);
-                ui.label(
-                    RichText::new("ICU")
-                        .font(egui::FontId::new(16.0, fonts::semibold()))
-                        .strong(),
+                let (badge, _) =
+                    ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+                ui.painter().rect_filled(badge, 8, tok.accent_tint_2);
+                ui.painter().rect_stroke(
+                    badge,
+                    8,
+                    egui::Stroke::new(1.0, tok.accent.gamma_multiply(0.33)),
+                    egui::StrokeKind::Inside,
                 );
-                ui.label(RichText::new(&state.server).small());
+                ui.painter().text(
+                    badge.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon::WAVEFORM,
+                    egui::FontId::new(17.0, egui::FontFamily::Proportional),
+                    tok.accent,
+                );
+
+                ui.vertical(|ui| {
+                    ui.label(theme::strong_text(&state.server).size(14.5));
+                    let (color, text) = match &state.conn {
+                        ConnStatus::Connected => (tok.connected, "verbunden".to_string()),
+                        ConnStatus::Connecting => (tok.connecting, "verbinde…".to_string()),
+                        ConnStatus::Disconnected { reason, attempt } => (
+                            tok.connecting,
+                            format!("getrennt ({reason}), Versuch {attempt}"),
+                        ),
+                        ConnStatus::Fatal(reason) => (tok.error, format!("Fehler: {reason}")),
+                    };
+                    let trailing = state.rtt_ms.map(|rtt| format!("{rtt:.0} ms"));
+                    widgets::status_pill(ui, color, &text, trailing.as_deref()).on_hover_text(
+                        match &state.me {
+                            Some(me) => format!("{} (user_id {})", me.name, me.user_id),
+                            None => String::new(),
+                        },
+                    );
+                });
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(rtt) = state.rtt_ms {
-                        ui.label(RichText::new(format!("{rtt:.0} ms")).small());
+                    let gear = egui::Button::new(RichText::new(icon::GEAR).size(16.0))
+                        .fill(if self.settings.is_some() {
+                            ui.visuals().faint_bg_color
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .corner_radius(egui::CornerRadius::same(9))
+                        .min_size(egui::vec2(36.0, 36.0));
+                    if ui.add(gear).on_hover_text("Einstellungen").clicked() {
+                        self.settings = match self.settings.take() {
+                            Some(_) => None,
+                            None => {
+                                let paths = self
+                                    .engine
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .map(|e| e.paths())
+                                    .unwrap_or_else(|| Paths::new(None));
+                                Some(SettingsView::new(
+                                    &state,
+                                    state.hotkey_backend.clone(),
+                                    self.stats.clone(),
+                                    paths,
+                                ))
+                            }
+                        };
                     }
+
                     // Own outgoing video quality tier, set by
                     // `crate::quality::QualityController`. Automatic, no
                     // settings toggle (`Research/feature-freeze.md`'s bias
@@ -231,143 +278,151 @@ impl eframe::App for App {
                         _ => Some("Video reduziert"),
                     };
                     if let Some(label) = label {
-                        ui.label(RichText::new(label).small().color(theme::CONNECTING));
+                        ui.label(RichText::new(label).small().color(tok.connecting));
                     }
                 });
-                ui.label(RichText::new(text).small())
-                    .on_hover_text(match &state.me {
-                        Some(me) => format!("{} (user_id {})", me.name, me.user_id),
-                        None => String::new(),
-                    });
             });
+
             if let Some(min) = &state.update_required {
-                ui.colored_label(
-                    theme::ERROR,
-                    format!(
-                        "Update nötig: der Server verlangt mindestens Version {min} (diese: {})",
+                let no_action: Option<(&str, fn())> = None;
+                widgets::banner(
+                    ui,
+                    widgets::BannerKind::Warning,
+                    "Update nötig",
+                    &format!(
+                        "Der Server verlangt mindestens Version {min} (diese: {}).",
                         env!("CARGO_PKG_VERSION")
                     ),
+                    no_action,
+                    None::<fn()>,
                 );
             }
             if let Some(banner) = &state.banner {
-                ui.horizontal(|ui| {
-                    ui.colored_label(theme::ERROR, banner);
-                    if ui.small_button(icon::X).clicked() {
-                        self.send(Command::DismissBanner);
-                    }
-                });
+                let no_action: Option<(&str, fn())> = None;
+                widgets::banner(
+                    ui,
+                    widgets::BannerKind::Error,
+                    "Fehler",
+                    banner,
+                    no_action,
+                    Some(|| self.send(Command::DismissBanner)),
+                );
             }
         });
 
         egui::Panel::bottom("controls").show(root, |ui| {
+            let tok = theme::tokens(ui.visuals());
             ui.add_space(4.0);
-            // Level meter with the VAD threshold marker.
-            let (rect, _) = ui
-                .allocate_exact_size(egui::vec2(ui.available_width(), 14.0), egui::Sense::hover());
-            let painter = ui.painter();
-            painter.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
-            let frac = theme::meter_fraction(state.level.rms_db);
-            let fill =
-                egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * frac, rect.height()));
-            let color = if state.sending {
-                theme::LEVEL_HOT
-            } else {
-                theme::LEVEL
-            };
-            painter.rect_filled(fill, 3.0, color);
-            if state.mode == Mode::Vad {
-                let x = rect.min.x + rect.width() * state.vad_prob.clamp(0.0, 1.0);
-                painter.line_segment(
-                    [egui::pos2(x, rect.min.y), egui::pos2(x, rect.max.y)],
-                    egui::Stroke::new(2.0, Color32::WHITE),
-                );
-            }
-            ui.label(
-                RichText::new(format!(
-                    "{:.0} dBFS · VAD {:.2}{}",
-                    state.level.rms_db,
-                    state.vad_prob,
-                    if state.sending { " · sendet" } else { "" }
-                ))
-                .small(),
+            widgets::level_meter(
+                ui,
+                state.level.rms_db,
+                (state.mode == Mode::Vad).then_some(state.vad_prob),
+                state.sending,
             );
-
-            ui.horizontal_wrapped(|ui| {
-                let ptt_label = match state.mode {
-                    Mode::Ptt => "PTT (halten)",
-                    Mode::Vad => "VAD",
-                };
-                let mut ptt_btn = egui::Button::new(ptt_label);
-                if state.ptt_down {
-                    ptt_btn = ptt_btn.fill(theme::SPEAKING);
-                }
-                let ptt = ui.add_sized([100.0, 28.0], ptt_btn);
-                // Hold semantics: a press that starts on the button keeps the gate
-                // open until the primary button is released anywhere, even if the
-                // pointer drifts off the widget or egui stops treating it as
-                // "down on" (observed in the live test: transmission ended after a
-                // few seconds while the button was still held).
-                let primary_down = ui.input(|i| i.pointer.primary_down());
-                let held = if self.ptt_held {
-                    primary_down
-                } else {
-                    ptt.is_pointer_button_down_on() && primary_down
-                };
-                if held {
-                    ui.ctx().request_repaint();
-                }
-                if held != self.ptt_held {
-                    self.ptt_held = held;
-                    if state.mode == Mode::Ptt {
-                        self.send(Command::Ptt(held));
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{:.0} dBFS", state.level.rms_db))
+                        .monospace()
+                        .small()
+                        .color(tok.dim_text),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if state.sending {
+                        ui.label(
+                            RichText::new("SENDET")
+                                .size(11.0)
+                                .color(tok.accent)
+                                .font(egui::FontId::new(11.0, fonts::semibold())),
+                        );
+                        widgets::speaking_bars(ui, true);
+                    } else if state.mode == Mode::Vad {
+                        ui.label(
+                            RichText::new(format!("VAD {:.2}", state.vad_prob))
+                                .monospace()
+                                .small()
+                                .color(tok.dim_text),
+                        );
                     }
-                }
-                if ptt.secondary_clicked() {
-                    self.send(Command::ToggleMode);
-                }
-                ptt.on_hover_text("Rechtsklick: PTT/VAD umschalten");
+                });
+            });
 
-                let mut mute_btn = egui::Button::new(if state.muted { "Mute ✓" } else { "Mute" });
-                if state.muted {
-                    mute_btn = mute_btn.fill(theme::MUTED);
+            ui.add_space(6.0);
+            let mut mode_choice = state.mode;
+            if widgets::segmented(
+                ui,
+                &mut mode_choice,
+                &[(Mode::Ptt, "Push-to-Talk"), (Mode::Vad, "Sprachaktivierung")],
+            )
+            .changed()
+            {
+                self.send(Command::ToggleMode);
+            }
+
+            ui.add_space(6.0);
+            let ptt_hint = format!("{} halten", state.settings.hotkeys.ptt.key);
+            let (label, fill, text_color) = match (state.mode, state.ptt_down) {
+                (Mode::Ptt, true) => (
+                    format!("{}  Mikrofon offen", icon::MICROPHONE),
+                    tok.accent,
+                    tok.on_accent,
+                ),
+                (Mode::Ptt, false) => (
+                    format!("{}  Sprechen", icon::MICROPHONE),
+                    ui.visuals().faint_bg_color,
+                    ui.visuals().text_color(),
+                ),
+                (Mode::Vad, _) => (
+                    format!("{}  Wartet auf Stimme", icon::MICROPHONE),
+                    ui.visuals().faint_bg_color,
+                    tok.muted_text,
+                ),
+            };
+            let btn = egui::Button::new(RichText::new(label).color(text_color))
+                .fill(fill)
+                .corner_radius(egui::CornerRadius::same(11))
+                .min_size(egui::vec2(ui.available_width(), 46.0));
+            let ptt = ui.add(btn);
+            if state.mode == Mode::Ptt {
+                ptt.clone().on_hover_ui(|ui| {
+                    widgets::kbd(ui, &ptt_hint);
+                });
+            }
+            // Hold semantics: a press that starts on the button keeps the gate
+            // open until the primary button is released anywhere, even if the
+            // pointer drifts off the widget or egui stops treating it as
+            // "down on" (observed in the live test: transmission ended after a
+            // few seconds while the button was still held).
+            let primary_down = ui.input(|i| i.pointer.primary_down());
+            let held = if self.ptt_held {
+                primary_down
+            } else {
+                ptt.is_pointer_button_down_on() && primary_down
+            };
+            if held {
+                ui.ctx().request_repaint();
+            }
+            if held != self.ptt_held {
+                self.ptt_held = held;
+                if state.mode == Mode::Ptt {
+                    self.send(Command::Ptt(held));
                 }
-                let mute = ui.add_sized([70.0, 28.0], mute_btn);
-                if mute.clicked() {
+            }
+
+            ui.add_space(6.0);
+            ui.columns(4, |cols| {
+                if control_button(&mut cols[0], icon::MICROPHONE_SLASH, "Mute", state.muted) {
                     self.send(Command::SetMuted(!state.muted));
                 }
-                let mut deafen_btn = egui::Button::new(if state.deafened {
-                    "Deafen ✓"
-                } else {
-                    "Deafen"
-                });
-                if state.deafened {
-                    deafen_btn = deafen_btn.fill(theme::MUTED);
-                }
-                let deafen = ui.add_sized([80.0, 28.0], deafen_btn);
-                if deafen.clicked() {
+                if control_button(&mut cols[1], icon::SPEAKER_SLASH, "Deafen", state.deafened) {
                     self.send(Command::SetDeafened(!state.deafened));
                 }
-            });
-            ui.horizontal_wrapped(|ui| {
                 #[cfg(feature = "camera")]
-                if ui.selectable_label(state.camera_on, "Kamera").clicked() {
+                if control_button(&mut cols[2], icon::VIDEO_CAMERA, "Kamera", state.camera_on) {
                     self.send(Command::SetCamera(!state.camera_on));
                 }
                 #[cfg(feature = "overlay")]
-                if ui.selectable_label(state.overlay_on, "Overlay").clicked() {
+                if control_button(&mut cols[3], icon::SQUARES_FOUR, "Overlay", state.overlay_on) {
                     self.send(Command::SetOverlay(!state.overlay_on));
-                }
-                if ui
-                    .selectable_label(
-                        self.settings.is_some(),
-                        format!("{} Einstellungen", icon::GEAR),
-                    )
-                    .clicked()
-                {
-                    self.settings = match self.settings.take() {
-                        Some(_) => None,
-                        None => Some(SettingsView::new(&state, state.hotkey_backend.clone())),
-                    };
                 }
             });
             ui.add_space(4.0);
@@ -407,10 +462,12 @@ impl eframe::App for App {
                     participant_row(
                         ui,
                         &me.name,
+                        me.user_id,
                         state.sending,
                         state.muted,
                         state.deafened,
                         state.camera_on,
+                        participant_subtitle(state.sending, state.muted, state.camera_on, Some(state.mode)),
                         None,
                         &mut self.volume_open,
                         &self.cmd,
@@ -423,10 +480,17 @@ impl eframe::App for App {
                     participant_row(
                         ui,
                         &p.info.name,
+                        p.info.user_id,
                         p.speaking,
                         p.info.flags.muted(),
                         p.info.flags.deafened(),
                         p.info.flags.camera_on(),
+                        participant_subtitle(
+                            p.speaking,
+                            p.info.flags.muted(),
+                            p.info.flags.camera_on(),
+                            None,
+                        ),
                         Some((p.info.user_id, p.volume)),
                         &mut self.volume_open,
                         &self.cmd,
@@ -434,12 +498,50 @@ impl eframe::App for App {
                     );
                 }
                 if state.peers.is_empty() && state.conn == ConnStatus::Connected {
-                    ui.label(RichText::new("Niemand sonst ist da.").italics().weak());
+                    let tok = theme::tokens(ui.visuals());
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(24.0);
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(52.0, 52.0), egui::Sense::hover());
+                        ui.painter().circle_filled(rect.center(), 26.0, ui.visuals().faint_bg_color);
+                        ui.painter().text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            icon::USERS,
+                            egui::FontId::new(22.0, egui::FontFamily::Proportional),
+                            tok.dim_text,
+                        );
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Niemand sonst ist da").strong());
+                        ui.label(
+                            RichText::new("Teile den Einladungslink, um jemanden hierher zu holen.")
+                                .small()
+                                .color(tok.dim_text),
+                        );
+                    });
                 }
                 #[cfg(feature = "camera")]
                 if let Some(camera) = self.camera.as_mut() {
                     if state.camera_on {
-                        camera.preview(ui);
+                        ui.add_space(4.0);
+                        let tok = theme::tokens(ui.visuals());
+                        egui::Frame::new()
+                            .fill(ui.visuals().faint_bg_color)
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                ui.visuals().widgets.inactive.bg_stroke.color,
+                            ))
+                            .corner_radius(egui::CornerRadius::same(12))
+                            .inner_margin(6)
+                            .show(ui, |ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::TOP),
+                                    |ui| {
+                                        widgets::status_pill(ui, tok.error, "LIVE", None);
+                                    },
+                                );
+                                camera.preview(ui);
+                            });
                     }
                 }
                 if self.debug_stats && !self.stats_text.is_empty() {
@@ -465,61 +567,148 @@ impl eframe::App for App {
     }
 }
 
+/// Second line under a participant's name: what they're currently doing,
+/// derived only from state already available (never invented). `mode` is
+/// `Some` only for the local user, since it's a client-local setting.
+fn participant_subtitle(speaking: bool, muted: bool, camera: bool, mode: Option<Mode>) -> Option<String> {
+    if speaking {
+        Some(match mode {
+            Some(Mode::Ptt) => "sendet · Push-to-Talk".to_string(),
+            Some(Mode::Vad) => "sendet · Sprachaktivierung".to_string(),
+            None => "spricht".to_string(),
+        })
+    } else if camera {
+        Some("Kamera an".to_string())
+    } else if !muted {
+        Some("Mikrofon frei".to_string())
+    } else {
+        None
+    }
+}
+
+/// One of the four bottom-bar control buttons (Mute/Deafen/Kamera/Overlay):
+/// icon over label, active state tinted by role (error for mute/deafen,
+/// accent for camera/overlay — callers pass the right glyph and label, the
+/// active color follows from the glyph's role below).
+fn control_button(ui: &mut egui::Ui, glyph: &str, label: &str, active: bool) -> bool {
+    let tok = theme::tokens(ui.visuals());
+    let is_error_role = glyph == icon::MICROPHONE_SLASH || glyph == icon::SPEAKER_SLASH;
+    let (accent, tint) = if is_error_role {
+        (tok.error, tok.error_tint)
+    } else {
+        (tok.accent, tok.accent_tint)
+    };
+    let (fill, border, text_color) = if active {
+        (tint, accent.gamma_multiply(0.47), accent)
+    } else {
+        (
+            ui.visuals().faint_bg_color,
+            ui.visuals().widgets.noninteractive.bg_stroke.color,
+            tok.muted_text,
+        )
+    };
+    let btn = egui::Button::new("")
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(egui::CornerRadius::same(11))
+        .min_size(egui::vec2(ui.available_width(), 54.0));
+    let resp = ui.add(btn);
+    let rect = resp.rect;
+    let painter = ui.painter();
+    painter.text(
+        egui::pos2(rect.center().x, rect.top() + 18.0),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::new(19.0, egui::FontFamily::Proportional),
+        text_color,
+    );
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 11.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::new(10.5, fonts::semibold()),
+        text_color,
+    );
+    resp.clicked()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn participant_row(
     ui: &mut egui::Ui,
     name: &str,
+    user_id: icu_proto::UserId,
     speaking: bool,
     muted: bool,
     deafened: bool,
     camera: bool,
+    subtitle: Option<String>,
     volume: Option<(icu_proto::UserId, f32)>,
     volume_open: &mut Option<icu_proto::UserId>,
     cmd: &tokio::sync::mpsc::UnboundedSender<Command>,
     is_me: bool,
 ) {
-    let row = ui.horizontal(|ui| {
-        let (bar, _) = ui.allocate_exact_size(egui::vec2(4.0, 20.0), egui::Sense::hover());
-        ui.painter().rect_filled(
-            bar,
-            2.0,
-            if speaking {
-                theme::SPEAKING
-            } else {
-                Color32::TRANSPARENT
-            },
-        );
-        let mut text = RichText::new(name);
-        if is_me {
-            text = text.strong();
-        }
-        ui.label(text);
-        if camera {
-            ui.label(icon::VIDEO_CAMERA);
-        }
-        if muted {
-            ui.colored_label(theme::MUTED, icon::MICROPHONE_SLASH);
-        }
-        if deafened {
-            ui.colored_label(theme::MUTED, icon::SPEAKER_SLASH);
-        }
-        if let Some((user_id, vol)) = volume {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(format!("{vol:.0} %"))
-                    .on_hover_text("Lautstärke")
-                    .clicked()
-                {
-                    *volume_open = if *volume_open == Some(user_id) {
-                        None
-                    } else {
-                        Some(user_id)
-                    };
-                }
+    let tok = theme::tokens(ui.visuals());
+    egui::Frame::new()
+        .fill(if speaking {
+            tok.accent_tint
+        } else {
+            Color32::TRANSPARENT
+        })
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(10, 7))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                widgets::avatar(ui, name, user_id, speaking, 34.0);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        let text = if is_me {
+                            theme::strong_text(name)
+                        } else {
+                            RichText::new(name).size(13.5)
+                        };
+                        ui.label(text);
+                        if speaking {
+                            widgets::speaking_bars(ui, true);
+                        }
+                    });
+                    if let Some(subtitle) = &subtitle {
+                        ui.label(RichText::new(subtitle).size(11.5).color(tok.dim_text));
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some((user_id, vol)) = volume {
+                        let chip = egui::Frame::new()
+                            .fill(ui.visuals().extreme_bg_color)
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                ui.visuals().widgets.inactive.bg_stroke.color,
+                            ))
+                            .corner_radius(egui::CornerRadius::same(7))
+                            .inner_margin(egui::Margin::symmetric(7, 3))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(format!("{vol:.0} %")).monospace().size(11.0))
+                            });
+                        if chip.response.interact(egui::Sense::click()).clicked() {
+                            *volume_open = if *volume_open == Some(user_id) {
+                                None
+                            } else {
+                                Some(user_id)
+                            };
+                        }
+                    }
+                    if deafened {
+                        ui.colored_label(tok.error, icon::SPEAKER_SLASH);
+                    }
+                    if muted {
+                        ui.colored_label(tok.error, icon::MICROPHONE_SLASH);
+                    }
+                    if camera {
+                        ui.colored_label(tok.muted_text, icon::VIDEO_CAMERA);
+                    }
+                });
             });
-        }
-    });
-    let _ = row;
+        });
     if let Some((user_id, vol)) = volume {
         if *volume_open == Some(user_id) {
             let mut v = vol;
@@ -533,6 +722,7 @@ fn participant_row(
             });
         }
     }
+    ui.add_space(4.0);
 }
 
 // ---------------------------------------------------------------------------

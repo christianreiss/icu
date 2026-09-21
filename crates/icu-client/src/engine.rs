@@ -377,6 +377,12 @@ pub struct Engine {
     runtime: Option<tokio::runtime::Runtime>,
     threads: Vec<std::thread::JoinHandle<()>>,
     backend: Arc<Mutex<Box<dyn AudioBackend>>>,
+    /// Where this instance's config/data live (`--config-dir` or default).
+    /// Only the spawned connection task holds its own copy for persisting
+    /// settings; this clone exists so the UI layer (the About tab's
+    /// histogram export) can resolve the same directory without a second
+    /// accessor path.
+    paths: Paths,
 }
 
 /// Engine start failure.
@@ -398,6 +404,7 @@ impl Engine {
         mut backend: Box<dyn AudioBackend>,
     ) -> Result<Engine, EngineError> {
         let settings = cfg.settings.clone();
+        let paths = cfg.paths.clone();
         let dsp = Arc::new(DspControl::from_settings(&settings, cfg.test_tone));
         let stats = Arc::new(DebugStats::default());
         let backend_name = backend.name();
@@ -549,6 +556,7 @@ impl Engine {
             runtime: Some(runtime),
             threads,
             backend,
+            paths,
         })
     }
 
@@ -575,6 +583,12 @@ impl Engine {
     /// Counters.
     pub fn stats(&self) -> Arc<DebugStats> {
         self.shared.stats.clone()
+    }
+
+    /// Where this instance's config/data live, for UI-side file exports
+    /// (the About tab's "Histogramm exportieren").
+    pub fn paths(&self) -> Paths {
+        self.paths.clone()
     }
 
     /// `PACKET_LOSS_PERC` currently applied to the encoder.
