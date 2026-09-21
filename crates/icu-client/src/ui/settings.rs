@@ -130,7 +130,10 @@ impl SettingsView {
 
         egui::Panel::left("settings_rail")
             .resizable(false)
-            .default_size(72.0)
+            // 64px buttons + 3px frame inset each side + the panel's own
+            // 8px side margins = 86px; 72px clipped the rail frame's right
+            // edge and rounded corner.
+            .default_size(88.0)
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 egui::Frame::new()
@@ -279,21 +282,23 @@ impl SettingsView {
                 |ui| widgets::toggle(ui, &mut self.draft.audio.aec),
             );
             let tok = theme::tokens(ui.visuals());
-            if !state.aec_available {
-                ui.label(
-                    RichText::new("Auf dieser Installation nicht verfügbar")
-                        .small()
-                        .color(tok.dim_text),
-                );
-            } else if let (Some(erl), Some(erle)) =
-                (state.aec_stats.erl_db, state.aec_stats.erle_db)
-            {
-                ui.label(
-                    RichText::new(format!("ERL {erl:.0} dB · ERLE {erle:.0} dB"))
-                        .monospace()
-                        .small(),
-                );
-            }
+            widgets::card_note(ui, |ui| {
+                if !state.aec_available {
+                    ui.label(
+                        RichText::new("Auf dieser Installation nicht verfügbar")
+                            .small()
+                            .color(tok.dim_text),
+                    );
+                } else if let (Some(erl), Some(erle)) =
+                    (state.aec_stats.erl_db, state.aec_stats.erle_db)
+                {
+                    ui.label(
+                        RichText::new(format!("ERL {erl:.0} dB · ERLE {erle:.0} dB"))
+                            .monospace()
+                            .small(),
+                    );
+                }
+            });
         });
 
         widgets::group_card(ui, "Töne", |ui| {
@@ -410,7 +415,7 @@ impl SettingsView {
                 .inner
             });
             widgets::setting_row(ui, true, "Abstand", None, |ui| {
-                ui.horizontal(|ui| {
+                widgets::ltr(ui, |ui| {
                     ui.add(
                         egui::DragValue::new(&mut self.draft.overlay.offset[0])
                             .prefix("x ")
@@ -439,7 +444,7 @@ impl SettingsView {
     fn general_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         widgets::group_card(ui, "Identität", |ui| {
             widgets::setting_row(ui, false, "Anzeigename", None, |ui| {
-                ui.horizontal(|ui| {
+                widgets::ltr(ui, |ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(140.0));
                     if ui.button("Übernehmen").clicked() {
                         cmds.push(Command::SetName(self.name.trim().to_string()));
@@ -447,7 +452,9 @@ impl SettingsView {
                 });
             });
             if let Some(err) = &state.name_error {
-                ui.colored_label(theme::tokens(ui.visuals()).error, err);
+                widgets::card_note(ui, |ui| {
+                    ui.colored_label(theme::tokens(ui.visuals()).error, err);
+                });
             }
             widgets::setting_row(ui, true, "Server", None, |ui| {
                 ui.label(RichText::new(&state.server).monospace())
@@ -469,7 +476,7 @@ impl SettingsView {
         if state.is_admin {
             widgets::group_card(ui, "Einladung", |ui| {
                 widgets::setting_row(ui, false, "Name der eingeladenen Person", None, |ui| {
-                    ui.horizontal(|ui| {
+                    widgets::ltr(ui, |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.invite_name).desired_width(140.0),
                         );
@@ -482,16 +489,20 @@ impl SettingsView {
                     });
                 });
                 if let Some(err) = &state.invite_error {
-                    ui.colored_label(theme::tokens(ui.visuals()).error, err);
+                    widgets::card_note(ui, |ui| {
+                        ui.colored_label(theme::tokens(ui.visuals()).error, err);
+                    });
                 }
                 if let Some((blob, expires)) = &state.last_invite {
-                    ui.label(format!("Gültig bis {expires}, einmal einfügbar:"));
-                    let mut copy = blob.clone();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut copy)
-                            .desired_rows(3)
-                            .font(egui::TextStyle::Monospace),
-                    );
+                    widgets::card_note(ui, |ui| {
+                        ui.label(format!("Gültig bis {expires}, einmal einfügbar:"));
+                        let mut copy = blob.clone();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut copy)
+                                .desired_rows(3)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                    });
                 }
             });
         }
@@ -526,7 +537,9 @@ impl SettingsView {
                 }
             });
             if let Some(err) = &state.user_action_error {
-                ui.colored_label(theme::tokens(ui.visuals()).error, err);
+                widgets::card_note(ui, |ui| {
+                    ui.colored_label(theme::tokens(ui.visuals()).error, err);
+                });
             }
             let me = state.me.as_ref().map(|m| m.user_id);
             let mut users: Vec<_> = state.user_list.iter().collect();
@@ -535,10 +548,12 @@ impl SettingsView {
                 self.user_row(ui, i > 0, user, me, cmds);
             }
             if state.user_list.is_empty() {
-                ui.label(
-                    RichText::new("Noch keine Liste geladen.")
-                        .color(theme::tokens(ui.visuals()).dim_text),
-                );
+                widgets::card_note(ui, |ui| {
+                    ui.label(
+                        RichText::new("Noch keine Liste geladen.")
+                            .color(theme::tokens(ui.visuals()).dim_text),
+                    );
+                });
             }
         });
     }
@@ -561,7 +576,7 @@ impl SettingsView {
         };
         let help = format!("{status}{}", if user.is_admin { " · Admin" } else { "" });
         widgets::setting_row(ui, divider, &user.name, Some(&help), |ui| {
-            ui.horizontal(|ui| {
+            widgets::ltr(ui, |ui| {
                 let role_label = if user.is_admin {
                     "Admin-Rechte entziehen"
                 } else {
@@ -625,15 +640,17 @@ impl SettingsView {
             widgets::setting_row(ui, true, "Audio-Backend", None, |ui| {
                 ui.label(state.backend)
             });
-            ui.label(
-                RichText::new(
-                    "Enthält Opus (BSD-3), RNNoise/nnnoiseless (BSD-3), WebRTC AudioProcessing \
-                     (BSD-3), OpenH264 (BSD-2, aus Quelle gebaut — nicht unter Ciscos \
-                     Lizenzgewährung für Binaries), Inter (OFL-1.1), Phosphor-Icons (MIT/Apache-2.0). \
-                     Lizenztexte liegen dem Release bei.",
-                )
-                .small(),
-            );
+            widgets::card_note(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Enthält Opus (BSD-3), RNNoise/nnnoiseless (BSD-3), WebRTC AudioProcessing \
+                         (BSD-3), OpenH264 (BSD-2, aus Quelle gebaut — nicht unter Ciscos \
+                         Lizenzgewährung für Binaries), Inter (OFL-1.1), Phosphor-Icons (MIT/Apache-2.0). \
+                         Lizenztexte liegen dem Release bei.",
+                    )
+                    .small(),
+                );
+            });
         });
 
         self.refresh_diagnose();
@@ -672,43 +689,45 @@ impl SettingsView {
                 ui.label(RichText::new(&self.diagnose.reconnects).monospace())
             });
 
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .button(format!("{} Bericht kopieren", icon::COPY))
-                    .clicked()
-                {
-                    ui.ctx().copy_text(self.stats.report());
-                }
-                if ui
-                    .button(format!("{} Histogramm exportieren", icon::EXPORT))
-                    .clicked()
-                {
-                    let path = self.paths.config_dir.join("histograms.txt");
-                    self.export_status = Some(match std::fs::write(&path, self.stats.report()) {
-                        Ok(()) => format!("Geschrieben: {}", path.display()),
-                        Err(e) => format!("Fehlgeschlagen: {e}"),
-                    });
-                }
-                if ui
-                    .button(format!(
-                        "{} Debug-Fenster {}",
-                        icon::BUG,
-                        if self.debug_window_open {
-                            "schließen"
-                        } else {
-                            "öffnen"
-                        }
-                    ))
-                    .clicked()
-                {
-                    self.debug_window_open = !self.debug_window_open;
+            widgets::card_note(ui, |ui| {
+                widgets::ltr(ui, |ui| {
+                    if ui
+                        .button(format!("{} Bericht kopieren", icon::COPY))
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(self.stats.report());
+                    }
+                    if ui
+                        .button(format!("{} Histogramm exportieren", icon::EXPORT))
+                        .clicked()
+                    {
+                        let path = self.paths.config_dir.join("histograms.txt");
+                        self.export_status =
+                            Some(match std::fs::write(&path, self.stats.report()) {
+                                Ok(()) => format!("Geschrieben: {}", path.display()),
+                                Err(e) => format!("Fehlgeschlagen: {e}"),
+                            });
+                    }
+                    if ui
+                        .button(format!(
+                            "{} Debug-Fenster {}",
+                            icon::BUG,
+                            if self.debug_window_open {
+                                "schließen"
+                            } else {
+                                "öffnen"
+                            }
+                        ))
+                        .clicked()
+                    {
+                        self.debug_window_open = !self.debug_window_open;
+                    }
+                });
+                if let Some(status) = &self.export_status {
+                    let tok = theme::tokens(ui.visuals());
+                    ui.label(RichText::new(status).small().color(tok.dim_text));
                 }
             });
-            if let Some(status) = &self.export_status {
-                let tok = theme::tokens(ui.visuals());
-                ui.label(RichText::new(status).small().color(tok.dim_text));
-            }
         });
     }
 
@@ -832,7 +851,7 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
                 *corner = value;
             }
         };
-    ui.horizontal(|ui| {
+    widgets::ltr(ui, |ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         for (value, dx, dy) in [
             (Corner::TopLeft, 0.0, 0.0),

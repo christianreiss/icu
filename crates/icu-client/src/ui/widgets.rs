@@ -13,6 +13,26 @@ use egui_phosphor::regular as icon;
 
 use super::theme;
 
+/// Forces left-to-right child order for a widget group, even when placed
+/// inside a `Layout::right_to_left` control column (`setting_row`'s control
+/// closure): plain `ui.horizontal` inherits right-to-left from such a
+/// parent and silently reverses its children (segmented controls, the
+/// corner picker, field+button pairs, action-button rows).
+pub fn ltr<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), add_contents)
+}
+
+/// A note dropped directly inside a [`group_card`] — error text, help
+/// blurbs, anything that isn't a label+control [`setting_row`] — inset by
+/// the same 12px the rows use, so it doesn't sit flush against the card
+/// border.
+pub fn card_note<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    Frame::new()
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, add_contents)
+        .inner
+}
+
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(
         egui::lerp(a.r() as f32..=b.r() as f32, t).round() as u8,
@@ -74,7 +94,7 @@ pub fn segmented<T: PartialEq + Copy>(
         .corner_radius(CornerRadius::same(9))
         .inner_margin(3)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ltr(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 for (value, label) in options {
                     let selected = *current == *value;
@@ -471,6 +491,10 @@ pub fn slider_row(
                     },
                 );
             });
+            // egui defaults `slider_width` to 100px; nothing else in the
+            // app overrides it, so without this the "full-width" slider
+            // this row promises is a 100px stub at the card's left edge.
+            ui.spacing_mut().slider_width = ui.available_width();
             let resp = ui.add(egui::Slider::new(value, range.clone()).show_value(false));
             ui.horizontal(|ui| {
                 ui.label(
