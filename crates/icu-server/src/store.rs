@@ -99,10 +99,15 @@ pub struct UserRecord {
     #[serde(default, rename = "cert")]
     pub certs: Vec<CertRecord>,
     /// Grants `CreateInviteRequest` and other admin actions. Set once, at the
-    /// first enrollment that completes against an empty store; never granted
-    /// afterwards by enrollment alone.
+    /// first enrollment that completes against an empty store; changed
+    /// afterwards only through `Store::set_admin`.
     #[serde(default)]
     pub is_admin: bool,
+    /// Reversible login block, independent of certificate revocation. Unlike
+    /// `revoke`, `Store::set_disabled(id, false)` restores access without
+    /// re-enrollment.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// `users.toml`
@@ -323,6 +328,7 @@ impl Store {
                 last_renew: None,
                 certs: vec![cert],
                 is_admin,
+                disabled: false,
             },
         );
         self.save_users()?;
@@ -351,8 +357,10 @@ impl Store {
             .and_then(|s| parse_rfc3339(s).ok())
     }
 
-    /// Revokes **all** certificates of a user (§5).
+    /// Revokes **all** certificates of a user (§5). Guarded against revoking
+    /// the last remaining functional admin.
     pub fn revoke(&mut self, id: UserId) -> Result<bool> {
+        self.guard_last_admin(id)?;
         let record = self
             .users
             .users
@@ -366,6 +374,78 @@ impl Store {
             }
         }
         self.save_users()?;
+        Ok(changed)
+    }
+
+    /// Whether `id` currently provides working admin capability: admin flag
+    /// set, not disabled, and at least one certificate not revoked. Cert
+    /// expiry is deliberately not checked, matching `AdminUser.revoked`'s
+    /// existing simplification.
+    fn is_functional_admin(&self, id: UserId) -> bool {
+        self.user(id)
+            .map(|u| u.is_admin && !u.disabled && u.certs.iter().any(|c| !c.revoked))
+            .unwrap_or(false)
+    }
+
+    /// How many users currently provide working admin capability.
+    fn functional_admin_count(&self) -> usize {
+        self.users()
+            .filter(|(id, _)| self.is_functional_admin(*id))
+            .count()
+    }
+
+    /// Rejects an action against `id` that would leave zero functional
+    /// admins. A no-op for anyone who is not currently a functional admin
+    /// (e.g. already disabled or fully revoked), so it never blocks cleanup
+    /// of a non-functional account.
+    fn guard_last_admin(&self, id: UserId) -> Result<()> {
+        if self.is_functional_admin(id) && self.functional_admin_count() <= 1 {
+            return Err(Error::coded(
+                ec::LAST_ADMIN,
+                "cannot demote, disable or revoke the last remaining admin",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Grants or revokes admin rights. Guarded against demoting the last
+    /// remaining functional admin. Returns whether anything changed.
+    pub fn set_admin(&mut self, id: UserId, is_admin: bool) -> Result<bool> {
+        if !is_admin {
+            self.guard_last_admin(id)?;
+        }
+        let record = self
+            .users
+            .users
+            .get_mut(&id.to_string())
+            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
+        let changed = record.is_admin != is_admin;
+        record.is_admin = is_admin;
+        if changed {
+            self.save_users()?;
+        }
+        Ok(changed)
+    }
+
+    /// Blocks or restores login without touching certificates. Guarded
+    /// against disabling the last remaining functional admin. Restoring
+    /// (`disabled: false`) makes existing non-revoked certificates usable
+    /// again immediately, no re-enrollment needed. Returns whether anything
+    /// changed.
+    pub fn set_disabled(&mut self, id: UserId, disabled: bool) -> Result<bool> {
+        if disabled {
+            self.guard_last_admin(id)?;
+        }
+        let record = self
+            .users
+            .users
+            .get_mut(&id.to_string())
+            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
+        let changed = record.disabled != disabled;
+        record.disabled = disabled;
+        if changed {
+            self.save_users()?;
+        }
         Ok(changed)
     }
 
@@ -615,6 +695,101 @@ mod tests {
         let user = s.user(alice).unwrap();
         assert_eq!(user.certs.len(), 2);
         assert!(user.certs.iter().all(|c| c.revoked));
+    }
+
+    /// §10: promote/demote updates `is_admin` and persists.
+    #[test]
+    fn promoting_and_demoting_updates_is_admin() {
+        let (dir, mut s) = store();
+        let alice = s.add_user("alice", cert("aa"), true).unwrap();
+        let bob = s.add_user("bob", cert("bb"), false).unwrap();
+        assert!(s.set_admin(bob, true).unwrap());
+        assert!(s.is_admin(bob));
+        assert!(!s.set_admin(bob, true).unwrap(), "no-op is reported as unchanged");
+        assert!(s.set_admin(bob, false).unwrap());
+        assert!(!s.is_admin(bob));
+        drop(s);
+
+        let s = Store::open(dir.path()).unwrap();
+        assert!(s.is_admin(alice));
+        assert!(!s.is_admin(bob));
+    }
+
+    /// §10: disable blocks nothing at the store layer (session.rs enforces
+    /// it), and enable restores without touching certificates.
+    #[test]
+    fn disabling_and_enabling_round_trips_without_touching_certs() {
+        let (_dir, mut s) = store();
+        let alice = s.add_user("alice", cert("aa"), true).unwrap();
+        let bob = s.add_user("bob", cert("bb"), false).unwrap();
+        assert!(s.set_disabled(bob, true).unwrap());
+        assert!(s.user(bob).unwrap().disabled);
+        assert!(!s.user(bob).unwrap().certs[0].revoked, "disable is not revoke");
+        assert!(s.set_disabled(bob, false).unwrap());
+        assert!(!s.user(bob).unwrap().disabled);
+        assert!(s.is_admin(alice), "unaffected");
+    }
+
+    /// §10: the last-admin guard — demote.
+    #[test]
+    fn demoting_the_last_functional_admin_is_rejected() {
+        let (_dir, mut s) = store();
+        let alice = s.add_user("alice", cert("aa"), true).unwrap();
+        let err = s.set_admin(alice, false).unwrap_err();
+        assert_eq!(err.code(), Some(ec::LAST_ADMIN));
+        assert!(s.is_admin(alice), "unchanged");
+    }
+
+    /// §10: the last-admin guard — disable.
+    #[test]
+    fn disabling_the_last_functional_admin_is_rejected() {
+        let (_dir, mut s) = store();
+        let alice = s.add_user("alice", cert("aa"), true).unwrap();
+        let err = s.set_disabled(alice, true).unwrap_err();
+        assert_eq!(err.code(), Some(ec::LAST_ADMIN));
+        assert!(!s.user(alice).unwrap().disabled, "unchanged");
+    }
+
+    /// §10: the last-admin guard — revoke.
+    #[test]
+    fn revoking_the_last_functional_admin_is_rejected() {
+        let (_dir, mut s) = store();
+        let alice = s.add_user("alice", cert("aa"), true).unwrap();
+        let err = s.revoke(alice).unwrap_err();
+        assert_eq!(err.code(), Some(ec::LAST_ADMIN));
+        assert!(!s.user(alice).unwrap().certs[0].revoked, "unchanged");
+    }
+
+    /// §10: the guard only counts *functional* admins — disabling one of two
+    /// admins is fine, but demoting the resulting sole functional admin is
+    /// then rejected, and acting further on the already-disabled admin is
+    /// never blocked by the guard (they no longer count).
+    #[test]
+    fn guard_counts_functional_admins_only() {
+        let (_dir, mut s) = store();
+        let alice = s.add_user("alice", cert("aa"), true).unwrap();
+        let bob = s.add_user("bob", cert("bb"), true).unwrap();
+
+        // Two functional admins: disabling one is fine.
+        assert!(s.set_disabled(alice, true).unwrap());
+
+        // Now bob is the sole functional admin: demoting him is rejected.
+        let err = s.set_admin(bob, false).unwrap_err();
+        assert_eq!(err.code(), Some(ec::LAST_ADMIN));
+
+        // Alice, already non-functional (disabled), is never blocked by the
+        // guard — e.g. revoking her outright is unaffected.
+        assert!(s.revoke(alice).unwrap());
+    }
+
+    /// §10: the guard is a no-op for ordinary, non-admin users.
+    #[test]
+    fn guard_does_not_affect_non_admins() {
+        let (_dir, mut s) = store();
+        s.add_user("alice", cert("aa"), true).unwrap();
+        let bob = s.add_user("bob", cert("bb"), false).unwrap();
+        assert!(s.revoke(bob).unwrap());
+        assert!(s.set_disabled(bob, true).unwrap());
     }
 
     /// §10: name collision gets a `-2` / `-3` suffix.

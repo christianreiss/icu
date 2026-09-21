@@ -148,6 +148,27 @@ pub struct UserInfo {
     pub flags: UserFlags,
 }
 
+/// One row of the admin User Manager list (`ControlMsg::UserListResponse`,
+/// `PROTOCOL.md` §2.2). Lighter than the admin-socket's `AdminUser`: no
+/// fingerprint/issued/expires, the manager only needs role and status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserSummary {
+    /// Stable identity, assigned at enrollment.
+    pub user_id: UserId,
+    /// Display name.
+    pub name: String,
+    /// When the user was created, RFC 3339 UTC.
+    pub created: String,
+    /// Whether the user may send admin-gated requests.
+    pub is_admin: bool,
+    /// Reversible login block, independent of `revoked`.
+    pub disabled: bool,
+    /// Whether every certificate of this user is revoked.
+    pub revoked: bool,
+    /// Whether the user is connected right now.
+    pub online: bool,
+}
+
 /// Audio parameters announced in `Welcome` (`PROTOCOL.md` §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioParams {

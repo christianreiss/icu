@@ -6,7 +6,11 @@
 //! refused — does the CLI open the state itself, holding
 //! `flock(state.lock)` while it does.
 
+pub mod demote;
+pub mod disable;
+pub mod enable;
 pub mod invite;
+pub mod promote;
 pub mod rename;
 pub mod revoke;
 pub mod status;

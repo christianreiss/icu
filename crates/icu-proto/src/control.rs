@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     framing::{self, MAX_CONTROL_FRAME, MAX_ENROLL_FRAME},
-    AudioParams, ProtoError, Session, UserFlags, UserInfo,
+    AudioParams, ProtoError, Session, UserFlags, UserId, UserInfo, UserSummary,
 };
 
 /// Protocol minor version of this implementation. v1 baseline is 1; a minor 0
@@ -155,6 +155,74 @@ pub enum ControlMsg {
         /// When the underlying invite expires, RFC 3339 UTC.
         expires: String,
     },
+    /// 19, C→S. Promote/demote another user. Admin only, rejected with
+    /// `AdminActionError{NOT_ADMIN}` otherwise; rejected with
+    /// `AdminActionError{LAST_ADMIN}` if this would demote the last
+    /// remaining functional admin. Non fatal either way.
+    AdminSetRole {
+        /// The user whose role changes.
+        user_id: UserId,
+        /// The new role.
+        is_admin: bool,
+    },
+    /// 20, S→C. Ack to the acting admin.
+    AdminSetRoleOk {
+        /// The user whose role changed.
+        user_id: UserId,
+        /// The new role.
+        is_admin: bool,
+    },
+    /// 21, S→C. Unicast to every session of the affected user (not a room
+    /// broadcast): their own cached role changed, live, without a reconnect.
+    UserAdminChanged {
+        /// The new role.
+        is_admin: bool,
+    },
+    /// 22, C→S. Reversible login block, independent of certificate revoke.
+    /// Admin only; same rejection shape as `AdminSetRole`.
+    AdminSetDisabled {
+        /// The affected user.
+        user_id: UserId,
+        /// The new disabled state.
+        disabled: bool,
+    },
+    /// 23, S→C. Ack to the acting admin.
+    AdminSetDisabledOk {
+        /// The affected user.
+        user_id: UserId,
+        /// The new disabled state.
+        disabled: bool,
+    },
+    /// 24, C→S. Revokes every certificate of `user_id` and kicks it. Admin
+    /// only; same rejection shape as `AdminSetRole`.
+    AdminRevokeUser {
+        /// The affected user.
+        user_id: UserId,
+    },
+    /// 25, S→C. Ack to the acting admin.
+    AdminRevokeUserOk {
+        /// The affected user.
+        user_id: UserId,
+        /// How many live connections were closed.
+        closed: u32,
+    },
+    /// 26, C→S. Admin only; same rejection shape as `AdminSetRole`.
+    UserListRequest,
+    /// 27, S→C. Every registered user, online or not.
+    UserListResponse {
+        /// One row per registered user.
+        users: Vec<UserSummary>,
+    },
+    /// 28, S→C. Rejection of variant 19/22/24/26. `user_id` is `0` for a
+    /// `UserListRequest` failure, since it names no single target.
+    AdminActionError {
+        /// The targeted user, or `0`.
+        user_id: UserId,
+        /// Error code (`PROTOCOL.md` §6).
+        code: u32,
+        /// Human readable detail.
+        detail: String,
+    },
 }
 
 impl ControlMsg {
@@ -195,6 +263,16 @@ impl ControlMsg {
             ControlMsg::VideoCongestionHint { .. } => "VideoCongestionHint",
             ControlMsg::CreateInviteRequest { .. } => "CreateInviteRequest",
             ControlMsg::CreateInviteResponse { .. } => "CreateInviteResponse",
+            ControlMsg::AdminSetRole { .. } => "AdminSetRole",
+            ControlMsg::AdminSetRoleOk { .. } => "AdminSetRoleOk",
+            ControlMsg::UserAdminChanged { .. } => "UserAdminChanged",
+            ControlMsg::AdminSetDisabled { .. } => "AdminSetDisabled",
+            ControlMsg::AdminSetDisabledOk { .. } => "AdminSetDisabledOk",
+            ControlMsg::AdminRevokeUser { .. } => "AdminRevokeUser",
+            ControlMsg::AdminRevokeUserOk { .. } => "AdminRevokeUserOk",
+            ControlMsg::UserListRequest => "UserListRequest",
+            ControlMsg::UserListResponse { .. } => "UserListResponse",
+            ControlMsg::AdminActionError { .. } => "AdminActionError",
         }
     }
 
@@ -210,6 +288,10 @@ impl ControlMsg {
                 | ControlMsg::KeyframeRequest { .. }
                 | ControlMsg::SetName { .. }
                 | ControlMsg::CreateInviteRequest { .. }
+                | ControlMsg::AdminSetRole { .. }
+                | ControlMsg::AdminSetDisabled { .. }
+                | ControlMsg::AdminRevokeUser { .. }
+                | ControlMsg::UserListRequest
         )
     }
 }
@@ -342,6 +424,45 @@ mod tests {
                 blob: "ICU1-abc".into(),
                 expires: "2026-09-22T00:00:00Z".into(),
             },
+            ControlMsg::AdminSetRole {
+                user_id: 5,
+                is_admin: true,
+            },
+            ControlMsg::AdminSetRoleOk {
+                user_id: 5,
+                is_admin: true,
+            },
+            ControlMsg::UserAdminChanged { is_admin: true },
+            ControlMsg::AdminSetDisabled {
+                user_id: 5,
+                disabled: true,
+            },
+            ControlMsg::AdminSetDisabledOk {
+                user_id: 5,
+                disabled: true,
+            },
+            ControlMsg::AdminRevokeUser { user_id: 5 },
+            ControlMsg::AdminRevokeUserOk {
+                user_id: 5,
+                closed: 1,
+            },
+            ControlMsg::UserListRequest,
+            ControlMsg::UserListResponse {
+                users: vec![UserSummary {
+                    user_id: 5,
+                    name: "eve".into(),
+                    created: "2026-09-21T00:00:00Z".into(),
+                    is_admin: false,
+                    disabled: true,
+                    revoked: false,
+                    online: true,
+                }],
+            },
+            ControlMsg::AdminActionError {
+                user_id: 5,
+                code: crate::error::LAST_ADMIN,
+                detail: "cannot demote the last admin".into(),
+            },
         ]
     }
 
@@ -349,7 +470,7 @@ mod tests {
     #[test]
     fn roundtrip_all_control_variants() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 19, "v1 has exactly 19 control variants");
+        assert_eq!(variants.len(), 29, "v1 has exactly 29 control variants");
         for msg in variants {
             let frame = msg.encode().unwrap();
             let body = framing::split_frame(&frame, MAX_CONTROL_FRAME)
@@ -427,8 +548,8 @@ mod tests {
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
     #[test]
     fn unknown_variant_is_an_error() {
-        // Discriminant 19 does not exist in v1.
-        let body = [19u8, 0, 0];
+        // Discriminant 29 does not exist in v1.
+        let body = [29u8, 0, 0];
         let err = ControlMsg::decode(&body).unwrap_err();
         assert!(
             matches!(err, ProtoError::UnknownVariant),
@@ -472,5 +593,19 @@ mod tests {
             expires: String::new()
         }
         .is_client_to_server());
+        assert!(ControlMsg::AdminSetRole {
+            user_id: 1,
+            is_admin: true
+        }
+        .is_client_to_server());
+        assert!(ControlMsg::AdminSetDisabled {
+            user_id: 1,
+            disabled: true
+        }
+        .is_client_to_server());
+        assert!(ControlMsg::AdminRevokeUser { user_id: 1 }.is_client_to_server());
+        assert!(ControlMsg::UserListRequest.is_client_to_server());
+        assert!(!ControlMsg::UserAdminChanged { is_admin: true }.is_client_to_server());
+        assert!(!ControlMsg::UserListResponse { users: vec![] }.is_client_to_server());
     }
 }

@@ -50,6 +50,26 @@ pub enum AdminRequest {
         /// The new name.
         new: String,
     },
+    /// Grant admin rights.
+    Promote {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Revoke admin rights.
+    Demote {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Reversibly block login without touching certificates.
+    Disable {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Restore login after `Disable`.
+    Enable {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
     /// Uptime, online count and relay counters.
     Status,
     /// Issue a fresh server leaf from the same CA.
@@ -77,8 +97,15 @@ pub enum AdminResponse {
         /// How many live connections were closed.
         closed: usize,
     },
-    /// `rename`, `rotate-server-cert`
+    /// `rename`, `promote`, `demote`, `enable`, `rotate-server-cert`
     Ok,
+    /// `disable`
+    Disable {
+        /// The affected user.
+        user_id: UserId,
+        /// How many live connections were closed.
+        closed: usize,
+    },
     /// `status`
     Status(serde_json::Value),
     /// Any failure.
@@ -109,6 +136,8 @@ pub struct AdminUser {
     pub online: bool,
     /// Whether the user may send `CreateInviteRequest`.
     pub is_admin: bool,
+    /// Reversible login block, independent of `revoked`.
+    pub disabled: bool,
 }
 
 impl AdminResponse {
@@ -130,6 +159,9 @@ impl AdminResponse {
                 json!({"ok": true, "user_id": user_id, "closed": closed})
             }
             AdminResponse::Ok => json!({"ok": true}),
+            AdminResponse::Disable { user_id, closed } => {
+                json!({"ok": true, "user_id": user_id, "closed": closed})
+            }
             AdminResponse::Status(value) => {
                 let mut out = json!({"ok": true});
                 if let (Some(out), Some(value)) = (out.as_object_mut(), value.as_object()) {
@@ -195,6 +227,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     revoked: !record.certs.is_empty() && record.certs.iter().all(|c| c.revoked),
                     online: !server.room.sessions_of_user(user_id).is_empty(),
                     is_admin: record.is_admin,
+                    disabled: record.disabled,
                 });
             }
             AdminResponse::Users(users)
@@ -208,10 +241,11 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                 Ok(_) => {
                     drop(store);
                     // A revoke takes effect immediately (§5).
-                    let closed = session::kick_user(server, user_id);
+                    let closed = session::kick_user(server, user_id, ec::KICKED);
                     tracing::info!(user_id, closed, "revoked");
                     AdminResponse::Revoke { user_id, closed }
                 }
+                Err(e) if e.code() == Some(ec::LAST_ADMIN) => AdminResponse::err("LAST_ADMIN", e),
                 Err(e) => AdminResponse::err("REVOKE_FAILED", e),
             }
         }
@@ -236,6 +270,25 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                 Err(e) => AdminResponse::err("RENAME_FAILED", e),
             }
         }
+        AdminRequest::Promote { user } => set_role(server, &user, true).await,
+        AdminRequest::Demote { user } => set_role(server, &user, false).await,
+        AdminRequest::Enable { user } => set_disabled(server, &user, false).await,
+        AdminRequest::Disable { user } => {
+            let mut store = server.store.lock().await;
+            let Some(user_id) = store.resolve(&user) else {
+                return AdminResponse::err("NO_SUCH_USER", format!("no user {user:?}"));
+            };
+            match store.set_disabled(user_id, true) {
+                Ok(_) => {
+                    drop(store);
+                    let closed = session::kick_user(server, user_id, ec::AUTH_DISABLED);
+                    tracing::info!(user_id, closed, "disabled");
+                    AdminResponse::Disable { user_id, closed }
+                }
+                Err(e) if e.code() == Some(ec::LAST_ADMIN) => AdminResponse::err("LAST_ADMIN", e),
+                Err(e) => AdminResponse::err("DISABLE_FAILED", e),
+            }
+        }
         AdminRequest::Status => AdminResponse::Status(status(server)),
         AdminRequest::RotateServerCert => {
             let mut ca = server.ca.write().await;
@@ -246,6 +299,50 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                 Err(e) => AdminResponse::err("ROTATE_FAILED", e),
             }
         }
+    }
+}
+
+/// Shared resolve→mutate→map-error body of `Promote`/`Demote`. On success,
+/// pushes `UserAdminChanged` live to every one of the target's own online
+/// sessions (same live-propagation shape as `Rename`'s `UserRenamed`), so
+/// their own cached `is_admin` updates without a reconnect, regardless of
+/// whether the action came from the socket or in-band.
+async fn set_role(server: &Arc<Server>, user: &str, is_admin: bool) -> AdminResponse {
+    let mut store = server.store.lock().await;
+    let Some(user_id) = store.resolve(user) else {
+        return AdminResponse::err("NO_SUCH_USER", format!("no user {user:?}"));
+    };
+    match store.set_admin(user_id, is_admin) {
+        Ok(_) => {
+            drop(store);
+            for session in server.room.sessions_of_user(user_id) {
+                server
+                    .room
+                    .send_to(session, &icu_proto::ControlMsg::UserAdminChanged { is_admin });
+            }
+            tracing::info!(user_id, is_admin, "admin role changed");
+            AdminResponse::Ok
+        }
+        Err(e) if e.code() == Some(ec::LAST_ADMIN) => AdminResponse::err("LAST_ADMIN", e),
+        Err(e) => AdminResponse::err("PROMOTE_FAILED", e),
+    }
+}
+
+/// Shared resolve→mutate→map-error body of `Enable` (and the non-kicking
+/// half of `Disable`'s logic; `Disable` itself stays inline in [`handle`]
+/// since it also needs to kick).
+async fn set_disabled(server: &Arc<Server>, user: &str, disabled: bool) -> AdminResponse {
+    let mut store = server.store.lock().await;
+    let Some(user_id) = store.resolve(user) else {
+        return AdminResponse::err("NO_SUCH_USER", format!("no user {user:?}"));
+    };
+    match store.set_disabled(user_id, disabled) {
+        Ok(_) => {
+            tracing::info!(user_id, disabled, "admin disabled state changed");
+            AdminResponse::Ok
+        }
+        Err(e) if e.code() == Some(ec::LAST_ADMIN) => AdminResponse::err("LAST_ADMIN", e),
+        Err(e) => AdminResponse::err("DISABLE_FAILED", e),
     }
 }
 

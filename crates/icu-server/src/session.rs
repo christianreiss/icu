@@ -77,7 +77,12 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
             format!("certificate {fp} is revoked"),
         ));
     }
-    let _ = user;
+    if user.disabled {
+        return Err(Error::coded(
+            ec::AUTH_DISABLED,
+            format!("user_id {user_id} is disabled"),
+        ));
+    }
     Ok(Identity { user_id })
 }
 
@@ -375,6 +380,24 @@ async fn control_loop(
             ControlMsg::CreateInviteRequest { name, ttl_s } => {
                 handle_create_invite(server, session, user_id, &name, ttl_s).await;
             }
+            ControlMsg::AdminSetRole {
+                user_id: target,
+                is_admin,
+            } => {
+                handle_admin_set_role(server, session, user_id, target, is_admin).await;
+            }
+            ControlMsg::AdminSetDisabled {
+                user_id: target,
+                disabled,
+            } => {
+                handle_admin_set_disabled(server, session, user_id, target, disabled).await;
+            }
+            ControlMsg::AdminRevokeUser { user_id: target } => {
+                handle_admin_revoke_user(server, session, user_id, target).await;
+            }
+            ControlMsg::UserListRequest => {
+                handle_user_list_request(server, session, user_id).await;
+            }
             other => {
                 return Err(Error::coded(
                     ec::PROTOCOL_VIOLATION,
@@ -564,6 +587,163 @@ async fn handle_create_invite(
     );
 }
 
+/// Sends `AdminActionError` to the acting admin's session.
+fn send_admin_error(server: &Arc<Server>, session: Session, user_id: UserId, code: u32, detail: String) {
+    server.room.send_to(
+        session,
+        &ControlMsg::AdminActionError {
+            user_id,
+            code,
+            detail,
+        },
+    );
+}
+
+/// `AdminSetRole` (`PROTOCOL.md` §2.2). Admin only; on success, pushes
+/// `UserAdminChanged` live to every one of the target's own sessions, so
+/// their own cached `is_admin` updates without a reconnect.
+async fn handle_admin_set_role(
+    server: &Arc<Server>,
+    session: Session,
+    actor: UserId,
+    target: UserId,
+    is_admin: bool,
+) {
+    let mut store = server.store.lock().await;
+    if !store.is_admin(actor) {
+        drop(store);
+        send_admin_error(server, session, target, ec::NOT_ADMIN, "not an admin".into());
+        return;
+    }
+    if store.user(target).is_none() {
+        drop(store);
+        send_admin_error(server, session, target, ec::NO_SUCH_USER, "unknown user".into());
+        return;
+    }
+    match store.set_admin(target, is_admin) {
+        Ok(_) => {
+            drop(store);
+            server
+                .room
+                .send_to(session, &ControlMsg::AdminSetRoleOk { user_id: target, is_admin });
+            for s in server.room.sessions_of_user(target) {
+                server
+                    .room
+                    .send_to(s, &ControlMsg::UserAdminChanged { is_admin });
+            }
+            tracing::info!(actor, target, is_admin, "admin role changed");
+        }
+        Err(e) => {
+            drop(store);
+            send_admin_error(server, session, target, e.code().unwrap_or(ec::LAST_ADMIN), e.to_string());
+        }
+    }
+}
+
+/// `AdminSetDisabled` (`PROTOCOL.md` §2.2). Admin only; disabling an online
+/// user kicks it immediately with `AUTH_DISABLED` — the close itself is the
+/// notification, no separate push is sent.
+async fn handle_admin_set_disabled(
+    server: &Arc<Server>,
+    session: Session,
+    actor: UserId,
+    target: UserId,
+    disabled: bool,
+) {
+    let mut store = server.store.lock().await;
+    if !store.is_admin(actor) {
+        drop(store);
+        send_admin_error(server, session, target, ec::NOT_ADMIN, "not an admin".into());
+        return;
+    }
+    if store.user(target).is_none() {
+        drop(store);
+        send_admin_error(server, session, target, ec::NO_SUCH_USER, "unknown user".into());
+        return;
+    }
+    match store.set_disabled(target, disabled) {
+        Ok(_) => {
+            drop(store);
+            if disabled {
+                kick_user(server, target, ec::AUTH_DISABLED);
+            }
+            server.room.send_to(
+                session,
+                &ControlMsg::AdminSetDisabledOk {
+                    user_id: target,
+                    disabled,
+                },
+            );
+            tracing::info!(actor, target, disabled, "admin disabled state changed");
+        }
+        Err(e) => {
+            drop(store);
+            send_admin_error(server, session, target, e.code().unwrap_or(ec::LAST_ADMIN), e.to_string());
+        }
+    }
+}
+
+/// `AdminRevokeUser` (`PROTOCOL.md` §2.2). Admin only; revokes every
+/// certificate of `target` and kicks any live connection with `KICKED`.
+async fn handle_admin_revoke_user(server: &Arc<Server>, session: Session, actor: UserId, target: UserId) {
+    let mut store = server.store.lock().await;
+    if !store.is_admin(actor) {
+        drop(store);
+        send_admin_error(server, session, target, ec::NOT_ADMIN, "not an admin".into());
+        return;
+    }
+    if store.user(target).is_none() {
+        drop(store);
+        send_admin_error(server, session, target, ec::NO_SUCH_USER, "unknown user".into());
+        return;
+    }
+    match store.revoke(target) {
+        Ok(_) => {
+            drop(store);
+            let closed = kick_user(server, target, ec::KICKED) as u32;
+            server.room.send_to(
+                session,
+                &ControlMsg::AdminRevokeUserOk {
+                    user_id: target,
+                    closed,
+                },
+            );
+            tracing::info!(actor, target, closed, "admin revoked user");
+        }
+        Err(e) => {
+            drop(store);
+            send_admin_error(server, session, target, e.code().unwrap_or(ec::LAST_ADMIN), e.to_string());
+        }
+    }
+}
+
+/// `UserListRequest` (`PROTOCOL.md` §2.2). Admin only; every registered user,
+/// online or not.
+async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor: UserId) {
+    let store = server.store.lock().await;
+    if !store.is_admin(actor) {
+        drop(store);
+        send_admin_error(server, session, 0, ec::NOT_ADMIN, "not an admin".into());
+        return;
+    }
+    let users = store
+        .users()
+        .map(|(id, u)| icu_proto::UserSummary {
+            user_id: id,
+            name: u.name.clone(),
+            created: u.created.clone(),
+            is_admin: u.is_admin,
+            disabled: u.disabled,
+            revoked: !u.certs.is_empty() && u.certs.iter().all(|c| c.revoked),
+            online: !server.room.sessions_of_user(id).is_empty(),
+        })
+        .collect();
+    drop(store);
+    server
+        .room
+        .send_to(session, &ControlMsg::UserListResponse { users });
+}
+
 /// The code the peer closed with, reduced to the `UserLeft.reason` range.
 ///
 /// Anything that is not a clean application close — idle timeout, reset,
@@ -582,19 +762,18 @@ fn peer_close_code(conn: &quinn::Connection) -> u32 {
     }
 }
 
-/// Closes every connection of a user with `KICKED` (`revoke`, §5).
-pub fn kick_user(server: &Arc<Server>, user_id: UserId) -> usize {
+/// Closes every connection of a user with `code` (`revoke`/`disable`, §5).
+pub fn kick_user(server: &Arc<Server>, user_id: UserId, code: u32) -> usize {
     let sessions = server.room.sessions_of_user(user_id);
     let mut closed = 0;
     for session in sessions {
         if let Some(member) = server.room.member(session) {
-            // Mark before closing, so the `UserLeft` broadcast says KICKED and
-            // not "the peer went away".
-            server.room.mark_closing(session, ec::KICKED);
-            member.conn.close(
-                quinn::VarInt::from_u32(ec::KICKED),
-                ec::name(ec::KICKED).as_bytes(),
-            );
+            // Mark before closing, so the `UserLeft` broadcast says the same
+            // code and not "the peer went away".
+            server.room.mark_closing(session, code);
+            member
+                .conn
+                .close(quinn::VarInt::from_u32(code), ec::name(code).as_bytes());
             closed += 1;
         }
     }

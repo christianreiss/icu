@@ -145,6 +145,103 @@ async fn status_reports_uptime_online_and_relay_counters() {
     server.shutdown().await;
 }
 
+/// §10: promote/demote over the socket push `UserAdminChanged` live to the
+/// target's own open connection, without a reconnect — mirrors
+/// `rename_over_the_socket_broadcasts_to_the_room`'s live-propagation shape.
+#[tokio::test]
+async fn promote_and_demote_over_the_socket_push_to_the_online_target() {
+    let server = TestServer::start().await;
+    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let _alice = server.client("alice").await; // sole bootstrap admin
+    let mut bob = server.client("bob").await;
+
+    let response = admin::request(
+        &socket,
+        &AdminRequest::Promote {
+            user: "bob".into(),
+        },
+    )
+    .await
+    .expect("promote");
+    assert_eq!(response["ok"], serde_json::json!(true));
+    let msg = bob
+        .recv_matching(|m| matches!(m, ControlMsg::UserAdminChanged { .. }))
+        .await;
+    assert!(
+        matches!(msg, Some(ControlMsg::UserAdminChanged { is_admin: true })),
+        "{msg:?}"
+    );
+
+    let response = admin::request(&socket, &AdminRequest::Demote { user: "bob".into() })
+        .await
+        .expect("demote");
+    assert_eq!(response["ok"], serde_json::json!(true));
+    let msg = bob
+        .recv_matching(|m| matches!(m, ControlMsg::UserAdminChanged { .. }))
+        .await;
+    assert!(
+        matches!(msg, Some(ControlMsg::UserAdminChanged { is_admin: false })),
+        "{msg:?}"
+    );
+    server.shutdown().await;
+}
+
+/// §10: the last-admin guard applies identically over the socket.
+#[tokio::test]
+async fn last_admin_guard_applies_over_the_socket() {
+    let server = TestServer::start().await;
+    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    server.enroll("alice").await; // sole bootstrap admin
+
+    let response = admin::request(&socket, &AdminRequest::Demote { user: "alice".into() })
+        .await
+        .expect("demote");
+    assert_eq!(response["ok"], serde_json::json!(false));
+    assert_eq!(response["error"], serde_json::json!("LAST_ADMIN"));
+    server.shutdown().await;
+}
+
+/// §10: `disable` over the socket reports the live-kick count, like `revoke`.
+#[tokio::test]
+async fn disable_over_the_socket_reports_closed_count() {
+    let server = TestServer::start().await;
+    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let _alice = server.client("alice").await;
+    let bob = server.client("bob").await;
+
+    let response = admin::request(&socket, &AdminRequest::Disable { user: "bob".into() })
+        .await
+        .expect("disable");
+    assert_eq!(response["ok"], serde_json::json!(true));
+    assert_eq!(response["user_id"], serde_json::json!(2));
+    assert_eq!(response["closed"], serde_json::json!(1));
+    assert_eq!(
+        bob.closed_code().await,
+        Some(icu_proto::error::AUTH_DISABLED)
+    );
+    server.shutdown().await;
+}
+
+/// §10: the `users` table reports the new `disabled` column.
+#[tokio::test]
+async fn users_command_reports_disabled() {
+    let server = TestServer::start().await;
+    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let _alice = server.client("alice").await;
+    server.enroll("bob").await;
+    admin::request(&socket, &AdminRequest::Disable { user: "bob".into() })
+        .await
+        .expect("disable");
+
+    let response = admin::request(&socket, &AdminRequest::Users)
+        .await
+        .expect("users");
+    let users = response["users"].as_array().expect("users array");
+    assert_eq!(users[0]["disabled"], serde_json::json!(false));
+    assert_eq!(users[1]["disabled"], serde_json::json!(true));
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn an_unknown_user_is_reported_as_an_error() {
     let server = TestServer::start().await;

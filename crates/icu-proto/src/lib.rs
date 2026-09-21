@@ -31,7 +31,7 @@ pub use header::{
 };
 pub use types::{
     name_eq_ci, name_key, validate_name, AudioParams, NameError, Session, UserFlags, UserId,
-    UserInfo, Version, VersionError,
+    UserInfo, UserSummary, Version, VersionError,
 };
 
 /// Everything that can go wrong while decoding or encoding wire data.

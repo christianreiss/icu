@@ -3,12 +3,14 @@
 //! Every change is applied at once through `Command::UpdateSettings`.
 
 use std::{
+    collections::HashMap,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
 use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
+use icu_proto::UserId;
 
 use super::{theme, widgets};
 use crate::{
@@ -25,6 +27,7 @@ enum Tab {
     Hotkeys,
     Camera,
     General,
+    Users,
     About,
 }
 
@@ -62,6 +65,10 @@ pub struct SettingsView {
     paths: Paths,
     diagnose: DiagnoseCache,
     export_status: Option<String>,
+    /// Revoke is destructive: first click starts a ~3s confirm window
+    /// (in-row, no modal per §10), second click within it actually sends
+    /// `Command::RevokeUser`.
+    confirm_revoke: HashMap<UserId, Instant>,
 }
 
 impl SettingsView {
@@ -88,6 +95,7 @@ impl SettingsView {
             paths,
             diagnose: DiagnoseCache::default(),
             export_status: None,
+            confirm_revoke: HashMap::new(),
         }
     }
 
@@ -95,6 +103,25 @@ impl SettingsView {
     pub fn ui(&mut self, ui: &mut Ui, state: &AppState) -> Vec<Command> {
         let mut cmds = Vec::new();
         let before = self.draft.clone();
+
+        // A live demote can orphan the tab: it is only in the rail while
+        // `state.is_admin`, so bounce back to Allgemein instead of rendering
+        // a tab that is no longer selectable.
+        if self.tab == Tab::Users && !state.is_admin {
+            self.tab = Tab::General;
+        }
+        let tab_before = self.tab;
+
+        let mut tabs = vec![
+            (Tab::Audio, icon::SLIDERS, "Audio"),
+            (Tab::Hotkeys, icon::COMMAND, "Hotkeys"),
+            (Tab::Camera, icon::VIDEO_CAMERA, "Kamera"),
+            (Tab::General, icon::GEAR_FINE, "Allgemein"),
+            (Tab::About, icon::QUESTION, "Über"),
+        ];
+        if state.is_admin {
+            tabs.insert(3, (Tab::Users, icon::USERS_THREE, "Nutzer"));
+        }
 
         egui::Panel::left("settings_rail")
             .resizable(false)
@@ -110,13 +137,7 @@ impl SettingsView {
                     .corner_radius(egui::CornerRadius::same(10))
                     .inner_margin(3)
                     .show(ui, |ui| {
-                        for (tab, glyph, label) in [
-                            (Tab::Audio, icon::SLIDERS, "Audio"),
-                            (Tab::Hotkeys, icon::COMMAND, "Hotkeys"),
-                            (Tab::Camera, icon::VIDEO_CAMERA, "Kamera"),
-                            (Tab::General, icon::GEAR_FINE, "Allgemein"),
-                            (Tab::About, icon::QUESTION, "Über"),
-                        ] {
+                        for (tab, glyph, label) in tabs {
                             if rail_button(ui, glyph, label, self.tab == tab) {
                                 self.tab = tab;
                             }
@@ -125,11 +146,16 @@ impl SettingsView {
                     });
             });
 
+        if self.tab != tab_before && self.tab == Tab::Users {
+            cmds.push(Command::RequestUserList);
+        }
+
         egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
             Tab::Audio => self.audio_tab(ui, state),
             Tab::Hotkeys => self.hotkeys_tab(ui),
             Tab::Camera => self.camera_tab(ui),
             Tab::General => self.general_tab(ui, state, &mut cmds),
+            Tab::Users => self.users_tab(ui, state, &mut cmds),
             Tab::About => self.about_tab(ui, state),
         });
 
@@ -452,6 +478,107 @@ impl SettingsView {
                     theme_swatch(ui, &mut self.draft.ui.theme, value, label);
                 }
             });
+        });
+    }
+
+    /// Admin-only "Nutzer" tab: promote/demote, disable/enable, revoke
+    /// (`ControlMsg::UserListRequest`/`AdminSetRole`/`AdminSetDisabled`/
+    /// `AdminRevokeUser`, `PROTOCOL.md` §2.2).
+    fn users_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
+        widgets::group_card(ui, "Nutzer", |ui| {
+            widgets::setting_row(ui, false, "Registrierte Nutzer", None, |ui| {
+                if ui.button("Aktualisieren").clicked() {
+                    cmds.push(Command::RequestUserList);
+                }
+            });
+            if let Some(err) = &state.user_action_error {
+                ui.colored_label(theme::tokens(ui.visuals()).error, err);
+            }
+            let me = state.me.as_ref().map(|m| m.user_id);
+            let mut users: Vec<_> = state.user_list.iter().collect();
+            users.sort_by_key(|u| u.name.to_lowercase());
+            for (i, user) in users.into_iter().enumerate() {
+                self.user_row(ui, i > 0, user, me, cmds);
+            }
+            if state.user_list.is_empty() {
+                ui.label(
+                    RichText::new("Noch keine Liste geladen.")
+                        .color(theme::tokens(ui.visuals()).dim_text),
+                );
+            }
+        });
+    }
+
+    fn user_row(
+        &mut self,
+        ui: &mut Ui,
+        divider: bool,
+        user: &icu_proto::UserSummary,
+        me: Option<UserId>,
+        cmds: &mut Vec<Command>,
+    ) {
+        let is_self = Some(user.user_id) == me;
+        let status = if user.revoked {
+            "widerrufen"
+        } else if user.disabled {
+            "deaktiviert"
+        } else {
+            "aktiv"
+        };
+        let help = format!(
+            "{status}{}",
+            if user.is_admin { " · Admin" } else { "" }
+        );
+        widgets::setting_row(ui, divider, &user.name, Some(&help), |ui| {
+            ui.horizontal(|ui| {
+                let role_label = if user.is_admin {
+                    "Admin-Rechte entziehen"
+                } else {
+                    "Zum Admin machen"
+                };
+                if ui
+                    .add_enabled(!is_self, egui::Button::new(role_label))
+                    .clicked()
+                {
+                    cmds.push(Command::SetUserAdmin {
+                        user_id: user.user_id,
+                        is_admin: !user.is_admin,
+                    });
+                }
+                let disable_label = if user.disabled { "Aktivieren" } else { "Deaktivieren" };
+                if ui
+                    .add_enabled(!is_self, egui::Button::new(disable_label))
+                    .clicked()
+                {
+                    cmds.push(Command::SetUserDisabled {
+                        user_id: user.user_id,
+                        disabled: !user.disabled,
+                    });
+                }
+                let confirming = self
+                    .confirm_revoke
+                    .get(&user.user_id)
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+                let revoke_label = if confirming {
+                    "Wirklich löschen?"
+                } else {
+                    "Löschen"
+                };
+                if ui
+                    .add_enabled(!is_self, egui::Button::new(revoke_label))
+                    .clicked()
+                {
+                    if confirming {
+                        self.confirm_revoke.remove(&user.user_id);
+                        cmds.push(Command::RevokeUser {
+                            user_id: user.user_id,
+                        });
+                    } else {
+                        self.confirm_revoke.insert(user.user_id, Instant::now());
+                    }
+                }
+            })
+            .inner
         });
     }
 

@@ -46,6 +46,16 @@ pub const ENROLL_BOOTSTRAP_CLOSED: u32 = 0x14;
 /// `CreateInviteRequest` from a non-admin user. Only ever sent as `Error`. Not
 /// fatal.
 pub const NOT_ADMIN: u32 = 0x15;
+/// An admin action would demote, disable or revoke the last remaining
+/// functional admin. Only ever sent as `AdminActionError`. Not fatal.
+pub const LAST_ADMIN: u32 = 0x16;
+/// The account is disabled (`UserRecord.disabled`). Checked at handshake,
+/// same shape as `AUTH_REVOKED`; also the close code used to kick an online
+/// user the moment they are disabled. Fatal.
+pub const AUTH_DISABLED: u32 = 0x17;
+/// An admin action named a `user_id` that does not exist. Only ever sent as
+/// `AdminActionError`. Not fatal.
+pub const NO_SUCH_USER: u32 = 0x18;
 
 /// All codes defined by v1, in ascending order.
 pub const ALL_CODES: &[u32] = &[
@@ -69,6 +79,9 @@ pub const ALL_CODES: &[u32] = &[
     RENEW_REJECTED,
     ENROLL_BOOTSTRAP_CLOSED,
     NOT_ADMIN,
+    LAST_ADMIN,
+    AUTH_DISABLED,
+    NO_SUCH_USER,
 ];
 
 /// Fatal codes (`PROTOCOL.md` §5/§6): the client must not reconnect.
@@ -88,6 +101,7 @@ pub fn is_fatal(code: u32) -> bool {
             | ENROLL_BAD_CSR
             | ENROLL_RATE_LIMITED
             | ENROLL_BOOTSTRAP_CLOSED
+            | AUTH_DISABLED
     )
 }
 
@@ -114,6 +128,9 @@ pub fn name(code: u32) -> &'static str {
         RENEW_REJECTED => "RENEW_REJECTED",
         ENROLL_BOOTSTRAP_CLOSED => "ENROLL_BOOTSTRAP_CLOSED",
         NOT_ADMIN => "NOT_ADMIN",
+        LAST_ADMIN => "LAST_ADMIN",
+        AUTH_DISABLED => "AUTH_DISABLED",
+        NO_SUCH_USER => "NO_SUCH_USER",
         _ => "UNKNOWN",
     }
 }
@@ -136,6 +153,7 @@ mod tests {
             ENROLL_BAD_CSR,
             ENROLL_RATE_LIMITED,
             ENROLL_BOOTSTRAP_CLOSED,
+            AUTH_DISABLED,
         ];
         for code in ALL_CODES {
             assert_eq!(

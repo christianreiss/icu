@@ -83,10 +83,60 @@ async fn an_unknown_certificate_from_our_own_ca_is_auth_unknown_cert() {
 
 #[tokio::test]
 async fn revoke_during_a_connection_kicks_with_kicked() {
+    // alice is the sole bootstrap admin, and the last-admin guard forbids
+    // revoking her (`store::guard_last_admin`); bob, the second, non-admin
+    // enrollee, exercises the same revoke+kick mechanics without tripping it.
     let server = TestServer::start().await;
-    let alice = server.client("alice").await;
-    let mut bob = server.client("bob").await;
+    let mut alice = server.client("alice").await;
+    let bob = server.client("bob").await;
     assert_eq!(bob.session, 2, "bob joined after alice");
+
+    let response = server
+        .handle
+        .admin(AdminRequest::Revoke {
+            user: "bob".into(),
+        })
+        .await;
+    match response {
+        AdminResponse::Revoke { user_id, closed } => {
+            assert_eq!(user_id, 2);
+            assert_eq!(closed, 1, "the live connection is closed immediately");
+        }
+        other => panic!("revoke failed: {other:?}"),
+    }
+
+    assert_eq!(bob.closed_code().await, Some(ec::KICKED));
+
+    let left = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserLeft { .. }))
+        .await;
+    assert!(matches!(
+        left,
+        Some(ControlMsg::UserLeft { session: 2, .. })
+    ));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_revoked_certificate_cannot_reconnect() {
+    let server = TestServer::start().await;
+    server.enroll("alice").await; // sole bootstrap admin, kept untouched
+    let identity = server.enroll("bob").await;
+    server
+        .handle
+        .admin(AdminRequest::Revoke {
+            user: "bob".into(),
+        })
+        .await;
+    let client = server.connect(&identity).await.expect("connect");
+    assert_eq!(client.closed_code().await, Some(ec::AUTH_REVOKED));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn revoking_the_sole_admin_is_rejected_with_last_admin() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await; // sole bootstrap admin
 
     let response = server
         .handle
@@ -95,37 +145,90 @@ async fn revoke_during_a_connection_kicks_with_kicked() {
         })
         .await;
     match response {
-        AdminResponse::Revoke { user_id, closed } => {
-            assert_eq!(user_id, 1);
-            assert_eq!(closed, 1, "the live connection is closed immediately");
-        }
-        other => panic!("revoke failed: {other:?}"),
+        AdminResponse::Error { error, .. } => assert_eq!(error, "LAST_ADMIN"),
+        other => panic!("expected LAST_ADMIN, got {other:?}"),
     }
 
-    assert_eq!(alice.closed_code().await, Some(ec::KICKED));
+    // The connection was never touched by the rejected admin action.
+    alice.send_msg(&ControlMsg::Ping { nonce: 42 }).await;
+    let pong = alice.recv_msg().await;
+    assert!(matches!(pong, ControlMsg::Pong { nonce: 42, .. }));
+    server.shutdown().await;
+}
 
-    let left = bob
+#[tokio::test]
+async fn a_disabled_user_cannot_reconnect_with_auth_disabled() {
+    let server = TestServer::start().await;
+    server.enroll("alice").await; // sole bootstrap admin, kept untouched
+    let identity = server.enroll("bob").await;
+
+    let response = server
+        .handle
+        .admin(AdminRequest::Disable {
+            user: "bob".into(),
+        })
+        .await;
+    assert!(matches!(response, AdminResponse::Disable { closed: 0, .. }));
+
+    let client = server.connect(&identity).await.expect("connect");
+    assert_eq!(client.closed_code().await, Some(ec::AUTH_DISABLED));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn disabling_an_online_user_kicks_immediately() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let bob = server.client("bob").await;
+
+    let response = server
+        .handle
+        .admin(AdminRequest::Disable {
+            user: "bob".into(),
+        })
+        .await;
+    match response {
+        AdminResponse::Disable { user_id, closed } => {
+            assert_eq!(user_id, 2);
+            assert_eq!(closed, 1, "the live connection is closed immediately");
+        }
+        other => panic!("disable failed: {other:?}"),
+    }
+
+    assert_eq!(bob.closed_code().await, Some(ec::AUTH_DISABLED));
+
+    let left = alice
         .recv_matching(|m| matches!(m, ControlMsg::UserLeft { .. }))
         .await;
     assert!(matches!(
         left,
-        Some(ControlMsg::UserLeft { session: 1, .. })
+        Some(ControlMsg::UserLeft { session: 2, .. })
     ));
     server.shutdown().await;
 }
 
 #[tokio::test]
-async fn a_revoked_certificate_cannot_reconnect() {
+async fn enabling_restores_login_without_reenrollment() {
     let server = TestServer::start().await;
-    let identity = server.enroll("alice").await;
+    server.enroll("alice").await; // sole bootstrap admin, kept untouched
+    let identity = server.enroll("bob").await;
+
     server
         .handle
-        .admin(AdminRequest::Revoke {
-            user: "alice".into(),
+        .admin(AdminRequest::Disable {
+            user: "bob".into(),
         })
         .await;
-    let client = server.connect(&identity).await.expect("connect");
-    assert_eq!(client.closed_code().await, Some(ec::AUTH_REVOKED));
+    server
+        .handle
+        .admin(AdminRequest::Enable {
+            user: "bob".into(),
+        })
+        .await;
+
+    let mut client = server.connect(&identity).await.expect("connect");
+    let welcome = client.hello("bob").await;
+    assert!(matches!(welcome, ControlMsg::Welcome { .. }));
     server.shutdown().await;
 }
 

@@ -71,8 +71,20 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | 16 | `VideoCongestionHint` | S→C | `drop_permille: u16` | Server leitet das Maximum der pro Empfänger gemessenen Slot-Verdrängungsrate (`Server/IMPLEMENTATION.md` §6.5) für diesen Sprecher weiter, gemessen über die letzten 2 s (`icu_proto::limits::VIDEO_CONGESTION_WINDOW_S`), nur wenn sich der Wert um ≥ 20 ‰ ändert (`VIDEO_CONGESTION_HINT_STEP_PERMILLE`). Mirror von `LossHint`s Maximum-Regel, aber für Video statt Audio. Der Client speist den Wert in die Qualitäts-Ladder (`Client/IMPLEMENTATION.md` §8): Video trägt die gesamte Anpassung, Audio-Bitrate bleibt unangetastet. |
 | 17 | `CreateInviteRequest` | C→S | `name: Name`, `ttl_s: u64` (`0` = Server-Default `limits::INVITE_TTL_S`) | Nur Admins (`Welcome.is_admin`); sonst `Error { code: NOT_ADMIN }`, nicht-fatal, Verbindung bleibt. Siehe §2.3.1. |
 | 18 | `CreateInviteResponse` | S→C | `blob: String` (`ICU1-…`), `expires: String` (RFC 3339 UTC) | Antwort auf `CreateInviteRequest`. |
+| 19 | `AdminSetRole` | C→S | `user_id: UserId`, `is_admin: bool` | Nur Admins, sonst `AdminActionError { code: NOT_ADMIN }`; bei letztem funktionsfähigen Admin `AdminActionError { code: LAST_ADMIN }`. Nicht-fatal in beiden Fällen. |
+| 20 | `AdminSetRoleOk` | S→C | `user_id: UserId`, `is_admin: bool` | Bestätigung an den ausführenden Admin. |
+| 21 | `UserAdminChanged` | S→C | `is_admin: bool` | **Unicast** an alle eigenen Sitzungen des betroffenen Nutzers (kein Broadcast, kein `session`-Feld nötig): eigener `is_admin`-Stand aktualisiert sich live, ohne Reconnect. |
+| 22 | `AdminSetDisabled` | C→S | `user_id: UserId`, `disabled: bool` | Reversible Login-Sperre, unabhängig von Zertifikatswiderruf. Gleiche Ablehnung wie `AdminSetRole`. Wird ein Online-Nutzer deaktiviert, kickt der Server ihn sofort mit `AUTH_DISABLED` — das Schließen der Verbindung ist die einzige Benachrichtigung, kein separater Push. |
+| 23 | `AdminSetDisabledOk` | S→C | `user_id: UserId`, `disabled: bool` | Bestätigung an den ausführenden Admin. |
+| 24 | `AdminRevokeUser` | C→S | `user_id: UserId` | Widerruft alle Zertifikate von `user_id` und kickt jede laufende Verbindung mit `KICKED`. Gleiche Ablehnung wie `AdminSetRole`. |
+| 25 | `AdminRevokeUserOk` | S→C | `user_id: UserId`, `closed: u32` | Bestätigung an den ausführenden Admin, mit Anzahl geschlossener Verbindungen. |
+| 26 | `UserListRequest` | C→S | – | Nur Admins, sonst `AdminActionError { code: NOT_ADMIN }`. |
+| 27 | `UserListResponse` | S→C | `users: Vec<UserSummary>` | Jeder registrierte Nutzer, online oder nicht. `UserSummary { user_id, name, created, is_admin, disabled, revoked, online }`. Größe durch `MAX_CONTROL_FRAME` begrenzt (§7): ~230 Nutzer passen in einen Frame, keine Paginierung gebaut. |
+| 28 | `AdminActionError` | S→C | `user_id: UserId`, `code: u32`, `detail: String` | Ablehnung von Variante 19/22/24/26. `user_id = 0` bei einem `UserListRequest`-Fehler, da kein einzelnes Ziel benannt ist. Eigene Variante statt der generischen `Error`, damit `NOT_ADMIN` nicht zwischen Einladung und Nutzerverwaltung mehrdeutig wird. |
 
-Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline ist `minor = 1`; ein Minor 0 existiert nicht, und alle 19 Varianten sind in v1 Pflicht. Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
+Varianten 19–28 sind die ersten C→S-Nachrichten, bei denen der sendende Client eine **andere** `user_id` benennt als seine eigene.
+
+Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline ist `minor = 1`; ein Minor 0 existiert nicht, und alle 29 Varianten sind in v1 Pflicht (Varianten 19–28 wie zuvor `VideoCongestionHint`: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
 ### 2.3 Enrollment `EnrollMsg` (nur ALPN `icu-enroll/1`)
 
@@ -197,6 +209,9 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | 0x13 | `RENEW_REJECTED` | nein | Renewal-CSR abgelehnt |
 | 0x14 | `ENROLL_BOOTSTRAP_CLOSED` | ja | Leeres Token (Bootstrap), aber `users.toml` hat schon mindestens einen Eintrag |
 | 0x15 | `NOT_ADMIN` | nein | `CreateInviteRequest` von einem Nicht-Admin; nur als `Error`, nie als Close |
+| 0x16 | `LAST_ADMIN` | nein | Admin-Aktion würde den letzten funktionsfähigen Admin entfernen (Demote/Disable/Revoke); nur als `AdminActionError`, nie als Close |
+| 0x17 | `AUTH_DISABLED` | ja | Nutzer ist deaktiviert (`UserRecord.disabled`); geprüft beim Handshake, auch der Close-Code beim sofortigen Kick eines Online-Nutzers durch `AdminSetDisabled` |
+| 0x18 | `NO_SUCH_USER` | nein | Admin-Aktion nennt eine unbekannte `user_id`; nur als `AdminActionError`, nie als Close |
 
 ## 7. Limits (Server erzwingt)
 

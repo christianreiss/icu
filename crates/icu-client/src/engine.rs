@@ -153,6 +153,13 @@ pub struct AppState {
     pub last_invite: Option<(String, String)>,
     /// `CreateInviteRequest` error.
     pub invite_error: Option<String>,
+    /// Every registered user, from the last `UserListResponse`, for the
+    /// Nutzer tab. Empty until the tab has requested it at least once.
+    pub user_list: Vec<icu_proto::UserSummary>,
+    /// Rejection of the most recent user-manager action (promote/demote/
+    /// disable/enable/revoke) — kept separate from `invite_error` so the two
+    /// admin features never clobber each other's error slot.
+    pub user_action_error: Option<String>,
     /// Devices.
     pub devices: Vec<DeviceInfo>,
     /// Backend name.
@@ -200,6 +207,27 @@ pub enum Command {
         /// Lifetime in seconds. `0` means the server default.
         ttl_s: u64,
     },
+    /// Promote/demote another user. Admin only.
+    SetUserAdmin {
+        /// The user whose role changes.
+        user_id: UserId,
+        /// The new role.
+        is_admin: bool,
+    },
+    /// Disable/enable another user. Admin only.
+    SetUserDisabled {
+        /// The affected user.
+        user_id: UserId,
+        /// The new disabled state.
+        disabled: bool,
+    },
+    /// Revoke another user's certificates and kick them. Admin only.
+    RevokeUser {
+        /// The affected user.
+        user_id: UserId,
+    },
+    /// Refresh the full user list for the Nutzer tab. Admin only.
+    RequestUserList,
     /// Replace the settings (device change, thresholds, …); effective at once.
     UpdateSettings(Box<Settings>),
     /// Camera on/off.
@@ -432,6 +460,8 @@ impl Engine {
             is_admin: false,
             last_invite: None,
             invite_error: None,
+            user_list: Vec::new(),
+            user_action_error: None,
             devices: backend.devices(),
             backend: backend_name,
             aec_available: false,
@@ -1368,7 +1398,13 @@ impl LocalState {
             Command::HotkeyBackend(name) => {
                 shared.state.send_modify(|s| s.hotkey_backend = name);
             }
-            Command::SetName(_) | Command::CreateInvite { .. } | Command::Quit => {}
+            Command::SetName(_)
+            | Command::CreateInvite { .. }
+            | Command::SetUserAdmin { .. }
+            | Command::SetUserDisabled { .. }
+            | Command::RevokeUser { .. }
+            | Command::RequestUserList
+            | Command::Quit => {}
         }
         set_state
     }
@@ -1572,6 +1608,26 @@ async fn run_session(
                         if let Err(e) = icu_proto::validate_name(&name) {
                             shared.state.send_modify(|s| s.invite_error = Some(e.to_string()));
                         } else if conn::write_msg(&mut send, &ControlMsg::CreateInviteRequest { name, ttl_s }).await.is_err() {
+                            break SessionEnd::Retry("send failed".into());
+                        }
+                    }
+                    Command::SetUserAdmin { user_id, is_admin } => {
+                        if conn::write_msg(&mut send, &ControlMsg::AdminSetRole { user_id, is_admin }).await.is_err() {
+                            break SessionEnd::Retry("send failed".into());
+                        }
+                    }
+                    Command::SetUserDisabled { user_id, disabled } => {
+                        if conn::write_msg(&mut send, &ControlMsg::AdminSetDisabled { user_id, disabled }).await.is_err() {
+                            break SessionEnd::Retry("send failed".into());
+                        }
+                    }
+                    Command::RevokeUser { user_id } => {
+                        if conn::write_msg(&mut send, &ControlMsg::AdminRevokeUser { user_id }).await.is_err() {
+                            break SessionEnd::Retry("send failed".into());
+                        }
+                    }
+                    Command::RequestUserList => {
+                        if conn::write_msg(&mut send, &ControlMsg::UserListRequest).await.is_err() {
                             break SessionEnd::Retry("send failed".into());
                         }
                     }
@@ -1933,6 +1989,29 @@ async fn handle_control(
                 s.invite_error = None;
             });
         }
+        ControlMsg::AdminSetRoleOk { .. }
+        | ControlMsg::AdminSetDisabledOk { .. }
+        | ControlMsg::AdminRevokeUserOk { .. } => {
+            // Acks don't carry the full row; the Nutzer tab re-issues
+            // RequestUserList right after sending an action, so this just
+            // confirms no error banner is needed while that refresh lands.
+            shared.state.send_modify(|s| s.user_action_error = None);
+        }
+        ControlMsg::UserListResponse { users } => {
+            shared.state.send_modify(|s| s.user_list = users);
+        }
+        ControlMsg::AdminActionError { detail, .. } => {
+            shared.state.send_modify(|s| s.user_action_error = Some(detail));
+        }
+        ControlMsg::UserAdminChanged { is_admin } => {
+            shared.state.send_modify(|s| {
+                s.is_admin = is_admin;
+                if !is_admin {
+                    s.user_list.clear();
+                    s.user_action_error = None;
+                }
+            });
+        }
         ControlMsg::Welcome { .. } => {
             return Some(SessionEnd::Fatal("second Welcome".into()));
         }
@@ -1942,7 +2021,11 @@ async fn handle_control(
         | ControlMsg::RenewRequest { .. }
         | ControlMsg::LossReport { .. }
         | ControlMsg::SetName { .. }
-        | ControlMsg::CreateInviteRequest { .. } => {
+        | ControlMsg::CreateInviteRequest { .. }
+        | ControlMsg::AdminSetRole { .. }
+        | ControlMsg::AdminSetDisabled { .. }
+        | ControlMsg::AdminRevokeUser { .. }
+        | ControlMsg::UserListRequest => {
             return Some(SessionEnd::Fatal(format!(
                 "server sent client message {}",
                 msg.variant()

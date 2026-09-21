@@ -73,7 +73,7 @@ format = "text"                      # oder "json"
 
 State unter `/var/lib/icu/`: `ca.key` (0600), `ca.crt`, `invite.key` (0600), `server.key` (0600), `server.crt`, `users.toml`, `invites.toml`, `state.lock`. Alle Schreibzugriffe atomar (Tempfile + rename) und unter `flock(state.lock)`.
 
-Nutzermodell: ein Nutzer hat eine stabile `user_id` und über die Zeit **mehrere** Zertifikate (Renewal stellt ein neues aus, das alte bleibt bis zum Ablauf gültig). `revoke` setzt `revoked` auf allen Certs des Nutzers. `is_admin` erlaubt `CreateInviteRequest` (`PROTOCOL.md` §2.2/§2.3.1); gesetzt wird es einmalig bei der ersten Anmeldung, die gegen einen leeren `users.toml`-Bestand erfolgreich abschließt (§6.3), danach nur noch manuell — `is_admin` fehlt in älteren `users.toml`-Dateien und deserialisiert dann als `false` (`#[serde(default)]`), keine Migration nötig.
+Nutzermodell: ein Nutzer hat eine stabile `user_id` und über die Zeit **mehrere** Zertifikate (Renewal stellt ein neues aus, das alte bleibt bis zum Ablauf gültig). `revoke` setzt `revoked` auf allen Certs des Nutzers — dauerhaft, kein Un-Revoke. `is_admin` erlaubt `CreateInviteRequest` und die Nutzerverwaltung (`PROTOCOL.md` §2.2/§2.3.1); gesetzt wird es einmalig bei der ersten Anmeldung, die gegen einen leeren `users.toml`-Bestand erfolgreich abschließt (§6.3), danach über `promote`/`demote` (CLI, Admin-Socket) oder `AdminSetRole` (in-band, `PROTOCOL.md` §2.2 Variante 19) — `is_admin` fehlt in älteren `users.toml`-Dateien und deserialisiert dann als `false` (`#[serde(default)]`), keine Migration nötig. `disabled` ist eine zweite, unabhängige und **reversible** Login-Sperre (`disable`/`enable`, `AdminSetDisabled`): anders als `revoke` macht `enable` bestehende, nicht widerrufene Zertifikate sofort wieder nutzbar, keine erneute Anmeldung nötig; auch hier `#[serde(default)]`, keine Migration nötig. Beide Aktionen sind gegen das Entfernen des letzten funktionsfähigen Admins geschützt (§6.4).
 
 `users.toml`:
 
@@ -85,6 +85,7 @@ next_user_id = 3
 name = "alice"
 created = "2026-09-20T12:00:00Z"
 is_admin = true
+disabled = false
 
 [[user.1.cert]]
 fingerprint = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"  # SHA-256(Leaf-DER), lowercase hex
@@ -116,6 +117,10 @@ Zeitstempel durchgehend RFC 3339 in UTC; Fingerprints lowercase Hex ohne Trenner
 | `icu-server users` | Tabelle: `user_id`, Name, Fingerprint (gekürzt), ausgestellt, läuft ab, revoked, online. |
 | `icu-server revoke <name\|user_id\|fingerprint>` | `revoked = true` auf **allen** Certs des Nutzers; eine laufende Verbindung wird sofort mit `KICKED` geschlossen. |
 | `icu-server rename <name\|user_id> <new>` | Anzeigename ändern. Kollidiert `<new>` case-insensitive mit einem bestehenden Namen, bricht die CLI mit Fehler ab und ändert nichts. Broadcast `UserRenamed`, wenn der Nutzer online ist. |
+| `icu-server promote <name\|user_id\|fingerprint>` | `is_admin = true`. Pusht `UserAdminChanged { is_admin: true }` an jede eigene Sitzung des Nutzers, wenn online. |
+| `icu-server demote <name\|user_id\|fingerprint>` | `is_admin = false`. Abgelehnt mit `LAST_ADMIN`, wenn der Nutzer der letzte funktionsfähige Admin ist. Sonst wie `promote`, mit `is_admin: false`. |
+| `icu-server disable <name\|user_id\|fingerprint>` | `disabled = true`; eine laufende Verbindung wird sofort mit `AUTH_DISABLED` geschlossen. Abgelehnt mit `LAST_ADMIN`, wenn der Nutzer der letzte funktionsfähige Admin ist. |
+| `icu-server enable <name\|user_id\|fingerprint>` | `disabled = false`; bestehende, nicht widerrufene Zertifikate sind sofort wieder gültig. |
 | `icu-server status` | Online-Liste, Uptime, Relay-Zähler. |
 | `icu-server rotate-server-cert` | Neues Server-Leaf von derselben CA; Clients brauchen nichts. |
 
@@ -129,8 +134,12 @@ Admin-Socket: `/run/icu/admin.sock` (`RuntimeDirectory=icu`, `RuntimeDirectoryMo
 | --- | --- | --- |
 | invite | `{"cmd":"invite","name":"bob","ttl_s":86400}` | `{"ok":true,"token":"k3nP…","link":"icu://…","expires":"2026-09-21T12:00:00Z"}` |
 | users | `{"cmd":"users"}` | `{"ok":true,"users":[{"user_id":1,"name":"alice","fingerprint":"9f86d0…","expires":"…","revoked":false,"online":true,"is_admin":true}]}` |
-| revoke | `{"cmd":"revoke","user":"alice"}` | `{"ok":true,"user_id":1,"closed":1}` |
+| revoke | `{"cmd":"revoke","user":"alice"}` | `{"ok":true,"user_id":1,"closed":1}` bzw. `{"ok":false,"error":"LAST_ADMIN"}` |
 | rename | `{"cmd":"rename","user":"alice","new":"alice2"}` | `{"ok":true}` bzw. `{"ok":false,"error":"NAME_TAKEN"}` |
+| promote | `{"cmd":"promote","user":"bob"}` | `{"ok":true}` |
+| demote | `{"cmd":"demote","user":"bob"}` | `{"ok":true}` bzw. `{"ok":false,"error":"LAST_ADMIN"}` |
+| disable | `{"cmd":"disable","user":"bob"}` | `{"ok":true,"user_id":2,"closed":1}` bzw. `{"ok":false,"error":"LAST_ADMIN"}` |
+| enable | `{"cmd":"enable","user":"bob"}` | `{"ok":true}` |
 | status | `{"cmd":"status"}` | `{"ok":true,"uptime_s":3600,"online":3,"relay":{"datagrams_in":…,"datagrams_out":…,"dropped":{…}}}` |
 
 Fehlerform einheitlich `{"ok":false,"error":"<kurzform>","detail":"<text>"}`.
@@ -182,7 +191,7 @@ Fehlerpfad einheitlich (`PROTOCOL.md` §2.3): erst `EnrollMsg::Error { code, det
 
 ### 6.4 Session (`session.rs`)
 
-1. `peer_identity()` → `None` → `close(AUTH_REQUIRED)`. Sonst Leaf-DER → SHA-256 → `users.toml`: unbekannt → `AUTH_UNKNOWN_CERT`, revoked → `AUTH_REVOKED`. (rustls hat Kette und Ablauf schon geprüft.)
+1. `peer_identity()` → `None` → `close(AUTH_REQUIRED)`. Sonst Leaf-DER → SHA-256 → `users.toml`: unbekannt → `AUTH_UNKNOWN_CERT`, revoked → `AUTH_REVOKED`, `disabled` → `AUTH_DISABLED`. (rustls hat Kette und Ablauf schon geprüft.)
 2. `accept_bi()` und erstes Frame binnen 5 s, sonst `HELLO_TIMEOUT`. Muss `Hello` sein. `minor` aushandeln (`min(client, server)`, nicht bedienbar → `VERSION_UNSUPPORTED`). `Hello.name` wird **nur** übernommen, wenn zu dieser `user_id` noch kein Name gespeichert ist; sonst ignoriert (`PROTOCOL.md` §2.2).
 3. Ist der Raum voll (`room.len() >= max_users`), `close(SERVER_FULL)`. Sonst `room.join()` → Session-ID (monoton, nie wiederverwendet), `Welcome { you: UserInfo{user_id, session, name, flags}, users, audio, min_client, minor, caps, is_admin }` senden (`is_admin` aus `store.is_admin(user_id)`, unter derselben Sperre wie `set_initial_name` gelesen), `UserJoined` an alle anderen.
 4. Zwei Tasks pro Client: (a) Control-Reader (Frames → `ControlMsg` → Handler), (b) Datagram-Reader (`read_datagram` → `relay::audio`). Video: `accept_uni` in einem dritten Task → `relay::video`.
@@ -200,7 +209,13 @@ Fehlerpfad einheitlich (`PROTOCOL.md` §2.3): erst `EnrollMsg::Error { code, det
 | `KeyframeRequest` | an den Sprecher weiterleiten, siehe §6.5. |
 | `RenewRequest` | CSR wie §6.3.3 prüfen und signieren (Subject CN und `user_id` aus dem bestehenden Eintrag, nicht aus der CSR), neuen Cert-Eintrag zu **demselben** Nutzer in `users.toml` anhängen; das alte Cert bleibt bis zu seinem `expires` gültig. `RenewResponse { leaf_der }`. Rate ≤ 1/Tag pro `user_id`, sonst `Error(RENEW_REJECTED)`; ungültige CSR ebenfalls `Error(RENEW_REJECTED)`. |
 | `CreateInviteRequest` | Nur wenn `store.is_admin(user_id)`, sonst `Error(NOT_ADMIN)` und nichts weiter. Sonst `store.create_invite` (unverändert) aufrufen, das Ergebnis als `InviteBlob` mit `invite_key.seal()` versiegeln (`PROTOCOL.md` §2.3.1) und als `CreateInviteResponse { blob, expires }` zurücksenden. |
+| `AdminSetRole` | Nur wenn `store.is_admin(user_id)` (live geprüft), sonst `AdminActionError(NOT_ADMIN)`. Sonst `store.set_admin(target, is_admin)`; bei `LAST_ADMIN` `AdminActionError(LAST_ADMIN)`. Bei Erfolg `AdminSetRoleOk` an den Absender und `UserAdminChanged { is_admin }` unicast an jede eigene Sitzung des Ziels (live, ohne Reconnect). |
+| `AdminSetDisabled` | Wie `AdminSetRole`, aber `store.set_disabled(target, disabled)`. Wird dabei deaktiviert, kickt der Server jede laufende Verbindung des Ziels sofort mit `AUTH_DISABLED` (`session::kick_user`) — kein separater Push, das Schließen ist die Benachrichtigung. `AdminSetDisabledOk` an den Absender. |
+| `AdminRevokeUser` | Wie `AdminSetRole`, aber `store.revoke(target)` und `session::kick_user(target, KICKED)`. `AdminRevokeUserOk { user_id, closed }` an den Absender. |
+| `UserListRequest` | Nur wenn `store.is_admin(user_id)`, sonst `AdminActionError(NOT_ADMIN)`. Sonst jeden registrierten Nutzer (online oder nicht) als `UserSummary` sammeln (`online` über `room.sessions_of_user`) und als `UserListResponse { users }` zurücksenden. |
 | unbekannte Variante / Decode-Fehler | `close(PROTOCOL_VIOLATION)`. |
+
+**Letzter-Admin-Schutz** (`store::guard_last_admin`, gilt für `set_admin(_, false)`, `set_disabled(_, true)` und `revoke`, über alle drei Pfade — in-band, Admin-Socket, CLI-Offline-Fallback — identisch, da eine einzige Store-Methode): ein Nutzer zählt als *funktionsfähiger Admin*, wenn `is_admin && !disabled && mindestens ein Cert nicht revoked`. Die Aktion wird nur abgelehnt, wenn ihr Ziel aktuell funktionsfähiger Admin ist **und** danach kein funktionsfähiger Admin mehr übrig wäre — ein bereits deaktivierter oder vollständig revoked Admin zählt nicht mehr mit und blockiert daher nichts.
 
 ### 6.5 Relay (`relay.rs`)
 

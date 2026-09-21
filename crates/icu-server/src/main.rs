@@ -48,6 +48,26 @@ enum Command {
         /// The new name.
         new: String,
     },
+    /// Grant admin rights.
+    Promote {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Revoke admin rights. Rejected if `user` is the sole remaining admin.
+    Demote {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Reversibly block login without touching certificates.
+    Disable {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Restore login after `disable`.
+    Enable {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
     /// Show uptime, online users and relay counters.
     Status {
         /// Print raw JSON, for a Checkmk local check.
@@ -94,6 +114,10 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Users { json } => cli::users::run(&config, json).await,
         Command::Revoke { user } => cli::revoke::run(&config, &user).await,
         Command::Rename { user, new } => cli::rename::run(&config, &user, &new).await,
+        Command::Promote { user } => cli::promote::run(&config, &user).await,
+        Command::Demote { user } => cli::demote::run(&config, &user).await,
+        Command::Disable { user } => cli::disable::run(&config, &user).await,
+        Command::Enable { user } => cli::enable::run(&config, &user).await,
         Command::Status { json } => cli::status::run(&config, json).await,
         Command::RotateServerCert => {
             let value = cli::dispatch(&config, AdminRequest::RotateServerCert).await?;
