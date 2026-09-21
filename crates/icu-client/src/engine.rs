@@ -1488,6 +1488,7 @@ async fn run_session(
             })
             .collect();
         let me = welcome.you.clone();
+        tracing::info!(peers = peers.len(), "welcome: initial peer list");
         shared.state.send_modify(|s| {
             s.conn = ConnStatus::Connected;
             s.me = Some(me);
@@ -1809,6 +1810,7 @@ async fn handle_control(
                     info: user,
                     volume,
                 });
+                tracing::info!(peers = s.peers.len(), "user joined: peer list updated");
             });
         }
         ControlMsg::UserLeft { session, .. } => {
