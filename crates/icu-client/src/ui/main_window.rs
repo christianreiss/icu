@@ -228,6 +228,9 @@ impl eframe::App for App {
         if self.settings.is_some() {
             let mut still_open = true;
             let mut cmds = Vec::new();
+            // Plain local, not a `self` field — read/write freely inside the
+            // closure with no borrow conflict against `self.settings`.
+            let mut debug_open = self.debug_window_open;
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("icu-settings"),
                 egui::ViewportBuilder::default()
@@ -238,7 +241,9 @@ impl eframe::App for App {
                 |vctx, _class| {
                     egui::CentralPanel::default().show(vctx, |ui| {
                         let view = self.settings.as_mut().expect("checked above");
+                        view.debug_window_open = debug_open;
                         cmds = view.ui(ui, &state);
+                        debug_open = view.debug_window_open;
                     });
                     if vctx.input(|i| i.viewport().close_requested()) {
                         still_open = false;
@@ -254,33 +259,50 @@ impl eframe::App for App {
             if !still_open {
                 self.settings = None;
             }
+            if debug_open != self.debug_window_open {
+                self.debug_window_open = debug_open;
+                if self.debug_window_open {
+                    self.stats_text = self.stats.report();
+                    self.last_stats = Instant::now();
+                }
+            }
         }
 
         egui::Panel::top("status").show(root, |ui| {
             let tok = theme::tokens(ui.visuals());
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                let (badge, _) =
-                    ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-                ui.painter().rect_filled(badge, 8, tok.accent_tint_2);
-                ui.painter().rect_stroke(
-                    badge,
-                    8,
-                    egui::Stroke::new(1.0, tok.accent.gamma_multiply(0.33)),
-                    egui::StrokeKind::Inside,
-                );
-                ui.painter().text(
-                    badge.center(),
-                    egui::Align2::CENTER_CENTER,
-                    icon::WAVEFORM,
-                    egui::FontId::new(17.0, egui::FontFamily::Proportional),
-                    tok.accent,
-                );
+            // One row, one explicit height, everything centered on a shared
+            // baseline — `allocate_ui_with_layout` with an explicit height,
+            // not `with_layout`: the latter claims the parent's *entire*
+            // remaining height, and `Align::Center` then centers the
+            // content inside that tall rect, which balloons the row's
+            // `min_rect` and pushes everything after it off-screen.
+            const ROW: f32 = 32.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), ROW),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    // Same quiet, transparent-chip treatment as the gear
+                    // button below (no accent-tinted fill/border) so the
+                    // logo doesn't out-shout the rest of the row.
+                    let (badge, _) =
+                        ui.allocate_exact_size(egui::vec2(ROW, ROW), egui::Sense::hover());
+                    ui.painter().rect_filled(badge, 8, ui.visuals().faint_bg_color);
+                    ui.painter().text(
+                        badge.center(),
+                        egui::Align2::CENTER_CENTER,
+                        icon::WAVEFORM,
+                        egui::FontId::new(15.0, egui::FontFamily::Proportional),
+                        tok.accent,
+                    );
 
-                ui.vertical(|ui| {
-                    ui.label(theme::strong_text(&state.server_name).size(14.5));
+                    // One consistent body-weight/size for every text element
+                    // in the row (name, user, tier label) — only the status
+                    // pill's dot carries color, so state changes read as the
+                    // one meaningful signal rather than one voice among many.
+                    ui.label(RichText::new(&state.server_name));
                     if let Some(me) = &state.me {
-                        ui.label(RichText::new(&me.name).small().color(tok.muted_text));
+                        ui.label(RichText::new("·").color(tok.dim_text));
+                        ui.label(RichText::new(&me.name).color(tok.muted_text));
                     }
                     let (color, text) = match &state.conn {
                         ConnStatus::Connected => (tok.connected, "verbunden".to_string()),
@@ -291,88 +313,74 @@ impl eframe::App for App {
                         ),
                         ConnStatus::Fatal(reason) => (tok.error, format!("Fehler: {reason}")),
                     };
-                    let trailing = state.rtt_ms.map(|rtt| format!("{rtt:.0} ms"));
-                    widgets::status_pill(ui, color, &text, trailing.as_deref()).on_hover_text(
+                    // No RTT trailing value here — it's noise in the header;
+                    // still available in Settings → Über → Diagnose.
+                    widgets::status_pill(ui, color, &text, None).on_hover_text(
                         match &state.me {
                             Some(me) => format!("user_id {}", me.user_id),
                             None => String::new(),
                         },
                     );
-                });
 
-                // `allocate_ui_with_layout` with an explicit height, not
-                // `with_layout`: the latter claims the parent's *entire*
-                // remaining height, and `Align::Center` then centers the
-                // content inside that tall rect, which balloons the row's
-                // `min_rect` and pushes everything after it off-screen.
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 36.0),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let gear = egui::Button::new(RichText::new(icon::GEAR_FINE).size(16.0))
-                            .fill(if self.settings.is_some() {
-                                ui.visuals().faint_bg_color
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .corner_radius(egui::CornerRadius::same(9))
-                            .min_size(egui::vec2(36.0, 36.0));
-                        if ui.add(gear).on_hover_text("Einstellungen").clicked() {
-                            self.settings = match self.settings.take() {
-                                Some(_) => None,
-                                None => {
-                                    let paths = self
-                                        .engine
-                                        .lock()
-                                        .unwrap()
-                                        .as_ref()
-                                        .map(|e| e.paths())
-                                        .unwrap_or_else(|| Paths::new(None));
-                                    Some(SettingsView::new(
-                                        &state,
-                                        state.hotkey_backend.clone(),
-                                        self.stats.clone(),
-                                        paths,
-                                    ))
-                                }
-                            };
-                        }
+                    // Own outgoing video quality tier, set by
+                    // `crate::quality::QualityController`. Automatic, no
+                    // settings toggle (`Research/feature-freeze.md`'s bias
+                    // against exposing adaptive behavior as a dial) — but
+                    // shown, since a tier-down is visible to other people as
+                    // this client's video degrading. Kept in the left-to-right
+                    // flow (not the button group below) so its appearance
+                    // never shifts the gear button off its fixed right-edge
+                    // offset.
+                    let tier =
+                        VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8);
+                    let label = match tier {
+                        VideoTier::T0 => None,
+                        VideoTier::T4 => Some("Video pausiert (Netz)"),
+                        _ => Some("Video reduziert"),
+                    };
+                    if let Some(label) = label {
+                        ui.label(RichText::new(label).color(tok.connecting));
+                    }
 
-                        let bug = egui::Button::new(RichText::new(icon::BUG).size(16.0))
-                            .fill(if self.debug_window_open {
-                                ui.visuals().faint_bg_color
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .corner_radius(egui::CornerRadius::same(9))
-                            .min_size(egui::vec2(36.0, 36.0));
-                        if ui.add(bug).on_hover_text("Debug-Fenster").clicked() {
-                            self.debug_window_open = !self.debug_window_open;
-                            if self.debug_window_open {
-                                self.stats_text = self.stats.report();
-                                self.last_stats = Instant::now();
+                    // Debug window toggle lives in Settings → Über now, so
+                    // this is the only button left — a single, quiet gear.
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), ROW),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let gear =
+                                egui::Button::new(RichText::new(icon::GEAR_FINE).size(16.0))
+                                    .fill(if self.settings.is_some() {
+                                        ui.visuals().faint_bg_color
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .corner_radius(egui::CornerRadius::same(8))
+                                    .min_size(egui::vec2(ROW, ROW));
+                            if ui.add(gear).on_hover_text("Einstellungen").clicked() {
+                                self.settings = match self.settings.take() {
+                                    Some(_) => None,
+                                    None => {
+                                        let paths = self
+                                            .engine
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .map(|e| e.paths())
+                                            .unwrap_or_else(|| Paths::new(None));
+                                        Some(SettingsView::new(
+                                            &state,
+                                            state.hotkey_backend.clone(),
+                                            self.stats.clone(),
+                                            paths,
+                                        ))
+                                    }
+                                };
                             }
-                        }
-
-                        // Own outgoing video quality tier, set by
-                        // `crate::quality::QualityController`. Automatic, no
-                        // settings toggle (`Research/feature-freeze.md`'s bias
-                        // against exposing adaptive behavior as a dial) — but
-                        // shown, since a tier-down is visible to other people as
-                        // this client's video degrading.
-                        let tier =
-                            VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8);
-                        let label = match tier {
-                            VideoTier::T0 => None,
-                            VideoTier::T4 => Some("Video pausiert (Netz)"),
-                            _ => Some("Video reduziert"),
-                        };
-                        if let Some(label) = label {
-                            ui.label(RichText::new(label).small().color(tok.connecting));
-                        }
-                    },
-                );
-            });
+                        },
+                    );
+                },
+            );
 
             if let Some(min) = &state.update_required {
                 let no_action: Option<(&str, fn())> = None;
@@ -521,14 +529,27 @@ impl eframe::App for App {
 
             ui.add_space(6.0);
             ui.columns(4, |cols| {
-                if control_button(&mut cols[0], icon::MICROPHONE_SLASH, "Mute", state.muted) {
+                if control_button(&mut cols[0], icon::MICROPHONE_SLASH, "Mute", state.muted, false)
+                {
                     self.send(Command::SetMuted(!state.muted));
                 }
-                if control_button(&mut cols[1], icon::SPEAKER_SLASH, "Deafen", state.deafened) {
+                if control_button(
+                    &mut cols[1],
+                    icon::SPEAKER_SLASH,
+                    "Deafen",
+                    state.deafened,
+                    false,
+                ) {
                     self.send(Command::SetDeafened(!state.deafened));
                 }
                 #[cfg(feature = "camera")]
-                if control_button(&mut cols[2], icon::VIDEO_CAMERA, "Video", state.camera_on) {
+                if control_button(
+                    &mut cols[2],
+                    icon::VIDEO_CAMERA,
+                    "Video",
+                    state.camera_on,
+                    state.camera_on,
+                ) {
                     self.send(Command::SetCamera(!state.camera_on));
                 }
                 #[cfg(feature = "overlay")]
@@ -537,6 +558,7 @@ impl eframe::App for App {
                     icon::SQUARES_FOUR,
                     "Overlay",
                     state.overlay_on,
+                    false,
                 ) {
                     self.send(Command::SetOverlay(!state.overlay_on));
                 }
@@ -621,31 +643,6 @@ impl eframe::App for App {
                             );
                         });
                     }
-                    #[cfg(feature = "camera")]
-                    if let Some(camera) = self.camera.as_mut() {
-                        if state.camera_on && state.settings.camera.show_self_preview {
-                            ui.add_space(4.0);
-                            let tok = theme::tokens(ui.visuals());
-                            egui::Frame::new()
-                                .fill(ui.visuals().faint_bg_color)
-                                .stroke(egui::Stroke::new(
-                                    1.0,
-                                    ui.visuals().widgets.inactive.bg_stroke.color,
-                                ))
-                                .corner_radius(egui::CornerRadius::same(12))
-                                .inner_margin(6)
-                                .show(ui, |ui| {
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(ui.available_width(), 22.0),
-                                        egui::Layout::right_to_left(egui::Align::TOP),
-                                        |ui| {
-                                            widgets::status_pill(ui, tok.error, "LIVE", None);
-                                        },
-                                    );
-                                    camera.preview(ui);
-                                });
-                        }
-                    }
                 });
         });
     }
@@ -693,7 +690,18 @@ fn participant_subtitle(
 /// icon over label, active state tinted by role (error for mute/deafen,
 /// accent for camera/overlay — callers pass the right glyph and label, the
 /// active color follows from the glyph's role below).
-fn control_button(ui: &mut egui::Ui, glyph: &str, label: &str, active: bool) -> bool {
+/// `rec_dot`: draws a small pulsing red dot in the button's top-right corner
+/// (the outgoing-video "on air" indicator, replacing the old self-preview
+/// box). The whole window already repaints continuously
+/// (`ctx.request_repaint_after` in `App::ui`), so the pulse animates for
+/// free — no extra repaint request needed here.
+fn control_button(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    label: &str,
+    active: bool,
+    rec_dot: bool,
+) -> bool {
     let tok = theme::tokens(ui.visuals());
     let is_error_role = glyph == icon::MICROPHONE_SLASH || glyph == icon::SPEAKER_SLASH;
     let (accent, tint) = if is_error_role {
@@ -732,6 +740,13 @@ fn control_button(ui: &mut egui::Ui, glyph: &str, label: &str, active: bool) -> 
         egui::FontId::new(10.5, fonts::semibold()),
         text_color,
     );
+    if rec_dot {
+        let t = ui.input(|i| i.time);
+        let pulse = ((t * 2.4).sin() as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
+        let pos = egui::pos2(rect.right() - 12.0, rect.top() + 12.0);
+        painter.circle_filled(pos, 5.0 + pulse * 2.0, tok.error.gamma_multiply(0.18 + pulse * 0.12));
+        painter.circle_filled(pos, 3.5, tok.error);
+    }
     resp.clicked()
 }
 

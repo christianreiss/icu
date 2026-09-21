@@ -69,6 +69,10 @@ pub struct SettingsView {
     /// (in-row, no modal per §10), second click within it actually sends
     /// `Command::RevokeUser`.
     confirm_revoke: HashMap<UserId, Instant>,
+    /// Debug window open state, mirrored in/out by `main_window.rs` each
+    /// frame (the window itself is owned by `App`, not this view — moved
+    /// here from a top-bar button so it doesn't compete for header space).
+    pub debug_window_open: bool,
 }
 
 impl SettingsView {
@@ -96,6 +100,7 @@ impl SettingsView {
             diagnose: DiagnoseCache::default(),
             export_status: None,
             confirm_revoke: HashMap::new(),
+            debug_window_open: false,
         }
     }
 
@@ -350,9 +355,6 @@ impl SettingsView {
         widgets::group_card(ui, "Kamera", |ui| {
             widgets::setting_row(ui, false, "Beim Start einschalten", None, |ui| {
                 widgets::toggle(ui, &mut self.draft.camera.enabled)
-            });
-            widgets::setting_row(ui, true, "Eigene Vorschau anzeigen", None, |ui| {
-                widgets::toggle(ui, &mut self.draft.camera.show_self_preview)
             });
             let mut dev = self.draft.camera.device.clone().unwrap_or_default();
             widgets::setting_row(ui, true, "Gerät (Index)", None, |ui| {
@@ -668,6 +670,16 @@ impl SettingsView {
                         Ok(()) => format!("Geschrieben: {}", path.display()),
                         Err(e) => format!("Fehlgeschlagen: {e}"),
                     });
+                }
+                if ui
+                    .button(format!(
+                        "{} Debug-Fenster {}",
+                        icon::BUG,
+                        if self.debug_window_open { "schließen" } else { "öffnen" }
+                    ))
+                    .clicked()
+                {
+                    self.debug_window_open = !self.debug_window_open;
                 }
             });
             if let Some(status) = &self.export_status {
