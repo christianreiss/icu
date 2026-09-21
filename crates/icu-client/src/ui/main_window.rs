@@ -437,14 +437,18 @@ impl eframe::App for App {
                     egui::vec2(ui.available_width(), 46.0),
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                        let mut mode_choice = state.mode;
-                        if widgets::segmented(
-                            ui,
-                            &mut mode_choice,
-                            &[(Mode::Ptt, "PTT"), (Mode::Vad, "VAD")],
-                        )
-                        .changed()
-                        {
+                        // Push-to-toggle: one small button showing only the
+                        // current mode; each tap flips PTT<->VAD. Replaces
+                        // the old two-label segmented control to save width.
+                        let mode_label = match state.mode {
+                            Mode::Ptt => "PTT",
+                            Mode::Vad => "VAD",
+                        };
+                        let mode_btn = egui::Button::new(mode_label)
+                            .fill(ui.visuals().faint_bg_color)
+                            .corner_radius(egui::CornerRadius::same(11))
+                            .min_size(egui::vec2(0.0, 46.0));
+                        if ui.add(mode_btn).clicked() {
                             self.send(Command::ToggleMode);
                         }
                         let btn = egui::Button::new(RichText::new(label).color(text_color))
@@ -490,7 +494,7 @@ impl eframe::App for App {
                     self.send(Command::SetDeafened(!state.deafened));
                 }
                 #[cfg(feature = "camera")]
-                if control_button(&mut cols[2], icon::VIDEO_CAMERA, "Kamera", state.camera_on) {
+                if control_button(&mut cols[2], icon::VIDEO_CAMERA, "Video", state.camera_on) {
                     self.send(Command::SetCamera(!state.camera_on));
                 }
                 #[cfg(feature = "overlay")]
