@@ -149,8 +149,7 @@ Konfigurationsfestlegungen (aus den Befunden abgeleitet):
 
 - `max_datagram_size()` real messen: direkt nach Handshake (1200-MTU-Basis) und nach MTU-Discovery, über Linux→Linux und Windows→Linux; prüfen, ob `TooLarge` beim Relay an Peers mit kleinerer MTU auftritt.
 - Verhalten von `send_datagram` unter Congestion: werden wirklich die ältesten Frames verworfen, und wie groß muss `datagram_send_buffer_size`/`datagram_receive_buffer_size` sein, damit keine Latenz aufläuft?
-- Priorisierung: bevorzugt quinn beim Packen ausgehender Pakete DATAGRAM-Frames gegenüber Stream-Daten (Video)? Unbelegt in der Doku; messen (Audio-Jitter bei laufendem Video-Stream).
-- Shared Congestion Controller: Video-Streams drosseln Audio-Datagrams? Messen mit künstlichem Paketverlust.
+- Shared Congestion Controller: Video-Streams drosseln Audio-Datagrams über ein gesättigtes `cwnd`? Priorisierung auf Paket-Ebene ist kein Schutz davor (siehe unten) — messen mit künstlichem Paketverlust/`tc netem` (`Client/IMPLEMENTATION.md` §8).
 - Idle/Keepalive: bestätigen, dass 15 s Keepalive NAT-Mappings über typische Consumer-Router hält; Reconnect-Zeit nach Rebinding messen (Migration).
 - `peer_identity()` bei Verbindungen mit `allow_unauthenticated()` und ohne Client-Cert: `None` oder leerer Vec? (relevant für Enrollment-Verbindung).
 - Handshake-Größe/-Dauer mit `prefer-post-quantum` (rustls-Default) vs. ohne; Initial-Paket-Anzahl bei Client-Cert + CA-Chain.
@@ -164,7 +163,8 @@ Konfigurationsfestlegungen (aus den Befunden abgeleitet):
   - Spike 2 **Falle**: `connect().await` liefert auf Client-Seite `Ok`, bevor der Server das fehlende Client-Cert ablehnt; die Verbindung wird 0,2 ms später mit TLS-Alert 116 geschlossen. Protokollfolge: Client gilt erst nach `Welcome` als verbunden.
   - Spike 2b **bestätigt**: ALPN vor Handshake-Ende lesbar (`Connecting::handshake_data()`); `peer_identity()` ohne Cert = `None`.
   - Spike 1 **entscheidet** den Provider: `rustls-ring` (cross-compiliert nach `x86_64-pc-windows-gnu` ohne Zusatzaufwand); aws-lc-rs nicht getestet und nicht nötig.
-  - Offen: Verhalten über echtes Netz/NAT, Keepalive, Datagram-vs-Stream-Priorisierung, quinn auf echtem Windows (unter Wine scheitert `Endpoint::client` an WSAENOPROTOOPT, Wine-Defizit).
+  - Offen: Verhalten über echtes Netz/NAT, Keepalive, quinn auf echtem Windows (unter Wine scheitert `Endpoint::client` an WSAENOPROTOOPT, Wine-Defizit).
+- [x] Netzwerk-adaptive Qualität, belegt am 2026-09-21 (Primärquelle statt Messung): Datagram-vs-Stream-Priorisierung ist **kein offener Messpunkt mehr**. `quinn-proto-0.11.18/src/connection/mod.rs::populate_packet` schreibt `self.datagrams.write(buf, max_size)` vor `self.streams.write_stream_frames(...)` bei jedem gepackten Paket — Audio-Datagramme gewinnen die Paket-interne Framing-Priorität gegenüber Video-Streams immer. Das beantwortet nur die Pack-Reihenfolge; ein gesättigtes `cwnd` drosselt weiterhin beide gemeinsam (siehe „Offene Punkte“ oben, jetzt Ziel der `tc netem`-Messung in `Client/IMPLEMENTATION.md` §8). `crates/icu-client/src/netcond.rs` liest deshalb `ConnectionStats.path.{rtt,min_rtt,cwnd,congestion_events,lost_packets,sent_packets}` und `Connection::datagram_send_buffer_space()` — beides bislang ungenutzt in diesem Repo — statt einen eigenen Bandbreiten-Schätzer zu bauen.
 
 Mit WebFetch gelesen (2026-09-20):
 - https://www.rfc-editor.org/rfc/rfc9000.html

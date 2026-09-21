@@ -11,6 +11,99 @@ use icu_proto::{
     Session, VideoHeader,
 };
 
+/// A quality tier for the outgoing camera stream, stepped by
+/// `crate::quality::QualityController` in response to measured network
+/// conditions (`Client/IMPLEMENTATION.md` §8). Video absorbs all of the
+/// adaptation — audio's Opus bitrate is never touched by this system.
+/// Defined here (not in `camera`, which is feature-gated) so `engine`'s
+/// `Shared` and `CameraLink` can hold and expose it unconditionally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoTier {
+    /// 150 kbit/s, 15 fps — the original fixed v1 config.
+    #[default]
+    T0,
+    /// 100 kbit/s, 7.5 fps (skip 1 of every 2 captured frames).
+    T1,
+    /// 60 kbit/s, 5 fps (skip 2 of every 3).
+    T2,
+    /// 40 kbit/s, 3 fps (skip 4 of every 5).
+    T3,
+    /// Paused: no frames encoded or sent. Audio is unaffected.
+    T4,
+}
+
+impl VideoTier {
+    /// Target encoder bitrate in bits/s. Meaningless (and unused) at `T4`.
+    pub fn bitrate(self) -> u32 {
+        match self {
+            VideoTier::T0 => 150_000,
+            VideoTier::T1 => 100_000,
+            VideoTier::T2 => 60_000,
+            VideoTier::T3 => 40_000,
+            VideoTier::T4 => 0,
+        }
+    }
+
+    /// Encode 1 of every `n` captured frames; `T4` encodes none.
+    pub fn frame_divisor(self) -> u32 {
+        match self {
+            VideoTier::T0 => 1,
+            VideoTier::T1 => 2,
+            VideoTier::T2 => 3,
+            VideoTier::T3 => 5,
+            VideoTier::T4 => 0,
+        }
+    }
+
+    /// Whether this tier sends no video at all.
+    pub fn paused(self) -> bool {
+        matches!(self, VideoTier::T4)
+    }
+
+    /// One step down (more degraded), saturating at `T4`.
+    pub fn step_down(self) -> VideoTier {
+        match self {
+            VideoTier::T0 => VideoTier::T1,
+            VideoTier::T1 => VideoTier::T2,
+            VideoTier::T2 => VideoTier::T3,
+            VideoTier::T3 | VideoTier::T4 => VideoTier::T4,
+        }
+    }
+
+    /// One step up (less degraded), saturating at `T0`.
+    pub fn step_up(self) -> VideoTier {
+        match self {
+            VideoTier::T0 => VideoTier::T0,
+            VideoTier::T1 => VideoTier::T0,
+            VideoTier::T2 => VideoTier::T1,
+            VideoTier::T3 => VideoTier::T2,
+            VideoTier::T4 => VideoTier::T3,
+        }
+    }
+
+    /// Wire index for `Shared::video_tier` and the debug-stats counter.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            VideoTier::T0 => 0,
+            VideoTier::T1 => 1,
+            VideoTier::T2 => 2,
+            VideoTier::T3 => 3,
+            VideoTier::T4 => 4,
+        }
+    }
+
+    /// Inverse of [`VideoTier::as_u8`]; anything unrecognized is `T0`.
+    pub fn from_u8(v: u8) -> VideoTier {
+        match v {
+            1 => VideoTier::T1,
+            2 => VideoTier::T2,
+            3 => VideoTier::T3,
+            4 => VideoTier::T4,
+            _ => VideoTier::T0,
+        }
+    }
+}
+
 /// A frame as it came off the wire.
 #[derive(Debug, Clone)]
 pub struct EncodedFrame {
@@ -246,6 +339,25 @@ mod tests {
             },
             data: vec![0, 0, 0, 1, 0x65],
         }
+    }
+
+    #[test]
+    fn video_tier_u8_roundtrips_and_saturates() {
+        for tier in [
+            VideoTier::T0,
+            VideoTier::T1,
+            VideoTier::T2,
+            VideoTier::T3,
+            VideoTier::T4,
+        ] {
+            assert_eq!(VideoTier::from_u8(tier.as_u8()), tier);
+        }
+        assert_eq!(VideoTier::T3.step_down(), VideoTier::T4);
+        assert_eq!(VideoTier::T4.step_down(), VideoTier::T4, "saturates at T4");
+        assert_eq!(VideoTier::T0.step_up(), VideoTier::T0, "saturates at T0");
+        assert_eq!(VideoTier::T4.step_up(), VideoTier::T3);
+        assert!(VideoTier::T4.paused());
+        assert!(!VideoTier::T0.paused());
     }
 
     #[test]

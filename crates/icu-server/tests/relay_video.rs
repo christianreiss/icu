@@ -199,6 +199,42 @@ async fn expired_loss_reports_send_a_zero_hint() {
     server.shutdown().await;
 }
 
+/// §2.2: with every frame delivered promptly (no slot displacement), the
+/// sender never receives a `VideoCongestionHint`, even across more than one
+/// aggregation window.
+#[tokio::test]
+async fn no_congestion_sends_no_video_congestion_hint() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let bob = server.client("bob").await;
+
+    alice
+        .send_msg(&ControlMsg::SetState {
+            flags: UserFlags(UserFlags::CAMERA_ON),
+        })
+        .await;
+    alice
+        .recv_matching(
+            |m| matches!(m, ControlMsg::UserState { session: 1, flags } if flags.camera_on()),
+        )
+        .await
+        .expect("camera on");
+
+    // Every frame is read promptly, so nothing is ever displaced; span more
+    // than one 2 s aggregation window (`icu_proto::limits::
+    // VIDEO_CONGESTION_WINDOW_S`).
+    for seq in 0..6u16 {
+        alice
+            .send_video(seq, u32::from(seq) * 3200, seq == 0, &[7; 64])
+            .await;
+        assert!(bob.recv_video(SOON).await.is_some());
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    alice.expect_silence().await;
+    server.shutdown().await;
+}
+
 /// §10: `KeyframeRequest` is forwarded to the speaker with `speaker = 0`.
 #[tokio::test]
 async fn a_keyframe_request_is_forwarded_to_the_speaker() {

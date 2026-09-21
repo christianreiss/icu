@@ -201,6 +201,8 @@ Video: pro Sender ein Task-Slot. Frame-Header lesen, prüfen, `speaker` setzen. 
 
 Ist die Empfängermenge leer (niemand sonst `Active`, oder alle `deafened`), wird der eingehende Stream trotzdem geleert — `stop(0x00)` auf dem `RecvStream` oder bis FIN lesen und verwerfen —, sonst läuft die Stream-Flow-Control des Senders voll. Zähler `video_dropped_no_receiver`.
 
+**`VideoCongestionHint`** (`PROTOCOL.md` §2.2 Variante 16, 2026-09-21): pro Sender (im selben `VideoSender`, keine neue Struktur) eine rollierende Offer/Verdrängungs-Zählung je Empfänger, alle 2 s zu einer Verdrängungsrate `Verdrängungen · 1000 / Angebote` je Empfänger verrechnet; das **Maximum über alle Empfänger** dieses Senders wird bei ≥ 20 ‰ Änderung als `VideoCongestionHint { drop_permille }` an den Sender geschickt — dieselbe Maximum-Regel wie bei `LossHint`, nur für Video statt Audio. Vereinfachung: das Fenster schließt nur bei einem eingehenden Frame; hört ein Sender ganz auf zu senden (Kamera aus), bleibt der letzte Hinweis stehen statt auf 0 zu verfallen — harmlos, weil ohne Video nichts mehr anzupassen ist. Der Client speist den Wert in seine Qualitäts-Ladder (`Client/IMPLEMENTATION.md` §8); der Server selbst transkodiert nichts, die Anpassung passiert ausschließlich beim sendenden Client.
+
 `LossReport` → Maximum pro Sprecher über alle Empfänger (jeder Report verfällt nach 6 s) → `LossHint` an den Sprecher, wenn sich der Wert ändert. **Der Verfall ist eine Änderung:** fallen alle Reports eines Sprechers weg, sendet der Server `LossHint { loss_permille: 0 }`, sonst bliebe der FEC-Overhead beim Sender dauerhaft stehen. `KeyframeRequest` → an den Sprecher mit `speaker = 0`, ≤ 1/s.
 
 ### 6.6 Limits (`limits.rs`)

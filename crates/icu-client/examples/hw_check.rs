@@ -73,7 +73,8 @@ fn main() {
                             f.height,
                             t.elapsed()
                         );
-                        let mut enc = icu_client::camera::encoder().expect("encoder");
+                        let mut enc = icu_client::camera::encoder(icu_client::video::VideoTier::T0)
+                            .expect("encoder");
                         let yuv = openh264::formats::YUVBuffer::from_rgb_source(
                             openh264::formats::RgbSliceU8::new(&f.rgb, (f.width, f.height)),
                         );

@@ -2,7 +2,7 @@
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{atomic::Ordering, Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -15,6 +15,7 @@ use crate::{
     dsp::gate::Mode,
     engine::{AppState, Command, ConnStatus, Engine},
     net::enroll::{enroll, InviteLink},
+    video::VideoTier,
 };
 
 /// Runs the main window.
@@ -216,6 +217,22 @@ impl eframe::App for App {
                     if let Some(rtt) = state.rtt_ms {
                         ui.label(RichText::new(format!("{rtt:.0} ms")).small());
                     }
+                    // Own outgoing video quality tier, set by
+                    // `crate::quality::QualityController`. Automatic, no
+                    // settings toggle (`Research/feature-freeze.md`'s bias
+                    // against exposing adaptive behavior as a dial) — but
+                    // shown, since a tier-down is visible to other people as
+                    // this client's video degrading.
+                    let tier =
+                        VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8);
+                    let label = match tier {
+                        VideoTier::T0 => None,
+                        VideoTier::T4 => Some("Video pausiert (Netz)"),
+                        _ => Some("Video reduziert"),
+                    };
+                    if let Some(label) = label {
+                        ui.label(RichText::new(label).small().color(theme::CONNECTING));
+                    }
                 });
                 ui.label(RichText::new(text).small())
                     .on_hover_text(match &state.me {
@@ -310,8 +327,7 @@ impl eframe::App for App {
                 }
                 ptt.on_hover_text("Rechtsklick: PTT/VAD umschalten");
 
-                let mut mute_btn =
-                    egui::Button::new(if state.muted { "Mute ✓" } else { "Mute" });
+                let mut mute_btn = egui::Button::new(if state.muted { "Mute ✓" } else { "Mute" });
                 if state.muted {
                     mute_btn = mute_btn.fill(theme::MUTED);
                 }

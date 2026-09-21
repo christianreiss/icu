@@ -131,6 +131,14 @@ pub struct DebugStats {
     pub video_received: AtomicU64,
     /// IDR frames produced on request.
     pub keyframes_forced: AtomicU64,
+    /// Current outgoing video quality tier (0 = full quality, 4 = paused),
+    /// as set by `crate::quality::QualityController`.
+    pub video_tier: AtomicI64,
+    /// Number of times `video_tier` has changed.
+    pub video_tier_changes: AtomicU64,
+    /// `video::Sender::send`'s 50 ms `open_uni` timeouts — the quality
+    /// controller's local, immediate congestion signal.
+    pub video_open_uni_drops: AtomicU64,
     /// Time a capture block spends in the DSP thread.
     pub dsp_block: Mutex<Histogram>,
     /// Time from datagram arrival to playout pop.
@@ -164,7 +172,7 @@ impl DebugStats {
             format!("{:.2} ms", rtt as f64 / 1000.0)
         };
         format!(
-            "icu stats: sent={} recv={} bad={} decoded={} fec={} plc={} played={} dsp_blocks={} ref_underruns={} cap_overruns={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
+            "icu stats: sent={} recv={} bad={} decoded={} fec={} plc={} played={} dsp_blocks={} ref_underruns={} cap_overruns={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
             Self::get(&self.datagrams_sent),
             Self::get(&self.datagrams_received),
             Self::get(&self.datagrams_bad),
@@ -181,6 +189,9 @@ impl DebugStats {
             Self::get(&self.video_sent),
             Self::get(&self.video_received),
             Self::get(&self.keyframes_forced),
+            self.video_tier.load(Ordering::Relaxed),
+            Self::get(&self.video_tier_changes),
+            Self::get(&self.video_open_uni_drops),
             self.dsp_block.lock().unwrap().summary(),
             self.jitter_delay.lock().unwrap().summary(),
             self.capture_to_send.lock().unwrap().summary(),

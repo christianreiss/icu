@@ -10,8 +10,10 @@ pub mod dsp;
 pub mod engine;
 pub mod hotkey;
 pub mod net;
+pub mod netcond;
 #[cfg(feature = "overlay")]
 pub mod overlay;
+pub mod quality;
 pub mod stats;
 #[cfg(feature = "tray")]
 pub mod tray;

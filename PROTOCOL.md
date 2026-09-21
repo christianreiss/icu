@@ -68,8 +68,9 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | 13 | `KeyframeRequest` | C→S | `speaker: Session` | Empfänger braucht ein H.264-IDR (Join, Verlust). Server leitet als `KeyframeRequest { speaker: 0 }` an den Sprecher weiter; der erzeugt binnen 100 ms einen IDR. Rate ≤ 1/s pro Sprecher. |
 | 14 | `SetName` | C→S | `name: Name` | Namensänderung. Server prüft Länge, Steuerzeichen und serverweite Eindeutigkeit (case-insensitive); bei Kollision `Error { code: NAME_TAKEN }` und keine Änderung, sonst persistieren und `UserRenamed` an alle broadcasten. |
 | 15 | `UserRenamed` | S→C | `session: Session`, `name: Name` | |
+| 16 | `VideoCongestionHint` | S→C | `drop_permille: u16` | Server leitet das Maximum der pro Empfänger gemessenen Slot-Verdrängungsrate (`Server/IMPLEMENTATION.md` §6.5) für diesen Sprecher weiter, gemessen über die letzten 2 s (`icu_proto::limits::VIDEO_CONGESTION_WINDOW_S`), nur wenn sich der Wert um ≥ 20 ‰ ändert (`VIDEO_CONGESTION_HINT_STEP_PERMILLE`). Mirror von `LossHint`s Maximum-Regel, aber für Video statt Audio. Der Client speist den Wert in die Qualitäts-Ladder (`Client/IMPLEMENTATION.md` §8): Video trägt die gesamte Anpassung, Audio-Bitrate bleibt unangetastet. |
 
-Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline ist `minor = 1`; ein Minor 0 existiert nicht, und alle 16 Varianten sind in v1 Pflicht. Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
+Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline ist `minor = 1`; ein Minor 0 existiert nicht, und alle 17 Varianten sind in v1 Pflicht. Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
 ### 2.3 Enrollment `EnrollMsg` (nur ALPN `icu-enroll/1`)
 
@@ -185,4 +186,8 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 
 ## 9. Offene Messpunkte (in Implementierung nachziehen)
 
-Aus `Research/verification.md` und den Research-Dokumenten: Datagram-vs-Stream-Priorisierung in quinn, In-place-`speaker`-Write ohne Kopie bei 16 Empfängern, Video-Relay-Latenz bei 1 % Verlust, Wirksamkeit von `LossHint` binnen 2 s, Keepalive über Consumer-NAT, echtes Windows.
+Aus `Research/verification.md` und den Research-Dokumenten: In-place-`speaker`-Write ohne Kopie bei 16 Empfängern, Video-Relay-Latenz bei 1 % Verlust, Wirksamkeit von `LossHint` binnen 2 s, Keepalive über Consumer-NAT, echtes Windows.
+
+**Belegt (2026-09-21):** Datagram-vs-Stream-Priorisierung in quinn — `quinn-proto-0.11.18/src/connection/mod.rs::populate_packet` schreibt `self.datagrams` vor `self.streams` in jedes ausgehende Paket; Audio-Datagramme gewinnen die Paket-interne Framing-Priorität gegenüber Video-Streams immer. Ungeklärt bleibt die Congestion-Window-Ebene: ein gesättigtes `cwnd` drosselt trotzdem beide (`Client/IMPLEMENTATION.md` §8, Messpunkt).
+
+**Neu (Netzwerk-adaptive Qualität, `Client/IMPLEMENTATION.md` §8):** `tc netem`-Messung, ob `queuing_delay_ms` (`rtt − min_rtt`) bei diesem App-Bitratenniveau (74 kbit/s Audio + bis 150 kbit/s Video) vor `congestion_events` messbar ausschlägt; ob ein aktiver Video-Stream Audio-Datagramme über das gemeinsame `cwnd` spürbar verzögert; Wirksamkeit von `VideoCongestionHint` binnen 2 s (analog zu `LossHint`).

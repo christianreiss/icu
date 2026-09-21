@@ -95,12 +95,23 @@ pub fn audio(server: &Arc<Server>, sender: Session, datagram: Bytes, bucket: &mu
     }
 }
 
-/// Per-sender video state: frame rate bucket, bitrate bucket and one slot per
-/// receiver.
+/// Rolling per-receiver slot-offer/displacement counts for one congestion
+/// window (`PROTOCOL.md` §2.2).
+#[derive(Default)]
+struct CongestionWindow {
+    offers: u32,
+    displacements: u32,
+}
+
+/// Per-sender video state: frame rate bucket, bitrate bucket, one slot per
+/// receiver, and the rolling counts behind `VideoCongestionHint`.
 pub struct VideoSender {
     frames: TokenBucket,
     bitrate: TokenBucket,
     slots: HashMap<Session, Arc<Slot>>,
+    congestion: HashMap<Session, CongestionWindow>,
+    window_start: Instant,
+    last_hint_permille: u16,
 }
 
 impl VideoSender {
@@ -110,6 +121,67 @@ impl VideoSender {
             frames: TokenBucket::per_second(limits.video_frames_per_s),
             bitrate: TokenBucket::bitrate(limits.video_kbit_s, Duration::from_secs(2)),
             slots: HashMap::new(),
+            congestion: HashMap::new(),
+            window_start: Instant::now(),
+            last_hint_permille: 0,
+        }
+    }
+
+    /// Records one slot offer for `receiver`, and returns a new
+    /// `VideoCongestionHint` value once the window has closed and the
+    /// worst-receiver drop rate changed by at least
+    /// [`icu_proto::limits::VIDEO_CONGESTION_HINT_STEP_PERMILLE`] since the
+    /// last hint sent — mirrors `LossTracker`'s max-across-reporters rule.
+    ///
+    /// Simplification: the window only closes on an incoming frame, so a
+    /// sender that stops sending video (camera off) freezes at its last
+    /// hint rather than decaying to 0 like `LossHint` does on expiry. That is
+    /// harmless here: with no video in flight, the hint has nothing left to
+    /// act on until the sender resumes and a fresh window closes.
+    fn record_and_maybe_hint(&mut self, receiver: Session, displaced: bool) -> Option<u16> {
+        self.record_and_maybe_hint_at(receiver, displaced, Instant::now())
+    }
+
+    /// [`VideoSender::record_and_maybe_hint`] with an explicit clock, for
+    /// tests.
+    fn record_and_maybe_hint_at(
+        &mut self,
+        receiver: Session,
+        displaced: bool,
+        now: Instant,
+    ) -> Option<u16> {
+        let entry = self.congestion.entry(receiver).or_default();
+        entry.offers += 1;
+        if displaced {
+            entry.displacements += 1;
+        }
+
+        let window = Duration::from_secs(icu_proto::limits::VIDEO_CONGESTION_WINDOW_S);
+        if now.saturating_duration_since(self.window_start) < window {
+            return None;
+        }
+        let worst = self
+            .congestion
+            .values()
+            .map(|w| {
+                w.displacements
+                    .checked_mul(1000)
+                    .and_then(|n| n.checked_div(w.offers))
+                    .unwrap_or(0)
+                    .min(1000) as u16
+            })
+            .max()
+            .unwrap_or(0);
+        self.congestion.clear();
+        self.window_start = now;
+
+        if worst.abs_diff(self.last_hint_permille)
+            >= icu_proto::limits::VIDEO_CONGESTION_HINT_STEP_PERMILLE
+        {
+            self.last_hint_permille = worst;
+            Some(worst)
+        } else {
+            None
         }
     }
 }
@@ -222,10 +294,20 @@ pub async fn video(
                 })
                 .clone()
         };
-        if slot.offer(out.clone()) {
+        let displaced = slot.offer(out.clone());
+        if displaced {
             // The older waiting frame is dropped. It never had a stream of its
             // own, so nothing has to be reset.
             Counters::inc(&server.counters.video_dropped_slow_receiver);
+        }
+        let hint = {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            state.record_and_maybe_hint(session, displaced)
+        };
+        if let Some(drop_permille) = hint {
+            server
+                .room
+                .send_to(sender, &ControlMsg::VideoCongestionHint { drop_permille });
         }
     }
 }
@@ -286,4 +368,72 @@ pub fn keyframe_request(server: &Arc<Server>, speaker: Session) -> bool {
     server
         .room
         .send_to(speaker, &ControlMsg::KeyframeRequest { speaker: 0 })
+}
+
+#[cfg(test)]
+mod congestion_tests {
+    use super::*;
+
+    fn sender() -> VideoSender {
+        VideoSender {
+            frames: TokenBucket::per_second(1000),
+            bitrate: TokenBucket::bitrate(u32::MAX, Duration::from_secs(2)),
+            slots: HashMap::new(),
+            congestion: HashMap::new(),
+            window_start: Instant::now(),
+            last_hint_permille: 0,
+        }
+    }
+
+    const WINDOW: Duration = Duration::from_secs(icu_proto::limits::VIDEO_CONGESTION_WINDOW_S);
+
+    #[test]
+    fn no_hint_before_the_window_closes() {
+        let t0 = Instant::now();
+        let mut vs = sender();
+        vs.window_start = t0;
+        assert_eq!(vs.record_and_maybe_hint_at(1, true, t0), None);
+    }
+
+    #[test]
+    fn worst_receiver_wins_and_resets_the_window() {
+        let t0 = Instant::now();
+        let mut vs = sender();
+        vs.window_start = t0;
+        // Receiver 1: 1 of 2 offers displaced (500‰). Receiver 2: 0 of 1 (0‰).
+        vs.record_and_maybe_hint_at(1, true, t0);
+        vs.record_and_maybe_hint_at(1, false, t0);
+        vs.record_and_maybe_hint_at(2, false, t0);
+        let hint = vs.record_and_maybe_hint_at(2, false, t0 + WINDOW);
+        assert_eq!(hint, Some(500), "receiver 1's 500‰ is the worst");
+        assert!(vs.congestion.is_empty(), "the window resets once it closes");
+    }
+
+    #[test]
+    fn unchanged_worst_rate_sends_no_hint() {
+        let t0 = Instant::now();
+        let mut vs = sender();
+        vs.window_start = t0;
+        vs.record_and_maybe_hint_at(1, true, t0);
+        vs.record_and_maybe_hint_at(1, true, t0 + WINDOW);
+        vs.window_start = t0 + WINDOW;
+        vs.record_and_maybe_hint_at(1, true, t0 + WINDOW);
+        let hint = vs.record_and_maybe_hint_at(1, true, t0 + WINDOW + WINDOW);
+        assert_eq!(hint, None, "still 1000‰, below the change threshold");
+    }
+
+    #[test]
+    fn a_small_change_below_the_step_is_not_reported() {
+        let t0 = Instant::now();
+        let mut vs = sender();
+        vs.window_start = t0;
+        vs.last_hint_permille = 500;
+        // 1 of 100 offers displaced = 10‰ away from 0, well under the 500‰
+        // baseline change of more than the 20‰ step.
+        for _ in 0..99 {
+            vs.record_and_maybe_hint_at(1, true, t0);
+        }
+        let hint = vs.record_and_maybe_hint_at(1, true, t0 + WINDOW);
+        assert_eq!(hint, Some(1000), "100 % displaced is far past the step");
+    }
 }

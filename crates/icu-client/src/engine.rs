@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -44,7 +44,10 @@ use crate::{
         conn::{self, ConnectError},
         NetError,
     },
+    netcond::{NetworkTracker, Sample},
+    quality::QualityController,
     stats::DebugStats,
+    video::VideoTier,
 };
 
 /// Samples per DSP block (10 ms).
@@ -341,6 +344,15 @@ struct Shared {
     loss_perc: AtomicI64,
     /// Bookkeeping for `LossReport`s.
     _loss_tick: AtomicU64,
+    /// Detected network condition (RTT, loss, congestion pressure); folded
+    /// from quinn's own connection stats plus `LossHint`/
+    /// `VideoCongestionHint` (`crate::netcond`).
+    net: Mutex<NetworkTracker>,
+    /// Outgoing camera quality tier, published by the `QualityController`
+    /// and read once per iteration by the camera thread (`crate::quality`,
+    /// `crate::camera::run_sender`). Video absorbs all of the network
+    /// adaptation; this atomic is the only channel for it.
+    video_tier: AtomicU8,
 }
 
 /// A running engine.
@@ -443,6 +455,8 @@ impl Engine {
             play_cons: Arc::new(Mutex::new(play_cons)),
             loss_perc: AtomicI64::new(0),
             _loss_tick: AtomicU64::new(0),
+            net: Mutex::new(NetworkTracker::new()),
+            video_tier: AtomicU8::new(VideoTier::T0.as_u8()),
         });
 
         open_streams(&mut *backend, &settings, &shared);
@@ -1484,6 +1498,14 @@ async fn run_session(
     loss_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut video_tick = tokio::time::interval(Duration::from_millis(200));
     video_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Network-condition sampling (`crate::netcond`) and the quality-tier
+    // state machine (`crate::quality`) share one cadence: both are cheap to
+    // evaluate and the controller's own hysteresis, not the tick rate,
+    // governs how fast the tier actually moves.
+    let net_tick_period = Duration::from_secs(2);
+    let mut net_tick = tokio::time::interval(net_tick_period);
+    net_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut quality = QualityController::new(Instant::now());
     let mut pings: HashMap<u64, Instant> = HashMap::new();
     let mut next_nonce: u64 = 1;
     let mut set_state_budget = RateBudget::new(20, Duration::from_secs(1));
@@ -1547,6 +1569,34 @@ async fn run_session(
                         break;
                     }
                 }
+            }
+            _ = net_tick.tick() => {
+                let stats = connection.stats();
+                let sample = Sample {
+                    rtt: stats.path.rtt,
+                    min_rtt: stats.path.min_rtt,
+                    congestion_events: stats.path.congestion_events,
+                    lost_packets: stats.path.lost_packets,
+                    sent_packets: stats.path.sent_packets,
+                    cwnd: stats.path.cwnd,
+                    udp_tx_bytes: stats.udp_tx.bytes,
+                    datagram_queue_bytes: icu_proto::limits::DATAGRAM_BUFFER_BYTES
+                        .saturating_sub(connection.datagram_send_buffer_space())
+                        as u64,
+                };
+                let cond = shared
+                    .net
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .observe(sample, net_tick_period);
+                let local_drops = DebugStats::get(&shared.stats.video_open_uni_drops);
+                let tier = quality.tick(&cond, local_drops, Instant::now());
+                let previous = shared.video_tier.swap(tier.as_u8(), Ordering::Relaxed);
+                if previous != tier.as_u8() {
+                    DebugStats::inc(&shared.stats.video_tier_changes);
+                    tracing::info!(?tier, "video quality tier changed");
+                }
+                shared.stats.video_tier.store(tier.as_u8() as i64, Ordering::Relaxed);
             }
             reason = connection.closed() => {
                 break close_end(ConnectError::from_connection_error(reason));
@@ -1778,6 +1828,11 @@ async fn handle_control(
                 .dsp
                 .loss_permille
                 .store(loss_permille as u32, Ordering::Relaxed);
+            shared
+                .net
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_audio_loss_hint(loss_permille);
             let hinted = loss_permille > 0;
             for sp in shared
                 .speakers
@@ -1793,6 +1848,13 @@ async fn handle_control(
         }
         ControlMsg::KeyframeRequest { .. } => {
             shared.keyframe_request.store(true, Ordering::Relaxed);
+        }
+        ControlMsg::VideoCongestionHint { drop_permille } => {
+            shared
+                .net
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_video_drop_hint(drop_permille);
         }
         ControlMsg::UserRenamed { session, name } => {
             let me_session = shared.state.borrow().me.as_ref().map(|m| m.session);
@@ -1896,10 +1958,24 @@ impl CameraLink {
             return Err("not connected".into());
         };
         let r = self.runtime.block_on(sender.send(keyframe, ts, data));
-        if r.is_ok() {
-            DebugStats::inc(&self.shared.stats.video_sent);
+        match &r {
+            Ok(()) => DebugStats::inc(&self.shared.stats.video_sent),
+            // The 50 ms `open_uni` timeout in `video::Sender::send` — a
+            // direct, immediate local congestion signal the quality
+            // controller leads on, ahead of the smoothed remote condition
+            // (`crate::quality`).
+            Err(e) if e == "flow control: frame dropped" => {
+                DebugStats::inc(&self.shared.stats.video_open_uni_drops)
+            }
+            Err(_) => {}
         }
         r
+    }
+
+    /// The current outgoing video quality tier, as set by the
+    /// `QualityController` (`crate::quality`).
+    pub fn video_tier(&self) -> VideoTier {
+        VideoTier::from_u8(self.shared.video_tier.load(Ordering::Relaxed))
     }
 
     /// Whether an IDR was requested since the last call (server

@@ -1,6 +1,8 @@
 //! Camera capture (nokhwa) and H.264 encoding (openh264) on their own
-//! thread (`Client/IMPLEMENTATION.md` §8). 320×240 @ 15 fps, 150 kbit/s,
-//! IDR every 2 s and on request.
+//! thread (`Client/IMPLEMENTATION.md` §8). 320×240 capture at 15 fps; the
+//! encoded bitrate and effective frame rate follow the network-adaptive
+//! [`crate::video::VideoTier`] (`crate::quality::QualityController`), IDR
+//! every 2 s and on request.
 
 use std::{
     sync::{
@@ -17,16 +19,18 @@ use openh264::{
     OpenH264API,
 };
 
-use crate::engine::{AppState, CameraLink};
+use crate::{
+    engine::{AppState, CameraLink},
+    video::VideoTier,
+};
 
-/// Target width.
+/// Capture width. Fixed: re-opening the camera device per quality-tier
+/// change would be far more disruptive than an encoder bitrate/fps change.
 pub const WIDTH: u32 = 320;
-/// Target height.
+/// Capture height.
 pub const HEIGHT: u32 = 240;
-/// Target frame rate.
+/// Capture frame rate. The encoder thins this down per `VideoTier`.
 pub const FPS: u32 = 15;
-/// Target bitrate.
-pub const BITRATE: u32 = 150_000;
 /// IDR interval.
 pub const IDR_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -152,10 +156,12 @@ impl FrameSource for SyntheticSource {
     }
 }
 
-/// The v1 encoder configuration.
-pub fn encoder() -> Result<Encoder, String> {
+/// The encoder configuration for one [`VideoTier`]. Never called for `T4`
+/// (paused): `run_sender` simply stops encoding instead of building an
+/// encoder with a zero bitrate.
+pub fn encoder(tier: VideoTier) -> Result<Encoder, String> {
     let cfg = EncoderConfig::new()
-        .bitrate(BitRate::from_bps(BITRATE))
+        .bitrate(BitRate::from_bps(tier.bitrate()))
         .max_frame_rate(FrameRate::from_hz(FPS as f32))
         .usage_type(UsageType::CameraVideoRealTime)
         .rate_control_mode(RateControlMode::Bitrate);
@@ -163,23 +169,39 @@ pub fn encoder() -> Result<Encoder, String> {
 }
 
 /// Encoder thread loop: capture → encode → send. `preview` receives every
-/// captured picture for the settings preview.
+/// captured picture for the settings preview, regardless of tier, so the
+/// settings preview keeps working even while video is paused for everyone
+/// else.
+///
+/// The encoder is rebuilt whenever `link.video_tier()` changes: openh264's
+/// safe Rust binding exposes no runtime bitrate mutator, so a tier change
+/// means a fresh `Encoder`. That is cheap relative to how rarely
+/// `QualityController` actually steps (bounded by its own hysteresis), and a
+/// freshly built encoder's first frame is an IDR regardless of
+/// `force_intra_frame` (`encoder_emits_idr_on_request` below), so SPS/PPS
+/// ride along for free — no separate flush logic is needed.
 pub fn run_sender(
     mut source: Box<dyn FrameSource>,
     link: CameraLink,
     stop: Arc<AtomicBool>,
     preview: Arc<Mutex<Option<RgbFrame>>>,
 ) {
-    let mut enc = match encoder() {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!(%e, "openh264 encoder");
-            return;
+    let mut tier = link.video_tier();
+    let mut enc = if tier.paused() {
+        None
+    } else {
+        match encoder(tier) {
+            Ok(e) => Some(e),
+            Err(e) => {
+                tracing::error!(%e, "openh264 encoder");
+                return;
+            }
         }
     };
     let start = Instant::now();
     let mut last_idr = Instant::now() - IDR_INTERVAL;
     let mut yuv: Option<YUVBuffer> = None;
+    let mut frame_index: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         let frame = match source.next_frame() {
             Ok(f) => f,
@@ -190,6 +212,38 @@ pub fn run_sender(
             }
         };
         *preview.lock().unwrap() = Some(frame.clone());
+
+        let new_tier = link.video_tier();
+        if new_tier != tier {
+            tier = new_tier;
+            enc = if tier.paused() {
+                None
+            } else {
+                match encoder(tier) {
+                    Ok(e) => Some(e),
+                    Err(e) => {
+                        tracing::error!(%e, "openh264 encoder rebuild");
+                        None
+                    }
+                }
+            };
+            last_idr = Instant::now() - IDR_INTERVAL;
+            frame_index = 0;
+        }
+
+        let Some(enc) = enc.as_mut() else {
+            // Paused: still drain keyframe requests so none is lost across
+            // the pause/resume boundary — the next encoder's first frame is
+            // an IDR anyway once video resumes.
+            let _ = link.take_keyframe_request();
+            continue;
+        };
+
+        frame_index += 1;
+        if !frame_index.is_multiple_of(tier.frame_divisor()) {
+            continue; // thin the fixed-FPS capture down to this tier's rate
+        }
+
         let src = RgbSliceU8::new(&frame.rgb, (frame.width, frame.height));
         match yuv.as_mut() {
             Some(buf) if buf.dimensions_match(frame.width, frame.height) => buf.read_rgb(src),
@@ -348,7 +402,7 @@ mod tests {
     /// with it.
     #[test]
     fn encoder_emits_idr_on_request() {
-        let mut enc = encoder().unwrap();
+        let mut enc = encoder(VideoTier::T0).unwrap();
         let mut src = SyntheticSource::new();
         let mut types = Vec::new();
         for i in 0..8 {

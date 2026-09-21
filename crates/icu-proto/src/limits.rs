@@ -51,6 +51,12 @@ pub const LOSS_REPORT_TTL_S: u64 = 6;
 /// Cap for `LossHint` in percent, as handed to `OPUS_SET_PACKET_LOSS_PERC`.
 pub const LOSS_HINT_MAX_PERCENT: u16 = 20;
 
+/// Window over which a sender's per-receiver video slot displacements are
+/// aggregated into a `VideoCongestionHint` (`PROTOCOL.md` §2.2).
+pub const VIDEO_CONGESTION_WINDOW_S: u64 = 2;
+/// Minimum change, in per mille, before a new `VideoCongestionHint` is sent.
+pub const VIDEO_CONGESTION_HINT_STEP_PERMILLE: u16 = 20;
+
 /// Rate limit violations within [`RATE_VIOLATION_WINDOW_S`] that turn into a
 /// fatal close.
 pub const RATE_VIOLATIONS_FATAL: u32 = 3;

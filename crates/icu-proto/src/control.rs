@@ -132,6 +132,12 @@ pub enum ControlMsg {
         /// The new display name.
         name: String,
     },
+    /// 16, S→C. Worst video-drop rate among this sender's receivers, measured
+    /// over the last 2 s. Mirrors `LossHint`'s max-across-reporters rule.
+    VideoCongestionHint {
+        /// Per mille of frames displaced in a receiver's slot before delivery.
+        drop_permille: u16,
+    },
 }
 
 impl ControlMsg {
@@ -169,6 +175,7 @@ impl ControlMsg {
             ControlMsg::KeyframeRequest { .. } => "KeyframeRequest",
             ControlMsg::SetName { .. } => "SetName",
             ControlMsg::UserRenamed { .. } => "UserRenamed",
+            ControlMsg::VideoCongestionHint { .. } => "VideoCongestionHint",
         }
     }
 
@@ -305,6 +312,7 @@ mod tests {
                 session: 1,
                 name: "alice2".into(),
             },
+            ControlMsg::VideoCongestionHint { drop_permille: 50 },
         ]
     }
 
@@ -312,7 +320,7 @@ mod tests {
     #[test]
     fn roundtrip_all_control_variants() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 16, "v1 has exactly 16 control variants");
+        assert_eq!(variants.len(), 17, "v1 has exactly 17 control variants");
         for msg in variants {
             let frame = msg.encode().unwrap();
             let body = framing::split_frame(&frame, MAX_CONTROL_FRAME)
@@ -390,8 +398,8 @@ mod tests {
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
     #[test]
     fn unknown_variant_is_an_error() {
-        // Discriminant 16 does not exist in v1.
-        let body = [16u8, 0, 0];
+        // Discriminant 17 does not exist in v1.
+        let body = [17u8, 0, 0];
         let err = ControlMsg::decode(&body).unwrap_err();
         assert!(
             matches!(err, ProtoError::UnknownVariant),
