@@ -235,7 +235,7 @@ impl eframe::App for App {
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let gear = egui::Button::new(RichText::new(icon::GEAR).size(16.0))
+                    let gear = egui::Button::new(RichText::new(icon::GEAR_FINE).size(16.0))
                         .fill(if self.settings.is_some() {
                             ui.visuals().faint_bg_color
                         } else {

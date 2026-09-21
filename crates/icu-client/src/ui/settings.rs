@@ -112,10 +112,10 @@ impl SettingsView {
                     .show(ui, |ui| {
                         for (tab, glyph, label) in [
                             (Tab::Audio, icon::SLIDERS, "Audio"),
-                            (Tab::Hotkeys, icon::KEYBOARD, "Hotkeys"),
+                            (Tab::Hotkeys, icon::COMMAND, "Hotkeys"),
                             (Tab::Camera, icon::VIDEO_CAMERA, "Kamera"),
-                            (Tab::General, icon::GEAR, "Allgemein"),
-                            (Tab::About, icon::INFO, "Über"),
+                            (Tab::General, icon::GEAR_FINE, "Allgemein"),
+                            (Tab::About, icon::QUESTION, "Über"),
                         ] {
                             if rail_button(ui, glyph, label, self.tab == tab) {
                                 self.tab = tab;
