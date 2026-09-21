@@ -367,8 +367,20 @@ impl Config {
         if self.server.listen.is_empty() {
             return Err(Error::msg("server.listen is empty"));
         }
-        if self.server.server_name.trim().is_empty() {
+        let server_name = self.server.server_name.trim();
+        if server_name.is_empty() {
             return Err(Error::msg("server.server_name must not be empty"));
+        }
+        // Must be exactly what a client's `ServerName::try_from` will accept,
+        // since that's what TLS hostname verification runs against
+        // (`enroll::server_name_for`, `icu-client/src/net/enroll.rs`) — a
+        // value `ca.rs`'s laxer ASCII check would accept but this rejects
+        // gets silently rewritten to "localhost" client-side, which is a far
+        // more confusing failure than catching it here at startup.
+        if rustls::pki_types::ServerName::try_from(server_name.to_string()).is_err() {
+            return Err(Error::msg(format!(
+                "server.server_name {server_name:?} is not a valid DNS name or IP address"
+            )));
         }
         if self.server.max_users < 1 || self.server.max_users > pl::MAX_MAX_USERS {
             return Err(Error::msg(format!(
@@ -496,6 +508,18 @@ format = "text"
         let mut c = base();
         c.server.server_name = String::new();
         assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.server.server_name = "not a host!".into();
+        assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.server.server_name = "192.0.2.10".into();
+        assert!(c.validate().is_ok());
+
+        let mut c = base();
+        c.server.server_name = "::1".into();
+        assert!(c.validate().is_ok());
 
         let mut c = base();
         c.server.max_users = 0;

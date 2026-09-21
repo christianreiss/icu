@@ -107,7 +107,7 @@ impl TestServer {
     /// A raw control client (no engine) that has said `Hello`.
     pub async fn raw_client(&self, name: &str) -> RawClient {
         let (identity, _paths, _dir) = self.enroll(name).await;
-        let config = conn::client_config(&identity).expect("client config");
+        let (config, cert_failure) = conn::client_config(&identity).expect("client config");
         let endpoint = icu_client::net::bind_endpoint(self.addr()).expect("endpoint");
         let session = conn::connect(
             &endpoint,
@@ -117,6 +117,7 @@ impl TestServer {
             "icu-test/0.1.0 linux",
             icu_proto::UserFlags::NONE,
             name,
+            &cert_failure,
         )
         .await
         .expect("connect");

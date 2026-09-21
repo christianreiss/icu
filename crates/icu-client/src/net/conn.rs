@@ -1,33 +1,128 @@
 //! The main connection: client config with the client certificate, connect,
 //! `Hello`/`Welcome`, control stream helpers (`PROTOCOL.md` §1, §2, §5).
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use icu_proto::{limits as pl, ControlMsg, UserFlags, MAX_CONTROL_FRAME};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::{
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime},
+    DigitallySignedStruct, SignatureScheme,
+};
 
 use crate::config::Identity;
 
 use super::{read_frame, NetError};
 
+/// Delegates every check to a standard `WebPkiServerVerifier` unchanged, but
+/// stashes the failure into a [`CertFailure`] slot so `connect()` can turn
+/// quinn's opaque transport error back into the specific [`rustls::Error`]
+/// that caused it. Purely an observation tap: it never overrides the
+/// underlying accept/reject decision.
+#[derive(Debug)]
+struct ReportingVerifier {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    last_failure: CertFailure,
+}
+
+/// Shared slot a [`ReportingVerifier`] writes into and `connect()` reads
+/// from. A fresh instance is created per [`client_config`] call (i.e. per
+/// connection attempt), so there is no cross-attempt leakage.
+#[derive(Clone, Default, Debug)]
+pub struct CertFailure(Arc<Mutex<Option<rustls::Error>>>);
+
+impl CertFailure {
+    fn record(&self, e: &rustls::Error) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.clone());
+    }
+
+    /// Takes and clears the last recorded verification failure, if any.
+    fn take(&self) -> Option<rustls::Error> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+impl ServerCertVerifier for ReportingVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            .inspect_err(|e| self.last_failure.record(e))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.inner.requires_raw_public_keys()
+    }
+
+    fn root_hint_subjects(&self) -> Option<&[rustls::DistinguishedName]> {
+        self.inner.root_hint_subjects()
+    }
+}
+
 /// Builds the QUIC client configuration for ALPN `icu/1` with the client
-/// certificate. Never installs a process wide crypto provider.
-pub fn client_config(identity: &Identity) -> Result<quinn::ClientConfig, NetError> {
+/// certificate. Never installs a process wide crypto provider. The returned
+/// [`CertFailure`] captures the specific TLS error (if any) from the next
+/// handshake attempt made with this config, for [`connect`] to inspect.
+pub fn client_config(identity: &Identity) -> Result<(quinn::ClientConfig, CertFailure), NetError> {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(CertificateDer::from(identity.ca_der.clone()))
         .map_err(|e| NetError::Tls(format!("ca: {e}")))?;
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|e| NetError::Tls(e.to_string()))?
-    .with_root_certificates(roots)
-    .with_client_auth_cert(
-        vec![CertificateDer::from(identity.leaf_der.clone())],
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key_der.clone())),
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let webpki_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
     )
-    .map_err(|e| NetError::Tls(format!("client auth: {e}")))?;
+    .build()
+    .map_err(|e| NetError::Tls(e.to_string()))?;
+    let cert_failure = CertFailure::default();
+    let verifier = Arc::new(ReportingVerifier {
+        inner: webpki_verifier,
+        last_failure: cert_failure.clone(),
+    });
+
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| NetError::Tls(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(
+            vec![CertificateDer::from(identity.leaf_der.clone())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key_der.clone())),
+        )
+        .map_err(|e| NetError::Tls(format!("client auth: {e}")))?;
     tls.alpn_protocols = vec![pl::ALPN_MAIN.to_vec()];
     tls.enable_early_data = false;
 
@@ -48,7 +143,18 @@ pub fn client_config(identity: &Identity) -> Result<quinn::ClientConfig, NetErro
         pl::MAX_MAX_USERS,
     )));
     config.transport_config(Arc::new(transport));
-    Ok(config)
+    Ok((config, cert_failure))
+}
+
+/// Turns a certificate-verification failure into a clear, user-facing reason.
+fn describe_certificate_error(ce: &rustls::CertificateError) -> String {
+    match ce {
+        rustls::CertificateError::NotValidForName
+        | rustls::CertificateError::NotValidForNameContext { .. } => {
+            "Hostname stimmt nicht mit dem Serverzertifikat überein".to_string()
+        }
+        other => format!("Zertifikatsprüfung fehlgeschlagen: {other:?}"),
+    }
 }
 
 /// What `Welcome` told us.
@@ -82,6 +188,7 @@ pub struct Session {
 
 /// Connects, opens the control stream, sends `Hello` at once and waits for
 /// `Welcome`. Only then is the client "connected" (Spike 2).
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     endpoint: &quinn::Endpoint,
     config: quinn::ClientConfig,
@@ -90,14 +197,26 @@ pub async fn connect(
     client: &str,
     initial: UserFlags,
     name: &str,
+    cert_failure: &CertFailure,
 ) -> Result<Session, ConnectError> {
     let connecting = endpoint
         .connect_with(config, addr, server_name)
         .map_err(|e| ConnectError::Transport(e.to_string()))?;
-    let conn = tokio::time::timeout(Duration::from_secs(10), connecting)
+    let handshake = tokio::time::timeout(Duration::from_secs(10), connecting)
         .await
-        .map_err(|_| ConnectError::Transport("handshake timed out".into()))?
-        .map_err(ConnectError::from_connection_error)?;
+        .map_err(|_| ConnectError::Transport("handshake timed out".into()))?;
+    let conn = match handshake {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(match cert_failure.take() {
+                Some(rustls::Error::InvalidCertificate(ce)) => ConnectError::Certificate {
+                    server_name: server_name.to_string(),
+                    detail: describe_certificate_error(&ce),
+                },
+                _ => ConnectError::from_connection_error(e),
+            });
+        }
+    };
     let (mut send, mut recv) = conn
         .open_bi()
         .await
@@ -173,6 +292,14 @@ pub enum ConnectError {
     Transport(String),
     /// We could not make sense of what the server sent.
     Protocol(String),
+    /// TLS certificate verification failed for `server_name`. Never
+    /// retryable: retrying will not fix a hostname/cert mismatch.
+    Certificate {
+        /// The FQDN/IP TLS verification ran against.
+        server_name: String,
+        /// What went wrong.
+        detail: String,
+    },
 }
 
 impl ConnectError {
@@ -193,6 +320,7 @@ impl ConnectError {
             ConnectError::Closed { code, .. } => icu_proto::error::is_fatal(*code),
             ConnectError::Transport(_) => false,
             ConnectError::Protocol(_) => true,
+            ConnectError::Certificate { .. } => true,
         }
     }
 
@@ -213,6 +341,10 @@ impl std::fmt::Display for ConnectError {
             }
             ConnectError::Transport(s) => write!(f, "transport: {s}"),
             ConnectError::Protocol(s) => write!(f, "protocol: {s}"),
+            ConnectError::Certificate {
+                server_name,
+                detail,
+            } => write!(f, "Zertifikat für „{server_name}“ ungültig: {detail}"),
         }
     }
 }
@@ -251,5 +383,10 @@ mod tests {
         assert!(!closed(icu_proto::error::HELLO_TIMEOUT).is_fatal());
         assert!(!ConnectError::Transport("x".into()).is_fatal());
         assert!(ConnectError::Protocol("x".into()).is_fatal());
+        assert!(ConnectError::Certificate {
+            server_name: "x".into(),
+            detail: "y".into(),
+        }
+        .is_fatal());
     }
 }

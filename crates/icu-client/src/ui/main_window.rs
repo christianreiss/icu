@@ -278,7 +278,10 @@ impl eframe::App for App {
                 );
 
                 ui.vertical(|ui| {
-                    ui.label(theme::strong_text(&state.server).size(14.5));
+                    ui.label(theme::strong_text(&state.server_name).size(14.5));
+                    if let Some(me) = &state.me {
+                        ui.label(RichText::new(&me.name).small().color(tok.muted_text));
+                    }
                     let (color, text) = match &state.conn {
                         ConnStatus::Connected => (tok.connected, "verbunden".to_string()),
                         ConnStatus::Connecting => (tok.connecting, "verbinde…".to_string()),
@@ -291,7 +294,7 @@ impl eframe::App for App {
                     let trailing = state.rtt_ms.map(|rtt| format!("{rtt:.0} ms"));
                     widgets::status_pill(ui, color, &text, trailing.as_deref()).on_hover_text(
                         match &state.me {
-                            Some(me) => format!("{} (user_id {})", me.name, me.user_id),
+                            Some(me) => format!("user_id {}", me.user_id),
                             None => String::new(),
                         },
                     );

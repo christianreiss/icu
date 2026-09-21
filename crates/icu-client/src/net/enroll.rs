@@ -203,7 +203,10 @@ enum Pin {
 }
 
 /// The pinning verifier: accepts exactly a chain of length 2 whose last
-/// element matches the configured [`Pin`]. Ignores SNI and validity.
+/// element matches the configured [`Pin`], and whose leaf covers the dialed
+/// hostname. Still ignores validity dates, and does not check that the leaf
+/// was signed by the pinned CA — the trust model here is chain-length + pin,
+/// not full path validation.
 #[derive(Debug)]
 pub struct PinVerifier {
     pin: Pin,
@@ -246,9 +249,9 @@ impl PinVerifier {
 impl ServerCertVerifier for PinVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
+        server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
@@ -276,6 +279,12 @@ impl ServerCertVerifier for PinVerifier {
             }
             Pin::TrustFirst => {}
         }
+        // The CA/intermediate pin is checked above; also require the leaf to
+        // actually cover the host we dialed, for every pin mode including
+        // `TrustFirst` — CA pinning alone says nothing about which hostname
+        // the presented leaf is valid for.
+        let leaf = rustls::server::ParsedCertificate::try_from(end_entity)?;
+        rustls::client::verify_server_name(&leaf, server_name)?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -441,7 +450,8 @@ pub async fn enroll(
 }
 
 /// SNI for the enrollment handshake: the link host, or `localhost` when the
-/// host is not a valid server name (the pin verifier ignores it anyway).
+/// host is not a valid server name. Load-bearing for security: the pin
+/// verifier now also checks the leaf covers this name.
 pub fn server_name_for(host: &str) -> String {
     if ServerName::try_from(host.to_string()).is_ok() {
         host.to_string()
@@ -538,12 +548,20 @@ mod tests {
         assert!(PinVerifier::new(&ok, p).is_ok());
     }
 
+    /// A real self-signed leaf DER covering `host`, for tests that now go
+    /// through actual X.509 parsing (hostname verification).
+    fn leaf_for(host: &str) -> CertificateDer<'static> {
+        let rcgen::CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(vec![host.to_string()]).unwrap();
+        CertificateDer::from(cert.der().to_vec())
+    }
+
     #[test]
     fn from_ca_der_matches_byte_exact_only() {
         let p = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = PinVerifier::from_ca_der(vec![1, 2, 3], p);
         let ok = verifier.verify_server_cert(
-            &CertificateDer::from(vec![9]),
+            &leaf_for("localhost"),
             &[CertificateDer::from(vec![1, 2, 3])],
             &ServerName::try_from("localhost").unwrap(),
             &[],
@@ -551,7 +569,7 @@ mod tests {
         );
         assert!(ok.is_ok());
         let bad = verifier.verify_server_cert(
-            &CertificateDer::from(vec![9]),
+            &leaf_for("localhost"),
             &[CertificateDer::from(vec![9, 9, 9])],
             &ServerName::try_from("localhost").unwrap(),
             &[],
@@ -567,7 +585,7 @@ mod tests {
         let name = ServerName::try_from("localhost").unwrap();
         assert!(verifier
             .verify_server_cert(
-                &CertificateDer::from(vec![9]),
+                &leaf_for("localhost"),
                 &[CertificateDer::from(vec![1, 2, 3])],
                 &name,
                 &[],
@@ -575,7 +593,35 @@ mod tests {
             )
             .is_ok());
         assert!(verifier
-            .verify_server_cert(&CertificateDer::from(vec![9]), &[], &name, &[], UnixTime::now())
+            .verify_server_cert(&leaf_for("localhost"), &[], &name, &[], UnixTime::now())
             .is_err());
+    }
+
+    #[test]
+    fn hostname_mismatch_is_rejected_even_with_correct_pin() {
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = PinVerifier::from_ca_der(vec![1, 2, 3], p);
+        let bad = verifier.verify_server_cert(
+            &leaf_for("other.invalid"),
+            &[CertificateDer::from(vec![1, 2, 3])],
+            &ServerName::try_from("localhost").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn trust_first_still_requires_hostname_match() {
+        let p = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = PinVerifier::trust_first(p);
+        let bad = verifier.verify_server_cert(
+            &leaf_for("other.invalid"),
+            &[CertificateDer::from(vec![1, 2, 3])],
+            &ServerName::try_from("localhost").unwrap(),
+            &[],
+            UnixTime::now(),
+        );
+        assert!(bad.is_err());
     }
 }

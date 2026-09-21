@@ -119,8 +119,11 @@ pub struct Peer {
 pub struct AppState {
     /// Connection.
     pub conn: ConnStatus,
-    /// `host:port`.
+    /// `host:port` dialed (may be an IP or alternate name).
     pub server: String,
+    /// The certificate-verified FQDN/IP (`Identity.server.server_name`,
+    /// the same value used as TLS SNI). Distinct from `server` above.
+    pub server_name: String,
     /// Own entry after `Welcome`.
     pub me: Option<UserInfo>,
     /// Everyone else.
@@ -440,6 +443,7 @@ impl Engine {
         let initial = AppState {
             conn: ConnStatus::Connecting,
             server: format!("{}:{}", cfg.identity.server.host, cfg.identity.server.port),
+            server_name: cfg.identity.server.server_name.clone(),
             me: None,
             peers: Vec::new(),
             muted: false,
@@ -1444,7 +1448,7 @@ async fn run_session(
     addr: SocketAddr,
     was_connected: &mut bool,
 ) -> SessionEnd {
-    let client_config = match conn::client_config(&cfg.identity) {
+    let (client_config, cert_failure) = match conn::client_config(&cfg.identity) {
         Ok(c) => c,
         Err(e) => return SessionEnd::Fatal(e.to_string()),
     };
@@ -1463,6 +1467,7 @@ async fn run_session(
         &cfg.client_string,
         hello_flags,
         &hello_name,
+        &cert_failure,
     );
     let session = tokio::select! {
         r = connect => r,
