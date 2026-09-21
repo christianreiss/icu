@@ -51,6 +51,10 @@ struct App {
     cmd: tokio::sync::mpsc::UnboundedSender<Command>,
     settings: Option<SettingsView>,
     debug_stats: bool,
+    /// Whether the separate debug window is still open (closed if the user
+    /// closes that window; there's no way to reopen it short of restarting
+    /// with `--debug-stats`, matching the old inline block's behavior).
+    debug_window_open: bool,
     last_stats: Instant,
     stats_text: String,
     stats: Arc<crate::stats::DebugStats>,
@@ -119,6 +123,7 @@ impl App {
             cmd,
             settings: None,
             debug_stats,
+            debug_window_open: debug_stats,
             last_stats: Instant::now(),
             stats_text: String::new(),
             stats,
@@ -191,6 +196,28 @@ impl eframe::App for App {
             self.last_stats = Instant::now();
             self.stats_text = self.stats.report();
             eprintln!("{}", self.stats_text);
+        }
+
+        if self.debug_window_open {
+            let mut still_open = true;
+            let stats_text = &self.stats_text;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("icu-debug"),
+                egui::ViewportBuilder::default()
+                    .with_title("ICU — Debug")
+                    .with_inner_size([520.0, 420.0]),
+                |ctx, _class| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.label(RichText::new(stats_text).monospace().small());
+                        });
+                    });
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        still_open = false;
+                    }
+                },
+            );
+            self.debug_window_open = still_open;
         }
 
         egui::Panel::top("status").show(root, |ui| {
@@ -562,10 +589,6 @@ impl eframe::App for App {
                                 camera.preview(ui);
                             });
                     }
-                }
-                if self.debug_stats && !self.stats_text.is_empty() {
-                    ui.separator();
-                    ui.label(RichText::new(&self.stats_text).monospace().small());
                 }
             });
         });
