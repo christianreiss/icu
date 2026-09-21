@@ -45,6 +45,17 @@ pub struct Tokens {
     pub dim_text: Color32,
 }
 
+/// Corner-radius scale. Four steps, nested smallest-inside-largest: a chip
+/// inside a control inside a row inside a card. Every rounded thing in the
+/// app picks one of these, so no call site has to invent a radius.
+pub const R_CHIP: u8 = 6;
+/// Buttons, segmented tracks, combo boxes.
+pub const R_CTRL: u8 = 9;
+/// Participant rows, banners, the big speak/control buttons.
+pub const R_ROW: u8 = 11;
+/// `widgets::group_card` and the settings rail.
+pub const R_CARD: u8 = 13;
+
 /// Returns the palette for the current theme (`visuals.dark_mode`).
 pub fn tokens(visuals: &Visuals) -> Tokens {
     if visuals.dark_mode {
@@ -98,7 +109,12 @@ pub fn apply(ctx: &egui::Context, theme: &str) {
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
         style.spacing.button_padding = egui::vec2(12.0, 8.0);
         style.spacing.interact_size.y = 30.0;
+        style.spacing.combo_height = 320.0;
         style.text_styles = text_styles();
+        // Every scrollbar in the app is an overlay over a card or a list:
+        // floating keeps it from stealing 12px of content width, and the
+        // thin handle keeps it quiet until it is touched.
+        style.spacing.scroll = egui::style::ScrollStyle::thin();
     });
 }
 
@@ -145,8 +161,8 @@ fn dark_visuals() -> Visuals {
     v.hyperlink_color = t.accent;
     v.selection.bg_fill = t.accent.gamma_multiply(0.5);
     v.selection.stroke = Stroke::new(1.0, t.accent);
-    v.window_corner_radius = CornerRadius::same(10);
-    v.menu_corner_radius = CornerRadius::same(8);
+    v.window_corner_radius = CornerRadius::same(R_ROW);
+    v.menu_corner_radius = CornerRadius::same(R_CTRL);
     v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0x2e, 0x32, 0x3d));
 
     for w in [
@@ -155,7 +171,7 @@ fn dark_visuals() -> Visuals {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.corner_radius = CornerRadius::same(6);
+        w.corner_radius = CornerRadius::same(R_CTRL);
     }
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x23, 0x26, 0x2f));
     // Differentiate the "track" role (bg_fill: checkbox/slider background)
@@ -181,8 +197,8 @@ fn light_visuals() -> Visuals {
     v.hyperlink_color = t.accent;
     v.selection.bg_fill = t.accent.gamma_multiply(0.35);
     v.selection.stroke = Stroke::new(1.0, t.accent);
-    v.window_corner_radius = CornerRadius::same(10);
-    v.menu_corner_radius = CornerRadius::same(8);
+    v.window_corner_radius = CornerRadius::same(R_ROW);
+    v.menu_corner_radius = CornerRadius::same(R_CTRL);
     v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0xcf, 0xd5, 0xdf));
     for w in [
         &mut v.widgets.inactive,
@@ -190,7 +206,7 @@ fn light_visuals() -> Visuals {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.corner_radius = CornerRadius::same(6);
+        w.corner_radius = CornerRadius::same(R_CTRL);
     }
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xe2, 0xe5, 0xec));
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xcf, 0xd5, 0xdf));
@@ -228,7 +244,10 @@ mod tests {
         (hi + 0.05) / (lo + 0.05)
     }
 
-    const THEMES: [(&str, fn() -> Visuals); 2] = [("dark", dark_visuals), ("light", light_visuals)];
+    /// Named so clippy's `type_complexity` has something to point at.
+    type Theme = (&'static str, fn() -> Visuals);
+
+    const THEMES: [Theme; 2] = [("dark", dark_visuals), ("light", light_visuals)];
 
     #[test]
     fn text_on_panel_meets_wcag_aa() {

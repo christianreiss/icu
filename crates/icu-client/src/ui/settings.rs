@@ -20,6 +20,18 @@ use crate::{
     stats::DebugStats,
 };
 
+/// Text-field width wherever a row pairs a field with a button, so the
+/// fields line up down the panel.
+const FIELD_W: f32 = 150.0;
+/// One square of the overlay-position picker.
+const CORNER_SWATCH: f32 = 46.0;
+/// Gap between the picker's squares, and the wider gap before the two
+/// full-edge options.
+const CORNER_GAP: f32 = 4.0;
+const CORNER_SPLIT: f32 = 8.0;
+/// Six squares, five gaps, and the split between the corners and the edges.
+const CORNER_PICKER_W: f32 = CORNER_SWATCH * 6.0 + CORNER_GAP * 6.0 + CORNER_SPLIT;
+
 /// Which settings section is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -73,6 +85,18 @@ pub struct SettingsView {
     /// frame (the window itself is owned by `App`, not this view — moved
     /// here from a top-bar button so it doesn't compete for header space).
     pub debug_window_open: bool,
+    /// Live picture for the Kamera tab, fed by the running capture thread.
+    #[cfg(feature = "camera")]
+    preview: Option<crate::camera::CameraPreview>,
+    /// Cameras found by `crate::camera::list()`. Refreshed when the Kamera
+    /// tab is opened, never per frame: enumerating V4L2 devices opens every
+    /// `/dev/video*` in turn.
+    #[cfg(feature = "camera")]
+    cameras: Vec<(u32, String)>,
+    /// Whether [`Self::cameras`] still has to be filled. Set when the tab is
+    /// opened, so a camera plugged in meanwhile shows up on the next visit.
+    #[cfg(feature = "camera")]
+    cameras_stale: bool,
 }
 
 impl SettingsView {
@@ -101,7 +125,21 @@ impl SettingsView {
             export_status: None,
             confirm_revoke: HashMap::new(),
             debug_window_open: false,
+            #[cfg(feature = "camera")]
+            preview: None,
+            #[cfg(feature = "camera")]
+            cameras: Vec::new(),
+            #[cfg(feature = "camera")]
+            cameras_stale: true,
         }
+    }
+
+    /// Gives the Kamera tab a live picture from the running capture thread.
+    /// Only the GUI binary has a camera handle to hand over.
+    #[cfg(feature = "camera")]
+    pub fn with_preview(mut self, slot: Arc<crate::camera::PreviewSlot>) -> SettingsView {
+        self.preview = Some(crate::camera::CameraPreview::new(slot));
+        self
     }
 
     /// Draws the panel content. Returns commands to send.
@@ -142,7 +180,7 @@ impl SettingsView {
                         1.0,
                         ui.visuals().widgets.inactive.bg_stroke.color,
                     ))
-                    .corner_radius(egui::CornerRadius::same(10))
+                    .corner_radius(egui::CornerRadius::same(theme::R_CARD))
                     .inner_margin(3)
                     .show(ui, |ui| {
                         for (tab, glyph, label) in tabs {
@@ -154,14 +192,19 @@ impl SettingsView {
                     });
             });
 
-        if self.tab != tab_before && self.tab == Tab::Users {
-            cmds.push(Command::RequestUserList);
+        if self.tab != tab_before {
+            match self.tab {
+                Tab::Users => cmds.push(Command::RequestUserList),
+                #[cfg(feature = "camera")]
+                Tab::Camera => self.cameras_stale = true,
+                _ => {}
+            }
         }
 
         egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
             Tab::Audio => self.audio_tab(ui, state),
             Tab::Hotkeys => self.hotkeys_tab(ui),
-            Tab::Camera => self.camera_tab(ui),
+            Tab::Camera => self.camera_tab(ui, state),
             Tab::General => self.general_tab(ui, state, &mut cmds),
             Tab::Users => self.users_tab(ui, state, &mut cmds),
             Tab::About => self.about_tab(ui, state),
@@ -328,7 +371,16 @@ impl SettingsView {
                 )
             });
             widgets::setting_row(ui, true, "Aktiv", None, |ui| {
-                ui.label(RichText::new(format!("✓ {}", self.hotkey_backend)).monospace())
+                let tok = theme::tokens(ui.visuals());
+                // `crate::hotkey::start` reports "portal", "evdev (n devices)"
+                // or "none"; the empty string means it was never started
+                // (`--no-hotkeys`).
+                let (color, text) = match self.hotkey_backend.as_str() {
+                    "" => (tok.connecting, "abgeschaltet"),
+                    "none" => (tok.error, "keiner"),
+                    backend => (tok.connected, backend),
+                };
+                widgets::status_pill(ui, color, text)
             });
         });
 
@@ -374,23 +426,37 @@ impl SettingsView {
         );
     }
 
-    fn camera_tab(&mut self, ui: &mut Ui) {
+    #[cfg_attr(not(feature = "camera"), allow(unused_variables))]
+    fn camera_tab(&mut self, ui: &mut Ui, state: &AppState) {
         widgets::group_card(ui, "Kamera", |ui| {
             widgets::setting_row(ui, false, "Beim Start einschalten", None, |ui| {
                 widgets::toggle(ui, &mut self.draft.camera.enabled)
             });
-            let mut dev = self.draft.camera.device.clone().unwrap_or_default();
-            widgets::setting_row(ui, true, "Gerät (Index)", None, |ui| {
-                let r = ui.add(egui::TextEdit::singleline(&mut dev).desired_width(120.0));
-                if r.changed() {
-                    self.draft.camera.device = if dev.is_empty() {
-                        None
-                    } else {
-                        Some(dev.clone())
-                    };
+            #[cfg(feature = "camera")]
+            {
+                if self.cameras_stale {
+                    // Opens every `/dev/video*` in turn, so: once per visit
+                    // to this tab, never per frame.
+                    self.cameras_stale = false;
+                    self.cameras = crate::camera::list();
                 }
-                r
-            });
+                widgets::setting_row(ui, true, "Gerät", None, |ui| {
+                    camera_combo(ui, &mut self.draft.camera.device, &self.cameras)
+                });
+                ui.separator();
+                widgets::card_note(ui, |ui| {
+                    // Wide enough to judge framing, small enough that the
+                    // card stays a settings row and not a video window.
+                    let width = ui.available_width().min(240.0);
+                    let live = self
+                        .preview
+                        .as_mut()
+                        .is_some_and(|preview| preview.ui(ui, width));
+                    if !live {
+                        preview_placeholder(ui, width, state.camera_on);
+                    }
+                });
+            }
         });
 
         widgets::group_card(ui, "Overlay", |ui| {
@@ -398,7 +464,9 @@ impl SettingsView {
                 widgets::toggle(ui, &mut self.draft.overlay.enabled)
             });
             widgets::setting_row(ui, true, "Ecke", None, |ui| {
-                corner_picker(ui, &mut self.draft.overlay.corner);
+                widgets::row_group(ui, CORNER_PICKER_W, |ui| {
+                    corner_picker(ui, &mut self.draft.overlay.corner)
+                });
             });
             let edge = matches!(self.draft.overlay.corner, Corner::Top | Corner::Bottom);
             widgets::setting_row(ui, true, "Ausrichtung", None, |ui| {
@@ -415,17 +483,17 @@ impl SettingsView {
                 .inner
             });
             widgets::setting_row(ui, true, "Abstand", None, |ui| {
-                widgets::ltr(ui, |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut self.draft.overlay.offset[0])
-                            .prefix("x ")
-                            .range(0..=2000),
-                    );
-                    ui.add(
-                        egui::DragValue::new(&mut self.draft.overlay.offset[1])
-                            .prefix("y ")
-                            .range(0..=2000),
-                    );
+                const DRAG_W: f32 = 62.0;
+                widgets::row_group(ui, DRAG_W * 2.0 + 6.0, |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for (axis, prefix) in [(0, "x "), (1, "y ")] {
+                        ui.add_sized(
+                            [DRAG_W, 24.0],
+                            egui::DragValue::new(&mut self.draft.overlay.offset[axis])
+                                .prefix(prefix)
+                                .range(0..=2000),
+                        );
+                    }
                 });
             });
             widgets::setting_row(ui, true, "Kachelgröße", None, |ui| {
@@ -444,9 +512,24 @@ impl SettingsView {
     fn general_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         widgets::group_card(ui, "Identität", |ui| {
             widgets::setting_row(ui, false, "Anzeigename", None, |ui| {
-                widgets::ltr(ui, |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(140.0));
-                    if ui.button("Übernehmen").clicked() {
+                let width = FIELD_W + 6.0 + widgets::button_width(ui, icon::CHECK, "");
+                widgets::row_group(ui, width, |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.name)
+                            .desired_width(FIELD_W)
+                            .hint_text("Name"),
+                    );
+                    let entered =
+                        field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let changed = self.name.trim() != state.me.as_ref().map_or("", |m| &m.name);
+                    let apply = ui
+                        .add_enabled_ui(changed, |ui| {
+                            widgets::button(ui, widgets::ButtonKind::Primary, icon::CHECK, "")
+                        })
+                        .inner
+                        .on_hover_text("Namen übernehmen");
+                    if (apply.clicked() || entered) && changed {
                         cmds.push(Command::SetName(self.name.trim().to_string()));
                     }
                 });
@@ -475,12 +558,28 @@ impl SettingsView {
 
         if state.is_admin {
             widgets::group_card(ui, "Einladung", |ui| {
-                widgets::setting_row(ui, false, "Name der eingeladenen Person", None, |ui| {
-                    widgets::ltr(ui, |ui| {
+                widgets::setting_row(ui, false, "Wer soll dazukommen?", None, |ui| {
+                    let width = FIELD_W + 6.0 + widgets::button_width(ui, icon::TICKET, "Einladen");
+                    widgets::row_group(ui, width, |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.invite_name).desired_width(140.0),
+                            egui::TextEdit::singleline(&mut self.invite_name)
+                                .desired_width(FIELD_W)
+                                .hint_text("Name"),
                         );
-                        if ui.button("Erzeugen").clicked() {
+                        let named = !self.invite_name.trim().is_empty();
+                        if ui
+                            .add_enabled_ui(named, |ui| {
+                                widgets::button(
+                                    ui,
+                                    widgets::ButtonKind::Primary,
+                                    icon::TICKET,
+                                    "Einladen",
+                                )
+                            })
+                            .inner
+                            .clicked()
+                        {
                             cmds.push(Command::CreateInvite {
                                 name: self.invite_name.trim().to_string(),
                                 ttl_s: 0,
@@ -494,12 +593,34 @@ impl SettingsView {
                     });
                 }
                 if let Some((blob, expires)) = &state.last_invite {
+                    ui.separator();
                     widgets::card_note(ui, |ui| {
-                        ui.label(format!("Gültig bis {expires}, einmal einfügbar:"));
+                        let tok = theme::tokens(ui.visuals());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("Einmal einlösbar, gültig bis {expires}"))
+                                    .size(11.5)
+                                    .color(tok.dim_text),
+                            );
+                            widgets::rtl(ui, 30.0, |ui| {
+                                if widgets::button(
+                                    ui,
+                                    widgets::ButtonKind::Neutral,
+                                    icon::COPY,
+                                    "Kopieren",
+                                )
+                                .clicked()
+                                {
+                                    ui.ctx().copy_text(blob.clone());
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
                         let mut copy = blob.clone();
                         ui.add(
                             egui::TextEdit::multiline(&mut copy)
-                                .desired_rows(3)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
                                 .font(egui::TextStyle::Monospace),
                         );
                     });
@@ -517,11 +638,15 @@ impl SettingsView {
         });
 
         widgets::group_card(ui, "Darstellung", |ui| {
-            ui.horizontal(|ui| {
-                for (value, label) in [("system", "System"), ("light", "Hell"), ("dark", "Dunkel")]
-                {
-                    theme_swatch(ui, &mut self.draft.ui.theme, value, label);
-                }
+            widgets::card_note(ui, |ui| {
+                widgets::ltr(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    for (value, label) in
+                        [("system", "System"), ("light", "Hell"), ("dark", "Dunkel")]
+                    {
+                        theme_swatch(ui, &mut self.draft.ui.theme, value, label);
+                    }
+                });
             });
         });
     }
@@ -532,7 +657,14 @@ impl SettingsView {
     fn users_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         widgets::group_card(ui, "Nutzer", |ui| {
             widgets::setting_row(ui, false, "Registrierte Nutzer", None, |ui| {
-                if ui.button("Aktualisieren").clicked() {
+                if widgets::button(
+                    ui,
+                    widgets::ButtonKind::Neutral,
+                    icon::ARROWS_CLOCKWISE,
+                    "Aktualisieren",
+                )
+                .clicked()
+                {
                     cmds.push(Command::RequestUserList);
                 }
             });
@@ -575,49 +707,65 @@ impl SettingsView {
             "aktiv"
         };
         let help = format!("{status}{}", if user.is_admin { " · Admin" } else { "" });
+        let confirming = self
+            .confirm_revoke
+            .get(&user.user_id)
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+        let revoke_label = if confirming { "Wirklich?" } else { "" };
         widgets::setting_row(ui, divider, &user.name, Some(&help), |ui| {
-            widgets::ltr(ui, |ui| {
-                let role_label = if user.is_admin {
-                    "Admin-Rechte entziehen"
-                } else {
-                    "Zum Admin machen"
+            let width = widgets::button_width(ui, icon::SHIELD_STAR, "")
+                + widgets::button_width(ui, icon::PROHIBIT, "")
+                + widgets::button_width(ui, icon::TRASH, revoke_label)
+                + 12.0;
+            widgets::row_group(ui, width, |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let action = |ui: &mut Ui, kind, glyph, label: &str, hover: &str| {
+                    ui.add_enabled_ui(!is_self, |ui| widgets::button(ui, kind, glyph, label))
+                        .inner
+                        .on_hover_text(hover.to_string())
+                        .clicked()
                 };
-                if ui
-                    .add_enabled(!is_self, egui::Button::new(role_label))
-                    .clicked()
-                {
+                if action(
+                    ui,
+                    widgets::ButtonKind::Neutral,
+                    icon::SHIELD_STAR,
+                    "",
+                    if user.is_admin {
+                        "Admin-Rechte entziehen"
+                    } else {
+                        "Zum Admin machen"
+                    },
+                ) {
                     cmds.push(Command::SetUserAdmin {
                         user_id: user.user_id,
                         is_admin: !user.is_admin,
                     });
                 }
-                let disable_label = if user.disabled {
-                    "Aktivieren"
-                } else {
-                    "Deaktivieren"
-                };
-                if ui
-                    .add_enabled(!is_self, egui::Button::new(disable_label))
-                    .clicked()
-                {
+                if action(
+                    ui,
+                    widgets::ButtonKind::Neutral,
+                    icon::PROHIBIT,
+                    "",
+                    if user.disabled {
+                        "Wieder aktivieren"
+                    } else {
+                        "Deaktivieren — darf sich nicht mehr verbinden"
+                    },
+                ) {
                     cmds.push(Command::SetUserDisabled {
                         user_id: user.user_id,
                         disabled: !user.disabled,
                     });
                 }
-                let confirming = self
-                    .confirm_revoke
-                    .get(&user.user_id)
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
-                let revoke_label = if confirming {
-                    "Wirklich löschen?"
-                } else {
-                    "Löschen"
-                };
-                if ui
-                    .add_enabled(!is_self, egui::Button::new(revoke_label))
-                    .clicked()
-                {
+                // Two clicks, because this cannot be undone: the first arms
+                // the button for three seconds, the second sends it.
+                if action(
+                    ui,
+                    widgets::ButtonKind::Danger,
+                    icon::TRASH,
+                    revoke_label,
+                    "Zugang endgültig widerrufen",
+                ) {
                     if confirming {
                         self.confirm_revoke.remove(&user.user_id);
                         cmds.push(Command::RevokeUser {
@@ -628,7 +776,6 @@ impl SettingsView {
                     }
                 }
             })
-            .inner
         });
     }
 
@@ -689,17 +836,24 @@ impl SettingsView {
                 ui.label(RichText::new(&self.diagnose.reconnects).monospace())
             });
 
+            ui.separator();
             widgets::card_note(ui, |ui| {
                 widgets::ltr(ui, |ui| {
-                    if ui
-                        .button(format!("{} Bericht kopieren", icon::COPY))
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if widgets::button(ui, widgets::ButtonKind::Neutral, icon::COPY, "Bericht")
+                        .on_hover_text("Den vollen Statistikbericht in die Zwischenablage")
                         .clicked()
                     {
                         ui.ctx().copy_text(self.stats.report());
                     }
-                    if ui
-                        .button(format!("{} Histogramm exportieren", icon::EXPORT))
-                        .clicked()
+                    if widgets::button(
+                        ui,
+                        widgets::ButtonKind::Neutral,
+                        icon::EXPORT,
+                        "Histogramme",
+                    )
+                    .on_hover_text("Als Datei neben die Konfiguration schreiben")
+                    .clicked()
                     {
                         let path = self.paths.config_dir.join("histograms.txt");
                         self.export_status =
@@ -708,17 +862,17 @@ impl SettingsView {
                                 Err(e) => format!("Fehlgeschlagen: {e}"),
                             });
                     }
-                    if ui
-                        .button(format!(
-                            "{} Debug-Fenster {}",
-                            icon::BUG,
-                            if self.debug_window_open {
-                                "schließen"
-                            } else {
-                                "öffnen"
-                            }
-                        ))
-                        .clicked()
+                    if widgets::button(
+                        ui,
+                        if self.debug_window_open {
+                            widgets::ButtonKind::Primary
+                        } else {
+                            widgets::ButtonKind::Neutral
+                        },
+                        icon::BUG,
+                        "Debug-Fenster",
+                    )
+                    .clicked()
                     {
                         self.debug_window_open = !self.debug_window_open;
                     }
@@ -780,6 +934,81 @@ impl SettingsView {
     }
 }
 
+/// The camera picker, fed by `crate::camera::list()`. An index the machine
+/// no longer has (a webcam that was unplugged) stays selected and shows its
+/// raw value, so a saved setting is never silently dropped.
+#[cfg(feature = "camera")]
+fn camera_combo(ui: &mut Ui, selected: &mut Option<String>, cameras: &[(u32, String)]) {
+    let current = match selected.as_deref() {
+        None => "Erste gefundene".to_string(),
+        Some("synthetic") => "Testbild".to_string(),
+        Some(id) => cameras
+            .iter()
+            .find(|(index, _)| index.to_string() == id)
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| format!("{id} (nicht vorhanden)")),
+    };
+    egui::ComboBox::from_id_salt("camera-device")
+        .selected_text(current)
+        .width(200.0)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(selected.is_none(), "Erste gefundene")
+                .clicked()
+            {
+                *selected = None;
+            }
+            for (index, name) in cameras {
+                let id = index.to_string();
+                if ui
+                    .selectable_label(selected.as_deref() == Some(id.as_str()), name)
+                    .clicked()
+                {
+                    *selected = Some(id);
+                }
+            }
+        });
+}
+
+/// Stands in for the live picture while there is none: the camera is off,
+/// or still waking up.
+#[cfg(feature = "camera")]
+fn preview_placeholder(ui: &mut Ui, width: f32, camera_on: bool) {
+    let tok = theme::tokens(ui.visuals());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(width, width * 3.0 / 4.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(theme::R_CHIP),
+        ui.visuals().extreme_bg_color,
+    );
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(theme::R_CHIP),
+        egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center() - egui::vec2(0.0, 10.0),
+        egui::Align2::CENTER_CENTER,
+        icon::VIDEO_CAMERA,
+        egui::FontId::new(24.0, egui::FontFamily::Proportional),
+        tok.dim_text,
+    );
+    painter.text(
+        rect.center() + egui::vec2(0.0, 16.0),
+        egui::Align2::CENTER_CENTER,
+        if camera_on {
+            "Kamera startet…"
+        } else {
+            "Video ist aus"
+        },
+        egui::FontId::new(11.5, egui::FontFamily::Proportional),
+        tok.dim_text,
+    );
+}
+
 /// One icon-rail entry.
 fn rail_button(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
     let tok = theme::tokens(ui.visuals());
@@ -790,12 +1019,12 @@ fn rail_button(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
         if active {
             painter.rect_filled(
                 rect,
-                egui::CornerRadius::same(8),
+                egui::CornerRadius::same(theme::R_CTRL),
                 ui.visuals().faint_bg_color,
             );
             painter.rect_stroke(
                 rect,
-                egui::CornerRadius::same(8),
+                egui::CornerRadius::same(theme::R_CTRL),
                 egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
                 egui::StrokeKind::Inside,
             );
@@ -822,7 +1051,7 @@ fn rail_button(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
 /// — each drawing a small preview of where the overlay tile stack would sit.
 fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
     let tok = theme::tokens(ui.visuals());
-    let swatch = egui::vec2(46.0, 46.0);
+    let swatch = egui::vec2(CORNER_SWATCH, CORNER_SWATCH);
     let mut button =
         |ui: &mut Ui, value: Corner, tile_rect_fn: &dyn Fn(egui::Rect) -> egui::Rect| {
             let selected = *corner == value;
@@ -831,12 +1060,12 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
                 let painter = ui.painter();
                 painter.rect_filled(
                     rect,
-                    egui::CornerRadius::same(8),
+                    egui::CornerRadius::same(theme::R_CTRL),
                     ui.visuals().extreme_bg_color,
                 );
                 painter.rect_stroke(
                     rect,
-                    egui::CornerRadius::same(8),
+                    egui::CornerRadius::same(theme::R_CTRL),
                     egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
                     egui::StrokeKind::Inside,
                 );
@@ -852,7 +1081,7 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
             }
         };
     widgets::ltr(ui, |ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.x = CORNER_GAP;
         for (value, dx, dy) in [
             (Corner::TopLeft, 0.0, 0.0),
             (Corner::TopRight, 1.0, 0.0),
@@ -868,7 +1097,7 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
                 egui::Rect::from_min_size(pos, tile)
             });
         }
-        ui.add_space(6.0);
+        ui.add_space(CORNER_SPLIT);
         for (value, dy) in [(Corner::Top, 0.0), (Corner::Bottom, 1.0)] {
             let tile = egui::vec2(30.0, 8.0);
             button(ui, value, &|rect| {
@@ -903,7 +1132,7 @@ fn theme_swatch(ui: &mut Ui, current: &mut String, value: &str, label: &str) {
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(64.0, 44.0), egui::Sense::click());
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
-            painter.rect_filled(rect, egui::CornerRadius::same(8), panel);
+            painter.rect_filled(rect, egui::CornerRadius::same(theme::R_CTRL), panel);
             let border = if selected {
                 egui::Stroke::new(2.0, accent)
             } else {
@@ -911,7 +1140,7 @@ fn theme_swatch(ui: &mut Ui, current: &mut String, value: &str, label: &str) {
             };
             painter.rect_stroke(
                 rect,
-                egui::CornerRadius::same(8),
+                egui::CornerRadius::same(theme::R_CTRL),
                 border,
                 egui::StrokeKind::Inside,
             );
@@ -983,25 +1212,29 @@ fn binding_row(
                     [92.0, 0.0],
                     egui::Label::new(RichText::new(label).size(13.5)),
                 );
-                widgets::kbd(ui, &binding.key);
-                widgets::kbd(ui, binding.trigger.as_deref().unwrap_or("—"));
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 24.0),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let is_open = expanded.contains(label);
-                        if ui
-                            .small_button(if is_open { "Fertig" } else { "Ändern" })
-                            .clicked()
-                        {
-                            if is_open {
-                                expanded.remove(label);
-                            } else {
-                                expanded.insert(label);
-                            }
+                // An unset binding shows one dash, not two empty boxes.
+                let key = if binding.key.is_empty() {
+                    "—"
+                } else {
+                    &binding.key
+                };
+                widgets::chip(ui, key, 0.0).on_hover_text("evdev-Taste");
+                if let Some(trigger) = binding.trigger.as_deref() {
+                    widgets::chip(ui, trigger, 0.0).on_hover_text("Portal-Trigger");
+                }
+                widgets::rtl(ui, 30.0, |ui| {
+                    let is_open = expanded.contains(label);
+                    if widgets::icon_button(ui, icon::PENCIL_SIMPLE, 30.0, is_open)
+                        .on_hover_text(if is_open { "Fertig" } else { "Ändern" })
+                        .clicked()
+                    {
+                        if is_open {
+                            expanded.remove(label);
+                        } else {
+                            expanded.insert(label);
                         }
-                    },
-                );
+                    }
+                });
             });
             if expanded.contains(label) {
                 ui.horizontal(|ui| {

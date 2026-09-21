@@ -6,7 +6,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::JoinHandle,
@@ -43,6 +43,34 @@ pub struct RgbFrame {
     pub height: usize,
     /// RGB8, row major.
     pub rgb: Vec<u8>,
+}
+
+/// The capture thread's latest picture. `seq` counts frames, so a viewer
+/// can tell a new picture from a repaint of the one it already uploaded —
+/// the preview is drawn at the window's frame rate, the camera delivers at
+/// [`FPS`], and without this two thirds of the texture uploads would be the
+/// same bytes again.
+#[derive(Default)]
+pub struct PreviewSlot {
+    /// The picture itself, `None` until the camera delivers one.
+    pub frame: Mutex<Option<RgbFrame>>,
+    /// Incremented once per captured picture.
+    pub seq: AtomicU64,
+}
+
+impl PreviewSlot {
+    /// Publishes a picture to whoever is watching.
+    pub fn put(&self, frame: RgbFrame) {
+        *self.frame.lock().unwrap() = Some(frame);
+        self.seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// Forgets the last picture, so a stopped camera doesn't leave a stale
+    /// still frame on screen.
+    pub fn clear(&self) {
+        *self.frame.lock().unwrap() = None;
+        self.seq.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// A source of pictures at roughly [`FPS`].
@@ -184,7 +212,7 @@ pub fn run_sender(
     mut source: Box<dyn FrameSource>,
     link: CameraLink,
     stop: Arc<AtomicBool>,
-    preview: Arc<Mutex<Option<RgbFrame>>>,
+    preview: Arc<PreviewSlot>,
 ) {
     let mut tier = link.video_tier();
     let mut enc = if tier.paused() {
@@ -211,7 +239,7 @@ pub fn run_sender(
                 continue;
             }
         };
-        *preview.lock().unwrap() = Some(frame.clone());
+        preview.put(frame.clone());
 
         let new_tier = link.video_tier();
         if new_tier != tier {
@@ -285,9 +313,7 @@ fn dimensions_match(buf: &YUVBuffer, w: usize, h: usize) -> bool {
 pub struct CameraHandle {
     link: CameraLink,
     thread: Option<(JoinHandle<()>, Arc<AtomicBool>)>,
-    preview: Arc<Mutex<Option<RgbFrame>>>,
-    #[cfg(feature = "gui")]
-    texture: Option<egui::TextureHandle>,
+    preview: Arc<PreviewSlot>,
     device: Option<String>,
 }
 
@@ -297,9 +323,7 @@ impl CameraHandle {
         CameraHandle {
             link,
             thread: None,
-            preview: Arc::new(Mutex::new(None)),
-            #[cfg(feature = "gui")]
-            texture: None,
+            preview: Arc::new(PreviewSlot::default()),
             device: None,
         }
     }
@@ -339,7 +363,7 @@ impl CameraHandle {
             stop.store(true, Ordering::Relaxed);
             let _ = thread.join();
         }
-        *self.preview.lock().unwrap() = None;
+        self.preview.clear();
     }
 
     /// Whether the thread runs.
@@ -360,32 +384,75 @@ impl CameraHandle {
         }
     }
 
-    /// Latest captured picture.
-    pub fn latest(&self) -> Option<RgbFrame> {
-        self.preview.lock().unwrap().clone()
-    }
-
-    /// Draws the preview.
-    #[cfg(feature = "gui")]
-    pub fn preview(&mut self, ui: &mut egui::Ui) {
-        if let Some(frame) = self.latest() {
-            let image = egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
-            let tex = self.texture.get_or_insert_with(|| {
-                ui.ctx().load_texture(
-                    "camera-preview",
-                    image.clone(),
-                    egui::TextureOptions::LINEAR,
-                )
-            });
-            tex.set(image, egui::TextureOptions::LINEAR);
-            ui.add(egui::Image::new((tex.id(), egui::vec2(160.0, 120.0))).corner_radius(4.0));
-        }
+    /// The slot the capture thread writes every picture into, shared so a
+    /// [`CameraPreview`] can show it without copying a frame per repaint.
+    pub fn preview_source(&self) -> Arc<PreviewSlot> {
+        self.preview.clone()
     }
 }
 
 impl Drop for CameraHandle {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Draws the camera's own picture, for the settings window: "is this the
+/// right camera, and is it pointing at me?". It owns the GPU texture, so it
+/// belongs to whoever draws rather than to [`CameraHandle`], which belongs
+/// to the capture thread and outlives any one window.
+#[cfg(feature = "gui")]
+pub struct CameraPreview {
+    slot: Arc<PreviewSlot>,
+    texture: Option<egui::TextureHandle>,
+    /// The `PreviewSlot::seq` already uploaded to [`Self::texture`].
+    shown: u64,
+}
+
+#[cfg(feature = "gui")]
+impl CameraPreview {
+    /// Reads from [`CameraHandle::preview_source`].
+    pub fn new(slot: Arc<PreviewSlot>) -> CameraPreview {
+        CameraPreview {
+            slot,
+            texture: None,
+            shown: u64::MAX,
+        }
+    }
+
+    /// Draws the latest picture into a `width`-wide 4:3 box. Returns `false`
+    /// when there is nothing to show yet — the camera is off, or still
+    /// opening (a USB webcam needs a few seconds for auto-exposure,
+    /// `Research/camera-video.md`).
+    pub fn ui(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
+        let seq = self.slot.seq.load(Ordering::Acquire);
+        if seq != self.shown {
+            self.shown = seq;
+            match self.slot.frame.lock().unwrap().as_ref() {
+                Some(frame) => {
+                    let image = egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
+                    match &mut self.texture {
+                        Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                        None => {
+                            self.texture = Some(ui.ctx().load_texture(
+                                "camera-preview",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            ))
+                        }
+                    }
+                }
+                None => self.texture = None,
+            }
+        }
+        let Some(tex) = &self.texture else {
+            return false;
+        };
+        ui.add(
+            egui::Image::new((tex.id(), egui::vec2(width, width * 3.0 / 4.0)))
+                .corner_radius(egui::CornerRadius::same(crate::ui::theme::R_CHIP)),
+        );
+        true
     }
 }
 
