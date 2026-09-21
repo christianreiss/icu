@@ -51,9 +51,10 @@ struct App {
     cmd: tokio::sync::mpsc::UnboundedSender<Command>,
     settings: Option<SettingsView>,
     debug_stats: bool,
-    /// Whether the separate debug window is still open (closed if the user
-    /// closes that window; there's no way to reopen it short of restarting
-    /// with `--debug-stats`, matching the old inline block's behavior).
+    /// Whether the separate debug window is open. Starts `true` when
+    /// `--debug-stats` was passed, otherwise toggled from the header's bug
+    /// icon; the stats refresh runs whenever either is true, not just the
+    /// CLI flag.
     debug_window_open: bool,
     last_stats: Instant,
     stats_text: String,
@@ -192,10 +193,14 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(33));
         let state = self.state_rx.borrow_and_update().clone();
 
-        if self.debug_stats && self.last_stats.elapsed() > Duration::from_secs(2) {
+        if (self.debug_stats || self.debug_window_open)
+            && self.last_stats.elapsed() > Duration::from_secs(2)
+        {
             self.last_stats = Instant::now();
             self.stats_text = self.stats.report();
-            eprintln!("{}", self.stats_text);
+            if self.debug_stats {
+                eprintln!("{}", self.stats_text);
+            }
         }
 
         if self.debug_window_open {
@@ -291,6 +296,22 @@ impl eframe::App for App {
                         };
                     }
 
+                    let bug = egui::Button::new(RichText::new(icon::BUG).size(16.0))
+                        .fill(if self.debug_window_open {
+                            ui.visuals().faint_bg_color
+                        } else {
+                            Color32::TRANSPARENT
+                        })
+                        .corner_radius(egui::CornerRadius::same(9))
+                        .min_size(egui::vec2(36.0, 36.0));
+                    if ui.add(bug).on_hover_text("Debug-Fenster").clicked() {
+                        self.debug_window_open = !self.debug_window_open;
+                        if self.debug_window_open {
+                            self.stats_text = self.stats.report();
+                            self.last_stats = Instant::now();
+                        }
+                    }
+
                     // Own outgoing video quality tier, set by
                     // `crate::quality::QualityController`. Automatic, no
                     // settings toggle (`Research/feature-freeze.md`'s bias
@@ -374,21 +395,6 @@ impl eframe::App for App {
             });
 
             ui.add_space(6.0);
-            let mut mode_choice = state.mode;
-            if widgets::segmented(
-                ui,
-                &mut mode_choice,
-                &[
-                    (Mode::Ptt, "Push-to-Talk"),
-                    (Mode::Vad, "Sprachaktivierung"),
-                ],
-            )
-            .changed()
-            {
-                self.send(Command::ToggleMode);
-            }
-
-            ui.add_space(6.0);
             let ptt_hint = format!("{} halten", state.settings.hotkeys.ptt.key);
             let (label, fill, text_color) = match (state.mode, state.ptt_down) {
                 (Mode::Ptt, true) => (
@@ -407,11 +413,28 @@ impl eframe::App for App {
                     tok.muted_text,
                 ),
             };
-            let btn = egui::Button::new(RichText::new(label).color(text_color))
-                .fill(fill)
-                .corner_radius(egui::CornerRadius::same(11))
-                .min_size(egui::vec2(ui.available_width(), 46.0));
-            let ptt = ui.add(btn);
+            // Right-to-left: the small PTT/VAD toggle claims its natural
+            // width first (rightmost), then the speak button fills whatever
+            // remains to its left — avoids guessing the toggle's width.
+            let ptt = ui
+                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut mode_choice = state.mode;
+                    if widgets::segmented(
+                        ui,
+                        &mut mode_choice,
+                        &[(Mode::Ptt, "PTT"), (Mode::Vad, "VAD")],
+                    )
+                    .changed()
+                    {
+                        self.send(Command::ToggleMode);
+                    }
+                    let btn = egui::Button::new(RichText::new(label).color(text_color))
+                        .fill(fill)
+                        .corner_radius(egui::CornerRadius::same(11))
+                        .min_size(egui::vec2(ui.available_width(), 46.0));
+                    ui.add(btn)
+                })
+                .inner;
             if state.mode == Mode::Ptt {
                 ptt.clone().on_hover_ui(|ui| {
                     widgets::kbd(ui, &ptt_hint);

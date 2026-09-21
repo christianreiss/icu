@@ -141,6 +141,7 @@ mod tests {
         ctx.begin_pass(egui::RawInput::default()); // materializes the fonts
 
         for icon in [
+            egui_phosphor::regular::BUG,
             egui_phosphor::regular::COPY,
             egui_phosphor::regular::EXPORT,
             egui_phosphor::regular::GEAR_FINE,
