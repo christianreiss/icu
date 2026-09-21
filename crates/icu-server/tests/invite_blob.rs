@@ -22,6 +22,15 @@ fn common_name(der: &[u8]) -> String {
 }
 
 /// Mints an invite blob as the given already-connected admin client.
+/// Enrolls and connects the bootstrap admin, the starting point of every test
+/// in this file.
+async fn admin_client(server: &TestServer) -> common::Client {
+    let identity = server.enroll_with_token("", "admin").await.unwrap();
+    let mut admin = server.connect(&identity).await.expect("connect");
+    admin.hello("admin").await;
+    admin
+}
+
 async fn mint(client: &mut common::Client, name: &str, ttl_s: u64) -> (String, String) {
     client
         .send_msg(&ControlMsg::CreateInviteRequest {
@@ -42,9 +51,7 @@ async fn mint(client: &mut common::Client, name: &str, ttl_s: u64) -> (String, S
 #[tokio::test]
 async fn a_blob_from_an_admin_enrolls_a_second_client_with_the_invite_cn() {
     let server = TestServer::start().await;
-    let admin_identity = server.enroll_with_token("", "admin").await.unwrap();
-    let mut admin = server.connect(&admin_identity).await.expect("connect");
-    admin.hello("admin").await;
+    let mut admin = admin_client(&server).await;
 
     let (blob, _expires) = mint(&mut admin, "invited-person", 0).await;
     let body = blob
@@ -66,9 +73,7 @@ async fn a_blob_from_an_admin_enrolls_a_second_client_with_the_invite_cn() {
 #[tokio::test]
 async fn tampering_with_the_sealed_token_is_rejected() {
     let server = TestServer::start().await;
-    let admin_identity = server.enroll_with_token("", "admin").await.unwrap();
-    let mut admin = server.connect(&admin_identity).await.expect("connect");
-    admin.hello("admin").await;
+    let mut admin = admin_client(&server).await;
 
     let (blob, _) = mint(&mut admin, "invited-person", 0).await;
     let mut parsed = InviteBlob::decode(&blob).expect("decode");
@@ -86,9 +91,7 @@ async fn tampering_with_the_sealed_token_is_rejected() {
 #[tokio::test]
 async fn tampering_with_the_nonce_is_rejected() {
     let server = TestServer::start().await;
-    let admin_identity = server.enroll_with_token("", "admin").await.unwrap();
-    let mut admin = server.connect(&admin_identity).await.expect("connect");
-    admin.hello("admin").await;
+    let mut admin = admin_client(&server).await;
 
     let (blob, _) = mint(&mut admin, "invited-person", 0).await;
     let mut parsed = InviteBlob::decode(&blob).expect("decode");
@@ -106,9 +109,7 @@ async fn tampering_with_the_nonce_is_rejected() {
 #[tokio::test]
 async fn an_expired_blob_is_rejected() {
     let server = TestServer::start().await;
-    let admin_identity = server.enroll_with_token("", "admin").await.unwrap();
-    let mut admin = server.connect(&admin_identity).await.expect("connect");
-    admin.hello("admin").await;
+    let mut admin = admin_client(&server).await;
 
     let (blob, _) = mint(&mut admin, "invited-person", 1).await;
     tokio::time::sleep(Duration::from_secs(2)).await;

@@ -13,7 +13,7 @@ use ring::aead;
 
 use crate::{
     error::{Error, Result},
-    store,
+    store::{self, encode_hex},
 };
 
 const INVITE_KEY_FILE: &str = "invite.key";
@@ -85,14 +85,6 @@ impl InviteKey {
         String::from_utf8(opened.to_vec())
             .map_err(|_| Error::coded(ec::ENROLL_BAD_TOKEN, "invite blob payload is not utf8"))
     }
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {

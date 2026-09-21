@@ -246,7 +246,7 @@ pub fn run_sender(
 
         let src = RgbSliceU8::new(&frame.rgb, (frame.width, frame.height));
         match yuv.as_mut() {
-            Some(buf) if buf.dimensions_match(frame.width, frame.height) => buf.read_rgb(src),
+            Some(buf) if dimensions_match(buf, frame.width, frame.height) => buf.read_rgb(src),
             _ => yuv = Some(YUVBuffer::from_rgb_source(src)),
         }
         let Some(buf) = yuv.as_ref() else { continue };
@@ -274,15 +274,10 @@ pub fn run_sender(
     }
 }
 
-trait DimsMatch {
-    fn dimensions_match(&self, w: usize, h: usize) -> bool;
-}
-
-impl DimsMatch for YUVBuffer {
-    fn dimensions_match(&self, w: usize, h: usize) -> bool {
-        use openh264::formats::YUVSource;
-        self.dimensions() == (w, h)
-    }
+/// Whether `buf` is already the right size to be overwritten in place.
+fn dimensions_match(buf: &YUVBuffer, w: usize, h: usize) -> bool {
+    use openh264::formats::YUVSource;
+    buf.dimensions() == (w, h)
 }
 
 /// Owns the camera thread; started/stopped from the UI according to

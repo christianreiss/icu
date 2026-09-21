@@ -12,7 +12,7 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const BLOCK_SAMPLES: usize = 240;
 
 /// Which side of the graph a device sits on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeviceKind {
     /// Microphone or other capture source.
     Input,

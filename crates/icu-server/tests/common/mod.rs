@@ -8,8 +8,10 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use icu_proto::{
-    header::VIDEO_HEADER_LEN, AudioHeader, ControlMsg, Session, UserFlags, UserId, VideoHeader,
-    MAX_CONTROL_FRAME, MAX_ENROLL_FRAME,
+    framing,
+    header::{VIDEO_HEADER_LEN, VIDEO_MAX_FRAME},
+    AudioHeader, ControlMsg, Session, UserFlags, UserId, VideoHeader, MAX_CONTROL_FRAME,
+    MAX_ENROLL_FRAME,
 };
 use icu_server::{config::Config, AdminRequest, AdminResponse, Handle};
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream};
@@ -49,6 +51,14 @@ impl TestServer {
     /// The CA certificate.
     pub fn ca(&self) -> CertificateDer<'static> {
         CertificateDer::from(self.handle.ca_der())
+    }
+
+    /// The admin socket path.
+    pub fn socket(&self) -> std::path::PathBuf {
+        self.handle
+            .admin_socket()
+            .expect("the admin socket is up")
+            .to_path_buf()
     }
 
     /// Creates an invite token through the admin path.
@@ -331,7 +341,10 @@ impl Client {
             .await
             .ok()?
             .ok()?;
-        let frame = recv.read_to_end(1024 * 1024).await.ok()?;
+        let frame = recv
+            .read_to_end(VIDEO_HEADER_LEN + VIDEO_MAX_FRAME)
+            .await
+            .ok()?;
         let header = VideoHeader::decode(&frame).ok()?;
         Some((header, frame[VIDEO_HEADER_LEN..].to_vec()))
     }
@@ -403,7 +416,9 @@ pub fn client_endpoint(
     ));
     transport.datagram_receive_buffer_size(Some(icu_proto::limits::DATAGRAM_BUFFER_BYTES));
     transport.datagram_send_buffer_size(icu_proto::limits::DATAGRAM_BUFFER_BYTES);
-    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(36));
+    transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(
+        icu_proto::limits::max_uni_streams(icu_proto::limits::DEFAULT_MAX_USERS),
+    ));
     config.transport_config(Arc::new(transport));
     endpoint.set_default_client_config(config);
     endpoint
@@ -434,25 +449,15 @@ pub async fn connect_with(
 
 /// Reads one length prefixed frame.
 pub async fn read_frame(recv: &mut RecvStream, max: usize) -> Result<Vec<u8>, String> {
-    let mut prefix = [0u8; 2];
+    let mut prefix = [0u8; framing::LEN_PREFIX];
     recv.read_exact(&mut prefix)
         .await
         .map_err(|e| e.to_string())?;
-    let len = u16::from_le_bytes(prefix) as usize;
-    if len == 0 || len > max {
-        return Err(format!("bad frame length {len}"));
-    }
+    let len = framing::frame_len(prefix);
+    framing::check_len(len, max).map_err(|e| e.to_string())?;
     let mut body = vec![0u8; len];
     recv.read_exact(&mut body)
         .await
         .map_err(|e| e.to_string())?;
     Ok(body)
-}
-
-/// Extracts the `users` field of a `Welcome`.
-pub fn welcome_users(msg: &ControlMsg) -> Vec<icu_proto::UserInfo> {
-    match msg {
-        ControlMsg::Welcome { users, .. } => users.clone(),
-        other => panic!("not a Welcome: {other:?}"),
-    }
 }

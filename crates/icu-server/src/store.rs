@@ -62,14 +62,19 @@ pub fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// SHA-256 over a certificate DER, lowercase hex without separators.
-pub fn fingerprint(der: &[u8]) -> String {
-    let digest = Sha256::digest(der);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+/// Lowercase hex without separators.
+pub fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
     }
     out
+}
+
+/// SHA-256 over a certificate DER, lowercase hex without separators.
+pub fn fingerprint(der: &[u8]) -> String {
+    encode_hex(&Sha256::digest(der))
 }
 
 /// One issued certificate of a user.
@@ -108,6 +113,14 @@ pub struct UserRecord {
     /// re-enrollment.
     #[serde(default)]
     pub disabled: bool,
+}
+
+impl UserRecord {
+    /// Whether every certificate this user ever had is revoked. A user with
+    /// no certificate at all is not "revoked", it never had one.
+    pub fn is_revoked(&self) -> bool {
+        !self.certs.is_empty() && self.certs.iter().all(|c| c.revoked)
+    }
 }
 
 /// `users.toml`
@@ -235,6 +248,15 @@ impl Store {
         self.users.users.get(&id.to_string())
     }
 
+    /// Looks a user up by id for mutation. The `BTreeMap` key is the decimal
+    /// `user_id`; this is the only place that encoding is spelled out.
+    fn user_mut(&mut self, id: UserId) -> Result<&mut UserRecord> {
+        self.users
+            .users
+            .get_mut(&id.to_string())
+            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))
+    }
+
     /// Whether `id` is an admin. `false` for an unknown id.
     pub fn is_admin(&self, id: UserId) -> bool {
         self.user(id).map(|u| u.is_admin).unwrap_or(false)
@@ -338,11 +360,7 @@ impl Store {
     /// Appends another certificate to an existing user (renewal). The older
     /// certificate stays valid until it expires.
     pub fn add_cert(&mut self, id: UserId, cert: CertRecord, renewal: bool) -> Result<()> {
-        let record = self
-            .users
-            .users
-            .get_mut(&id.to_string())
-            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
+        let record = self.user_mut(id)?;
         record.certs.push(cert);
         if renewal {
             record.last_renew = Some(rfc3339(now()));
@@ -361,11 +379,7 @@ impl Store {
     /// the last remaining functional admin.
     pub fn revoke(&mut self, id: UserId) -> Result<bool> {
         self.guard_last_admin(id)?;
-        let record = self
-            .users
-            .users
-            .get_mut(&id.to_string())
-            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
+        let record = self.user_mut(id)?;
         let mut changed = false;
         for cert in &mut record.certs {
             if !cert.revoked {
@@ -414,11 +428,7 @@ impl Store {
         if !is_admin {
             self.guard_last_admin(id)?;
         }
-        let record = self
-            .users
-            .users
-            .get_mut(&id.to_string())
-            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
+        let record = self.user_mut(id)?;
         let changed = record.is_admin != is_admin;
         record.is_admin = is_admin;
         if changed {
@@ -436,11 +446,7 @@ impl Store {
         if disabled {
             self.guard_last_admin(id)?;
         }
-        let record = self
-            .users
-            .users
-            .get_mut(&id.to_string())
-            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
+        let record = self.user_mut(id)?;
         let changed = record.disabled != disabled;
         record.disabled = disabled;
         if changed {
@@ -456,11 +462,7 @@ impl Store {
         if self.name_taken(new, Some(id)) {
             return Err(Error::coded(ec::NAME_TAKEN, format!("name {new:?} taken")));
         }
-        let record = self
-            .users
-            .users
-            .get_mut(&id.to_string())
-            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
+        let record = self.user_mut(id)?;
         record.name = new.to_string();
         self.save_users()
     }
@@ -600,15 +602,23 @@ fn load_or_default<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Resul
 }
 
 /// Writes `contents` atomically: temp file in the same directory, fsync,
-/// rename (`Server/IMPLEMENTATION.md` §4).
-pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+/// rename, fsync of the directory (`Server/IMPLEMENTATION.md` §4). `mode` is
+/// the permission bits of the temp file, and therefore of the result.
+fn write_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = dir.join(format!(
         ".{}.tmp",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("state")
     ));
     {
-        let mut file = File::create(&tmp).context(format!("cannot create {}", tmp.display()))?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&tmp)
+            .context(format!("cannot create {}", tmp.display()))?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
     }
@@ -619,26 +629,14 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// Writes a private file with mode 0600.
+/// Writes a world-readable file atomically.
+pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    write_mode(path, contents, 0o644)
+}
+
+/// Writes a private file with mode 0600, atomically.
 pub fn write_private(path: &Path, contents: &str) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(
-        ".{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("key")
-    ));
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    write_mode(path, contents, 0o600)
 }
 
 #[cfg(test)]
@@ -705,7 +703,10 @@ mod tests {
         let bob = s.add_user("bob", cert("bb"), false).unwrap();
         assert!(s.set_admin(bob, true).unwrap());
         assert!(s.is_admin(bob));
-        assert!(!s.set_admin(bob, true).unwrap(), "no-op is reported as unchanged");
+        assert!(
+            !s.set_admin(bob, true).unwrap(),
+            "no-op is reported as unchanged"
+        );
         assert!(s.set_admin(bob, false).unwrap());
         assert!(!s.is_admin(bob));
         drop(s);
@@ -724,7 +725,10 @@ mod tests {
         let bob = s.add_user("bob", cert("bb"), false).unwrap();
         assert!(s.set_disabled(bob, true).unwrap());
         assert!(s.user(bob).unwrap().disabled);
-        assert!(!s.user(bob).unwrap().certs[0].revoked, "disable is not revoke");
+        assert!(
+            !s.user(bob).unwrap().certs[0].revoked,
+            "disable is not revoke"
+        );
         assert!(s.set_disabled(bob, false).unwrap());
         assert!(!s.user(bob).unwrap().disabled);
         assert!(s.is_admin(alice), "unaffected");

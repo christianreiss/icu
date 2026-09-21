@@ -11,23 +11,29 @@ use icu_proto::{ControlMsg, UserFlags};
 use icu_server::room::Counters;
 
 /// §10: video relay with the `speaker` field set.
+/// Turns the camera on and waits for the server to echo the flag back, which
+/// is the point from which the relay accepts video from this sender.
+async fn camera_on(client: &mut common::Client, session: icu_proto::Session) {
+    client
+        .send_msg(&ControlMsg::SetState {
+            flags: UserFlags(UserFlags::CAMERA_ON),
+        })
+        .await;
+    client
+        .recv_matching(
+            |m| matches!(m, ControlMsg::UserState { session: s, flags } if *s == session && flags.camera_on()),
+        )
+        .await
+        .expect("camera on");
+}
+
 #[tokio::test]
 async fn video_reaches_the_other_clients_with_the_speaker_set() {
     let server = TestServer::start().await;
     let mut alice = server.client("alice").await;
     let bob = server.client("bob").await;
 
-    alice
-        .send_msg(&ControlMsg::SetState {
-            flags: UserFlags(UserFlags::CAMERA_ON),
-        })
-        .await;
-    alice
-        .recv_matching(
-            |m| matches!(m, ControlMsg::UserState { session: 1, flags } if flags.camera_on()),
-        )
-        .await
-        .expect("camera on");
+    camera_on(&mut alice, 1).await;
 
     alice.send_video(3, 1920, true, &[0x42; 200]).await;
     let (header, payload) = bob.recv_video(SOON).await.expect("the frame arrives");
@@ -58,17 +64,7 @@ async fn video_without_camera_on_is_dropped() {
 async fn a_video_frame_without_receivers_is_drained() {
     let server = TestServer::start().await;
     let mut alice = server.client("alice").await;
-    alice
-        .send_msg(&ControlMsg::SetState {
-            flags: UserFlags(UserFlags::CAMERA_ON),
-        })
-        .await;
-    alice
-        .recv_matching(
-            |m| matches!(m, ControlMsg::UserState { session: 1, flags } if flags.camera_on()),
-        )
-        .await
-        .expect("camera on");
+    camera_on(&mut alice, 1).await;
 
     // More frames than `max_concurrent_uni_streams` would allow if they were
     // left open: this only completes because every stream is drained.
@@ -95,17 +91,7 @@ async fn video_over_the_frame_rate_limit_is_dropped() {
     .await;
     let mut alice = server.client("alice").await;
     let bob = server.client("bob").await;
-    alice
-        .send_msg(&ControlMsg::SetState {
-            flags: UserFlags(UserFlags::CAMERA_ON),
-        })
-        .await;
-    alice
-        .recv_matching(
-            |m| matches!(m, ControlMsg::UserState { session: 1, flags } if flags.camera_on()),
-        )
-        .await
-        .expect("camera on");
+    camera_on(&mut alice, 1).await;
 
     for seq in 0..12u16 {
         alice
@@ -208,17 +194,7 @@ async fn no_congestion_sends_no_video_congestion_hint() {
     let mut alice = server.client("alice").await;
     let bob = server.client("bob").await;
 
-    alice
-        .send_msg(&ControlMsg::SetState {
-            flags: UserFlags(UserFlags::CAMERA_ON),
-        })
-        .await;
-    alice
-        .recv_matching(
-            |m| matches!(m, ControlMsg::UserState { session: 1, flags } if flags.camera_on()),
-        )
-        .await
-        .expect("camera on");
+    camera_on(&mut alice, 1).await;
 
     // Every frame is read promptly, so nothing is ever displaced; span more
     // than one 2 s aggregation window (`icu_proto::limits::

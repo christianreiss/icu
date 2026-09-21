@@ -35,8 +35,6 @@ pub struct Tokens {
     pub error_tint: Color32,
     /// Warning banner tint surface.
     pub warning_tint: Color32,
-    /// Success banner tint surface (unused today, kept for completeness).
-    pub success_tint: Color32,
     /// Level meter fill.
     pub level: Color32,
     /// Level meter near/at 0 dBFS (top segments) — same value as [`Self::error`].
@@ -60,7 +58,6 @@ pub fn tokens(visuals: &Visuals) -> Tokens {
             error: Color32::from_rgb(0xe5, 0x56, 0x5b),
             error_tint: Color32::from_rgb(0x22, 0x12, 0x14),
             warning_tint: Color32::from_rgb(0x20, 0x19, 0x0d),
-            success_tint: Color32::from_rgb(0x0f, 0x1e, 0x19),
             level: Color32::from_rgb(0x58, 0xc0, 0x89),
             level_clip: Color32::from_rgb(0xe5, 0x56, 0x5b),
             muted_text: Color32::from_rgb(0xa2, 0xa9, 0xb8),
@@ -77,7 +74,6 @@ pub fn tokens(visuals: &Visuals) -> Tokens {
             error: Color32::from_rgb(0xc0, 0x34, 0x2f),
             error_tint: Color32::from_rgb(0xfb, 0xec, 0xeb),
             warning_tint: Color32::from_rgb(0xfb, 0xf1, 0xdf),
-            success_tint: Color32::from_rgb(0xe6, 0xf3, 0xec),
             level: Color32::from_rgb(0x2c, 0x9a, 0x63),
             level_clip: Color32::from_rgb(0xc0, 0x34, 0x2f),
             muted_text: Color32::from_rgb(0x4e, 0x57, 0x66),

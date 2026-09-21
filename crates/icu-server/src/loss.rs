@@ -44,7 +44,7 @@ impl LossTracker {
     ) -> Option<u16> {
         self.reports
             .insert((speaker, reporter), (loss_permille, now));
-        self.recompute(speaker, ttl, now)
+        self.recompute(speaker, Some(ttl), now)
     }
 
     /// Drops expired reports and returns every hint that changed as a result.
@@ -65,7 +65,7 @@ impl LossTracker {
         touched
             .into_iter()
             .filter_map(|speaker| {
-                self.recompute(speaker, ttl, now)
+                self.recompute(speaker, Some(ttl), now)
                     .map(|value| (speaker, value))
             })
             .collect()
@@ -86,24 +86,22 @@ impl LossTracker {
             keep
         });
         self.sent.remove(&session);
-        let ttl = Duration::from_secs(u64::MAX / 2);
+        let now = Instant::now();
         touched
             .into_iter()
-            .filter_map(|speaker| {
-                self.recompute(speaker, ttl, Instant::now())
-                    .map(|value| (speaker, value))
-            })
+            .filter_map(|speaker| self.recompute(speaker, None, now).map(|v| (speaker, v)))
             .collect()
     }
 
     /// The maximum live report for a speaker, or `None` when it did not change
-    /// since the last hint.
-    fn recompute(&mut self, speaker: Session, ttl: Duration, now: Instant) -> Option<u16> {
+    /// since the last hint. `ttl` of `None` counts every report regardless of
+    /// age, for callers that have just pruned the map themselves.
+    fn recompute(&mut self, speaker: Session, ttl: Option<Duration>, now: Instant) -> Option<u16> {
         let max = self
             .reports
             .iter()
             .filter(|((s, _), (_, when))| {
-                *s == speaker && now.saturating_duration_since(*when) < ttl
+                *s == speaker && ttl.is_none_or(|ttl| now.saturating_duration_since(*when) < ttl)
             })
             .map(|(_, (value, _))| *value)
             .max()

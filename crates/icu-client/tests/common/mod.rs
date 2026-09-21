@@ -137,10 +137,6 @@ pub struct RawClient {
 }
 
 impl RawClient {
-    pub fn session_id(&self) -> icu_proto::Session {
-        self.session.welcome.you.session
-    }
-
     pub async fn send(&mut self, msg: &ControlMsg) {
         conn::write_msg(&mut self.session.send, msg)
             .await
@@ -181,7 +177,10 @@ impl RawClient {
             .await
             .ok()?
             .ok()?;
-        let frame = recv.read_to_end(1024 * 1024).await.ok()?;
+        let frame = recv
+            .read_to_end(icu_proto::header::VIDEO_HEADER_LEN + icu_proto::header::VIDEO_MAX_FRAME)
+            .await
+            .ok()?;
         let header = icu_proto::VideoHeader::decode(&frame).ok()?;
         Some((
             header,

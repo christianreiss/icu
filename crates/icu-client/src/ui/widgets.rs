@@ -250,14 +250,14 @@ pub fn avatar(
 
 /// Five static accent bars indicating "currently speaking". Always
 /// allocates its footprint so rows don't reflow when this toggles.
-pub fn speaking_bars(ui: &mut Ui, speaking: bool) -> egui::Response {
+pub fn speaking_bars(ui: &mut Ui) -> egui::Response {
     const HEIGHTS: [f32; 5] = [5.0, 11.0, 7.0, 13.0, 6.0];
     let w = 2.0;
     let gap = 2.0;
     let total_w = HEIGHTS.len() as f32 * w + (HEIGHTS.len() as f32 - 1.0) * gap;
     let max_h = 13.0;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(total_w, max_h), Sense::hover());
-    if ui.is_rect_visible(rect) && speaking {
+    if ui.is_rect_visible(rect) {
         let tok = theme::tokens(ui.visuals());
         let painter = ui.painter();
         let mut x = rect.left();
@@ -331,13 +331,12 @@ pub enum BannerKind {
 
 /// A dismissible (or not) inline banner. Replaces the old plain
 /// `colored_label` + `small_button` pattern.
-pub fn banner<F1: FnOnce(), F2: FnOnce()>(
+pub fn banner<F: FnOnce()>(
     ui: &mut Ui,
     kind: BannerKind,
     title: &str,
     body: &str,
-    action: Option<(&str, F1)>,
-    on_dismiss: Option<F2>,
+    on_dismiss: Option<F>,
 ) {
     let tok = theme::tokens(ui.visuals());
     let (fill, color, glyph) = match kind {
@@ -360,11 +359,6 @@ pub fn banner<F1: FnOnce(), F2: FnOnce()>(
                             .font(FontId::new(12.5, super::fonts::semibold())),
                     );
                     ui.label(RichText::new(body).size(12.0).color(tok.muted_text));
-                    if let Some((label, run)) = action {
-                        if ui.button(label).clicked() {
-                            run();
-                        }
-                    }
                 });
                 if let Some(dismiss) = on_dismiss {
                     ui.allocate_ui_with_layout(

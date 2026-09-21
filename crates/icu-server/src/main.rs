@@ -112,18 +112,36 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Invite { name, ttl } => cli::invite::run(&config, &name, &ttl).await,
         Command::Users { json } => cli::users::run(&config, json).await,
-        Command::Revoke { user } => cli::revoke::run(&config, &user).await,
-        Command::Rename { user, new } => cli::rename::run(&config, &user, &new).await,
-        Command::Promote { user } => cli::promote::run(&config, &user).await,
-        Command::Demote { user } => cli::demote::run(&config, &user).await,
-        Command::Disable { user } => cli::disable::run(&config, &user).await,
-        Command::Enable { user } => cli::enable::run(&config, &user).await,
+        Command::Revoke { user } => {
+            cli::with_closed(&config, AdminRequest::Revoke { user }, "revoked").await
+        }
+        Command::Rename { user, new } => {
+            let done = format!("renamed {user} to {new}");
+            cli::simple(&config, AdminRequest::Rename { user, new }, &done).await
+        }
+        Command::Promote { user } => {
+            let done = format!("promoted {user} to admin");
+            cli::simple(&config, AdminRequest::Promote { user }, &done).await
+        }
+        Command::Demote { user } => {
+            let done = format!("demoted {user}");
+            cli::simple(&config, AdminRequest::Demote { user }, &done).await
+        }
+        Command::Disable { user } => {
+            cli::with_closed(&config, AdminRequest::Disable { user }, "disabled").await
+        }
+        Command::Enable { user } => {
+            let done = format!("enabled {user}");
+            cli::simple(&config, AdminRequest::Enable { user }, &done).await
+        }
         Command::Status { json } => cli::status::run(&config, json).await,
         Command::RotateServerCert => {
-            let value = cli::dispatch(&config, AdminRequest::RotateServerCert).await?;
-            cli::require_ok(&value)?;
-            println!("new server certificate issued; restart the server to present it");
-            Ok(())
+            cli::simple(
+                &config,
+                AdminRequest::RotateServerCert,
+                "new server certificate issued; restart the server to present it",
+            )
+            .await
         }
     }
 }

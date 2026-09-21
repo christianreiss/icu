@@ -31,22 +31,12 @@ pub struct FakeProbe {
 #[derive(Default)]
 struct ProbeInner {
     played: Vec<f32>,
-    captured_blocks: u64,
-    played_blocks: u64,
 }
 
 impl FakeProbe {
     /// Everything the playback callback produced so far.
     pub fn played(&self) -> Vec<f32> {
         self.inner.lock().unwrap().played.clone()
-    }
-    /// Number of capture blocks delivered.
-    pub fn captured_blocks(&self) -> u64 {
-        self.inner.lock().unwrap().captured_blocks
-    }
-    /// Number of playback blocks pulled.
-    pub fn played_blocks(&self) -> u64 {
-        self.inner.lock().unwrap().played_blocks
     }
     /// Drops collected playback samples.
     pub fn clear(&self) {
@@ -139,15 +129,15 @@ fn run(shared: Arc<Shared>) {
         }
         // Playback first, so the reference (monitor) sees this block.
         out.fill(0.0);
-        let mut any_playback = false;
         if let Some(cb) = shared.playback.lock().unwrap().as_mut() {
             cb(&mut out);
-            any_playback = true;
-        }
-        if any_playback {
-            let mut p = shared.probe.inner.lock().unwrap();
-            p.played.extend_from_slice(&out);
-            p.played_blocks += 1;
+            shared
+                .probe
+                .inner
+                .lock()
+                .unwrap()
+                .played
+                .extend_from_slice(&out);
         }
         if let Some(cb) = shared.reference.lock().unwrap().as_mut() {
             if shared.loop_reference {
@@ -164,7 +154,6 @@ fn run(shared: Arc<Shared>) {
                 block.fill(0.0);
             }
             cb(&block);
-            shared.probe.inner.lock().unwrap().captured_blocks += 1;
         }
         tick += 1;
     }

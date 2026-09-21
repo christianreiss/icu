@@ -190,16 +190,6 @@ pub fn ts_diff(a: u32, b: u32) -> i32 {
     a.wrapping_sub(b) as i32
 }
 
-/// Whether `a` is newer than `b` in `seq` order.
-pub fn seq_after(a: u16, b: u16) -> bool {
-    seq_diff(a, b) > 0
-}
-
-/// Whether `a` is newer than `b` in `ts` order.
-pub fn ts_after(a: u32, b: u32) -> bool {
-    ts_diff(a, b) > 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,14 +343,14 @@ mod tests {
         assert_eq!(seq_diff(0, u16::MAX), 1, "0 follows 65535");
         assert_eq!(seq_diff(u16::MAX, 0), -1);
         assert_eq!(seq_diff(5, u16::MAX - 4), 10);
-        assert!(seq_after(3, u16::MAX));
-        assert!(!seq_after(u16::MAX, 3));
+        assert!(seq_diff(3, u16::MAX) > 0);
+        assert!(seq_diff(u16::MAX, 3) <= 0);
         assert_eq!(seq_diff(7, 7), 0);
-        assert!(!seq_after(7, 7));
+        assert!(seq_diff(7, 7) <= 0);
         // Exactly half the range: 0x8000 is the ambiguous point and comes out
         // negative, which is the documented "step backwards" reading.
         assert_eq!(seq_diff(0x8000, 0), i16::MIN);
-        assert!(!seq_after(0x8000, 0));
+        assert!(seq_diff(0x8000, 0) <= 0);
     }
 
     #[test]
@@ -369,10 +359,10 @@ mod tests {
         assert_eq!(ts_diff(960, 0), 960);
         assert_eq!(ts_diff(0, 960), -960);
         assert_eq!(ts_diff(479, u32::MAX - 480), 960, "960 samples across wrap");
-        assert!(ts_after(479, u32::MAX - 480));
-        assert!(!ts_after(u32::MAX - 480, 479));
+        assert!(ts_diff(479, u32::MAX - 480) > 0);
+        assert!(ts_diff(u32::MAX - 480, 479) <= 0);
         assert_eq!(ts_diff(0x8000_0000, 0), i32::MIN);
-        assert!(!ts_after(0x8000_0000, 0));
+        assert!(ts_diff(0x8000_0000, 0) <= 0);
     }
 
     /// A full talk spurt across the seq wrap stays gapless.

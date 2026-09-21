@@ -6,13 +6,7 @@
 //! refused — does the CLI open the state itself, holding
 //! `flock(state.lock)` while it does.
 
-pub mod demote;
-pub mod disable;
-pub mod enable;
 pub mod invite;
-pub mod promote;
-pub mod rename;
-pub mod revoke;
 pub mod status;
 pub mod users;
 
@@ -49,4 +43,25 @@ pub fn require_ok(value: &serde_json::Value) -> Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     Err(crate::Error::msg(format!("{error}: {detail}")))
+}
+
+/// Runs an admin command whose only output is a confirmation line.
+pub async fn simple(config: &Config, request: AdminRequest, done: &str) -> Result<()> {
+    let value = dispatch(config, request).await?;
+    require_ok(&value)?;
+    println!("{done}");
+    Ok(())
+}
+
+/// Runs an admin command that also reports how many live connections it
+/// closed (`disable`, `revoke`).
+pub async fn with_closed(config: &Config, request: AdminRequest, verb: &str) -> Result<()> {
+    let value = dispatch(config, request).await?;
+    require_ok(&value)?;
+    println!(
+        "{verb} user_id {}, closed {} connection(s)",
+        value.get("user_id").and_then(|v| v.as_u64()).unwrap_or(0),
+        value.get("closed").and_then(|v| v.as_u64()).unwrap_or(0)
+    );
+    Ok(())
 }

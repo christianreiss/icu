@@ -53,11 +53,6 @@ pub fn validate_name(name: &str) -> Result<(), NameError> {
     Ok(())
 }
 
-/// Case-insensitive name comparison, as used for server wide uniqueness.
-pub fn name_eq_ci(a: &str, b: &str) -> bool {
-    name_key(a) == name_key(b)
-}
-
 /// Normalized lookup key for the case-insensitive uniqueness check.
 pub fn name_key(name: &str) -> String {
     name.to_lowercase()
@@ -268,10 +263,10 @@ mod tests {
     }
 
     #[test]
-    fn name_comparison_is_case_insensitive() {
-        assert!(name_eq_ci("Alice", "alice"));
-        assert!(name_eq_ci("ÄRGER", "ärger"));
-        assert!(!name_eq_ci("alice", "alicia"));
+    fn name_keys_are_case_insensitive() {
+        assert_eq!(name_key("Alice"), name_key("alice"));
+        assert_eq!(name_key("ÄRGER"), name_key("ärger"));
+        assert_ne!(name_key("alice"), name_key("alicia"));
     }
 
     #[test]

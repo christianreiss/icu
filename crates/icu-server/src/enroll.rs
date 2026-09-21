@@ -53,11 +53,7 @@ pub async fn handle(
     match run(&server, remote, &mut send, &mut recv).await {
         Ok(()) => {
             Counters::inc(&server.counters.enroll_ok);
-            let _ = send.finish();
-            // `close()` discards unacknowledged stream data, so wait until the
-            // peer has it (A5: for "delivered" one awaits `stopped()`).
-            let _ = tokio::time::timeout(FLUSH_TIMEOUT, send.stopped()).await;
-            conn.close(quinn::VarInt::from_u32(ec::NO_ERROR), b"");
+            finish_and_close(&conn, &mut send, ec::NO_ERROR, b"").await;
             Ok(())
         }
         Err(e) => {
@@ -74,12 +70,26 @@ pub async fn handle(
             if let Ok(frame) = msg.encode() {
                 let _ = wire::write_frame(&mut send, &frame).await;
             }
-            let _ = send.finish();
-            let _ = tokio::time::timeout(FLUSH_TIMEOUT, send.stopped()).await;
-            conn.close(quinn::VarInt::from_u32(code), ec::name(code).as_bytes());
+            finish_and_close(&conn, &mut send, code, ec::name(code).as_bytes()).await;
             Err(e)
         }
     }
+}
+
+/// Ends the enrollment stream the way `PROTOCOL.md` §2.3 requires: finish the
+/// stream, wait for the peer to have the bytes, only then close the
+/// connection with `code`. `close()` discards unacknowledged stream data, so
+/// without the flush the client sees a bare number instead of the message
+/// (A5: for "delivered" one awaits `stopped()`).
+async fn finish_and_close(
+    conn: &quinn::Connection,
+    send: &mut quinn::SendStream,
+    code: u32,
+    reason: &[u8],
+) {
+    let _ = send.finish();
+    let _ = tokio::time::timeout(FLUSH_TIMEOUT, send.stopped()).await;
+    conn.close(quinn::VarInt::from_u32(code), reason);
 }
 
 async fn run(

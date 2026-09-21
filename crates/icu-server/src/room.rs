@@ -149,7 +149,7 @@ impl Room {
         self.lock().members.len()
     }
 
-    /// Whether the room is empty.
+    /// Whether nobody is in the room. Companion to [`Room::len`].
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -180,7 +180,7 @@ impl Room {
                 user_id,
                 name,
                 // A client cannot announce itself as speaking.
-                flags: UserFlags(flags.0 & UserFlags::CLIENT_SETTABLE),
+                flags: UserFlags::NONE.apply_client_request(flags),
                 conn,
                 out,
                 speak: Speaking::default(),
@@ -212,11 +212,6 @@ impl Room {
     /// One participant, cloned.
     pub fn member(&self, session: Session) -> Option<Member> {
         self.lock().members.get(&session).cloned()
-    }
-
-    /// All participants as wire records.
-    pub fn users(&self) -> Vec<UserInfo> {
-        self.lock().members.values().map(Member::info).collect()
     }
 
     /// All participants except `session`.

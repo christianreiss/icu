@@ -168,22 +168,6 @@ impl AudioBackend for PipeWireBackend {
     }
 }
 
-impl PartialOrd for DeviceKind {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for DeviceKind {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let rank = |k: &DeviceKind| match k {
-            DeviceKind::Input => 0,
-            DeviceKind::Output => 1,
-        };
-        rank(self).cmp(&rank(other))
-    }
-}
-
 /// A live stream plus its listener; dropping both disconnects it.
 struct LiveStream {
     _listener: pw::stream::StreamListener<StreamData>,

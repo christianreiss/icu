@@ -128,14 +128,6 @@ pub struct KeyBinding {
     /// Portal trigger description (`CTRL+SHIFT+F12`), optional.
     pub trigger: Option<String>,
 }
-
-impl KeyBinding {
-    /// Whether anything is bound.
-    pub fn is_set(&self) -> bool {
-        !self.key.is_empty() || self.trigger.is_some()
-    }
-}
-
 /// Which hotkey backend to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -332,14 +324,16 @@ impl Settings {
             .unwrap_or(100.0)
     }
 
-    /// Sets a peer volume in percent.
-    pub fn set_volume(&mut self, user_id: icu_proto::UserId, percent: f32) {
+    /// Sets a peer volume in percent, clamped to the allowed range, and
+    /// returns the value actually stored.
+    pub fn set_volume(&mut self, user_id: icu_proto::UserId, percent: f32) -> f32 {
         let percent = percent.clamp(0.0, 200.0);
         if (percent - 100.0).abs() < f32::EPSILON {
             self.volumes.remove(&user_id.to_string());
         } else {
             self.volumes.insert(user_id.to_string(), percent);
         }
+        percent
     }
 }
 
@@ -398,11 +392,6 @@ impl Identity {
         let text =
             toml::to_string_pretty(&self.server).map_err(|e| ConfigError::Parse(e.to_string()))?;
         write_atomic(&paths.server(), text.as_bytes(), false)
-    }
-
-    /// Replaces the leaf after a renewal.
-    pub fn save_leaf(&self, paths: &Paths) -> Result<(), ConfigError> {
-        write_atomic(&paths.leaf(), &self.leaf_der, false)
     }
 }
 

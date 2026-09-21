@@ -148,8 +148,7 @@ impl QualityController {
         } else {
             self.bad_ticks = 0;
             self.seen_local_burst = false;
-            let b = self.rtt_baseline_ms.unwrap_or(cond.rtt_ms);
-            self.rtt_baseline_ms = Some(b + RTT_BASELINE_ALPHA * (cond.rtt_ms - b));
+            self.rtt_baseline_ms = Some(baseline + RTT_BASELINE_ALPHA * (cond.rtt_ms - baseline));
 
             if self.tier != VideoTier::T0 {
                 self.good_ticks += 1;

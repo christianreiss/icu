@@ -127,7 +127,7 @@ impl VideoSender {
         }
     }
 
-    /// Records one slot offer for `receiver`, and returns a new
+    /// Records one slot offer for `receiver` at `now`, and returns a new
     /// `VideoCongestionHint` value once the window has closed and the
     /// worst-receiver drop rate changed by at least
     /// [`icu_proto::limits::VIDEO_CONGESTION_HINT_STEP_PERMILLE`] since the
@@ -138,12 +138,6 @@ impl VideoSender {
     /// hint rather than decaying to 0 like `LossHint` does on expiry. That is
     /// harmless here: with no video in flight, the hint has nothing left to
     /// act on until the sender resumes and a fresh window closes.
-    fn record_and_maybe_hint(&mut self, receiver: Session, displaced: bool) -> Option<u16> {
-        self.record_and_maybe_hint_at(receiver, displaced, Instant::now())
-    }
-
-    /// [`VideoSender::record_and_maybe_hint`] with an explicit clock, for
-    /// tests.
     fn record_and_maybe_hint_at(
         &mut self,
         receiver: Session,
@@ -231,7 +225,7 @@ pub async fn video(
 ) {
     Counters::inc(&server.counters.video_frames_in);
 
-    let frame = match recv.read_to_end(VIDEO_HEADER_LEN + VIDEO_MAX_FRAME).await {
+    let mut frame = match recv.read_to_end(VIDEO_HEADER_LEN + VIDEO_MAX_FRAME).await {
         Ok(frame) => frame,
         Err(e) => {
             tracing::debug!(sender, error = %e, "video frame read failed");
@@ -269,13 +263,16 @@ pub async fn video(
         return;
     }
 
-    let mut out = BytesMut::from(&frame[..]);
-    if header::set_speaker_in_place(&mut out, sender).is_err() {
+    if header::set_speaker_in_place(&mut frame, sender).is_err() {
         Counters::inc(&server.counters.video_dropped_rate);
         return;
     }
-    let out = out.freeze();
+    // `Bytes::from(Vec<u8>)` takes ownership; the fan-out below only clones
+    // the refcount.
+    let out = Bytes::from(frame);
 
+    // One clock read for the whole fan-out instead of one per receiver.
+    let now = Instant::now();
     for (session, conn) in receivers {
         let slot = {
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -302,7 +299,7 @@ pub async fn video(
         }
         let hint = {
             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-            state.record_and_maybe_hint(session, displaced)
+            state.record_and_maybe_hint_at(session, displaced, now)
         };
         if let Some(drop_permille) = hint {
             server

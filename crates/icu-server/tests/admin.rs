@@ -12,11 +12,7 @@ use icu_server::{admin, AdminRequest};
 #[tokio::test]
 async fn an_invite_over_the_socket_works_without_a_restart() {
     let server = TestServer::start().await;
-    let socket = server
-        .handle
-        .admin_socket()
-        .expect("the admin socket is up")
-        .to_path_buf();
+    let socket = server.socket();
 
     let response = admin::request(
         &socket,
@@ -48,7 +44,7 @@ async fn an_invite_over_the_socket_works_without_a_restart() {
 #[tokio::test]
 async fn users_lists_online_state_and_the_newest_certificate() {
     let server = TestServer::start().await;
-    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let socket = server.socket();
     let _alice = server.client("alice").await;
     server.enroll("bob").await;
 
@@ -73,7 +69,7 @@ async fn users_lists_online_state_and_the_newest_certificate() {
 #[tokio::test]
 async fn rename_over_the_socket_broadcasts_to_the_room() {
     let server = TestServer::start().await;
-    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let socket = server.socket();
     let mut alice = server.client("alice").await;
 
     let response = admin::request(
@@ -100,7 +96,7 @@ async fn rename_over_the_socket_broadcasts_to_the_room() {
 #[tokio::test]
 async fn rename_onto_a_taken_name_fails_without_changing_anything() {
     let server = TestServer::start().await;
-    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let socket = server.socket();
     server.enroll("alice").await;
     server.enroll("bob").await;
 
@@ -126,7 +122,7 @@ async fn rename_onto_a_taken_name_fails_without_changing_anything() {
 #[tokio::test]
 async fn status_reports_uptime_online_and_relay_counters() {
     let server = TestServer::start().await;
-    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let socket = server.socket();
     let alice = server.client("alice").await;
     let bob = server.client("bob").await;
     alice.send_audio(1, 0, &[1; 30]);
@@ -151,18 +147,13 @@ async fn status_reports_uptime_online_and_relay_counters() {
 #[tokio::test]
 async fn promote_and_demote_over_the_socket_push_to_the_online_target() {
     let server = TestServer::start().await;
-    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let socket = server.socket();
     let _alice = server.client("alice").await; // sole bootstrap admin
     let mut bob = server.client("bob").await;
 
-    let response = admin::request(
-        &socket,
-        &AdminRequest::Promote {
-            user: "bob".into(),
-        },
-    )
-    .await
-    .expect("promote");
+    let response = admin::request(&socket, &AdminRequest::Promote { user: "bob".into() })
+        .await
+        .expect("promote");
     assert_eq!(response["ok"], serde_json::json!(true));
     let msg = bob
         .recv_matching(|m| matches!(m, ControlMsg::UserAdminChanged { .. }))
@@ -190,12 +181,17 @@ async fn promote_and_demote_over_the_socket_push_to_the_online_target() {
 #[tokio::test]
 async fn last_admin_guard_applies_over_the_socket() {
     let server = TestServer::start().await;
-    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let socket = server.socket();
     server.enroll("alice").await; // sole bootstrap admin
 
-    let response = admin::request(&socket, &AdminRequest::Demote { user: "alice".into() })
-        .await
-        .expect("demote");
+    let response = admin::request(
+        &socket,
+        &AdminRequest::Demote {
+            user: "alice".into(),
+        },
+    )
+    .await
+    .expect("demote");
     assert_eq!(response["ok"], serde_json::json!(false));
     assert_eq!(response["error"], serde_json::json!("LAST_ADMIN"));
     server.shutdown().await;
@@ -205,7 +201,7 @@ async fn last_admin_guard_applies_over_the_socket() {
 #[tokio::test]
 async fn disable_over_the_socket_reports_closed_count() {
     let server = TestServer::start().await;
-    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let socket = server.socket();
     let _alice = server.client("alice").await;
     let bob = server.client("bob").await;
 
@@ -226,7 +222,7 @@ async fn disable_over_the_socket_reports_closed_count() {
 #[tokio::test]
 async fn users_command_reports_disabled() {
     let server = TestServer::start().await;
-    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let socket = server.socket();
     let _alice = server.client("alice").await;
     server.enroll("bob").await;
     admin::request(&socket, &AdminRequest::Disable { user: "bob".into() })
@@ -245,7 +241,7 @@ async fn users_command_reports_disabled() {
 #[tokio::test]
 async fn an_unknown_user_is_reported_as_an_error() {
     let server = TestServer::start().await;
-    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let socket = server.socket();
     let response = admin::request(
         &socket,
         &AdminRequest::Revoke {
@@ -263,7 +259,7 @@ async fn an_unknown_user_is_reported_as_an_error() {
 #[tokio::test]
 async fn a_malformed_request_line_is_answered_not_dropped() {
     let server = TestServer::start().await;
-    let socket = server.handle.admin_socket().unwrap().to_path_buf();
+    let socket = server.socket();
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
     let (read, mut write) = stream.into_split();

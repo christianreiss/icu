@@ -338,7 +338,6 @@ impl SettingsView {
             );
         });
 
-        let no_action: Option<(&str, fn())> = None;
         widgets::banner(
             ui,
             widgets::BannerKind::Warning,
@@ -346,7 +345,6 @@ impl SettingsView {
             "evdev-Namen wie KEY_RIGHTCTRL, BTN_SIDE oder code:97; Portal-Trigger wie \
              CTRL+SHIFT+F12. evdev braucht Gruppe input und liest technisch jeden \
              Tastendruck mit (Keylogger-Aspekt). Änderungen gelten ab dem nächsten Start.",
-            no_action,
             None::<fn()>,
         );
     }

@@ -10,10 +10,9 @@ pub mod rawinput;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{
-    config::{HotkeyBackend, HotkeySettings},
-    engine::Command,
-};
+#[cfg(target_os = "linux")]
+use crate::config::HotkeyBackend;
+use crate::{config::HotkeySettings, engine::Command};
 
 /// What a bound key does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +101,3 @@ pub async fn start(settings: &HotkeySettings, cmd: UnboundedSender<Command>) -> 
         }
     }
 }
-
-#[allow(dead_code)]
-fn _assert_backend_used(_: HotkeyBackend) {}

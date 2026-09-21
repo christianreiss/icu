@@ -167,11 +167,6 @@ impl JitterBuffer {
         self.stats
     }
 
-    /// Packets waiting.
-    pub fn queued(&self) -> usize {
-        self.queue.len()
-    }
-
     /// Whether a talk spurt is being played.
     pub fn active(&self) -> bool {
         self.next.is_some()

@@ -16,99 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Context, Error, Result};
 
-/// Per-field defaults, so that a config file may omit any single key.
-///
-/// Each function returns the value from the section's `Default` impl, which is
-/// the single source of truth for the spec values.
-mod d {
-    use super::*;
-
-    pub fn listen() -> Vec<SocketAddr> {
-        ServerSection::default().listen
-    }
-    pub fn server_name() -> String {
-        ServerSection::default().server_name
-    }
-    pub fn public_host() -> String {
-        ServerSection::default().public_host
-    }
-    pub fn max_users() -> u16 {
-        ServerSection::default().max_users
-    }
-    pub fn min_client() -> String {
-        ServerSection::default().min_client
-    }
-    pub fn audio_datagrams_per_s() -> u32 {
-        LimitsSection::default().audio_datagrams_per_s
-    }
-    pub fn control_msgs_per_s() -> u32 {
-        LimitsSection::default().control_msgs_per_s
-    }
-    pub fn set_state_per_s() -> u32 {
-        LimitsSection::default().set_state_per_s
-    }
-    pub fn video_frames_per_s() -> u32 {
-        LimitsSection::default().video_frames_per_s
-    }
-    pub fn video_kbit_s() -> u32 {
-        LimitsSection::default().video_kbit_s
-    }
-    pub fn enroll_per_ip_per_min() -> u32 {
-        LimitsSection::default().enroll_per_ip_per_min
-    }
-    pub fn enroll_global_per_min() -> u32 {
-        LimitsSection::default().enroll_global_per_min
-    }
-    pub fn handshakes_per_ip_per_s() -> u32 {
-        LimitsSection::default().handshakes_per_ip_per_s
-    }
-    pub fn ca_validity_days() -> u32 {
-        TlsSection::default().ca_validity_days
-    }
-    pub fn client_validity_days() -> u32 {
-        TlsSection::default().client_validity_days
-    }
-    pub fn server_validity_days() -> u32 {
-        TlsSection::default().server_validity_days
-    }
-    pub fn level() -> String {
-        LogSection::default().level
-    }
-    pub fn format() -> String {
-        LogSection::default().format
-    }
-    pub fn state_dir() -> PathBuf {
-        PathsSection::default().state_dir
-    }
-    pub fn runtime_dir() -> PathBuf {
-        PathsSection::default().runtime_dir
-    }
-    pub fn hello_timeout_ms() -> u64 {
-        TimingSection::default().hello_timeout_ms
-    }
-    pub fn speaking_silence_ms() -> u64 {
-        TimingSection::default().speaking_silence_ms
-    }
-    pub fn loss_report_ttl_ms() -> u64 {
-        TimingSection::default().loss_report_ttl_ms
-    }
-    pub fn keyframe_min_interval_ms() -> u64 {
-        TimingSection::default().keyframe_min_interval_ms
-    }
-    pub fn rate_violation_window_ms() -> u64 {
-        TimingSection::default().rate_violation_window_ms
-    }
-    pub fn shutdown_grace_ms() -> u64 {
-        TimingSection::default().shutdown_grace_ms
-    }
-    pub fn max_idle_timeout_ms() -> u64 {
-        TimingSection::default().max_idle_timeout_ms
-    }
-}
-
 /// Complete server configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Listen addresses, room size, names.
     #[serde(default)]
@@ -133,22 +43,17 @@ pub struct Config {
 
 /// `[server]`
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerSection {
     /// UDP addresses to bind. One endpoint per entry.
-    #[serde(default = "d::listen")]
     pub listen: Vec<SocketAddr>,
     /// SNI in the server certificate and in the invite link.
-    #[serde(default = "d::server_name")]
     pub server_name: String,
     /// `host:port` as it appears in the invite link.
-    #[serde(default = "d::public_host")]
     pub public_host: String,
     /// Room size, 1..=64.
-    #[serde(default = "d::max_users")]
     pub max_users: u16,
     /// Lowest allowed client version, SemVer.
-    #[serde(default = "d::min_client")]
     pub min_client: String,
     /// Group that owns the admin socket. `None` leaves the group alone.
     #[serde(default)]
@@ -173,31 +78,23 @@ impl Default for ServerSection {
 
 /// `[limits]`
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct LimitsSection {
     /// Audio datagrams per second and client.
-    #[serde(default = "d::audio_datagrams_per_s")]
     pub audio_datagrams_per_s: u32,
     /// Control messages per second and client.
-    #[serde(default = "d::control_msgs_per_s")]
     pub control_msgs_per_s: u32,
     /// `SetState` messages per second and client.
-    #[serde(default = "d::set_state_per_s")]
     pub set_state_per_s: u32,
     /// Video frames per second and client.
-    #[serde(default = "d::video_frames_per_s")]
     pub video_frames_per_s: u32,
     /// Video bitrate per sender, sliding over 2 s.
-    #[serde(default = "d::video_kbit_s")]
     pub video_kbit_s: u32,
     /// Enrollments per minute and IP.
-    #[serde(default = "d::enroll_per_ip_per_min")]
     pub enroll_per_ip_per_min: u32,
     /// Enrollments per minute, server wide.
-    #[serde(default = "d::enroll_global_per_min")]
     pub enroll_global_per_min: u32,
     /// Handshakes per second and IP.
-    #[serde(default = "d::handshakes_per_ip_per_s")]
     pub handshakes_per_ip_per_s: u32,
 }
 
@@ -218,16 +115,13 @@ impl Default for LimitsSection {
 
 /// `[tls]`
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct TlsSection {
     /// CA validity in days.
-    #[serde(default = "d::ca_validity_days")]
     pub ca_validity_days: u32,
     /// Client certificate validity in days.
-    #[serde(default = "d::client_validity_days")]
     pub client_validity_days: u32,
     /// Server certificate validity in days.
-    #[serde(default = "d::server_validity_days")]
     pub server_validity_days: u32,
 }
 
@@ -243,13 +137,11 @@ impl Default for TlsSection {
 
 /// `[log]`
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct LogSection {
     /// `tracing` filter string.
-    #[serde(default = "d::level")]
     pub level: String,
     /// `"text"` or `"json"`.
-    #[serde(default = "d::format")]
     pub format: String,
 }
 
@@ -264,13 +156,11 @@ impl Default for LogSection {
 
 /// `[paths]` — beyond the spec, see the module docs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct PathsSection {
     /// Directory holding `ca.key`, `users.toml`, `state.lock`, …
-    #[serde(default = "d::state_dir")]
     pub state_dir: PathBuf,
     /// Directory holding `admin.sock`.
-    #[serde(default = "d::runtime_dir")]
     pub runtime_dir: PathBuf,
     /// Explicit admin socket path. Defaults to `runtime_dir/admin.sock`.
     #[serde(default)]
@@ -289,28 +179,21 @@ impl Default for PathsSection {
 
 /// `[timing]` — beyond the spec, see the module docs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct TimingSection {
     /// Milliseconds a client has to send `Hello`.
-    #[serde(default = "d::hello_timeout_ms")]
     pub hello_timeout_ms: u64,
     /// Silence after which a talk spurt ends.
-    #[serde(default = "d::speaking_silence_ms")]
     pub speaking_silence_ms: u64,
     /// Lifetime of a `LossReport`.
-    #[serde(default = "d::loss_report_ttl_ms")]
     pub loss_report_ttl_ms: u64,
     /// Minimum interval between forwarded `KeyframeRequest`s per speaker.
-    #[serde(default = "d::keyframe_min_interval_ms")]
     pub keyframe_min_interval_ms: u64,
     /// Window in which rate limit violations are counted.
-    #[serde(default = "d::rate_violation_window_ms")]
     pub rate_violation_window_ms: u64,
     /// How long shutdown waits after sending `SHUTDOWN`.
-    #[serde(default = "d::shutdown_grace_ms")]
     pub shutdown_grace_ms: u64,
     /// Idle timeout announced to peers.
-    #[serde(default = "d::max_idle_timeout_ms")]
     pub max_idle_timeout_ms: u64,
 }
 
@@ -320,7 +203,7 @@ impl Default for TimingSection {
             hello_timeout_ms: pl::HELLO_TIMEOUT_S * 1000,
             speaking_silence_ms: pl::SPEAKING_SILENCE_MS,
             loss_report_ttl_ms: pl::LOSS_REPORT_TTL_S * 1000,
-            keyframe_min_interval_ms: 1000,
+            keyframe_min_interval_ms: 1000 / u64::from(pl::KEYFRAME_REQUESTS_PER_S),
             rate_violation_window_ms: pl::RATE_VIOLATION_WINDOW_S * 1000,
             shutdown_grace_ms: 1000,
             max_idle_timeout_ms: pl::MAX_IDLE_TIMEOUT_S * 1000,

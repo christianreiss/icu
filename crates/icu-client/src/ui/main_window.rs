@@ -48,6 +48,10 @@ pub fn run(engine: Engine, debug_stats: bool) -> Result<(), String> {
 struct App {
     engine: Arc<Mutex<Option<Engine>>>,
     state_rx: tokio::sync::watch::Receiver<AppState>,
+    /// The snapshot this frame draws from. Refreshed once per frame in
+    /// `logic`, which eframe always runs before `ui`, so the two no longer
+    /// clone the same `AppState` twice per repaint.
+    state: AppState,
     cmd: tokio::sync::mpsc::UnboundedSender<Command>,
     settings: Option<SettingsView>,
     debug_stats: bool,
@@ -118,8 +122,10 @@ impl App {
             }
             Some(handle)
         };
+        let state = state_rx.borrow().clone();
         App {
             engine,
+            state,
             state_rx,
             cmd,
             settings: None,
@@ -150,11 +156,12 @@ impl eframe::App for App {
     /// Runs before every `ui` pass and also while the window is hidden (on
     /// `request_repaint`): tray events, camera state, close handling.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.state = self.state_rx.borrow_and_update().clone();
         #[cfg_attr(
             not(any(feature = "tray", feature = "camera")),
             allow(unused_variables)
         )]
-        let state = self.state_rx.borrow().clone();
+        let state = &self.state;
 
         #[cfg(feature = "tray")]
         if let Some(tray) = &self.tray {
@@ -170,11 +177,11 @@ impl eframe::App for App {
                 }
                 None => {}
             }
-            tray.update(&state);
+            tray.update(state);
         }
         #[cfg(feature = "camera")]
         if let Some(camera) = &mut self.camera {
-            camera.sync(&state);
+            camera.sync(state);
         }
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested {
@@ -191,7 +198,7 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(33));
-        let state = self.state_rx.borrow_and_update().clone();
+        let mut state = self.state.clone();
 
         if (self.debug_stats || self.debug_window_open)
             && self.last_stats.elapsed() > Duration::from_secs(2)
@@ -383,7 +390,6 @@ impl eframe::App for App {
             );
 
             if let Some(min) = &state.update_required {
-                let no_action: Option<(&str, fn())> = None;
                 widgets::banner(
                     ui,
                     widgets::BannerKind::Warning,
@@ -392,18 +398,15 @@ impl eframe::App for App {
                         "Der Server verlangt mindestens Version {min} (diese: {}).",
                         env!("CARGO_PKG_VERSION")
                     ),
-                    no_action,
                     None::<fn()>,
                 );
             }
             if let Some(banner) = &state.banner {
-                let no_action: Option<(&str, fn())> = None;
                 widgets::banner(
                     ui,
                     widgets::BannerKind::Error,
                     "Fehler",
                     banner,
-                    no_action,
                     Some(|| self.send(Command::DismissBanner)),
                 );
             }
@@ -436,7 +439,7 @@ impl eframe::App for App {
                                     .color(tok.accent)
                                     .font(egui::FontId::new(11.0, fonts::semibold())),
                             );
-                            widgets::speaking_bars(ui, true);
+                            widgets::speaking_bars(ui);
                         } else if state.mode == Mode::Vad {
                             ui.label(
                                 RichText::new(format!("VAD {:.2}", state.vad_prob))
@@ -591,9 +594,12 @@ impl eframe::App for App {
                             true,
                         );
                     }
-                    let mut peers = state.peers.clone();
-                    peers.sort_by_key(|a| a.info.name.to_lowercase());
-                    for p in &peers {
+                    // `sort_by_cached_key` computes each lowercase key once
+                    // instead of once per comparison.
+                    state
+                        .peers
+                        .sort_by_cached_key(|a| a.info.name.to_lowercase());
+                    for p in &state.peers {
                         participant_row(
                             ui,
                             &p.info.name,
@@ -787,7 +793,7 @@ fn participant_row(
                         };
                         ui.label(text);
                         if speaking {
-                            widgets::speaking_bars(ui, true);
+                            widgets::speaking_bars(ui);
                         }
                     });
                     if let Some(subtitle) = &subtitle {

@@ -69,10 +69,6 @@ mod real {
         }
 
         /// Tells the APM the output is muted (mute/deafen).
-        pub fn set_output_muted(&mut self, muted: bool) {
-            self.apm.set_output_will_be_muted(muted);
-        }
-
         /// Current statistics.
         pub fn stats(&self) -> AecStats {
             let s = self.apm.get_stats();
@@ -102,7 +98,6 @@ mod real {
         /// No-op.
         pub fn reinitialize(&mut self) {}
         /// No-op.
-        pub fn set_output_muted(&mut self, _muted: bool) {}
         /// Empty.
         pub fn stats(&self) -> AecStats {
             AecStats::default()

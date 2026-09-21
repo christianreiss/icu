@@ -57,13 +57,9 @@ pub async fn start(
     ];
     let shortcuts: Vec<NewShortcut> = wanted
         .iter()
-        .filter(|(_, _, trigger, _)| trigger.is_some())
-        .map(|(id, desc, trigger, _)| {
-            let s = NewShortcut::new(*id, *desc);
-            match trigger {
-                Some(t) => s.preferred_trigger(t.as_str()),
-                None => s,
-            }
+        .filter_map(|(id, desc, trigger, _)| {
+            let t = trigger.as_ref()?;
+            Some(NewShortcut::new(*id, *desc).preferred_trigger(t.as_str()))
         })
         .collect();
     if shortcuts.is_empty() {

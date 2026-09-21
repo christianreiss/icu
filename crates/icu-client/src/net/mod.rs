@@ -83,11 +83,3 @@ pub async fn read_frame(recv: &mut quinn::RecvStream, max: usize) -> Result<Vec<
         .map_err(|e| NetError::Connect(e.to_string()))?;
     Ok(body)
 }
-
-/// The application close code of a connection error, if it has one.
-pub fn close_code(error: &quinn::ConnectionError) -> Option<u32> {
-    match error {
-        quinn::ConnectionError::ApplicationClosed(c) => Some(u64::from(c.error_code) as u32),
-        _ => None,
-    }
-}

@@ -101,11 +101,6 @@ impl Server {
         self.started.elapsed()
     }
 
-    /// Whether shutdown has been requested.
-    pub fn is_shutting_down(&self) -> bool {
-        *self.shutdown.borrow()
-    }
-
     /// Builds a server that owns the state but serves nothing, for CLI
     /// commands running while no server is up (§5).
     pub fn offline(config: Config) -> Result<Arc<Server>> {

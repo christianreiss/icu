@@ -13,15 +13,15 @@ use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 
 use icu_proto::{
-    error as codes, header::AUDIO_FLAG_END, AudioHeader, ControlMsg, Session, UserFlags, UserId,
-    UserInfo,
+    error as codes, header::AUDIO_FLAG_END, limits as pl, AudioHeader, ControlMsg, Session,
+    UserFlags, UserId, UserInfo,
 };
 use ringbuf::{
     traits::{Consumer, Observer, Producer, Split},
@@ -272,18 +272,20 @@ pub struct DspControl {
 }
 
 impl DspControl {
+    /// Builds the control block and derives every settings-driven field
+    /// through [`DspControl::apply_settings`], so the two never drift.
     fn from_settings(s: &Settings, test_tone: bool) -> DspControl {
-        DspControl {
+        let ctl = DspControl {
             muted: AtomicBool::new(false),
             ptt_down: AtomicBool::new(false),
-            vad_mode: AtomicBool::new(s.audio.mode == ModeSetting::Vad),
-            denoise: AtomicBool::new(s.audio.denoise && !test_tone),
-            aec: AtomicBool::new(s.audio.aec && !test_tone),
-            vad_threshold_bits: AtomicU32::new(s.audio.vad_threshold.to_bits()),
-            gain_bits: AtomicU32::new(meter::from_db(s.audio.gain_db).to_bits()),
-            release_ms: AtomicU32::new(s.audio.release_ms),
-            hangover_ms: AtomicU32::new(s.audio.hangover_ms),
-            frame_samples: AtomicU32::new(if s.audio.frame_ms == 10 { 480 } else { 960 }),
+            vad_mode: AtomicBool::new(false),
+            denoise: AtomicBool::new(false),
+            aec: AtomicBool::new(false),
+            vad_threshold_bits: AtomicU32::new(0),
+            gain_bits: AtomicU32::new(0),
+            release_ms: AtomicU32::new(0),
+            hangover_ms: AtomicU32::new(0),
+            frame_samples: AtomicU32::new(0),
             loss_permille: AtomicU32::new(0),
             level_peak_bits: AtomicU32::new((-100.0f32).to_bits()),
             level_rms_bits: AtomicU32::new((-100.0f32).to_bits()),
@@ -293,7 +295,9 @@ impl DspControl {
             reinit_aec: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             test_tone: AtomicBool::new(test_tone),
-        }
+        };
+        ctl.apply_settings(s);
+        ctl
     }
 
     fn apply_settings(&self, s: &Settings) {
@@ -387,8 +391,6 @@ struct Shared {
     play_cons: Arc<Mutex<HeapCons<f32>>>,
     /// Encoder loss percent mirrored for the tests.
     loss_perc: AtomicI64,
-    /// Bookkeeping for `LossReport`s.
-    _loss_tick: AtomicU64,
     /// Detected network condition (RTT, loss, congestion pressure); folded
     /// from quinn's own connection stats plus `LossHint`/
     /// `VideoCongestionHint` (`crate::netcond`).
@@ -512,7 +514,6 @@ impl Engine {
             ref_prod: Arc::new(Mutex::new(ref_prod)),
             play_cons: Arc::new(Mutex::new(play_cons)),
             loss_perc: AtomicI64::new(0),
-            _loss_tick: AtomicU64::new(0),
             net: Mutex::new(NetworkTracker::new()),
             video_tier: AtomicU8::new(VideoTier::T0.as_u8()),
         });
@@ -642,11 +643,6 @@ impl Engine {
     /// Latest decoded video frame per session (M4).
     pub fn video_frames(&self) -> Vec<(Session, crate::video::Frame)> {
         self.shared.video.lock().unwrap().latest()
-    }
-
-    /// Whether a keyframe was requested and not yet served (tests).
-    pub fn keyframe_pending(&self) -> bool {
-        self.shared.keyframe_request.load(Ordering::Relaxed)
     }
 
     /// Stops everything.
@@ -785,7 +781,6 @@ fn dsp_thread(
     let mut seq: u16 = 0;
     let mut ts: u32 = 0;
     let mut voice_in_frame = false;
-    let mut prob_in_frame = 0.0f32;
     let mut ref_underruns_window = 0u32;
     let mut window_start = Instant::now();
     let mut last_state_push = Instant::now();
@@ -899,7 +894,6 @@ fn dsp_thread(
         let threshold = f32::from_bits(ctl.vad_threshold_bits.load(Ordering::Relaxed));
         let voice = vad::is_voice(vad::VadSource::Rnnoise { threshold }, prob, level);
         voice_in_frame |= voice;
-        prob_in_frame = prob_in_frame.max(prob.unwrap_or(0.0));
 
         // 4. Accumulate to an Opus frame.
         frame_acc.extend_from_slice(&block);
@@ -921,7 +915,6 @@ fn dsp_thread(
             gate.set_muted(ctl.muted.load(Ordering::Relaxed));
             let decision = gate.update(now, voice_in_frame);
             voice_in_frame = false;
-            prob_in_frame = 0.0;
 
             // LossHint → encoder.
             let permille = ctl.loss_permille.load(Ordering::Relaxed);
@@ -1324,8 +1317,7 @@ impl LocalState {
                 shared.state.send_modify(|s| s.ptt_down = down);
             }
             Command::SetVolume(user_id, percent) => {
-                let percent = percent.clamp(0.0, 200.0);
-                self.settings.set_volume(user_id, percent);
+                let percent = self.settings.set_volume(user_id, percent);
                 shared.volumes.lock().unwrap().insert(user_id, percent);
                 for sp in shared.speakers.lock().unwrap().values_mut() {
                     if sp.user_id == user_id {
@@ -1583,7 +1575,7 @@ async fn run_session(
     let mut quality = QualityController::new(Instant::now());
     let mut pings: HashMap<u64, Instant> = HashMap::new();
     let mut next_nonce: u64 = 1;
-    let mut set_state_budget = RateBudget::new(20, Duration::from_secs(1));
+    let mut set_state_budget = RateBudget::new(pl::SET_STATE_PER_S, Duration::from_secs(1));
 
     let end = loop {
         tokio::select! {
@@ -2006,7 +1998,9 @@ async fn handle_control(
             shared.state.send_modify(|s| s.user_list = users);
         }
         ControlMsg::AdminActionError { detail, .. } => {
-            shared.state.send_modify(|s| s.user_action_error = Some(detail));
+            shared
+                .state
+                .send_modify(|s| s.user_action_error = Some(detail));
         }
         ControlMsg::UserAdminChanged { is_admin } => {
             shared.state.send_modify(|s| {

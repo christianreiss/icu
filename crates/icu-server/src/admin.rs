@@ -224,7 +224,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                         .unwrap_or_default(),
                     issued: newest.map(|c| c.issued.clone()).unwrap_or_default(),
                     expires: newest.map(|c| c.expires.clone()).unwrap_or_default(),
-                    revoked: !record.certs.is_empty() && record.certs.iter().all(|c| c.revoked),
+                    revoked: record.is_revoked(),
                     online: !server.room.sessions_of_user(user_id).is_empty(),
                     is_admin: record.is_admin,
                     disabled: record.disabled,
@@ -245,8 +245,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     tracing::info!(user_id, closed, "revoked");
                     AdminResponse::Revoke { user_id, closed }
                 }
-                Err(e) if e.code() == Some(ec::LAST_ADMIN) => AdminResponse::err("LAST_ADMIN", e),
-                Err(e) => AdminResponse::err("REVOKE_FAILED", e),
+                Err(e) => store_err(e, "REVOKE_FAILED"),
             }
         }
         AdminRequest::Rename { user, new } => {
@@ -266,29 +265,13 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     }
                     AdminResponse::Ok
                 }
-                Err(e) if e.code() == Some(ec::NAME_TAKEN) => AdminResponse::err("NAME_TAKEN", e),
-                Err(e) => AdminResponse::err("RENAME_FAILED", e),
+                Err(e) => store_err(e, "RENAME_FAILED"),
             }
         }
         AdminRequest::Promote { user } => set_role(server, &user, true).await,
         AdminRequest::Demote { user } => set_role(server, &user, false).await,
         AdminRequest::Enable { user } => set_disabled(server, &user, false).await,
-        AdminRequest::Disable { user } => {
-            let mut store = server.store.lock().await;
-            let Some(user_id) = store.resolve(&user) else {
-                return AdminResponse::err("NO_SUCH_USER", format!("no user {user:?}"));
-            };
-            match store.set_disabled(user_id, true) {
-                Ok(_) => {
-                    drop(store);
-                    let closed = session::kick_user(server, user_id, ec::AUTH_DISABLED);
-                    tracing::info!(user_id, closed, "disabled");
-                    AdminResponse::Disable { user_id, closed }
-                }
-                Err(e) if e.code() == Some(ec::LAST_ADMIN) => AdminResponse::err("LAST_ADMIN", e),
-                Err(e) => AdminResponse::err("DISABLE_FAILED", e),
-            }
-        }
+        AdminRequest::Disable { user } => set_disabled(server, &user, true).await,
         AdminRequest::Status => AdminResponse::Status(status(server)),
         AdminRequest::RotateServerCert => {
             let mut ca = server.ca.write().await;
@@ -323,14 +306,13 @@ async fn set_role(server: &Arc<Server>, user: &str, is_admin: bool) -> AdminResp
             tracing::info!(user_id, is_admin, "admin role changed");
             AdminResponse::Ok
         }
-        Err(e) if e.code() == Some(ec::LAST_ADMIN) => AdminResponse::err("LAST_ADMIN", e),
-        Err(e) => AdminResponse::err("PROMOTE_FAILED", e),
+        Err(e) => store_err(e, "PROMOTE_FAILED"),
     }
 }
 
-/// Shared resolve→mutate→map-error body of `Enable` (and the non-kicking
-/// half of `Disable`'s logic; `Disable` itself stays inline in [`handle`]
-/// since it also needs to kick).
+/// Shared resolve→mutate→map-error body of `Enable`/`Disable`. Disabling
+/// takes effect immediately, so it also closes the target's live sessions and
+/// reports how many; enabling has nothing to close.
 async fn set_disabled(server: &Arc<Server>, user: &str, disabled: bool) -> AdminResponse {
     let mut store = server.store.lock().await;
     let Some(user_id) = store.resolve(user) else {
@@ -338,11 +320,26 @@ async fn set_disabled(server: &Arc<Server>, user: &str, disabled: bool) -> Admin
     };
     match store.set_disabled(user_id, disabled) {
         Ok(_) => {
-            tracing::info!(user_id, disabled, "admin disabled state changed");
-            AdminResponse::Ok
+            drop(store);
+            if !disabled {
+                tracing::info!(user_id, "enabled");
+                return AdminResponse::Ok;
+            }
+            let closed = session::kick_user(server, user_id, ec::AUTH_DISABLED);
+            tracing::info!(user_id, closed, "disabled");
+            AdminResponse::Disable { user_id, closed }
         }
-        Err(e) if e.code() == Some(ec::LAST_ADMIN) => AdminResponse::err("LAST_ADMIN", e),
-        Err(e) => AdminResponse::err("DISABLE_FAILED", e),
+        Err(e) => store_err(e, "DISABLE_FAILED"),
+    }
+}
+
+/// Maps a store failure onto a response. A coded error reports under its own
+/// protocol name, so the socket does not invent a second name for something
+/// `icu_proto::error` already names; anything uncoded becomes `failed`.
+fn store_err(e: Error, failed: &str) -> AdminResponse {
+    match e.code().map(ec::name) {
+        Some(name) if name != "UNKNOWN" => AdminResponse::err(name, e),
+        _ => AdminResponse::err(failed, e),
     }
 }
 

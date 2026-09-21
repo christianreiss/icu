@@ -38,7 +38,8 @@ crates/icu-server/
   src/relay.rs             # Audio-Datagram-Relay, Video-Stream-Relay
   src/limits.rs            # Token-Bucket je Client/IP
   src/admin.rs             # Unix-Socket /run/icu/admin.sock, JSON-Zeilenprotokoll
-  src/cli/{invite,users,revoke,rename,status}.rs   # sprechen über admin.rs mit dem laufenden Server
+  src/cli/{invite,users,status}.rs   # sprechen über admin.rs mit dem laufenden Server
+                           # die übrigen Kommandos sind cli::simple/with_closed in main.rs
 ```
 
 `icu-proto` ist die einzige Stelle, an der Wire-Format definiert wird; Server und Client kompilieren dasselbe Crate.

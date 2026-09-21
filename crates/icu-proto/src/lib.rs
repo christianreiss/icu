@@ -26,12 +26,10 @@ pub mod types;
 
 pub use control::{ControlMsg, EnrollMsg, CAPS, MINOR};
 pub use framing::{MAX_CONTROL_FRAME, MAX_ENROLL_FRAME};
-pub use header::{
-    seq_after, seq_diff, set_speaker_in_place, ts_after, ts_diff, AudioHeader, VideoHeader,
-};
+pub use header::{seq_diff, set_speaker_in_place, ts_diff, AudioHeader, VideoHeader};
 pub use types::{
-    name_eq_ci, name_key, validate_name, AudioParams, NameError, Session, UserFlags, UserId,
-    UserInfo, UserSummary, Version, VersionError,
+    name_key, validate_name, AudioParams, NameError, Session, UserFlags, UserId, UserInfo,
+    UserSummary, Version, VersionError,
 };
 
 /// Everything that can go wrong while decoding or encoding wire data.

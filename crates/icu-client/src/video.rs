@@ -8,8 +8,15 @@ use std::{
 
 use icu_proto::{
     header::{VIDEO_CODEC_H264, VIDEO_HEADER_LEN, VIDEO_MAX_FRAME},
-    Session, VideoHeader,
+    limits as pl, Session, VideoHeader,
 };
+
+/// Minimum spacing between two `KeyframeRequest`s for the same speaker. The
+/// server forwards at most [`pl::KEYFRAME_REQUESTS_PER_S`] per second and
+/// speaker, so asking faster only burns control budget.
+const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1)
+    .checked_div(pl::KEYFRAME_REQUESTS_PER_S)
+    .unwrap();
 
 /// A quality tier for the outgoing camera stream, stepped by
 /// `crate::quality::QualityController` in response to measured network
@@ -275,7 +282,7 @@ impl Receivers {
             }
             let due = r
                 .last_request
-                .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+                .map(|t| now.duration_since(t) >= KEYFRAME_REQUEST_MIN_INTERVAL)
                 .unwrap_or(true);
             if due {
                 r.last_request = Some(now);

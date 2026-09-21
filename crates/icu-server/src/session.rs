@@ -8,7 +8,7 @@ use std::{
 
 use icu_proto::{
     error as ec, limits as pl, validate_name, AudioParams, ControlMsg, Session, UserFlags, UserId,
-    UserInfo, Version, MAX_CONTROL_FRAME,
+    UserInfo, MAX_CONTROL_FRAME,
 };
 use rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc;
@@ -471,7 +471,7 @@ async fn handle_renew(server: &Arc<Server>, session: Session, user_id: UserId, c
     let mut store = server.store.lock().await;
     // At most one renewal per day and user (§6.4 control handler).
     if let Some(last) = store.last_renew(user_id) {
-        if now() - last < time::Duration::days(1) {
+        if now() - last < time::Duration::days(1) / pl::RENEW_PER_DAY {
             server
                 .room
                 .send_to(session, &reject("at most one renewal per day".into()));
@@ -734,7 +734,7 @@ async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor:
             created: u.created.clone(),
             is_admin: u.is_admin,
             disabled: u.disabled,
-            revoked: !u.certs.is_empty() && u.certs.iter().all(|c| c.revoked),
+            revoked: u.is_revoked(),
             online: !server.room.sessions_of_user(id).is_empty(),
         })
         .collect();
@@ -778,11 +778,4 @@ pub fn kick_user(server: &Arc<Server>, user_id: UserId, code: u32) -> usize {
         }
     }
     closed
-}
-
-/// Parses a client version string for the `min_client` comparison. The server
-/// only validates its own value; the client does the actual comparison
-/// (`PROTOCOL.md` §2.2).
-pub fn parse_min_client(value: &str) -> Result<Version> {
-    Ok(Version::parse(value)?)
 }
