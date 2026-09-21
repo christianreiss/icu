@@ -9,8 +9,11 @@
 //! Stream properties (Spike 8): `node.latency = 240/48000`,
 //! `node.rate = 1/48000`, `node.group = icu`, `media.role = Communication`,
 //! format F32LE mono 48 kHz. The reference stream sets
-//! `stream.capture.sink = true` and no target, so PipeWire connects it to the
-//! monitor ports of the default sink and follows default-sink changes itself.
+//! `stream.capture.sink = true`; with no target device it connects to the
+//! monitor ports of the default sink and follows default-sink changes
+//! itself, and with an explicit output device (same one playback uses) it
+//! follows that sink's monitor instead, so the reference always matches
+//! what is actually being played back.
 
 use std::{
     cell::RefCell,

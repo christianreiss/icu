@@ -667,7 +667,7 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
     if settings.audio.aec {
         let ref_prod = shared.ref_prod.clone();
         if let Err(e) = backend.open_reference(
-            None,
+            settings.audio.output_device.as_deref(),
             Box::new(move |block| {
                 if let Ok(mut p) = ref_prod.try_lock() {
                     let _ = p.push_slice(block);
