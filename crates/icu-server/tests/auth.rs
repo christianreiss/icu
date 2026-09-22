@@ -64,11 +64,8 @@ async fn an_unknown_certificate_from_our_own_ca_is_auth_unknown_cert() {
         "localhost",
     )
     .expect("load ca");
-    let key = rcgen::KeyPair::generate().unwrap();
-    let csr = rcgen::CertificateParams::default()
-        .serialize_request(&key)
-        .unwrap();
-    let leaf = ca.sign_client_csr(csr.der(), "mallory", 365).unwrap();
+    let (key, csr) = common::csr_with_cn("mallory");
+    let (leaf, _) = ca.sign_client_csr(&csr, 365).unwrap();
 
     let identity = common::Identity {
         cert: leaf,
@@ -245,16 +242,29 @@ async fn a_token_works_exactly_once() {
     server.shutdown().await;
 }
 
+/// §10: a taken name is refused outright — no silent `-2` suffix any more —
+/// and the invite survives the attempt, so the user can pick another name.
 #[tokio::test]
-async fn a_name_collision_gets_a_suffix() {
+async fn a_taken_name_at_enrollment_leaves_the_token_reusable() {
     let server = TestServer::start().await;
     server.enroll("alice").await;
-    let second = server.enroll("alice").await;
-    let mut client = server.connect(&second).await.expect("connect");
-    let welcome = client.hello("alice").await;
-    match welcome {
+
+    let token = server.invite("").await;
+    let err = server
+        .enroll_with_token(&token, "ALICE")
+        .await
+        .expect_err("a taken name is refused");
+    assert_eq!(err.code(), Some(ec::NAME_TAKEN), "{err:?}");
+
+    // Same token, another name: this is what makes the refusal recoverable.
+    let carol = server
+        .enroll_with_token(&token, "carol")
+        .await
+        .expect("the token is still unused");
+    let mut client = server.connect(&carol).await.expect("connect");
+    match client.hello("ignored").await {
         ControlMsg::Welcome { you, .. } => {
-            assert_eq!(you.name, "alice-2");
+            assert_eq!(you.name, "carol");
             assert_eq!(you.user_id, 2);
         }
         other => panic!("expected Welcome, got {other:?}"),
@@ -269,13 +279,10 @@ async fn renewal_issues_a_second_certificate_and_both_connect() {
     let mut client = server.connect(&old).await.expect("connect");
     client.hello("alice").await;
 
-    let new_key = rcgen::KeyPair::generate().unwrap();
-    let csr = rcgen::CertificateParams::default()
-        .serialize_request(&new_key)
-        .unwrap();
+    let (new_key, csr) = common::csr_with_cn("alice");
     client
         .send_msg(&ControlMsg::RenewRequest {
-            csr_der: csr.der().to_vec(),
+            csr_der: csr.clone(),
         })
         .await;
     let response = client
@@ -310,9 +317,7 @@ async fn renewal_issues_a_second_certificate_and_both_connect() {
 
     // A second renewal on the same day is rejected.
     client
-        .send_msg(&ControlMsg::RenewRequest {
-            csr_der: csr.der().to_vec(),
-        })
+        .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
         .await;
     let answer = client
         .recv_matching(|m| matches!(m, ControlMsg::Error { .. }))

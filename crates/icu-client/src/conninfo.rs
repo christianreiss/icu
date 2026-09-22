@@ -85,6 +85,22 @@ impl CertInfo {
     }
 }
 
+/// Whether `leaf_der`'s public key is the one belonging to `key_der`
+/// (PKCS#8).
+///
+/// Guards the renewal path: persisting a certificate that does not match the
+/// local key would make the next connection fail with no way back but a
+/// passport from another device.
+pub fn leaf_matches_key(leaf_der: &[u8], key_der: &[u8]) -> bool {
+    let Ok(key) = rcgen::KeyPair::try_from(key_der) else {
+        return false;
+    };
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(leaf_der) else {
+        return false;
+    };
+    cert.public_key().subject_public_key.data.as_ref() == key.public_key_raw()
+}
+
 /// The certificate's common name, or the whole RDN sequence when it has none.
 fn common_name(name: &x509_parser::x509::X509Name<'_>) -> String {
     name.iter_common_name()

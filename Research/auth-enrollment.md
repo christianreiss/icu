@@ -165,3 +165,5 @@ Mit WebFetch gelesen (2026-09-20):
 - http://specifications.freedesktop.org/desktop-entry/latest/exec-variables.html
 - https://raw.githubusercontent.com/mumble-voip/mumble/master/auxiliary_files/mumble-server.ini
 - https://www.mumble.info/documentation/user/certificates/
+
+> **Revidiert 2026-09-22 (Name im Zertifikat).** Der Subject-Override ist entfallen: der Server prüft den CN der CSR (genau einer, `validate_name`, serverweit eindeutig) und übernimmt ihn, statt ihn zu ersetzen. SAN, EKU, Basic Constraints, Key Usage, Validity und Serial setzt er weiterhin selbst. Die Sätze in Zeile 98 und 136 („Server überschreibt ohnehin", „CSR-CN `admin-impersonator` wird zu `alice`") beschreiben den Stand von Spike 2b und bleiben als Spike-Protokoll stehen. Maßgeblich ist `PROTOCOL.md` §2.3.

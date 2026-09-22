@@ -43,6 +43,13 @@ UserId:    u32     beim Enrollment vergeben, ab 1, monoton, nie wiederverwendet;
                    und Server-Neustarts hinweg, in `users.toml` persistiert. Schlüssel für alles, was ein Client
                    dauerhaft je Peer speichert (Lautstärken, Notizen). 0 = „unbekannt“.
 Name:      String  UTF-8, 1–32 Bytes, keine Steuerzeichen; serverweit eindeutig, Vergleich case-insensitive
+                   Der Name steht im Subject-CN des Client-Zertifikats. Er wird beim Enrollment durch die CSR gesetzt
+                   und danach ausschließlich dadurch geändert, dass ein neues Zertifikat ausgestellt wird (§2.2 Nr. 9).
+                   `users.toml` spiegelt den CN des zuletzt ausgestellten Zertifikats; dieser Spiegel füllt alle
+                   Roster-Felder. Identität bleibt der Fingerprint, nie der Name.
+                   Eindeutig ist ein Name zum Ausstellungszeitpunkt, nicht über die Zeit: alte Zertifikate bleiben bis
+                   zum Ablauf gültig, also kann nach einer Umbenennung ein altes Zertifikat denselben CN tragen wie ein
+                   neuer Nutzer. Der CN ist deshalb kein Schlüssel.
 UserInfo { user_id: UserId, session: Session, name: Name, flags: UserFlags }
 AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64000 }
 ```
@@ -53,8 +60,8 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 
 | Nr | Variante | Richtung | Felder | Semantik |
 | --- | --- | --- | --- | --- |
-| 0 | `Hello` | C→S | `minor: u16`, `caps: u32`, `client: String` (≤ 64 B, Format `<name>/<semver> <os>`, z. B. `icu/0.1.0 linux`), `initial: UserFlags`, `name: Name` | Erste Message nach Handshake, binnen 5 s. `name` wird **nur** übernommen, wenn der Server zu dieser `user_id` noch keinen Namen gespeichert hat; danach ignoriert er das Feld. Namensänderung läuft ausschließlich über `SetName` (Client) und die CLI `rename` (Admin). |
-| 1 | `Welcome` | S→C | `minor: u16`, `caps: u32`, `you: UserInfo`, `audio: AudioParams`, `users: Vec<UserInfo>` (ohne sich selbst), `min_client: String`, `is_admin: bool` | Vollständiger State. `you` ist der eigene Eintrag inklusive `user_id` und dem serverseitig gespeicherten Namen — der Client übernimmt diesen Namen, auch wenn er von seinem `Hello.name` abweicht. `min_client` = niedrigste erlaubte Client-Version als SemVer-String; der Client vergleicht sie in SemVer-Ordnung gegen die eigene Version. `is_admin` erlaubt `CreateInviteRequest` (§2.3.1). |
+| 0 | `Hello` | C→S | `minor: u16`, `caps: u32`, `client: String` (≤ 64 B, Format `<name>/<semver> <os>`, z. B. `icu/0.1.0 linux`), `initial: UserFlags`, `name: Name` | Erste Message nach Handshake, binnen 5 s. `name` ist obsolet: der Server ignoriert es, weil der Name im Zertifikat steht (§2.1). Das Feld bleibt aus Wire-Kompatibilität erhalten. Namensänderung läuft ausschließlich über `RenewRequest` (Nr. 9). |
+| 1 | `Welcome` | S→C | `minor: u16`, `caps: u32`, `you: UserInfo`, `audio: AudioParams`, `users: Vec<UserInfo>` (ohne sich selbst), `min_client: String`, `is_admin: bool` | Vollständiger State. `you` ist der eigene Eintrag inklusive `user_id` und dem serverseitig gespeicherten Namen — der Client übernimmt diesen Namen, auch wenn er von seinem `Hello.name` abweicht. `min_client` = niedrigste erlaubte Client-Version als SemVer-String; der Client vergleicht sie in SemVer-Ordnung gegen die eigene Version. `is_admin` erlaubt `CreateInviteRequest` (§2.3.1). Weicht `you.name` vom CN des eigenen Zertifikats ab, fordert der Client ein neues Zertifikat mit dem aktuellen Namen an; der Server lässt das außerhalb des Tageslimits zu (Nr. 9). |
 | 2 | `UserJoined` | S→C | `user: UserInfo` | |
 | 3 | `UserLeft` | S→C | `session: Session`, `reason: u8` (Fehlercode < 256) | |
 | 4 | `UserState` | S→C | `session: Session`, `flags: UserFlags` | Broadcast nach jeder Änderung, inkl. an den Verursacher. |
@@ -62,12 +69,12 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | 6 | `Ping` | C→S | `nonce: u64` | Anwendungs-RTT; Intervall 5 s. |
 | 7 | `Pong` | S→C | `nonce: u64`, `server_time_ms: u64` | `server_time_ms` = Unix-Zeit in Millisekunden (UTC). Server antwortet unverzüglich; der Client misst die RTT über `nonce`. |
 | 8 | `Error` | S→C | `code: u32`, `detail: String` | Nicht-fatal. Fatale Fehler gehen über CONNECTION_CLOSE. |
-| 9 | `RenewRequest` | C→S | `csr_der: Vec<u8>` (≤ 2 KiB) | Cert-Renewal über die authentifizierte Verbindung, ab 30 Tage vor Ablauf. |
-| 10 | `RenewResponse` | S→C | `leaf_der: Vec<u8>` | Alter Fingerprint bleibt bis Ablauf gültig. |
+| 9 | `RenewRequest` | C→S | `csr_der: Vec<u8>` (≤ 2 KiB) | Cert-Renewal über die authentifizierte Verbindung **und der einzige Weg, den Namen zu ändern**. Der Subject-CN der CSR ist der gewünschte Name; er muss genau einmal vorkommen, `Name` erfüllen und serverweit frei sein. Drei Fälle, unterschieden durch exakten Stringvergleich gegen den gespeicherten Namen: **normales Renewal** (CN = gespeichert, vorgelegtes Cert aktuell; höchstens eines pro Tag, ab 30 Tage vor Ablauf), **Nachzügler** (CN = gespeichert, vorgelegtes Cert trägt noch einen alten CN, weil auf einem anderen Gerät umbenannt wurde; vom Tageslimit ausgenommen, aber je Zertifikat auf einen pro Tag begrenzt) und **Umbenennung** (CN ≠ gespeichert; kostet das Tagesbudget). Kollision → `Error { code: NAME_TAKEN }`, nichts geändert, nicht fatal. Ratenlimit oder unbrauchbare CSR → `Error { code: RENEW_REJECTED }`. Bei einer Umbenennung broadcastet der Server `UserRenamed` für jede Sitzung dieses Nutzers. |
+| 10 | `RenewResponse` | S→C | `leaf_der: Vec<u8>` | Das neue Leaf trägt den angeforderten Namen als CN. Alter Fingerprint bleibt bis Ablauf gültig. |
 | 11 | `LossReport` | C→S | `speaker: Session`, `loss_permille: u16` | Vom Empfänger gemessener Verlust des Audio-Streams eines Sprechers über die letzten 2 s. Intervall 2 s, nur wenn sich der Wert um ≥ 10 ‰ ändert. |
 | 12 | `LossHint` | S→C | `loss_permille: u16` | Server leitet das Maximum aller `LossReport` für diesen Sprecher weiter; der Client setzt `OPUS_SET_PACKET_LOSS_PERC` (auf ganze Prozent gerundet, gedeckelt auf 20 — bewusste Festlegung, nicht aus dem Research belegt: oberhalb 20 % kostet LBRR mehr Bitrate als es rettet). Verfallen alle Reports eines Sprechers (6 s ohne neuen Report), sendet der Server `LossHint { loss_permille: 0 }`; der Client setzt dann auch die Jitter-Buffer-Untergrenze zurück. |
 | 13 | `KeyframeRequest` | C→S | `speaker: Session` | Empfänger braucht ein H.264-IDR (Join, Verlust). Server leitet als `KeyframeRequest { speaker: 0 }` an den Sprecher weiter; der erzeugt binnen 100 ms einen IDR. Rate ≤ 1/s pro Sprecher. |
-| 14 | `SetName` | C→S | `name: Name` | Namensänderung. Server prüft Länge, Steuerzeichen und serverweite Eindeutigkeit (case-insensitive); bei Kollision `Error { code: NAME_TAKEN }` und keine Änderung, sonst persistieren und `UserRenamed` an alle broadcasten. |
+| 14 | `SetName` | — | `name: Name` | **Obsolet.** Namensänderung läuft über `RenewRequest` (Nr. 9), weil der Name im Zertifikat steht. Die Variantennummer bleibt reserviert, damit die Nummerierung normativ bleibt; kein Client sendet sie, und ein Server, der sie empfängt, schließt mit `PROTOCOL_VIOLATION`. |
 | 15 | `UserRenamed` | S→C | `session: Session`, `name: Name` | |
 | 16 | `VideoCongestionHint` | S→C | `drop_permille: u16` | Server leitet das Maximum der pro Empfänger gemessenen Slot-Verdrängungsrate (`Server/IMPLEMENTATION.md` §6.5) für diesen Sprecher weiter, gemessen über die letzten 2 s (`icu_proto::limits::VIDEO_CONGESTION_WINDOW_S`), nur wenn sich der Wert um ≥ 20 ‰ ändert (`VIDEO_CONGESTION_HINT_STEP_PERMILLE`). Mirror von `LossHint`s Maximum-Regel, aber für Video statt Audio. Der Client speist den Wert in die Qualitäts-Ladder (`Client/IMPLEMENTATION.md` §8): Video trägt die gesamte Anpassung, Audio-Bitrate bleibt unangetastet. |
 | 17 | `CreateInviteRequest` | C→S | `name: Name`, `ttl_s: u64` (`0` = Server-Default `limits::INVITE_TTL_S`) | Nur Admins (`Welcome.is_admin`); sonst `Error { code: NOT_ADMIN }`, nicht-fatal, Verbindung bleibt. Siehe §2.3.1. |
@@ -86,7 +93,7 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 
 Varianten 19–28 sind die ersten C→S-Nachrichten, bei denen der sendende Client eine **andere** `user_id` benennt als seine eigene.
 
-Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline ist `minor = 1`; ein Minor 0 existiert nicht, und alle 30 Varianten sind in v1 Pflicht (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt`: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
+Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline ist `minor = 1`; ein Minor 0 existiert nicht, und alle 30 Variantennummern sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt`: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
 ### 2.3 Enrollment `EnrollMsg` (nur ALPN `icu-enroll/1`)
 
@@ -94,7 +101,7 @@ Gleiche Framing-Regel, Stream-Limit 8 KiB, ein Request/Response, danach Close.
 
 | Nr | Variante | Richtung | Felder |
 | --- | --- | --- | --- |
-| 0 | `EnrollRequest` | C→S | `token: String`, `csr_der: Vec<u8>` (≤ 2 KiB), `name: Name` (gewünschter Anzeigename; der Server nimmt ihn als initialen Anzeigenamen — kollidiert er case-insensitive mit einem bestehenden Namen, hängt der Server `-2`, `-3`, … an, bis er eindeutig ist. Das Cert-CN kommt immer aus dem Invite, nie aus der CSR, außer beim Bootstrap-Fall unten) |
+| 0 | `EnrollRequest` | C→S | `token: String`, `csr_der: Vec<u8>` (≤ 2 KiB, Subject-CN = gewünschter Name), `name: Name` (**obsolet**, wird ignoriert; das Feld bleibt aus Wire-Kompatibilität erhalten) |
 | 1 | `EnrollResponse` | S→C | `leaf_der: Vec<u8>`, `ca_der: Vec<u8>`, `server_name: String` (SNI für die Hauptverbindung) |
 | 2 | `Error` | S→C | `code: u32`, `detail: String` |
 
@@ -102,17 +109,19 @@ Gleiche Framing-Regel, Stream-Limit 8 KiB, ein Request/Response, danach Close.
 
 | Form | Länge | Bedeutung |
 | --- | --- | --- |
-| leer | 0 | **Bootstrap**: nur solange `users.toml` noch keinen Eintrag hat. CN kommt aus `EnrollRequest.name` (validiert), kein Invite wird konsumiert. |
+| leer | 0 | **Bootstrap**: nur solange `users.toml` noch keinen Eintrag hat. Kein Invite wird konsumiert; der CN kommt wie überall aus der CSR. |
 | Plain-Token | 22 Zeichen (base64url, 128 Bit) | Klassischer Invite, wie bisher über `store.peek_invite`/`consume_invite` geprüft. |
 | Blob-Passthrough | länger | Base64url-Body eines `ICU1-…`-Blobs (§2.3.1) ohne das Präfix, vom Client unverändert durchgereicht. Der Server entschlüsselt, gewinnt daraus das Plain-Token und validiert es identisch zum Plain-Token-Pfad. |
+
+**CSR-Regeln** (revidiert 2026-09-22, Name im Zertifikat): das Subject der CSR muss **genau einen** CN tragen, der als UTF-8 lesbar ist und `Name` erfüllt; dieser CN wird der Anzeigename. Er muss serverweit frei sein (case-insensitive) — bei Kollision antwortet der Server `Error { code: NAME_TAKEN }` **und verbraucht das Token nicht**, der Nutzer kann also mit einem anderen Namen erneut anlaufen. Kein stilles `-2`/`-3`-Anhängen mehr. Fehlt der CN, gibt es mehr als einen, ist er unlesbar oder verletzt er `Name`, antwortet der Server `ENROLL_BAD_CSR`. Unbekannte angeforderte Extensions in der CSR lehnt rcgen ab; auch das ist `ENROLL_BAD_CSR`.
 
 **Wer wird Admin:** die *erste* Anmeldung, die gegen einen leeren `users.toml`-Bestand erfolgreich abschließt — gleich über welche der drei Formen —, erhält `is_admin = true` in `UserRecord`. Danach lehnt ein leeres Token mit `ENROLL_BOOTSTRAP_CLOSED` ab; alle weiteren Anmeldungen brauchen ein gültiges Token oder einen Blob.
 
 Fehlerpfad: der Server sendet **immer zuerst** `Error { code, detail }`, dann `finish()`, dann `close(code)` mit demselben Code — sonst sieht der Nutzer im Enrollment-Dialog nur eine Codenummer ohne Text.
 
-Server-Pinning beim Enrollment: der Client verifiziert die Serverkette nicht gegen einen Root-Store, sondern per eigenem `ServerCertVerifier`. Bei einem `icu://`-Link ist die Regel: `ca` ist base64url **ohne Padding** über SHA-256 des DER des **letzten** Kettenglieds; der Verifier akzeptiert genau Kettenlänge 2 (Leaf + CA), vergleicht nur diesen Hash, ignoriert SNI und Gültigkeitszeitraum (das Leaf ist zu diesem Zeitpunkt noch nicht vertrauenswürdig), muss aber `verify_tls12_signature`/`verify_tls13_signature` an den CryptoProvider delegieren. Bei einem `ICU1-…`-Blob (§2.3.1) vergleicht der Verifier stattdessen das DER byteweise gegen `InviteBlob.ca_der`. Beim Bootstrap-Fall (leeres Token) gibt es noch keinen Prior — der Verifier akzeptiert dort jede Kette der Länge 2 unconditional (Trust-on-first-use, unvermeidbar, da noch kein Geheimnis existiert). Der Server sendet daher immer die Kette Leaf + CA. Server-Seite: CSR-Subject, SAN, EKU und Validity werden vom Server gesetzt, nicht aus der CSR übernommen (Spike 2b).
+Server-Pinning beim Enrollment: der Client verifiziert die Serverkette nicht gegen einen Root-Store, sondern per eigenem `ServerCertVerifier`. Bei einem `icu://`-Link ist die Regel: `ca` ist base64url **ohne Padding** über SHA-256 des DER des **letzten** Kettenglieds; der Verifier akzeptiert genau Kettenlänge 2 (Leaf + CA), vergleicht nur diesen Hash, ignoriert SNI und Gültigkeitszeitraum (das Leaf ist zu diesem Zeitpunkt noch nicht vertrauenswürdig), muss aber `verify_tls12_signature`/`verify_tls13_signature` an den CryptoProvider delegieren. Bei einem `ICU1-…`-Blob (§2.3.1) vergleicht der Verifier stattdessen das DER byteweise gegen `InviteBlob.ca_der`. Beim Bootstrap-Fall (leeres Token) gibt es noch keinen Prior — der Verifier akzeptiert dort jede Kette der Länge 2 unconditional (Trust-on-first-use, unvermeidbar, da noch kein Geheimnis existiert). Der Server sendet daher immer die Kette Leaf + CA. Server-Seite: SAN, EKU, Basic Constraints, Key Usage, Validity und Serial setzt der Server; aus der CSR stammen der Public Key **und der geprüfte CN** (revidiert 2026-09-22 — bis dahin überschrieb der Server auch das Subject, Spike 2b). Der Server baut das Subject trotzdem von Grund auf neu: das kanonisiert die Kodierung auf UTF8String und wirft jedes andere DN-Attribut weg.
 
-Invite-Link: `icu://<host>:<port>/enroll?t=<token>&ca=<sha256-base64url>&n=<name-urlencoded>`. Token einmalig, 24 h gültig. Weiterhin per CLI (`icu-server invite`) oder Admin-Socket erzeugbar, unverändert.
+Invite-Link: `icu://<host>:<port>/enroll?t=<token>&ca=<sha256-base64url>[&n=<name-urlencoded>]`. Token einmalig, 24 h gültig. Weiterhin per CLI (`icu-server invite`) oder Admin-Socket erzeugbar. `n=` ist optional und nur eine **Vorbelegung** des Namensfelds im Client; der Name, der ins Zertifikat kommt, ist der, den der Eingeladene bestätigt. Ein ungültiges `n=` wird verworfen statt den Link abzulehnen.
 
 ### 2.3.1 Invite-Blob `ICU1-…`
 
@@ -136,6 +145,28 @@ Armor: `"ICU1-" + base64url(postcard(InviteBlob))`, ohne Padding, ≤ 4096 Byte 
 `host_port`/`server_name`/`ca_der`/`expires` sind zwangsläufig Klartext — der Client muss sie lesen, bevor überhaupt eine gesicherte Verbindung existiert (identisches TOFU-Modell wie der `ca=`-Hash-Link, nur mit vollen CA-Bytes statt Hash). Nur das Token selbst braucht Vertraulichkeit: es ist mit einem serverseitigen, unabhängig vom CA-Key gehaltenen `invite.key` (32 Zufallsbytes, `ChaCha20-Poly1305`, analog `ca.key` mit Mode 0600 persistiert) versiegelt. Die AAD der Versiegelung ist `postcard(host_port, server_name, ca_der, expires)` — jede Manipulation eines dieser Klartextfelder macht das Öffnen serverseitig ungültig (`ENROLL_BAD_TOKEN`), auch wenn der Client die Manipulation vorher nicht erkennen kann.
 
 Der Client reicht beim Enrollment nicht den `ICU1-…`-String, sondern den nackten Base64url-Body (ohne Präfix) unverändert als `EnrollRequest.token` durch; der Server dekodiert, berechnet die AAD aus den Klartextfeldern neu und öffnet die Versiegelung mit `invite.key`. Gelingt das, läuft die Validierung identisch zum Plain-Token-Pfad über `store.peek_invite`/`consume_invite` weiter — kein separater Invite-Lebenszyklus.
+
+### 2.3.2 Passport `-----BEGIN ICU PASSPORT-----`
+
+Die ganze Identität eines Clients in einem ASCII-armierten Block, damit ein Nutzer sie auf ein zweites Gerät mitnehmen kann. Kein Server-Pfad erzeugt, akzeptiert oder liest je einen Passport — er ist eine Datei in der Verantwortung des Nutzers, kein Transportformat.
+
+```
+PassportV1 {
+    host: String,        // zu wählender Host
+    port: u16,
+    server_name: String, // SNI
+    name: String,        // CN zum Exportzeitpunkt, nur Vorschau — das Zertifikat bleibt maßgeblich
+    key_der: Vec<u8>,    // privater Schlüssel, PKCS#8 DER
+    leaf_der: Vec<u8>,   // Client-Zertifikat, DER
+    ca_der: Vec<u8>,     // CA des Servers, DER
+}
+```
+
+Armor: `-----BEGIN ICU PASSPORT-----`, Base64 (Standard-Alphabet mit Padding) auf 64 Spalten umbrochen, `-----END ICU PASSPORT-----`. Body = `[Version-Byte] ++ postcard(PassportV1)`, aktuell Version 1, ≤ 8192 Byte dekodiert. Das Versionsbyte steht **außerhalb** des postcard-Bodys, weil postcard nicht selbstbeschreibend ist: ein künftiges v2 würde sonst als plausibler Müll durchgehen statt abgelehnt zu werden. Beim Dekodieren wird jeder Whitespace ignoriert, damit ein neu umbrochener oder eingerückter Block aus einem Chat-Client weiter lesbar ist.
+
+**Der Body ist Klartext.** Ein Passport ist bis zum Ablauf des Zertifikats oder bis zum Widerruf ein vollwertiger Identitätsnachweis: wer den Text liest, kann sich als dieser Nutzer anmelden. Der Client warnt entsprechend, schreibt die Datei mit Mode 0600 und zeigt den Text nie am Bildschirm. Er pinnt auch nichts — wer einen gefälschten Passport einspielt, landet auf fremdem Server mit fremder CA; dasselbe Vertrauensmodell wie beim `ICU1-…`-Blob, nur ohne Token, das zu stehlen wäre.
+
+Beide Geräte halten danach dasselbe Zertifikat. Der Server akzeptiert das (Identität ist der Fingerprint, mehrere Sitzungen je `user_id` sind erlaubt); benennt sich eines der Geräte um, zieht das andere beim nächsten Start über den Nachzügler-Pfad aus §2.2 Nr. 9 nach.
 
 ## 3. Audio-Datagram
 
@@ -204,11 +235,11 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | 0x0A | `AUTH_REQUIRED` | ja | ALPN `icu/1` ohne Client-Cert |
 | 0x0B | `RATE_LIMITED_FATAL` | ja | dritter `RATE_LIMITED`-Verstoß binnen 60 s; Server schließt, Client reconnectet nicht |
 | 0x0C | `TIMEOUT` | nein | Idle-Timeout oder Transportabbruch; auch `UserLeft.reason`, wenn eine Verbindung ohne sauberes Close endet |
-| 0x0D | `NAME_TAKEN` | nein | `SetName` auf einen serverweit schon vergebenen Namen (case-insensitive); nur als `Error`, nie als Close |
+| 0x0D | `NAME_TAKEN` | nein | Angeforderter Name (CSR-CN bei Enrollment oder Renewal) ist serverweit schon vergeben (case-insensitive); nichts geändert. Auf `icu/1` als `Error`, auf `icu-enroll/1` zusätzlich als Close-Code, weil dort jede Ablehnung so läuft |
 | 0x10 | `ENROLL_BAD_TOKEN` | ja | Token unbekannt/verbraucht/abgelaufen |
-| 0x11 | `ENROLL_BAD_CSR` | ja | CSR nicht parsebar/Signatur ungültig |
+| 0x11 | `ENROLL_BAD_CSR` | ja | CSR nicht parsebar/Signatur ungültig, oder Subject ohne genau einen gültigen CN |
 | 0x12 | `ENROLL_RATE_LIMITED` | ja | 5/min pro IP oder 20/min global |
-| 0x13 | `RENEW_REJECTED` | nein | Renewal-CSR abgelehnt |
+| 0x13 | `RENEW_REJECTED` | nein | Renewal-CSR abgelehnt (Ratenlimit, unbrauchbare CSR, unbekannter Nutzer) |
 | 0x14 | `ENROLL_BOOTSTRAP_CLOSED` | ja | Leeres Token (Bootstrap), aber `users.toml` hat schon mindestens einen Eintrag |
 | 0x15 | `NOT_ADMIN` | nein | `CreateInviteRequest` von einem Nicht-Admin; nur als `Error`, nie als Close |
 | 0x16 | `LAST_ADMIN` | nein | Admin-Aktion würde den letzten funktionsfähigen Admin entfernen (Demote/Disable/Revoke); nur als `AdminActionError`, nie als Close |

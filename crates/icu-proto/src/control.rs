@@ -33,8 +33,9 @@ pub enum ControlMsg {
         client: String,
         /// Initial state bits.
         initial: UserFlags,
-        /// Desired display name. Only taken if the server has none stored for
-        /// this `user_id`.
+        /// Obsolete. The display name lives in the certificate's subject CN
+        /// (`PROTOCOL.md` §2.1); the server ignores this field. Kept because
+        /// postcard encodes fields positionally.
         name: String,
     },
     /// 1, S→C. Complete state.
@@ -44,6 +45,8 @@ pub enum ControlMsg {
         /// Server capability bits.
         caps: u32,
         /// The client's own entry, including `user_id` and the stored name.
+        /// A client whose own leaf carries a different CN asks for a new
+        /// certificate carrying `you.name` (`PROTOCOL.md` §2.2).
         you: UserInfo,
         /// Audio parameters for this room.
         audio: AudioParams,
@@ -97,14 +100,18 @@ pub enum ControlMsg {
         /// Human readable detail.
         detail: String,
     },
-    /// 9, C→S. Certificate renewal over the authenticated connection.
+    /// 9, C→S. Certificate renewal over the authenticated connection, and the
+    /// only way to change a display name: the CSR's subject CN is the name the
+    /// client asks for (`PROTOCOL.md` §2.2).
     RenewRequest {
-        /// PKCS#10 CSR, DER, at most 2 KiB.
+        /// PKCS#10 CSR, DER, at most 2 KiB. Exactly one subject CN, which must
+        /// pass `validate_name` and be free server-wide.
         csr_der: Vec<u8>,
     },
     /// 10, S→C.
     RenewResponse {
-        /// The freshly issued leaf certificate, DER.
+        /// The freshly issued leaf certificate, DER. Its CN is the name the
+        /// CSR asked for.
         leaf_der: Vec<u8>,
     },
     /// 11, C→S. Loss measured by a receiver over the last 2 s.
@@ -124,7 +131,12 @@ pub enum ControlMsg {
         /// Whose camera should emit an IDR. `0` towards the speaker.
         speaker: Session,
     },
-    /// 14, C→S. Rename.
+    /// 14, obsolete. Renaming runs through `RenewRequest`, because the name
+    /// lives in the certificate.
+    ///
+    /// The variant number stays reserved so the numbering remains normative;
+    /// no client sends it, and a server that receives it closes with
+    /// `PROTOCOL_VIOLATION`.
     SetName {
         /// The new display name.
         name: String,
@@ -145,7 +157,8 @@ pub enum ControlMsg {
     /// 17, C→S. Admin only (`Welcome.is_admin`); rejected with `Error{NOT_ADMIN}`
     /// otherwise. Non fatal either way.
     CreateInviteRequest {
-        /// Name the certificate CN will carry.
+        /// Advisory label: it prefills the invited user's name dialog and does
+        /// not bind the certificate CN. May be empty.
         name: String,
         /// Lifetime in seconds. `0` means the default (`limits::INVITE_TTL_S`).
         ttl_s: u64,
@@ -299,7 +312,6 @@ impl ControlMsg {
                 | ControlMsg::RenewRequest { .. }
                 | ControlMsg::LossReport { .. }
                 | ControlMsg::KeyframeRequest { .. }
-                | ControlMsg::SetName { .. }
                 | ControlMsg::CreateInviteRequest { .. }
                 | ControlMsg::AdminSetRole { .. }
                 | ControlMsg::AdminSetDisabled { .. }
@@ -316,9 +328,12 @@ pub enum EnrollMsg {
     EnrollRequest {
         /// Invite token, base64url without padding, 22 characters = 128 bit.
         token: String,
-        /// PKCS#10 CSR, DER, at most 2 KiB.
+        /// PKCS#10 CSR, DER, at most 2 KiB. Exactly one subject CN, which must
+        /// pass `validate_name` and be free server-wide — that CN becomes the
+        /// display name (`PROTOCOL.md` §2.3).
         csr_der: Vec<u8>,
-        /// Desired display name.
+        /// Obsolete. The name comes from the CSR; the server ignores this
+        /// field. Kept because postcard encodes fields positionally.
         name: String,
     },
     /// 1, S→C.
@@ -624,5 +639,11 @@ mod tests {
         assert!(!ControlMsg::UserAdminChanged { is_admin: true }.is_client_to_server());
         assert!(!ControlMsg::UserListResponse { users: vec![] }.is_client_to_server());
         assert!(!ControlMsg::UserRtt { rtts: vec![] }.is_client_to_server());
+        // Obsolete: renaming runs through `RenewRequest`, so a server that
+        // sees variant 14 treats it as a protocol violation.
+        assert!(!ControlMsg::SetName {
+            name: "alice".into()
+        }
+        .is_client_to_server());
     }
 }

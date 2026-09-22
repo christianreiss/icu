@@ -67,7 +67,7 @@ Tabelle „Feature | v1 | Grund". „Perfekt" = das Kriterium in der Grund-Spalt
 | Tray-Icon | ja | Zeigt Zustand (verbunden/getrennt, Mute, Deafen) als Icon-Variante; Menü: Mute, Deafen, Fenster zeigen, Beenden; Schließen des Fensters minimiert in den Tray; Linux via KSNI (kein GTK). |
 | Settings-Dialog minimal | ja | Ein Fenster, alle Änderungen wirken sofort (kein OK/Apply), Bereiche: Audio (Geräte, Pegel, Modus, Hotkeys, Release-Delay, Cues, Rauschunterdrückung), Kamera (Gerät, Vorschau), Overlay (an/aus, Position), Anzeigename. |
 | Join/Leave-Hinweis | ja (Empfehlung Grauzone) | Kurzer Ton + Tray-Benachrichtigung bei Join/Leave, beides einzeln abschaltbar, Default: Ton an. |
-| Anzeigename ändern | ja | Wird bei Enrollment gesetzt, später im Settings-Dialog änderbar; Server verknüpft Identität mit Cert-Fingerprint, nicht mit dem Namen. |
+| Anzeigename ändern | ja | **Revidiert 2026-09-22 (Name im Zertifikat).** Der Name wird beim Enrollment vom Nutzer gewählt und reist im CSR-CN; eine spätere Änderung im Settings-Dialog löst ein Cert-Renewal aus, das ein neues Zertifikat mit dem neuen CN ausstellt. Identität bleibt der Fingerprint. Das alte Zertifikat bleibt bis zum Ablauf gültig. Namen sind serverweit eindeutig; eine Kollision wird mit `NAME_TAKEN` abgelehnt, kein stilles `-2`-Suffix mehr. |
 | Versionshinweis | ja | Server meldet Mindest-Protokollversion; Client zeigt „Update nötig" mit Link, kein Auto-Update (packaging-licensing.md). |
 
 ### Ausdrücklich abgelehnt
@@ -93,7 +93,7 @@ Tabelle „Feature | v1 | Grund". „Perfekt" = das Kriterium in der Grund-Spalt
 | Attenuation anderer Apps beim Sprechen | nein | Systemweite Lautstärkeeingriffe (Ducking) sind plattformspezifisch und überraschend; Spiel-Lautstärke regelt das OS. |
 | Idle-Auto-Mute/Deafen | nein | Mit PTT irrelevant, mit VAD wird Stille ohnehin nicht gesendet. |
 | Text-to-Speech, Avatare, Themes, Fonts | nein | Kosmetik bzw. Barrierefreiheitsfeature ohne Nachfrage in der Gruppe; Themes folgen dem System (hell/dunkel). |
-| Zertifikatsverwaltung im Client | nein | Enrollment läuft über den Invite-Link; Widerruf über Server-CLI; der Nutzer sieht nie ein Zertifikat. |
+| Zertifikatsverwaltung im Client | nein | **Revidiert 2026-09-22.** Weiterhin keine Zertifikats*verwaltung* (kein Ausstellen, kein Widerrufen, kein Store) — aber der Nutzer sieht sein Zertifikat sehr wohl: das Verbindungsfenster zeigt es lesend an, eine Namensänderung erneuert es still, und der Passport (`PROTOCOL.md` §2.3.2) exportiert und importiert die ganze Identität. Widerruf bleibt Sache von Server-CLI und Admin-Tab. |
 | Positionierbare Overlay-Layouts (FPS, Uhr) | nein | Overlay zeigt Sprecher und Kamera, sonst nichts; FPS/Uhr liefern Spiele/OS. |
 
 ### Grauzone mit Empfehlung

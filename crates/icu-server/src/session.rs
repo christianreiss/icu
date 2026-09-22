@@ -7,13 +7,14 @@ use std::{
 };
 
 use icu_proto::{
-    error as ec, limits as pl, validate_name, AudioParams, ControlMsg, Session, UserFlags, UserId,
+    error as ec, limits as pl, name_key, AudioParams, ControlMsg, Session, UserFlags, UserId,
     UserInfo, MAX_CONTROL_FRAME,
 };
 use rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc;
 
 use crate::{
+    ca,
     error::{Error, Result},
     limits::{TokenBucket, ViolationCounter},
     relay::{self, VideoSender},
@@ -54,6 +55,13 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
 #[derive(Debug, Clone)]
 struct Identity {
     user_id: UserId,
+    /// SHA-256 of the presented leaf, lowercase hex.
+    cert_fp: String,
+    /// Subject CN of the presented leaf, `""` when it does not parse.
+    /// Advisory: authentication is the fingerprint, never the name. It only
+    /// says whether this client still holds a certificate carrying the current
+    /// name, or has to catch up (`PROTOCOL.md` §2.2).
+    cert_cn: String,
 }
 
 async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<Identity> {
@@ -83,7 +91,24 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
             format!("user_id {user_id} is disabled"),
         ));
     }
-    Ok(Identity { user_id })
+    let cert_cn = ca::leaf_common_name(leaf);
+    if name_key(&cert_cn) != name_key(&user.name) {
+        // Not a reason to reject: the store keeps fingerprints, not DER, so
+        // certificates issued before the name moved into the certificate have
+        // no recorded CN at all. The client notices the same mismatch and
+        // renews itself (`PROTOCOL.md` §2.2).
+        tracing::debug!(
+            user_id,
+            cert_cn = %cert_cn,
+            stored = %user.name,
+            "stale cn, client will catch up"
+        );
+    }
+    Ok(Identity {
+        user_id,
+        cert_fp: fp,
+        cert_cn,
+    })
 }
 
 async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identity) -> Result<()> {
@@ -132,10 +157,20 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     }
     let minor = minor.min(icu_proto::MINOR);
 
-    // `Hello.name` only counts when nothing is stored yet (§6.4.2).
+    // `Hello.name` is obsolete: the name lives in the certificate, and the
+    // store mirrors the CN of the newest one (§6.4.2).
+    let _ = name;
     let (stored_name, is_admin) = {
-        let mut store = server.store.lock().await;
-        let stored_name = store.set_initial_name(identity.user_id, &name)?;
+        let store = server.store.lock().await;
+        let stored_name = store
+            .user(identity.user_id)
+            .map(|u| u.name.clone())
+            .ok_or_else(|| {
+                Error::coded(
+                    ec::AUTH_UNKNOWN_CERT,
+                    format!("unknown user_id {}", identity.user_id),
+                )
+            })?;
         let is_admin = store.is_admin(identity.user_id);
         (stored_name, is_admin)
     };
@@ -200,7 +235,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     let datagrams = tokio::spawn(datagram_task(server.clone(), conn.clone(), session));
     let uni = tokio::spawn(uni_task(server.clone(), conn.clone(), session));
 
-    let outcome = control_loop(server, conn, session, identity.user_id, &mut recv).await;
+    let outcome = control_loop(server, conn, session, identity, &mut recv).await;
 
     // 6. Leave and announce.
     datagrams.abort();
@@ -286,9 +321,10 @@ async fn control_loop(
     server: &Arc<Server>,
     conn: &quinn::Connection,
     session: Session,
-    user_id: UserId,
+    identity: &Identity,
     recv: &mut quinn::RecvStream,
 ) -> Result<()> {
+    let user_id = identity.user_id;
     let mut control = TokenBucket::per_second(server.config.limits.control_msgs_per_s);
     let mut set_state = TokenBucket::per_second(server.config.limits.set_state_per_s);
     let mut violations = ViolationCounter::new(
@@ -360,9 +396,6 @@ async fn control_loop(
                     },
                 );
             }
-            ControlMsg::SetName { name } => {
-                handle_set_name(server, session, user_id, &name).await;
-            }
             ControlMsg::LossReport {
                 speaker,
                 loss_permille,
@@ -383,7 +416,7 @@ async fn control_loop(
                 relay::keyframe_request(server, speaker);
             }
             ControlMsg::RenewRequest { csr_der } => {
-                handle_renew(server, session, user_id, &csr_der).await;
+                handle_renew(server, session, identity, &csr_der).await;
             }
             ControlMsg::CreateInviteRequest { name, ttl_s } => {
                 handle_create_invite(server, session, user_id, &name, ttl_s).await;
@@ -435,76 +468,91 @@ fn rate_limited(
     violations.record()
 }
 
-async fn handle_set_name(server: &Arc<Server>, session: Session, user_id: UserId, name: &str) {
-    if let Err(e) = validate_name(name) {
-        server.room.send_to(
-            session,
-            &ControlMsg::Error {
-                code: ec::NAME_TAKEN,
-                detail: e.to_string(),
-            },
-        );
-        return;
-    }
-    let result = {
-        let mut store = server.store.lock().await;
-        store.rename(user_id, name)
-    };
-    match result {
-        Ok(()) => {
-            server.room.rename(session, name);
-            server.room.broadcast(&ControlMsg::UserRenamed {
-                session,
-                name: name.to_string(),
-            });
-        }
-        Err(e) => {
-            server.room.send_to(
-                session,
-                &ControlMsg::Error {
-                    code: e.code().unwrap_or(ec::NAME_TAKEN),
-                    detail: e.to_string(),
-                },
-            );
-        }
-    }
-}
+/// Certificate renewal, and the only way a name changes (`PROTOCOL.md` §2.2).
+///
+/// The CSR's subject CN is the name the client asks for. Three cases, told
+/// apart by exact string comparison against the stored name — case-insensitive
+/// comparison would misfile a pure case change as a plain renewal:
+///
+/// * CN == stored, presented certificate current: plain renewal, one per day.
+/// * CN == stored, presented certificate stale: catch-up after a rename on
+///   another device. Exempt from the daily limit, but bounded per certificate
+///   so one stale session cannot mint certificates in a loop.
+/// * CN != stored: rename. Costs the daily budget and needs the name to be
+///   free server-wide.
+async fn handle_renew(
+    server: &Arc<Server>,
+    session: Session,
+    identity: &Identity,
+    csr_der: &[u8],
+) {
+    let reject = |code: u32, detail: String| ControlMsg::Error { code, detail };
+    let user_id = identity.user_id;
 
-async fn handle_renew(server: &Arc<Server>, session: Session, user_id: UserId, csr_der: &[u8]) {
-    let reject = |detail: String| ControlMsg::Error {
-        code: ec::RENEW_REJECTED,
-        detail,
+    let requested = match ca::csr_common_name(csr_der) {
+        Ok(cn) => cn,
+        Err(e) => {
+            server
+                .room
+                .send_to(session, &reject(ec::RENEW_REJECTED, e.to_string()));
+            return;
+        }
     };
 
     let mut store = server.store.lock().await;
-    // At most one renewal per day and user (§6.4 control handler).
-    if let Some(last) = store.last_renew(user_id) {
+    let Some(user) = store.user(user_id) else {
+        server
+            .room
+            .send_to(session, &reject(ec::RENEW_REJECTED, "unknown user".into()));
+        return;
+    };
+    let stored = user.name.clone();
+    let rename = requested != stored;
+
+    // Uniqueness before the rate check, so a taken name reports NAME_TAKEN
+    // instead of a confusing rate message.
+    if rename && store.name_taken(&requested, Some(user_id)) {
+        server.room.send_to(
+            session,
+            &reject(ec::NAME_TAKEN, format!("name {requested:?} is already taken")),
+        );
+        return;
+    }
+
+    let catch_up = !rename && identity.cert_cn != stored;
+    if catch_up {
+        if let Some(last) = store.cert_renewed(user_id, &identity.cert_fp) {
+            if now() - last < time::Duration::days(1) {
+                server.room.send_to(
+                    session,
+                    &reject(
+                        ec::RENEW_REJECTED,
+                        "this certificate already caught up today".into(),
+                    ),
+                );
+                return;
+            }
+        }
+    } else if let Some(last) = store.last_renew(user_id) {
         if now() - last < time::Duration::days(1) / pl::RENEW_PER_DAY {
-            server
-                .room
-                .send_to(session, &reject("at most one renewal per day".into()));
+            server.room.send_to(
+                session,
+                &reject(ec::RENEW_REJECTED, "at most one renewal per day".into()),
+            );
             return;
         }
     }
-    let Some(user) = store.user(user_id) else {
-        server.room.send_to(session, &reject("unknown user".into()));
-        return;
-    };
-    // The CN comes from the stored record, never from the CSR.
-    let common_name = user.name.clone();
 
-    let leaf = {
+    let signed = {
         let ca = server.ca.read().await;
-        ca.sign_client_csr(
-            csr_der,
-            &common_name,
-            server.config.tls.client_validity_days,
-        )
+        ca.sign_client_csr(csr_der, server.config.tls.client_validity_days)
     };
-    let leaf = match leaf {
-        Ok(leaf) => leaf,
+    let (leaf, cn) = match signed {
+        Ok(signed) => signed,
         Err(e) => {
-            server.room.send_to(session, &reject(e.to_string()));
+            server
+                .room
+                .send_to(session, &reject(ec::RENEW_REJECTED, e.to_string()));
             return;
         }
     };
@@ -512,25 +560,43 @@ async fn handle_renew(server: &Arc<Server>, session: Session, user_id: UserId, c
     let issued = now();
     let cert = CertRecord {
         fingerprint: fingerprint(&leaf),
+        cn: cn.clone(),
         issued: rfc3339(issued),
         expires: rfc3339(
             issued + Duration::from_secs(u64::from(server.config.tls.client_validity_days) * 86400),
         ),
         revoked: false,
+        renewed: None,
     };
-    if let Err(e) = store.add_cert(user_id, cert, true) {
-        server.room.send_to(session, &reject(e.to_string()));
-        return;
-    }
+    // Only a catch-up stamps the presented certificate: the same certificate
+    // may be on a second device (passport) that still has to catch up itself.
+    let supersedes = catch_up.then_some(identity.cert_fp.as_str());
+    let renamed = match store.add_cert(user_id, cert, supersedes, !catch_up) {
+        Ok(renamed) => renamed,
+        Err(e) => {
+            let code = e.code().unwrap_or(ec::RENEW_REJECTED);
+            server.room.send_to(session, &reject(code, e.to_string()));
+            return;
+        }
+    };
     drop(store);
 
-    tracing::info!(session, user_id, "certificate renewed");
+    tracing::info!(session, user_id, name = %cn, renamed, catch_up, "certificate renewed");
     server.room.send_to(
         session,
         &ControlMsg::RenewResponse {
             leaf_der: leaf.to_vec(),
         },
     );
+    if renamed {
+        for s in server.room.sessions_of_user(user_id) {
+            server.room.rename(s, &cn);
+            server.room.broadcast(&ControlMsg::UserRenamed {
+                session: s,
+                name: cn.clone(),
+            });
+        }
+    }
 }
 
 /// Mints an invite and returns it as a self-contained blob (`CreateInviteRequest`,
@@ -552,6 +618,9 @@ async fn handle_create_invite(
         return;
     }
     let ttl = Duration::from_secs(if ttl_s == 0 { pl::INVITE_TTL_S } else { ttl_s });
+    // The label binds nothing (the invited user picks their own name), so the
+    // only failure here is a malformed label or a failed write. `NAME_TAKEN` is
+    // the non-fatal code the client already shows next to the invite field.
     let (token, record) = match store.create_invite(name, ttl) {
         Ok(v) => v,
         Err(e) => {

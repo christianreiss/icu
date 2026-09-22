@@ -1,5 +1,6 @@
 //! Control channel behaviour (`Server/IMPLEMENTATION.md` §10: Hello-Timeout,
-//! `SERVER_FULL`, `Ping`/`Pong`, `SetName`, `Hello.name`, rate limits).
+//! `SERVER_FULL`, `Ping`/`Pong`, rename through `RenewRequest`, `Hello.name`,
+//! rate limits).
 
 mod common;
 
@@ -105,17 +106,34 @@ async fn ping_is_answered_with_a_plausible_pong() {
     server.shutdown().await;
 }
 
+/// A rename is a renewal carrying a new CN: the name lives in the certificate
+/// (`PROTOCOL.md` §2.2).
 #[tokio::test]
-async fn set_name_to_a_free_name_broadcasts_user_renamed() {
+async fn renewal_with_a_new_cn_renames_and_broadcasts_user_renamed() {
     let server = TestServer::start().await;
-    let mut alice = server.client("alice").await;
+    let old = server.enroll("alice").await;
+    let mut alice = server.connect(&old).await.expect("connect");
+    alice.hello("alice").await;
     let mut bob = server.client("bob").await;
 
+    let (_key, csr) = common::csr_with_cn("alicia");
     alice
-        .send_msg(&ControlMsg::SetName {
-            name: "alicia".into(),
-        })
+        .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
         .await;
+
+    let response = alice
+        .recv_matching(|m| matches!(m, ControlMsg::RenewResponse { .. }))
+        .await
+        .expect("RenewResponse");
+    let ControlMsg::RenewResponse { leaf_der } = response else {
+        unreachable!()
+    };
+    assert_eq!(
+        icu_server::ca::leaf_common_name(&leaf_der),
+        "alicia",
+        "the new certificate carries the new name"
+    );
+
     for client in [&mut alice, &mut bob] {
         let msg = client
             .recv_matching(|m| matches!(m, ControlMsg::UserRenamed { .. }))
@@ -125,17 +143,26 @@ async fn set_name_to_a_free_name_broadcasts_user_renamed() {
             "{msg:?}"
         );
     }
+
+    // The pre-rename certificate stays valid until it expires, and sees the
+    // current name.
+    let mut stale = server.connect(&old).await.expect("old cert still connects");
+    match stale.hello("alice").await {
+        ControlMsg::Welcome { you, .. } => assert_eq!(you.name, "alicia"),
+        other => panic!("expected Welcome, got {other:?}"),
+    }
     server.shutdown().await;
 }
 
 #[tokio::test]
-async fn set_name_to_a_taken_name_is_an_error_and_changes_nothing() {
+async fn renewal_onto_a_taken_name_is_name_taken_and_changes_nothing() {
     let server = TestServer::start().await;
     let mut alice = server.client("alice").await;
     let mut bob = server.client("bob").await;
 
+    let (_key, csr) = common::csr_with_cn("BOB");
     alice
-        .send_msg(&ControlMsg::SetName { name: "BOB".into() })
+        .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
         .await;
     let msg = alice
         .recv_matching(|m| matches!(m, ControlMsg::Error { .. }))
@@ -145,38 +172,118 @@ async fn set_name_to_a_taken_name_is_an_error_and_changes_nothing() {
         "{msg:?}"
     );
     bob.expect_silence().await;
+
+    // Non-fatal: the connection is still usable.
+    alice.send_msg(&ControlMsg::Ping { nonce: 7 }).await;
+    let pong = alice
+        .recv_matching(|m| matches!(m, ControlMsg::Pong { .. }))
+        .await;
+    assert!(
+        matches!(pong, Some(ControlMsg::Pong { nonce: 7, .. })),
+        "{pong:?}"
+    );
     server.shutdown().await;
 }
 
 #[tokio::test]
-async fn set_name_validates_length_and_control_characters() {
+async fn a_renewal_cn_is_validated_like_any_other_name() {
     let server = TestServer::start().await;
     let mut alice = server.client("alice").await;
     for bad in ["", &"x".repeat(33), "a\nb"] {
+        let (_key, csr) = common::csr_with_cn(bad);
         alice
-            .send_msg(&ControlMsg::SetName {
-                name: bad.to_string(),
-            })
+            .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
             .await;
         let msg = alice
             .recv_matching(|m| matches!(m, ControlMsg::Error { .. }))
             .await;
-        assert!(msg.is_some(), "{bad:?} should be rejected");
+        assert!(
+            matches!(&msg, Some(ControlMsg::Error { code, .. }) if *code == ec::RENEW_REJECTED),
+            "{bad:?} should be rejected, got {msg:?}"
+        );
     }
     server.shutdown().await;
 }
 
+/// A device that missed a rename connects with a stale CN, learns the current
+/// name from `Welcome` and catches up — even though the rename already used
+/// the day's renewal budget. A second catch-up on the same certificate is
+/// refused, so a stale session cannot mint certificates in a loop.
 #[tokio::test]
-async fn hello_name_is_ignored_once_a_name_is_stored() {
+async fn a_stale_cn_connects_and_may_catch_up_the_same_day() {
+    let server = TestServer::start().await;
+    let old = server.enroll("alice").await;
+    let mut alice = server.connect(&old).await.expect("connect");
+    alice.hello("alice").await;
+
+    let (_key, csr) = common::csr_with_cn("alicia");
+    alice
+        .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
+        .await;
+    alice
+        .recv_matching(|m| matches!(m, ControlMsg::RenewResponse { .. }))
+        .await
+        .expect("the rename lands");
+
+    // Second device, still holding the pre-rename certificate.
+    let mut stale = server.connect(&old).await.expect("stale connect");
+    match stale.hello("alice").await {
+        ControlMsg::Welcome { you, .. } => assert_eq!(
+            you.name, "alicia",
+            "the roster carries the current name, not the certificate's"
+        ),
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+
+    let (_key, csr) = common::csr_with_cn("alicia");
+    stale
+        .send_msg(&ControlMsg::RenewRequest {
+            csr_der: csr.clone(),
+        })
+        .await;
+    let response = stale
+        .recv_matching(|m| matches!(m, ControlMsg::RenewResponse { .. }))
+        .await
+        .expect("catch-up is exempt from the daily limit");
+    let ControlMsg::RenewResponse { leaf_der } = response else {
+        unreachable!()
+    };
+    assert_eq!(icu_server::ca::leaf_common_name(&leaf_der), "alicia");
+
+    // The same certificate cannot catch up twice.
+    stale
+        .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
+        .await;
+    let msg = stale
+        .recv_matching(|m| matches!(m, ControlMsg::Error { .. }))
+        .await;
+    assert!(
+        matches!(&msg, Some(ControlMsg::Error { code, .. }) if *code == ec::RENEW_REJECTED),
+        "{msg:?}"
+    );
+    server.shutdown().await;
+}
+
+/// `SetName` is obsolete; the variant number stays reserved, so a server that
+/// still receives it treats it as a wrong-direction message.
+#[tokio::test]
+async fn set_name_is_a_protocol_violation() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    alice
+        .send_msg(&ControlMsg::SetName {
+            name: "alicia".into(),
+        })
+        .await;
+    assert_eq!(alice.closed_code().await, Some(ec::PROTOCOL_VIOLATION));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn hello_name_is_ignored_entirely() {
     let server = TestServer::start().await;
     let identity = server.enroll("alice").await;
-    {
-        let mut client = server.connect(&identity).await.expect("connect");
-        client.hello("alice").await;
-    }
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let mut client = server.connect(&identity).await.expect("reconnect");
+    let mut client = server.connect(&identity).await.expect("connect");
     let welcome = client
         .hello_with("mallory", icu_proto::MINOR, UserFlags::NONE)
         .await
@@ -184,7 +291,7 @@ async fn hello_name_is_ignored_once_a_name_is_stored() {
     match welcome {
         ControlMsg::Welcome { you, .. } => assert_eq!(
             you.name, "alice",
-            "Hello.name must not overwrite the stored name"
+            "the name comes from the certificate, never from Hello"
         ),
         other => panic!("expected Welcome, got {other:?}"),
     }

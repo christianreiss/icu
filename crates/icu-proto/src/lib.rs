@@ -22,6 +22,7 @@ pub mod framing;
 pub mod header;
 pub mod invite_blob;
 pub mod limits;
+pub mod passport;
 pub mod types;
 
 pub use control::{ControlMsg, EnrollMsg, CAPS, MINOR};

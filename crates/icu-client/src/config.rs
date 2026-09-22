@@ -273,7 +273,9 @@ impl Default for OverlaySettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiSettings {
-    /// Display name sent in `Hello`; `None` uses the invite name.
+    /// Legacy. The display name lives in the certificate's CN since the name
+    /// moved there (`PROTOCOL.md` §2.1); nothing reads this any more. Kept so
+    /// an existing `settings.toml` still round-trips.
     pub name: Option<String>,
     /// Start in the tray.
     pub start_minimized: bool,
@@ -358,13 +360,14 @@ pub struct ServerInfo {
     pub port: u16,
     /// SNI from `EnrollResponse.server_name`.
     pub server_name: String,
-    /// Name from the invite (`n=`), used as `Hello.name` unless `[ui].name`
-    /// overrides it.
+    /// Last known display name, mirrored from the certificate's CN at
+    /// enrollment and after every renewal. Informational: the certificate is
+    /// the authority (`PROTOCOL.md` §2.1).
     pub name: String,
 }
 
 /// Key, leaf, CA and server coordinates.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Identity {
     /// PKCS#8 DER private key.
     pub key_der: Vec<u8>,
@@ -374,6 +377,52 @@ pub struct Identity {
     pub ca_der: Vec<u8>,
     /// Server coordinates.
     pub server: ServerInfo,
+}
+
+/// Hand written so the private key cannot reach a log line: `Identity` travels
+/// inside `Command`, which derives `Debug`.
+impl std::fmt::Debug for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field(
+                "key_der",
+                &format_args!("<redacted, {} bytes>", self.key_der.len()),
+            )
+            .field("leaf_der", &format_args!("{} bytes", self.leaf_der.len()))
+            .field("ca_der", &format_args!("{} bytes", self.ca_der.len()))
+            .field("server", &self.server)
+            .finish()
+    }
+}
+
+impl From<&Identity> for icu_proto::passport::PassportV1 {
+    fn from(id: &Identity) -> Self {
+        icu_proto::passport::PassportV1 {
+            host: id.server.host.clone(),
+            port: id.server.port,
+            server_name: id.server.server_name.clone(),
+            name: id.server.name.clone(),
+            key_der: id.key_der.clone(),
+            leaf_der: id.leaf_der.clone(),
+            ca_der: id.ca_der.clone(),
+        }
+    }
+}
+
+impl From<icu_proto::passport::PassportV1> for Identity {
+    fn from(p: icu_proto::passport::PassportV1) -> Self {
+        Identity {
+            key_der: p.key_der,
+            leaf_der: p.leaf_der,
+            ca_der: p.ca_der,
+            server: ServerInfo {
+                host: p.host,
+                port: p.port,
+                server_name: p.server_name,
+                name: p.name,
+            },
+        }
+    }
 }
 
 impl Identity {

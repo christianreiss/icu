@@ -2,9 +2,10 @@
 //! §6.3).
 //!
 //! The server is its own CA: it issues the server leaf and every client
-//! certificate, and it is the only thing clients trust. Key facts verified in
-//! Spike 2b: the server overrides subject, SAN, EKU and validity, so nothing
-//! from a CSR ends up in a certificate except the public key.
+//! certificate, and it is the only thing clients trust. SAN, EKU, basic
+//! constraints, key usage, validity and serial are server-set; from a CSR come
+//! the public key **and the validated subject CN**, which is the user's display
+//! name (`PROTOCOL.md` §2.1, revised 2026-09-22).
 
 use std::{
     net::IpAddr,
@@ -122,20 +123,15 @@ impl Ca {
         Ok(())
     }
 
-    /// Signs a client CSR. Subject CN, EKU, validity and serial come from the
-    /// server; only the public key comes from the CSR (Spike 2b).
+    /// Signs a client CSR. The public key and the validated subject CN come
+    /// from the CSR; SAN, EKU, basic constraints, key usage, validity and
+    /// serial are server-set. Returns the leaf and the CN it carries.
     pub fn sign_client_csr(
         &self,
         csr_der: &[u8],
-        common_name: &str,
         validity_days: u32,
-    ) -> Result<CertificateDer<'static>> {
-        if csr_der.len() > icu_proto::ControlMsg::MAX_CSR_DER {
-            return Err(Error::coded(
-                icu_proto::error::ENROLL_BAD_CSR,
-                format!("csr is {} bytes, limit is 2 KiB", csr_der.len()),
-            ));
-        }
+    ) -> Result<(CertificateDer<'static>, String)> {
+        let common_name = csr_common_name(csr_der)?;
         let csr_der = CertificateSigningRequestDer::from(csr_der.to_vec());
         let mut csr = CertificateSigningRequestParams::from_der(&csr_der).map_err(|e| {
             Error::coded(
@@ -153,10 +149,12 @@ impl Ca {
             ));
         }
 
+        // Rebuilt from scratch even though the CN is adopted: this canonicalises
+        // the encoding to a UTF8String and drops every other DN attribute.
         csr.params.distinguished_name = DistinguishedName::new();
         csr.params
             .distinguished_name
-            .push(DnType::CommonName, common_name);
+            .push(DnType::CommonName, common_name.clone());
         csr.params.subject_alt_names = Vec::new();
         csr.params.is_ca = IsCa::NoCa;
         csr.params.key_usages = Vec::new();
@@ -172,7 +170,7 @@ impl Ca {
                 format!("cannot sign csr: {e}"),
             )
         })?;
-        Ok(cert.der().clone())
+        Ok((cert.der().clone(), common_name))
     }
 
     /// The CA certificate in DER form.
@@ -216,6 +214,73 @@ impl Ca {
         let key = KeyPair::from_pem(&self.ca_key_pem).context("cannot load ca.key")?;
         Issuer::from_ca_cert_der(&self.ca_der, key).context("cannot load ca.crt as issuer")
     }
+}
+
+/// The display name a CSR asks for: exactly one subject CN, readable as UTF-8,
+/// passing `validate_name` (`PROTOCOL.md` §2.3).
+///
+/// Parsed with x509-parser on the raw DER rather than through rcgen's
+/// `DistinguishedName`: that one is a map keyed by `DnType`, so a CSR carrying
+/// two CN attributes would silently collapse to one and "exactly one CN" would
+/// not be checkable at all.
+pub fn csr_common_name(csr_der: &[u8]) -> Result<String> {
+    use x509_parser::prelude::FromDer;
+
+    if csr_der.len() > icu_proto::ControlMsg::MAX_CSR_DER {
+        return Err(Error::coded(
+            icu_proto::error::ENROLL_BAD_CSR,
+            format!("csr is {} bytes, limit is 2 KiB", csr_der.len()),
+        ));
+    }
+    let (_, csr) =
+        x509_parser::certification_request::X509CertificationRequest::from_der(csr_der).map_err(
+            |e| {
+                Error::coded(
+                    icu_proto::error::ENROLL_BAD_CSR,
+                    format!("csr not parsable: {e}"),
+                )
+            },
+        )?;
+    let mut cns = csr.certification_request_info.subject.iter_common_name();
+    let Some(cn) = cns.next() else {
+        return Err(Error::coded(
+            icu_proto::error::ENROLL_BAD_CSR,
+            "csr subject has no common name",
+        ));
+    };
+    if cns.next().is_some() {
+        return Err(Error::coded(
+            icu_proto::error::ENROLL_BAD_CSR,
+            "csr subject has more than one common name",
+        ));
+    }
+    let cn = cn.as_str().map_err(|_| {
+        Error::coded(
+            icu_proto::error::ENROLL_BAD_CSR,
+            "csr common name is not readable as utf-8",
+        )
+    })?;
+    icu_proto::validate_name(cn)
+        .map_err(|e| Error::coded(icu_proto::error::ENROLL_BAD_CSR, format!("bad name: {e}")))?;
+    Ok(cn.to_string())
+}
+
+/// The subject CN of an already verified leaf, or `""` when it has none or does
+/// not parse. Never fails: an unreadable CN must not cost a client its
+/// connection, it only means the client has to catch up (`PROTOCOL.md` §2.2).
+pub fn leaf_common_name(der: &[u8]) -> String {
+    use x509_parser::prelude::FromDer;
+
+    x509_parser::certificate::X509Certificate::from_der(der)
+        .ok()
+        .and_then(|(_, cert)| {
+            cert.subject()
+                .iter_common_name()
+                .next()
+                .and_then(|a| a.as_str().ok())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
 }
 
 fn create_ca(dir: &Path, tls: &TlsSection) -> Result<(CertificateDer<'static>, String)> {
@@ -323,24 +388,49 @@ mod tests {
         }
     }
 
-    /// §10: the CSR override from Spike 2b — a cheeky CN does not survive.
+    /// A CSR for `cn`, plus its key so the caller can keep it.
+    fn csr_with_cn(cn: &str) -> (KeyPair, Vec<u8>) {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params.distinguished_name.push(DnType::CommonName, cn);
+        let csr = params.serialize_request(&key).unwrap().der().to_vec();
+        (key, csr)
+    }
+
+    /// §10: the CN is adopted from the CSR (it *is* the name the user picked),
+    /// everything else in the subject and the extensions is not.
     #[test]
-    fn csr_subject_and_eku_are_overridden() {
+    fn csr_subject_is_adopted_but_validated() {
         let dir = tempfile::tempdir().unwrap();
         let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
 
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::default();
+        // A cheeky name is just a name: uniqueness and impersonation are the
+        // store's business, not the CA's.
         params
             .distinguished_name
             .push(DnType::CommonName, "admin-impersonator");
+        params.distinguished_name.push(DnType::OrganizationName, "evil corp");
+        params.subject_alt_names = vec![SanType::DnsName("icu.example.org".try_into().unwrap())];
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let csr = params.serialize_request(&key).unwrap();
 
-        let leaf = ca.sign_client_csr(csr.der(), "alice", 365).unwrap();
-        assert_eq!(common_name(&leaf), "alice");
+        let (leaf, cn) = ca.sign_client_csr(csr.der(), 365).unwrap();
+        assert_eq!(cn, "admin-impersonator");
+        assert_eq!(common_name(&leaf), "admin-impersonator");
+        assert_eq!(leaf_common_name(&leaf), "admin-impersonator");
         let x = parse(&leaf);
+        assert!(
+            x.subject_alternative_name().unwrap().is_none(),
+            "the CSR must not be able to request a SAN"
+        );
+        assert_eq!(
+            x.subject().iter().count(),
+            1,
+            "every DN attribute besides the CN is dropped"
+        );
         assert!(
             x.basic_constraints().unwrap().is_none()
                 || !x.basic_constraints().unwrap().unwrap().value.ca,
@@ -365,13 +455,10 @@ mod tests {
     fn fingerprints_are_stable_and_distinct() {
         let dir = tempfile::tempdir().unwrap();
         let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
-        let key = KeyPair::generate().unwrap();
-        let csr = CertificateParams::default()
-            .serialize_request(&key)
-            .unwrap();
+        let (_key, csr) = csr_with_cn("alice");
 
-        let a = ca.sign_client_csr(csr.der(), "alice", 365).unwrap();
-        let b = ca.sign_client_csr(csr.der(), "alice", 365).unwrap();
+        let (a, _) = ca.sign_client_csr(&csr, 365).unwrap();
+        let (b, _) = ca.sign_client_csr(&csr, 365).unwrap();
         assert_eq!(store::fingerprint(&a), store::fingerprint(&a));
         assert_ne!(
             store::fingerprint(&a),
@@ -385,23 +472,116 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
 
-        let err = ca.sign_client_csr(b"not a csr", "alice", 365).unwrap_err();
+        let err = ca.sign_client_csr(b"not a csr", 365).unwrap_err();
         assert_eq!(err.code(), Some(icu_proto::error::ENROLL_BAD_CSR));
 
-        let err = ca
-            .sign_client_csr(&vec![0u8; 3000], "alice", 365)
-            .unwrap_err();
+        let err = ca.sign_client_csr(&vec![0u8; 3000], 365).unwrap_err();
         assert_eq!(err.code(), Some(icu_proto::error::ENROLL_BAD_CSR));
 
-        // RSA keys are refused: §6.3.3 allows P-256 and P-384 only.
+        // RSA keys are refused: §6.3.3 allows P-256 and P-384 only. The CN is
+        // valid so the key check is what fires.
         let rsa = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256);
         if let Ok(rsa) = rsa {
-            let csr = CertificateParams::default()
-                .serialize_request(&rsa)
-                .unwrap();
-            let err = ca.sign_client_csr(csr.der(), "alice", 365).unwrap_err();
+            let mut params = CertificateParams::default();
+            params.distinguished_name.push(DnType::CommonName, "alice");
+            let csr = params.serialize_request(&rsa).unwrap();
+            let err = ca.sign_client_csr(csr.der(), 365).unwrap_err();
             assert_eq!(err.code(), Some(icu_proto::error::ENROLL_BAD_CSR));
         }
+    }
+
+    #[test]
+    fn a_csr_without_a_cn_is_rejected() {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        // rcgen's default DN carries a placeholder CN; an empty subject is the
+        // case under test.
+        params.distinguished_name = DistinguishedName::new();
+        let csr = params.serialize_request(&key).unwrap();
+        let err = csr_common_name(csr.der()).unwrap_err();
+        assert_eq!(err.code(), Some(icu_proto::error::ENROLL_BAD_CSR));
+    }
+
+    /// DER: tag + definite length + contents.
+    fn der(tag: u8, contents: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let n = contents.len();
+        if n < 0x80 {
+            out.push(n as u8);
+        } else if n < 0x100 {
+            out.extend_from_slice(&[0x81, n as u8]);
+        } else {
+            out.extend_from_slice(&[0x82, (n >> 8) as u8, n as u8]);
+        }
+        out.extend_from_slice(contents);
+        out
+    }
+
+    /// The reason the CN is read with x509-parser: rcgen's `DistinguishedName`
+    /// is keyed by `DnType`, so a second CN attribute would silently collapse
+    /// into the first and this case would be unobservable there.
+    ///
+    /// The CSR is rebuilt by hand around a real public key. Its signature does
+    /// not match any more, which is fine: `csr_common_name` reads the subject,
+    /// and a CSR that gets past it still has to survive rcgen's signature check
+    /// in `sign_client_csr`.
+    #[test]
+    fn a_csr_with_two_cns_is_rejected() {
+        use x509_parser::prelude::FromDer;
+
+        let (_key, csr) = csr_with_cn("alice");
+        let (_, parsed) =
+            x509_parser::certification_request::X509CertificationRequest::from_der(&csr).unwrap();
+        let info = &parsed.certification_request_info;
+
+        // AttributeTypeAndValue { OID 2.5.4.3 (CN), UTF8String }
+        let cn_attr = |name: &str| {
+            let oid = der(0x06, &[0x55, 0x04, 0x03]);
+            let value = der(0x0c, name.as_bytes());
+            let mut inner = oid;
+            inner.extend_from_slice(&value);
+            der(0x31, &der(0x30, &inner))
+        };
+        let mut rdns = cn_attr("alice");
+        rdns.extend_from_slice(&cn_attr("mallory"));
+        let subject = der(0x30, &rdns);
+
+        let mut cri = vec![0x02, 0x01, 0x00]; // version 0
+        cri.extend_from_slice(&subject);
+        cri.extend_from_slice(info.subject_pki.raw);
+        cri.extend_from_slice(&[0xa0, 0x00]); // attributes [0] IMPLICIT, empty
+        let cri = der(0x30, &cri);
+
+        let mut body = cri;
+        body.extend_from_slice(parsed.signature_algorithm.oid().as_bytes());
+        body.extend_from_slice(&der(0x30, &[])); // placeholder algorithm params
+        body.extend_from_slice(&der(0x03, &[0x00, 0x00])); // placeholder signature
+        let forged = der(0x30, &body);
+
+        let err = csr_common_name(&forged).unwrap_err();
+        assert_eq!(err.code(), Some(icu_proto::error::ENROLL_BAD_CSR));
+    }
+
+    #[test]
+    fn a_csr_cn_must_pass_validate_name() {
+        for bad in ["", "a\nb", &"x".repeat(33)] {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::default();
+            params.distinguished_name.push(DnType::CommonName, bad);
+            let csr = params.serialize_request(&key).unwrap();
+            let err = csr_common_name(csr.der()).unwrap_err();
+            assert_eq!(
+                err.code(),
+                Some(icu_proto::error::ENROLL_BAD_CSR),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_common_name_degrades_to_empty_on_garbage() {
+        assert_eq!(leaf_common_name(b"not a certificate"), "");
+        assert_eq!(leaf_common_name(&[]), "");
     }
 
     #[test]

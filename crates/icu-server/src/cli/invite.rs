@@ -1,11 +1,14 @@
-//! `icu-server invite --name alice [--ttl 24h]`
+//! `icu-server invite [--name alice] [--ttl 24h]`
+//!
+//! `--name` only prefills the invited user's name dialog; the name the
+//! certificate carries is the one that user picks (`PROTOCOL.md` §2.3).
 
 use crate::{cli, config::Config, error::Result, AdminRequest};
 
 /// Creates an invite token and prints the link.
-pub async fn run(config: &Config, name: &str, ttl: &str) -> Result<()> {
+pub async fn run(config: &Config, name: Option<&str>, ttl: &str) -> Result<()> {
     let request = AdminRequest::Invite {
-        name: name.to_string(),
+        name: name.unwrap_or_default().to_string(),
         ttl_s: Some(parse_duration(ttl)?),
     };
     let value = cli::dispatch(config, request).await?;

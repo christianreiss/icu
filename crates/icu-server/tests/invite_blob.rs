@@ -49,10 +49,12 @@ async fn mint(client: &mut common::Client, name: &str, ttl_s: u64) -> (String, S
 }
 
 #[tokio::test]
-async fn a_blob_from_an_admin_enrolls_a_second_client_with_the_invite_cn() {
+async fn a_blob_from_an_admin_enrolls_a_second_client_with_its_own_name() {
     let server = TestServer::start().await;
     let mut admin = admin_client(&server).await;
 
+    // The label on the invite is a prefill for the invited person's dialog;
+    // the name in the certificate is the one they pick (`PROTOCOL.md` §2.3).
     let (blob, _expires) = mint(&mut admin, "invited-person", 0).await;
     let body = blob
         .strip_prefix(icu_proto::invite_blob::ARMOR_PREFIX)
@@ -64,9 +66,27 @@ async fn a_blob_from_an_admin_enrolls_a_second_client_with_the_invite_cn() {
         .expect("blob enrolls");
     assert_eq!(
         common_name(&identity.cert),
-        "invited-person",
-        "the CN must come from the invite, never from the enrolling client"
+        "whatever-the-client-picks",
+        "the CN comes from the CSR, the invite label binds nothing"
     );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_invite_without_a_label_still_enrolls() {
+    let server = TestServer::start().await;
+    let mut admin = admin_client(&server).await;
+
+    let (blob, _expires) = mint(&mut admin, "", 0).await;
+    let body = blob
+        .strip_prefix(icu_proto::invite_blob::ARMOR_PREFIX)
+        .expect("armor prefix");
+
+    let identity = server
+        .enroll_with_token(body, "carol")
+        .await
+        .expect("blob enrolls");
+    assert_eq!(common_name(&identity.cert), "carol");
     server.shutdown().await;
 }
 

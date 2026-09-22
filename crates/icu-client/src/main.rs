@@ -21,8 +21,9 @@ struct Cli {
     /// Invite to enroll with: an `icu://host:port/enroll?t=…&ca=…&n=…` link,
     /// an `ICU1-…` blob, or a bare `host[:port]` for first-run bootstrap.
     link: Option<String>,
-    /// Display name. Required for an `ICU1-…` blob or a bootstrap
-    /// `host[:port]`; ignored for an `icu://` link, which carries its own.
+    /// The name to enroll with. It goes into the certificate, so it is what
+    /// everyone sees. Only optional for an `icu://` link that carries an `n=`
+    /// prefill, which is then used as-is.
     #[arg(long)]
     name: Option<String>,
     /// Configuration directory (default `$XDG_CONFIG_HOME/icu`).
@@ -87,8 +88,9 @@ fn run(cli: Cli) -> Result<(), String> {
     if let Some(link) = &cli.link {
         let link = InviteLink::parse(link).map_err(|e| e.to_string())?;
         let name = match (&link, &cli.name) {
-            (InviteLink::Link { .. }, _) => String::new(),
             (_, Some(name)) => name.clone(),
+            // An empty name lets `enroll` fall back to the link's `n=`.
+            (InviteLink::Link { name: Some(_), .. }, None) => String::new(),
             (_, None) => {
                 return Err(
                     "this invite needs --name <display name> (it carries none itself)".into(),

@@ -67,59 +67,6 @@ async fn users_lists_online_state_and_the_newest_certificate() {
 }
 
 #[tokio::test]
-async fn rename_over_the_socket_broadcasts_to_the_room() {
-    let server = TestServer::start().await;
-    let socket = server.socket();
-    let mut alice = server.client("alice").await;
-
-    let response = admin::request(
-        &socket,
-        &AdminRequest::Rename {
-            user: "alice".into(),
-            new: "alicia".into(),
-        },
-    )
-    .await
-    .expect("rename");
-    assert_eq!(response["ok"], serde_json::json!(true));
-
-    let msg = alice
-        .recv_matching(|m| matches!(m, ControlMsg::UserRenamed { .. }))
-        .await;
-    assert!(
-        matches!(&msg, Some(ControlMsg::UserRenamed { session: 1, name }) if name == "alicia"),
-        "{msg:?}"
-    );
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn rename_onto_a_taken_name_fails_without_changing_anything() {
-    let server = TestServer::start().await;
-    let socket = server.socket();
-    server.enroll("alice").await;
-    server.enroll("bob").await;
-
-    let response = admin::request(
-        &socket,
-        &AdminRequest::Rename {
-            user: "alice".into(),
-            new: "BOB".into(),
-        },
-    )
-    .await
-    .expect("rename");
-    assert_eq!(response["ok"], serde_json::json!(false));
-    assert_eq!(response["error"], serde_json::json!("NAME_TAKEN"));
-
-    let users = admin::request(&socket, &AdminRequest::Users)
-        .await
-        .expect("users");
-    assert_eq!(users["users"][0]["name"], serde_json::json!("alice"));
-    server.shutdown().await;
-}
-
-#[tokio::test]
 async fn status_reports_uptime_online_and_relay_counters() {
     let server = TestServer::start().await;
     let socket = server.socket();

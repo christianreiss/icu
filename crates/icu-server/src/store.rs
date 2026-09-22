@@ -82,18 +82,33 @@ pub fn fingerprint(der: &[u8]) -> String {
 pub struct CertRecord {
     /// SHA-256 of the leaf DER, lowercase hex.
     pub fingerprint: String,
+    /// Subject CN this certificate carries, i.e. the display name it was
+    /// issued for. `""` for records written before the name moved into the
+    /// certificate — the DER is not kept, so it cannot be back-filled, and
+    /// `""` therefore means "unknown", never "empty name".
+    #[serde(default)]
+    pub cn: String,
     /// When it was issued, RFC 3339 UTC.
     pub issued: String,
     /// When it expires, RFC 3339 UTC.
     pub expires: String,
     /// Whether it was revoked.
     pub revoked: bool,
+    /// When this certificate was last used for a *catch-up* renewal, RFC 3339
+    /// UTC. Those are exempt from the per-user daily limit, so this is what
+    /// bounds them. A plain renewal or a rename does not stamp it: the
+    /// certificate it was requested with may well be sitting on a second
+    /// device that still has its own catch-up to do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewed: Option<String>,
 }
 
 /// One user. A user has a stable [`UserId`] and over time several certificates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
-    /// Display name.
+    /// Display name — a mirror of the subject CN of the most recently issued
+    /// certificate (`PROTOCOL.md` §2.1). Only `Store::add_user` and
+    /// `Store::add_cert` write it.
     pub name: String,
     /// When the user was enrolled, RFC 3339 UTC.
     pub created: String,
@@ -148,7 +163,8 @@ impl Default for UsersFile {
 /// One invite token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteRecord {
-    /// Name the certificate CN will carry.
+    /// Advisory label: it prefills the invited user's name dialog and does not
+    /// bind the certificate CN. May be empty.
     pub name: String,
     /// When it was created, RFC 3339 UTC.
     pub created: String,
@@ -301,43 +317,22 @@ impl Store {
             .any(|(id, u)| Some(id) != except && name_key(&u.name) == key)
     }
 
-    /// Makes `desired` unique by appending `-2`, `-3`, … (`PROTOCOL.md` §2.3).
-    ///
-    /// The base is truncated on a UTF-8 boundary when the suffix would push the
-    /// name past 32 bytes.
-    pub fn unique_name(&self, desired: &str) -> String {
-        if !self.name_taken(desired, None) {
-            return desired.to_string();
-        }
-        for n in 2u32..10_000 {
-            let suffix = format!("-{n}");
-            let max_base = icu_proto::types::NAME_MAX_LEN - suffix.len();
-            let mut base = desired;
-            while base.len() > max_base {
-                base = &base[..base
-                    .char_indices()
-                    .take_while(|(i, _)| *i < max_base)
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)];
-            }
-            let candidate = format!("{base}{suffix}");
-            if !self.name_taken(&candidate, None) {
-                return candidate;
-            }
-        }
-        // 10k collisions on one name is not a real case; fall back to the id.
-        format!("user-{}", self.users.next_user_id)
-    }
-
     /// The id the next [`Store::add_user`] will hand out.
     pub fn peek_next_user_id(&self) -> UserId {
         self.users.next_user_id
     }
 
-    /// Adds a new user with its first certificate. Returns the new `user_id`.
-    pub fn add_user(&mut self, name: &str, cert: CertRecord, is_admin: bool) -> Result<UserId> {
-        validate_name(name)?;
+    /// Adds a new user with its first certificate. The display name is the
+    /// certificate's CN. Returns the new `user_id`.
+    pub fn add_user(&mut self, cert: CertRecord, is_admin: bool) -> Result<UserId> {
+        validate_name(&cert.cn)?;
+        if self.name_taken(&cert.cn, None) {
+            return Err(Error::coded(
+                ec::NAME_TAKEN,
+                format!("name {:?} taken", cert.cn),
+            ));
+        }
+        let name = cert.cn.clone();
         let id = self.users.next_user_id;
         self.users.next_user_id = id
             .checked_add(1)
@@ -345,7 +340,7 @@ impl Store {
         self.users.users.insert(
             id.to_string(),
             UserRecord {
-                name: name.to_string(),
+                name,
                 created: rfc3339(now()),
                 last_renew: None,
                 certs: vec![cert],
@@ -357,15 +352,58 @@ impl Store {
         Ok(id)
     }
 
-    /// Appends another certificate to an existing user (renewal). The older
-    /// certificate stays valid until it expires.
-    pub fn add_cert(&mut self, id: UserId, cert: CertRecord, renewal: bool) -> Result<()> {
+    /// Appends a newly issued certificate to an existing user and adopts its
+    /// CN as the user's current name — together with [`Store::add_user`] the
+    /// only writer of `UserRecord.name`. The older certificate stays valid
+    /// until it expires.
+    ///
+    /// `supersedes` stamps the certificate the request was made with, and is
+    /// passed only for catch-up renewals — that stamp is what bounds them.
+    /// Returns whether the stored name actually changed, i.e. whether to
+    /// broadcast `UserRenamed`.
+    ///
+    /// Cert append, name adoption and the supersede stamp are one write on
+    /// purpose: two writes could crash in between and leave a user whose name
+    /// does not match their newest certificate.
+    pub fn add_cert(
+        &mut self,
+        id: UserId,
+        cert: CertRecord,
+        supersedes: Option<&str>,
+        renewal: bool,
+    ) -> Result<bool> {
+        validate_name(&cert.cn)?;
+        if self.name_taken(&cert.cn, Some(id)) {
+            return Err(Error::coded(
+                ec::NAME_TAKEN,
+                format!("name {:?} taken", cert.cn),
+            ));
+        }
+        let stamp = rfc3339(now());
         let record = self.user_mut(id)?;
+        let renamed = record.name != cert.cn;
+        record.name = cert.cn.clone();
+        if let Some(fp) = supersedes {
+            if let Some(old) = record.certs.iter_mut().find(|c| c.fingerprint == fp) {
+                old.renewed = Some(stamp.clone());
+            }
+        }
         record.certs.push(cert);
         if renewal {
-            record.last_renew = Some(rfc3339(now()));
+            record.last_renew = Some(stamp);
         }
-        self.save_users()
+        self.save_users()?;
+        Ok(renamed)
+    }
+
+    /// When `fingerprint` was last used to obtain a successor certificate.
+    pub fn cert_renewed(&self, id: UserId, fingerprint: &str) -> Option<OffsetDateTime> {
+        self.user(id)?
+            .certs
+            .iter()
+            .find(|c| c.fingerprint == fingerprint)
+            .and_then(|c| c.renewed.as_deref())
+            .and_then(|s| parse_rfc3339(s).ok())
     }
 
     /// When the user last renewed, if ever.
@@ -455,50 +493,24 @@ impl Store {
         Ok(changed)
     }
 
-    /// Renames a user. Fails with `NAME_TAKEN` on a case-insensitive
-    /// collision.
-    pub fn rename(&mut self, id: UserId, new: &str) -> Result<()> {
-        validate_name(new)?;
-        if self.name_taken(new, Some(id)) {
-            return Err(Error::coded(ec::NAME_TAKEN, format!("name {new:?} taken")));
-        }
-        let record = self.user_mut(id)?;
-        record.name = new.to_string();
-        self.save_users()
-    }
-
-    /// Sets the display name only if the user has none yet. Returns the name
-    /// in force afterwards (`PROTOCOL.md` §2.2: `Hello.name`).
-    pub fn set_initial_name(&mut self, id: UserId, proposed: &str) -> Result<String> {
-        let current = self
-            .user(id)
-            .map(|u| u.name.clone())
-            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
-        if !current.is_empty() {
-            return Ok(current);
-        }
-        if validate_name(proposed).is_err() {
-            return Ok(current);
-        }
-        let unique = self.unique_name(proposed);
-        self.rename(id, &unique)?;
-        Ok(unique)
-    }
-
     /// All invites.
     pub fn invites(&self) -> &BTreeMap<String, InviteRecord> {
         &self.invites.invites
     }
 
-    /// Creates an invite token, valid for `ttl`.
-    pub fn create_invite(&mut self, name: &str, ttl: Duration) -> Result<(String, InviteRecord)> {
-        validate_name(name)?;
+    /// Creates an invite token, valid for `ttl`. `label` is advisory — it
+    /// prefills the invited user's name dialog and does not bind the
+    /// certificate CN — and may be empty.
+    pub fn create_invite(&mut self, label: &str, ttl: Duration) -> Result<(String, InviteRecord)> {
+        if !label.is_empty() {
+            validate_name(label)?;
+        }
         let mut raw = [0u8; 16];
         rand::rng().fill_bytes(&mut raw);
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
         let created = now();
         let record = InviteRecord {
-            name: name.to_string(),
+            name: label.to_string(),
             created: rfc3339(created),
             expires: rfc3339(created + ttl),
             used_by: 0,
@@ -638,13 +650,15 @@ pub fn write_private(path: &Path, contents: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn cert(fp: &str) -> CertRecord {
+    fn named_cert(fp: &str, cn: &str) -> CertRecord {
         let t = now();
         CertRecord {
             fingerprint: fp.to_string(),
+            cn: cn.to_string(),
             issued: rfc3339(t),
             expires: rfc3339(t + Duration::from_secs(365 * 86400)),
             revoked: false,
+            renewed: None,
         }
     }
 
@@ -658,11 +672,11 @@ mod tests {
     #[test]
     fn user_ids_are_monotonic_and_stable_across_renewal() {
         let (_dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa"), false).unwrap();
-        let bob = s.add_user("bob", cert("bb"), false).unwrap();
+        let alice = s.add_user(named_cert("aa", "alice"), false).unwrap();
+        let bob = s.add_user(named_cert("bb", "bob"), false).unwrap();
         assert_eq!((alice, bob), (1, 2));
 
-        s.add_cert(alice, cert("cc"), true).unwrap();
+        s.add_cert(alice, named_cert("cc", &s.user(alice).unwrap().name.clone()), None, true).unwrap();
         assert_eq!(s.user(alice).unwrap().certs.len(), 2);
         assert_eq!(s.by_fingerprint("cc").unwrap().0, alice, "same user_id");
         assert_eq!(s.by_fingerprint("aa").unwrap().0, alice, "old cert stays");
@@ -670,7 +684,7 @@ mod tests {
 
         // Ids are never reused: removing is not even offered, and next_user_id
         // only grows.
-        let carol = s.add_user("carol", cert("dd"), false).unwrap();
+        let carol = s.add_user(named_cert("dd", "carol"), false).unwrap();
         assert_eq!(carol, 3);
     }
 
@@ -678,8 +692,8 @@ mod tests {
     #[test]
     fn revoke_marks_every_certificate_and_persists() {
         let (dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa"), false).unwrap();
-        s.add_cert(alice, cert("bb"), true).unwrap();
+        let alice = s.add_user(named_cert("aa", "alice"), false).unwrap();
+        s.add_cert(alice, named_cert("bb", &s.user(alice).unwrap().name.clone()), None, true).unwrap();
         assert!(s.revoke(alice).unwrap());
         assert!(!s.revoke(alice).unwrap(), "second revoke changes nothing");
         drop(s);
@@ -694,8 +708,8 @@ mod tests {
     #[test]
     fn promoting_and_demoting_updates_is_admin() {
         let (dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa"), true).unwrap();
-        let bob = s.add_user("bob", cert("bb"), false).unwrap();
+        let alice = s.add_user(named_cert("aa", "alice"), true).unwrap();
+        let bob = s.add_user(named_cert("bb", "bob"), false).unwrap();
         assert!(s.set_admin(bob, true).unwrap());
         assert!(s.is_admin(bob));
         assert!(
@@ -716,8 +730,8 @@ mod tests {
     #[test]
     fn disabling_and_enabling_round_trips_without_touching_certs() {
         let (_dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa"), true).unwrap();
-        let bob = s.add_user("bob", cert("bb"), false).unwrap();
+        let alice = s.add_user(named_cert("aa", "alice"), true).unwrap();
+        let bob = s.add_user(named_cert("bb", "bob"), false).unwrap();
         assert!(s.set_disabled(bob, true).unwrap());
         assert!(s.user(bob).unwrap().disabled);
         assert!(
@@ -733,7 +747,7 @@ mod tests {
     #[test]
     fn demoting_the_last_functional_admin_is_rejected() {
         let (_dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa"), true).unwrap();
+        let alice = s.add_user(named_cert("aa", "alice"), true).unwrap();
         let err = s.set_admin(alice, false).unwrap_err();
         assert_eq!(err.code(), Some(ec::LAST_ADMIN));
         assert!(s.is_admin(alice), "unchanged");
@@ -743,7 +757,7 @@ mod tests {
     #[test]
     fn disabling_the_last_functional_admin_is_rejected() {
         let (_dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa"), true).unwrap();
+        let alice = s.add_user(named_cert("aa", "alice"), true).unwrap();
         let err = s.set_disabled(alice, true).unwrap_err();
         assert_eq!(err.code(), Some(ec::LAST_ADMIN));
         assert!(!s.user(alice).unwrap().disabled, "unchanged");
@@ -753,7 +767,7 @@ mod tests {
     #[test]
     fn revoking_the_last_functional_admin_is_rejected() {
         let (_dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa"), true).unwrap();
+        let alice = s.add_user(named_cert("aa", "alice"), true).unwrap();
         let err = s.revoke(alice).unwrap_err();
         assert_eq!(err.code(), Some(ec::LAST_ADMIN));
         assert!(!s.user(alice).unwrap().certs[0].revoked, "unchanged");
@@ -766,8 +780,8 @@ mod tests {
     #[test]
     fn guard_counts_functional_admins_only() {
         let (_dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa"), true).unwrap();
-        let bob = s.add_user("bob", cert("bb"), true).unwrap();
+        let alice = s.add_user(named_cert("aa", "alice"), true).unwrap();
+        let bob = s.add_user(named_cert("bb", "bob"), true).unwrap();
 
         // Two functional admins: disabling one is fine.
         assert!(s.set_disabled(alice, true).unwrap());
@@ -785,54 +799,85 @@ mod tests {
     #[test]
     fn guard_does_not_affect_non_admins() {
         let (_dir, mut s) = store();
-        s.add_user("alice", cert("aa"), true).unwrap();
-        let bob = s.add_user("bob", cert("bb"), false).unwrap();
+        s.add_user(named_cert("aa", "alice"), true).unwrap();
+        let bob = s.add_user(named_cert("bb", "bob"), false).unwrap();
         assert!(s.revoke(bob).unwrap());
         assert!(s.set_disabled(bob, true).unwrap());
     }
 
-    /// §10: name collision gets a `-2` / `-3` suffix.
     #[test]
-    fn unique_name_appends_suffixes() {
+    fn add_user_refuses_a_case_insensitive_collision() {
         let (_dir, mut s) = store();
-        s.add_user("alice", cert("aa"), false).unwrap();
-        assert_eq!(s.unique_name("bob"), "bob");
-        assert_eq!(s.unique_name("alice"), "alice-2");
-        // The collision check is case-insensitive, the returned name keeps the
-        // requested spelling.
-        assert_eq!(s.unique_name("ALICE"), "ALICE-2");
-        s.add_user("alice-2", cert("bb"), false).unwrap();
-        assert_eq!(s.unique_name("alice"), "alice-3");
-    }
-
-    #[test]
-    fn unique_name_truncates_on_a_char_boundary() {
-        let (_dir, mut s) = store();
-        let long = "ä".repeat(16); // 32 bytes
-        s.add_user(&long, cert("aa"), false).unwrap();
-        let unique = s.unique_name(&long);
-        assert!(unique.len() <= icu_proto::types::NAME_MAX_LEN, "{unique}");
-        assert!(validate_name(&unique).is_ok());
-        assert!(unique.ends_with("-2"));
-    }
-
-    #[test]
-    fn rename_rejects_collisions() {
-        let (_dir, mut s) = store();
-        let alice = s.add_user("alice", cert("aa"), false).unwrap();
-        s.add_user("bob", cert("bb"), false).unwrap();
-        let err = s.rename(alice, "BOB").unwrap_err();
+        s.add_user(named_cert("aa", "alice"), false).unwrap();
+        let err = s.add_user(named_cert("bb", "ALICE"), false).unwrap_err();
         assert_eq!(err.code(), Some(ec::NAME_TAKEN));
+        assert_eq!(s.users().count(), 1, "nothing was written");
+    }
+
+    /// A renewal carrying a new CN is how a rename happens, and the stored
+    /// name follows the newest certificate.
+    #[test]
+    fn add_cert_adopts_the_cn_and_reports_the_change() {
+        let (_dir, mut s) = store();
+        let alice = s.add_user(named_cert("aa", "alice"), false).unwrap();
+
+        // Plain renewal: same name, no rename reported, the superseded
+        // certificate is stamped.
+        assert!(!s
+            .add_cert(alice, named_cert("bb", "alice"), Some("aa"), true)
+            .unwrap());
         assert_eq!(s.user(alice).unwrap().name, "alice");
-        s.rename(alice, "Alice").unwrap(); // own name, different case
-        s.rename(alice, "carol").unwrap();
+        assert!(s.cert_renewed(alice, "aa").is_some());
+        assert!(s.cert_renewed(alice, "bb").is_none());
+
+        // Rename, including a case-only one: the exact string decides.
+        assert!(s
+            .add_cert(alice, named_cert("cc", "Alice"), Some("bb"), true)
+            .unwrap());
+        assert_eq!(s.user(alice).unwrap().name, "Alice");
+        assert!(s
+            .add_cert(alice, named_cert("dd", "carol"), Some("cc"), true)
+            .unwrap());
         assert_eq!(s.user(alice).unwrap().name, "carol");
+        assert_eq!(s.user(alice).unwrap().certs.len(), 4, "old certs stay");
+    }
+
+    #[test]
+    fn add_cert_refuses_another_users_name_and_writes_nothing() {
+        let (_dir, mut s) = store();
+        let alice = s.add_user(named_cert("aa", "alice"), false).unwrap();
+        s.add_user(named_cert("bb", "bob"), false).unwrap();
+        let err = s
+            .add_cert(alice, named_cert("cc", "BOB"), Some("aa"), true)
+            .unwrap_err();
+        assert_eq!(err.code(), Some(ec::NAME_TAKEN));
+        let user = s.user(alice).unwrap();
+        assert_eq!(user.name, "alice");
+        assert_eq!(user.certs.len(), 1);
+        assert!(user.last_renew.is_none());
+    }
+
+    /// Records written before the name moved into the certificate load with an
+    /// empty `cn`, which is what makes the migration a no-op.
+    #[test]
+    fn legacy_records_without_cn_load_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(USERS_FILE),
+            "schema = 1\nnext_user_id = 2\n\n[user.1]\nname = \"alice\"\ncreated = \"2026-01-01T00:00:00Z\"\nis_admin = true\ndisabled = false\n\n[[user.1.cert]]\nfingerprint = \"aa\"\nissued = \"2026-01-01T00:00:00Z\"\nexpires = \"2027-01-01T00:00:00Z\"\nrevoked = false\n",
+        )
+        .unwrap();
+        let s = Store::open(dir.path()).unwrap();
+        let user = s.user(1).unwrap();
+        assert_eq!(user.name, "alice");
+        assert_eq!(user.certs[0].cn, "", "unknown, not an empty name");
+        assert!(user.certs[0].renewed.is_none());
     }
 
     #[test]
     fn resolve_by_id_name_and_fingerprint() {
         let (_dir, mut s) = store();
-        let alice = s.add_user("alice", cert("9f86d0"), false).unwrap();
+        let alice = s.add_user(named_cert("9f86d0", "alice"), false).unwrap();
         assert_eq!(s.resolve("1"), Some(alice));
         assert_eq!(s.resolve("ALICE"), Some(alice));
         assert_eq!(s.resolve("9f86d0"), Some(alice));
@@ -846,7 +891,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut s = Store::open(dir.path()).unwrap();
-            let id = s.add_user("alice", cert("aa"), false).unwrap();
+            let id = s.add_user(named_cert("aa", "alice"), false).unwrap();
             s.create_invite("bob", Duration::from_secs(60)).unwrap();
             assert_eq!(id, 1);
         }
@@ -932,19 +977,6 @@ mod tests {
         );
         assert_eq!(fingerprint(b"abc").len(), 64);
         assert_eq!(fingerprint(b"abc"), fingerprint(b"abc"));
-    }
-
-    #[test]
-    fn hello_name_only_applies_when_none_is_stored() {
-        let (_dir, mut s) = store();
-        let id = s.add_user("alice", cert("aa"), false).unwrap();
-        assert_eq!(s.set_initial_name(id, "mallory").unwrap(), "alice");
-
-        // A user without a name (should not happen through enrollment, but the
-        // code path must be sound).
-        s.users.users.get_mut(&id.to_string()).unwrap().name = String::new();
-        assert_eq!(s.set_initial_name(id, "mallory").unwrap(), "mallory");
-        assert_eq!(s.user(id).unwrap().name, "mallory");
     }
 
     #[test]

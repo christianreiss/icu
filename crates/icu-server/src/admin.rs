@@ -30,7 +30,9 @@ use crate::{
 pub enum AdminRequest {
     /// Create an invite token.
     Invite {
-        /// Name the certificate CN will carry.
+        /// Advisory label: it prefills the invited user's name dialog and does
+        /// not bind the certificate CN. May be empty or absent.
+        #[serde(default)]
         name: String,
         /// Lifetime in seconds. Defaults to 24 h.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,13 +44,6 @@ pub enum AdminRequest {
     Revoke {
         /// `user_id`, name or fingerprint.
         user: String,
-    },
-    /// Change a display name.
-    Rename {
-        /// `user_id` or name.
-        user: String,
-        /// The new name.
-        new: String,
     },
     /// Grant admin rights.
     Promote {
@@ -97,7 +92,7 @@ pub enum AdminResponse {
         /// How many live connections were closed.
         closed: usize,
     },
-    /// `rename`, `promote`, `demote`, `enable`, `rotate-server-cert`
+    /// `promote`, `demote`, `enable`, `rotate-server-cert`
     Ok,
     /// `disable`
     Disable {
@@ -248,26 +243,6 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                 Err(e) => store_err(e, "REVOKE_FAILED"),
             }
         }
-        AdminRequest::Rename { user, new } => {
-            let mut store = server.store.lock().await;
-            let Some(user_id) = store.resolve(&user) else {
-                return AdminResponse::err("NO_SUCH_USER", format!("no user {user:?}"));
-            };
-            match store.rename(user_id, &new) {
-                Ok(()) => {
-                    drop(store);
-                    for session in server.room.sessions_of_user(user_id) {
-                        server.room.rename(session, &new);
-                        server.room.broadcast(&icu_proto::ControlMsg::UserRenamed {
-                            session,
-                            name: new.clone(),
-                        });
-                    }
-                    AdminResponse::Ok
-                }
-                Err(e) => store_err(e, "RENAME_FAILED"),
-            }
-        }
         AdminRequest::Promote { user } => set_role(server, &user, true).await,
         AdminRequest::Demote { user } => set_role(server, &user, false).await,
         AdminRequest::Enable { user } => set_disabled(server, &user, false).await,
@@ -287,7 +262,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
 
 /// Shared resolve→mutate→map-error body of `Promote`/`Demote`. On success,
 /// pushes `UserAdminChanged` live to every one of the target's own online
-/// sessions (same live-propagation shape as `Rename`'s `UserRenamed`), so
+/// sessions (same live-propagation shape as a renewal's `UserRenamed`), so
 /// their own cached `is_admin` updates without a reconnect, regardless of
 /// whether the action came from the socket or in-band.
 async fn set_role(server: &Arc<Server>, user: &str, is_admin: bool) -> AdminResponse {
@@ -381,12 +356,15 @@ fn status(server: &Arc<Server>) -> serde_json::Value {
     })
 }
 
-/// Builds an invite link (`PROTOCOL.md` §2.3).
-pub fn invite_link(public_host: &str, token: &str, ca_pin: &str, name: &str) -> String {
-    format!(
-        "icu://{public_host}/enroll?t={token}&ca={ca_pin}&n={}",
-        percent_encode(name)
-    )
+/// Builds an invite link (`PROTOCOL.md` §2.3). `label` is an optional name
+/// prefill for the invited client's dialog; an empty one is left out entirely.
+pub fn invite_link(public_host: &str, token: &str, ca_pin: &str, label: &str) -> String {
+    let base = format!("icu://{public_host}/enroll?t={token}&ca={ca_pin}");
+    if label.is_empty() {
+        base
+    } else {
+        format!("{base}&n={}", percent_encode(label))
+    }
 }
 
 /// Minimal percent-encoding for the `n=` parameter: everything outside the
@@ -537,12 +515,11 @@ mod tests {
             serde_json::from_str::<AdminRequest>(r#"{"cmd":"revoke","user":"alice"}"#).unwrap(),
             AdminRequest::Revoke { .. }
         ));
+        // A label-less invite is the normal case now that the name comes
+        // from the client's CSR.
         assert!(matches!(
-            serde_json::from_str::<AdminRequest>(
-                r#"{"cmd":"rename","user":"alice","new":"alice2"}"#
-            )
-            .unwrap(),
-            AdminRequest::Rename { .. }
+            serde_json::from_str::<AdminRequest>(r#"{"cmd":"invite"}"#).unwrap(),
+            AdminRequest::Invite { .. }
         ));
         assert!(matches!(
             serde_json::from_str::<AdminRequest>(r#"{"cmd":"status"}"#).unwrap(),

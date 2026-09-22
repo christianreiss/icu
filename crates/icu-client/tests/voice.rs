@@ -200,7 +200,7 @@ async fn mute_and_deafen_roundtrip_through_the_server() {
         .expect("UserState deafened");
     assert!(matches!(msg, ControlMsg::UserState { .. }));
 
-    engine.command(Command::SetName("alicia".into()));
+    engine.command(Command::RequestRename("alicia".into()));
     let msg = bob
         .recv_matching(SOON, |m| matches!(m, ControlMsg::UserRenamed { .. }))
         .await
@@ -216,12 +216,7 @@ async fn mute_and_deafen_roundtrip_through_the_server() {
         s.me.as_ref().map(|m| m.name.as_str()) == Some("alicia")
     })
     .await;
-    assert_eq!(state.settings.ui.name.as_deref(), Some("alicia"));
-
-    // Taken name → NAME_TAKEN error shown, name unchanged.
-    engine.command(Command::SetName("bob".into()));
-    let state = wait_for(&engine, SOON, |s| s.name_error.is_some()).await;
-    assert_eq!(state.me.unwrap().name, "alicia");
+    assert!(!state.rename_pending, "the rename settled");
 
     engine.shutdown();
     server.handle.shutdown().await;

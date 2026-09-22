@@ -31,8 +31,9 @@ pub enum InviteLink {
         token: String,
         /// CA pin, base64url without padding of SHA-256(CA DER).
         ca_pin: String,
-        /// Display name, carried by the link itself.
-        name: String,
+        /// Optional name prefill from `n=`. Advisory: the name that ends up in
+        /// the certificate is the one the user confirms (`PROTOCOL.md` §2.3).
+        name: Option<String>,
     },
     /// `ICU1-…`, minted by an admin via `CreateInviteRequest`.
     Blob {
@@ -103,8 +104,9 @@ impl InviteLink {
             return Err(NetError::BadLink("token must be 22 characters".into()));
         }
         let ca_pin = ca_pin.ok_or_else(|| NetError::BadLink("missing ca=".into()))?;
-        let name = name.ok_or_else(|| NetError::BadLink("missing n=".into()))?;
-        icu_proto::validate_name(&name).map_err(|e| NetError::BadLink(e.to_string()))?;
+        // `n=` is a prefill and may be absent; a malformed one is dropped
+        // rather than failing the link, since the user picks the name anyway.
+        let name = name.filter(|n| icu_proto::validate_name(n).is_ok());
         Ok(InviteLink::Link {
             host,
             port,
@@ -349,13 +351,21 @@ pub async fn enroll(
         } => passthrough_token.clone(),
         InviteLink::Bootstrap { .. } => String::new(),
     };
-    let cn = match link {
-        InviteLink::Link { name, .. } => name.clone(),
-        InviteLink::Blob { .. } | InviteLink::Bootstrap { .. } => {
-            icu_proto::validate_name(display_name).map_err(|e| NetError::BadLink(e.to_string()))?;
-            display_name.to_string()
+    // The name the user picked is what the CSR asks for; a link's `n=` only
+    // prefilled the field they confirmed (`PROTOCOL.md` §2.3).
+    let cn = if display_name.trim().is_empty() {
+        match link {
+            InviteLink::Link { name: Some(n), .. } => n.clone(),
+            _ => {
+                return Err(NetError::BadLink(
+                    "this invite carries no name, pick one".into(),
+                ))
+            }
         }
+    } else {
+        display_name.trim().to_string()
     };
+    icu_proto::validate_name(&cn).map_err(|e| NetError::BadLink(e.to_string()))?;
 
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -379,13 +389,7 @@ pub async fn enroll(
     config.transport_config(Arc::new(transport));
 
     let key = rcgen::KeyPair::generate().map_err(|e| NetError::Other(e.to_string()))?;
-    let mut params = rcgen::CertificateParams::default();
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, cn.clone());
-    let csr = params
-        .serialize_request(&key)
-        .map_err(|e| NetError::Other(e.to_string()))?;
+    let csr = csr_for(&cn, &key)?;
 
     let connecting = endpoint
         .connect_with(config, addr, &server_name_for(host))
@@ -400,7 +404,7 @@ pub async fn enroll(
         .map_err(|e| NetError::Connect(e.to_string()))?;
     let request = EnrollMsg::EnrollRequest {
         token,
-        csr_der: csr.der().to_vec(),
+        csr_der: csr,
         name: cn.clone(),
     };
     send.write_all(
@@ -449,6 +453,24 @@ pub async fn enroll(
     result
 }
 
+/// A PKCS#10 CSR asking for `cn`, signed by `key`.
+///
+/// The one place a name goes into a certificate request: enrollment and
+/// renewal must not drift apart, because the server reads the CN as the
+/// display name (`PROTOCOL.md` §2.3).
+pub fn csr_for(cn: &str, key: &rcgen::KeyPair) -> Result<Vec<u8>, NetError> {
+    icu_proto::validate_name(cn).map_err(|e| NetError::BadLink(e.to_string()))?;
+    let mut params = rcgen::CertificateParams::default();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    Ok(params
+        .serialize_request(key)
+        .map_err(|e| NetError::Other(e.to_string()))?
+        .der()
+        .to_vec())
+}
+
 /// SNI for the enrollment handshake: the link host, or `localhost` when the
 /// host is not a valid server name. Load-bearing for security: the pin
 /// verifier now also checks the leaf covers this name.
@@ -483,7 +505,7 @@ mod tests {
         assert_eq!(host, "icu.example.org");
         assert_eq!(port, 4711);
         assert_eq!(token, "k3nP8sQ2vL7xR1wY4tZ6bA");
-        assert_eq!(name, "böb");
+        assert_eq!(name.as_deref(), Some("böb"));
 
         let l =
             InviteLink::parse("icu://[::1]:5000/enroll?t=k3nP8sQ2vL7xR1wY4tZ6bA&ca=x&n=a").unwrap();
@@ -494,7 +516,13 @@ mod tests {
         assert!(InviteLink::parse("https://x/enroll?t=1&ca=2&n=3").is_err());
         assert!(InviteLink::parse("icu://x/other?t=k3nP8sQ2vL7xR1wY4tZ6bA&ca=2&n=3").is_err());
         assert!(InviteLink::parse("icu://x/enroll?t=short&ca=2&n=3").is_err());
-        assert!(InviteLink::parse("icu://x/enroll?t=k3nP8sQ2vL7xR1wY4tZ6bA&ca=2").is_err());
+        // `n=` is a prefill, not a requirement: an invite may leave the name
+        // entirely to the person enrolling.
+        let l = InviteLink::parse("icu://x/enroll?t=k3nP8sQ2vL7xR1wY4tZ6bA&ca=2").unwrap();
+        assert!(matches!(l, InviteLink::Link { name: None, .. }));
+        // A malformed prefill is dropped rather than failing the link.
+        let l = InviteLink::parse("icu://x/enroll?t=k3nP8sQ2vL7xR1wY4tZ6bA&ca=2&n=").unwrap();
+        assert!(matches!(l, InviteLink::Link { name: None, .. }));
     }
 
     #[test]

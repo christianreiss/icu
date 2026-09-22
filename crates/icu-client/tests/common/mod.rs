@@ -92,7 +92,33 @@ impl TestServer {
         backend: Box<dyn AudioBackend>,
         test_tone: bool,
     ) -> (Engine, tempfile::TempDir) {
+        let (engine, _paths, dir) = self.engine_with_paths(name, backend, test_tone).await;
+        (engine, dir)
+    }
+
+    /// Like [`TestServer::engine`], but hands back the config directory too —
+    /// what a test needs to look at the certificate on disk.
+    pub async fn engine_with_paths(
+        &self,
+        name: &str,
+        backend: Box<dyn AudioBackend>,
+        test_tone: bool,
+    ) -> (Engine, Paths, tempfile::TempDir) {
         let (identity, paths, dir) = self.enroll(name).await;
+        self.engine_from(identity, paths.clone(), backend, test_tone)
+            .map(|engine| (engine, paths, dir))
+            .expect("engine starts")
+    }
+
+    /// An engine on an identity the caller already has (passport import, a
+    /// stale certificate, a second device).
+    pub fn engine_from(
+        &self,
+        identity: Identity,
+        paths: Paths,
+        backend: Box<dyn AudioBackend>,
+        test_tone: bool,
+    ) -> Result<Engine, String> {
         let mut settings = Settings::default();
         settings.audio.aec = false;
         settings.audio.denoise = false;
@@ -100,8 +126,7 @@ impl TestServer {
         let mut cfg = EngineConfig::new(identity, settings, paths);
         cfg.server_addr = Some(self.addr());
         cfg.test_tone = test_tone;
-        let engine = Engine::start(cfg, backend).expect("engine starts");
-        (engine, dir)
+        Engine::start(cfg, backend).map_err(|e| e.to_string())
     }
 
     /// A raw control client (no engine) that has said `Hello`.

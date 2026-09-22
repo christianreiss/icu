@@ -6,10 +6,11 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use icu_proto::{
-    error as ec, invite_blob::InviteBlob, limits as pl, validate_name, EnrollMsg, MAX_ENROLL_FRAME,
+    error as ec, invite_blob::InviteBlob, limits as pl, EnrollMsg, MAX_ENROLL_FRAME,
 };
 
 use crate::{
+    ca,
     error::{Error, Result},
     room::Counters,
     store::{fingerprint, now, rfc3339, CertRecord},
@@ -113,10 +114,12 @@ async fn run(
     let body = wire::read_frame(recv, MAX_ENROLL_FRAME).await?;
     let request = EnrollMsg::decode(&body)
         .map_err(|e| Error::coded(ec::ENROLL_BAD_TOKEN, format!("bad request: {e}")))?;
+    // `name` is obsolete: the display name is the CSR's subject CN
+    // (`PROTOCOL.md` §2.3, revised 2026-09-22).
     let EnrollMsg::EnrollRequest {
         token,
         csr_der,
-        name,
+        name: _,
     } = request
     else {
         return Err(Error::coded(
@@ -133,6 +136,10 @@ async fn run(
         Bootstrap,
         Invite(String),
     }
+
+    // The name the client asks for. Parsed before the lock: a malformed CSR
+    // must not hold up other enrollments.
+    let cn = ca::csr_common_name(&csr_der)?;
 
     let mut store = server.store.lock().await;
 
@@ -156,26 +163,24 @@ async fn run(
         TokenKind::Invite(real_token)
     };
 
-    // The CN comes from the invite when there is one, never from the CSR
-    // (`PROTOCOL.md` §2.3). Bootstrap is the one case with no invite to draw
-    // it from, so it falls back to the (validated) requested name.
-    let cn = match &kind {
-        TokenKind::Bootstrap => {
-            validate_name(&name)
-                .map_err(|e| Error::coded(ec::ENROLL_BAD_TOKEN, format!("bad name: {e}")))?;
-            name.clone()
-        }
-        TokenKind::Invite(real_token) => {
-            let (_, invite) = store.peek_invite(real_token).ok_or_else(|| {
-                Error::coded(ec::ENROLL_BAD_TOKEN, "token unknown, used or expired")
-            })?;
-            invite.name.clone()
-        }
-    };
+    if let TokenKind::Invite(real_token) = &kind {
+        store.peek_invite(real_token).ok_or_else(|| {
+            Error::coded(ec::ENROLL_BAD_TOKEN, "token unknown, used or expired")
+        })?;
+    }
 
-    let leaf = {
+    // Uniqueness before signing, and signing before the token is consumed: a
+    // collision leaves the invite usable for another attempt (§6.3).
+    if store.name_taken(&cn, None) {
+        return Err(Error::coded(
+            ec::NAME_TAKEN,
+            format!("name {cn:?} is already taken"),
+        ));
+    }
+
+    let (leaf, cn) = {
         let ca = server.ca.read().await;
-        ca.sign_client_csr(&csr_der, &cn, server.config.tls.client_validity_days)?
+        ca.sign_client_csr(&csr_der, server.config.tls.client_validity_days)?
     };
 
     // Compare-and-set under the state lock: two parallel enrollments with the
@@ -190,37 +195,29 @@ async fn run(
         store.consume_invite(real_token, reserved)?;
     }
 
-    // The display name may come from the request; a collision gets a suffix.
-    let desired = if !matches!(kind, TokenKind::Bootstrap) && validate_name(&name).is_ok() {
-        name.as_str()
-    } else {
-        cn.as_str()
-    };
-    let display_name = store.unique_name(desired);
-
     let issued = now();
     let cert = CertRecord {
         fingerprint: fingerprint(&leaf),
+        cn: cn.clone(),
         issued: rfc3339(issued),
         expires: rfc3339(
             issued + Duration::from_secs(u64::from(server.config.tls.client_validity_days) * 86400),
         ),
         revoked: false,
+        renewed: None,
     };
     // Any first successful enrollment against an empty store grants admin,
     // whichever of the three paths above it took (clarified requirement,
     // not just the no-token bootstrap path).
-    let user_id = match store.add_user(&display_name, cert, is_first) {
+    let user_id = match store.add_user(cert, is_first) {
         Ok(id) => id,
         Err(e) => {
             // Nothing was delivered, so the token goes back (§6.3.4).
             if let TokenKind::Invite(real_token) = &kind {
                 let _ = store.release_invite(real_token);
             }
-            return Err(Error::coded(
-                ec::ENROLL_BAD_TOKEN,
-                format!("state write failed: {e}"),
-            ));
+            let code = e.code().unwrap_or(ec::ENROLL_BAD_TOKEN);
+            return Err(Error::coded(code, format!("state write failed: {e}")));
         }
     };
     debug_assert_eq!(user_id, reserved);
@@ -233,6 +230,6 @@ async fn run(
         server_name: server.config.server.server_name.clone(),
     };
     wire::write_frame(send, &response.encode()?).await?;
-    tracing::info!(user_id, name = %display_name, is_admin = is_first, %remote, "enrolled");
+    tracing::info!(user_id, name = %cn, is_admin = is_first, %remote, "enrolled");
     Ok(())
 }

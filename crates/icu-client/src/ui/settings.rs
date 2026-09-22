@@ -15,7 +15,7 @@ use icu_proto::UserId;
 use super::{theme, widgets};
 use crate::{
     audio::DeviceKind,
-    config::{Corner, Expand, HotkeyBackend, ModeSetting, Paths, Settings, TileSize},
+    config::{Corner, Expand, HotkeyBackend, Identity, ModeSetting, Paths, Settings, TileSize},
     engine::{AppState, Command},
     stats::DebugStats,
 };
@@ -63,6 +63,17 @@ pub struct SettingsView {
     pub draft: Settings,
     /// Name field (applied with the button, not on every keystroke).
     pub name: String,
+    /// What [`Self::name`] was last synced to, so a rename that happened
+    /// elsewhere (another device catching up) can refill the field without
+    /// overwriting what the user is typing.
+    name_synced: String,
+    /// Pasted passport waiting to be imported.
+    passport_import: String,
+    /// Result of the last passport export or import.
+    passport_status: Option<String>,
+    /// Importing a passport replaces the identity: first click arms, second
+    /// within ~3 s does it — same shape as [`Self::confirm_revoke`].
+    confirm_import: Option<Instant>,
     /// Display name for the next invite to mint (admin only).
     pub invite_name: String,
     /// Hotkey backend in use, for display.
@@ -114,6 +125,14 @@ impl SettingsView {
                 .as_ref()
                 .map(|m| m.name.clone())
                 .unwrap_or_default(),
+            name_synced: state
+                .me
+                .as_ref()
+                .map(|m| m.name.clone())
+                .unwrap_or_default(),
+            passport_import: String::new(),
+            passport_status: None,
+            confirm_import: None,
             invite_name: String::new(),
             hotkey_backend,
             show_portal_hint: true,
@@ -357,6 +376,150 @@ impl SettingsView {
         });
     }
 
+    /// Export and import of the whole identity (`PROTOCOL.md` §2.3.2).
+    ///
+    /// The armored text is never rendered: it carries the private key in the
+    /// clear, and a settings window is exactly the thing people have open
+    /// during a screen share.
+    fn passport_card(&mut self, ui: &mut Ui, cmds: &mut Vec<Command>) {
+        widgets::group_card(ui, "Passport", |ui| {
+            widgets::setting_row(ui, false, "Auf ein anderes Gerät mitnehmen", None, |ui| {
+                let width = widgets::button_width(ui, icon::COPY, "Kopieren")
+                    + 6.0
+                    + widgets::button_width(ui, icon::EXPORT, "Speichern");
+                widgets::row_group(ui, width, |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if widgets::button(ui, widgets::ButtonKind::Neutral, icon::COPY, "Kopieren")
+                        .on_hover_text("Als Text in die Zwischenablage")
+                        .clicked()
+                    {
+                        match self.passport_text() {
+                            Ok(text) => {
+                                ui.ctx().copy_text(text);
+                                self.passport_status =
+                                    Some("In die Zwischenablage kopiert.".into());
+                            }
+                            Err(e) => self.passport_status = Some(e),
+                        }
+                    }
+                    if widgets::button(ui, widgets::ButtonKind::Neutral, icon::EXPORT, "Speichern")
+                        .on_hover_text("Als Datei neben die Konfiguration, nur für dich lesbar")
+                        .clicked()
+                    {
+                        self.passport_status = Some(match self.passport_text() {
+                            Ok(text) => {
+                                let path = self.paths.config_dir.join("icu-passport.txt");
+                                match crate::config::write_atomic(&path, text.as_bytes(), true) {
+                                    Ok(()) => format!("Gespeichert: {}", path.display()),
+                                    Err(e) => format!("Speichern fehlgeschlagen: {e}"),
+                                }
+                            }
+                            Err(e) => e,
+                        });
+                    }
+                });
+            });
+            widgets::card_note(ui, |ui| {
+                let tok = theme::tokens(ui.visuals());
+                ui.colored_label(
+                    tok.error,
+                    RichText::new(
+                        "Enthält deinen privaten Schlüssel im Klartext — wer diesen Text hat, \
+                         kann sich als du anmelden.",
+                    )
+                    .size(11.5),
+                );
+                ui.label(
+                    RichText::new(
+                        "Nur über einen sicheren Kanal weitergeben, die Kopie danach löschen. \
+                         Auf dem anderen Gerät hier oder im Einladungsfeld einfügen.",
+                    )
+                    .size(11.5)
+                    .color(tok.dim_text),
+                );
+            });
+
+            widgets::setting_row(ui, true, "Passport einspielen", None, |ui| {
+                let armed = self
+                    .confirm_import
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+                let label = if armed {
+                    "Wirklich? Ersetzt deine Identität"
+                } else {
+                    "Einspielen"
+                };
+                let width = widgets::button_width(ui, icon::EXPORT, label);
+                widgets::row_group(ui, width, |ui| {
+                    let clicked = ui
+                        .add_enabled_ui(!self.passport_import.trim().is_empty(), |ui| {
+                            widgets::button(ui, widgets::ButtonKind::Danger, icon::EXPORT, label)
+                        })
+                        .inner
+                        .on_hover_text("Ersetzt Schlüssel, Zertifikat und Serverdaten dieses Geräts")
+                        .clicked();
+                    if clicked {
+                        if armed {
+                            self.confirm_import = None;
+                            self.import_passport(cmds);
+                        } else {
+                            self.confirm_import = Some(Instant::now());
+                        }
+                    }
+                });
+            });
+            widgets::card_note(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.passport_import)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(icu_proto::passport::ARMOR_BEGIN)
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
+            if let Some(status) = &self.passport_status {
+                widgets::card_note(ui, |ui| {
+                    ui.label(
+                        RichText::new(status)
+                            .size(11.5)
+                            .color(theme::tokens(ui.visuals()).dim_text),
+                    );
+                });
+            }
+        });
+    }
+
+    /// The armored passport for the identity on disk. Disk, not `AppState`:
+    /// that one is cloned ten times a second and has no business carrying a
+    /// private key.
+    fn passport_text(&self) -> Result<String, String> {
+        match Identity::load(&self.paths) {
+            Ok(Some(id)) => {
+                Ok(icu_proto::passport::PassportV1::from(&id).encode())
+            }
+            Ok(None) => Err("Keine Identität gefunden.".into()),
+            Err(e) => Err(format!("Fehlgeschlagen: {e}")),
+        }
+    }
+
+    fn import_passport(&mut self, cmds: &mut Vec<Command>) {
+        match icu_proto::passport::PassportV1::decode(&self.passport_import) {
+            Ok(p) => {
+                let identity = Identity::from(p);
+                // The codec only checks the wrapper; a passport whose key does
+                // not parse would brick the next connection.
+                if rcgen::KeyPair::try_from(identity.key_der.as_slice()).is_err() {
+                    self.passport_status =
+                        Some("Passport enthält keinen gültigen Schlüssel.".into());
+                    return;
+                }
+                cmds.push(Command::ReplaceIdentity(Box::new(identity)));
+                self.passport_import.clear();
+                self.passport_status = Some("Identität ersetzt, verbinde neu…".into());
+            }
+            Err(e) => self.passport_status = Some(format!("Passport unlesbar: {e}")),
+        }
+    }
+
     fn hotkeys_tab(&mut self, ui: &mut Ui) {
         widgets::group_card(ui, "Backend", |ui| {
             widgets::setting_row(ui, false, "Backend", None, |ui| {
@@ -523,29 +686,58 @@ impl SettingsView {
     }
 
     fn general_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
+        // A rename that happened on another device arrives as `UserRenamed`;
+        // refill the field unless the user is editing it.
+        let current = state.me.as_ref().map_or("", |m| m.name.as_str());
+        if current != self.name_synced && self.name == self.name_synced {
+            self.name = current.to_string();
+            self.name_synced = current.to_string();
+        } else if current != self.name_synced && !state.rename_pending {
+            self.name_synced = current.to_string();
+        }
+
         widgets::group_card(ui, "Identität", |ui| {
+            let editable = state.me.is_some() && !state.rename_pending;
             widgets::setting_row(ui, false, "Anzeigename", None, |ui| {
                 let width = FIELD_W + 6.0 + widgets::button_width(ui, icon::CHECK, "");
                 widgets::row_group(ui, width, |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    let field = ui.add(
-                        egui::TextEdit::singleline(&mut self.name)
-                            .desired_width(FIELD_W)
-                            .hint_text("Name"),
-                    );
+                    let field = ui
+                        .add_enabled_ui(editable, |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.name)
+                                    .desired_width(FIELD_W)
+                                    .hint_text("Name"),
+                            )
+                        })
+                        .inner;
                     let entered =
                         field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let changed = self.name.trim() != state.me.as_ref().map_or("", |m| &m.name);
                     let apply = ui
-                        .add_enabled_ui(changed, |ui| {
+                        .add_enabled_ui(editable && changed, |ui| {
                             widgets::button(ui, widgets::ButtonKind::Primary, icon::CHECK, "")
                         })
                         .inner
-                        .on_hover_text("Namen übernehmen");
-                    if (apply.clicked() || entered) && changed {
-                        cmds.push(Command::SetName(self.name.trim().to_string()));
+                        .on_hover_text(if state.rename_pending {
+                            "Wird beim Server angefragt…"
+                        } else {
+                            "Namen übernehmen"
+                        });
+                    if editable && (apply.clicked() || entered) && changed {
+                        cmds.push(Command::RequestRename(self.name.trim().to_string()));
                     }
                 });
+            });
+            widgets::card_note(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Der Name steht im Zertifikat. Eine Änderung stellt ein neues aus; \
+                         das alte bleibt bis zum Ablauf gültig.",
+                    )
+                    .size(11.5)
+                    .color(theme::tokens(ui.visuals()).dim_text),
+                );
             });
             if let Some(err) = &state.name_error {
                 widgets::card_note(ui, |ui| {
@@ -568,6 +760,8 @@ impl SettingsView {
                 )
             });
         });
+
+        self.passport_card(ui, cmds);
 
         if state.is_admin {
             widgets::group_card(ui, "Einladung", |ui| {

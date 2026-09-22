@@ -170,8 +170,10 @@ pub struct AppState {
     pub update_required: Option<String>,
     /// Non-modal banner.
     pub banner: Option<String>,
-    /// `SetName` error.
+    /// Rename error (`NAME_TAKEN`, `RENEW_REJECTED`, or a local one).
     pub name_error: Option<String>,
+    /// A rename the user asked for is waiting for its new certificate.
+    pub rename_pending: bool,
     /// `Welcome.is_admin`: whether `CreateInviteRequest` is allowed.
     pub is_admin: bool,
     /// The most recently minted invite blob and its expiry, if any.
@@ -222,8 +224,12 @@ pub enum Command {
     ToggleMode,
     /// Per peer volume in percent.
     SetVolume(UserId, f32),
-    /// Rename.
-    SetName(String),
+    /// Rename. Travels as a certificate renewal carrying the new CN, because
+    /// the name lives in the certificate (`PROTOCOL.md` §2.2).
+    RequestRename(String),
+    /// Replace the whole identity (passport import): persist it, then
+    /// reconnect with it.
+    ReplaceIdentity(Box<Identity>),
     /// Mint an invite blob. Admin only (`AppState.is_admin`); a non-admin
     /// send is rejected by the server, non-fatally.
     CreateInvite {
@@ -495,6 +501,7 @@ impl Engine {
             update_required: None,
             banner: None,
             name_error: None,
+            rename_pending: false,
             is_admin: false,
             last_invite: None,
             invite_error: None,
@@ -1191,13 +1198,13 @@ async fn net_task(
         flags: UserFlags::NONE,
         settings: cfg.settings.clone(),
         paths: cfg.paths.clone(),
-        name: cfg
-            .settings
-            .ui
-            .name
-            .clone()
-            .unwrap_or_else(|| cfg.identity.server.name.clone()),
+        // The name is whatever the certificate says, so the pre-`Welcome`
+        // display cannot contradict it (`PROTOCOL.md` §2.1).
+        name: crate::conninfo::CertInfo::from_der(&cfg.identity.leaf_der).subject,
         backend,
+        identity: cfg.identity.clone(),
+        pending_renew: None,
+        renew_attempted: false,
     };
     let mut attempt: u32 = 0;
     let mut first = true;
@@ -1211,7 +1218,9 @@ async fn net_task(
             .send_modify(|s| s.conn = ConnStatus::Connecting);
         let addr = match cfg.server_addr {
             Some(a) => Ok(a),
-            None => crate::net::resolve(&cfg.identity.server.host, cfg.identity.server.port).await,
+            None => {
+                crate::net::resolve(&local.identity.server.host, local.identity.server.port).await
+            }
         };
         let mut was_connected = false;
         let outcome = match addr {
@@ -1303,7 +1312,89 @@ struct LocalState {
     paths: Paths,
     name: String,
     backend: Arc<Mutex<Box<dyn AudioBackend>>>,
+    /// The identity in force. Lives here and not in `EngineConfig` because a
+    /// renewal replaces the leaf mid-run and the next reconnect has to use the
+    /// new one; `LocalState` is the only thing that survives a session.
+    identity: Identity,
+    /// The renewal this client is waiting for, if any.
+    pending_renew: Option<PendingRenew>,
+    /// Whether the once-per-start automatic renewal has already been tried.
+    renew_attempted: bool,
 }
+
+/// A renewal in flight: which name it asks for, and why it was sent.
+#[derive(Debug, Clone)]
+struct PendingRenew {
+    cn: String,
+    reason: RenewReason,
+}
+
+/// Why a certificate is being renewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenewReason {
+    /// The user asked for a different name.
+    UserRename,
+    /// The certificate carries a name the server no longer stores — it was
+    /// renamed on another device.
+    CatchUp,
+    /// The certificate is about to expire.
+    Expiry,
+}
+
+/// Why a renewal could not be sent.
+enum RenewSendError {
+    /// Refused locally — a bad name or an unusable key. The connection is fine.
+    Local(String),
+    /// The control stream broke; the caller has to reconnect.
+    Transport,
+}
+
+/// Builds a CSR for `cn` with the *existing* key and sends it as a renewal.
+///
+/// The key is reused deliberately: a rename must not orphan it, or a passport
+/// exported before the rename would stop matching.
+async fn send_renew(
+    send: &mut quinn::SendStream,
+    local: &mut LocalState,
+    cn: &str,
+    reason: RenewReason,
+) -> Result<(), RenewSendError> {
+    icu_proto::validate_name(cn).map_err(|e| RenewSendError::Local(e.to_string()))?;
+    let key = rcgen::KeyPair::try_from(local.identity.key_der.as_slice())
+        .map_err(|e| RenewSendError::Local(format!("eigener Schlüssel unlesbar: {e}")))?;
+    let csr_der =
+        crate::net::enroll::csr_for(cn, &key).map_err(|e| RenewSendError::Local(e.to_string()))?;
+    if conn::write_msg(send, &ControlMsg::RenewRequest { csr_der })
+        .await
+        .is_err()
+    {
+        return Err(RenewSendError::Transport);
+    }
+    local.pending_renew = Some(PendingRenew {
+        cn: cn.to_string(),
+        reason,
+    });
+    Ok(())
+}
+
+/// Whether this client should renew now, and why. `stored` is the name the
+/// server just reported in `Welcome`.
+///
+/// The CN is compared exactly: the server stores names verbatim, so `alice` →
+/// `Alice` is a real rename this client has to pick up.
+fn renewal_due(cert: &crate::conninfo::CertInfo, stored: &str) -> Option<RenewReason> {
+    if cert.subject != stored {
+        return Some(RenewReason::CatchUp);
+    }
+    if cert.expires_in_days <= RENEW_BEFORE_EXPIRY_DAYS {
+        return Some(RenewReason::Expiry);
+    }
+    None
+}
+
+/// Renew this many days before the certificate expires
+/// (`Client/IMPLEMENTATION.md` §5).
+const RENEW_BEFORE_EXPIRY_DAYS: i64 = 30;
 
 impl LocalState {
     /// Commands that do not need a connection. Returns `true` if `SetState`
@@ -1454,8 +1545,15 @@ impl LocalState {
             Command::HotkeyBackend(name) => {
                 shared.state.send_modify(|s| s.hotkey_backend = name);
             }
-            Command::SetName(_)
-            | Command::CreateInvite { .. }
+            Command::RequestRename(_) => {
+                shared
+                    .state
+                    .send_modify(|s| s.name_error = Some("Nicht verbunden".into()));
+            }
+            Command::ReplaceIdentity(identity) => {
+                self.replace_identity(*identity, shared);
+            }
+            Command::CreateInvite { .. }
             | Command::SetUserAdmin { .. }
             | Command::SetUserDisabled { .. }
             | Command::RevokeUser { .. }
@@ -1463,6 +1561,82 @@ impl LocalState {
             | Command::Quit => {}
         }
         set_state
+    }
+
+    /// Takes over an imported identity: memory first, then disk, so a failed
+    /// write cannot leave the two disagreeing about which leaf is in force.
+    fn replace_identity(&mut self, identity: Identity, shared: &Arc<Shared>) {
+        self.identity = identity;
+        self.pending_renew = None;
+        self.renew_attempted = false;
+        self.name = crate::conninfo::CertInfo::from_der(&self.identity.leaf_der).subject;
+        let saved = self.identity.save(&self.paths);
+        let server = format!("{}:{}", self.identity.server.host, self.identity.server.port);
+        let server_name = self.identity.server.server_name.clone();
+        shared.state.send_modify(|s| {
+            s.server = server;
+            s.server_name = server_name;
+            s.name_error = None;
+            s.rename_pending = false;
+            if let Err(e) = &saved {
+                s.banner = Some(format!("Passport konnte nicht gespeichert werden: {e}"));
+            }
+        });
+        tracing::info!(name = %self.name, "identity replaced");
+    }
+
+    /// Takes a freshly issued leaf into use.
+    ///
+    /// Checked before it is written: a leaf that does not match the request or
+    /// the local key would make the next `client_config` fail, and the only way
+    /// back from that is a passport from another device.
+    fn apply_renewed_leaf(&mut self, leaf_der: Vec<u8>, shared: &Arc<Shared>) {
+        let Some(pending) = self.pending_renew.take() else {
+            tracing::warn!("unsolicited RenewResponse");
+            return;
+        };
+        let info = crate::conninfo::CertInfo::from_der(&leaf_der);
+        let mismatch = if info.subject != pending.cn {
+            Some(format!(
+                "Server hat ein Zertifikat für {:?} ausgestellt, erwartet war {:?}",
+                info.subject, pending.cn
+            ))
+        } else if !crate::conninfo::leaf_matches_key(&leaf_der, &self.identity.key_der) {
+            Some("Neues Zertifikat passt nicht zum eigenen Schlüssel".to_string())
+        } else {
+            None
+        };
+        if let Some(detail) = mismatch {
+            tracing::warn!(%detail, "renewal rejected locally, keeping the old certificate");
+            let user_asked = pending.reason == RenewReason::UserRename;
+            shared.state.send_modify(|s| {
+                s.rename_pending = false;
+                if user_asked {
+                    s.name_error = Some(detail);
+                }
+            });
+            return;
+        }
+
+        self.identity.leaf_der = leaf_der;
+        self.identity.server.name = pending.cn.clone();
+        let saved = self.identity.save(&self.paths);
+        self.name = pending.cn.clone();
+        tracing::info!(name = %pending.cn, reason = ?pending.reason, "certificate renewed");
+        shared.state.send_modify(|s| {
+            s.rename_pending = false;
+            s.name_error = None;
+            if let Err(e) = &saved {
+                s.banner = Some(format!("Neues Zertifikat nicht gespeichert: {e}"));
+            }
+            // Otherwise the Verbindung window keeps showing the old subject
+            // and fingerprint for the rest of the session.
+            if let Some(old) = s.conn_info.as_ref() {
+                let mut fresh = (**old).clone();
+                fresh.client_cert = info.clone();
+                s.conn_info = Some(Arc::new(fresh));
+            }
+        });
     }
 
     fn reopen_streams(&mut self, shared: &Arc<Shared>) {
@@ -1500,7 +1674,7 @@ async fn run_session(
     addr: SocketAddr,
     was_connected: &mut bool,
 ) -> SessionEnd {
-    let (client_config, cert_failure) = match conn::client_config(&cfg.identity) {
+    let (client_config, cert_failure) = match conn::client_config(&local.identity) {
         Ok(c) => c,
         Err(e) => return SessionEnd::Fatal(e.to_string()),
     };
@@ -1508,7 +1682,7 @@ async fn run_session(
         Ok(e) => e,
         Err(e) => return SessionEnd::Retry(e.to_string()),
     };
-    let sni = crate::net::enroll::server_name_for(&cfg.identity.server.server_name);
+    let sni = crate::net::enroll::server_name_for(&local.identity.server.server_name);
     let hello_flags = local.flags;
     let hello_name = local.name.clone();
     let connect = conn::connect(
@@ -1592,7 +1766,7 @@ async fn run_session(
         let info = Arc::new(crate::conninfo::ConnInfo::collect(
             &connection,
             &welcome,
-            &cfg.identity,
+            &local.identity,
             &cfg.client_string,
         ));
         shared.state.send_modify(|s| {
@@ -1634,6 +1808,26 @@ async fn run_session(
         };
         if conn::write_msg(&mut send, &msg).await.is_err() {
             return SessionEnd::Retry("send failed".into());
+        }
+    }
+
+    // Once per start: pick up a rename that happened on another device, or
+    // renew a certificate that is about to expire (`PROTOCOL.md` §2.2).
+    if !local.renew_attempted && local.pending_renew.is_none() {
+        let cert = crate::conninfo::CertInfo::from_der(&local.identity.leaf_der);
+        if let Some(reason) = renewal_due(&cert, &welcome.you.name) {
+            local.renew_attempted = true;
+            // Silent: no banner, no `name_error`, and `rename_pending` stays
+            // false — this is not something the user asked for.
+            match send_renew(&mut send, local, &welcome.you.name, reason).await {
+                Ok(()) => {}
+                Err(RenewSendError::Local(e)) => {
+                    tracing::warn!(error = %e, ?reason, "automatic renewal not possible");
+                }
+                Err(RenewSendError::Transport) => {
+                    return SessionEnd::Retry("send failed".into());
+                }
+            }
         }
     }
 
@@ -1689,12 +1883,30 @@ async fn run_session(
                 let Some(cmd) = cmd else { break SessionEnd::Quit };
                 match cmd {
                     Command::Quit => break SessionEnd::Quit,
-                    Command::SetName(name) => {
-                        if let Err(e) = icu_proto::validate_name(&name) {
-                            shared.state.send_modify(|s| s.name_error = Some(e.to_string()));
-                        } else if conn::write_msg(&mut send, &ControlMsg::SetName { name }).await.is_err() {
-                            break SessionEnd::Retry("send failed".into());
+                    Command::RequestRename(name) => {
+                        let name = name.trim().to_string();
+                        if local.pending_renew.is_some() {
+                            shared.state.send_modify(|s| {
+                                s.name_error = Some("Eine Änderung läuft noch".into())
+                            });
+                        } else {
+                            match send_renew(&mut send, local, &name, RenewReason::UserRename).await {
+                                Ok(()) => shared.state.send_modify(|s| {
+                                    s.rename_pending = true;
+                                    s.name_error = None;
+                                }),
+                                Err(RenewSendError::Local(e)) => {
+                                    shared.state.send_modify(|s| s.name_error = Some(e));
+                                }
+                                Err(RenewSendError::Transport) => {
+                                    break SessionEnd::Retry("send failed".into());
+                                }
+                            }
                         }
+                    }
+                    Command::ReplaceIdentity(identity) => {
+                        local.replace_identity(*identity, shared);
+                        break SessionEnd::Retry("Identität ersetzt".into());
                     }
                     Command::CreateInvite { name, ttl_s } => {
                         if let Err(e) = icu_proto::validate_name(&name) {
@@ -2124,8 +2336,22 @@ async fn handle_control(
         }
         ControlMsg::Error { code, detail } => {
             tracing::warn!(code, %detail, "server error");
-            if code == codes::NAME_TAKEN {
-                shared.state.send_modify(|s| s.name_error = Some(detail));
+            if code == codes::NAME_TAKEN || code == codes::RENEW_REJECTED {
+                // A background renewal must not paint a red error under the
+                // name field: only a rename the user asked for lands there.
+                let pending = local.pending_renew.take();
+                let asked_for_it = pending
+                    .map(|p| p.reason == RenewReason::UserRename)
+                    .unwrap_or(code == codes::NAME_TAKEN);
+                shared.state.send_modify(|s| {
+                    s.rename_pending = false;
+                    if asked_for_it {
+                        s.name_error = Some(detail.clone());
+                    }
+                });
+                if !asked_for_it {
+                    tracing::warn!(code, %detail, "background renewal rejected");
+                }
             } else if code == codes::NOT_ADMIN {
                 shared.state.send_modify(|s| s.invite_error = Some(detail));
             } else {
@@ -2169,12 +2395,8 @@ async fn handle_control(
         }
         ControlMsg::UserRenamed { session, name } => {
             let me_session = shared.state.borrow().me.as_ref().map(|m| m.session);
-            let mut settings = None;
             if me_session == Some(session) {
                 local.name = name.clone();
-                local.settings.ui.name = Some(name.clone());
-                let _ = local.settings.save(&local.paths);
-                settings = Some(local.settings.clone());
             }
             shared.state.send_modify(|s| {
                 if let Some(me) = s.me.as_mut() {
@@ -2188,12 +2410,11 @@ async fn handle_control(
                         p.info.name = name.clone();
                     }
                 }
-                if let Some(settings) = settings {
-                    s.settings = settings;
-                }
             });
         }
-        ControlMsg::RenewResponse { .. } => {}
+        ControlMsg::RenewResponse { leaf_der } => {
+            local.apply_renewed_leaf(leaf_der, shared);
+        }
         ControlMsg::CreateInviteResponse { blob, expires } => {
             shared.state.send_modify(|s| {
                 s.last_invite = Some((blob, expires));

@@ -1131,6 +1131,7 @@ pub fn run_enroll(
                 server_addr,
                 link: String::new(),
                 name: String::new(),
+                prefilled_from: None,
                 status: None,
                 pending: None,
                 result: result_app,
@@ -1157,9 +1158,12 @@ struct EnrollApp {
     paths: Paths,
     server_addr: Option<SocketAddr>,
     link: String,
-    /// Only used for a `ICU1-…` blob or a bare `host[:port]` bootstrap — an
-    /// `icu://` link already carries its own name.
+    /// The name the user picks. It is what the CSR asks for, so it ends up in
+    /// the certificate; a link's `n=` only prefills it (`PROTOCOL.md` §2.3).
     name: String,
+    /// The `n=` prefill already taken from the pasted link, so a newly pasted
+    /// link can refill the field without overwriting what the user typed.
+    prefilled_from: Option<String>,
     status: Option<EnrollStatus>,
     /// The in-flight enrollment's result slot. `Some` means a thread is
     /// running: without it a second click would start a second enrollment
@@ -1170,7 +1174,31 @@ struct EnrollApp {
 
 impl EnrollApp {
     /// Parses the link and starts the enrollment thread.
+    ///
+    /// A passport is handled right here: it is a local file, not an invite —
+    /// there is no server round trip to make.
     fn submit(&mut self) {
+        if icu_proto::passport::PassportV1::looks_like(&self.link) {
+            match icu_proto::passport::PassportV1::decode(&self.link) {
+                Ok(p) => {
+                    let identity = Identity::from(p);
+                    if rcgen::KeyPair::try_from(identity.key_der.as_slice()).is_err() {
+                        self.status = Some(EnrollStatus::Failed(
+                            "Passport enthält keinen gültigen Schlüssel.".into(),
+                        ));
+                        return;
+                    }
+                    // Through the same slot as an enrollment, so the one place
+                    // that saves and closes the window stays the only one.
+                    let slot: EnrollSlot = Arc::new(Mutex::new(Some(Ok(identity))));
+                    self.pending = Some(slot);
+                }
+                Err(e) => {
+                    self.status = Some(EnrollStatus::Failed(format!("Passport unlesbar: {e}")))
+                }
+            }
+            return;
+        }
         match InviteLink::parse(&self.link) {
             Ok(link) => {
                 let (host, port) = link.host_port();
@@ -1244,7 +1272,10 @@ impl eframe::App for EnrollApp {
                     ui.vertical(|ui| {
                         ui.label(theme::strong_text("Mit ICU verbinden"));
                         ui.label(
-                            RichText::new("Füge die Einladung ein, die du bekommen hast.")
+                            RichText::new(
+                                "Füge die Einladung ein, die du bekommen hast — oder deinen \
+                                 Passport von einem anderen Gerät.",
+                            )
                                 .size(12.0)
                                 .color(tok.muted_text),
                         );
@@ -1252,7 +1283,24 @@ impl eframe::App for EnrollApp {
                 });
                 ui.add_space(14.0);
 
-                let needs_name = !self.link.trim_start().starts_with("icu://");
+                // A passport carries its own certificate; everything else
+                // needs a name, prefilled from the link's `n=` when it has one.
+                let parsed = InviteLink::parse(&self.link).ok();
+                let prefill = match &parsed {
+                    Some(InviteLink::Link { name, .. }) => name.clone(),
+                    _ => None,
+                };
+                if prefill != self.prefilled_from {
+                    if let Some(n) = &prefill {
+                        if self.name.trim().is_empty()
+                            || Some(self.name.as_str()) == self.prefilled_from.as_deref()
+                        {
+                            self.name = n.clone();
+                        }
+                    }
+                    self.prefilled_from = prefill;
+                }
+                let needs_name = !icu_proto::passport::PassportV1::looks_like(&self.link);
                 let mut submit = false;
                 widgets::group_card(ui, "Einladung", |ui| {
                     widgets::card_note(ui, |ui| {
@@ -1262,7 +1310,7 @@ impl eframe::App for EnrollApp {
                                 .desired_rows(2)
                                 .desired_width(f32::INFINITY)
                                 .font(egui::TextStyle::Monospace)
-                                .hint_text("icu://… · ICU1-… · host:port"),
+                                .hint_text("icu://… · ICU1-… · host:port · Passport"),
                         );
                     });
                     if needs_name {
@@ -1270,7 +1318,7 @@ impl eframe::App for EnrollApp {
                             ui,
                             true,
                             "Dein Name",
-                            Some("Nur nötig, wenn die Einladung keinen enthält."),
+                            Some("Steht später in deinem Zertifikat."),
                             |ui| {
                                 let field = ui.add_enabled(
                                     !busy,
@@ -1289,7 +1337,9 @@ impl eframe::App for EnrollApp {
                 });
 
                 ui.horizontal(|ui| {
-                    let can_submit = !busy && !self.link.trim().is_empty();
+                    let can_submit = !busy
+                        && !self.link.trim().is_empty()
+                        && (!needs_name || !self.name.trim().is_empty());
                     if ui
                         .add_enabled_ui(can_submit, |ui| {
                             widgets::button(

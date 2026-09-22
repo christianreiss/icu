@@ -23,9 +23,10 @@ enum Command {
     Run,
     /// Create an invite token and print the link.
     Invite {
-        /// Display name of the invited user.
+        /// Optional name prefill for the invited user's dialog. The name the
+        /// certificate carries is the one that user picks.
         #[arg(long)]
-        name: String,
+        name: Option<String>,
         /// Lifetime, e.g. `24h`, `30m`, `7d`.
         #[arg(long, default_value = "24h")]
         ttl: String,
@@ -40,13 +41,6 @@ enum Command {
     Revoke {
         /// `user_id`, name or fingerprint.
         user: String,
-    },
-    /// Change a display name.
-    Rename {
-        /// `user_id` or current name.
-        user: String,
-        /// The new name.
-        new: String,
     },
     /// Grant admin rights.
     Promote {
@@ -110,14 +104,10 @@ async fn run(cli: Cli) -> Result<()> {
             handle.shutdown().await;
             Ok(())
         }
-        Command::Invite { name, ttl } => cli::invite::run(&config, &name, &ttl).await,
+        Command::Invite { name, ttl } => cli::invite::run(&config, name.as_deref(), &ttl).await,
         Command::Users { json } => cli::users::run(&config, json).await,
         Command::Revoke { user } => {
             cli::with_closed(&config, AdminRequest::Revoke { user }, "revoked").await
-        }
-        Command::Rename { user, new } => {
-            let done = format!("renamed {user} to {new}");
-            cli::simple(&config, AdminRequest::Rename { user, new }, &done).await
         }
         Command::Promote { user } => {
             let done = format!("promoted {user} to admin");

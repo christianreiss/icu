@@ -61,7 +61,9 @@ impl TestServer {
             .to_path_buf()
     }
 
-    /// Creates an invite token through the admin path.
+    /// Creates an invite token through the admin path. `name` is only the
+    /// advisory label — the enrolling client picks the name that ends up in
+    /// its certificate.
     pub async fn invite(&self, name: &str) -> String {
         match self
             .handle
@@ -85,13 +87,9 @@ impl TestServer {
     }
 
     /// Enrollment with an explicit token, so the failure paths are testable.
+    /// The name travels in the CSR's subject CN (`PROTOCOL.md` §2.3).
     pub async fn enroll_with_token(&self, token: &str, name: &str) -> Result<Identity, EnrollFail> {
-        let key = rcgen::KeyPair::generate().expect("keypair");
-        let mut params = rcgen::CertificateParams::default();
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "whatever-the-client-wants");
-        let csr = params.serialize_request(&key).expect("csr");
+        let (key, csr) = csr_with_cn(name);
 
         let endpoint = client_endpoint(self.ca(), None, icu_proto::limits::ALPN_ENROLL);
         let conn = endpoint
@@ -102,8 +100,8 @@ impl TestServer {
         let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
         let request = icu_proto::EnrollMsg::EnrollRequest {
             token: token.to_string(),
-            csr_der: csr.der().to_vec(),
-            name: name.to_string(),
+            csr_der: csr,
+            name: String::new(),
         };
         send.write_all(&request.encode().expect("encode"))
             .await
@@ -151,6 +149,18 @@ impl TestServer {
     pub async fn shutdown(self) {
         self.handle.shutdown().await;
     }
+}
+
+/// A PKCS#10 CSR asking for `cn`, plus the key that signed it. The one place
+/// these tests put a name into a certificate request.
+pub fn csr_with_cn(cn: &str) -> (rcgen::KeyPair, Vec<u8>) {
+    let key = rcgen::KeyPair::generate().expect("keypair");
+    let mut params = rcgen::CertificateParams::default();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    let csr = params.serialize_request(&key).expect("csr").der().to_vec();
+    (key, csr)
 }
 
 /// Why an enrollment failed.

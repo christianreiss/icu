@@ -1,0 +1,215 @@
+//! The name lives in the certificate (`PROTOCOL.md` §2.1): renaming issues a
+//! new certificate, a device that missed a rename catches up by itself, and a
+//! passport moves the whole identity to another installation.
+
+mod common;
+
+use std::time::Duration;
+
+use common::{wait_connected, wait_for, wait_until, TestServer, SOON};
+use icu_client::{
+    audio::fake::FakeBackend,
+    config::{Identity, Paths},
+    conninfo::CertInfo,
+    engine::Command,
+};
+use icu_proto::passport::PassportV1;
+
+fn leaf_cn(paths: &Paths) -> String {
+    let id = Identity::load(paths)
+        .expect("identity readable")
+        .expect("identity present");
+    CertInfo::from_der(&id.leaf_der).subject
+}
+
+/// A rename must not orphan the key: a passport exported before it still has
+/// to match the certificate afterwards.
+#[tokio::test]
+async fn rename_issues_a_new_certificate_and_keeps_the_key() {
+    let server = TestServer::start().await;
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+
+    let before = Identity::load(&paths).unwrap().unwrap();
+    assert_eq!(CertInfo::from_der(&before.leaf_der).subject, "alice");
+
+    engine.command(Command::RequestRename("alicia".into()));
+    let state = wait_for(&engine, SOON, |s| {
+        s.me.as_ref().map(|m| m.name.as_str()) == Some("alicia")
+    })
+    .await;
+    assert!(!state.rename_pending);
+
+    assert!(
+        wait_until(SOON, || leaf_cn(&paths) == "alicia").await,
+        "the new certificate reaches the disk"
+    );
+    let after = Identity::load(&paths).unwrap().unwrap();
+    assert_eq!(after.key_der, before.key_der, "the key is reused");
+    assert_ne!(after.leaf_der, before.leaf_der, "a new leaf was issued");
+    assert_eq!(after.server.name, "alicia");
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// A taken name comes back as `NAME_TAKEN` and changes nothing.
+#[tokio::test]
+async fn renaming_onto_a_taken_name_reports_it_under_the_field() {
+    let server = TestServer::start().await;
+    let (_bob, _bob_paths, _bob_dir) = server.enroll("bob").await;
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+
+    engine.command(Command::RequestRename("BOB".into()));
+    let state = wait_for(&engine, SOON, |s| s.name_error.is_some()).await;
+    assert!(!state.rename_pending, "the field is usable again");
+    assert_eq!(state.me.unwrap().name, "alice");
+    assert_eq!(leaf_cn(&paths), "alice", "the certificate is untouched");
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// Two devices share one certificate (passport). One renames; the other picks
+/// the new name up on its next start, silently, and ends up with a
+/// certificate that carries it.
+#[tokio::test]
+async fn a_stale_certificate_catches_up_on_the_next_start() {
+    let server = TestServer::start().await;
+    let (stale, paths_a, _dir_a) = server.enroll("alice").await;
+
+    // Device A renames and goes away.
+    let engine_a = server
+        .engine_from(
+            stale.clone(),
+            paths_a.clone(),
+            Box::new(FakeBackend::silent().0),
+            false,
+        )
+        .expect("engine a");
+    wait_connected(&engine_a).await;
+    engine_a.command(Command::RequestRename("alicia".into()));
+    wait_for(&engine_a, SOON, |s| {
+        s.me.as_ref().map(|m| m.name.as_str()) == Some("alicia")
+    })
+    .await;
+    engine_a.shutdown();
+
+    // Device B still holds the pre-rename certificate.
+    let dir_b = tempfile::tempdir().expect("tempdir");
+    let paths_b = Paths::new(Some(dir_b.path().to_path_buf()));
+    stale.save(&paths_b).expect("seed device b");
+    let engine_b = server
+        .engine_from(stale, paths_b.clone(), Box::new(FakeBackend::silent().0), false)
+        .expect("engine b");
+
+    let state = wait_for(&engine_b, SOON, |s| {
+        s.me.as_ref().map(|m| m.name.as_str()) == Some("alicia")
+    })
+    .await;
+    assert!(
+        state.name_error.is_none() && !state.rename_pending,
+        "a catch-up is silent, it is not something the user asked for"
+    );
+    assert!(
+        wait_until(SOON, || leaf_cn(&paths_b) == "alicia").await,
+        "device b renews itself onto the current name"
+    );
+
+    engine_b.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// The passport round trip, end to end: export on one installation, import
+/// into an empty one, connect as the same user.
+#[tokio::test]
+async fn a_passport_moves_an_identity_to_a_second_installation() {
+    let server = TestServer::start().await;
+    let (identity, paths_a, _dir_a) = server.enroll("alice").await;
+
+    let armored = PassportV1::from(&identity).encode();
+    let imported = Identity::from(PassportV1::decode(&armored).expect("passport decodes"));
+    assert_eq!(imported, identity, "nothing is lost in the armor");
+
+    let dir_b = tempfile::tempdir().expect("tempdir");
+    let paths_b = Paths::new(Some(dir_b.path().to_path_buf()));
+    imported.save(&paths_b).expect("save imported");
+    assert_eq!(leaf_cn(&paths_b), leaf_cn(&paths_a));
+
+    let engine = server
+        .engine_from(
+            imported,
+            paths_b,
+            Box::new(FakeBackend::silent().0),
+            false,
+        )
+        .expect("engine on the imported identity");
+    let state = wait_connected(&engine).await;
+    assert_eq!(state.me.unwrap().name, "alice");
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// Importing a passport while connected swaps the identity and reconnects
+/// with it — the way out of a revoked or broken certificate, too.
+#[tokio::test]
+async fn replacing_the_identity_reconnects_as_the_other_user() {
+    let server = TestServer::start().await;
+    let (bob, _bob_paths, _bob_dir) = server.enroll("bob").await;
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    let state = wait_connected(&engine).await;
+    assert_eq!(state.me.unwrap().name, "alice");
+
+    engine.command(Command::ReplaceIdentity(Box::new(bob)));
+    let state = wait_for(&engine, SOON, |s| {
+        s.me.as_ref().map(|m| m.name.as_str()) == Some("bob")
+    })
+    .await;
+    assert!(matches!(
+        state.conn,
+        icu_client::engine::ConnStatus::Connected
+    ));
+    assert!(
+        wait_until(SOON, || leaf_cn(&paths) == "bob").await,
+        "the imported identity is on disk"
+    );
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// A malformed passport is refused before anything is written.
+#[test]
+fn a_broken_passport_is_refused() {
+    assert!(PassportV1::decode("nicht mal armor").is_err());
+    assert!(PassportV1::decode(&format!(
+        "{}\nAAAA\n{}\n",
+        icu_proto::passport::ARMOR_BEGIN,
+        icu_proto::passport::ARMOR_END
+    ))
+    .is_err());
+}
+
+/// The key inside a passport is a real, reloadable key — the property the
+/// whole renewal path rests on.
+#[tokio::test]
+async fn a_passport_carries_a_usable_key() {
+    let server = TestServer::start().await;
+    let (identity, _paths, _dir) = server.enroll("alice").await;
+    let armored = PassportV1::from(&identity).encode();
+    let back = PassportV1::decode(&armored).expect("decode");
+    assert!(
+        rcgen::KeyPair::try_from(back.key_der.as_slice()).is_ok(),
+        "the key survives the armor"
+    );
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    server.handle.shutdown().await;
+}
