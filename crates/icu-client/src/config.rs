@@ -216,6 +216,8 @@ pub enum TileSize {
     Small,
     /// 320×240.
     Medium,
+    /// 480×360.
+    Large,
 }
 
 /// Direction the tile stack grows in for a corner position. Ignored for
@@ -246,6 +248,10 @@ pub struct OverlaySettings {
     pub expand: Expand,
     /// Dim tiles of peers who aren't currently speaking.
     pub dim_non_speaking: bool,
+    /// Draw a highlighted frame around the tile of whoever is speaking.
+    pub speaking_frame: bool,
+    /// Color of that frame, RGB.
+    pub frame_color: [u8; 3],
 }
 
 impl Default for OverlaySettings {
@@ -257,6 +263,8 @@ impl Default for OverlaySettings {
             size: TileSize::Small,
             expand: Expand::Vertical,
             dim_non_speaking: true,
+            speaking_frame: true,
+            frame_color: [0x2e, 0x9b, 0xff],
         }
     }
 }
@@ -467,6 +475,9 @@ mod tests {
         s.overlay.corner = Corner::BottomLeft;
         s.overlay.expand = Expand::Horizontal;
         s.overlay.dim_non_speaking = false;
+        s.overlay.size = TileSize::Large;
+        s.overlay.speaking_frame = false;
+        s.overlay.frame_color = [0x10, 0x20, 0x30];
         s.set_volume(7, 120.0);
         s.set_volume(9, 100.0);
         s.ui.name = Some("chris".into());
@@ -478,6 +489,9 @@ mod tests {
         assert_eq!(back.volume(9), 100.0, "100 % is not stored");
         assert!(!back.volumes.contains_key("9"));
         assert!(!back.overlay.dim_non_speaking);
+        assert_eq!(back.overlay.size, TileSize::Large);
+        assert!(!back.overlay.speaking_frame);
+        assert_eq!(back.overlay.frame_color, [0x10, 0x20, 0x30]);
 
         let text = fs::read_to_string(paths.settings()).unwrap();
         assert!(text.contains("mode = \"vad\""));

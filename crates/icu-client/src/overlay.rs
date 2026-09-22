@@ -115,6 +115,8 @@ struct App {
     offset: [u32; 2],
     size: TileSize,
     expand: Expand,
+    speaking_frame: bool,
+    frame_color: [u8; 3],
     tiles: Vec<Tile>,
     state: watch::Receiver<AppState>,
     frames: VideoFrames,
@@ -209,6 +211,8 @@ fn overlay_thread(
         offset: settings.offset,
         size: settings.size,
         expand: settings.expand,
+        speaking_frame: settings.speaking_frame,
+        frame_color: settings.frame_color,
         tiles: Vec::new(),
         state,
         frames,
@@ -230,6 +234,7 @@ impl App {
         match self.size {
             TileSize::Small => (160, 120),
             TileSize::Medium => (320, 240),
+            TileSize::Large => (480, 360),
         }
     }
 
@@ -253,6 +258,8 @@ impl App {
         self.offset = settings.offset;
         self.size = settings.size;
         self.expand = settings.expand;
+        self.speaking_frame = settings.speaking_frame;
+        self.frame_color = settings.frame_color;
 
         // Tiles: every peer with the camera on, in name order.
         let frames = self.frames.latest();
@@ -355,8 +362,9 @@ impl App {
         let mut x0 = 0u32;
         let mut y0 = 0u32;
         for tile in &self.tiles {
-            let border = if tile.speaking {
-                [0xff, 0x9b, 0x2e, 0xff] // B G R A premultiplied
+            let border = if tile.speaking && self.speaking_frame {
+                let [r, g, b] = self.frame_color;
+                [b, g, r, 0xff] // B G R A premultiplied
             } else {
                 [0x30, 0x30, 0x30, 0xc0]
             };

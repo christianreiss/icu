@@ -500,11 +500,24 @@ impl SettingsView {
                 widgets::segmented(
                     ui,
                     &mut self.draft.overlay.size,
-                    &[(TileSize::Small, "klein"), (TileSize::Medium, "mittel")],
+                    &[
+                        (TileSize::Small, "klein"),
+                        (TileSize::Medium, "mittel"),
+                        (TileSize::Large, "groß"),
+                    ],
                 )
             });
             widgets::setting_row(ui, true, "Stille Teilnehmer abdunkeln", None, |ui| {
                 widgets::toggle(ui, &mut self.draft.overlay.dim_non_speaking)
+            });
+            widgets::setting_row(ui, true, "Rahmen um sprechende Person", None, |ui| {
+                widgets::toggle(ui, &mut self.draft.overlay.speaking_frame)
+            });
+            widgets::setting_row(ui, true, "Rahmenfarbe", None, |ui| {
+                ui.add_enabled_ui(self.draft.overlay.speaking_frame, |ui| {
+                    ui.color_edit_button_srgb(&mut self.draft.overlay.frame_color)
+                })
+                .inner
             });
         });
     }
