@@ -18,6 +18,11 @@ const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1)
     .checked_div(pl::KEYFRAME_REQUESTS_PER_S)
     .unwrap();
 
+/// How long a decoded picture is still worth showing. Past this the sender
+/// stopped or its stream stalled, and a frozen still is worse than none — the
+/// overlay drops the tile, the participant list falls back to the initials.
+const FRESH: Duration = Duration::from_secs(3);
+
 /// A quality tier for the outgoing camera stream, stepped by
 /// `crate::quality::QualityController` in response to measured network
 /// conditions (`Client/IMPLEMENTATION.md` §8). Video absorbs all of the
@@ -214,6 +219,10 @@ struct Receiver {
     #[cfg(feature = "camera")]
     decoder: Option<openh264::decoder::Decoder>,
     latest: Option<Frame>,
+    /// Counts decoded pictures, mirroring `crate::camera::PreviewSlot::seq`:
+    /// a viewer that already uploaded `seq` knows the pixels have not changed
+    /// and can skip both the clone and the texture upload.
+    seq: u64,
     got_keyframe: bool,
     last_frame: Option<Instant>,
     last_request: Option<Instant>,
@@ -226,11 +235,19 @@ impl Receiver {
             #[cfg(feature = "camera")]
             decoder: openh264::decoder::Decoder::new().ok(),
             latest: None,
+            seq: 0,
             got_keyframe: false,
             last_frame: None,
             last_request: None,
             frames: 0,
         }
+    }
+
+    /// Whether [`Receiver::latest`] is fresh enough to put on screen.
+    fn fresh(&self) -> bool {
+        self.latest
+            .as_ref()
+            .is_some_and(|f| f.at.elapsed() <= FRESH)
     }
 }
 
@@ -268,6 +285,7 @@ impl Receivers {
                     rgba,
                     at: Instant::now(),
                 });
+                r.seq += 1;
             }
         }
     }
@@ -292,19 +310,43 @@ impl Receivers {
         out
     }
 
-    /// Latest decoded frame per session; tiles older than 3 s are hidden.
+    /// Latest decoded frame per session; tiles older than [`FRESH`] are
+    /// hidden.
     pub fn latest(&self) -> Vec<(Session, Frame)> {
         self.map
             .iter()
             .filter_map(|(s, r)| {
                 let f = r.latest.clone()?;
-                if f.at.elapsed() > Duration::from_secs(3) {
+                if f.at.elapsed() > FRESH {
                     None
                 } else {
                     Some((*s, f))
                 }
             })
             .collect()
+    }
+
+    /// `(session, seq)` for every session with a picture fresh enough to
+    /// show. Copies no pixels, so a UI drawing at its own frame rate can ask
+    /// on every repaint and fetch only what it has not uploaded yet. A
+    /// session that stopped sending drops out of the list — that is what
+    /// makes a stale picture disappear instead of freezing.
+    pub fn seqs(&self) -> Vec<(Session, u64)> {
+        self.map
+            .iter()
+            .filter(|(_, r)| r.fresh())
+            .map(|(s, r)| (*s, r.seq))
+            .collect()
+    }
+
+    /// One session's latest picture and its `seq`. Clones exactly that one
+    /// picture, unlike [`Receivers::latest`], which clones everybody's.
+    pub fn picture(&self, session: Session) -> Option<(u64, Frame)> {
+        let r = self.map.get(&session)?;
+        if !r.fresh() {
+            return None;
+        }
+        Some((r.seq, r.latest.clone()?))
     }
 
     /// Frames received for a session (tests).
@@ -328,6 +370,72 @@ impl Receivers {
     /// Drops everything (reconnect).
     pub fn clear(&mut self) {
         self.map.clear();
+    }
+}
+
+/// The participant list's live pictures: one GPU texture per session,
+/// re-uploaded only when that session's `seq` moved. Like
+/// [`crate::camera::CameraPreview`] it owns the texture, so it belongs to the
+/// window that draws rather than to the engine, which outlives any window.
+#[cfg(feature = "gui")]
+pub struct VideoTextures {
+    frames: crate::engine::VideoFrames,
+    /// Texture plus the `seq` already uploaded into it, per session.
+    shown: HashMap<Session, (egui::TextureHandle, u64)>,
+}
+
+#[cfg(feature = "gui")]
+impl VideoTextures {
+    /// Reads from [`crate::engine::Engine::video_frames_source`].
+    pub fn new(frames: crate::engine::VideoFrames) -> VideoTextures {
+        VideoTextures {
+            frames,
+            shown: HashMap::new(),
+        }
+    }
+
+    /// Uploads what is new and forgets whoever stopped sending. Call once per
+    /// frame, before the rows are drawn. A session that left, reconnected or
+    /// simply went quiet for [`FRESH`] drops out of `seqs`, its texture is
+    /// released here, and its row falls back to the initials circle — which
+    /// is also why the eviction runs before the uploads and not after.
+    pub fn refresh(&mut self, ctx: &egui::Context) {
+        let seqs = self.frames.seqs();
+        self.shown
+            .retain(|session, _| seqs.iter().any(|(s, _)| s == session));
+        for (session, seq) in seqs {
+            if self.shown.get(&session).is_some_and(|(_, up)| *up == seq) {
+                continue;
+            }
+            let Some((seq, frame)) = self.frames.picture(session) else {
+                continue;
+            };
+            // The decoder writes alpha 255 for every pixel, so premultiplied
+            // is both correct and one multiply per pixel cheaper.
+            let image =
+                egui::ColorImage::from_rgba_premultiplied([frame.width, frame.height], &frame.rgba);
+            match self.shown.get_mut(&session) {
+                Some((tex, uploaded)) => {
+                    tex.set(image, egui::TextureOptions::LINEAR);
+                    *uploaded = seq;
+                }
+                None => {
+                    let tex = ctx.load_texture(
+                        format!("video-{session}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.shown.insert(session, (tex, seq));
+                }
+            }
+        }
+    }
+
+    /// One session's picture, for `crate::ui::widgets::avatar`.
+    pub fn get(&self, session: Session) -> Option<egui::load::SizedTexture> {
+        self.shown
+            .get(&session)
+            .map(|(tex, _)| egui::load::SizedTexture::from_handle(tex))
     }
 }
 
@@ -379,5 +487,18 @@ mod tests {
         assert_eq!(r.frames(3), 2);
         r.remove(3);
         assert_eq!(r.frames(3), 0);
+    }
+
+    /// A session that delivered frames but nothing decodable is not offered
+    /// to the participant list: there is no picture to put in the circle,
+    /// and the row has to keep its initials.
+    #[test]
+    fn seqs_skips_sessions_without_a_decoded_picture() {
+        let mut r = Receivers::default();
+        r.push(3, frame(true));
+        assert_eq!(r.frames(3), 1, "the frame arrived");
+        assert!(r.seqs().is_empty(), "but nothing decoded out of it");
+        assert!(r.picture(3).is_none());
+        assert!(r.latest().is_empty());
     }
 }

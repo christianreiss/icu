@@ -547,39 +547,71 @@ const AVATAR_LIGHT: [(Color32, Color32); 6] = [
 ];
 
 /// A circular avatar with a hash-picked fill and the name's [`initials`];
-/// `speaking` draws an accent ring around it.
+/// `speaking` draws an accent ring around it. `video` puts that person's live
+/// picture into the circle instead of the initials — same slot, same
+/// allocation, same ring, so a row does not move when a camera comes on.
 pub fn avatar(
     ui: &mut Ui,
     name: &str,
     user_id: icu_proto::UserId,
     speaking: bool,
     size: f32,
+    video: Option<egui::load::SizedTexture>,
 ) -> egui::Response {
     // The ring sits outside the circle; reserving room for it keeps the row
     // from shifting when somebody starts talking.
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(size + 6.0, size + 6.0), Sense::hover());
     if ui.is_rect_visible(rect) {
-        let palette = if ui.visuals().dark_mode {
-            &AVATAR_DARK
-        } else {
-            &AVATAR_LIGHT
-        };
-        let (fill, text_color) = palette[(user_id % 6) as usize];
         let painter = ui.painter();
         let center = rect.center();
-        painter.circle_filled(center, size / 2.0, fill);
+        match video {
+            Some(tex) => {
+                // 4:3 into a circle: keep the short side whole and crop the
+                // long one symmetrically, so a face stays centered instead of
+                // sliding towards one edge.
+                let (w, h) = (tex.size.x.max(1.0), tex.size.y.max(1.0));
+                let crop = if w >= h {
+                    egui::vec2(h / w, 1.0)
+                } else {
+                    egui::vec2(1.0, w / h)
+                };
+                painter.add(
+                    egui::epaint::RectShape::filled(
+                        egui::Rect::from_center_size(center, egui::vec2(size, size)),
+                        // The tessellator clamps a corner radius to half the
+                        // shorter side, which turns this rect into the circle
+                        // the initials would have drawn.
+                        CornerRadius::same((size / 2.0).ceil() as u8),
+                        Color32::WHITE,
+                    )
+                    .with_texture(
+                        tex.id,
+                        egui::Rect::from_center_size(egui::pos2(0.5, 0.5), crop),
+                    ),
+                );
+            }
+            None => {
+                let palette = if ui.visuals().dark_mode {
+                    &AVATAR_DARK
+                } else {
+                    &AVATAR_LIGHT
+                };
+                let (fill, text_color) = palette[(user_id % 6) as usize];
+                painter.circle_filled(center, size / 2.0, fill);
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    initials(name),
+                    FontId::new(size * 0.37, super::fonts::semibold()),
+                    text_color,
+                );
+            }
+        }
         if speaking {
             let tok = theme::tokens(ui.visuals());
             painter.circle_stroke(center, size / 2.0 + 2.0, Stroke::new(2.0, tok.accent));
         }
-        painter.text(
-            center,
-            egui::Align2::CENTER_CENTER,
-            initials(name),
-            FontId::new(size * 0.37, super::fonts::semibold()),
-            text_color,
-        );
     }
     response
 }

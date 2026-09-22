@@ -420,11 +420,11 @@ impl CameraPreview {
         }
     }
 
-    /// Draws the latest picture into a `width`-wide 4:3 box. Returns `false`
-    /// when there is nothing to show yet — the camera is off, or still
+    /// Uploads the latest picture if the capture thread produced a new one,
+    /// and hands back what to draw. `None` while the camera is off or still
     /// opening (a USB webcam needs a few seconds for auto-exposure,
     /// `Research/camera-video.md`).
-    pub fn ui(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
+    pub fn texture(&mut self, ctx: &egui::Context) -> Option<egui::load::SizedTexture> {
         let seq = self.slot.seq.load(Ordering::Acquire);
         if seq != self.shown {
             self.shown = seq;
@@ -434,7 +434,7 @@ impl CameraPreview {
                     match &mut self.texture {
                         Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
                         None => {
-                            self.texture = Some(ui.ctx().load_texture(
+                            self.texture = Some(ctx.load_texture(
                                 "camera-preview",
                                 image,
                                 egui::TextureOptions::LINEAR,
@@ -445,11 +445,19 @@ impl CameraPreview {
                 None => self.texture = None,
             }
         }
-        let Some(tex) = &self.texture else {
+        self.texture
+            .as_ref()
+            .map(egui::load::SizedTexture::from_handle)
+    }
+
+    /// Draws the latest picture into a `width`-wide 4:3 box. Returns `false`
+    /// when there is nothing to show yet.
+    pub fn ui(&mut self, ui: &mut egui::Ui, width: f32) -> bool {
+        let Some(tex) = self.texture(ui.ctx()) else {
             return false;
         };
         ui.add(
-            egui::Image::new((tex.id(), egui::vec2(width, width * 3.0 / 4.0)))
+            egui::Image::new((tex.id, egui::vec2(width, width * 3.0 / 4.0)))
                 .corner_radius(egui::CornerRadius::same(crate::ui::theme::R_CHIP)),
         );
         true

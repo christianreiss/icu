@@ -108,3 +108,61 @@ async fn received_video_is_decoded_per_speaker() {
     engine_b.shutdown();
     server.handle.shutdown().await;
 }
+
+/// The `seq` the participant list uses to skip redundant texture uploads
+/// advances with every decoded picture, and a speaker that stops drops out
+/// of `seqs` so no stale picture sticks in a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn video_seq_advances_and_expires() {
+    let server = TestServer::start().await;
+    let (backend_a, _pa) = FakeBackend::silent();
+    let (engine_a, _da) = server.engine("alice", Box::new(backend_a), false).await;
+    let (backend_b, _pb) = FakeBackend::silent();
+    let (engine_b, _db) = server.engine("bob", Box::new(backend_b), false).await;
+    let state_a = wait_connected(&engine_a).await;
+    wait_connected(&engine_b).await;
+    let alice = state_a.me.unwrap().session;
+
+    engine_a.command(Command::SetCamera(true));
+    wait_for(&engine_a, SOON, |s| s.camera_on).await;
+    let mut camera = CameraHandle::new(engine_a.camera_link());
+    camera.start_with(Box::new(SyntheticSource::new()));
+
+    let frames = engine_b.video_frames_source();
+    assert!(
+        wait_until(SOON, || frames.seqs().iter().any(|(s, _)| *s == alice)).await,
+        "alice shows up with a picture"
+    );
+    let (seq, picture) = frames.picture(alice).expect("a picture");
+    assert_eq!(picture.rgba.len(), 320 * 240 * 4);
+    // `>=`, not `==`: the two calls take the lock separately, so a decode
+    // may land between them.
+    assert!(
+        frames
+            .seqs()
+            .iter()
+            .any(|(s, q)| *s == alice && *q >= seq),
+        "`seqs` and `picture` report the same counter"
+    );
+    assert!(
+        wait_until(SOON, || frames
+            .seqs()
+            .iter()
+            .any(|(s, q)| *s == alice && *q > seq))
+        .await,
+        "the next decoded picture advances the seq"
+    );
+
+    // Nothing arrives any more: after the freshness window the row has to
+    // fall back to the initials instead of freezing on the last picture.
+    camera.stop();
+    assert!(
+        wait_until(Duration::from_secs(6), || frames.seqs().is_empty()).await,
+        "a stopped speaker leaves `seqs`"
+    );
+    assert!(frames.picture(alice).is_none());
+
+    engine_a.shutdown();
+    engine_b.shutdown();
+    server.handle.shutdown().await;
+}

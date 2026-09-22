@@ -85,6 +85,15 @@ struct App {
     overlay: Option<crate::overlay::OverlayHandle>,
     #[cfg(feature = "camera")]
     camera: Option<crate::camera::CameraHandle>,
+    /// Live pictures for the participant list. Not feature-gated: without
+    /// `camera` nothing decodes, the list stays empty, and every row keeps
+    /// its initials.
+    videos: crate::video::VideoTextures,
+    /// The own row's picture: own video never comes back from the server
+    /// (the sender is excluded from the fan-out), so it is read straight
+    /// from the capture thread's preview slot.
+    #[cfg(feature = "camera")]
+    self_video: Option<crate::camera::CameraPreview>,
     #[cfg_attr(not(feature = "tray"), allow(dead_code))]
     hidden: bool,
     quit_requested: bool,
@@ -126,15 +135,21 @@ impl App {
             }
         };
         #[cfg(feature = "camera")]
-        let camera = {
+        let (camera, self_video) = {
             let guard = engine.lock().unwrap();
             let e = guard.as_ref().expect("engine");
             let snapshot = e.snapshot();
             let handle = crate::camera::CameraHandle::new(e.camera_link());
+            let preview = crate::camera::CameraPreview::new(handle.preview_source());
             if snapshot.settings.camera.enabled {
                 let _ = cmd.send(Command::SetCamera(true));
             }
-            Some(handle)
+            (Some(handle), Some(preview))
+        };
+        let videos = {
+            let guard = engine.lock().unwrap();
+            let e = guard.as_ref().expect("engine");
+            crate::video::VideoTextures::new(e.video_frames_source())
         };
         let mut state = state_rx.borrow().clone();
         sort_peers(&mut state);
@@ -159,6 +174,9 @@ impl App {
             overlay,
             #[cfg(feature = "camera")]
             camera,
+            videos,
+            #[cfg(feature = "camera")]
+            self_video,
             hidden: false,
             quit_requested: false,
         }
@@ -233,6 +251,22 @@ impl eframe::App for App {
         self.debug_window(&ctx);
         self.settings_window(&ctx);
         self.connection_window(&ctx);
+
+        // Here and not in `logic`: a window hidden to tray would upload
+        // textures nobody is looking at. `ui` already asks for a repaint
+        // every 33 ms against a 15 fps decoder, so every picture is uploaded
+        // exactly once.
+        self.videos.refresh(&ctx);
+        #[cfg(feature = "camera")]
+        let self_video = {
+            let on = self.state.camera_on;
+            self.self_video
+                .as_mut()
+                .filter(|_| on)
+                .and_then(|p| p.texture(&ctx))
+        };
+        #[cfg(not(feature = "camera"))]
+        let self_video = None;
 
         let state = &self.state;
         egui::Panel::top("status").show(root, |ui| {
@@ -437,6 +471,7 @@ impl eframe::App for App {
         });
 
         let volume_open = &mut self.volume_open;
+        let videos = &self.videos;
         egui::CentralPanel::default().show(root, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -457,6 +492,7 @@ impl eframe::App for App {
                                 volume: None,
                                 is_admin: state.is_admin,
                                 rtt_ms: state.rtt_ms.map(|ms| ms.round() as u16),
+                                video: self_video,
                             },
                             volume_open,
                             &send,
@@ -476,6 +512,16 @@ impl eframe::App for App {
                                 volume: Some(p.volume),
                                 is_admin: p.info.flags.is_admin(),
                                 rtt_ms: p.rtt_ms,
+                                // The flag arrives with `UserState`, so the
+                                // picture goes the moment somebody switches
+                                // off — not three seconds later when the
+                                // last frame goes stale.
+                                video: p
+                                    .info
+                                    .flags
+                                    .camera_on()
+                                    .then(|| videos.get(p.info.session))
+                                    .flatten(),
                             },
                             volume_open,
                             &send,
@@ -904,6 +950,9 @@ struct Participant<'a> {
     /// Server-measured RTT, milliseconds. `None` until the first
     /// `UserRtt` arrives (`PROTOCOL.md` §2.2).
     rtt_ms: Option<u16>,
+    /// This person's live picture, `None` when there is none to show. Goes
+    /// into the avatar's circle in place of the initials.
+    video: Option<egui::load::SizedTexture>,
 }
 
 impl Participant<'_> {
@@ -950,7 +999,7 @@ fn participant_row(
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                widgets::avatar(ui, p.name, p.user_id, p.speaking, 34.0);
+                widgets::avatar(ui, p.name, p.user_id, p.speaking, 34.0, p.video);
                 ui.add_space(4.0);
                 ui.vertical(|ui| {
                     // Tight enough that a two-line row is still shorter than

@@ -2347,7 +2347,9 @@ impl CameraLink {
     }
 }
 
-/// Read side of the received video for the overlay (M4).
+/// Read side of the received video (M4): the overlay's tiles take everything
+/// at once with [`VideoFrames::latest`], the participant list picks per
+/// session with [`VideoFrames::seqs`] and [`VideoFrames::picture`].
 #[derive(Clone)]
 pub struct VideoFrames {
     shared: Arc<Shared>,
@@ -2357,6 +2359,17 @@ impl VideoFrames {
     /// Latest decoded frame per session.
     pub fn latest(&self) -> Vec<(Session, crate::video::Frame)> {
         self.shared.video.lock().unwrap().latest()
+    }
+
+    /// `(session, seq)` per session currently showing video. Copies no
+    /// pixels, so a window can ask on every repaint.
+    pub fn seqs(&self) -> Vec<(Session, u64)> {
+        self.shared.video.lock().unwrap().seqs()
+    }
+
+    /// One session's latest picture and its `seq`.
+    pub fn picture(&self, session: Session) -> Option<(u64, crate::video::Frame)> {
+        self.shared.video.lock().unwrap().picture(session)
     }
 }
 
