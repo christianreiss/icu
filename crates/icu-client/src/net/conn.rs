@@ -162,6 +162,8 @@ fn describe_certificate_error(ce: &rustls::CertificateError) -> String {
 pub struct Welcome {
     /// Negotiated minor.
     pub minor: u16,
+    /// Capability bits the server announced. All zero in v1.
+    pub caps: u32,
     /// Own entry.
     pub you: icu_proto::UserInfo,
     /// Audio parameters.
@@ -244,18 +246,19 @@ pub async fn connect(
     match ControlMsg::decode(&body).map_err(|e| ConnectError::Protocol(e.to_string()))? {
         ControlMsg::Welcome {
             minor,
+            caps,
             you,
             audio,
             users,
             min_client,
             is_admin,
-            ..
         } => Ok(Session {
             conn,
             send,
             recv,
             welcome: Welcome {
                 minor,
+                caps,
                 you,
                 audio,
                 users,

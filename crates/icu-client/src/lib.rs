@@ -5,6 +5,7 @@ pub mod audio;
 #[cfg(feature = "camera")]
 pub mod camera;
 pub mod config;
+pub mod conninfo;
 pub mod cues;
 pub mod dsp;
 pub mod engine;

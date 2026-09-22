@@ -110,6 +110,32 @@ mod tests {
         }
     }
 
+    /// The Verbindung window sets throughput and per-mille readouts in
+    /// typographic characters rather than words (`↑ 74 · ↓ 148 kbit/s`).
+    /// Those are ordinary text, not icons, so they have to come out of the
+    /// composed font chain — a tofu box is as broken as a blanked letter
+    /// above, and far easier to miss in review.
+    ///
+    /// Only the proportional family is asserted here: `Fonts::has_glyph`
+    /// answers `false` for every character in `FontFamily::Monospace`,
+    /// including plain `A`, so it cannot test that side. Hack — egui's
+    /// bundled monospace — was checked against its `cmap` directly and does
+    /// carry all six, which is what lets `widgets::chip` (monospace) hold
+    /// them too.
+    #[test]
+    fn typographic_characters_render() {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        ctx.begin_pass(egui::RawInput::default()); // materializes the fonts
+        let proportional = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+        for c in ['↑', '↓', '·', '‰', '×', '—'] {
+            assert!(
+                ctx.fonts_mut(|f| f.has_glyph(&proportional, c)),
+                "{c:?} has no proportional glyph — readouts using it show tofu"
+            );
+        }
+    }
+
     /// The handful of Phosphor icons this crate actually uses must not
     /// collide with one of Inter's own PUA-range stylistic-alternate glyphs
     /// (the *other* direction of the same family-ordering tradeoff — see
@@ -143,16 +169,20 @@ mod tests {
         for icon in [
             egui_phosphor::regular::ARROWS_CLOCKWISE,
             egui_phosphor::regular::BUG,
+            egui_phosphor::regular::CERTIFICATE,
             egui_phosphor::regular::CHECK,
             egui_phosphor::regular::COPY,
             egui_phosphor::regular::EXPORT,
+            egui_phosphor::regular::GAUGE,
             egui_phosphor::regular::GEAR_FINE,
             egui_phosphor::regular::HAND_TAP,
             egui_phosphor::regular::QUESTION,
             egui_phosphor::regular::COMMAND,
             egui_phosphor::regular::MICROPHONE,
             egui_phosphor::regular::MICROPHONE_SLASH,
+            egui_phosphor::regular::LOCK_KEY,
             egui_phosphor::regular::PENCIL_SIMPLE,
+            egui_phosphor::regular::PLUGS_CONNECTED,
             egui_phosphor::regular::PROHIBIT,
             egui_phosphor::regular::SHIELD_STAR,
             egui_phosphor::regular::SIGN_IN,

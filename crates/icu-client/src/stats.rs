@@ -103,6 +103,12 @@ pub struct DebugStats {
     pub datagrams_sent: AtomicU64,
     /// Audio datagrams received (any speaker).
     pub datagrams_received: AtomicU64,
+    /// Wire bytes of audio sent — header plus Opus payload, before QUIC's
+    /// own framing. Counted separately from `udp_tx` so the Verbindung
+    /// window can tell audio, video and protocol overhead apart.
+    pub audio_bytes_sent: AtomicU64,
+    /// Wire bytes of audio received.
+    pub audio_bytes_received: AtomicU64,
     /// Datagrams that failed to parse.
     pub datagrams_bad: AtomicU64,
     /// Opus frames decoded from real packets.
@@ -129,6 +135,10 @@ pub struct DebugStats {
     pub video_sent: AtomicU64,
     /// Video frames received.
     pub video_received: AtomicU64,
+    /// Wire bytes of video sent — header plus Annex-B frame.
+    pub video_bytes_sent: AtomicU64,
+    /// Wire bytes of video received.
+    pub video_bytes_received: AtomicU64,
     /// IDR frames produced on request.
     pub keyframes_forced: AtomicU64,
     /// Current outgoing video quality tier (0 = full quality, 4 = paused),

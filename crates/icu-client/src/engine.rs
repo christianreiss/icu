@@ -115,6 +115,10 @@ pub struct Peer {
     /// Server-measured RTT to this peer, milliseconds. `None` until the
     /// first `ControlMsg::UserRtt` arrives (`PROTOCOL.md` §2.2).
     pub rtt_ms: Option<u16>,
+    /// What this client loses of *this* peer's audio, per mille, as the
+    /// jitter buffer last measured it. Already computed for `LossReport`;
+    /// kept here so the Verbindung window can show it per participant.
+    pub recv_loss_permille: Option<u16>,
 }
 
 /// Everything the UI renders.
@@ -148,8 +152,20 @@ pub struct AppState {
     /// The VAD threshold currently in effect (manual, or auto-calibrated
     /// when `vad_auto` is on).
     pub vad_threshold: f32,
-    /// Last RTT.
+    /// Last RTT, as this client's own `Ping`/`Pong` measured it.
     pub rtt_ms: Option<f32>,
+    /// Own round trip as the *server* measured it (`UserRtt`), which every
+    /// participant sees the same way — unlike [`Self::rtt_ms`].
+    pub server_rtt_ms: Option<u16>,
+    /// Offset between the server's clock and ours, milliseconds, from
+    /// `Pong.server_time_ms`. An estimate: it assumes a symmetric path, so
+    /// it is good to about ±RTT/2.
+    pub clock_offset_ms: Option<i64>,
+    /// Everything about the connection that holds still for one session.
+    /// `None` while not connected.
+    pub conn_info: Option<std::sync::Arc<crate::conninfo::ConnInfo>>,
+    /// Transport counters, refreshed every 2 s. `None` while not connected.
+    pub conn_stats: Option<crate::conninfo::ConnStats>,
     /// `Welcome.min_client` is above our version.
     pub update_required: Option<String>,
     /// Non-modal banner.
@@ -472,6 +488,10 @@ impl Engine {
             vad_prob: 0.0,
             vad_threshold: settings.audio.vad_threshold,
             rtt_ms: None,
+            server_rtt_ms: None,
+            clock_offset_ms: None,
+            conn_info: None,
+            conn_stats: None,
             update_required: None,
             banner: None,
             name_error: None,
@@ -967,10 +987,15 @@ fn dsp_thread(
                             ts,
                         };
                         if let Ok(datagram) = header.datagram(packet) {
+                            // `into()` moves the buffer, so take its length
+                            // first; it is only counted once the send is
+                            // accepted.
+                            let wire_bytes = datagram.len() as u64;
                             let conn = shared.conn.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(c) = conn.as_ref() {
                                 if c.send_datagram(datagram.into()).is_ok() {
                                     DebugStats::inc(&stats.datagrams_sent);
+                                    DebugStats::add(&stats.audio_bytes_sent, wire_bytes);
                                     stats
                                         .capture_to_send
                                         .lock()
@@ -1213,6 +1238,16 @@ async fn net_task(
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         shared.video.lock().unwrap().clear();
+        // Here, not at the end of `run_session`: that function returns early
+        // from half a dozen places, and a stale `conn_info` outliving the
+        // connection it describes is exactly the lie this window must not
+        // tell.
+        shared.state.send_modify(|s| {
+            s.conn_info = None;
+            s.conn_stats = None;
+            s.server_rtt_ms = None;
+            s.clock_offset_ms = None;
+        });
         match outcome {
             SessionEnd::Quit => return,
             SessionEnd::Fatal(reason) => {
@@ -1544,16 +1579,29 @@ async fn run_session(
                 speaking: u.flags.speaking(),
                 volume: volumes.get(&u.user_id).copied().unwrap_or(100.0),
                 rtt_ms: None,
+                recv_loss_permille: None,
             })
             .collect();
         let me = welcome.you.clone();
         tracing::info!(peers = peers.len(), "welcome: initial peer list");
+        // Parsed here, once: three X.509 certificates is far too much work
+        // for a render thread that repaints at 30 fps.
+        // Behind an `Arc`: `AppState` is cloned on every change — the
+        // speaking tick alone fires ten times a second — and this is a
+        // couple of dozen strings that are written exactly once.
+        let info = Arc::new(crate::conninfo::ConnInfo::collect(
+            &connection,
+            &welcome,
+            &cfg.identity,
+            &cfg.client_string,
+        ));
         shared.state.send_modify(|s| {
             s.conn = ConnStatus::Connected;
             s.me = Some(me);
             s.peers = peers;
             s.update_required = update_required;
             s.is_admin = welcome.is_admin;
+            s.conn_info = Some(info);
         });
     }
     *shared.conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection.clone());
@@ -1605,6 +1653,23 @@ async fn run_session(
     let mut quality = QualityController::new(Instant::now());
     let mut pings: HashMap<u64, Instant> = HashMap::new();
     let mut next_nonce: u64 = 1;
+    // Previous tick's cumulative byte counters, so `net_tick` can turn them
+    // into rates. quinn only ever reports totals. The `DebugStats` counters
+    // are process-global and survive a reconnect, so they are seeded from
+    // where they stand now — starting from zero would bill this session's
+    // first tick for everything the previous one sent.
+    let mut prev_bytes = ByteMarks {
+        udp_tx: 0,
+        udp_rx: 0,
+        audio_tx: DebugStats::get(&shared.stats.audio_bytes_sent),
+        audio_rx: DebugStats::get(&shared.stats.audio_bytes_received),
+        video_tx: DebugStats::get(&shared.stats.video_bytes_sent),
+        video_rx: DebugStats::get(&shared.stats.video_bytes_received),
+    };
+    // `net_tick` uses `MissedTickBehavior::Delay`, so a tick can slip under
+    // load; the rate must divide by what actually elapsed, not by the
+    // nominal period.
+    let mut prev_tick = Instant::now();
     let mut set_state_budget = RateBudget::new(pl::SET_STATE_PER_S, Duration::from_secs(1));
 
     let end = loop {
@@ -1679,7 +1744,19 @@ async fn run_session(
                 }
             }
             _ = loss_tick.tick() => {
-                let reports = collect_loss_reports(shared);
+                let (reports, measured) = collect_loss_reports(shared);
+                // After `collect_loss_reports` returned, so the `speakers`
+                // lock it holds is gone: `send_modify` while holding one is
+                // how this engine would deadlock.
+                shared.state.send_modify(|s| {
+                    for p in s.peers.iter_mut() {
+                        if let Some((_, permille)) =
+                            measured.iter().find(|(sess, _)| *sess == p.info.session)
+                        {
+                            p.recv_loss_permille = Some(*permille);
+                        }
+                    }
+                });
                 for (speaker, loss_permille) in reports {
                     if conn::write_msg(&mut send, &ControlMsg::LossReport { speaker, loss_permille }).await.is_err() {
                         break;
@@ -1713,6 +1790,47 @@ async fn run_session(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .observe(sample, net_tick_period);
+                let conn_stats = {
+                    let now = ByteMarks {
+                        udp_tx: stats.udp_tx.bytes,
+                        udp_rx: stats.udp_rx.bytes,
+                        audio_tx: DebugStats::get(&shared.stats.audio_bytes_sent),
+                        audio_rx: DebugStats::get(&shared.stats.audio_bytes_received),
+                        video_tx: DebugStats::get(&shared.stats.video_bytes_sent),
+                        video_rx: DebugStats::get(&shared.stats.video_bytes_received),
+                    };
+                    let tick_at = Instant::now();
+                    let secs = tick_at.duration_since(prev_tick).as_secs_f64();
+                    prev_tick = tick_at;
+                    let rate = |a: u64, b: u64| crate::conninfo::kbps(a.saturating_sub(b), secs);
+                    let out = crate::conninfo::ConnStats {
+                        rtt_ms: stats.path.rtt.as_secs_f32() * 1000.0,
+                        min_rtt_ms: stats.path.min_rtt.as_secs_f32() * 1000.0,
+                        cwnd: stats.path.cwnd,
+                        congestion_events: stats.path.congestion_events,
+                        black_holes: stats.path.black_holes_detected,
+                        lost_packets: stats.path.lost_packets,
+                        sent_packets: stats.path.sent_packets,
+                        lost_bytes: stats.path.lost_bytes,
+                        current_mtu: stats.path.current_mtu,
+                        max_datagram_size: connection.max_datagram_size(),
+                        udp_tx_bytes: now.udp_tx,
+                        udp_rx_bytes: now.udp_rx,
+                        udp_tx_datagrams: stats.udp_tx.datagrams,
+                        udp_rx_datagrams: stats.udp_rx.datagrams,
+                        tx_kbps: rate(now.udp_tx, prev_bytes.udp_tx),
+                        rx_kbps: rate(now.udp_rx, prev_bytes.udp_rx),
+                        audio_tx_kbps: rate(now.audio_tx, prev_bytes.audio_tx),
+                        audio_rx_kbps: rate(now.audio_rx, prev_bytes.audio_rx),
+                        video_tx_kbps: rate(now.video_tx, prev_bytes.video_tx),
+                        video_rx_kbps: rate(now.video_rx, prev_bytes.video_rx),
+                        datagram_queue_bytes: sample.datagram_queue_bytes,
+                        cond,
+                    };
+                    prev_bytes = now;
+                    out
+                };
+                shared.state.send_modify(|s| s.conn_stats = Some(conn_stats));
                 let local_drops = DebugStats::get(&shared.stats.video_open_uni_drops);
                 let tier = quality.tick(&cond, local_drops, Instant::now());
                 let previous = shared.video_tier.swap(tier.as_u8(), Ordering::Relaxed);
@@ -1746,6 +1864,10 @@ async fn run_session(
 impl crate::video::VideoSink for Arc<Shared> {
     fn deliver(&self, session: Session, frame: crate::video::EncodedFrame) {
         DebugStats::inc(&self.stats.video_received);
+        DebugStats::add(
+            &self.stats.video_bytes_received,
+            (icu_proto::header::VIDEO_HEADER_LEN + frame.data.len()) as u64,
+        );
         self.video.lock().unwrap().push(session, frame);
     }
 }
@@ -1805,6 +1927,7 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
         match AudioHeader::decode(&datagram) {
             Ok((header, payload)) => {
                 DebugStats::inc(&shared.stats.datagrams_received);
+                DebugStats::add(&shared.stats.audio_bytes_received, datagram.len() as u64);
                 let mut speakers = shared.speakers.lock().unwrap_or_else(|e| e.into_inner());
                 let sp = match speakers.get_mut(&header.speaker) {
                     Some(sp) => sp,
@@ -1832,8 +1955,18 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
     }
 }
 
-fn collect_loss_reports(shared: &Arc<Shared>) -> Vec<(Session, u16)> {
-    let mut out = Vec::new();
+/// `(session, loss per mille)` for every speaker with traffic this tick.
+type LossPerSpeaker = Vec<(Session, u16)>;
+
+/// Reads each speaker's jitter buffer and returns `(to_report, measured)`:
+/// the first is what goes on the wire as `LossReport`, still gated on a
+/// ≥10 ‰ change so idle jitter does not chatter at the server; the second is
+/// every speaker's current figure, for the Verbindung window. The gate
+/// mutates `last_reported_permille`, so the caller cannot re-derive one from
+/// the other — hence both.
+fn collect_loss_reports(shared: &Arc<Shared>) -> (LossPerSpeaker, LossPerSpeaker) {
+    let mut report = Vec::new();
+    let mut all = Vec::new();
     let mut speakers = shared.speakers.lock().unwrap_or_else(|e| e.into_inner());
     for (session, sp) in speakers.iter_mut() {
         let st = sp.jitter.stats();
@@ -1845,12 +1978,28 @@ fn collect_loss_reports(shared: &Arc<Shared>) -> Vec<(Session, u16)> {
             continue;
         }
         let permille = ((lost * 1000) / total) as u16;
+        all.push((*session, permille));
+        // The ≥10 ‰ gate is what keeps `LossReport` off the wire for noise;
+        // it must stay exactly as it was. `all` is display only.
         if permille.abs_diff(sp.last_reported_permille) >= 10 {
             sp.last_reported_permille = permille;
-            out.push((*session, permille));
+            report.push((*session, permille));
         }
     }
-    out
+    (report, all)
+}
+
+/// The cumulative byte counters one `net_tick` reads, so the next tick can
+/// turn the difference into a rate. quinn and `DebugStats` both only ever
+/// report totals.
+#[derive(Debug, Clone, Copy, Default)]
+struct ByteMarks {
+    udp_tx: u64,
+    udp_rx: u64,
+    audio_tx: u64,
+    audio_rx: u64,
+    video_tx: u64,
+    video_rx: u64,
 }
 
 /// Returns `Some(end)` when the session must end.
@@ -1893,6 +2042,7 @@ async fn handle_control(
                     info: user,
                     volume,
                     rtt_ms: None,
+                    recv_loss_permille: None,
                 });
                 tracing::info!(peers = s.peers.len(), "user joined: peer list updated");
             });
@@ -1927,21 +2077,43 @@ async fn handle_control(
                 }
             });
         }
-        ControlMsg::Pong { nonce, .. } => {
+        ControlMsg::Pong {
+            nonce,
+            server_time_ms,
+        } => {
             if let Some(t) = pings.remove(&nonce) {
                 let rtt = t.elapsed();
                 shared
                     .stats
                     .rtt_us
                     .store(rtt.as_micros() as i64, Ordering::Relaxed);
-                shared
-                    .state
-                    .send_modify(|s| s.rtt_ms = Some(rtt.as_secs_f32() * 1000.0));
+                // The server stamped `server_time_ms` roughly half a round
+                // trip ago, so compare it against then, not now. Symmetric
+                // paths are an assumption, hence ±RTT/2 accuracy.
+                let offset = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| {
+                        server_time_ms as i64 - (d.as_millis() as i64 - rtt.as_millis() as i64 / 2)
+                    });
+                shared.state.send_modify(|s| {
+                    s.rtt_ms = Some(rtt.as_secs_f32() * 1000.0);
+                    if offset.is_some() {
+                        s.clock_offset_ms = offset;
+                    }
+                });
             }
         }
         ControlMsg::UserRtt { rtts } => {
             shared.state.send_modify(|s| {
+                // The server measures every member including us, so the
+                // vector carries our own entry too — `s.peers` is everyone
+                // *else*, which is why it needs matching separately.
+                let me = s.me.as_ref().map(|m| m.session);
                 for (session, ms) in &rtts {
+                    if me == Some(*session) {
+                        s.server_rtt_ms = Some(*ms);
+                    }
                     for p in s.peers.iter_mut() {
                         if p.info.session == *session {
                             p.rtt_ms = Some(*ms);
@@ -2134,7 +2306,13 @@ impl CameraLink {
         };
         let r = self.runtime.block_on(sender.send(keyframe, ts, data));
         match &r {
-            Ok(()) => DebugStats::inc(&self.shared.stats.video_sent),
+            Ok(()) => {
+                DebugStats::inc(&self.shared.stats.video_sent);
+                DebugStats::add(
+                    &self.shared.stats.video_bytes_sent,
+                    (icu_proto::header::VIDEO_HEADER_LEN + data.len()) as u64,
+                );
+            }
             // The 50 ms `open_uni` timeout in `video::Sender::send` — a
             // direct, immediate local congestion signal the quality
             // controller leads on, ahead of the smoothed remote condition

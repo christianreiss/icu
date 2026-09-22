@@ -226,3 +226,55 @@ async fn mute_and_deafen_roundtrip_through_the_server() {
     engine.shutdown();
     server.handle.shutdown().await;
 }
+
+/// The Verbindung window reads everything from `AppState`, so what it can
+/// show is exactly what a session puts there — and, just as important, what
+/// a dead session takes away again: a certificate fingerprint left behind
+/// after the connection is gone would be describing nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_details_appear_and_are_cleared() {
+    let server = TestServer::start().await;
+    let addr = server.addr();
+    let (backend, _probe) = FakeBackend::silent();
+    let (engine, _dir) = server.engine("alice", Box::new(backend), false).await;
+
+    let up = wait_connected(&engine).await;
+    let info = up.conn_info.as_ref().expect("conn_info after Welcome");
+    assert_eq!(info.alpn, "icu/1");
+    assert_eq!(info.remote, addr);
+    assert_eq!(info.minor, icu_proto::MINOR);
+    assert_eq!(info.audio, icu_proto::AudioParams::default());
+    assert!(info.client_string.starts_with("icu/"));
+    // Three distinct certificates, each with a real SHA-256 fingerprint.
+    for cert in [&info.server_cert, &info.client_cert, &info.ca_cert] {
+        assert_eq!(cert.fingerprint.split(':').count(), 32, "{cert:?}");
+        assert_ne!(cert.subject, "unbekannt", "{cert:?}");
+    }
+    assert_ne!(info.server_cert.fingerprint, info.client_cert.fingerprint);
+    assert_ne!(info.server_cert.fingerprint, info.ca_cert.fingerprint);
+    // Both leaves are issued by the CA whose fingerprint we pinned.
+    assert_eq!(info.server_cert.issuer, info.ca_cert.subject);
+    assert_eq!(info.client_cert.issuer, info.ca_cert.subject);
+
+    // Transport numbers land on the first `net_tick`, two seconds in.
+    let ticked = wait_for(&engine, SOON, |s| {
+        s.conn_stats.is_some_and(|c| c.sent_packets > 0)
+    })
+    .await;
+    let cs = ticked.conn_stats.expect("checked in the predicate");
+    assert!(cs.current_mtu >= 1200, "mtu {}", cs.current_mtu);
+    assert!(cs.udp_tx_bytes > 0 && cs.udp_rx_bytes > 0);
+    // Not `== 0.0`: quinn declares loss on a time threshold derived from
+    // the RTT, and on a 0.2 ms loopback that lands inside one timer tick —
+    // a starved runtime can manufacture a spurious loss.
+    assert!(cs.loss_percent() < 5.0, "loss {}", cs.loss_percent());
+
+    server.handle.shutdown().await;
+    let down = wait_for(&engine, SOON, |s| s.conn != ConnStatus::Connected).await;
+    assert!(
+        down.conn_info.is_none(),
+        "conn_info outlived its connection"
+    );
+    assert!(down.conn_stats.is_none());
+    engine.shutdown();
+}

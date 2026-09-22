@@ -637,44 +637,86 @@ pub fn chip_width(ui: &Ui, samples: &[String]) -> f32 {
         + 14.0
 }
 
+/// Horizontal padding inside a [`status_pill`].
+const PILL_PAD: f32 = 9.0;
+/// Diameter of a [`status_pill`]'s dot.
+const PILL_DOT: f32 = 7.0;
+/// Gap between the dot and the word.
+const PILL_GAP: f32 = 5.0;
+
 /// A rounded status pill: a colored dot plus one short word. Anything longer
 /// than a word belongs in the caller's `on_hover_text`, not in here.
 pub fn status_pill(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
-    const PAD: f32 = 9.0;
-    const DOT: f32 = 7.0;
-    const GAP: f32 = 5.0;
+    let (rect, response, galley) = pill_shape(ui, text, Sense::hover());
+    paint_pill(ui, rect, color, galley, false);
+    response
+}
 
+/// [`status_pill`] that reacts to a click and says so — hand cursor and a
+/// brighter fill under the pointer. Identical geometry, because the header
+/// row it lives in is height-constrained (`main_window.rs`) and must not
+/// reflow when the pill gains an affordance.
+pub fn status_pill_button(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
+    let (rect, response, galley) = pill_shape(ui, text, Sense::click());
+    let hovered = response.hovered();
+    paint_pill(ui, rect, color, galley, hovered);
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// Lays out the word and allocates the pill's rect. Shared so the inert and
+/// the clickable pill can never drift apart in size.
+fn pill_shape(
+    ui: &mut Ui,
+    text: &str,
+    sense: Sense,
+) -> (egui::Rect, egui::Response, std::sync::Arc<egui::Galley>) {
     let font = FontId::new(11.5, egui::FontFamily::Proportional);
     let galley = ui
         .painter()
         .layout_no_wrap(text.to_string(), font, ui.visuals().text_color());
     let size = egui::vec2(
-        PAD * 2.0 + DOT + GAP + galley.size().x,
-        galley.size().y.max(DOT) + 7.0,
+        PILL_PAD * 2.0 + PILL_DOT + PILL_GAP + galley.size().x,
+        galley.size().y.max(PILL_DOT) + 7.0,
     );
-    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        painter.rect_filled(rect, rect.height() / 2.0, color.gamma_multiply(0.16));
-        painter.rect_stroke(
-            rect,
-            rect.height() / 2.0,
-            Stroke::new(1.0, color.gamma_multiply(0.27)),
-            StrokeKind::Inside,
-        );
-        painter.circle_filled(
-            egui::pos2(rect.left() + PAD + DOT / 2.0, rect.center().y),
-            DOT / 2.0,
-            color,
-        );
-        let y = rect.center().y - galley.size().y / 2.0;
-        painter.galley(
-            egui::pos2(rect.left() + PAD + DOT + GAP, y),
-            galley,
-            ui.visuals().text_color(),
-        );
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    (rect, response, galley)
+}
+
+/// Paints one pill. `hovered` lifts the fill and border the way
+/// [`icon_button`] does, so a clickable pill reads as clickable.
+fn paint_pill(
+    ui: &Ui,
+    rect: egui::Rect,
+    color: Color32,
+    galley: std::sync::Arc<egui::Galley>,
+    hovered: bool,
+) {
+    if !ui.is_rect_visible(rect) {
+        return;
     }
-    response
+    let (fill, stroke) = if hovered { (0.26, 0.45) } else { (0.16, 0.27) };
+    let painter = ui.painter();
+    painter.rect_filled(rect, rect.height() / 2.0, color.gamma_multiply(fill));
+    painter.rect_stroke(
+        rect,
+        rect.height() / 2.0,
+        Stroke::new(1.0, color.gamma_multiply(stroke)),
+        StrokeKind::Inside,
+    );
+    painter.circle_filled(
+        egui::pos2(rect.left() + PILL_PAD + PILL_DOT / 2.0, rect.center().y),
+        PILL_DOT / 2.0,
+        color,
+    );
+    let y = rect.center().y - galley.size().y / 2.0;
+    painter.galley(
+        egui::pos2(rect.left() + PILL_PAD + PILL_DOT + PILL_GAP, y),
+        galley,
+        ui.visuals().text_color(),
+    );
 }
 
 /// Non-modal banner kind, driving the tint/border/icon color.
@@ -729,6 +771,44 @@ pub fn banner<F: FnOnce()>(
                 }
             });
         });
+}
+
+/// One icon-rail entry.
+pub fn rail_button(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
+    let tok = theme::tokens(ui.visuals());
+    let text_color = if active { tok.accent } else { tok.muted_text };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(64.0, 38.0), egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if active {
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius::same(theme::R_CTRL),
+                ui.visuals().faint_bg_color,
+            );
+            painter.rect_stroke(
+                rect,
+                egui::CornerRadius::same(theme::R_CTRL),
+                egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+                egui::StrokeKind::Inside,
+            );
+        }
+        painter.text(
+            egui::pos2(rect.center().x, rect.top() + 13.0),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            egui::FontId::new(17.0, egui::FontFamily::Proportional),
+            text_color,
+        );
+        painter.text(
+            egui::pos2(rect.center().x, rect.bottom() - 9.0),
+            egui::Align2::CENTER_CENTER,
+            label,
+            egui::FontId::new(9.5, super::fonts::semibold()),
+            text_color,
+        );
+    }
+    resp.clicked()
 }
 
 // ---------------------------------------------------------------------------

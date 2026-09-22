@@ -184,7 +184,7 @@ impl SettingsView {
                     .inner_margin(3)
                     .show(ui, |ui| {
                         for (tab, glyph, label) in tabs {
-                            if rail_button(ui, glyph, label, self.tab == tab) {
+                            if widgets::rail_button(ui, glyph, label, self.tab == tab) {
                                 self.tab = tab;
                             }
                             ui.add_space(3.0);
@@ -1020,44 +1020,6 @@ fn preview_placeholder(ui: &mut Ui, width: f32, camera_on: bool) {
         egui::FontId::new(11.5, egui::FontFamily::Proportional),
         tok.dim_text,
     );
-}
-
-/// One icon-rail entry.
-fn rail_button(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
-    let tok = theme::tokens(ui.visuals());
-    let text_color = if active { tok.accent } else { tok.muted_text };
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(64.0, 38.0), egui::Sense::click());
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        if active {
-            painter.rect_filled(
-                rect,
-                egui::CornerRadius::same(theme::R_CTRL),
-                ui.visuals().faint_bg_color,
-            );
-            painter.rect_stroke(
-                rect,
-                egui::CornerRadius::same(theme::R_CTRL),
-                egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
-                egui::StrokeKind::Inside,
-            );
-        }
-        painter.text(
-            egui::pos2(rect.center().x, rect.top() + 13.0),
-            egui::Align2::CENTER_CENTER,
-            glyph,
-            egui::FontId::new(17.0, egui::FontFamily::Proportional),
-            text_color,
-        );
-        painter.text(
-            egui::pos2(rect.center().x, rect.bottom() - 9.0),
-            egui::Align2::CENTER_CENTER,
-            label,
-            egui::FontId::new(9.5, super::fonts::semibold()),
-            text_color,
-        );
-    }
-    resp.clicked()
 }
 
 /// A row of position buttons — the 4 corners plus centered top/bottom edges

@@ -10,7 +10,7 @@ use std::{
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icon;
 
-use super::{fonts, settings::SettingsView, theme, widgets};
+use super::{connection::ConnectionView, fonts, settings::SettingsView, theme, widgets};
 use crate::{
     config::{Identity, Paths},
     dsp::gate::Mode,
@@ -63,6 +63,8 @@ struct App {
     state: AppState,
     cmd: tokio::sync::mpsc::UnboundedSender<Command>,
     settings: Option<SettingsView>,
+    /// The Verbindung window, opened from the status pill in the header.
+    connection: Option<ConnectionView>,
     /// The theme currently installed in the egui context, so a settings
     /// change that isn't a theme change doesn't rebuild every style. A
     /// slider drag emits `UpdateSettings` on every frame it moves.
@@ -142,6 +144,7 @@ impl App {
             state_rx,
             cmd,
             settings: None,
+            connection: None,
             theme: theme_name,
             debug_stats,
             debug_window_open: debug_stats,
@@ -229,6 +232,7 @@ impl eframe::App for App {
 
         self.debug_window(&ctx);
         self.settings_window(&ctx);
+        self.connection_window(&ctx);
 
         let state = &self.state;
         egui::Panel::top("status").show(root, |ui| {
@@ -260,9 +264,22 @@ impl eframe::App for App {
                     // list right below.
                     ui.label(RichText::new(&state.server_name));
                     let (color, short, detail) = conn_status(state, &tok);
-                    let pill = widgets::status_pill(ui, color, &short);
-                    if !detail.is_empty() {
-                        pill.on_hover_text(detail);
+                    // Clickable in every state, not just Connected: a failed
+                    // or retrying connection is exactly when the details are
+                    // worth a window instead of a one-line tooltip.
+                    let hint = if detail.is_empty() {
+                        "Klicken für Verbindungsdetails".to_string()
+                    } else {
+                        format!("{detail}\n\nKlicken für Verbindungsdetails")
+                    };
+                    if widgets::status_pill_button(ui, color, &short)
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        self.connection = match self.connection.take() {
+                            Some(_) => None,
+                            None => Some(ConnectionView::new(self.stats.clone())),
+                        };
                     }
 
                     // Own outgoing video quality tier, set by
@@ -520,6 +537,40 @@ impl App {
             },
         );
         self.debug_window_open = still_open;
+    }
+
+    /// The Verbindung window, drawn into its own immediate viewport.
+    /// Simpler than [`Self::settings_window`]: the view is read-only, so
+    /// there are no commands to drain and no theme change to react to.
+    fn connection_window(&mut self, ctx: &egui::Context) {
+        if self.connection.is_none() {
+            return;
+        }
+        let mut still_open = true;
+        // Plain locals, not `self` fields — the closure would otherwise
+        // capture the whole of `self` and collide `&self.state` against
+        // `&mut self.connection` (see `settings_window`).
+        let state = &self.state;
+        let view = &mut self.connection;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("icu-connection"),
+            egui::ViewportBuilder::default()
+                .with_title("ICU — Verbindung")
+                .with_inner_size([700.0, 560.0])
+                .with_min_inner_size([560.0, 380.0])
+                .with_resizable(true),
+            |vctx, _class| {
+                egui::CentralPanel::default().show(vctx, |ui| {
+                    view.as_mut().expect("checked above").ui(ui, state);
+                });
+                if vctx.input(|i| i.viewport().close_requested()) {
+                    still_open = false;
+                }
+            },
+        );
+        if !still_open {
+            self.connection = None;
+        }
     }
 
     /// The settings window, drawn into its own immediate viewport.
@@ -944,8 +995,12 @@ fn participant_row(
                         }
                     }
                     if p.is_admin {
-                        ui.label(RichText::new(icon::SHIELD_STAR).size(15.0).color(tok.accent))
-                            .on_hover_text("Admin");
+                        ui.label(
+                            RichText::new(icon::SHIELD_STAR)
+                                .size(15.0)
+                                .color(tok.accent),
+                        )
+                        .on_hover_text("Admin");
                     }
                     // Server-measured RTT (`PROTOCOL.md` §2.2 `UserRtt`), not
                     // a client self-report: every viewer sees the same
