@@ -109,15 +109,25 @@ pub async fn start(
     let task = tokio::spawn(async move {
         let _session = session;
         let _portal = portal;
+        // A stream that ends mid-press must not leave the mic open.
+        let mut ptt_held = false;
         loop {
             let (id, pressed) = tokio::select! {
                 Some(a) = activated.next() => (a.shortcut_id().to_string(), true),
                 Some(d) = deactivated.next() => (d.shortcut_id().to_string(), false),
-                else => return,
+                else => {
+                    if ptt_held {
+                        let _ = cmd.send(Command::Ptt(false));
+                    }
+                    return;
+                }
             };
             tracing::debug!(id, pressed, "portal shortcut event");
             for (bound, action) in &actions {
                 if *bound == id {
+                    if *action == Action::Ptt {
+                        ptt_held = pressed;
+                    }
                     if let Some(c) = action.command(pressed) {
                         let _ = cmd.send(c);
                     }

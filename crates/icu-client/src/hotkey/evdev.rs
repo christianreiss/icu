@@ -162,8 +162,17 @@ fn spawn_reader(
                 return;
             }
         };
+        // Whether this device last reported a bound PTT key down: a reader
+        // that exits mid-press must release it, or the mic stays open.
+        let mut ptt_held = false;
+        let release = |held: bool| {
+            if held {
+                let _ = cmd.send(Command::Ptt(false));
+            }
+        };
         loop {
             if stop.load(Ordering::Relaxed) {
+                release(ptt_held);
                 return;
             }
             let ev = tokio::select! {
@@ -175,6 +184,7 @@ fn spawn_reader(
                 Err(_) => {
                     // Device gone; let the rescan pick it up again.
                     opened.lock().unwrap().remove(&path);
+                    release(ptt_held);
                     return;
                 }
             };
@@ -186,6 +196,9 @@ fn spawn_reader(
                 };
                 for (k, action) in &bindings {
                     if *k == code {
+                        if *action == Action::Ptt {
+                            ptt_held = pressed;
+                        }
                         if let Some(c) = action.command(pressed) {
                             let _ = cmd.send(c);
                         }

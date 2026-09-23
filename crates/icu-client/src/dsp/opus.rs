@@ -86,10 +86,13 @@ impl Decoder {
         next_packet: &[u8],
         out: &mut [f32],
     ) -> Result<usize, opus::Error> {
+        // The frame length comes from the peer's packet (up to 120 ms);
+        // clamped so the slice stays in bounds and libopus decides instead.
         let frame = self
             .inner
             .get_nb_samples(next_packet)
-            .unwrap_or(self.last_frame);
+            .unwrap_or(self.last_frame)
+            .min(out.len());
         let n = self
             .inner
             .decode_float(next_packet, &mut out[..frame], true)?;
@@ -112,6 +115,22 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::dsp::testsignal::{harmonic_voice, pearson, speechlike};
+
+    /// A peer's 60 ms packet must not panic FEC recovery into a buffer
+    /// sized for 20 ms.
+    #[test]
+    fn fec_with_oversized_next_packet_does_not_panic() {
+        let mut enc =
+            opus::Encoder::new(RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        let pkt = enc
+            .encode_vec_float(&vec![0.0f32; 2880], MAX_PACKET)
+            .unwrap();
+        let mut dec = Decoder::new().unwrap();
+        let mut out = vec![0.0f32; 1920];
+        if let Ok(n) = dec.decode_fec(&pkt, &mut out) {
+            assert!(n <= out.len());
+        }
+    }
 
     #[test]
     fn encode_decode_roundtrip_correlates() {

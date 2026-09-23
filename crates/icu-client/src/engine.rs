@@ -1051,7 +1051,8 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
     let mut inputs: Vec<(Vec<f32>, f32)> = Vec::new();
     let mut last_indicator = Instant::now();
     let mut stalled_since: Option<Instant> = None;
-    let mut fec_scratch = vec![0.0f32; 2 * 960];
+    // 120 ms, the longest frame Opus allows: a peer picks its frame length.
+    let mut fec_scratch = vec![0.0f32; 5760];
     loop {
         if shared.dsp.stop.load(Ordering::Relaxed) {
             return;
@@ -1071,6 +1072,9 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
+            // Nobody consumes: discard at playback pace, not CPU speed, or the
+            // jitter buffers drain instantly and report fake losses.
+            std::thread::sleep(Duration::from_millis(10));
         } else {
             stalled_since = None;
         }

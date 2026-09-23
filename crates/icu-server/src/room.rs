@@ -156,6 +156,13 @@ impl Room {
 
     /// Adds a participant and returns its session id. Session ids are
     /// monotonic and never reused within a server run.
+    ///
+    /// `welcome` builds the joiner's `Welcome` from its session, flags and the
+    /// other participants. It is queued, and `UserJoined` broadcast, under the
+    /// same lock that inserts the member: otherwise a concurrent broadcast
+    /// could reach the joiner before its `Welcome`, which the client treats as
+    /// a fatal protocol error, and the user list could miss or double a peer.
+    #[allow(clippy::too_many_arguments)]
     pub fn join(
         &self,
         user_id: UserId,
@@ -164,6 +171,7 @@ impl Room {
         is_admin: bool,
         conn: quinn::Connection,
         out: mpsc::UnboundedSender<Vec<u8>>,
+        welcome: impl FnOnce(Session, UserFlags, Vec<UserInfo>) -> ControlMsg,
     ) -> Result<Session, JoinError> {
         let mut state = self.lock();
         if state.members.len() >= usize::from(self.max_users) {
@@ -178,19 +186,36 @@ impl Room {
         // bit comes from the store, looked up by the caller before join.
         let mut initial = UserFlags::NONE.apply_client_request(flags);
         initial = initial.with_bit(UserFlags::ADMIN, is_admin);
-        state.members.insert(
+        let member = Member {
             session,
-            Member {
-                session,
-                user_id,
-                name,
-                flags: initial,
-                conn,
-                out,
-                speak: Speaking::default(),
-                close_code: None,
-            },
-        );
+            user_id,
+            name,
+            flags: initial,
+            conn,
+            out,
+            speak: Speaking::default(),
+            close_code: None,
+        };
+        let users = state.members.values().map(Member::info).collect();
+        let welcome = welcome(session, initial, users);
+        match welcome.encode() {
+            Ok(frame) => {
+                let _ = member.out.send(frame);
+            }
+            Err(_) => tracing::error!(msg = welcome.variant(), "cannot encode control message"),
+        }
+        let joined = ControlMsg::UserJoined {
+            user: member.info(),
+        };
+        match joined.encode() {
+            Ok(frame) => {
+                for other in state.members.values() {
+                    let _ = other.out.send(frame.clone());
+                }
+            }
+            Err(_) => tracing::error!("cannot encode UserJoined"),
+        }
+        state.members.insert(session, member);
         Ok(session)
     }
 

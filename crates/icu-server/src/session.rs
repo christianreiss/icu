@@ -7,8 +7,8 @@ use std::{
 };
 
 use icu_proto::{
-    error as ec, limits as pl, name_key, AudioParams, ControlMsg, Session, UserFlags, UserId,
-    UserInfo, MAX_CONTROL_FRAME,
+    error as ec, limits as pl, name_key, AudioParams, ControlMsg, Session, UserId, UserInfo,
+    MAX_CONTROL_FRAME,
 };
 use rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc;
@@ -177,6 +177,21 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
 
     // 3. Join, `Welcome`, `UserJoined`.
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let min_client = server.config.server.min_client.clone();
+    let welcome = |session, flags, users| ControlMsg::Welcome {
+        minor,
+        caps: icu_proto::CAPS,
+        you: UserInfo {
+            user_id: identity.user_id,
+            session,
+            name: stored_name.clone(),
+            flags,
+        },
+        audio: AudioParams::default(),
+        users,
+        min_client,
+        is_admin,
+    };
     let session = match server.room.join(
         identity.user_id,
         stored_name.clone(),
@@ -184,6 +199,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         is_admin,
         conn.clone(),
         out_tx,
+        welcome,
     ) {
         Ok(session) => session,
         Err(JoinError::Full) => {
@@ -195,33 +211,6 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     };
 
     let writer = tokio::spawn(writer_task(send, out_rx));
-    let flags = server.room.flags(session).unwrap_or(UserFlags::NONE);
-    let welcome = ControlMsg::Welcome {
-        minor,
-        caps: icu_proto::CAPS,
-        you: UserInfo {
-            user_id: identity.user_id,
-            session,
-            name: stored_name.clone(),
-            flags,
-        },
-        audio: AudioParams::default(),
-        users: server.room.users_except(session),
-        min_client: server.config.server.min_client.clone(),
-        is_admin,
-    };
-    server.room.send_to(session, &welcome);
-    server.room.broadcast_except(
-        session,
-        &ControlMsg::UserJoined {
-            user: UserInfo {
-                user_id: identity.user_id,
-                session,
-                name: stored_name.clone(),
-                flags,
-            },
-        },
-    );
     tracing::info!(
         session,
         user_id = identity.user_id,

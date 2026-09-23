@@ -33,6 +33,8 @@ pub const USERS_FILE: &str = "users.toml";
 pub const INVITES_FILE: &str = "invites.toml";
 /// File name of the lock file.
 pub const LOCK_FILE: &str = "state.lock";
+/// Longest invite lifetime; longer requests are clamped to it.
+pub const MAX_INVITE_TTL: Duration = Duration::from_secs(365 * 86400);
 
 /// Formats a timestamp as RFC 3339 in UTC.
 pub fn rfc3339(t: OffsetDateTime) -> String {
@@ -381,6 +383,14 @@ impl Store {
         }
         let stamp = rfc3339(now());
         let record = self.user_mut(id)?;
+        // A renewal queued behind a revoke or disable must not hand out a
+        // fresh, unrevoked certificate and undo it.
+        if record.disabled {
+            return Err(Error::coded(ec::AUTH_DISABLED, "user is disabled"));
+        }
+        if record.is_revoked() {
+            return Err(Error::coded(ec::AUTH_REVOKED, "user is revoked"));
+        }
         let renamed = record.name != cert.cn;
         record.name = cert.cn.clone();
         if let Some(fp) = supersedes {
@@ -509,6 +519,9 @@ impl Store {
         rand::rng().fill_bytes(&mut raw);
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
         let created = now();
+        // `ttl` comes straight from an admin's request; unclamped, a huge
+        // value overflows the date arithmetic and aborts the server.
+        let ttl = ttl.min(MAX_INVITE_TTL);
         let record = InviteRecord {
             name: label.to_string(),
             created: rfc3339(created),
@@ -702,6 +715,39 @@ mod tests {
         let user = s.user(alice).unwrap();
         assert_eq!(user.certs.len(), 2);
         assert!(user.certs.iter().all(|c| c.revoked));
+    }
+
+    /// A renewal that was queued behind a revoke or disable must not hand
+    /// the user a fresh, unrevoked certificate.
+    #[test]
+    fn renewal_is_rejected_after_revoke_or_disable() {
+        let (_dir, mut s) = store();
+        let alice = s.add_user(named_cert("aa", "alice"), false).unwrap();
+        s.revoke(alice).unwrap();
+        let e = s
+            .add_cert(alice, named_cert("bb", "alice"), None, true)
+            .unwrap_err();
+        assert_eq!(e.code(), Some(ec::AUTH_REVOKED));
+        assert!(s.user(alice).unwrap().is_revoked());
+
+        let bob = s.add_user(named_cert("cc", "bob"), false).unwrap();
+        s.set_disabled(bob, true).unwrap();
+        let e = s
+            .add_cert(bob, named_cert("dd", "bob"), None, true)
+            .unwrap_err();
+        assert_eq!(e.code(), Some(ec::AUTH_DISABLED));
+        assert_eq!(s.user(bob).unwrap().certs.len(), 1);
+    }
+
+    /// An admin-supplied TTL of `u64::MAX` seconds must not overflow the
+    /// expiry date (that aborts the server).
+    #[test]
+    fn huge_invite_ttl_is_clamped() {
+        let (_dir, mut s) = store();
+        let (_, inv) = s.create_invite("", Duration::from_secs(u64::MAX)).unwrap();
+        let expires = OffsetDateTime::parse(&inv.expires, &Rfc3339).unwrap();
+        let created = OffsetDateTime::parse(&inv.created, &Rfc3339).unwrap();
+        assert_eq!(expires - created, MAX_INVITE_TTL);
     }
 
     /// §10: promote/demote updates `is_admin` and persists.
