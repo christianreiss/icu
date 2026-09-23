@@ -65,6 +65,10 @@ pub const RATE_VIOLATION_WINDOW_S: u64 = 60;
 pub const RENEW_PER_DAY: u32 = 1;
 /// How long a registration certificate stays valid by default.
 pub const INVITE_TTL_S: u64 = 24 * 60 * 60;
+/// Organizational unit of a registration certificate (`PROTOCOL.md` §2.3).
+/// Informational: it lets a client tell a registration bundle from a
+/// passport before connecting; the server decides by its own records.
+pub const REGISTRATION_OU: &str = "ICU registration";
 /// Longest lifetime of a registration certificate; longer requests are
 /// clamped to it (`PROTOCOL.md` §2.3).
 pub const MAX_INVITE_TTL_S: u64 = 7 * 24 * 60 * 60;

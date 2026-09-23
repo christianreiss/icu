@@ -39,10 +39,9 @@ use crate::{
 /// client takes its SNI from.
 pub const CA_COMMON_NAME: &str = "ICU CA";
 
-/// Organizational unit of a registration certificate. Informational, so a
-/// client can tell a registration bundle from a passport before it connects;
-/// the server decides by `CertRecord.registration`, never by this.
-pub const REGISTRATION_OU: &str = "ICU registration";
+/// Organizational unit of a registration certificate; the server decides by
+/// `CertRecord.registration`, never by this.
+pub use icu_proto::limits::REGISTRATION_OU;
 
 /// File names under the state directory.
 const CA_CRT: &str = "ca.crt";

@@ -109,7 +109,6 @@ Neustart. Sie brauchen root oder Mitgliedschaft in der Socket-Gruppe.
 ```bash
 icu-server invite --ttl 24h --out bob.txt  # Registrierungs-Bundle, einmalig, 24 h gültig
 icu-server users                           # Tabelle mit user_id, Cert, online
-icu-server rename alice alicia             # Anzeigename ändern
 icu-server revoke alice                    # alle Certs sperren, sofort kicken
 icu-server status                          # Uptime, online, Relay-Zähler
 icu-server status --json                   # dasselbe für Monitoring

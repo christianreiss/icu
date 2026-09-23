@@ -1638,11 +1638,9 @@ impl LocalState {
 
         // A server that moved says so in the certificates it issues; the next
         // reconnect goes to the new address.
-        if let Some(server) =
-            crate::config::ServerInfo::from_certs(&leaf_der, &self.identity.ca_der)
-        {
-            self.identity.server = server;
-        }
+        self.identity
+            .server
+            .update_from_certs(&leaf_der, &self.identity.ca_der);
         self.identity.leaf_der = leaf_der;
         self.identity.server.name = pending.cn.clone();
         let saved = self.identity.save(&self.paths);

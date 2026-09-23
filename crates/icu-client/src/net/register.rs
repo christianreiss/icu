@@ -16,10 +16,7 @@ use crate::config::{Identity, ServerInfo};
 
 use super::{conn, read_frame, resolve, server_name_for, NetError};
 
-/// Organizational unit the server puts into a registration certificate.
-/// Informational: it lets the UI ask for a name before connecting. The server
-/// decides by its own records.
-pub const REGISTRATION_OU: &str = "ICU registration";
+pub use icu_proto::limits::REGISTRATION_OU;
 
 /// Whether `leaf_der` is a registration certificate.
 pub fn is_registration(leaf_der: &[u8]) -> bool {

@@ -396,18 +396,7 @@ impl ServerInfo {
             .and_then(|cn| cn.as_str().ok())
             .unwrap_or_default()
             .to_string();
-        let server_name = x509_parser::parse_x509_certificate(ca_der)
-            .ok()
-            .and_then(|(_, ca)| {
-                ca.subject()
-                    .iter_common_name()
-                    .next()
-                    .and_then(|cn| cn.as_str().ok())
-                    .and_then(|cn| cn.strip_prefix("ICU CA "))
-                    .map(|s| s.trim().to_string())
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| host.clone());
+        let server_name = ca_server_name(ca_der).unwrap_or_else(|| host.clone());
         Some(ServerInfo {
             host,
             port,
@@ -415,6 +404,35 @@ impl ServerInfo {
             name,
         })
     }
+
+    /// Takes over what a renewed leaf says about the server. Host and port
+    /// always come from its URI; the SNI only when the CA names one — for an
+    /// older CA the stored value is the one known to work, and the URI host
+    /// may be an IP or alias the server certificate does not cover.
+    pub fn update_from_certs(&mut self, leaf_der: &[u8], ca_der: &[u8]) {
+        if let Some(derived) = ServerInfo::from_certs(leaf_der, ca_der) {
+            self.host = derived.host;
+            self.port = derived.port;
+            if ca_server_name(ca_der).is_some() {
+                self.server_name = derived.server_name;
+            }
+        }
+    }
+}
+
+/// The SNI a CA announces in its CN `ICU CA <server_name>`, if it does.
+fn ca_server_name(ca_der: &[u8]) -> Option<String> {
+    let (_, ca) = x509_parser::parse_x509_certificate(ca_der).ok()?;
+    let name = ca
+        .subject()
+        .iter_common_name()
+        .next()?
+        .as_str()
+        .ok()?
+        .strip_prefix("ICU CA ")?
+        .trim()
+        .to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Key, leaf, CA and server coordinates.
@@ -485,13 +503,18 @@ impl Identity {
         Ok(identity)
     }
 
-    /// The armored passport for this identity. Version 2 when the leaf says
-    /// where the server is, otherwise version 1 with the address spelled out —
-    /// a version 2 export of an older certificate would not know where to
-    /// connect.
+    /// The armored passport for this identity. Version 2 when the
+    /// certificates alone lead to the same host, port and SNI this identity
+    /// uses, otherwise version 1 with the address spelled out — an older
+    /// certificate or CA would send the other device somewhere else.
     pub fn to_passport(&self) -> String {
         use icu_proto::passport::{PassportV1, PassportV2};
-        if ServerInfo::from_certs(&self.leaf_der, &self.ca_der).is_some() {
+        let reproducible = ServerInfo::from_certs(&self.leaf_der, &self.ca_der).is_some_and(|d| {
+            d.host == self.server.host
+                && d.port == self.server.port
+                && d.server_name == self.server.server_name
+        });
+        if reproducible {
             PassportV2 {
                 key_der: self.key_der.clone(),
                 leaf_der: self.leaf_der.clone(),
@@ -729,6 +752,34 @@ mod tests {
         ));
         assert_eq!(Identity::from_passport(&text).unwrap(), new);
         assert!(!new.is_registration());
+
+        // Old CA without an SNI in its CN, but the address is in the leaf:
+        // when the stored SNI differs from the URI host, only V1 keeps it.
+        let (leaf, ca, key) = issued(Some("icu://192.0.2.10:4711"), "ICU CA");
+        let mixed = Identity {
+            key_der: key,
+            leaf_der: leaf,
+            ca_der: ca,
+            server: ServerInfo {
+                host: "192.0.2.10".into(),
+                port: 4711,
+                server_name: "icu.example.org".into(),
+                name: "alice".into(),
+            },
+        };
+        let text = mixed.to_passport();
+        assert!(matches!(
+            icu_proto::passport::Passport::decode(&text).unwrap(),
+            icu_proto::passport::Passport::V1(_)
+        ));
+        assert_eq!(Identity::from_passport(&text).unwrap(), mixed);
+
+        // A renewal under that CA moves host and port, never the SNI.
+        let mut server = mixed.server.clone();
+        let (leaf, _, _) = issued(Some("icu://198.51.100.7:5000"), "ICU CA");
+        server.update_from_certs(&leaf, &mixed.ca_der);
+        assert_eq!((server.host.as_str(), server.port), ("198.51.100.7", 5000));
+        assert_eq!(server.server_name, "icu.example.org");
 
         let broken = icu_proto::passport::PassportV2 {
             key_der: vec![1, 2, 3],
