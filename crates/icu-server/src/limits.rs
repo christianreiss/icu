@@ -6,6 +6,19 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Control frames queued per client before it counts as not reading
+/// (`Room`'s bounded out queue). Steady state is a `UserRtt` every 2 s plus
+/// the odd `UserState`; a join storm of 16 users is well under 100 frames.
+/// Reaching this means the client's control stream has stalled for tens of
+/// seconds, and it is closed with `TIMEOUT` instead of buffered for.
+pub const CONTROL_QUEUE_FRAMES: usize = 256;
+
+/// Most source addresses the per-IP handshake table tracks. Spoofed Initials
+/// can name any address, so the table has to have a ceiling; past it,
+/// unknown addresses are sent through a Retry (or refused) instead of being
+/// added (`endpoint::accept_loop`).
+pub const MAX_TRACKED_IPS: usize = 4096;
+
 /// A classic token bucket with fractional tokens.
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
@@ -68,6 +81,28 @@ impl TokenBucket {
     pub fn take_one(&mut self) -> bool {
         self.take(1.0)
     }
+
+    /// Takes `n` tokens whenever the bucket is not in debt, even if that
+    /// drives it below zero; the debt is then paid off by the refill before
+    /// anything else passes. For byte budgets, where a single item (one
+    /// video frame, up to 512 KiB) may be larger than the whole burst
+    /// (100 KB at 400 kbit/s over 2 s) and would otherwise never fit.
+    pub fn take_debt(&mut self, n: f64) -> bool {
+        self.take_debt_at(n, Instant::now())
+    }
+
+    /// [`TokenBucket::take_debt`] with an explicit clock, for tests.
+    pub fn take_debt_at(&mut self, n: f64, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.rate_per_s).min(self.capacity);
+        if self.tokens > 0.0 {
+            self.tokens -= n;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Counts rate limit violations in a sliding window (§6.6: the third violation
@@ -125,13 +160,23 @@ impl IpLimits {
         }
     }
 
-    /// Whether this IP may start another handshake.
-    pub fn allow_handshake(&mut self, ip: IpAddr) -> bool {
+    /// Whether this IP may start another handshake. `None` when the IP is
+    /// not tracked yet and the table is full even after pruning — the
+    /// caller then decides without a per-IP budget.
+    pub fn allow_handshake(&mut self, ip: IpAddr) -> Option<bool> {
+        if !self.handshakes.contains_key(&ip) && self.handshakes.len() >= MAX_TRACKED_IPS {
+            self.prune();
+            if self.handshakes.len() >= MAX_TRACKED_IPS {
+                return None;
+            }
+        }
         let per_s = self.handshakes_per_s;
-        self.handshakes
-            .entry(ip)
-            .or_insert_with(|| TokenBucket::per_second(per_s))
-            .take_one()
+        Some(
+            self.handshakes
+                .entry(ip)
+                .or_insert_with(|| TokenBucket::per_second(per_s))
+                .take_one(),
+        )
     }
 
     /// Whether this IP may start another enrollment. Checks the per-IP bucket
@@ -147,12 +192,13 @@ impl IpLimits {
     }
 
     /// Drops buckets that have been full again for a while, so the maps do not
-    /// grow without bound.
+    /// grow without bound. A handshake bucket refills within a second, so it
+    /// goes after 10 s; an enrollment bucket needs its full minute.
     pub fn prune(&mut self) {
         let now = Instant::now();
         let stale = Duration::from_secs(300);
         self.handshakes
-            .retain(|_, b| now.saturating_duration_since(b.last) < stale);
+            .retain(|_, b| now.saturating_duration_since(b.last) < Duration::from_secs(10));
         self.enrollments
             .retain(|_, b| now.saturating_duration_since(b.last) < stale);
     }
@@ -201,6 +247,17 @@ mod tests {
     }
 
     #[test]
+    fn a_debt_bucket_passes_an_item_larger_than_its_capacity_then_pays_it_off() {
+        let t0 = Instant::now();
+        // 400 kbit/s: 50_000 byte/s, 100_000 byte burst.
+        let mut b = TokenBucket::bitrate(400, Duration::from_secs(2));
+        assert!(b.take_debt_at(150_000.0, t0), "bigger than the burst");
+        assert!(!b.take_debt_at(1.0, t0), "in debt");
+        assert!(!b.take_debt_at(1.0, t0 + Duration::from_millis(900)));
+        assert!(b.take_debt_at(1.0, t0 + Duration::from_millis(1100)));
+    }
+
+    #[test]
     fn the_third_violation_in_the_window_is_fatal() {
         let t0 = Instant::now();
         let mut v = ViolationCounter::new(3, Duration::from_secs(60));
@@ -230,6 +287,26 @@ mod tests {
         }
         assert!(!limits.allow_enroll(a), "5/min per IP");
         assert!(limits.allow_enroll(b), "another IP has its own bucket");
+    }
+
+    #[test]
+    fn the_handshake_table_has_a_ceiling() {
+        let mut limits = IpLimits::new(&crate::config::LimitsSection::default());
+        for i in 0..MAX_TRACKED_IPS as u32 {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+            assert_eq!(limits.allow_handshake(ip), Some(true));
+        }
+        let fresh: IpAddr = "192.0.2.1".parse().unwrap();
+        assert_eq!(
+            limits.allow_handshake(fresh),
+            None,
+            "full, and nothing stale"
+        );
+        let known = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000));
+        assert!(
+            limits.allow_handshake(known).is_some(),
+            "known IPs keep their budget"
+        );
     }
 
     #[test]

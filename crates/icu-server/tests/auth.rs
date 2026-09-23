@@ -274,7 +274,9 @@ async fn a_taken_name_at_enrollment_leaves_the_token_reusable() {
 
 #[tokio::test]
 async fn renewal_issues_a_second_certificate_and_both_connect() {
-    let server = TestServer::start().await;
+    // Short-lived certificates, so the fresh one is already inside the
+    // 30-day renewal window (`PROTOCOL.md` §2.2 Nr. 9).
+    let server = TestServer::start_with(|c| c.tls.client_validity_days = 20).await;
     let old = server.enroll("alice").await;
     let mut client = server.connect(&old).await.expect("connect");
     client.hello("alice").await;
@@ -410,4 +412,32 @@ async fn a_shut_down_server_closes_with_shutdown() {
         .await
         .expect("closed");
     assert_eq!(common::code_of(&reason), Some(ec::SHUTDOWN));
+}
+
+/// A plain renewal is refused while the presented certificate still has
+/// more than 30 days to run (`PROTOCOL.md` §2.2 Nr. 9).
+#[tokio::test]
+async fn plain_renewal_is_refused_outside_the_window() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let mut client = server.connect(&alice).await.expect("connect");
+    client.hello("alice").await;
+
+    let (_, csr) = common::csr_with_cn("alice");
+    client
+        .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
+        .await;
+    let answer = client
+        .recv_matching(|m| {
+            matches!(
+                m,
+                ControlMsg::Error { .. } | ControlMsg::RenewResponse { .. }
+            )
+        })
+        .await;
+    assert!(
+        matches!(answer, Some(ControlMsg::Error { code, .. }) if code == ec::RENEW_REJECTED),
+        "{answer:?}"
+    );
+    server.shutdown().await;
 }

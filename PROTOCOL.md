@@ -37,7 +37,7 @@ Framing auf dem Control-Stream in beide Richtungen:
 UserFlags: u8      bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4 admin, bit5–7 reserviert
                    bit2 ist serverseitig autoritativ: der Server leitet es aus dem Audio-Datagram-Fluss ab (erstes Datagram nach ≥ 500 ms Stille → 1; END-Flag oder 500 ms ohne Datagram → 0) und broadcastet UserState; ein von Clients in SetState gesendetes bit2 wird ignoriert.
                    bit4 ist ebenfalls serverseitig autoritativ und spiegelt Store::is_admin: reitet kostenlos auf Welcome/UserJoined/UserState statt einer eigenen Variante; ein von Clients in SetState gesendetes bit4 wird ignoriert. AdminSetRole broadcastet zusätzlich zum bisherigen Unicast UserAdminChanged ein UserState für jede betroffene Sitzung, damit das Abzeichen bei jedem Betrachter live kippt.
-Session:   u16     serverseitig vergeben, ab 1, pro Server-Laufzeit monoton, nie wiederverwendet; 0 = „unbekannt/ich“.
+Session:   u16     serverseitig vergeben, ab 1, monoton; nach 65 535 läuft der Zähler auf 1 um und überspringt belegte IDs, bei leerem Raum beginnt er wieder bei 1. Eine ID kehrt also frühestens nach 65 534 anderen Vergaben zurück; 0 = „unbekannt/ich“.
                    Gilt nur innerhalb einer Verbindung: nach einem Server-Neustart beginnt die Vergabe wieder bei 1.
 UserId:    u32     beim Enrollment vergeben, ab 1, monoton, nie wiederverwendet; stabil über Cert-Renewals, Reconnects
                    und Server-Neustarts hinweg, in `users.toml` persistiert. Schlüssel für alles, was ein Client

@@ -111,7 +111,14 @@ async fn run(
         ));
     }
 
-    let body = wire::read_frame(recv, MAX_ENROLL_FRAME).await?;
+    // Bounded like `Hello`: QUIC keep-alives would otherwise hold a silent
+    // enrollment open indefinitely, on the global enrollment budget.
+    let body = tokio::time::timeout(
+        Duration::from_secs(pl::HELLO_TIMEOUT_S),
+        wire::read_frame(recv, MAX_ENROLL_FRAME),
+    )
+    .await
+    .map_err(|_| Error::coded(ec::HELLO_TIMEOUT, "no EnrollRequest within the timeout"))??;
     let request = EnrollMsg::decode(&body)
         .map_err(|e| Error::coded(ec::ENROLL_BAD_TOKEN, format!("bad request: {e}")))?;
     // `name` is obsolete: the display name is the CSR's subject CN

@@ -112,17 +112,8 @@ pub async fn accept_loop(server: Arc<Server>, endpoint: Endpoint) {
         };
 
         let remote = incoming.remote_address();
-        let allowed = server
-            .ip_limits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .allow_handshake(remote.ip());
-        if !allowed {
-            tracing::debug!(%remote, "handshake rate limit, refusing");
-            incoming.refuse();
-            continue;
-        }
-        // Address validation under load (§6.2).
+        // Address validation under load (§6.2) comes first: a Retry costs
+        // no budget, so spoofed Initials cannot spend somebody else's.
         let incoming = if endpoint.open_connections() >= pl::HANDSHAKES_IN_FLIGHT_RETRY
             && incoming.may_retry()
         {
@@ -133,6 +124,28 @@ pub async fn accept_loop(server: Arc<Server>, endpoint: Endpoint) {
         } else {
             incoming
         };
+        let allowed = server
+            .ip_limits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .allow_handshake(remote.ip());
+        match allowed {
+            Some(true) => {}
+            // The table is full of addresses nobody validated: a validated
+            // one passes untracked, anything else has to prove its address.
+            None if incoming.remote_address_validated() => {}
+            None if incoming.may_retry() => {
+                if let Err(e) = incoming.retry() {
+                    e.into_incoming().refuse();
+                }
+                continue;
+            }
+            Some(false) | None => {
+                tracing::debug!(%remote, "handshake rate limit, refusing");
+                incoming.refuse();
+                continue;
+            }
+        }
 
         let server = server.clone();
         tokio::spawn(async move {

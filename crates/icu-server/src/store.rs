@@ -266,13 +266,28 @@ impl Store {
         self.users.users.get(&id.to_string())
     }
 
-    /// Looks a user up by id for mutation. The `BTreeMap` key is the decimal
-    /// `user_id`; this is the only place that encoding is spelled out.
-    fn user_mut(&mut self, id: UserId) -> Result<&mut UserRecord> {
-        self.users
-            .users
-            .get_mut(&id.to_string())
-            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))
+    /// Applies `change` to a copy of the user database, writes the copy and
+    /// only then adopts it. A failed write (disk full, permissions) therefore
+    /// leaves the running server exactly as it was, instead of serving a
+    /// state that is gone after the next restart.
+    fn update_users<R>(&mut self, change: impl FnOnce(&mut UsersFile) -> Result<R>) -> Result<R> {
+        let mut next = self.users.clone();
+        let out = change(&mut next)?;
+        write_atomic(&self.dir.join(USERS_FILE), &toml::to_string(&next)?)?;
+        self.users = next;
+        Ok(out)
+    }
+
+    /// [`Store::update_users`] for `invites.toml`.
+    fn update_invites<R>(
+        &mut self,
+        change: impl FnOnce(&mut InvitesFile) -> Result<R>,
+    ) -> Result<R> {
+        let mut next = self.invites.clone();
+        let out = change(&mut next)?;
+        write_atomic(&self.dir.join(INVITES_FILE), &toml::to_string(&next)?)?;
+        self.invites = next;
+        Ok(out)
     }
 
     /// Whether `id` is an admin. `false` for an unknown id.
@@ -334,24 +349,24 @@ impl Store {
                 format!("name {:?} taken", cert.cn),
             ));
         }
-        let name = cert.cn.clone();
-        let id = self.users.next_user_id;
-        self.users.next_user_id = id
-            .checked_add(1)
-            .ok_or_else(|| Error::msg("user_id space exhausted"))?;
-        self.users.users.insert(
-            id.to_string(),
-            UserRecord {
-                name,
-                created: rfc3339(now()),
-                last_renew: None,
-                certs: vec![cert],
-                is_admin,
-                disabled: false,
-            },
-        );
-        self.save_users()?;
-        Ok(id)
+        self.update_users(|users| {
+            let id = users.next_user_id;
+            users.next_user_id = id
+                .checked_add(1)
+                .ok_or_else(|| Error::msg("user_id space exhausted"))?;
+            users.users.insert(
+                id.to_string(),
+                UserRecord {
+                    name: cert.cn.clone(),
+                    created: rfc3339(now()),
+                    last_renew: None,
+                    certs: vec![cert],
+                    is_admin,
+                    disabled: false,
+                },
+            );
+            Ok(id)
+        })
     }
 
     /// Appends a newly issued certificate to an existing user and adopts its
@@ -381,29 +396,38 @@ impl Store {
                 format!("name {:?} taken", cert.cn),
             ));
         }
-        let stamp = rfc3339(now());
-        let record = self.user_mut(id)?;
-        // A renewal queued behind a revoke or disable must not hand out a
-        // fresh, unrevoked certificate and undo it.
-        if record.disabled {
-            return Err(Error::coded(ec::AUTH_DISABLED, "user is disabled"));
-        }
-        if record.is_revoked() {
-            return Err(Error::coded(ec::AUTH_REVOKED, "user is revoked"));
-        }
-        let renamed = record.name != cert.cn;
-        record.name = cert.cn.clone();
-        if let Some(fp) = supersedes {
-            if let Some(old) = record.certs.iter_mut().find(|c| c.fingerprint == fp) {
-                old.renewed = Some(stamp.clone());
+        let now = now();
+        let stamp = rfc3339(now);
+        self.update_users(|users| {
+            let record = user_entry(users, id)?;
+            // A renewal queued behind a revoke or disable must not hand out a
+            // fresh, unrevoked certificate and undo it.
+            if record.disabled {
+                return Err(Error::coded(ec::AUTH_DISABLED, "user is disabled"));
             }
-        }
-        record.certs.push(cert);
-        if renewal {
-            record.last_renew = Some(stamp);
-        }
-        self.save_users()?;
-        Ok(renamed)
+            if record.is_revoked() {
+                return Err(Error::coded(ec::AUTH_REVOKED, "user is revoked"));
+            }
+            let renamed = record.name != cert.cn;
+            record.name = cert.cn.clone();
+            if let Some(fp) = supersedes {
+                if let Some(old) = record.certs.iter_mut().find(|c| c.fingerprint == fp) {
+                    old.renewed = Some(stamp.clone());
+                }
+            }
+            // Expired certificates can no longer authenticate (rustls checks
+            // validity first), so their records are dead weight in every
+            // fingerprint lookup. Revoked ones stay: they are what makes a
+            // revoke visible, and what `is_revoked` counts.
+            record.certs.retain(|c| {
+                c.revoked || parse_rfc3339(&c.expires).map(|e| e > now).unwrap_or(true)
+            });
+            record.certs.push(cert);
+            if renewal {
+                record.last_renew = Some(stamp);
+            }
+            Ok(renamed)
+        })
     }
 
     /// When `fingerprint` was last used to obtain a successor certificate.
@@ -427,16 +451,17 @@ impl Store {
     /// the last remaining functional admin.
     pub fn revoke(&mut self, id: UserId) -> Result<bool> {
         self.guard_last_admin(id)?;
-        let record = self.user_mut(id)?;
-        let mut changed = false;
-        for cert in &mut record.certs {
-            if !cert.revoked {
-                cert.revoked = true;
-                changed = true;
+        self.update_users(|users| {
+            let record = user_entry(users, id)?;
+            let mut changed = false;
+            for cert in &mut record.certs {
+                if !cert.revoked {
+                    cert.revoked = true;
+                    changed = true;
+                }
             }
-        }
-        self.save_users()?;
-        Ok(changed)
+            Ok(changed)
+        })
     }
 
     /// Whether `id` currently provides working admin capability: admin flag
@@ -476,13 +501,16 @@ impl Store {
         if !is_admin {
             self.guard_last_admin(id)?;
         }
-        let record = self.user_mut(id)?;
-        let changed = record.is_admin != is_admin;
-        record.is_admin = is_admin;
-        if changed {
-            self.save_users()?;
+        let current = self
+            .user(id)
+            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
+        if current.is_admin == is_admin {
+            return Ok(false);
         }
-        Ok(changed)
+        self.update_users(|users| {
+            user_entry(users, id)?.is_admin = is_admin;
+            Ok(true)
+        })
     }
 
     /// Blocks or restores login without touching certificates. Guarded
@@ -494,13 +522,16 @@ impl Store {
         if disabled {
             self.guard_last_admin(id)?;
         }
-        let record = self.user_mut(id)?;
-        let changed = record.disabled != disabled;
-        record.disabled = disabled;
-        if changed {
-            self.save_users()?;
+        let current = self
+            .user(id)
+            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
+        if current.disabled == disabled {
+            return Ok(false);
         }
-        Ok(changed)
+        self.update_users(|users| {
+            user_entry(users, id)?.disabled = disabled;
+            Ok(true)
+        })
     }
 
     /// All invites.
@@ -528,26 +559,28 @@ impl Store {
             expires: rfc3339(created + ttl),
             used_by: 0,
         };
-        self.invites.invites.insert(token.clone(), record.clone());
-        self.save_invites()?;
+        self.update_invites(|invites| {
+            invites.invites.insert(token.clone(), record.clone());
+            Ok(())
+        })?;
         Ok((token, record))
     }
 
     /// Drops expired, unused invites (called at startup, §6.1.4).
     pub fn purge_expired_invites(&mut self) -> Result<usize> {
         let now = now();
-        let before = self.invites.invites.len();
-        self.invites.invites.retain(|_, inv| {
-            if inv.used_by != 0 {
-                return true;
-            }
-            parse_rfc3339(&inv.expires)
-                .map(|e| e > now)
-                .unwrap_or(false)
-        });
-        let removed = before - self.invites.invites.len();
+        let live = |inv: &InviteRecord| {
+            inv.used_by != 0
+                || parse_rfc3339(&inv.expires)
+                    .map(|e| e > now)
+                    .unwrap_or(false)
+        };
+        let removed = self.invites.invites.values().filter(|i| !live(i)).count();
         if removed > 0 {
-            self.save_invites()?;
+            self.update_invites(|invites| {
+                invites.invites.retain(|_, inv| live(inv));
+                Ok(())
+            })?;
         }
         Ok(removed)
     }
@@ -580,37 +613,38 @@ impl Store {
         let (key, record) = self
             .peek_invite(token)
             .ok_or_else(|| Error::coded(ec::ENROLL_BAD_TOKEN, "token unknown, used or expired"))?;
-        let entry = self
-            .invites
-            .invites
-            .get_mut(&key)
-            .ok_or_else(|| Error::coded(ec::ENROLL_BAD_TOKEN, "token vanished"))?;
-        if entry.used_by != 0 {
-            return Err(Error::coded(ec::ENROLL_BAD_TOKEN, "token already used"));
-        }
-        entry.used_by = user_id;
-        self.save_invites()?;
+        self.update_invites(|invites| {
+            let entry = invites
+                .invites
+                .get_mut(&key)
+                .ok_or_else(|| Error::coded(ec::ENROLL_BAD_TOKEN, "token vanished"))?;
+            if entry.used_by != 0 {
+                return Err(Error::coded(ec::ENROLL_BAD_TOKEN, "token already used"));
+            }
+            entry.used_by = user_id;
+            Ok(())
+        })?;
         Ok(record)
     }
 
     /// Releases a token again, used when a later step of the enrollment fails.
     pub fn release_invite(&mut self, token: &str) -> Result<()> {
-        if let Some(entry) = self.invites.invites.get_mut(token) {
-            entry.used_by = 0;
-        }
-        self.save_invites()
+        self.update_invites(|invites| {
+            if let Some(entry) = invites.invites.get_mut(token) {
+                entry.used_by = 0;
+            }
+            Ok(())
+        })
     }
+}
 
-    fn save_users(&self) -> Result<()> {
-        write_atomic(&self.dir.join(USERS_FILE), &toml::to_string(&self.users)?)
-    }
-
-    fn save_invites(&self) -> Result<()> {
-        write_atomic(
-            &self.dir.join(INVITES_FILE),
-            &toml::to_string(&self.invites)?,
-        )
-    }
+/// Looks a user up by id for mutation. The `BTreeMap` key is the decimal
+/// `user_id`; this is the only place that encoding is spelled out.
+fn user_entry(users: &mut UsersFile, id: UserId) -> Result<&mut UserRecord> {
+    users
+        .users
+        .get_mut(&id.to_string())
+        .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))
 }
 
 fn load_or_default<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T> {

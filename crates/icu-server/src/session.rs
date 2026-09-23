@@ -19,7 +19,7 @@ use crate::{
     limits::{TokenBucket, ViolationCounter},
     relay::{self, VideoSender},
     room::{Counters, JoinError},
-    store::{fingerprint, now, rfc3339, unix_millis, CertRecord, Store},
+    store::{fingerprint, now, parse_rfc3339, rfc3339, unix_millis, CertRecord, Store},
     wire, Server,
 };
 
@@ -112,20 +112,19 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
 }
 
 async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identity) -> Result<()> {
-    // 2. Control stream and `Hello` within the timeout (§6.4.2).
-    let (send, mut recv) =
-        tokio::time::timeout(server.config.timing.hello_timeout(), conn.accept_bi())
-            .await
-            .map_err(|_| Error::coded(ec::HELLO_TIMEOUT, "no control stream within the timeout"))?
-            .map_err(|e| Error::coded(ec::HELLO_TIMEOUT, e.to_string()))?;
+    // 2. Control stream and `Hello` within the timeout (§6.4.2) — one
+    //    deadline for both, not one each, or a client could take twice as
+    //    long as the spec allows.
+    let deadline = tokio::time::Instant::now() + server.config.timing.hello_timeout();
+    let (send, mut recv) = tokio::time::timeout_at(deadline, conn.accept_bi())
+        .await
+        .map_err(|_| Error::coded(ec::HELLO_TIMEOUT, "no control stream within the timeout"))?
+        .map_err(|e| Error::coded(ec::HELLO_TIMEOUT, e.to_string()))?;
     let _ = send.set_priority(1); // control beats video (`PROTOCOL.md` §4)
 
-    let body = tokio::time::timeout(
-        server.config.timing.hello_timeout(),
-        wire::read_frame(&mut recv, MAX_CONTROL_FRAME),
-    )
-    .await
-    .map_err(|_| Error::coded(ec::HELLO_TIMEOUT, "no Hello within the timeout"))??;
+    let body = tokio::time::timeout_at(deadline, wire::read_frame(&mut recv, MAX_CONTROL_FRAME))
+        .await
+        .map_err(|_| Error::coded(ec::HELLO_TIMEOUT, "no Hello within the timeout"))??;
 
     let hello = ControlMsg::decode(&body)
         .map_err(|e| Error::coded(ec::PROTOCOL_VIOLATION, format!("bad Hello: {e}")))?;
@@ -160,23 +159,30 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     // `Hello.name` is obsolete: the name lives in the certificate, and the
     // store mirrors the CN of the newest one (§6.4.2).
     let _ = name;
-    let (stored_name, is_admin) = {
-        let store = server.store.lock().await;
-        let stored_name = store
-            .user(identity.user_id)
-            .map(|u| u.name.clone())
-            .ok_or_else(|| {
-                Error::coded(
-                    ec::AUTH_UNKNOWN_CERT,
-                    format!("unknown user_id {}", identity.user_id),
-                )
-            })?;
-        let is_admin = store.is_admin(identity.user_id);
-        (stored_name, is_admin)
-    };
+    // The store lock is held from here across `room.join`. A revoke or
+    // disable during the `Hello` wait happened after `authenticate` and
+    // before this session is in the room, where `kick_user` cannot see it;
+    // admin actions change the store under this lock and kick only after
+    // releasing it, so either this check sees the change or the kick sees
+    // the session.
+    let store = server.store.lock().await;
+    let (_, user, cert) = store.by_fingerprint(&identity.cert_fp).ok_or_else(|| {
+        Error::coded(
+            ec::AUTH_UNKNOWN_CERT,
+            format!("unknown user_id {}", identity.user_id),
+        )
+    })?;
+    if cert.revoked {
+        return Err(Error::coded(ec::AUTH_REVOKED, "certificate revoked"));
+    }
+    if user.disabled {
+        return Err(Error::coded(ec::AUTH_DISABLED, "user disabled"));
+    }
+    let stored_name = user.name.clone();
+    let is_admin = user.is_admin;
 
     // 3. Join, `Welcome`, `UserJoined`.
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(crate::limits::CONTROL_QUEUE_FRAMES);
     let min_client = server.config.server.min_client.clone();
     let welcome = |session, flags, users| ControlMsg::Welcome {
         minor,
@@ -205,10 +211,8 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         Err(JoinError::Full) => {
             return Err(Error::coded(ec::SERVER_FULL, "room is full"));
         }
-        Err(JoinError::SessionSpaceExhausted) => {
-            return Err(Error::coded(ec::SERVER_FULL, "session id space exhausted"));
-        }
     };
+    drop(store);
 
     let writer = tokio::spawn(writer_task(send, out_rx));
     tracing::info!(
@@ -265,7 +269,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
 }
 
 /// Drains the outgoing control queue onto the control stream.
-async fn writer_task(mut send: quinn::SendStream, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn writer_task(mut send: quinn::SendStream, mut rx: mpsc::Receiver<Vec<u8>>) {
     while let Some(frame) = rx.recv().await {
         if send.write_all(&frame).await.is_err() {
             return;
@@ -457,6 +461,11 @@ fn rate_limited(
     violations.record()
 }
 
+/// A plain renewal is accepted from this many days before the presented
+/// certificate expires (`PROTOCOL.md` §2.2 Nr. 9; the client asks at the
+/// same threshold).
+const RENEW_WINDOW_DAYS: i64 = 30;
+
 /// Certificate renewal, and the only way a name changes (`PROTOCOL.md` §2.2).
 ///
 /// The CSR's subject CN is the name the client asks for. Three cases, told
@@ -529,6 +538,26 @@ async fn handle_renew(
                 &reject(ec::RENEW_REJECTED, "at most one renewal per day".into()),
             );
             return;
+        }
+    }
+    // A plain renewal only inside the last 30 days of the presented
+    // certificate (`PROTOCOL.md` §2.2 Nr. 9); otherwise one renewal a day
+    // would pile up a year's worth of live certificates.
+    if !rename && !catch_up {
+        let expires = store
+            .by_fingerprint(&identity.cert_fp)
+            .and_then(|(_, _, c)| parse_rfc3339(&c.expires).ok());
+        if let Some(expires) = expires {
+            if expires - now() > time::Duration::days(RENEW_WINDOW_DAYS) {
+                server.room.send_to(
+                    session,
+                    &reject(
+                        ec::RENEW_REJECTED,
+                        format!("renewal opens {RENEW_WINDOW_DAYS} days before expiry"),
+                    ),
+                );
+                return;
+            }
         }
     }
 
@@ -703,18 +732,7 @@ async fn handle_admin_set_role(
         target,
         |store| store.set_admin(target, is_admin),
         || {
-            for s in server.room.sessions_of_user(target) {
-                server
-                    .room
-                    .send_to(s, &ControlMsg::UserAdminChanged { is_admin });
-            }
-            for s in server.room.set_admin_flag(target, is_admin) {
-                if let Some(flags) = server.room.flags(s) {
-                    server
-                        .room
-                        .broadcast(&ControlMsg::UserState { session: s, flags });
-                }
-            }
+            announce_admin_change(server, target, is_admin);
             tracing::info!(actor, target, is_admin, "admin role changed");
             ControlMsg::AdminSetRoleOk {
                 user_id: target,
@@ -723,6 +741,25 @@ async fn handle_admin_set_role(
         },
     )
     .await
+}
+
+/// Puts a role change live without a reconnect: `UserAdminChanged` to every
+/// one of the target's own sessions, then a `UserState` broadcast per session
+/// whose `ADMIN` bit flipped, which is what moves the badge on everybody
+/// else's roster. Shared by the in-band handler and the admin socket.
+pub fn announce_admin_change(server: &Arc<Server>, target: UserId, is_admin: bool) {
+    for s in server.room.sessions_of_user(target) {
+        server
+            .room
+            .send_to(s, &ControlMsg::UserAdminChanged { is_admin });
+    }
+    for s in server.room.set_admin_flag(target, is_admin) {
+        if let Some(flags) = server.room.flags(s) {
+            server
+                .room
+                .broadcast(&ControlMsg::UserState { session: s, flags });
+        }
+    }
 }
 
 /// `AdminSetDisabled`: disabling an online user kicks it immediately with

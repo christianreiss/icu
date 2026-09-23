@@ -273,12 +273,7 @@ async fn set_role(server: &Arc<Server>, user: &str, is_admin: bool) -> AdminResp
     match store.set_admin(user_id, is_admin) {
         Ok(_) => {
             drop(store);
-            for session in server.room.sessions_of_user(user_id) {
-                server.room.send_to(
-                    session,
-                    &icu_proto::ControlMsg::UserAdminChanged { is_admin },
-                );
-            }
+            session::announce_admin_change(server, user_id, is_admin);
             tracing::info!(user_id, is_admin, "admin role changed");
             AdminResponse::Ok
         }

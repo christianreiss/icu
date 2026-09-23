@@ -25,10 +25,12 @@ use crate::{limits::TokenBucket, room::Counters, Server};
 
 /// Relays one audio datagram (`PROTOCOL.md` §3).
 ///
-/// Order: check length and `kind`, check that the sender is active and not
-/// muted, rate limit, set `speaker`, then `send_datagram` to every other
+/// Order: check length and `kind`, rate limit, check that the sender is
+/// active and not muted, set `speaker`, then `send_datagram` to every other
 /// active, non-deafened peer. Send errors are counted per receiver and never
-/// block.
+/// block. The rate limit comes before the room lock on purpose: it needs
+/// only the task-local bucket, so a flood is turned away without touching
+/// shared state or cloning a single receiver handle.
 ///
 /// This is the one hot path in the server — 16 clients at 50 packets/s mean
 /// 800 calls a second, each fanning out to 15 peers. It therefore takes the
@@ -49,16 +51,16 @@ pub fn audio(
         return;
     };
 
+    if !bucket.take_one() {
+        Counters::inc(&server.counters.dropped_rate);
+        return;
+    }
     let Some(flags) = server.room.audio_fanout(sender, receivers) else {
         Counters::inc(&server.counters.dropped_malformed);
         return;
     };
     if flags.muted() {
         Counters::inc(&server.counters.dropped_muted);
-        return;
-    }
-    if !bucket.take_one() {
-        Counters::inc(&server.counters.dropped_rate);
         return;
     }
 
@@ -209,6 +211,11 @@ impl Drop for VideoSender {
 /// One sender-receiver pair: at most one frame in flight plus one waiting
 /// (`PROTOCOL.md` §4).
 pub struct Slot {
+    /// `stable_id` of the receiver connection the forwarder writes to. A
+    /// session id can come back after wrapping (`room::allocate_session`);
+    /// a slot left over from the id's previous owner must not be inherited,
+    /// its forwarder has already ended with that old connection.
+    conn_id: usize,
     waiting: Mutex<Option<Bytes>>,
     notify: tokio::sync::Notify,
     /// Set when nothing will fill this slot again, so that the forwarder
@@ -217,8 +224,9 @@ pub struct Slot {
 }
 
 impl Slot {
-    fn new() -> Slot {
+    fn new(conn_id: usize) -> Slot {
         Slot {
+            conn_id,
             waiting: Mutex::new(None),
             notify: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
@@ -256,9 +264,13 @@ impl Slot {
 
 /// Relays one incoming video frame (`PROTOCOL.md` §4).
 ///
-/// The frame is read completely (bounded by 512 KiB) before it is fanned out,
-/// so that the per sender-receiver drop rule can be applied without holding a
-/// half written stream open. At the target profile a frame is around 1.2 KiB.
+/// The header is read and checked first — camera on, sender active, frame
+/// rate — and only then the payload (bounded by 512 KiB): a frame that is
+/// going to be dropped is refused with `stop(RATE_LIMITED)` instead of being
+/// read into memory. The payload is then read completely before it is fanned
+/// out, so that the per sender-receiver drop rule can be applied without
+/// holding a half written stream open. At the target profile a frame is
+/// around 1.2 KiB.
 pub async fn video(
     server: Arc<Server>,
     sender: Session,
@@ -266,36 +278,60 @@ pub async fn video(
     state: Arc<Mutex<VideoSender>>,
 ) {
     Counters::inc(&server.counters.video_frames_in);
+    let refuse = |recv: &mut quinn::RecvStream| {
+        let _ = recv.stop(quinn::VarInt::from_u32(icu_proto::error::RATE_LIMITED));
+    };
 
-    let mut frame = match recv.read_to_end(VIDEO_HEADER_LEN + VIDEO_MAX_FRAME).await {
-        Ok(frame) => frame,
+    let mut header = [0u8; VIDEO_HEADER_LEN];
+    if let Err(e) = recv.read_exact(&mut header).await {
+        tracing::debug!(sender, error = %e, "video header read failed");
+        return;
+    }
+    if VideoHeader::decode(&header).is_err() {
+        Counters::inc(&server.counters.video_dropped_rate);
+        refuse(&mut recv);
+        return;
+    }
+
+    // Only while the camera is on and the sender is active (§6.5).
+    if !server.room.flags(sender).is_some_and(|f| f.camera_on()) {
+        Counters::inc(&server.counters.video_dropped_not_allowed);
+        refuse(&mut recv);
+        return;
+    }
+    let frame_ok = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .frames
+        .take_one();
+    if !frame_ok {
+        Counters::inc(&server.counters.video_dropped_rate);
+        refuse(&mut recv);
+        return;
+    }
+
+    let payload = match recv.read_to_end(VIDEO_MAX_FRAME).await {
+        Ok(payload) => payload,
         Err(e) => {
             tracing::debug!(sender, error = %e, "video frame read failed");
             return;
         }
     };
-    if frame.len() < VIDEO_HEADER_LEN || VideoHeader::decode(&frame).is_err() {
+    // The byte budget can only be charged once the size is known. It runs
+    // into debt rather than refusing outright, so a frame larger than the
+    // 2 s burst — a big IDR — still passes when the budget is not spent.
+    let bytes_ok = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bitrate
+        .take_debt((VIDEO_HEADER_LEN + payload.len()) as f64);
+    if !bytes_ok {
         Counters::inc(&server.counters.video_dropped_rate);
         return;
     }
-
-    // Only while the camera is on and the sender is active (§6.5).
-    let Some(flags) = server.room.flags(sender) else {
-        Counters::inc(&server.counters.video_dropped_not_allowed);
-        return;
-    };
-    if !flags.camera_on() {
-        Counters::inc(&server.counters.video_dropped_not_allowed);
-        return;
-    }
-
-    {
-        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-        if !state.frames.take_one() || !state.bitrate.take(frame.len() as f64) {
-            Counters::inc(&server.counters.video_dropped_rate);
-            return;
-        }
-    }
+    let mut frame = Vec::with_capacity(VIDEO_HEADER_LEN + payload.len());
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(&payload);
 
     let receivers = server.room.video_receivers(sender);
     if receivers.is_empty() {
@@ -318,11 +354,14 @@ pub async fn video(
     let mut hint = None;
     {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-        // Receivers that left take their slot with them. Session ids are never
-        // reused, so without this the map — and a held-back frame in each
-        // entry — would grow for as long as the sender stays connected.
+        // Receivers that left take their slot with them, and so does an id
+        // that now belongs to a different connection. Without this the map —
+        // and a held-back frame in each entry — would grow for as long as the
+        // sender stays connected.
         state.slots.retain(|session, slot| {
-            let keep = receivers.iter().any(|(r, _)| r == session);
+            let keep = receivers
+                .iter()
+                .any(|(r, c)| r == session && c.stable_id() == slot.conn_id);
             if !keep {
                 slot.close();
             }
@@ -333,7 +372,7 @@ pub async fn video(
                 .slots
                 .entry(*session)
                 .or_insert_with(|| {
-                    let slot = Arc::new(Slot::new());
+                    let slot = Arc::new(Slot::new(conn.stable_id()));
                     tokio::spawn(forward_frames(
                         server.clone(),
                         conn.clone(),
@@ -440,7 +479,7 @@ mod tests {
 
     #[test]
     fn closing_a_slot_drops_the_waiting_frame() {
-        let slot = Slot::new();
+        let slot = Slot::new(0);
         assert!(!slot.offer(Bytes::from_static(b"frame")));
         slot.close();
         assert!(slot.is_closed());
@@ -451,7 +490,7 @@ mod tests {
     /// instead of parking on a slot nobody will fill again.
     #[test]
     fn dropping_a_video_sender_closes_its_slots() {
-        let slot = Arc::new(Slot::new());
+        let slot = Arc::new(Slot::new(0));
         let mut vs = sender();
         vs.slots.insert(7, slot.clone());
         drop(vs);

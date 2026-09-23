@@ -83,8 +83,10 @@ pub struct Member {
     pub flags: UserFlags,
     /// The QUIC connection, for datagrams and for closing.
     pub conn: quinn::Connection,
-    /// Outgoing control frames. The writer task drains this.
-    pub out: mpsc::UnboundedSender<Vec<u8>>,
+    /// Outgoing control frames. The writer task drains this. Bounded by
+    /// [`crate::limits::CONTROL_QUEUE_FRAMES`]: a client that stops reading
+    /// is closed rather than buffered for.
+    pub out: mpsc::Sender<Vec<u8>>,
     /// Talk spurt tracking.
     pub speak: Speaking,
     /// Set just before the server closes this connection itself, so that
@@ -94,6 +96,30 @@ pub struct Member {
 }
 
 impl Member {
+    /// Queues one control frame. A full queue means the client has stopped
+    /// reading its control stream; it is closed with `TIMEOUT` instead of
+    /// letting its backlog grow in server memory. `quinn::Connection::close`
+    /// is synchronous and never calls back into the room, so this is safe
+    /// under the room lock.
+    fn push(&mut self, frame: Vec<u8>) -> bool {
+        match self.out.try_send(frame) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                if self.close_code.is_none() {
+                    tracing::info!(session = self.session, "control queue full, closing");
+                    self.close_code = Some(icu_proto::error::TIMEOUT);
+                    let code = icu_proto::error::TIMEOUT;
+                    self.conn.close(
+                        quinn::VarInt::from_u32(code),
+                        icu_proto::error::name(code).as_bytes(),
+                    );
+                }
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
     /// This member as it appears on the wire.
     pub fn info(&self) -> UserInfo {
         UserInfo {
@@ -123,8 +149,22 @@ pub struct Room {
 pub enum JoinError {
     /// `max_users` reached.
     Full,
-    /// Session ids exhausted (2^16 connections in one server run).
-    SessionSpaceExhausted,
+}
+
+/// The next free session id from `*next` on, advancing it. Monotonic until
+/// `u16` runs out, then it wraps to 1 and skips ids still in use: with at
+/// most `max_users` members there is always one free, and an id comes back
+/// only after 65 534 others have been handed out (`PROTOCOL.md` §1). Without
+/// the wrap, a client reconnecting in a loop exhausted the space in about
+/// two hours, and the server then turned everybody away until restarted.
+fn allocate_session(next: &mut Session, in_use: impl Fn(Session) -> bool) -> Session {
+    loop {
+        let session = *next;
+        *next = session.checked_add(1).unwrap_or(1);
+        if session != 0 && !in_use(session) {
+            return session;
+        }
+    }
 }
 
 impl Room {
@@ -154,8 +194,8 @@ impl Room {
         self.len() == 0
     }
 
-    /// Adds a participant and returns its session id. Session ids are
-    /// monotonic and never reused within a server run.
+    /// Adds a participant and returns its session id (see
+    /// [`allocate_session`] for when an id can come back).
     ///
     /// `welcome` builds the joiner's `Welcome` from its session, flags and the
     /// other participants. It is queued, and `UserJoined` broadcast, under the
@@ -170,23 +210,20 @@ impl Room {
         flags: UserFlags,
         is_admin: bool,
         conn: quinn::Connection,
-        out: mpsc::UnboundedSender<Vec<u8>>,
+        out: mpsc::Sender<Vec<u8>>,
         welcome: impl FnOnce(Session, UserFlags, Vec<UserInfo>) -> ControlMsg,
     ) -> Result<Session, JoinError> {
         let mut state = self.lock();
         if state.members.len() >= usize::from(self.max_users) {
             return Err(JoinError::Full);
         }
-        let session = state.next_session;
-        if session == Session::MAX {
-            return Err(JoinError::SessionSpaceExhausted);
-        }
-        state.next_session += 1;
+        let state = &mut *state;
+        let session = allocate_session(&mut state.next_session, |s| state.members.contains_key(&s));
         // A client cannot announce itself as speaking or admin; the admin
         // bit comes from the store, looked up by the caller before join.
         let mut initial = UserFlags::NONE.apply_client_request(flags);
         initial = initial.with_bit(UserFlags::ADMIN, is_admin);
-        let member = Member {
+        let mut member = Member {
             session,
             user_id,
             name,
@@ -200,7 +237,7 @@ impl Room {
         let welcome = welcome(session, initial, users);
         match welcome.encode() {
             Ok(frame) => {
-                let _ = member.out.send(frame);
+                member.push(frame);
             }
             Err(_) => tracing::error!(msg = welcome.variant(), "cannot encode control message"),
         }
@@ -209,8 +246,8 @@ impl Room {
         };
         match joined.encode() {
             Ok(frame) => {
-                for other in state.members.values() {
-                    let _ = other.out.send(frame.clone());
+                for other in state.members.values_mut() {
+                    other.push(frame.clone());
                 }
             }
             Err(_) => tracing::error!("cannot encode UserJoined"),
@@ -233,9 +270,15 @@ impl Room {
         }
     }
 
-    /// Removes a participant.
+    /// Removes a participant. The last one out resets the id counter:
+    /// nobody is left who could tell a new session 1 from the old one.
     pub fn leave(&self, session: Session) -> Option<Member> {
-        self.lock().members.remove(&session)
+        let mut state = self.lock();
+        let member = state.members.remove(&session);
+        if state.members.is_empty() {
+            state.next_session = 1;
+        }
+        member
     }
 
     /// One participant, cloned.
@@ -414,9 +457,9 @@ impl Room {
             tracing::error!(msg = msg.variant(), "cannot encode control message");
             return false;
         };
-        let state = self.lock();
-        match state.members.get(&session) {
-            Some(member) => member.out.send(frame).is_ok(),
+        let mut state = self.lock();
+        match state.members.get_mut(&session) {
+            Some(member) => member.push(frame),
             None => false,
         }
     }
@@ -436,12 +479,12 @@ impl Room {
             tracing::error!(msg = msg.variant(), "cannot encode control message");
             return;
         };
-        let state = self.lock();
-        for member in state.members.values() {
+        let mut state = self.lock();
+        for member in state.members.values_mut() {
             if Some(member.session) == except {
                 continue;
             }
-            let _ = member.out.send(frame.clone());
+            member.push(frame.clone());
         }
     }
 
@@ -556,6 +599,16 @@ mod tests {
         // After an expiry, the next datagram does announce a new spurt.
         assert!(s.expire(t0 + Duration::from_millis(2100), silence));
         assert!(s.note_audio(t0 + Duration::from_millis(2200), silence));
+    }
+
+    #[test]
+    fn session_ids_wrap_and_skip_ids_in_use() {
+        let free = |_| false;
+        let mut next = Session::MAX;
+        assert_eq!(allocate_session(&mut next, free), Session::MAX);
+        assert_eq!(allocate_session(&mut next, free), 1, "wraps past 0");
+        // 2 is still connected: skipped, never handed out twice.
+        assert_eq!(allocate_session(&mut next, |s| s == 2), 3);
     }
 
     #[test]
