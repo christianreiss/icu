@@ -1,14 +1,14 @@
-//! Transport: enrollment, the main connection and the control framing.
+//! Transport: the main connection, registration and the control framing.
 
 pub mod conn;
-pub mod enroll;
+pub mod register;
 
 use std::net::SocketAddr;
 
 /// Network failure.
 #[derive(Debug, Clone)]
 pub enum NetError {
-    /// Invite link malformed.
+    /// Bundle or name unusable.
     BadLink(String),
     /// Name resolution.
     Resolve(String),
@@ -30,7 +30,7 @@ pub enum NetError {
 impl std::fmt::Display for NetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            NetError::BadLink(s) => write!(f, "invalid invite link: {s}"),
+            NetError::BadLink(s) => write!(f, "invalid bundle or name: {s}"),
             NetError::Resolve(s) => write!(f, "cannot resolve: {s}"),
             NetError::Tls(s) => write!(f, "tls: {s}"),
             NetError::Connect(s) => write!(f, "connection: {s}"),
@@ -82,4 +82,58 @@ pub async fn read_frame(recv: &mut quinn::RecvStream, max: usize) -> Result<Vec<
         .await
         .map_err(|e| NetError::Connect(e.to_string()))?;
     Ok(body)
+}
+
+/// Splits `host[:port]`, `[v6]` or `[v6]:port`; a missing port is the
+/// default 4711.
+pub fn split_host_port(authority: &str) -> Result<(String, u16), NetError> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| NetError::BadLink("bad IPv6 literal".into()))?;
+        let host = rest[..end].to_string();
+        let port = match rest[end + 1..].strip_prefix(':') {
+            Some(p) => p
+                .parse()
+                .map_err(|_| NetError::BadLink("bad port".into()))?,
+            None => icu_proto::limits::DEFAULT_PORT,
+        };
+        return Ok((host, port));
+    }
+    match authority.rsplit_once(':') {
+        Some((h, p)) => Ok((
+            h.to_string(),
+            p.parse()
+                .map_err(|_| NetError::BadLink("bad port".into()))?,
+        )),
+        None => Ok((authority.to_string(), icu_proto::limits::DEFAULT_PORT)),
+    }
+}
+
+/// SNI for a handshake: `host`, or `localhost` when it is not a valid server
+/// name.
+pub fn server_name_for(host: &str) -> String {
+    if rustls::pki_types::ServerName::try_from(host.to_string()).is_ok() {
+        host.to_string()
+    } else {
+        "localhost".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_port_forms() {
+        assert_eq!(
+            split_host_port("icu.example.org:4711").unwrap(),
+            ("icu.example.org".to_string(), 4711)
+        );
+        assert_eq!(split_host_port("[::1]:5000").unwrap(), ("::1".to_string(), 5000));
+        assert_eq!(split_host_port("[::1]").unwrap(), ("::1".to_string(), 4711));
+        assert_eq!(split_host_port("host").unwrap(), ("host".to_string(), 4711));
+        assert!(split_host_port("host:port").is_err());
+        assert!(split_host_port("[::1").is_err());
+    }
 }

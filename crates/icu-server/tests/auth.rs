@@ -1,5 +1,5 @@
-//! Enrollment and authentication (`Server/IMPLEMENTATION.md` §10, rows
-//! "Enrollment → Connect → Hello/Welcome", "Connect ohne Cert",
+//! Registration and authentication (`Server/IMPLEMENTATION.md` §10, rows
+//! "Registrierung → Connect → Hello/Welcome", "Connect ohne Cert",
 //! "unbekanntes Cert", "Revoke während Verbindung", "RenewRequest").
 
 mod common;
@@ -12,7 +12,7 @@ use icu_server::{AdminRequest, AdminResponse};
 async fn enrollment_then_connect_then_hello_welcome() {
     let server = TestServer::start().await;
     let identity = server.enroll("alice").await;
-    assert_eq!(identity.ca, server.ca(), "the CA travels with the response");
+    assert_eq!(identity.ca, server.ca(), "the CA travels in the bundle");
 
     let mut client = server.connect(&identity).await.expect("connect");
     let welcome = client.hello("alice").await;
@@ -65,7 +65,7 @@ async fn an_unknown_certificate_from_our_own_ca_is_auth_unknown_cert() {
     )
     .expect("load ca");
     let (key, csr) = common::csr_with_cn("mallory");
-    let (leaf, _) = ca.sign_client_csr(&csr, 365).unwrap();
+    let (leaf, _) = ca.sign_client_csr(&csr, 365, "localhost:4711").unwrap();
 
     let identity = common::Identity {
         cert: leaf,
@@ -218,49 +218,141 @@ async fn enabling_restores_login_without_reenrollment() {
 }
 
 #[tokio::test]
-async fn an_unknown_token_is_enroll_bad_token() {
+async fn a_bundle_works_exactly_once() {
     let server = TestServer::start().await;
-    let result = server
-        .enroll_with_token("AAAAAAAAAAAAAAAAAAAAAA", "mallory")
+    let bundle = server.invite("").await;
+    let bob = server.register(&bundle, "bob").await.expect("registers");
+
+    // The registration certificate was revoked when it was redeemed.
+    let reused = common::identity_from_bundle(&bundle);
+    let client = server.connect(&reused).await.expect("connect");
+    assert_eq!(client.closed_code().await, Some(ec::AUTH_REVOKED));
+
+    // The certificate on the client's own key is a normal one.
+    let mut client = server.connect(&bob).await.expect("connect");
+    match client.hello("bob").await {
+        ControlMsg::Welcome {
+            you, registration, ..
+        } => {
+            assert!(!registration);
+            assert_eq!(you.name, "bob");
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+    server.shutdown().await;
+}
+
+/// The key in the bundle has been seen by whoever carried the bundle, so the
+/// server insists on a new one.
+#[tokio::test]
+async fn registering_with_the_bundle_key_is_rejected() {
+    let server = TestServer::start().await;
+    let bundle = server.invite("").await;
+    let parts = icu_proto::passport::Passport::decode(&bundle)
+        .unwrap()
+        .into_parts();
+    let key = rcgen::KeyPair::try_from(parts.key_der.as_slice()).unwrap();
+    let mut params = rcgen::CertificateParams::default();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "mallory");
+    let csr = params.serialize_request(&key).unwrap().der().to_vec();
+
+    let err = server
+        .register_with_csr(&bundle, key, csr)
+        .await
+        .expect_err("the bundle key must not be kept");
+    assert_eq!(err.code(), Some(ec::RENEW_REJECTED), "{err:?}");
+    assert!(
+        server.register(&bundle, "carol").await.is_ok(),
+        "the bundle is still unused"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_expired_bundle_is_refused() {
+    let server = TestServer::start().await;
+    let bundle = match server
+        .handle
+        .admin(AdminRequest::Invite {
+            name: String::new(),
+            ttl_s: Some(1),
+        })
+        .await
+    {
+        AdminResponse::Invite { bundle, .. } => bundle,
+        other => panic!("invite failed: {other:?}"),
+    };
+    // The certificate carries an hour of clock slack before `not_before`,
+    // but `not_after` is exact.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let err = server
+        .register(&bundle, "late")
+        .await
+        .expect_err("an expired registration certificate must not connect");
+    assert!(matches!(err, EnrollFail::Connection(_)), "{err:?}");
+    server.shutdown().await;
+}
+
+/// A registration session is not a member of the room: anything but a
+/// renewal or a ping is a protocol violation.
+#[tokio::test]
+async fn a_registration_session_may_only_renew() {
+    let server = TestServer::start().await;
+    let _alice = server.client("alice").await;
+    let bundle = server.invite("").await;
+    let mut client = server
+        .connect(&common::identity_from_bundle(&bundle))
+        .await
+        .expect("connect");
+    match client.hello("").await {
+        ControlMsg::Welcome {
+            registration,
+            users,
+            you,
+            ..
+        } => {
+            assert!(registration);
+            assert!(users.is_empty(), "no roster before registering");
+            assert_eq!(you.session, 0, "not in the room");
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+    client.send_msg(&ControlMsg::Ping { nonce: 7 }).await;
+    assert!(matches!(
+        client.recv_msg().await,
+        ControlMsg::Pong { nonce: 7, .. }
+    ));
+    client.send_audio(1, 0, &[1; 30]);
+    client
+        .send_msg(&ControlMsg::SetState {
+            flags: icu_proto::UserFlags::NONE,
+        })
         .await;
-    match result {
-        Err(fail) => assert_eq!(fail.code(), Some(ec::ENROLL_BAD_TOKEN), "{fail:?}"),
-        Ok(_) => panic!("an unknown token must not enroll"),
-    }
+    assert_eq!(client.closed_code().await, Some(ec::PROTOCOL_VIOLATION));
     server.shutdown().await;
 }
 
+/// §10: a taken name is refused outright — no silent `-2` suffix — and the
+/// bundle survives the attempt, so the user can pick another name.
 #[tokio::test]
-async fn a_token_works_exactly_once() {
-    let server = TestServer::start().await;
-    let token = server.invite("bob").await;
-    assert!(server.enroll_with_token(&token, "bob").await.is_ok());
-    match server.enroll_with_token(&token, "bob").await {
-        Err(fail) => assert_eq!(fail.code(), Some(ec::ENROLL_BAD_TOKEN), "{fail:?}"),
-        Ok(_) => panic!("a token must not enroll twice"),
-    }
-    server.shutdown().await;
-}
-
-/// §10: a taken name is refused outright — no silent `-2` suffix any more —
-/// and the invite survives the attempt, so the user can pick another name.
-#[tokio::test]
-async fn a_taken_name_at_enrollment_leaves_the_token_reusable() {
+async fn a_taken_name_at_registration_leaves_the_bundle_reusable() {
     let server = TestServer::start().await;
     server.enroll("alice").await;
 
-    let token = server.invite("").await;
+    let bundle = server.invite("").await;
     let err = server
-        .enroll_with_token(&token, "ALICE")
+        .register(&bundle, "ALICE")
         .await
         .expect_err("a taken name is refused");
     assert_eq!(err.code(), Some(ec::NAME_TAKEN), "{err:?}");
 
-    // Same token, another name: this is what makes the refusal recoverable.
+    // Same bundle, another name: this is what makes the refusal recoverable.
     let carol = server
-        .enroll_with_token(&token, "carol")
+        .register(&bundle, "carol")
         .await
-        .expect("the token is still unused");
+        .expect("the bundle is still unused");
     let mut client = server.connect(&carol).await.expect("connect");
     match client.hello("ignored").await {
         ControlMsg::Welcome { you, .. } => {
@@ -269,6 +361,37 @@ async fn a_taken_name_at_enrollment_leaves_the_token_reusable() {
         }
         other => panic!("expected Welcome, got {other:?}"),
     }
+    server.shutdown().await;
+}
+
+/// Every client certificate says where the server is, so a passport needs no
+/// separate address (`PROTOCOL.md` §2.3).
+#[tokio::test]
+async fn certificates_carry_the_server_address() {
+    use x509_parser::prelude::FromDer;
+    let server = TestServer::start().await;
+    let bundle = server.invite("").await;
+    let registration = common::identity_from_bundle(&bundle);
+    let alice = server.register(&bundle, "alice").await.unwrap();
+    for der in [&registration.cert, &alice.cert] {
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).unwrap();
+        let uris: Vec<String> = cert
+            .subject_alternative_name()
+            .unwrap()
+            .unwrap()
+            .value
+            .general_names
+            .iter()
+            .filter_map(|n| match n {
+                x509_parser::extensions::GeneralName::URI(u) => Some(u.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uris, vec!["icu://localhost:4711".to_string()]);
+    }
+    let (_, ca) = x509_parser::certificate::X509Certificate::from_der(&alice.ca).unwrap();
+    let cn = ca.subject().iter_common_name().next().unwrap();
+    assert_eq!(cn.as_str().unwrap(), "ICU CA localhost");
     server.shutdown().await;
 }
 
@@ -357,36 +480,17 @@ async fn an_invalid_renewal_csr_is_rejected_without_closing() {
 }
 
 #[tokio::test]
-async fn the_enrollment_error_path_sends_a_message_before_closing() {
-    // `PROTOCOL.md` §2.3: Error first, then finish(), then close with the same
-    // code — otherwise the dialog only shows a number.
-    let server = TestServer::start().await;
-    let fail = server
-        .enroll_with_token("ZZZZZZZZZZZZZZZZZZZZZZ", "mallory")
-        .await
-        .expect_err("must fail");
-    match fail {
-        EnrollFail::Rejected { code, detail } => {
-            assert_eq!(code, ec::ENROLL_BAD_TOKEN);
-            assert!(!detail.is_empty(), "the detail text carries the reason");
-        }
-        other => panic!("expected a message, got {other:?}"),
-    }
-    server.shutdown().await;
-}
-
-#[tokio::test]
-async fn enrollment_is_rate_limited_per_ip() {
+async fn registration_is_rate_limited_per_ip() {
     let server = TestServer::start_with(|config| {
         config.limits.enroll_per_ip_per_min = 2;
     })
     .await;
     let mut codes = Vec::new();
     for i in 0..4 {
-        let token = server.invite(&format!("user{i}")).await;
+        let bundle = server.invite("").await;
         codes.push(
             server
-                .enroll_with_token(&token, &format!("user{i}"))
+                .register(&bundle, &format!("user{i}"))
                 .await
                 .err()
                 .and_then(|e| e.code()),
@@ -397,7 +501,7 @@ async fn enrollment_is_rate_limited_per_ip() {
     assert_eq!(
         codes[2],
         Some(ec::ENROLL_RATE_LIMITED),
-        "third enrollment from the same IP within a minute"
+        "third registration from the same IP within a minute"
     );
     server.shutdown().await;
 }

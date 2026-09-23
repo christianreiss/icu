@@ -6,10 +6,16 @@
 //! constraints, key usage, validity and serial are server-set; from a CSR come
 //! the public key **and the validated subject CN**, which is the user's display
 //! name (`PROTOCOL.md` §2.1, revised 2026-09-22).
+//!
+//! The certificates also say where the server is, so a passport needs nothing
+//! besides key, leaf and CA (`PROTOCOL.md` §2.3): every client certificate
+//! carries a URI SAN `icu://<public_host>`, and the CA's CN is
+//! `ICU CA <server_name>`.
 
 use std::{
     net::IpAddr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use rand::RngCore;
@@ -28,8 +34,15 @@ use crate::{
     store,
 };
 
-/// Common name of the CA certificate.
+/// Common name of the CA certificate, or its prefix: a CA created since the
+/// cert-only registration carries `ICU CA <server_name>`, which is where a
+/// client takes its SNI from.
 pub const CA_COMMON_NAME: &str = "ICU CA";
+
+/// Organizational unit of a registration certificate. Informational, so a
+/// client can tell a registration bundle from a passport before it connects;
+/// the server decides by `CertRecord.registration`, never by this.
+pub const REGISTRATION_OU: &str = "ICU registration";
 
 /// File names under the state directory.
 const CA_CRT: &str = "ca.crt";
@@ -65,7 +78,7 @@ impl Ca {
             std::fs::read_to_string(dir.join(CA_KEY)),
         ) {
             (Ok(crt), Ok(key)) => (read_cert_pem(&crt)?, key),
-            _ => create_ca(dir, tls)?,
+            _ => create_ca(dir, tls, server_name)?,
         };
 
         let mut ca = Ca {
@@ -125,11 +138,13 @@ impl Ca {
 
     /// Signs a client CSR. The public key and the validated subject CN come
     /// from the CSR; SAN, EKU, basic constraints, key usage, validity and
-    /// serial are server-set. Returns the leaf and the CN it carries.
+    /// serial are server-set. The only SAN is `icu://<public_host>`. Returns
+    /// the leaf and the CN it carries.
     pub fn sign_client_csr(
         &self,
         csr_der: &[u8],
         validity_days: u32,
+        public_host: &str,
     ) -> Result<(CertificateDer<'static>, String)> {
         let common_name = csr_common_name(csr_der)?;
         let csr_der = CertificateSigningRequestDer::from(csr_der.to_vec());
@@ -155,7 +170,7 @@ impl Ca {
         csr.params
             .distinguished_name
             .push(DnType::CommonName, common_name.clone());
-        csr.params.subject_alt_names = Vec::new();
+        csr.params.subject_alt_names = vec![server_uri(public_host)?];
         csr.params.is_ca = IsCa::NoCa;
         csr.params.key_usages = Vec::new();
         csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
@@ -173,6 +188,36 @@ impl Ca {
         Ok((cert.der().clone(), common_name))
     }
 
+    /// Issues a registration certificate on a freshly generated key
+    /// (`PROTOCOL.md` §2.3): subject `CN=<name>, OU=ICU registration`, the
+    /// server URI SAN, EKU ClientAuth, valid for `ttl`. Returns the leaf and
+    /// the key as PKCS#8 DER — the key leaves the server inside the bundle and
+    /// is not kept.
+    pub fn issue_registration(
+        &self,
+        name: &str,
+        ttl: Duration,
+        public_host: &str,
+    ) -> Result<(CertificateDer<'static>, Vec<u8>)> {
+        icu_proto::validate_name(name)?;
+        let key = KeyPair::generate()?;
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params.distinguished_name.push(DnType::CommonName, name);
+        params
+            .distinguished_name
+            .push(DnType::OrganizationalUnitName, REGISTRATION_OU);
+        params.subject_alt_names = vec![server_uri(public_host)?];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        params.use_authority_key_identifier_extension = true;
+        let now = OffsetDateTime::from(std::time::SystemTime::now());
+        params.not_before = now - time::Duration::hours(1);
+        params.not_after = now + ttl;
+        params.serial_number = Some(random_serial());
+        let cert = params.signed_by(&key, &self.issuer()?)?;
+        Ok((cert.der().clone(), key.serialize_der()))
+    }
+
     /// The CA certificate in DER form.
     pub fn ca_der(&self) -> &CertificateDer<'static> {
         &self.ca_der
@@ -183,8 +228,7 @@ impl Ca {
         &self.server_der
     }
 
-    /// The chain the server presents: leaf + CA (`PROTOCOL.md` §2.3 requires
-    /// exactly this for the enrollment pinning rule).
+    /// The chain the server presents: leaf + CA.
     pub fn server_chain(&self) -> Vec<CertificateDer<'static>> {
         vec![self.server_der.clone(), self.ca_der.clone()]
     }
@@ -200,14 +244,6 @@ impl Ca {
     /// SHA-256 of the CA DER, lowercase hex.
     pub fn ca_fingerprint(&self) -> String {
         store::fingerprint(&self.ca_der)
-    }
-
-    /// The `ca=` parameter of an invite link: base64url **without padding**
-    /// over SHA-256 of the CA DER (`PROTOCOL.md` §2.3).
-    pub fn ca_pin(&self) -> String {
-        use base64::Engine;
-        use sha2::Digest;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(&self.ca_der))
     }
 
     fn issuer(&self) -> Result<Issuer<'static, KeyPair>> {
@@ -265,6 +301,36 @@ pub fn csr_common_name(csr_der: &[u8]) -> Result<String> {
     Ok(cn.to_string())
 }
 
+/// The raw SubjectPublicKeyInfo of a CSR. A registration renewal compares it
+/// with the registration certificate's to insist on a fresh key.
+pub fn csr_public_key(csr_der: &[u8]) -> Result<Vec<u8>> {
+    use x509_parser::prelude::FromDer;
+    let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(csr_der)
+        .map_err(|e| {
+            Error::coded(
+                icu_proto::error::RENEW_REJECTED,
+                format!("csr not parsable: {e}"),
+            )
+        })?;
+    Ok(csr.certification_request_info.subject_pki.raw.to_vec())
+}
+
+/// The raw SubjectPublicKeyInfo of a leaf, empty when it does not parse.
+pub fn leaf_public_key(der: &[u8]) -> Vec<u8> {
+    use x509_parser::prelude::FromDer;
+    x509_parser::certificate::X509Certificate::from_der(der)
+        .map(|(_, cert)| cert.public_key().raw.to_vec())
+        .unwrap_or_default()
+}
+
+/// `icu://<public_host>` as a URI SAN.
+fn server_uri(public_host: &str) -> Result<SanType> {
+    let uri = format!("icu://{public_host}");
+    Ok(SanType::URI(uri.clone().try_into().map_err(|e| {
+        Error::msg(format!("bad public_host {public_host:?}: {e}"))
+    })?))
+}
+
 /// The subject CN of an already verified leaf, or `""` when it has none or does
 /// not parse. Never fails: an unreadable CN must not cost a client its
 /// connection, it only means the client has to catch up (`PROTOCOL.md` §2.2).
@@ -283,7 +349,11 @@ pub fn leaf_common_name(der: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-fn create_ca(dir: &Path, tls: &TlsSection) -> Result<(CertificateDer<'static>, String)> {
+fn create_ca(
+    dir: &Path,
+    tls: &TlsSection,
+    server_name: &str,
+) -> Result<(CertificateDer<'static>, String)> {
     let key = KeyPair::generate()?; // P-256 by default (Spike 2b)
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -291,7 +361,7 @@ fn create_ca(dir: &Path, tls: &TlsSection) -> Result<(CertificateDer<'static>, S
     params.distinguished_name = DistinguishedName::new();
     params
         .distinguished_name
-        .push(DnType::CommonName, CA_COMMON_NAME);
+        .push(DnType::CommonName, format!("{CA_COMMON_NAME} {server_name}"));
     set_validity(&mut params, tls.ca_validity_days);
     params.serial_number = Some(random_serial());
     let cert = params.self_signed(&key)?;
@@ -326,8 +396,28 @@ mod tests {
     use super::*;
     use x509_parser::prelude::FromDer;
 
+    const HOST: &str = "icu.example.org:4711";
+
     fn tls() -> TlsSection {
         TlsSection::default()
+    }
+
+    /// The URI SANs of a leaf.
+    fn uris(der: &[u8]) -> Vec<String> {
+        parse(der)
+            .subject_alternative_name()
+            .unwrap()
+            .map(|san| {
+                san.value
+                    .general_names
+                    .iter()
+                    .filter_map(|n| match n {
+                        x509_parser::extensions::GeneralName::URI(u) => Some(u.to_string()),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn parse(der: &[u8]) -> x509_parser::certificate::X509Certificate<'_> {
@@ -353,7 +443,7 @@ mod tests {
         let ca = Ca::load_or_create(dir.path(), &tls(), "icu.example.org").unwrap();
         let fp = ca.ca_fingerprint();
         assert_eq!(fp.len(), 64);
-        assert_eq!(common_name(ca.ca_der()), CA_COMMON_NAME);
+        assert_eq!(common_name(ca.ca_der()), "ICU CA icu.example.org");
         assert_eq!(common_name(ca.server_der()), "icu.example.org");
         assert_eq!(ca.server_chain().len(), 2, "leaf + ca");
 
@@ -417,14 +507,24 @@ mod tests {
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let csr = params.serialize_request(&key).unwrap();
 
-        let (leaf, cn) = ca.sign_client_csr(csr.der(), 365).unwrap();
+        let (leaf, cn) = ca.sign_client_csr(csr.der(), 365, HOST).unwrap();
         assert_eq!(cn, "admin-impersonator");
         assert_eq!(common_name(&leaf), "admin-impersonator");
         assert_eq!(leaf_common_name(&leaf), "admin-impersonator");
         let x = parse(&leaf);
-        assert!(
-            x.subject_alternative_name().unwrap().is_none(),
-            "the CSR must not be able to request a SAN"
+        assert_eq!(
+            uris(&leaf),
+            vec!["icu://icu.example.org:4711".to_string()],
+            "the only SAN is the server-set URI; the CSR's DNS SAN is dropped"
+        );
+        assert_eq!(
+            x.subject_alternative_name()
+                .unwrap()
+                .unwrap()
+                .value
+                .general_names
+                .len(),
+            1
         );
         assert_eq!(
             x.subject().iter().count(),
@@ -445,8 +545,46 @@ mod tests {
                 .unwrap()
                 .as_str()
                 .unwrap(),
-            CA_COMMON_NAME
+            "ICU CA localhost"
         );
+    }
+
+    /// A registration certificate: fresh key, placeholder CN, the marker OU,
+    /// the server URI and the requested lifetime.
+    #[test]
+    fn registration_certificates_carry_key_uri_and_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        let (leaf, key_der) = ca
+            .issue_registration("neu-1a2b", Duration::from_secs(3600), HOST)
+            .unwrap();
+        assert_eq!(common_name(&leaf), "neu-1a2b");
+        let x = parse(&leaf);
+        let ou: Vec<_> = x
+            .subject()
+            .iter_organizational_unit()
+            .filter_map(|a| a.as_str().ok())
+            .collect();
+        assert_eq!(ou, vec![REGISTRATION_OU]);
+        assert_eq!(uris(&leaf), vec!["icu://icu.example.org:4711".to_string()]);
+        let eku = x.extended_key_usage().unwrap().unwrap().value;
+        assert!(eku.client_auth && !eku.server_auth);
+        let lifetime = x.validity().not_after.timestamp() - x.validity().not_before.timestamp();
+        assert_eq!(lifetime, 3600 + 3600, "ttl plus the hour of clock slack");
+
+        let key = KeyPair::try_from(key_der.as_slice()).unwrap();
+        assert_eq!(leaf_public_key(&leaf), rcgen::PublicKeyData::subject_public_key_info(&key));
+        assert!(ca
+            .issue_registration("bad\nname", Duration::from_secs(60), HOST)
+            .is_err());
+    }
+
+    #[test]
+    fn csr_public_key_matches_the_signing_key() {
+        let (key, csr) = csr_with_cn("alice");
+        assert_eq!(csr_public_key(&csr).unwrap(), rcgen::PublicKeyData::subject_public_key_info(&key));
+        assert!(csr_public_key(b"junk").is_err());
+        assert!(leaf_public_key(b"junk").is_empty());
     }
 
     /// §10: fingerprint stability — the same DER always hashes the same, two
@@ -457,8 +595,8 @@ mod tests {
         let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
         let (_key, csr) = csr_with_cn("alice");
 
-        let (a, _) = ca.sign_client_csr(&csr, 365).unwrap();
-        let (b, _) = ca.sign_client_csr(&csr, 365).unwrap();
+        let (a, _) = ca.sign_client_csr(&csr, 365, HOST).unwrap();
+        let (b, _) = ca.sign_client_csr(&csr, 365, HOST).unwrap();
         assert_eq!(store::fingerprint(&a), store::fingerprint(&a));
         assert_ne!(
             store::fingerprint(&a),
@@ -472,10 +610,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
 
-        let err = ca.sign_client_csr(b"not a csr", 365).unwrap_err();
+        let err = ca.sign_client_csr(b"not a csr", 365, HOST).unwrap_err();
         assert_eq!(err.code(), Some(icu_proto::error::ENROLL_BAD_CSR));
 
-        let err = ca.sign_client_csr(&vec![0u8; 3000], 365).unwrap_err();
+        let err = ca.sign_client_csr(&vec![0u8; 3000], 365, HOST).unwrap_err();
         assert_eq!(err.code(), Some(icu_proto::error::ENROLL_BAD_CSR));
 
         // RSA keys are refused: §6.3.3 allows P-256 and P-384 only. The CN is
@@ -485,7 +623,7 @@ mod tests {
             let mut params = CertificateParams::default();
             params.distinguished_name.push(DnType::CommonName, "alice");
             let csr = params.serialize_request(&rsa).unwrap();
-            let err = ca.sign_client_csr(csr.der(), 365).unwrap_err();
+            let err = ca.sign_client_csr(csr.der(), 365, HOST).unwrap_err();
             assert_eq!(err.code(), Some(icu_proto::error::ENROLL_BAD_CSR));
         }
     }
@@ -594,16 +732,6 @@ mod tests {
         assert_eq!(ca.ca_fingerprint(), ca_fp);
         assert_ne!(store::fingerprint(ca.server_der()), old);
         assert!(ca.server_key().is_ok());
-    }
-
-    #[test]
-    fn ca_pin_is_base64url_without_padding() {
-        let dir = tempfile::tempdir().unwrap();
-        let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
-        let pin = ca.ca_pin();
-        assert_eq!(pin.len(), 43, "32 bytes base64url unpadded");
-        assert!(!pin.contains('='));
-        assert!(!pin.contains('+') && !pin.contains('/'));
     }
 
     #[test]

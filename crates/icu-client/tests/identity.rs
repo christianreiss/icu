@@ -13,7 +13,6 @@ use icu_client::{
     conninfo::CertInfo,
     engine::Command,
 };
-use icu_proto::passport::PassportV1;
 
 fn leaf_cn(paths: &Paths) -> String {
     let id = Identity::load(paths)
@@ -132,8 +131,15 @@ async fn a_passport_moves_an_identity_to_a_second_installation() {
     let server = TestServer::start().await;
     let (identity, paths_a, _dir_a) = server.enroll("alice").await;
 
-    let armored = PassportV1::from(&identity).encode();
-    let imported = Identity::from(PassportV1::decode(&armored).expect("passport decodes"));
+    let armored = identity.to_passport();
+    assert!(
+        matches!(
+            icu_proto::passport::Passport::decode(&armored).unwrap(),
+            icu_proto::passport::Passport::V2(_)
+        ),
+        "a current certificate exports without a separate address"
+    );
+    let imported = Identity::from_passport(&armored).expect("passport decodes");
     assert_eq!(imported, identity, "nothing is lost in the armor");
 
     let dir_b = tempfile::tempdir().expect("tempdir");
@@ -189,8 +195,8 @@ async fn replacing_the_identity_reconnects_as_the_other_user() {
 /// A malformed passport is refused before anything is written.
 #[test]
 fn a_broken_passport_is_refused() {
-    assert!(PassportV1::decode("nicht mal armor").is_err());
-    assert!(PassportV1::decode(&format!(
+    assert!(Identity::from_passport("nicht mal armor").is_err());
+    assert!(Identity::from_passport(&format!(
         "{}\nAAAA\n{}\n",
         icu_proto::passport::ARMOR_BEGIN,
         icu_proto::passport::ARMOR_END
@@ -204,12 +210,72 @@ fn a_broken_passport_is_refused() {
 async fn a_passport_carries_a_usable_key() {
     let server = TestServer::start().await;
     let (identity, _paths, _dir) = server.enroll("alice").await;
-    let armored = PassportV1::from(&identity).encode();
-    let back = PassportV1::decode(&armored).expect("decode");
+    let armored = identity.to_passport();
+    let back = Identity::from_passport(&armored).expect("decode");
     assert!(
         rcgen::KeyPair::try_from(back.key_der.as_slice()).is_ok(),
         "the key survives the armor"
     );
     tokio::time::sleep(Duration::from_millis(1)).await;
+    server.handle.shutdown().await;
+}
+
+/// A registration bundle imported into a running client (settings) is
+/// registered by the engine itself, under its placeholder name, and the
+/// bundle is spent.
+#[tokio::test]
+async fn an_imported_bundle_registers_itself() {
+    let server = TestServer::start().await;
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+
+    let bundle = Identity::from_passport(&server.invite_bundle("carol").await).unwrap();
+    engine.command(Command::ReplaceIdentity(Box::new(bundle.clone())));
+    let state = wait_for(&engine, SOON, |s| {
+        s.me.as_ref().map(|m| m.name.as_str()) == Some("carol")
+            && matches!(s.conn, icu_client::engine::ConnStatus::Connected)
+    })
+    .await;
+    assert!(!state.is_admin);
+    let on_disk = Identity::load(&paths).unwrap().unwrap();
+    assert!(!on_disk.is_registration(), "the registration was swapped");
+    assert_ne!(on_disk.key_der, bundle.key_der, "on a key of its own");
+    assert_eq!(leaf_cn(&paths), "carol");
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// Review item 1: after a fatal close (here: revoked), importing a passport
+/// reconnects at once instead of waiting for a restart.
+#[tokio::test]
+async fn a_passport_import_recovers_from_a_fatal_state() {
+    let server = TestServer::start().await;
+    let (alice, _alice_paths, _alice_dir) = server.enroll("alice").await;
+    let (engine, _paths, _dir) = server
+        .engine_with_paths("bob", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+
+    server
+        .handle
+        .admin(icu_server::AdminRequest::Revoke { user: "bob".into() })
+        .await;
+    wait_for(&engine, SOON, |s| {
+        matches!(s.conn, icu_client::engine::ConnStatus::Fatal(_))
+    })
+    .await;
+
+    engine.command(Command::ReplaceIdentity(Box::new(alice)));
+    let state = wait_for(&engine, SOON, |s| {
+        s.me.as_ref().map(|m| m.name.as_str()) == Some("alice")
+            && matches!(s.conn, icu_client::engine::ConnStatus::Connected)
+    })
+    .await;
+    assert!(state.me.is_some());
+
+    engine.shutdown();
     server.handle.shutdown().await;
 }

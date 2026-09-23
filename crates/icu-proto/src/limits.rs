@@ -2,8 +2,6 @@
 
 /// ALPN of the main protocol. Major version gate.
 pub const ALPN_MAIN: &[u8] = b"icu/1";
-/// ALPN of the enrollment protocol.
-pub const ALPN_ENROLL: &[u8] = b"icu-enroll/1";
 
 /// Default UDP port.
 pub const DEFAULT_PORT: u16 = 4711;
@@ -23,9 +21,9 @@ pub const AUDIO_DATAGRAMS_PER_S: u32 = 110;
 pub const VIDEO_FRAMES_PER_S: u32 = 20;
 /// Video bitrate ceiling per sender, sliding over 2 s.
 pub const VIDEO_KBIT_S: u32 = 400;
-/// Enrollments per minute and source IP.
+/// Registration sessions per minute and source IP.
 pub const ENROLL_PER_IP_PER_MIN: u32 = 5;
-/// Enrollments per minute, server wide.
+/// Registration sessions per minute, server wide.
 pub const ENROLL_GLOBAL_PER_MIN: u32 = 20;
 /// Handshakes per second and source IP (`Server/IMPLEMENTATION.md` §6.6).
 pub const HANDSHAKES_PER_IP_PER_S: u32 = 10;
@@ -65,8 +63,11 @@ pub const RATE_VIOLATION_WINDOW_S: u64 = 60;
 
 /// Certificate renewals per day and `user_id`.
 pub const RENEW_PER_DAY: u32 = 1;
-/// How long an invite token stays valid by default.
+/// How long a registration certificate stays valid by default.
 pub const INVITE_TTL_S: u64 = 24 * 60 * 60;
+/// Longest lifetime of a registration certificate; longer requests are
+/// clamped to it (`PROTOCOL.md` §2.3).
+pub const MAX_INVITE_TTL_S: u64 = 7 * 24 * 60 * 60;
 
 /// Bytes reserved per `UserInfo` when validating that a full `Welcome` fits
 /// into one control frame (`PROTOCOL.md` §7).

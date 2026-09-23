@@ -1,4 +1,4 @@
-//! Control and enrollment messages (`PROTOCOL.md` §2.2, §2.3).
+//! Control messages (`PROTOCOL.md` §2.2, §2.3).
 //!
 //! Variant order is normative: postcard encodes the discriminant as the varint
 //! of the variant index. New variants go at the end, new fields at the end of a
@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    framing::{self, MAX_CONTROL_FRAME, MAX_ENROLL_FRAME},
+    framing::{self, MAX_CONTROL_FRAME},
     AudioParams, ProtoError, Session, UserFlags, UserId, UserInfo, UserSummary,
 };
 
@@ -56,6 +56,11 @@ pub enum ControlMsg {
         min_client: String,
         /// Whether `you` may send `CreateInviteRequest`.
         is_admin: bool,
+        /// The client authenticated with a registration certificate
+        /// (`PROTOCOL.md` §2.3). `users` is then empty, the session is not in
+        /// the room, and the only message the server accepts besides `Ping` is
+        /// a `RenewRequest` with a fresh key.
+        registration: bool,
     },
     /// 2, S→C.
     UserJoined {
@@ -155,19 +160,21 @@ pub enum ControlMsg {
         drop_permille: u16,
     },
     /// 17, C→S. Admin only (`Welcome.is_admin`); rejected with `Error{NOT_ADMIN}`
-    /// otherwise. Non fatal either way.
+    /// otherwise. Non fatal either way. Issues a registration certificate.
     CreateInviteRequest {
-        /// Advisory label: it prefills the invited user's name dialog and does
-        /// not bind the certificate CN. May be empty.
+        /// Placeholder name the registration certificate carries until the
+        /// invited user picks their own. Empty means a generated one. Must be
+        /// free server-wide (`NAME_TAKEN` otherwise).
         name: String,
         /// Lifetime in seconds. `0` means the default (`limits::INVITE_TTL_S`).
         ttl_s: u64,
     },
     /// 18, S→C.
     CreateInviteResponse {
-        /// Self-contained ASCII-armored invite, `ICU1-…`.
-        blob: String,
-        /// When the underlying invite expires, RFC 3339 UTC.
+        /// Registration bundle: an ASCII-armored passport carrying the
+        /// one-time key, the registration certificate and the CA.
+        bundle: String,
+        /// When the registration certificate expires, RFC 3339 UTC.
         expires: String,
     },
     /// 19, C→S. Promote/demote another user. Admin only, rejected with
@@ -321,54 +328,6 @@ impl ControlMsg {
     }
 }
 
-/// Messages on the enrollment stream (ALPN `icu-enroll/1`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EnrollMsg {
-    /// 0, C→S.
-    EnrollRequest {
-        /// Invite token, base64url without padding, 22 characters = 128 bit.
-        token: String,
-        /// PKCS#10 CSR, DER, at most 2 KiB. Exactly one subject CN, which must
-        /// pass `validate_name` and be free server-wide — that CN becomes the
-        /// display name (`PROTOCOL.md` §2.3).
-        csr_der: Vec<u8>,
-        /// Obsolete. The name comes from the CSR; the server ignores this
-        /// field. Kept because postcard encodes fields positionally.
-        name: String,
-    },
-    /// 1, S→C.
-    EnrollResponse {
-        /// Issued leaf certificate, DER.
-        leaf_der: Vec<u8>,
-        /// The server's CA certificate, DER.
-        ca_der: Vec<u8>,
-        /// SNI to use for the main connection.
-        server_name: String,
-    },
-    /// 2, S→C.
-    Error {
-        /// Error code (`PROTOCOL.md` §6).
-        code: u32,
-        /// Human readable detail.
-        detail: String,
-    },
-}
-
-impl EnrollMsg {
-    /// Length of an invite token in characters (128 bit, base64url, unpadded).
-    pub const TOKEN_LEN: usize = 22;
-
-    /// Encodes the message as a complete enrollment frame.
-    pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
-        framing::encode_frame(self, MAX_ENROLL_FRAME)
-    }
-
-    /// Decodes an enrollment frame body.
-    pub fn decode(body: &[u8]) -> Result<EnrollMsg, ProtoError> {
-        framing::decode_body(body, MAX_ENROLL_FRAME)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +359,7 @@ mod tests {
                 users: vec![user(2, 2, "bob"), user(3, 3, "carol")],
                 min_client: "0.1.0".into(),
                 is_admin: true,
+                registration: false,
             },
             ControlMsg::UserJoined {
                 user: user(4, 4, "dave"),
@@ -449,7 +409,7 @@ mod tests {
                 ttl_s: 3600,
             },
             ControlMsg::CreateInviteResponse {
-                blob: "ICU1-abc".into(),
+                bundle: "-----BEGIN ICU PASSPORT-----".into(),
                 expires: "2026-09-22T00:00:00Z".into(),
             },
             ControlMsg::AdminSetRole {
@@ -525,55 +485,6 @@ mod tests {
                 msg.variant()
             );
         }
-        for (index, msg) in [
-            EnrollMsg::EnrollRequest {
-                token: "k3nP8sQ2vL7xR1wY4tZ6bA".into(),
-                csr_der: vec![1, 2, 3],
-                name: "bob".into(),
-            },
-            EnrollMsg::EnrollResponse {
-                leaf_der: vec![1],
-                ca_der: vec![2],
-                server_name: "icu.example.org".into(),
-            },
-            EnrollMsg::Error {
-                code: crate::error::ENROLL_BAD_TOKEN,
-                detail: "unknown token".into(),
-            },
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let body = postcard::to_stdvec(&msg).unwrap();
-            assert_eq!(body[0] as usize, index);
-        }
-    }
-
-    /// §10: roundtrip of every `EnrollMsg` variant.
-    #[test]
-    fn roundtrip_all_enroll_variants() {
-        for msg in [
-            EnrollMsg::EnrollRequest {
-                token: "k3nP8sQ2vL7xR1wY4tZ6bA".into(),
-                csr_der: vec![0x30; 218],
-                name: "bob".into(),
-            },
-            EnrollMsg::EnrollResponse {
-                leaf_der: vec![0x30; 318],
-                ca_der: vec![0x30; 366],
-                server_name: "icu.example.org".into(),
-            },
-            EnrollMsg::Error {
-                code: crate::error::ENROLL_BAD_CSR,
-                detail: "csr not parsable".into(),
-            },
-        ] {
-            let frame = msg.encode().unwrap();
-            let body = framing::split_frame(&frame, MAX_ENROLL_FRAME)
-                .unwrap()
-                .unwrap();
-            assert_eq!(EnrollMsg::decode(body).unwrap(), msg);
-        }
     }
 
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
@@ -587,9 +498,6 @@ mod tests {
             "expected UnknownVariant, got {err:?}"
         );
         assert_eq!(err.error_code(), crate::error::PROTOCOL_VIOLATION);
-
-        let err = EnrollMsg::decode(&[9u8, 0]).unwrap_err();
-        assert!(matches!(err, ProtoError::UnknownVariant));
     }
 
     /// A future minor's message must not be mistaken for a known one.
@@ -620,7 +528,7 @@ mod tests {
         }
         .is_client_to_server());
         assert!(!ControlMsg::CreateInviteResponse {
-            blob: String::new(),
+            bundle: String::new(),
             expires: String::new()
         }
         .is_client_to_server());

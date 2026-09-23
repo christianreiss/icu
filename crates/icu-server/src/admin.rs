@@ -1,11 +1,11 @@
 //! Admin socket: `/run/icu/admin.sock`, one JSON request per line, one JSON
 //! response per line, then close (`Server/IMPLEMENTATION.md` §5).
 //!
-//! A running server is the only writer of `users.toml` and `invites.toml`, so
+//! A running server is the only writer of `users.toml`, so
 //! every CLI command except `run` goes through here. Authentication is the
 //! file permissions of the socket, nothing else.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc};
 
 use icu_proto::{error as ec, UserId};
 use serde::{Deserialize, Serialize};
@@ -28,13 +28,13 @@ use crate::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum AdminRequest {
-    /// Create an invite token.
+    /// Issue a registration bundle (`PROTOCOL.md` §2.3).
     Invite {
-        /// Advisory label: it prefills the invited user's name dialog and does
-        /// not bind the certificate CN. May be empty or absent.
+        /// Placeholder name until the invited user picks their own. Empty or
+        /// absent means a generated one.
         #[serde(default)]
         name: String,
-        /// Lifetime in seconds. Defaults to 24 h.
+        /// Lifetime in seconds. Defaults to 24 h, at most 7 days.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ttl_s: Option<u64>,
     },
@@ -76,12 +76,16 @@ pub enum AdminRequest {
 pub enum AdminResponse {
     /// `invite`
     Invite {
-        /// The token.
-        token: String,
-        /// The complete `icu://` link.
-        link: String,
+        /// The armored registration bundle.
+        bundle: String,
         /// Expiry, RFC 3339 UTC.
         expires: String,
+        /// The invited user's `user_id`.
+        user_id: UserId,
+        /// Their placeholder name.
+        name: String,
+        /// Whether they will be an admin (the first user is).
+        is_admin: bool,
     },
     /// `users`
     Users(Vec<AdminUser>),
@@ -145,10 +149,19 @@ impl AdminResponse {
     pub fn to_json(&self) -> serde_json::Value {
         match self {
             AdminResponse::Invite {
-                token,
-                link,
+                bundle,
                 expires,
-            } => json!({"ok": true, "token": token, "link": link, "expires": expires}),
+                user_id,
+                name,
+                is_admin,
+            } => json!({
+                "ok": true,
+                "bundle": bundle,
+                "expires": expires,
+                "user_id": user_id,
+                "name": name,
+                "is_admin": is_admin,
+            }),
             AdminResponse::Users(users) => json!({"ok": true, "users": users}),
             AdminResponse::Revoke { user_id, closed } => {
                 json!({"ok": true, "user_id": user_id, "closed": closed})
@@ -184,23 +197,16 @@ impl AdminResponse {
 pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminResponse {
     match request {
         AdminRequest::Invite { name, ttl_s } => {
-            let ttl = Duration::from_secs(ttl_s.unwrap_or(icu_proto::limits::INVITE_TTL_S).max(1));
-            let mut store = server.store.lock().await;
-            match store.create_invite(&name, ttl) {
-                Ok((token, record)) => {
-                    let ca_pin = server.ca.read().await.ca_pin();
-                    AdminResponse::Invite {
-                        link: invite_link(
-                            &server.config.public_host(),
-                            &token,
-                            &ca_pin,
-                            &record.name,
-                        ),
-                        token,
-                        expires: record.expires,
-                    }
-                }
-                Err(e) => AdminResponse::err("BAD_NAME", e),
+            let ttl_s = ttl_s.unwrap_or(icu_proto::limits::INVITE_TTL_S).max(1);
+            match crate::registration::issue(server, &name, ttl_s).await {
+                Ok(issued) => AdminResponse::Invite {
+                    bundle: issued.bundle,
+                    expires: issued.expires,
+                    user_id: issued.user_id,
+                    name: issued.name,
+                    is_admin: issued.is_admin,
+                },
+                Err(e) => store_err(e, "BAD_NAME"),
             }
         }
         AdminRequest::Users => {
@@ -349,32 +355,6 @@ fn status(server: &Arc<Server>) -> serde_json::Value {
             "failed": Counters::get(&c.enroll_failed),
         }
     })
-}
-
-/// Builds an invite link (`PROTOCOL.md` §2.3). `label` is an optional name
-/// prefill for the invited client's dialog; an empty one is left out entirely.
-pub fn invite_link(public_host: &str, token: &str, ca_pin: &str, label: &str) -> String {
-    let base = format!("icu://{public_host}/enroll?t={token}&ca={ca_pin}");
-    if label.is_empty() {
-        base
-    } else {
-        format!("{base}&n={}", percent_encode(label))
-    }
-}
-
-/// Minimal percent-encoding for the `n=` parameter: everything outside the
-/// unreserved set of RFC 3986 is escaped.
-pub fn percent_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(*byte as char)
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
 }
 
 /// Opens the admin socket and serves it until shutdown.
@@ -551,29 +531,5 @@ mod tests {
         let status = AdminResponse::Status(json!({"uptime_s": 3600, "online": 3})).to_json();
         assert_eq!(status["ok"], json!(true));
         assert_eq!(status["uptime_s"], json!(3600));
-    }
-
-    /// `PROTOCOL.md` §2.3: the invite link format.
-    #[test]
-    fn invite_links_are_well_formed() {
-        let link = invite_link(
-            "icu.example.org:4711",
-            "k3nP8sQ2vL7xR1wY4tZ6bA",
-            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-            "bob",
-        );
-        assert_eq!(
-            link,
-            "icu://icu.example.org:4711/enroll?t=k3nP8sQ2vL7xR1wY4tZ6bA&ca=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08&n=bob"
-        );
-    }
-
-    #[test]
-    fn names_are_percent_encoded() {
-        assert_eq!(percent_encode("bob"), "bob");
-        assert_eq!(percent_encode("a b"), "a%20b");
-        assert_eq!(percent_encode("mühle"), "m%C3%BChle");
-        assert_eq!(percent_encode("a&b=c"), "a%26b%3Dc");
-        assert_eq!(percent_encode("a-b_c.d~e"), "a-b_c.d~e");
     }
 }

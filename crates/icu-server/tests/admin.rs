@@ -7,8 +7,8 @@ use common::TestServer;
 use icu_proto::ControlMsg;
 use icu_server::{admin, AdminRequest};
 
-/// §10: a token minted through the socket works right away, without a
-/// restart.
+/// §10: a registration bundle issued through the socket works right away,
+/// without a restart.
 #[tokio::test]
 async fn an_invite_over_the_socket_works_without_a_restart() {
     let server = TestServer::start().await;
@@ -24,17 +24,17 @@ async fn an_invite_over_the_socket_works_without_a_restart() {
     .await
     .expect("admin request");
     assert_eq!(response["ok"], serde_json::json!(true));
-    let token = response["token"].as_str().expect("token").to_string();
-    assert_eq!(token.len(), 22);
-    let link = response["link"].as_str().expect("link");
-    assert!(link.starts_with("icu://localhost:4711/enroll?t="), "{link}");
-    assert!(link.contains("&ca=") && link.ends_with("&n=bob"), "{link}");
+    let bundle = response["bundle"].as_str().expect("bundle").to_string();
+    assert!(icu_proto::passport::Passport::looks_like(&bundle), "{bundle}");
+    assert_eq!(response["name"], serde_json::json!("bob"));
+    assert_eq!(response["user_id"], serde_json::json!(1));
+    assert_eq!(response["is_admin"], serde_json::json!(true), "first user");
 
     // The very same running server accepts it.
     let identity = server
-        .enroll_with_token(&token, "bob")
+        .register(&bundle, "bob")
         .await
-        .expect("enrollment with the fresh token");
+        .expect("registration with the fresh bundle");
     let mut client = server.connect(&identity).await.expect("connect");
     let welcome = client.hello("bob").await;
     assert!(matches!(welcome, ControlMsg::Welcome { .. }));
@@ -236,15 +236,20 @@ async fn the_cli_falls_back_to_the_state_file_when_no_server_runs() {
     .await
     .expect("offline invite");
     assert_eq!(value["ok"], serde_json::json!(true));
-    let token = value["token"].as_str().unwrap().to_string();
+    assert_eq!(
+        value["is_admin"],
+        serde_json::json!(true),
+        "the first registration on a fresh server is the admin's"
+    );
+    let bundle = value["bundle"].as_str().unwrap().to_string();
 
-    // A server started afterwards honours the token.
+    // A server started afterwards honours the bundle.
     let handle = icu_server::run(config.clone()).await.expect("server");
     let server = TestServer { dir, handle };
     let identity = server
-        .enroll_with_token(&token, "offline")
+        .register(&bundle, "offline")
         .await
-        .expect("enroll with the offline token");
+        .expect("register with the offline bundle");
     let mut client = server.connect(&identity).await.expect("connect");
     assert!(matches!(
         client.hello("offline").await,

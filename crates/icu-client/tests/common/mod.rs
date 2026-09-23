@@ -1,6 +1,6 @@
-//! Harness for the client integration tests: an in-process server, enrollment
-//! through the real client code, and a raw control client for the server side
-//! of a conversation.
+//! Harness for the client integration tests: an in-process server,
+//! registration through the real client code, and a raw control client for
+//! the server side of a conversation.
 
 #![allow(dead_code)]
 
@@ -12,7 +12,7 @@ use icu_client::{
     engine::{AppState, ConnStatus, Engine, EngineConfig},
     net::{
         conn::{self, Session},
-        enroll::{enroll, InviteLink},
+        register::register,
     },
 };
 use icu_proto::ControlMsg;
@@ -58,8 +58,8 @@ impl TestServer {
         self.handle.local_addrs()[0]
     }
 
-    /// Mints an invite link.
-    pub async fn invite_link(&self, name: &str) -> String {
+    /// Issues a registration bundle; `name` is the placeholder.
+    pub async fn invite_bundle(&self, name: &str) -> String {
         match self
             .handle
             .admin(AdminRequest::Invite {
@@ -68,17 +68,18 @@ impl TestServer {
             })
             .await
         {
-            AdminResponse::Invite { link, .. } => link,
+            AdminResponse::Invite { bundle, .. } => bundle,
             other => panic!("invite failed: {other:?}"),
         }
     }
 
-    /// Enrolls through the real client code into a fresh config directory.
+    /// Registers through the real client code into a fresh config directory.
     pub async fn enroll(&self, name: &str) -> (Identity, Paths, tempfile::TempDir) {
-        let link = InviteLink::parse(&self.invite_link(name).await).expect("link parses");
-        let identity = enroll(&link, "", Some(self.addr()))
+        let bundle = Identity::from_passport(&self.invite_bundle("").await).expect("bundle");
+        assert!(bundle.is_registration());
+        let identity = register(&bundle, name, "icu-test/0.1.0 linux", Some(self.addr()))
             .await
-            .expect("enrollment");
+            .expect("registration");
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(dir.path().to_path_buf()));
         identity.save(&paths).expect("identity saved");

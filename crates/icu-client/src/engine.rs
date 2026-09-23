@@ -176,7 +176,7 @@ pub struct AppState {
     pub rename_pending: bool,
     /// `Welcome.is_admin`: whether `CreateInviteRequest` is allowed.
     pub is_admin: bool,
-    /// The most recently minted invite blob and its expiry, if any.
+    /// The most recently issued registration bundle and its expiry, if any.
     pub last_invite: Option<(String, String)>,
     /// `CreateInviteRequest` error.
     pub invite_error: Option<String>,
@@ -230,10 +230,11 @@ pub enum Command {
     /// Replace the whole identity (passport import): persist it, then
     /// reconnect with it.
     ReplaceIdentity(Box<Identity>),
-    /// Mint an invite blob. Admin only (`AppState.is_admin`); a non-admin
-    /// send is rejected by the server, non-fatally.
+    /// Issue a registration bundle. Admin only (`AppState.is_admin`); a
+    /// non-admin send is rejected by the server, non-fatally.
     CreateInvite {
-        /// Name the new certificate CN will carry.
+        /// Placeholder name until the invited user picks their own. Empty
+        /// means a generated one.
         name: String,
         /// Lifetime in seconds. `0` means the server default.
         ttl_s: u64,
@@ -1268,14 +1269,21 @@ async fn net_task(
                     s.conn = ConnStatus::Fatal(reason.clone());
                     s.peers.clear();
                 });
-                // Keep serving local commands (mute etc.) until Quit.
-                while let Some(cmd) = cmd_rx.recv().await {
-                    if let Command::Quit = cmd {
-                        return;
+                // Keep serving local commands (mute etc.) until Quit. A new
+                // identity (passport import) is the way out: reconnect with it.
+                loop {
+                    match cmd_rx.recv().await {
+                        None | Some(Command::Quit) => return,
+                        Some(cmd) => {
+                            let replaced = matches!(cmd, Command::ReplaceIdentity(_));
+                            local.handle_local(cmd, &shared, None).await;
+                            if replaced {
+                                attempt = 0;
+                                break;
+                            }
+                        }
                     }
-                    local.handle_local(cmd, &shared, None).await;
                 }
-                return;
             }
             SessionEnd::Retry(reason) => {
                 let wait = conn::backoff(attempt);
@@ -1294,7 +1302,13 @@ async fn net_task(
                         cmd = cmd_rx.recv() => match cmd {
                             Some(Command::Quit) | None => return,
                             Some(cmd) => {
+                                // A new identity is worth trying right away.
+                                let replaced = matches!(cmd, Command::ReplaceIdentity(_));
                                 local.handle_local(cmd, &shared, None).await;
+                                if replaced {
+                                    attempt = 0;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1367,7 +1381,7 @@ async fn send_renew(
     let key = rcgen::KeyPair::try_from(local.identity.key_der.as_slice())
         .map_err(|e| RenewSendError::Local(format!("eigener Schlüssel unlesbar: {e}")))?;
     let csr_der =
-        crate::net::enroll::csr_for(cn, &key).map_err(|e| RenewSendError::Local(e.to_string()))?;
+        crate::net::register::csr_for(cn, &key).map_err(|e| RenewSendError::Local(e.to_string()))?;
     if conn::write_msg(send, &ControlMsg::RenewRequest { csr_der })
         .await
         .is_err()
@@ -1622,6 +1636,13 @@ impl LocalState {
             return;
         }
 
+        // A server that moved says so in the certificates it issues; the next
+        // reconnect goes to the new address.
+        if let Some(server) =
+            crate::config::ServerInfo::from_certs(&leaf_der, &self.identity.ca_der)
+        {
+            self.identity.server = server;
+        }
         self.identity.leaf_der = leaf_der;
         self.identity.server.name = pending.cn.clone();
         let saved = self.identity.save(&self.paths);
@@ -1686,7 +1707,7 @@ async fn run_session(
         Ok(e) => e,
         Err(e) => return SessionEnd::Retry(e.to_string()),
     };
-    let sni = crate::net::enroll::server_name_for(&local.identity.server.server_name);
+    let sni = crate::net::server_name_for(&local.identity.server.server_name);
     let hello_flags = local.flags;
     let hello_name = local.name.clone();
     let connect = conn::connect(
@@ -1701,10 +1722,9 @@ async fn run_session(
     );
     let session = tokio::select! {
         r = connect => r,
-        // Commands keep working while connecting; Quit aborts.
-        _ = drain_until_quit(cmd_rx, local, shared) => {
-            return SessionEnd::Quit;
-        }
+        // Commands keep working while connecting; Quit aborts, and a new
+        // identity abandons the attempt made with the old one.
+        end = drain_until_quit(cmd_rx, local, shared) => return end,
     };
     let session = match session {
         Ok(s) => s,
@@ -1719,9 +1739,38 @@ async fn run_session(
     let conn::Session {
         conn: connection,
         mut send,
-        recv,
+        mut recv,
         welcome,
     } = session;
+
+    // A registration bundle imported into a running client: swap it for a
+    // certificate of our own under the placeholder name, which the user can
+    // change like any other name (`PROTOCOL.md` §2.3). The first-run window
+    // does this itself, with the name the user typed.
+    if welcome.registration {
+        shared.state.send_modify(|s| {
+            s.conn = ConnStatus::Connecting;
+            s.banner = Some("Registrierung läuft…".into());
+        });
+        let name = welcome.you.name.clone();
+        let bundle = local.identity.clone();
+        let registered = tokio::select! {
+            r = crate::net::register::complete(&mut send, &mut recv, &bundle, &name) => r,
+            end = drain_until_quit(cmd_rx, local, shared) => return end,
+        };
+        connection.close(quinn::VarInt::from_u32(0), b"");
+        return match registered {
+            Ok(identity) => {
+                local.replace_identity(identity, shared);
+                shared.state.send_modify(|s| s.banner = None);
+                SessionEnd::Retry("registriert".into())
+            }
+            Err(e) => {
+                shared.state.send_modify(|s| s.banner = None);
+                SessionEnd::Fatal(format!("Registrierung fehlgeschlagen: {e}"))
+            }
+        };
+    }
 
     // Connected: install the peer state, clear everything session scoped.
     let frame_samples = shared.dsp.frame_samples.load(Ordering::Relaxed);
@@ -1913,7 +1962,13 @@ async fn run_session(
                         break SessionEnd::Retry("Identität ersetzt".into());
                     }
                     Command::CreateInvite { name, ttl_s } => {
-                        if let Err(e) = icu_proto::validate_name(&name) {
+                        // Empty asks the server for a generated placeholder.
+                        let checked = if name.is_empty() {
+                            Ok(())
+                        } else {
+                            icu_proto::validate_name(&name)
+                        };
+                        if let Err(e) = checked {
                             shared.state.send_modify(|s| s.invite_error = Some(e.to_string()));
                         } else if conn::write_msg(&mut send, &ControlMsg::CreateInviteRequest { name, ttl_s }).await.is_err() {
                             break SessionEnd::Retry("send failed".into());
@@ -2096,18 +2151,23 @@ fn close_end(e: ConnectError) -> SessionEnd {
     }
 }
 
-/// Handles commands while a connection is being established; returns when
-/// `Quit` arrives (or the channel closes).
+/// Handles commands while a connection is being established. Returns `Quit`
+/// when `Quit` arrives (or the channel closes), and `Retry` once the identity
+/// was replaced, since the attempt in flight uses the old one.
 async fn drain_until_quit(
     cmd_rx: &mut mpsc::UnboundedReceiver<Command>,
     local: &mut LocalState,
     shared: &Arc<Shared>,
-) {
+) -> SessionEnd {
     loop {
         match cmd_rx.recv().await {
-            None | Some(Command::Quit) => return,
+            None | Some(Command::Quit) => return SessionEnd::Quit,
             Some(cmd) => {
+                let replaced = matches!(cmd, Command::ReplaceIdentity(_));
                 local.handle_local(cmd, shared, None).await;
+                if replaced {
+                    return SessionEnd::Retry("Identität ersetzt".into());
+                }
             }
         }
     }
@@ -2419,9 +2479,9 @@ async fn handle_control(
         ControlMsg::RenewResponse { leaf_der } => {
             local.apply_renewed_leaf(leaf_der, shared);
         }
-        ControlMsg::CreateInviteResponse { blob, expires } => {
+        ControlMsg::CreateInviteResponse { bundle, expires } => {
             shared.state.send_modify(|s| {
-                s.last_invite = Some((blob, expires));
+                s.last_invite = Some((bundle, expires));
                 s.invite_error = None;
             });
         }

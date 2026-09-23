@@ -174,6 +174,9 @@ pub struct Welcome {
     pub min_client: String,
     /// Whether this client may send `CreateInviteRequest`.
     pub is_admin: bool,
+    /// Authenticated with a registration certificate: nothing works until it
+    /// is swapped (`net::register::complete`).
+    pub registration: bool,
 }
 
 /// An established, welcomed connection.
@@ -252,6 +255,7 @@ pub async fn connect(
             users,
             min_client,
             is_admin,
+            registration,
         } => Ok(Session {
             conn,
             send,
@@ -264,6 +268,7 @@ pub async fn connect(
                 users,
                 min_client,
                 is_admin,
+                registration,
             },
         }),
         other => Err(ConnectError::Protocol(format!(

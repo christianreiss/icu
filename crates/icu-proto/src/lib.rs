@@ -7,12 +7,13 @@
 //! Layout:
 //!
 //! * [`types`] — `UserFlags`, `UserInfo`, `AudioParams`, name rules, SemVer
-//! * [`control`] — `ControlMsg`, `EnrollMsg`
+//! * [`control`] — `ControlMsg`
 //! * [`framing`] — u16 LE length prefix, 16 KiB / 8 KiB limits
 //! * [`header`] — audio and video headers plus the wrap arithmetic helpers
 //! * [`error`] — error codes and the fatality table
 //! * [`limits`] — the numbers from `PROTOCOL.md` §7 as constants
-//! * [`invite_blob`] — the self-contained `ICU1-…` invite format (§2.3.1)
+//! * [`passport`] — the armored identity bundle, also used for registration
+//!   bundles (§2.3)
 
 #![forbid(unsafe_code)]
 
@@ -20,13 +21,12 @@ pub mod control;
 pub mod error;
 pub mod framing;
 pub mod header;
-pub mod invite_blob;
 pub mod limits;
 pub mod passport;
 pub mod types;
 
-pub use control::{ControlMsg, EnrollMsg, CAPS, MINOR};
-pub use framing::{MAX_CONTROL_FRAME, MAX_ENROLL_FRAME};
+pub use control::{ControlMsg, CAPS, MINOR};
+pub use framing::MAX_CONTROL_FRAME;
 pub use header::{seq_diff, set_speaker_in_place, ts_diff, AudioHeader, VideoHeader};
 pub use types::{
     name_key, validate_name, AudioParams, NameError, Session, UserFlags, UserId, UserInfo,

@@ -23,16 +23,16 @@ Cargo.toml                 # workspace: icu-proto, icu-server, icu-client
 rust-toolchain.toml        # stable, targets windows-gnu (Client) und musl (Server)
 .cargo/config.toml         # Rezept aus Research/cross-compile.md
 build/win-static/libstdc++.a
-crates/icu-proto/          # Wire-Typen (ControlMsg, EnrollMsg, Header-Encoder/-Decoder, Fehlercodes)
+crates/icu-proto/          # Wire-Typen (ControlMsg, Passport, Header-Encoder/-Decoder, Fehlercodes)
 crates/icu-server/
   src/lib.rs               # `pub async fn run(Config) -> Handle` — der Server als Bibliothek,
                            #   damit die Client-Integrationstests ihn in-process starten können
   src/main.rs              # dünner CLI-Wrapper um lib.rs (clap)
   src/config.rs            # TOML laden/validieren
   src/ca.rs                # CA erzeugen/laden, Leaf signieren, CSR-Handling (rcgen 0.14)
-  src/store.rs             # users.toml (user_id → Name + n Certs), invites.toml, flock auf state.lock
+  src/store.rs             # users.toml (user_id → Name + n Certs), flock auf state.lock
   src/endpoint.rs          # quinn ServerConfig, Bind v4+v6, Accept-Loop, ALPN-Dispatch
-  src/enroll.rs            # ALPN icu-enroll/1
+  src/registration.rs      # Registrierungs-Bundles ausstellen (Sitzungsseite in session.rs)
   src/session.rs           # Zustandsautomat pro Client, Control-Stream
   src/room.rs              # Teilnehmerliste, Broadcast, Session-ID-Vergabe
   src/relay.rs             # Audio-Datagram-Relay, Video-Stream-Relay
@@ -49,8 +49,8 @@ crates/icu-server/
 ```toml
 [server]
 listen = ["0.0.0.0:4711", "[::]:4711"]
-server_name = "icu.example.org"      # SNI im Server-Cert und im Invite-Link
-public_host = "icu.example.org:4711" # was im Invite-Link steht
+server_name = "icu.example.org"      # SNI im Server-Cert, steht auch im CN der CA
+public_host = "icu.example.org:4711" # steht als URI-SAN icu://… in jedem Client-Cert
 max_users = 16                       # 1..=64; Server validiert die Obergrenze beim Start
 min_client = "0.1.0"                 # SemVer, geht als Welcome.min_client an die Clients
 admin_socket_group = "icu"           # Gruppe, der /run/icu/admin.sock gehört
@@ -72,9 +72,9 @@ level = "info"                       # tracing-Filter
 format = "text"                      # oder "json"
 ```
 
-State unter `/var/lib/icu/`: `ca.key` (0600), `ca.crt`, `invite.key` (0600), `server.key` (0600), `server.crt`, `users.toml`, `invites.toml`, `state.lock`. Alle Schreibzugriffe atomar (Tempfile + rename) und unter `flock(state.lock)`. Jede Änderung geht auf eine Kopie des Datenbestands, die Kopie wird geschrieben und erst danach übernommen — ein fehlgeschlagener Schreibvorgang lässt den laufenden Server also unverändert, statt einen Zustand zu bedienen, der nach dem nächsten Neustart weg ist.
+State unter `/var/lib/icu/`: `ca.key` (0600), `ca.crt`, `server.key` (0600), `server.crt`, `users.toml`, `state.lock`. `invites.toml` und `invite.key` von vor 2026-09-24 werden ignoriert und können weg. Alle Schreibzugriffe atomar (Tempfile + rename) und unter `flock(state.lock)`. Jede Änderung geht auf eine Kopie des Datenbestands, die Kopie wird geschrieben und erst danach übernommen — ein fehlgeschlagener Schreibvorgang lässt den laufenden Server also unverändert, statt einen Zustand zu bedienen, der nach dem nächsten Neustart weg ist.
 
-Nutzermodell: ein Nutzer hat eine stabile `user_id` und über die Zeit **mehrere** Zertifikate (Renewal stellt ein neues aus, das alte bleibt bis zum Ablauf gültig). `UserRecord.name` ist seit 2026-09-22 nur noch ein **Spiegel** des Subject-CN des zuletzt ausgestellten Zertifikats (`PROTOCOL.md` §2.1); geschrieben wird er ausschließlich von `Store::add_user` (Enrollment) und `Store::add_cert` (Renewal). `CertRecord.cn` hält den CN des jeweiligen Zertifikats, `CertRecord.renewed` den Zeitpunkt, zu dem dieses Zertifikat zuletzt für ein **Nachzügler**-Renewal benutzt wurde (§6.4). Beide sind `#[serde(default)]`, **`schema` bleibt 1, keine Migration**: Bestandsdatensätze laden mit `cn = ""`, was „unbekannt" heißt und nie „leerer Name" — die Zertifikats-DER werden nicht aufbewahrt, der CN lässt sich also nicht nachtragen. Die Angleichung passiert von selbst, pro Gerät, beim nächsten Connect (§6.4). `revoke` setzt `revoked` auf allen Certs des Nutzers — dauerhaft, kein Un-Revoke. `is_admin` erlaubt `CreateInviteRequest` und die Nutzerverwaltung (`PROTOCOL.md` §2.2/§2.3.1); gesetzt wird es einmalig bei der ersten Anmeldung, die gegen einen leeren `users.toml`-Bestand erfolgreich abschließt (§6.3), danach über `promote`/`demote` (CLI, Admin-Socket) oder `AdminSetRole` (in-band, `PROTOCOL.md` §2.2 Variante 19) — `is_admin` fehlt in älteren `users.toml`-Dateien und deserialisiert dann als `false` (`#[serde(default)]`), keine Migration nötig. `disabled` ist eine zweite, unabhängige und **reversible** Login-Sperre (`disable`/`enable`, `AdminSetDisabled`): anders als `revoke` macht `enable` bestehende, nicht widerrufene Zertifikate sofort wieder nutzbar, keine erneute Anmeldung nötig; auch hier `#[serde(default)]`, keine Migration nötig. Beide Aktionen sind gegen das Entfernen des letzten funktionsfähigen Admins geschützt (§6.4).
+Nutzermodell: ein Nutzer hat eine stabile `user_id` und über die Zeit **mehrere** Zertifikate (Renewal stellt ein neues aus, das alte bleibt bis zum Ablauf gültig). `UserRecord.name` ist seit 2026-09-22 nur noch ein **Spiegel** des Subject-CN des zuletzt ausgestellten Zertifikats (`PROTOCOL.md` §2.1); geschrieben wird er ausschließlich von `Store::add_user` (Registrierung ausstellen), `Store::redeem_registration` (Registrierung einlösen) und `Store::add_cert` (Renewal). `CertRecord.cn` hält den CN des jeweiligen Zertifikats, `CertRecord.renewed` den Zeitpunkt, zu dem dieses Zertifikat zuletzt für ein **Nachzügler**-Renewal benutzt wurde (§6.4). Beide sind `#[serde(default)]`, **`schema` bleibt 1, keine Migration**: Bestandsdatensätze laden mit `cn = ""`, was „unbekannt" heißt und nie „leerer Name" — die Zertifikats-DER werden nicht aufbewahrt, der CN lässt sich also nicht nachtragen. Die Angleichung passiert von selbst, pro Gerät, beim nächsten Connect (§6.4). `revoke` setzt `revoked` auf allen Certs des Nutzers — dauerhaft, kein Un-Revoke. `is_admin` erlaubt `CreateInviteRequest` und die Nutzerverwaltung (`PROTOCOL.md` §2.2/§2.3); gesetzt wird es einmalig für die erste Registrierung, die gegen einen leeren `users.toml`-Bestand ausgestellt wird (§6.3), danach über `promote`/`demote` (CLI, Admin-Socket) oder `AdminSetRole` (in-band, `PROTOCOL.md` §2.2 Variante 19) — `is_admin` fehlt in älteren `users.toml`-Dateien und deserialisiert dann als `false` (`#[serde(default)]`), keine Migration nötig. `disabled` ist eine zweite, unabhängige und **reversible** Login-Sperre (`disable`/`enable`, `AdminSetDisabled`): anders als `revoke` macht `enable` bestehende, nicht widerrufene Zertifikate sofort wieder nutzbar, keine erneute Anmeldung nötig; auch hier `#[serde(default)]`, keine Migration nötig. Beide Aktionen sind gegen das Entfernen des letzten funktionsfähigen Admins geschützt (§6.4).
 
 `users.toml`:
 
@@ -97,17 +97,7 @@ revoked = false
 # renewed = "..."                    # nur gesetzt, wenn damit ein Nachzügler-Renewal lief
 ```
 
-`invites.toml`:
-
-```toml
-schema = 1
-
-[invite."k3nP8sQ2vL7xR1wY4tZ6bA"]   # Token, base64url ohne Padding, 22 Zeichen
-name    = "bob"                      # nur Etikett/Vorbelegung, bindet den Cert-CN nicht; darf leer sein
-created = "2026-09-20T12:00:00Z"
-expires = "2026-09-21T12:00:00Z"
-used_by = 0                          # 0 = unbenutzt, sonst die vergebene user_id
-```
+`CertRecord.registration = true` markiert ein Registrierungszertifikat (`PROTOCOL.md` §2.3): der Nutzer ist eingeladen, hat sich aber noch nicht registriert. Beim Einlösen wird es widerrufen; ein nie eingelöstes verschwindet nach Ablauf samt Nutzer (beim Start und bei jeder neuen Ausstellung), damit der Platzhaltername und der Admin-Platz eines leeren Bestands wieder frei werden. Ein Invite-Verzeichnis gibt es nicht mehr.
 
 Zeitstempel durchgehend RFC 3339 in UTC; Fingerprints lowercase Hex ohne Trenner; `schema` erlaubt spätere Migrationen.
 
@@ -116,7 +106,7 @@ Zeitstempel durchgehend RFC 3339 in UTC; Fingerprints lowercase Hex ohne Trenner
 | Kommando | Wirkung |
 | --- | --- |
 | `icu-server run [--config PATH]` | Server starten; beim ersten Start CA und Server-Leaf erzeugen. |
-| `icu-server invite [--name alice] [--ttl 24h]` | Token (128 Bit, base64url) erzeugen, in `invites.toml` mit Ablauf und Etikett speichern, Invite-Link ausgeben (`icu://host:port/enroll?t=…&ca=…[&n=…]`). `--name` ist nur eine Vorbelegung für den Eingeladenen und bindet den Cert-CN nicht; ohne `--name` entfällt `n=` im Link. |
+| `icu-server invite [--name neu-bob] [--ttl 24h] [--out datei]` | Registrierungs-Bundle ausstellen (`PROTOCOL.md` §2.3): Schlüssel + Registrierungszertifikat + CA als Passport, auf stdout oder mit Modus 0600 in `--out`. `--name` ist nur der Platzhaltername, bis der Eingeladene seinen eigenen wählt; ohne ihn wird `neu-xxxx` erzeugt. `--ttl` höchstens 7 Tage. Das erste Bundle auf einem leeren Server ist das des Admins; es geht auch ohne laufenden Server. |
 | `icu-server users` | Tabelle: `user_id`, Name, Fingerprint (gekürzt), ausgestellt, läuft ab, revoked, online. |
 | `icu-server revoke <name\|user_id\|fingerprint>` | `revoked = true` auf **allen** Certs des Nutzers; eine laufende Verbindung wird sofort mit `KICKED` geschlossen. |
 | `icu-server promote <name\|user_id\|fingerprint>` | `is_admin = true`. Pusht `UserAdminChanged { is_admin: true }` an jede eigene Sitzung des Nutzers, wenn online. |
@@ -126,15 +116,15 @@ Zeitstempel durchgehend RFC 3339 in UTC; Fingerprints lowercase Hex ohne Trenner
 | `icu-server status` | Online-Liste, Uptime, Relay-Zähler. |
 | `icu-server rotate-server-cert` | Neues Server-Leaf von derselben CA; Clients brauchen nichts. |
 
-Invite-Erstellung ist seit `CreateInviteRequest` (`PROTOCOL.md` §2.2/§2.3.1) auch über die authentifizierte `icu/1`-Verbindung möglich — ein eingeloggter Admin braucht dafür weder CLI noch Host-Zugriff, nur `Welcome.is_admin`. CLI und Admin-Socket bleiben unverändert für headless/skriptgesteuerte Deployments; beide Pfade laufen über dieselben `store.create_invite`/`peek_invite`/`consume_invite`, kein eigener Invite-Lebenszyklus.
+Einladen geht auch über die authentifizierte `icu/1`-Verbindung (`CreateInviteRequest`, `PROTOCOL.md` §2.2) — ein eingeloggter Admin braucht dafür weder CLI noch Host-Zugriff, nur `Welcome.is_admin`. Alle drei Wege laufen über `registration::issue`.
 
-**Wer schreibt den State.** Ein laufender Server ist der alleinige Schreiber von `users.toml` und `invites.toml`. Jedes CLI-Kommando außer `run` geht deshalb über den Admin-Socket; der Server führt die Änderung aus, persistiert sie und wendet sie sofort auf offene Verbindungen an. Nur wenn kein Server läuft (Socket nicht vorhanden oder `ECONNREFUSED`), schreibt die CLI selbst und hält dabei `flock(/var/lib/icu/state.lock)`. Damit wirkt ein frisch erzeugtes Invite-Token sofort statt erst nach dem nächsten Neustart, und CLI und Server können einander keine Änderung überschreiben.
+**Wer schreibt den State.** Ein laufender Server ist der alleinige Schreiber von `users.toml`. Jedes CLI-Kommando außer `run` geht deshalb über den Admin-Socket; der Server führt die Änderung aus, persistiert sie und wendet sie sofort auf offene Verbindungen an. Nur wenn kein Server läuft (Socket nicht vorhanden oder `ECONNREFUSED`), schreibt die CLI selbst und hält dabei `flock(/var/lib/icu/state.lock)`. Damit wirkt ein frisch ausgestelltes Bundle sofort statt erst nach dem nächsten Neustart, und CLI und Server können einander keine Änderung überschreiben.
 
 Admin-Socket: `/run/icu/admin.sock` (`RuntimeDirectory=icu`, `RuntimeDirectoryMode=0750`, Gruppe aus `admin_socket_group`), JSON-Zeilenprotokoll, ein Request pro Zeile, eine Response pro Zeile, dann Close. Kein Netzwerk-Admin, keine Authentifizierung außer den Dateirechten des Sockets.
 
 | Kommando | Request | Response |
 | --- | --- | --- |
-| invite | `{"cmd":"invite","name":"bob","ttl_s":86400}` | `{"ok":true,"token":"k3nP…","link":"icu://…","expires":"2026-09-21T12:00:00Z"}` |
+| invite | `{"cmd":"invite","name":"bob","ttl_s":86400}` | `{"ok":true,"bundle":"-----BEGIN ICU PASSPORT-----…","expires":"2026-09-21T12:00:00Z","user_id":7,"name":"bob","is_admin":false}` |
 | users | `{"cmd":"users"}` | `{"ok":true,"users":[{"user_id":1,"name":"alice","fingerprint":"9f86d0…","expires":"…","revoked":false,"online":true,"is_admin":true}]}` |
 | revoke | `{"cmd":"revoke","user":"alice"}` | `{"ok":true,"user_id":1,"closed":1}` bzw. `{"ok":false,"error":"LAST_ADMIN"}` |
 | promote | `{"cmd":"promote","user":"bob"}` | `{"ok":true}` |
@@ -145,18 +135,18 @@ Admin-Socket: `/run/icu/admin.sock` (`RuntimeDirectory=icu`, `RuntimeDirectoryMo
 
 Fehlerform einheitlich `{"ok":false,"error":"<kurzform>","detail":"<text>"}`.
 
-**Kein `rename` mehr** (entfallen 2026-09-22): der Name steht im Zertifikat, und der Server kann keinen Schlüssel für einen Nutzer erzeugen — umbenennen kann sich also nur der Nutzer selbst, über ein Renewal (`PROTOCOL.md` §2.2 Nr. 9). Muss ein Admin trotzdem eingreifen (anstößiger Name, Tippfehler, von Hand verkorkster Bestand): Server stoppen, `UserRecord.name` in `users.toml` editieren, Server starten. Der nächste Connect dieses Nutzers ist dann ein CN-Mismatch, und sein Client zieht selbsttätig nach — Notausgang und Nachzügler-Mechanismus sind dasselbe. Als härtere Mittel bleiben `revoke` plus neues Invite.
+**Kein `rename` mehr** (entfallen 2026-09-22): der Name steht im Zertifikat, und der Server kann keinen Schlüssel für einen Nutzer erzeugen — umbenennen kann sich also nur der Nutzer selbst, über ein Renewal (`PROTOCOL.md` §2.2 Nr. 9). Muss ein Admin trotzdem eingreifen (anstößiger Name, Tippfehler, von Hand verkorkster Bestand): Server stoppen, `UserRecord.name` in `users.toml` editieren, Server starten. Der nächste Connect dieses Nutzers ist dann ein CN-Mismatch, und sein Client zieht selbsttätig nach — Notausgang und Nachzügler-Mechanismus sind dasselbe. Als härtere Mittel bleiben `revoke` plus neues Bundle.
 
 ## 6. Ablauf
 
 ### 6.1 Start
 
 1. Config laden, validieren: Listen-Adressen, `server_name` nicht leer, `1 ≤ max_users ≤ 64`, `min_client` als SemVer parsebar, und `max_users × 100 B + Reserve < 16 KiB` (sonst passt ein volles `Welcome` nicht in ein Control-Frame, `PROTOCOL.md` §7).
-2. CA laden oder erzeugen (`rcgen::CertificateParams` mit `IsCa::Ca(Constrained(0))`, `KeyCertSign|CrlSign`, P-256; Spike 2b). Danach `invite.key` laden oder erzeugen (`invite_key.rs`, 32 Zufallsbytes, hex in einer Datei mit Modus 0600 neben `ca.key`, eigener Zweck also eigener Schlüssel statt CA-Key-Wiederverwendung) — versiegelt/öffnet ausschließlich das Bearer-Token in einem `InviteBlob` (`PROTOCOL.md` §2.3.1), rotiert in v1 nie.
+2. CA laden oder erzeugen (`rcgen::CertificateParams` mit `IsCa::Ca(Constrained(0))`, `KeyCertSign|CrlSign`, P-256; Spike 2b). Eine neue CA heißt `ICU CA <server_name>` — daraus nimmt der Client das SNI (`PROTOCOL.md` §2.3). Eine bestehende CA bleibt, wie sie ist.
 3. Server-Leaf laden oder erzeugen (SAN = `server_name` und, falls IP, IP-SAN; EKU ServerAuth) über `CertificateParams::signed_by(&leaf_key_pair, &issuer)` — in rcgen 0.14 nimmt `signed_by` **Public Key und Issuer**, anders als die CSR-Variante in §6.3; Kette = Leaf + CA.
-4. `flock(state.lock)` nehmen und für die gesamte Laufzeit halten; `users.toml` und `invites.toml` laden (`schema` prüfen); abgelaufene Invites verwerfen. Ab hier ist der Server alleiniger Schreiber des States (§5).
+4. `flock(state.lock)` nehmen und für die gesamte Laufzeit halten; `users.toml` laden (`schema` prüfen); nie eingelöste, abgelaufene Registrierungen verwerfen. Ab hier ist der Server alleiniger Schreiber des States (§5).
 5. rustls `ServerConfig` in **dieser** Reihenfolge — `builder_with_provider(rustls::crypto::ring::default_provider().into())` liefert `WantsVersions`, der Versionsschritt muss also vor dem Verifier kommen, sonst übersetzt es nicht:
-   `ServerConfig::builder_with_provider(ring_provider)` → `.with_protocol_versions(&[&rustls::version::TLS13])?` → `.with_client_cert_verifier(WebPkiClientVerifier::builder(Arc::new(roots)).allow_unauthenticated().build()?)` → `.with_single_cert(vec![leaf, ca], key)?`; danach `alpn_protocols = [b"icu/1", b"icu-enroll/1"]` und `max_early_data_size = 0`.
+   `ServerConfig::builder_with_provider(ring_provider)` → `.with_protocol_versions(&[&rustls::version::TLS13])?` → `.with_client_cert_verifier(WebPkiClientVerifier::builder(Arc::new(roots)).allow_unauthenticated().build()?)` → `.with_single_cert(vec![leaf, ca], key)?`; danach `alpn_protocols = [b"icu/1"]` und `max_early_data_size = 0`.
 6. quinn `ServerConfig` aus `QuicServerConfig::try_from(rustls_config)`; Transport wie `PROTOCOL.md §1`. Signaturhinweise: `max_idle_timeout(Some(IdleTimeout::try_from(Duration::from_secs(60))?))`, `datagram_receive_buffer_size(Some(64 * 1024))` (Option) gegen `datagram_send_buffer_size(64 * 1024)` (kein Option), `max_concurrent_uni_streams(VarInt::from_u32(2 * max_users + 4))`. `migration(true)` liegt auf `quinn::ServerConfig`, nicht auf `TransportConfig`.
 7. Ein `Endpoint` pro Listen-Adresse; Accept-Loop je Endpoint auf einem tokio-Multi-Thread-Runtime.
 8. Admin-Socket öffnen (`/run/icu/admin.sock`, Gruppe aus `admin_socket_group`, Modus 0660). SIGTERM → allen `close(SHUTDOWN)`, 1 s warten, Socket und `state.lock` freigeben, Ende.
@@ -174,24 +164,26 @@ alpn = connecting.handshake_data().await?
          .downcast::<quinn::crypto::rustls::HandshakeData>()?.protocol   // Spike 2b: vor Handshake-Ende lesbar
 conn = connecting.await
 match alpn:
-  icu-enroll/1 → enroll::handle(conn)
   icu/1        → session::handle(conn)
 ```
 
-### 6.3 Enrollment (`enroll.rs`)
+### 6.3 Registrierung (`registration.rs`, `session.rs`)
 
-1. `accept_bi()` mit 5-s-Timeout; Frame lesen (≤ 8 KiB).
-2. `EnrollRequest` decodieren. `token` wird allein über seine Länge in drei Formen unterschieden (`PROTOCOL.md` §2.3), alles unter derselben State-Sperre, die auch den bisherigen Compare-and-Set hält:
-   - **leer** (Bootstrap): nur zulässig, solange `store.is_empty()`; sonst `ENROLL_BOOTSTRAP_CLOSED`. Kein Sonderfall mehr beim Namen — der CN kommt wie in allen drei Formen aus der CSR.
-   - **22 Zeichen** (Plain-Token): wie bisher `peek_invite` (konstantzeitiger Vergleich, `subtle`).
-   - **länger** (Blob-Passthrough): Base64url dekodieren, `InviteBlob` per postcard parsen, AAD aus den Klartextfeldern neu berechnen, mit `invite_key.open()` öffnen (`ChaCha20-Poly1305`) → das gewonnene Plain-Token läuft anschließend durch denselben `peek_invite`-Pfad. Fehlschlagendes Öffnen (Manipulation an `sealed`/`nonce` oder an einem AAD-Feld) → `ENROLL_BAD_TOKEN`.
+Ablauf und Regeln normativ in `PROTOCOL.md` §2.3; hier nur die Umsetzung.
 
-   In allen drei Fällen wird der Invite (falls vorhanden) erst **unter derselben Sperre** per Compare-and-Set verbraucht, nachdem `is_first = store.is_empty()` gelesen wurde — damit gewinnt bei zwei parallelen Enrollments (gleiches Token oder beide leer) genau eines, und `is_first` ist über alle drei Pfade hinweg race-sicher.
-3. **Name aus der CSR** (`ca::csr_common_name`, x509-parser auf dem rohen DER — nicht rcgens `DistinguishedName`, das als Map über `DnType` zwei CNs still zu einem verschmelzen würde): genau ein CN, als UTF-8 lesbar, `validate_name` erfüllt, sonst `ENROLL_BAD_CSR`. Der CN wird noch **unter derselben Sperre und vor** `consume_invite` gegen `store.name_taken` geprüft; bei Kollision `Error(NAME_TAKEN)` und das Token bleibt unverbraucht. Dann `CertificateSigningRequestParams::from_der(&csr_der)`; Parse- oder Signaturfehler → `ENROLL_BAD_CSR`, ebenso wenn der CSR-Key nicht P-256 oder P-384 ist. Der Server baut das Subject neu (nur der geprüfte CN, als UTF8String), setzt EKU ClientAuth, leert SAN und Key Usage, `not_before = now − 1 h`, `not_after = now + client_validity_days`, Serial = 16 Zufallsbytes; `signed_by(&issuer)` — der Public Key kommt aus der CSR.
-4. `user_id` = `next_user_id++`. Anzeigename **ist** der CN aus Schritt 3; kein `-2`/`-3`-Suffix mehr, Kollisionen wurden schon abgelehnt. Fingerprint = SHA-256(Leaf-DER), lowercase Hex; Nutzer- und Cert-Eintrag (inklusive `cn`) in `users.toml` schreiben (`is_admin = is_first` aus Schritt 2 — **jede** erste erfolgreiche Anmeldung gegen einen leeren Bestand wird Admin, nicht nur der Bootstrap-Pfad), Token als verbraucht markieren — beides atomar und **vor** der Antwort persistieren. Schlägt das Schreiben fehl, wird das Cert nicht ausgeliefert: `Error(<Code des Fehlers>, "state write failed")`, Token (falls vorhanden) bleibt unverbraucht.
-5. `EnrollResponse { leaf_der, ca_der, server_name }` senden, `finish()`, `close(NO_ERROR)`.
+**Ausstellen** (`registration::issue`, gemeinsam für CLI, Admin-Socket und `CreateInviteRequest`), unter der Store-Sperre:
+1. Abgelaufene, nie eingelöste Registrierungen verwerfen (`store.purge_expired_registrations`) — sonst hielte ein verfallenes erstes Bundle den Bestand nicht-leer und kostete das nächste die Admin-Rechte bis zum Neustart.
+2. Platzhaltername: der mitgegebene (muss `validate_name` erfüllen und frei sein, sonst `NAME_TAKEN`), sonst `neu-` + 4 Hex-Ziffern, bis einer frei ist.
+3. `ca.issue_registration`: frischer P-256-Schlüssel, Subject `CN=<Platzhalter>, OU=ICU registration`, URI-SAN `icu://<public_host>`, EKU ClientAuth, `not_after = now + ttl` (Default 24 h, höchstens 7 Tage).
+4. `store.add_registration`: Nutzer mit `CertRecord { registration: true }`; `is_admin = store.is_empty()`. Der Schlüssel wird nicht gespeichert, er verlässt den Server nur im Bundle (`PassportV2`).
 
-Fehlerpfad einheitlich (`PROTOCOL.md` §2.3): erst `EnrollMsg::Error { code, detail }` senden, dann `finish()`, dann `close(code)` mit demselben Code. Ein präsentiertes Client-Cert auf diesem ALPN wird ignoriert.
+**Einlösen** (`session::serve_registration`): `authenticate` liest `CertRecord.registration` und den SubjectPublicKeyInfo des vorgelegten Leafs. Ist es eine Registrierung, läuft die Sitzung nicht über den Raum:
+1. IP-Ratenlimit (`allow_enroll`, 5/min pro IP, 20/min global) → sonst `close(ENROLL_RATE_LIMITED)`.
+2. `Hello` wie in §6.4 Schritt 2, dann direkt auf den Stream `Welcome { registration: true, users: [], you.session: 0 }`.
+3. Schleife, höchstens 120 s: `Ping` → `Pong`; `RenewRequest` → `redeem`; alles andere → `PROTOCOL_VIOLATION`. `redeem`: CN aus der CSR (`csr_common_name`), Schlüssel ≠ Registrierungsschlüssel, Name frei (außer für sich selbst), `sign_client_csr`, dann `store.redeem_registration` — neues Cert anhängen, Namen übernehmen, Registrierungszertifikat widerrufen, **ein** Schreibvorgang. Nicht-fatale Fehler gehen als `Error` hinaus, die Sitzung bleibt für einen neuen Versuch offen (höchstens 10, dann `RATE_LIMITED_FATAL`).
+4. Nach `RenewResponse` wartet der Server bis zu 5 s darauf, dass der Client schließt, statt selbst zu schließen — ein eigenes Close könnte die Antwort überholen.
+
+**Client-Zertifikate** (`sign_client_csr`, auch für Renewals): Subject nur der geprüfte CN aus der CSR (als UTF8String neu gebaut), einziger SAN die URI `icu://<public_host>`, EKU ClientAuth, keine Key Usage, `not_before = now − 1 h`, `not_after = now + client_validity_days`, Serial = 16 Zufallsbytes; nur P-256- und P-384-Schlüssel. Der CN wird mit x509-parser aus dem rohen DER gelesen (nicht über rcgens `DistinguishedName`, das zwei CNs still zu einem verschmelzen würde): genau einer, als UTF-8 lesbar, `validate_name` erfüllt.
 
 ### 6.4 Session (`session.rs`)
 
@@ -211,8 +203,8 @@ Fehlerpfad einheitlich (`PROTOCOL.md` §2.3): erst `EnrollMsg::Error { code, det
 | `SetName` | Entfällt. Nicht mehr C→S: Empfang schließt mit `PROTOCOL_VIOLATION`. Umbenennen läuft über `RenewRequest`. |
 | `LossReport` | Maximum je Sprecher fortschreiben, siehe §6.5. |
 | `KeyframeRequest` | an den Sprecher weiterleiten, siehe §6.5. |
-| `RenewRequest` | CSR wie in §6.3 Schritt 3 prüfen; der CN **kommt aus der CSR** und ist der gewünschte Name. Drei Fälle, unterschieden durch exakten Stringvergleich gegen den gespeicherten Namen (exakt, nicht `name_key`: sonst liefe eine reine Groß-/Kleinschreibungs-Umbenennung auf dem Zweitgerät als normales Renewal ins Tageslimit): **normales Renewal** (CN = gespeichert, vorgelegtes Cert aktuell) erst ab 30 Tage vor Ablauf des vorgelegten Zertifikats, zählt gegen `last_renew`, ≤ 1/Tag; **Nachzügler** (CN = gespeichert, vorgelegter CN alt) ist davon ausgenommen und stattdessen über `CertRecord.renewed` des vorgelegten Zertifikats auf einen pro Tag begrenzt; **Umbenennung** (CN ≠ gespeichert) prüft zuerst `name_taken(cn, Some(self))` → `Error(NAME_TAKEN)` und zählt sonst gegen `last_renew`. Die Eindeutigkeitsprüfung liegt **vor** dem Ratenlimit, damit ein belegter Name `NAME_TAKEN` meldet und nicht eine verwirrende Ratenmeldung. Danach `store.add_cert`: Cert anhängen, CN als Namen übernehmen, ggf. den vorgelegten Fingerprint stempeln — **ein** Schreibvorgang, damit kein Crash zwischen zwei Writes einen Nutzer hinterlässt, dessen Name nicht zu seinem jüngsten Zertifikat passt. Gestempelt wird nur beim Nachzügler: dasselbe Zertifikat kann auf einem zweiten Gerät liegen (Passport), das seinen eigenen Nachzügler noch vor sich hat. Antwort `RenewResponse { leaf_der }`; bei geändertem Namen zusätzlich `room.rename` + `UserRenamed` für **jede** Sitzung dieses Nutzers. Das alte Cert bleibt bis zu seinem `expires` gültig. Abgelaufene, nicht widerrufene `CertRecord`s räumt derselbe Schreibvorgang weg; widerrufene bleiben stehen. |
-| `CreateInviteRequest` | Nur wenn `store.is_admin(user_id)`, sonst `Error(NOT_ADMIN)` und nichts weiter. Sonst `store.create_invite` (unverändert) aufrufen, das Ergebnis als `InviteBlob` mit `invite_key.seal()` versiegeln (`PROTOCOL.md` §2.3.1) und als `CreateInviteResponse { blob, expires }` zurücksenden. |
+| `RenewRequest` | CSR wie in §6.3 („Client-Zertifikate“) prüfen; der CN **kommt aus der CSR** und ist der gewünschte Name. Drei Fälle, unterschieden durch exakten Stringvergleich gegen den gespeicherten Namen (exakt, nicht `name_key`: sonst liefe eine reine Groß-/Kleinschreibungs-Umbenennung auf dem Zweitgerät als normales Renewal ins Tageslimit): **normales Renewal** (CN = gespeichert, vorgelegtes Cert aktuell) erst ab 30 Tage vor Ablauf des vorgelegten Zertifikats, zählt gegen `last_renew`, ≤ 1/Tag; **Nachzügler** (CN = gespeichert, vorgelegter CN alt) ist davon ausgenommen und stattdessen über `CertRecord.renewed` des vorgelegten Zertifikats auf einen pro Tag begrenzt; **Umbenennung** (CN ≠ gespeichert) prüft zuerst `name_taken(cn, Some(self))` → `Error(NAME_TAKEN)` und zählt sonst gegen `last_renew`. Die Eindeutigkeitsprüfung liegt **vor** dem Ratenlimit, damit ein belegter Name `NAME_TAKEN` meldet und nicht eine verwirrende Ratenmeldung. Danach `store.add_cert`: Cert anhängen, CN als Namen übernehmen, ggf. den vorgelegten Fingerprint stempeln — **ein** Schreibvorgang, damit kein Crash zwischen zwei Writes einen Nutzer hinterlässt, dessen Name nicht zu seinem jüngsten Zertifikat passt. Gestempelt wird nur beim Nachzügler: dasselbe Zertifikat kann auf einem zweiten Gerät liegen (Passport), das seinen eigenen Nachzügler noch vor sich hat. Antwort `RenewResponse { leaf_der }`; bei geändertem Namen zusätzlich `room.rename` + `UserRenamed` für **jede** Sitzung dieses Nutzers. Das alte Cert bleibt bis zu seinem `expires` gültig. Abgelaufene, nicht widerrufene `CertRecord`s räumt derselbe Schreibvorgang weg; widerrufene bleiben stehen. |
+| `CreateInviteRequest` | Nur wenn `store.is_admin(user_id)`, sonst `Error(NOT_ADMIN)` und nichts weiter. Sonst `registration::issue` (§6.3) und `CreateInviteResponse { bundle, expires }`; ein belegter oder ungültiger Platzhalter → `Error(NAME_TAKEN)`. |
 | `AdminSetRole` | Nur wenn `store.is_admin(user_id)` (live geprüft), sonst `AdminActionError(NOT_ADMIN)`. Sonst `store.set_admin(target, is_admin)`; bei `LAST_ADMIN` `AdminActionError(LAST_ADMIN)`. Bei Erfolg `AdminSetRoleOk` an den Absender und `UserAdminChanged { is_admin }` unicast an jede eigene Sitzung des Ziels (live, ohne Reconnect). |
 | `AdminSetDisabled` | Wie `AdminSetRole`, aber `store.set_disabled(target, disabled)`. Wird dabei deaktiviert, kickt der Server jede laufende Verbindung des Ziels sofort mit `AUTH_DISABLED` (`session::kick_user`) — kein separater Push, das Schließen ist die Benachrichtigung. `AdminSetDisabledOk` an den Absender. |
 | `AdminRevokeUser` | Wie `AdminSetRole`, aber `store.revoke(target)` und `session::kick_user(target, KICKED)`. `AdminRevokeUserOk { user_id, closed }` an den Absender. |
@@ -235,11 +227,11 @@ Ist die Empfängermenge leer (niemand sonst `Active`, oder alle `deafened`), wir
 
 ### 6.6 Limits (`limits.rs`)
 
-Token-Buckets pro Client (Control 50/s, Audio 110/s, Video 20/s und 400 kbit/s) und pro IP (Enrollment 5/min, Handshakes 10/s). Überschreitung: Datagram/Frame verwerfen und zählen; bei Control `Error(RATE_LIMITED)` (nicht fatal, Verbindung bleibt), beim dritten Verstoß binnen 60 s `close(RATE_LIMITED_FATAL)` — ein eigener, fataler Code, damit der Client nicht in einen Reconnect-Loop läuft (`PROTOCOL.md` §5/§6).
+Token-Buckets pro Client (Control 50/s, Audio 110/s, Video 20/s und 400 kbit/s) und pro IP (Registrierungssitzungen 5/min, Handshakes 10/s). Überschreitung: Datagram/Frame verwerfen und zählen; bei Control `Error(RATE_LIMITED)` (nicht fatal, Verbindung bleibt), beim dritten Verstoß binnen 60 s `close(RATE_LIMITED_FATAL)` — ein eigener, fataler Code, damit der Client nicht in einen Reconnect-Loop läuft (`PROTOCOL.md` §5/§6).
 
 ## 7. Logging und Metriken
 
-`tracing` mit `tracing-subscriber` (text/json), Felder: `session`, `name`, `remote` (nur bei Connect/Disconnect, nie bei jedem Datagram). Zähler (atomics, über `status` abrufbar): Verbindungen, Relay-Datagrams in/out, verworfene Datagrams pro Grund, Video-Frames, Enrollment-Versuche. Kein Prometheus in v1; `status --json` reicht für einen Checkmk-Local-Check.
+`tracing` mit `tracing-subscriber` (text/json), Felder: `session`, `name`, `remote` (nur bei Connect/Disconnect, nie bei jedem Datagram). Zähler (atomics, über `status` abrufbar): Verbindungen, Relay-Datagrams in/out, verworfene Datagrams pro Grund, Video-Frames, Registrierungsversuche (JSON-Schlüssel weiterhin `enroll`). Kein Prometheus in v1; `status --json` reicht für einen Checkmk-Local-Check.
 
 ## 8. systemd-Unit
 
@@ -290,10 +282,8 @@ CLI-Aufrufe als root oder als Mitglied der Gruppe, der der Admin-Socket gehört 
 | clap | 4 | MIT/Apache-2.0 | CLI |
 | toml | 0.8 | MIT/Apache-2.0 | Config/State |
 | tracing, tracing-subscriber | 0.1 / 0.3 | MIT | Logging |
-| subtle | 2 | BSD-3 | Token-Vergleich |
-| base64 | 0.22 | MIT/Apache-2.0 | Token/CA-Hash |
 | sha2 | 0.10 | MIT/Apache-2.0 | Fingerprint (oder ring::digest) |
-| rand | 0.9 | MIT/Apache-2.0 | Invite-Token (128 Bit), Cert-Serial (16 B) |
+| rand | 0.9 | MIT/Apache-2.0 | Platzhalternamen, Cert-Serial (16 B) |
 | time | 0.3 | MIT/Apache-2.0 | `OffsetDateTime` für rcgen-Validity, RFC-3339 im State |
 | rustix | 1 | Apache-2.0/MIT | `flock` auf `state.lock`, Unix-Socket-Rechte |
 
@@ -307,9 +297,9 @@ Lizenz von ICU selbst: **TBD** (Empfehlung Apache-2.0, siehe `Research/packaging
 
 | Ebene | Inhalt |
 | --- | --- |
-| Unit (`icu-proto`) | Roundtrip aller `ControlMsg`/`EnrollMsg`; Header-Encode/Decode; unbekannte Variante → `Err`; Framing-Grenzen (0, 16384, 16385). |
+| Unit (`icu-proto`) | Roundtrip aller `ControlMsg`, Passport v1/v2; Header-Encode/Decode; unbekannte Variante → `Err`; Framing-Grenzen (0, 16384, 16385). |
 | Unit (`ca.rs`, `store.rs`) | CA-Erzeugung; CSR-CN-Prüfung (CN wird übernommen, aber genau einer, `validate_name`-konform, SAN/EKU/`is_ca` weiterhin servergesetzt; kein CN, zwei CNs, ungültiger CN → `ENROLL_BAD_CSR`); `leaf_common_name` degradiert bei Müll zu `""`; Fingerprint-Stabilität; atomares Schreiben; Revoke-Persistenz über **alle** Certs eines Nutzers; `user_id`-Vergabe und -Stabilität über Renewal; `add_user`/`add_cert` weisen Kollisionen ab und schreiben dabei nichts; `add_cert` übernimmt den CN und meldet die Änderung; Altdatensatz ohne `cn` lädt; `schema`-Prüfung beim Laden; `flock`-Verhalten bei parallelem CLI-Zugriff. |
-| Integration (in-process, `127.0.0.1:0`) | Enrollment → Connect → Hello/Welcome; Connect ohne Cert → `AUTH_REQUIRED`; unbekanntes Cert → `AUTH_UNKNOWN_CERT`; Revoke während Verbindung → `KICKED`; Relay: 3 Clients, Audio von A kommt bei B und C mit `speaker = A` an, nicht bei A; `deafened` C bekommt nichts; `muted` A wird nicht relayt; Rate-Limits; Video-Relay mit Frame-Verwerfen; `LossReport` → `LossHint`; `KeyframeRequest`-Weiterleitung; Hello-Timeout; `max_users` erreicht → `SERVER_FULL`; `Ping` → `Pong` mit plausibler `server_time_ms`; belegter Name beim Enrollment → `NAME_TAKEN`, **und das Token bleibt benutzbar**; Renewal mit neuem CN benennt um und broadcastet `UserRenamed`, das alte Cert verbindet weiter und sieht den neuen Namen; Renewal auf einen belegten Namen → `NAME_TAKEN`, nichts geändert, Verbindung überlebt; veralteter CN verbindet und darf am selben Tag nachziehen, ein zweites Mal mit demselben Zertifikat nicht; `SetName` → `PROTOCOL_VIOLATION`; `Hello.name` wird ignoriert; Invite ohne Etikett enrollt; `RenewRequest` → `RenewResponse`, altes und neues Cert verbinden beide; normales Renewal mehr als 30 Tage vor Ablauf → `RENEW_REJECTED`; dritter `RATE_LIMITED`-Verstoß → `close(RATE_LIMITED_FATAL)`; Video-Frame ohne Empfänger wird geleert statt zu stauen; Verfall aller `LossReport` → `LossHint{0}`; Invite über den Admin-Socket wirkt ohne Serverneustart. |
+| Integration (in-process, `127.0.0.1:0`) | Registrierung → Connect → Hello/Welcome; Bundle genau einmal einlösbar, danach `AUTH_REVOKED`; Registrierung mit dem Bundle-Schlüssel → `RENEW_REJECTED`; abgelaufenes Bundle verbindet nicht; Registrierungssitzung darf nur `Ping`/`RenewRequest`; Zertifikate tragen `icu://`-URI und CA-CN `ICU CA <server_name>`; erstes Bundle = Admin; Connect ohne Cert → `AUTH_REQUIRED`; unbekanntes Cert → `AUTH_UNKNOWN_CERT`; Revoke während Verbindung → `KICKED`; Relay: 3 Clients, Audio von A kommt bei B und C mit `speaker = A` an, nicht bei A; `deafened` C bekommt nichts; `muted` A wird nicht relayt; Rate-Limits; Video-Relay mit Frame-Verwerfen; `LossReport` → `LossHint`; `KeyframeRequest`-Weiterleitung; Hello-Timeout; `max_users` erreicht → `SERVER_FULL`; `Ping` → `Pong` mit plausibler `server_time_ms`; belegter Name bei der Registrierung → `NAME_TAKEN`, **und das Bundle bleibt benutzbar**; Renewal mit neuem CN benennt um und broadcastet `UserRenamed`, das alte Cert verbindet weiter und sieht den neuen Namen; Renewal auf einen belegten Namen → `NAME_TAKEN`, nichts geändert, Verbindung überlebt; veralteter CN verbindet und darf am selben Tag nachziehen, ein zweites Mal mit demselben Zertifikat nicht; `SetName` → `PROTOCOL_VIOLATION`; `Hello.name` wird ignoriert; Bundle ohne Namen bekommt einen Platzhalter; `RenewRequest` → `RenewResponse`, altes und neues Cert verbinden beide; normales Renewal mehr als 30 Tage vor Ablauf → `RENEW_REJECTED`; dritter `RATE_LIMITED`-Verstoß → `close(RATE_LIMITED_FATAL)`; Video-Frame ohne Empfänger wird geleert statt zu stauen; Verfall aller `LossReport` → `LossHint{0}`; Bundle über den Admin-Socket wirkt ohne Serverneustart. |
 | Last | 16 Clients × 50 Datagrams/s für 60 s: keine Verluste auf Loopback, CPU < 10 % eines Kerns, keine Latenzzunahme (Datagram-Roundtrip p99 < 1 ms). |
 | Netz | `tc netem` 30 ms ± 10 ms, 2 % Verlust: Relay verliert nichts zusätzlich; Keepalive hält die Verbindung über 10 min Stille. |
 

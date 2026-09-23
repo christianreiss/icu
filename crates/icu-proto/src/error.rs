@@ -30,23 +30,24 @@ pub const AUTH_REQUIRED: u32 = 0x0A;
 pub const RATE_LIMITED_FATAL: u32 = 0x0B;
 /// Idle timeout or transport abort. Not fatal.
 pub const TIMEOUT: u32 = 0x0C;
-/// A requested name — the subject CN of an enrollment or renewal CSR — is
+/// A requested name — the subject CN of a renewal or registration CSR — is
 /// already taken server-wide (case-insensitive). Not fatal: nothing changed and
-/// the client may retry with another name. On `icu/1` it arrives as `Error`, on
-/// `icu-enroll/1` as `EnrollMsg::Error` followed by `close(0x0D)` like every
-/// enrollment rejection.
+/// the client may retry with another name. Arrives as `Error`.
 pub const NAME_TAKEN: u32 = 0x0D;
-/// Enrollment token unknown, used or expired. Fatal.
+/// Reserved: enrollment token unknown, used or expired. Only the removed
+/// `icu-enroll/1` sent it. Fatal.
 pub const ENROLL_BAD_TOKEN: u32 = 0x10;
 /// CSR not parsable, signature invalid, or its subject does not carry exactly
-/// one CN that passes `validate_name`. Fatal.
+/// one CN that passes `validate_name`. Fatal. A renewal reports these as
+/// `RENEW_REJECTED` instead.
 pub const ENROLL_BAD_CSR: u32 = 0x11;
-/// Enrollment rate limit (5/min per IP, 20/min global). Fatal.
+/// Registration rate limit (5/min per IP, 20/min global): the server closes a
+/// registration session with it. Fatal.
 pub const ENROLL_RATE_LIMITED: u32 = 0x12;
 /// Renewal CSR rejected. Not fatal.
 pub const RENEW_REJECTED: u32 = 0x13;
-/// Bootstrap enrollment (empty token) attempted while the server already has
-/// at least one user. Fatal.
+/// Reserved: bootstrap enrollment (empty token) while the server already had
+/// users. Only the removed `icu-enroll/1` sent it. Fatal.
 pub const ENROLL_BOOTSTRAP_CLOSED: u32 = 0x14;
 /// `CreateInviteRequest` from a non-admin user. Only ever sent as `Error`. Not
 /// fatal.

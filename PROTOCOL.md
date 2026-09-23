@@ -9,8 +9,8 @@ Stand 2026-09-20. Abgeleitet aus `Research/transport.md`, `Research/protocol/wir
 | Transport | QUIC (RFC 9000/9001) mit Unreliable Datagrams (RFC 9221). Implementierung quinn 0.11 + rustls 0.23, Crypto-Provider ring. |
 | Port | Ein UDP-Port, Default 4711. Server bindet IPv4 und IPv6 getrennt (quinn-Dual-Stack-Hinweis). |
 | TLS | TLS 1.3, Server-Cert und Client-Cert von der ICU-CA des Servers. Client vertraut nur dieser CA. |
-| ALPN | `icu/1` (Hauptprotokoll), `icu-enroll/1` (Enrollment). ALPN ist das Major-Versions-Gate. |
-| Client-Auth | Server: `WebPkiClientVerifier` mit `allow_unauthenticated()`; Pflicht wird pro ALPN in der Anwendung erzwungen (Spike 2b: ALPN per `handshake_data()` vor Handshake-Ende lesbar, `peer_identity()` ohne Cert = `None`). |
+| ALPN | `icu/1`. ALPN ist das Major-Versions-Gate. Das frühere `icu-enroll/1` gibt es nicht mehr (revidiert 2026-09-24, §2.3). |
+| Client-Auth | Server: `WebPkiClientVerifier` mit `allow_unauthenticated()`; die Pflicht erzwingt die Anwendung und schließt ohne Cert mit `AUTH_REQUIRED` statt eines nackten TLS-Alerts (Spike 2b: `peer_identity()` ohne Cert = `None`). |
 | 0-RTT | Aus (`max_early_data_size = 0`, kein `into_0rtt()`). |
 | Idle / Keepalive | `max_idle_timeout` 60 s beidseitig; Client `keep_alive_interval` 15 s. |
 | Migration | quinn-Default (erlaubt). |
@@ -39,11 +39,11 @@ UserFlags: u8      bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit
                    bit4 ist ebenfalls serverseitig autoritativ und spiegelt Store::is_admin: reitet kostenlos auf Welcome/UserJoined/UserState statt einer eigenen Variante; ein von Clients in SetState gesendetes bit4 wird ignoriert. AdminSetRole broadcastet zusätzlich zum bisherigen Unicast UserAdminChanged ein UserState für jede betroffene Sitzung, damit das Abzeichen bei jedem Betrachter live kippt.
 Session:   u16     serverseitig vergeben, ab 1, monoton; nach 65 535 läuft der Zähler auf 1 um und überspringt belegte IDs, bei leerem Raum beginnt er wieder bei 1. Eine ID kehrt also frühestens nach 65 534 anderen Vergaben zurück; 0 = „unbekannt/ich“.
                    Gilt nur innerhalb einer Verbindung: nach einem Server-Neustart beginnt die Vergabe wieder bei 1.
-UserId:    u32     beim Enrollment vergeben, ab 1, monoton, nie wiederverwendet; stabil über Cert-Renewals, Reconnects
+UserId:    u32     beim Ausstellen der Registrierung vergeben, ab 1, monoton, nie wiederverwendet; stabil über Cert-Renewals, Reconnects
                    und Server-Neustarts hinweg, in `users.toml` persistiert. Schlüssel für alles, was ein Client
                    dauerhaft je Peer speichert (Lautstärken, Notizen). 0 = „unbekannt“.
 Name:      String  UTF-8, 1–32 Bytes, keine Steuerzeichen; serverweit eindeutig, Vergleich case-insensitive
-                   Der Name steht im Subject-CN des Client-Zertifikats. Er wird beim Enrollment durch die CSR gesetzt
+                   Der Name steht im Subject-CN des Client-Zertifikats. Er wird bei der Registrierung durch die CSR gesetzt
                    und danach ausschließlich dadurch geändert, dass ein neues Zertifikat ausgestellt wird (§2.2 Nr. 9).
                    `users.toml` spiegelt den CN des zuletzt ausgestellten Zertifikats; dieser Spiegel füllt alle
                    Roster-Felder. Identität bleibt der Fingerprint, nie der Name.
@@ -61,7 +61,7 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | Nr | Variante | Richtung | Felder | Semantik |
 | --- | --- | --- | --- | --- |
 | 0 | `Hello` | C→S | `minor: u16`, `caps: u32`, `client: String` (≤ 64 B, Format `<name>/<semver> <os>`, z. B. `icu/0.1.0 linux`), `initial: UserFlags`, `name: Name` | Erste Message nach Handshake, binnen 5 s. `name` ist obsolet: der Server ignoriert es, weil der Name im Zertifikat steht (§2.1). Das Feld bleibt aus Wire-Kompatibilität erhalten. Namensänderung läuft ausschließlich über `RenewRequest` (Nr. 9). |
-| 1 | `Welcome` | S→C | `minor: u16`, `caps: u32`, `you: UserInfo`, `audio: AudioParams`, `users: Vec<UserInfo>` (ohne sich selbst), `min_client: String`, `is_admin: bool` | Vollständiger State. `you` ist der eigene Eintrag inklusive `user_id` und dem serverseitig gespeicherten Namen — der Client übernimmt diesen Namen, auch wenn er von seinem `Hello.name` abweicht. `min_client` = niedrigste erlaubte Client-Version als SemVer-String; der Client vergleicht sie in SemVer-Ordnung gegen die eigene Version. `is_admin` erlaubt `CreateInviteRequest` (§2.3.1). Weicht `you.name` vom CN des eigenen Zertifikats ab, fordert der Client ein neues Zertifikat mit dem aktuellen Namen an; der Server lässt das außerhalb des Tageslimits zu (Nr. 9). |
+| 1 | `Welcome` | S→C | `minor: u16`, `caps: u32`, `you: UserInfo`, `audio: AudioParams`, `users: Vec<UserInfo>` (ohne sich selbst), `min_client: String`, `is_admin: bool`, `registration: bool` | Vollständiger State. `you` ist der eigene Eintrag inklusive `user_id` und dem serverseitig gespeicherten Namen — der Client übernimmt diesen Namen, auch wenn er von seinem `Hello.name` abweicht. `min_client` = niedrigste erlaubte Client-Version als SemVer-String; der Client vergleicht sie in SemVer-Ordnung gegen die eigene Version. `is_admin` erlaubt `CreateInviteRequest` (§2.3). `registration = true` heißt: der Client hat sich mit einem Registrierungszertifikat angemeldet (§2.3); dann ist `users` leer, `you.session` = 0, die Sitzung ist nicht im Raum, und außer `Ping` nimmt der Server nur `RenewRequest` an. Weicht `you.name` vom CN des eigenen Zertifikats ab, fordert der Client ein neues Zertifikat mit dem aktuellen Namen an; der Server lässt das außerhalb des Tageslimits zu (Nr. 9). |
 | 2 | `UserJoined` | S→C | `user: UserInfo` | |
 | 3 | `UserLeft` | S→C | `session: Session`, `reason: u8` (Fehlercode < 256) | |
 | 4 | `UserState` | S→C | `session: Session`, `flags: UserFlags` | Broadcast nach jeder Änderung, inkl. an den Verursacher. |
@@ -77,8 +77,8 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | 14 | `SetName` | — | `name: Name` | **Obsolet.** Namensänderung läuft über `RenewRequest` (Nr. 9), weil der Name im Zertifikat steht. Die Variantennummer bleibt reserviert, damit die Nummerierung normativ bleibt; kein Client sendet sie, und ein Server, der sie empfängt, schließt mit `PROTOCOL_VIOLATION`. |
 | 15 | `UserRenamed` | S→C | `session: Session`, `name: Name` | |
 | 16 | `VideoCongestionHint` | S→C | `drop_permille: u16` | Server leitet das Maximum der pro Empfänger gemessenen Slot-Verdrängungsrate (`Server/IMPLEMENTATION.md` §6.5) für diesen Sprecher weiter, gemessen über die letzten 2 s (`icu_proto::limits::VIDEO_CONGESTION_WINDOW_S`), nur wenn sich der Wert um ≥ 20 ‰ ändert (`VIDEO_CONGESTION_HINT_STEP_PERMILLE`). Mirror von `LossHint`s Maximum-Regel, aber für Video statt Audio. Der Client speist den Wert in die Qualitäts-Ladder (`Client/IMPLEMENTATION.md` §8): Video trägt die gesamte Anpassung, Audio-Bitrate bleibt unangetastet. |
-| 17 | `CreateInviteRequest` | C→S | `name: Name`, `ttl_s: u64` (`0` = Server-Default `limits::INVITE_TTL_S`) | Nur Admins (`Welcome.is_admin`); sonst `Error { code: NOT_ADMIN }`, nicht-fatal, Verbindung bleibt. Siehe §2.3.1. |
-| 18 | `CreateInviteResponse` | S→C | `blob: String` (`ICU1-…`), `expires: String` (RFC 3339 UTC) | Antwort auf `CreateInviteRequest`. |
+| 17 | `CreateInviteRequest` | C→S | `name: String` (Platzhaltername, leer = generiert), `ttl_s: u64` (`0` = Server-Default `limits::INVITE_TTL_S`, höchstens `limits::MAX_INVITE_TTL_S` = 7 Tage) | Stellt ein Registrierungszertifikat aus (§2.3). Nur Admins (`Welcome.is_admin`); sonst `Error { code: NOT_ADMIN }`. Ein vergebener oder ungültiger Platzhalter → `Error { code: NAME_TAKEN }`. Beides nicht-fatal, Verbindung bleibt. |
+| 18 | `CreateInviteResponse` | S→C | `bundle: String` (Passport-Armor, §2.3.1), `expires: String` (RFC 3339 UTC) | Antwort auf `CreateInviteRequest`: das Registrierungs-Bundle. |
 | 19 | `AdminSetRole` | C→S | `user_id: UserId`, `is_admin: bool` | Nur Admins, sonst `AdminActionError { code: NOT_ADMIN }`; bei letztem funktionsfähigen Admin `AdminActionError { code: LAST_ADMIN }`. Nicht-fatal in beiden Fällen. |
 | 20 | `AdminSetRoleOk` | S→C | `user_id: UserId`, `is_admin: bool` | Bestätigung an den ausführenden Admin. |
 | 21 | `UserAdminChanged` | S→C | `is_admin: bool` | **Unicast** an alle eigenen Sitzungen des betroffenen Nutzers (kein Broadcast, kein `session`-Feld nötig): eigener `is_admin`-Stand aktualisiert sich live, ohne Reconnect. |
@@ -95,76 +95,49 @@ Varianten 19–28 sind die ersten C→S-Nachrichten, bei denen der sendende Clie
 
 Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline ist `minor = 1`; ein Minor 0 existiert nicht, und alle 30 Variantennummern sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt`: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
-### 2.3 Enrollment `EnrollMsg` (nur ALPN `icu-enroll/1`)
+### 2.3 Registrierung (revidiert 2026-09-24, nur Zertifikate)
 
-Gleiche Framing-Regel, Stream-Limit 8 KiB, ein Request/Response, danach Close.
+Es gibt kein Einladungs-Token, keinen Link, keinen Blob und kein eigenes Enrollment-Protokoll mehr. Eine Einladung **ist** ein Zertifikat:
 
-| Nr | Variante | Richtung | Felder |
-| --- | --- | --- | --- |
-| 0 | `EnrollRequest` | C→S | `token: String`, `csr_der: Vec<u8>` (≤ 2 KiB, Subject-CN = gewünschter Name), `name: Name` (**obsolet**, wird ignoriert; das Feld bleibt aus Wire-Kompatibilität erhalten) |
-| 1 | `EnrollResponse` | S→C | `leaf_der: Vec<u8>`, `ca_der: Vec<u8>`, `server_name: String` (SNI für die Hauptverbindung) |
-| 2 | `Error` | S→C | `code: u32`, `detail: String` |
+1. Ein Admin (CLI `icu-server invite`, Admin-Socket oder `CreateInviteRequest`) erhält ein **Registrierungs-Bundle**: einen frisch erzeugten P-256-Schlüssel, ein kurzlebiges **Registrierungszertifikat** darauf und die CA — als Passport armiert (§2.3.1). Der Server legt dabei sofort einen Nutzer mit Platzhalternamen an (der mitgegebene Name, sonst `neu-` + 4 Hex-Ziffern; er muss frei sein wie jeder Name) und merkt sich das Zertifikat mit `registration = true`. Den Schlüssel behält er nicht.
+2. Der Eingeladene verbindet sich damit ganz normal über `icu/1`. Er vertraut der CA aus dem Bundle; Adresse und SNI stehen in den Zertifikaten (unten). Nichts wird gepinnt, nichts ist TOFU.
+3. Der Server antwortet auf `Hello` mit `Welcome { registration: true, users: [], … }`. Die Sitzung tritt dem Raum nicht bei.
+4. Der Client erzeugt einen **eigenen** Schlüssel und sendet `RenewRequest` mit einer CSR, deren CN der gewählte Name ist.
+5. Der Server prüft: Schlüssel ≠ Schlüssel des Registrierungszertifikats (sonst `RENEW_REJECTED`), Name frei (sonst `NAME_TAKEN`, das Bundle bleibt gültig, der Nutzer kann einen anderen Namen versuchen), CSR-Regeln wie bei jedem Renewal (sonst `RENEW_REJECTED`). Dann stellt er das echte Zertifikat aus und widerruft **in derselben Schreiboperation** das Registrierungszertifikat. Antwort `RenewResponse`.
+6. Der Client schließt und verbindet sich mit dem neuen Zertifikat. Das Bundle ist damit wertlos (`AUTH_REVOKED`).
 
-`EnrollRequest.token` hat drei Formen, unterschieden allein durch die Länge:
+Eine Registrierungssitzung darf außer `Ping` und `RenewRequest` nichts senden (sonst `PROTOCOL_VIOLATION`), höchstens 10 `RenewRequest` stellen und höchstens 120 s offen bleiben. Registrierungssitzungen sind auf 5/min pro IP und 20/min global begrenzt (`ENROLL_RATE_LIMITED`). Ein Registrierungszertifikat ist höchstens 7 Tage gültig (Default 24 h); ein nie eingelöstes wird nach Ablauf samt Nutzer entfernt, sein Platzhaltername ist dann wieder frei.
 
-| Form | Länge | Bedeutung |
-| --- | --- | --- |
-| leer | 0 | **Bootstrap**: nur solange `users.toml` noch keinen Eintrag hat. Kein Invite wird konsumiert; der CN kommt wie überall aus der CSR. |
-| Plain-Token | 22 Zeichen (base64url, 128 Bit) | Klassischer Invite, wie bisher über `store.peek_invite`/`consume_invite` geprüft. |
-| Blob-Passthrough | länger | Base64url-Body eines `ICU1-…`-Blobs (§2.3.1) ohne das Präfix, vom Client unverändert durchgereicht. Der Server entschlüsselt, gewinnt daraus das Plain-Token und validiert es identisch zum Plain-Token-Pfad. |
+**Wer wird Admin:** das erste Registrierungszertifikat, das gegen einen leeren Bestand ausgestellt wird. Den ersten Admin erzeugt man also mit `icu-server invite` auf dem Host, auch ohne laufenden Server.
 
-**CSR-Regeln** (revidiert 2026-09-22, Name im Zertifikat): das Subject der CSR muss **genau einen** CN tragen, der als UTF-8 lesbar ist und `Name` erfüllt; dieser CN wird der Anzeigename. Er muss serverweit frei sein (case-insensitive) — bei Kollision antwortet der Server `Error { code: NAME_TAKEN }` **und verbraucht das Token nicht**, der Nutzer kann also mit einem anderen Namen erneut anlaufen. Kein stilles `-2`/`-3`-Anhängen mehr. Fehlt der CN, gibt es mehr als einen, ist er unlesbar oder verletzt er `Name`, antwortet der Server `ENROLL_BAD_CSR`. Unbekannte angeforderte Extensions in der CSR lehnt rcgen ab; auch das ist `ENROLL_BAD_CSR`.
+**Registrierungszertifikat:** Subject `CN=<Platzhalter>, OU=ICU registration`, EKU ClientAuth, URI-SAN wie unten. Die OU ist nur ein Hinweis für die Client-Oberfläche (Namensfeld zeigen); der Server entscheidet allein anhand seines Eintrags.
 
-**Wer wird Admin:** die *erste* Anmeldung, die gegen einen leeren `users.toml`-Bestand erfolgreich abschließt — gleich über welche der drei Formen —, erhält `is_admin = true` in `UserRecord`. Danach lehnt ein leeres Token mit `ENROLL_BOOTSTRAP_CLOSED` ab; alle weiteren Anmeldungen brauchen ein gültiges Token oder einen Blob.
+**Wo der Server ist, steht in den Zertifikaten.** Jedes Client-Zertifikat, Registrierung wie Renewal, trägt als einzigen SAN die URI `icu://<public_host>` (`host:port`, IPv6 in Klammern). Die CA trägt den CN `ICU CA <server_name>`; daraus nimmt der Client das SNI. Bei einer CA von vor dieser Änderung (CN nur `ICU CA`) ist das SNI der Host aus der URI. Zieht der Server um, schreibt er die neue Adresse ins nächste Renewal; der Client übernimmt sie von dort.
 
-Fehlerpfad: der Server sendet **immer zuerst** `Error { code, detail }`, dann `finish()`, dann `close(code)` mit demselben Code — sonst sieht der Nutzer im Enrollment-Dialog nur eine Codenummer ohne Text.
+**CSR-Regeln** (revidiert 2026-09-22, Name im Zertifikat): das Subject der CSR muss **genau einen** CN tragen, der als UTF-8 lesbar ist und `Name` erfüllt; dieser CN wird der Anzeigename. Er muss serverweit frei sein (case-insensitive). Kein stilles `-2`/`-3`-Anhängen. SAN, EKU, Basic Constraints, Key Usage, Validity und Serial setzt der Server; aus der CSR stammen der Public Key **und der geprüfte CN**. Der Server baut das Subject trotzdem von Grund auf neu: das kanonisiert die Kodierung auf UTF8String und wirft jedes andere DN-Attribut weg. Nur P-256- und P-384-Schlüssel.
 
-Server-Pinning beim Enrollment: der Client verifiziert die Serverkette nicht gegen einen Root-Store, sondern per eigenem `ServerCertVerifier`. Bei einem `icu://`-Link ist die Regel: `ca` ist base64url **ohne Padding** über SHA-256 des DER des **letzten** Kettenglieds; der Verifier akzeptiert genau Kettenlänge 2 (Leaf + CA), vergleicht diesen Hash, prüft, dass das Leaf von genau dieser CA signiert ist und gültig ist, prüft den gewählten Hostnamen gegen das Leaf und delegiert `verify_tls12_signature`/`verify_tls13_signature` an den CryptoProvider (revidiert 2026-09-23 — bis dahin nur Hash-Vergleich; das CA-Zertifikat ist öffentlich, ohne Signaturprüfung hätte jeder im Pfad die echte CA neben ein eigenes Leaf legen können). Der Client übernimmt `EnrollResponse.ca_der` nur, wenn es byteweise der im Handshake akzeptierten CA entspricht; sonst bricht er ab. Bei einem `ICU1-…`-Blob (§2.3.1) vergleicht der Verifier stattdessen das DER byteweise gegen `InviteBlob.ca_der`. Beim Bootstrap-Fall (leeres Token) gibt es noch keinen Prior — der Verifier akzeptiert dort jede Kette der Länge 2 ohne Pin-Vergleich (Signatur und Hostname prüft er trotzdem) (Trust-on-first-use, unvermeidbar, da noch kein Geheimnis existiert). Der Server sendet daher immer die Kette Leaf + CA. Server-Seite: SAN, EKU, Basic Constraints, Key Usage, Validity und Serial setzt der Server; aus der CSR stammen der Public Key **und der geprüfte CN** (revidiert 2026-09-22 — bis dahin überschrieb der Server auch das Subject, Spike 2b). Der Server baut das Subject trotzdem von Grund auf neu: das kanonisiert die Kodierung auf UTF8String und wirft jedes andere DN-Attribut weg.
+### 2.3.1 Passport `-----BEGIN ICU PASSPORT-----`
 
-Invite-Link: `icu://<host>:<port>/enroll?t=<token>&ca=<sha256-base64url>[&n=<name-urlencoded>]`. Token einmalig, 24 h gültig. Weiterhin per CLI (`icu-server invite`) oder Admin-Socket erzeugbar. `n=` ist optional und nur eine **Vorbelegung** des Namensfelds im Client; der Name, der ins Zertifikat kommt, ist der, den der Eingeladene bestätigt. Ein ungültiges `n=` wird verworfen statt den Link abzulehnen.
-
-### 2.3.1 Invite-Blob `ICU1-…`
-
-Selbstständige Alternative zum Link: ein Admin fordert ihn über `CreateInviteRequest` an (§2.2), ohne CLI/Host-Zugriff. Enthält alles, was eine unregistrierte Instanz braucht — kein separater `ca=`-Hash-Abruf nötig.
-
-Aufbau vor Armor: postcard-serialisiertes `icu_proto::invite_blob::InviteBlob`:
+Die ganze Identität eines Clients in einem ASCII-armierten Block, damit ein Nutzer sie auf ein zweites Gerät mitnehmen kann. Dasselbe Format transportiert das Registrierungs-Bundle (§2.3) — das ist der einzige Fall, in dem der Server einen Passport erzeugt; er liest nie einen. Ein wieder eingespielter Passport verbindet sofort mit dem ursprünglichen Server: CA und Adresse reisen mit.
 
 ```
-InviteBlob {
-    host_port: String,   // "host:port" bzw. "[ipv6]:port", wie public_host()
-    server_name: String, // SNI, nur zur Anzeige
-    ca_der: Vec<u8>,      // volles CA-Zertifikat, nicht nur ein Hash
-    expires: String,      // RFC 3339 UTC, informativ — maßgeblich bleibt der Server
-    nonce: [u8; 12],
-    sealed: Vec<u8>,       // ChaCha20-Poly1305(token) mit angehängtem 16-B-Tag
-}
-```
-
-Armor: `"ICU1-" + base64url(postcard(InviteBlob))`, ohne Padding, ≤ 4096 Byte gesamt.
-
-`host_port`/`server_name`/`ca_der`/`expires` sind zwangsläufig Klartext — der Client muss sie lesen, bevor überhaupt eine gesicherte Verbindung existiert (identisches TOFU-Modell wie der `ca=`-Hash-Link, nur mit vollen CA-Bytes statt Hash). Nur das Token selbst braucht Vertraulichkeit: es ist mit einem serverseitigen, unabhängig vom CA-Key gehaltenen `invite.key` (32 Zufallsbytes, `ChaCha20-Poly1305`, analog `ca.key` mit Mode 0600 persistiert) versiegelt. Die AAD der Versiegelung ist `postcard(host_port, server_name, ca_der, expires)` — jede Manipulation eines dieser Klartextfelder macht das Öffnen serverseitig ungültig (`ENROLL_BAD_TOKEN`), auch wenn der Client die Manipulation vorher nicht erkennen kann.
-
-Der Client reicht beim Enrollment nicht den `ICU1-…`-String, sondern den nackten Base64url-Body (ohne Präfix) unverändert als `EnrollRequest.token` durch; der Server dekodiert, berechnet die AAD aus den Klartextfeldern neu und öffnet die Versiegelung mit `invite.key`. Gelingt das, läuft die Validierung identisch zum Plain-Token-Pfad über `store.peek_invite`/`consume_invite` weiter — kein separater Invite-Lebenszyklus.
-
-### 2.3.2 Passport `-----BEGIN ICU PASSPORT-----`
-
-Die ganze Identität eines Clients in einem ASCII-armierten Block, damit ein Nutzer sie auf ein zweites Gerät mitnehmen kann. Kein Server-Pfad erzeugt, akzeptiert oder liest je einen Passport — er ist eine Datei in der Verantwortung des Nutzers, kein Transportformat.
-
-```
-PassportV1 {
-    host: String,        // zu wählender Host
-    port: u16,
-    server_name: String, // SNI
-    name: String,        // CN zum Exportzeitpunkt, nur Vorschau — das Zertifikat bleibt maßgeblich
+PassportV2 {                 // Version 2, aktuell geschrieben
     key_der: Vec<u8>,    // privater Schlüssel, PKCS#8 DER
-    leaf_der: Vec<u8>,   // Client-Zertifikat, DER
-    ca_der: Vec<u8>,     // CA des Servers, DER
+    leaf_der: Vec<u8>,   // Client-Zertifikat, DER — trägt die Serveradresse als URI-SAN
+    ca_der: Vec<u8>,     // CA des Servers, DER — trägt das SNI im CN
+}
+
+PassportV1 {                 // Version 1, nur noch gelesen
+    host: String, port: u16, server_name: String, name: String,
+    key_der: Vec<u8>, leaf_der: Vec<u8>, ca_der: Vec<u8>,
 }
 ```
 
-Armor: `-----BEGIN ICU PASSPORT-----`, Base64 (Standard-Alphabet mit Padding) auf 64 Spalten umbrochen, `-----END ICU PASSPORT-----`. Body = `[Version-Byte] ++ postcard(PassportV1)`, aktuell Version 1, ≤ 8192 Byte dekodiert. Das Versionsbyte steht **außerhalb** des postcard-Bodys, weil postcard nicht selbstbeschreibend ist: ein künftiges v2 würde sonst als plausibler Müll durchgehen statt abgelehnt zu werden. Beim Dekodieren wird jeder Whitespace ignoriert, damit ein neu umbrochener oder eingerückter Block aus einem Chat-Client weiter lesbar ist.
+Armor: `-----BEGIN ICU PASSPORT-----`, Base64 (Standard-Alphabet mit Padding) auf 64 Spalten umbrochen, `-----END ICU PASSPORT-----`. Body = `[Version-Byte] ++ postcard(PassportV<n>)`, ≤ 8192 Byte dekodiert. Das Versionsbyte steht **außerhalb** des postcard-Bodys, weil postcard nicht selbstbeschreibend ist: eine andere Version würde sonst als plausibler Müll durchgehen statt abgelehnt zu werden. Beim Dekodieren wird jeder Whitespace ignoriert, damit ein neu umbrochener oder eingerückter Block aus einem Chat-Client weiter lesbar ist.
 
-**Der Body ist Klartext.** Ein Passport ist bis zum Ablauf des Zertifikats oder bis zum Widerruf ein vollwertiger Identitätsnachweis: wer den Text liest, kann sich als dieser Nutzer anmelden. Der Client warnt entsprechend, schreibt die Datei mit Mode 0600 und zeigt den Text nie am Bildschirm. Er pinnt auch nichts — wer einen gefälschten Passport einspielt, landet auf fremdem Server mit fremder CA; dasselbe Vertrauensmodell wie beim `ICU1-…`-Blob, nur ohne Token, das zu stehlen wäre.
+Der Client exportiert Version 2, wenn sein Zertifikat die Adresse trägt, sonst Version 1 mit ausgeschriebener Adresse (ein Zertifikat von vor 2026-09-24, bis zum nächsten Renewal). Beim Import von Version 2 ohne Adresse im Zertifikat lehnt er ab.
+
+**Der Body ist Klartext.** Ein Passport ist bis zum Ablauf des Zertifikats oder bis zum Widerruf ein vollwertiger Identitätsnachweis: wer den Text liest, kann sich als dieser Nutzer anmelden. Der Client warnt entsprechend, schreibt die Datei mit Mode 0600 und zeigt den Text nie am Bildschirm. Er pinnt auch nichts — wer einen gefälschten Passport einspielt, landet auf fremdem Server mit fremder CA. Für ein Registrierungs-Bundle gilt dasselbe, bis es eingelöst oder abgelaufen ist.
 
 Beide Geräte halten danach dasselbe Zertifikat. Der Server akzeptiert das (Identität ist der Fingerprint, mehrere Sitzungen je `user_id` sind erlaubt); benennt sich eines der Geräte um, zieht das andere beim nächsten Start über den Nachzügler-Pfad aus §2.2 Nr. 9 nach.
 
@@ -207,9 +180,10 @@ Server-Sicht pro Client:
 
 ```
 Incoming ─accept─▶ Handshaking ─ALPN icu/1, TLS ok─▶ Authenticating ─Fingerprint ok─▶ AwaitHello ─Hello ≤5 s─▶ Active ─▶ Closed
-                                │ ALPN icu-enroll/1                │ unbekannt/revoked            │ Timeout
-                                ▼                                  ▼                              ▼
-                             Enrolling ─▶ Closed                close(AUTH_*)                close(HELLO_TIMEOUT)
+                                                                   │ unbekannt/revoked            │ Timeout
+                                                                   │                              │ Registrierungszertifikat
+                                                                   ▼                              ▼
+                                                                close(AUTH_*)                  Registering ─RenewResponse─▶ Closed
 ```
 
 Client-Sicht: `Connecting → Handshaking → SendHello → AwaitWelcome → Active → Closed`. Reconnect bei jedem nicht-fatalen Close und bei Netzfehlern: Backoff 1, 2, 4, 8, 15 s, dann 15 s, unbegrenzt; lokaler Zustand (Mute, Deafen, Lautstärken) bleibt. Fatal (kein Reconnect, UI-Hinweis) sind genau die in §6 mit „ja“ markierten Codes: PROTOCOL_VIOLATION, VERSION_UNSUPPORTED, AUTH_*, KICKED, RATE_LIMITED_FATAL, ENROLL_*. Alle anderen → Reconnect mit Backoff.
@@ -235,12 +209,12 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | 0x0A | `AUTH_REQUIRED` | ja | ALPN `icu/1` ohne Client-Cert |
 | 0x0B | `RATE_LIMITED_FATAL` | ja | dritter `RATE_LIMITED`-Verstoß binnen 60 s; Server schließt, Client reconnectet nicht |
 | 0x0C | `TIMEOUT` | nein | Idle-Timeout oder Transportabbruch; auch `UserLeft.reason`, wenn eine Verbindung ohne sauberes Close endet |
-| 0x0D | `NAME_TAKEN` | nein | Angeforderter Name (CSR-CN bei Enrollment oder Renewal) ist serverweit schon vergeben (case-insensitive); nichts geändert. Auf `icu/1` als `Error`, auf `icu-enroll/1` zusätzlich als Close-Code, weil dort jede Ablehnung so läuft |
-| 0x10 | `ENROLL_BAD_TOKEN` | ja | Token unbekannt/verbraucht/abgelaufen |
-| 0x11 | `ENROLL_BAD_CSR` | ja | CSR nicht parsebar/Signatur ungültig, oder Subject ohne genau einen gültigen CN |
-| 0x12 | `ENROLL_RATE_LIMITED` | ja | 5/min pro IP oder 20/min global |
+| 0x0D | `NAME_TAKEN` | nein | Angeforderter Name (CSR-CN bei Registrierung oder Renewal, Platzhalter bei `CreateInviteRequest`) ist serverweit schon vergeben (case-insensitive); nichts geändert. Als `Error` |
+| 0x10 | `ENROLL_BAD_TOKEN` | ja | reserviert; nur das entfernte `icu-enroll/1` sendete ihn |
+| 0x11 | `ENROLL_BAD_CSR` | ja | reserviert; CSR-Fehler melden Renewal und Registrierung als `RENEW_REJECTED` |
+| 0x12 | `ENROLL_RATE_LIMITED` | ja | Registrierungssitzungen: 5/min pro IP oder 20/min global |
 | 0x13 | `RENEW_REJECTED` | nein | Renewal-CSR abgelehnt (Ratenlimit, unbrauchbare CSR, unbekannter Nutzer) |
-| 0x14 | `ENROLL_BOOTSTRAP_CLOSED` | ja | Leeres Token (Bootstrap), aber `users.toml` hat schon mindestens einen Eintrag |
+| 0x14 | `ENROLL_BOOTSTRAP_CLOSED` | ja | reserviert; nur das entfernte `icu-enroll/1` sendete ihn |
 | 0x15 | `NOT_ADMIN` | nein | `CreateInviteRequest` von einem Nicht-Admin; nur als `Error`, nie als Close |
 | 0x16 | `LAST_ADMIN` | nein | Admin-Aktion würde den letzten funktionsfähigen Admin entfernen (Demote/Disable/Revoke); nur als `AdminActionError`, nie als Close |
 | 0x17 | `AUTH_DISABLED` | ja | Nutzer ist deaktiviert (`UserRecord.disabled`); geprüft beim Handshake, auch der Close-Code beim sofortigen Kick eines Online-Nutzers durch `AdminSetDisabled` |
@@ -258,7 +232,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | Users | `max_users` (Default 16, Obergrenze 64); beim Erreichen `close(SERVER_FULL)` |
 | Uni-Streams | `max_concurrent_uni_streams` = `2 × max_users + 4` je Richtung |
 | `Welcome`-Größe | Server validiert beim Start, dass `max_users` × 100 B + Reserve unter dem 16-KiB-Frame-Limit bleibt |
-| Enrollment | Stream ≤ 8 KiB, 5/min pro IP, 20/min global |
+| Registrierung | 5/min pro IP, 20/min global; je Sitzung ≤ 10 `RenewRequest`, ≤ 120 s; Registrierungszertifikat ≤ 7 Tage |
 | Hello | ≤ 5 s nach Handshake |
 
 ## 8. Versionierung

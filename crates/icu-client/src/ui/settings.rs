@@ -372,7 +372,7 @@ impl SettingsView {
         });
     }
 
-    /// Export and import of the whole identity (`PROTOCOL.md` §2.3.2).
+    /// Export and import of the whole identity (`PROTOCOL.md` §2.3.1).
     ///
     /// The armored text is never rendered: it carries the private key in the
     /// clear, and a settings window is exactly the thing people have open
@@ -489,30 +489,23 @@ impl SettingsView {
     /// private key.
     fn passport_text(&self) -> Result<String, String> {
         match Identity::load(&self.paths) {
-            Ok(Some(id)) => {
-                Ok(icu_proto::passport::PassportV1::from(&id).encode())
-            }
+            Ok(Some(id)) => Ok(id.to_passport()),
             Ok(None) => Err("Keine Identität gefunden.".into()),
             Err(e) => Err(format!("Fehlgeschlagen: {e}")),
         }
     }
 
     fn import_passport(&mut self, cmds: &mut Vec<Command>) {
-        match icu_proto::passport::PassportV1::decode(&self.passport_import) {
-            Ok(p) => {
-                let identity = Identity::from(p);
-                // The codec only checks the wrapper; a passport whose key does
-                // not parse would brick the next connection.
-                if rcgen::KeyPair::try_from(identity.key_der.as_slice()).is_err() {
-                    self.passport_status =
-                        Some("Passport enthält keinen gültigen Schlüssel.".into());
-                    return;
-                }
+        // `from_passport` also checks the key: a passport whose key does not
+        // parse would brick the next connection. A registration bundle is
+        // taken as well; the engine registers it under its placeholder name.
+        match Identity::from_passport(&self.passport_import) {
+            Ok(identity) => {
                 cmds.push(Command::ReplaceIdentity(Box::new(identity)));
                 self.passport_import.clear();
                 self.passport_status = Some("Identität ersetzt, verbinde neu…".into());
             }
-            Err(e) => self.passport_status = Some(format!("Passport unlesbar: {e}")),
+            Err(e) => self.passport_status = Some(e),
         }
     }
 
@@ -760,11 +753,14 @@ impl SettingsView {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.invite_name)
                                 .desired_width(FIELD_W)
-                                .hint_text("Name"),
+                                .hint_text("Name (optional)"),
                         );
-                        let named = !self.invite_name.trim().is_empty();
+                        // The name is only a placeholder until the invited
+                        // person picks their own; empty means a generated one.
+                        let valid = self.invite_name.trim().is_empty()
+                            || icu_proto::validate_name(self.invite_name.trim()).is_ok();
                         if ui
-                            .add_enabled_ui(named, |ui| {
+                            .add_enabled_ui(valid, |ui| {
                                 widgets::button(
                                     ui,
                                     widgets::ButtonKind::Primary,
@@ -787,7 +783,7 @@ impl SettingsView {
                         ui.colored_label(theme::tokens(ui.visuals()).error, err);
                     });
                 }
-                if let Some((blob, expires)) = &state.last_invite {
+                if let Some((bundle, expires)) = &state.last_invite {
                     ui.separator();
                     widgets::card_note(ui, |ui| {
                         let tok = theme::tokens(ui.visuals());
@@ -806,15 +802,15 @@ impl SettingsView {
                                 )
                                 .clicked()
                                 {
-                                    ui.ctx().copy_text(blob.clone());
+                                    ui.ctx().copy_text(bundle.clone());
                                 }
                             });
                         });
                         ui.add_space(4.0);
-                        let mut copy = blob.clone();
+                        let mut copy = bundle.clone();
                         ui.add(
                             egui::TextEdit::multiline(&mut copy)
-                                .desired_rows(2)
+                                .desired_rows(4)
                                 .desired_width(f32::INFINITY)
                                 .font(egui::TextStyle::Monospace),
                         );

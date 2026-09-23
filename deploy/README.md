@@ -85,9 +85,9 @@ sudo systemctl enable --now icu-server
 ```
 
 `StateDirectory=icu` legt `/var/lib/icu/` an; beim ersten Start entstehen dort
-`ca.key` (0600), `ca.crt`, `server.key` (0600), `server.crt`, `users.toml`,
-`invites.toml` und `state.lock`. **`ca.key` ist das einzige Geheimnis, das
-zählt** — geht es verloren, müssen alle Nutzer neu enrollen. Ein Backup von
+`ca.key` (0600), `ca.crt`, `server.key` (0600), `server.crt`, `users.toml`
+und `state.lock`. **`ca.key` ist das einzige Geheimnis, das zählt** — geht es
+verloren, müssen sich alle Nutzer neu registrieren. Ein Backup von
 `/var/lib/icu/` gehört zur Inbetriebnahme.
 
 Die Unit bindet IPv4 und IPv6 getrennt auf denselben Port; der Server setzt
@@ -107,7 +107,7 @@ laufenden Server; eine Änderung wirkt damit sofort und nicht erst nach einem
 Neustart. Sie brauchen root oder Mitgliedschaft in der Socket-Gruppe.
 
 ```bash
-icu-server invite --name alice --ttl 24h   # Invite-Link, einmalig, 24 h gültig
+icu-server invite --ttl 24h --out bob.txt  # Registrierungs-Bundle, einmalig, 24 h gültig
 icu-server users                           # Tabelle mit user_id, Cert, online
 icu-server rename alice alicia             # Anzeigename ändern
 icu-server revoke alice                    # alle Certs sperren, sofort kicken
@@ -115,6 +115,16 @@ icu-server status                          # Uptime, online, Relay-Zähler
 icu-server status --json                   # dasselbe für Monitoring
 icu-server rotate-server-cert              # neues Server-Leaf derselben CA
 ```
+
+**Erster Admin:** das erste Bundle auf einem leeren Server ist das des Admins —
+direkt nach der Installation also `icu-server invite --out admin.txt` (geht auch
+ohne laufenden Server), die Datei auf den eigenen Rechner bringen und dort
+`icu admin.txt --name <name>` ausführen oder den Inhalt ins Erststart-Fenster
+einfügen. Das Bundle enthält einen privaten Schlüssel und gilt, bis es
+eingelöst oder abgelaufen ist; es gehört nicht in einen Chat, den andere lesen.
+Weitere Bundles stellt ein Admin auch im Client aus (⚙ → Allgemein →
+Einladung). Die Serveradresse steht in den Zertifikaten (`public_host`,
+`server_name`), der Eingeladene braucht nichts weiter.
 
 Läuft **kein** Server, erledigt die CLI dieselbe Arbeit selbst und hält dabei
 `flock(/var/lib/icu/state.lock)`. Läuft einer und der Socket fehlt, bricht die

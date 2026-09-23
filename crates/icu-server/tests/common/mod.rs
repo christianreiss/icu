@@ -11,7 +11,6 @@ use icu_proto::{
     framing,
     header::{VIDEO_HEADER_LEN, VIDEO_MAX_FRAME},
     AudioHeader, ControlMsg, Session, UserFlags, UserId, VideoHeader, MAX_CONTROL_FRAME,
-    MAX_ENROLL_FRAME,
 };
 use icu_server::{config::Config, AdminRequest, AdminResponse, Handle};
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream};
@@ -61,70 +60,88 @@ impl TestServer {
             .to_path_buf()
     }
 
-    /// Creates an invite token through the admin path. `name` is only the
-    /// advisory label — the enrolling client picks the name that ends up in
-    /// its certificate.
-    pub async fn invite(&self, name: &str) -> String {
+    /// Issues a registration bundle through the admin path. `label` is the
+    /// placeholder name; empty means a generated one.
+    pub async fn invite(&self, label: &str) -> String {
         match self
             .handle
             .admin(AdminRequest::Invite {
-                name: name.to_string(),
+                name: label.to_string(),
                 ttl_s: Some(3600),
             })
             .await
         {
-            AdminResponse::Invite { token, .. } => token,
+            AdminResponse::Invite { bundle, .. } => bundle,
             other => panic!("invite failed: {other:?}"),
         }
     }
 
-    /// Full enrollment over ALPN `icu-enroll/1`, returning a usable identity.
+    /// Full registration: bundle, connect with it, swap it for a certificate
+    /// on a fresh key carrying `name`.
     pub async fn enroll(&self, name: &str) -> Identity {
-        let token = self.invite(name).await;
-        self.enroll_with_token(&token, name)
+        let bundle = self.invite("").await;
+        self.register(&bundle, name)
             .await
-            .expect("enrollment succeeds")
+            .expect("registration succeeds")
     }
 
-    /// Enrollment with an explicit token, so the failure paths are testable.
+    /// Registers with an explicit bundle, so the failure paths are testable.
     /// The name travels in the CSR's subject CN (`PROTOCOL.md` §2.3).
-    pub async fn enroll_with_token(&self, token: &str, name: &str) -> Result<Identity, EnrollFail> {
+    pub async fn register(&self, bundle: &str, name: &str) -> Result<Identity, EnrollFail> {
         let (key, csr) = csr_with_cn(name);
+        self.register_with_csr(bundle, key, csr).await
+    }
 
-        let endpoint = client_endpoint(self.ca(), None, icu_proto::limits::ALPN_ENROLL);
-        let conn = endpoint
-            .connect(self.addr(), "localhost")
-            .expect("connect")
-            .await
-            .map_err(|e| EnrollFail::Connection(e.to_string()))?;
-        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
-        let request = icu_proto::EnrollMsg::EnrollRequest {
-            token: token.to_string(),
-            csr_der: csr,
-            name: String::new(),
-        };
-        send.write_all(&request.encode().expect("encode"))
-            .await
-            .expect("write");
-        send.finish().expect("finish");
-
-        let body = read_frame(&mut recv, MAX_ENROLL_FRAME)
+    /// [`TestServer::register`] with a caller-built CSR.
+    pub async fn register_with_csr(
+        &self,
+        bundle: &str,
+        key: rcgen::KeyPair,
+        csr: Vec<u8>,
+    ) -> Result<Identity, EnrollFail> {
+        let registration = identity_from_bundle(bundle);
+        let mut client = self
+            .connect(&registration)
             .await
             .map_err(EnrollFail::Connection)?;
-        match icu_proto::EnrollMsg::decode(&body).expect("decode") {
-            icu_proto::EnrollMsg::EnrollResponse {
-                leaf_der, ca_der, ..
-            } => Ok(Identity {
+        let welcome = client
+            .hello_with("", icu_proto::MINOR, UserFlags::NONE)
+            .await
+            .ok_or_else(|| {
+                EnrollFail::Connection(match client.conn.close_reason() {
+                    Some(e) => e.to_string(),
+                    None => "no Welcome".into(),
+                })
+            })?;
+        let ControlMsg::Welcome { registration, .. } = welcome else {
+            panic!("expected Welcome, got {welcome:?}");
+        };
+        assert!(
+            registration,
+            "a registration certificate gets a registration session"
+        );
+        client
+            .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
+            .await;
+        let answer = client
+            .recv_matching(|m| !matches!(m, ControlMsg::Pong { .. }))
+            .await;
+        let result = match answer {
+            Some(ControlMsg::RenewResponse { leaf_der }) => Ok(Identity {
                 cert: CertificateDer::from(leaf_der),
                 key_pem: key.serialize_pem(),
                 key_der: key.serialize_der(),
-                ca: CertificateDer::from(ca_der),
+                ca: registration_ca(bundle),
             }),
-            icu_proto::EnrollMsg::Error { code, detail } => {
-                Err(EnrollFail::Rejected { code, detail })
-            }
-            other => panic!("unexpected enrollment answer: {other:?}"),
-        }
+            Some(ControlMsg::Error { code, detail }) => Err(EnrollFail::Rejected { code, detail }),
+            Some(other) => panic!("unexpected registration answer: {other:?}"),
+            None => Err(EnrollFail::Connection(match client.conn.close_reason() {
+                Some(e) => e.to_string(),
+                None => "no answer".into(),
+            })),
+        };
+        client.conn.close(quinn::VarInt::from_u32(0), b"");
+        result
     }
 
     /// Enrolls and immediately connects and says `Hello`.
@@ -163,10 +180,10 @@ pub fn csr_with_cn(cn: &str) -> (rcgen::KeyPair, Vec<u8>) {
     (key, csr)
 }
 
-/// Why an enrollment failed.
+/// Why a registration failed.
 #[derive(Debug)]
 pub enum EnrollFail {
-    /// The server answered with `EnrollMsg::Error`.
+    /// The server answered with `Error`.
     Rejected {
         /// Error code.
         code: u32,
@@ -185,6 +202,24 @@ impl EnrollFail {
             EnrollFail::Connection(text) => close_code_from(text),
         }
     }
+}
+
+/// The identity inside a registration bundle.
+pub fn identity_from_bundle(bundle: &str) -> Identity {
+    let parts = icu_proto::passport::Passport::decode(bundle)
+        .expect("bundle decodes")
+        .into_parts();
+    let key = rcgen::KeyPair::try_from(parts.key_der.as_slice()).expect("bundle key");
+    Identity {
+        cert: CertificateDer::from(parts.leaf_der),
+        key_pem: key.serialize_pem(),
+        key_der: parts.key_der,
+        ca: CertificateDer::from(parts.ca_der),
+    }
+}
+
+fn registration_ca(bundle: &str) -> CertificateDer<'static> {
+    identity_from_bundle(bundle).ca
 }
 
 /// A client certificate plus its key.

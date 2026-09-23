@@ -15,7 +15,7 @@ use crate::{
     config::{Identity, Paths},
     dsp::gate::Mode,
     engine::{AppState, Command, ConnStatus, Engine},
-    net::enroll::{enroll, InviteLink},
+    net::register::register,
     video::VideoTier,
 };
 
@@ -1105,7 +1105,8 @@ fn alone(ui: &mut egui::Ui) {
 // Enrollment window
 // ---------------------------------------------------------------------------
 
-/// Shows a window that takes an invite link and turns it into an identity.
+/// Shows a window that takes a registration bundle (or a passport) and turns
+/// it into an identity.
 pub fn run_enroll(
     paths: Paths,
     server_addr: Option<SocketAddr>,
@@ -1143,7 +1144,7 @@ pub fn run_enroll(
     Ok(out)
 }
 
-/// Where the enrollment thread drops its result for the UI thread.
+/// Where the registration thread drops its result for the UI thread.
 type EnrollSlot = Arc<Mutex<Option<Result<Identity, String>>>>;
 
 /// What the enrollment window has to say, if anything.
@@ -1159,64 +1160,57 @@ struct EnrollApp {
     server_addr: Option<SocketAddr>,
     link: String,
     /// The name the user picks. It is what the CSR asks for, so it ends up in
-    /// the certificate; a link's `n=` only prefills it (`PROTOCOL.md` §2.3).
+    /// the certificate; the bundle's placeholder only prefills it
+    /// (`PROTOCOL.md` §2.3).
     name: String,
-    /// The `n=` prefill already taken from the pasted link, so a newly pasted
-    /// link can refill the field without overwriting what the user typed.
+    /// The placeholder already taken from the pasted bundle, so a newly
+    /// pasted one can refill the field without overwriting what the user
+    /// typed.
     prefilled_from: Option<String>,
     status: Option<EnrollStatus>,
-    /// The in-flight enrollment's result slot. `Some` means a thread is
-    /// running: without it a second click would start a second enrollment
-    /// against a token the first one is already spending.
+    /// The in-flight registration's result slot. `Some` means a thread is
+    /// running: without it a second click would start a second registration
+    /// with a bundle the first one is already spending.
     pending: Option<EnrollSlot>,
     result: Arc<Mutex<Option<Identity>>>,
 }
 
 impl EnrollApp {
-    /// Parses the link and starts the enrollment thread.
-    ///
-    /// A passport is handled right here: it is a local file, not an invite —
-    /// there is no server round trip to make.
+    /// Reads the pasted text and either takes it as it is (a passport) or
+    /// starts the registration thread (a registration bundle).
     fn submit(&mut self) {
-        if icu_proto::passport::PassportV1::looks_like(&self.link) {
-            match icu_proto::passport::PassportV1::decode(&self.link) {
-                Ok(p) => {
-                    let identity = Identity::from(p);
-                    if rcgen::KeyPair::try_from(identity.key_der.as_slice()).is_err() {
-                        self.status = Some(EnrollStatus::Failed(
-                            "Passport enthält keinen gültigen Schlüssel.".into(),
-                        ));
-                        return;
-                    }
-                    // Through the same slot as an enrollment, so the one place
-                    // that saves and closes the window stays the only one.
-                    let slot: EnrollSlot = Arc::new(Mutex::new(Some(Ok(identity))));
-                    self.pending = Some(slot);
-                }
-                Err(e) => {
-                    self.status = Some(EnrollStatus::Failed(format!("Passport unlesbar: {e}")))
-                }
+        let identity = match Identity::from_passport(&self.link) {
+            Ok(identity) => identity,
+            Err(e) => {
+                self.status = Some(EnrollStatus::Failed(e));
+                return;
             }
+        };
+        if !identity.is_registration() {
+            // A passport is a local file, not an invite — there is no server
+            // round trip to make. Through the same slot as a registration, so
+            // the one place that saves and closes the window stays the only
+            // one.
+            let slot: EnrollSlot = Arc::new(Mutex::new(Some(Ok(identity))));
+            self.pending = Some(slot);
             return;
         }
-        match InviteLink::parse(&self.link) {
-            Ok(link) => {
-                let (host, port) = link.host_port();
-                self.status = Some(EnrollStatus::Busy(format!("Verbinde mit {host}:{port}…")));
-                let slot: EnrollSlot = Arc::new(Mutex::new(None));
-                self.pending = Some(slot.clone());
-                let addr = self.server_addr;
-                let name = self.name.trim().to_string();
-                std::thread::spawn(move || {
-                    let rt = tokio::runtime::Runtime::new().expect("runtime");
-                    let r = rt
-                        .block_on(enroll(&link, &name, addr))
-                        .map_err(|e| e.to_string());
-                    *slot.lock().unwrap() = Some(r);
-                });
-            }
-            Err(e) => self.status = Some(EnrollStatus::Failed(e.to_string())),
-        }
+        self.status = Some(EnrollStatus::Busy(format!(
+            "Verbinde mit {}:{}…",
+            identity.server.host, identity.server.port
+        )));
+        let slot: EnrollSlot = Arc::new(Mutex::new(None));
+        self.pending = Some(slot.clone());
+        let addr = self.server_addr;
+        let name = self.name.trim().to_string();
+        let client = format!("icu/{} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS);
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("runtime");
+            let r = rt
+                .block_on(register(&identity, &name, &client, addr))
+                .map_err(|e| e.to_string());
+            *slot.lock().unwrap() = Some(r);
+        });
     }
 }
 
@@ -1283,13 +1277,14 @@ impl eframe::App for EnrollApp {
                 });
                 ui.add_space(14.0);
 
-                // A passport carries its own certificate; everything else
-                // needs a name, prefilled from the link's `n=` when it has one.
-                let parsed = InviteLink::parse(&self.link).ok();
-                let prefill = match &parsed {
-                    Some(InviteLink::Link { name, .. }) => name.clone(),
-                    _ => None,
-                };
+                // A passport carries its own certificate; a registration
+                // bundle needs a name, prefilled from its placeholder.
+                let registration = Identity::from_passport(&self.link)
+                    .ok()
+                    .filter(Identity::is_registration);
+                let prefill = registration.as_ref().map(|id| {
+                    crate::conninfo::CertInfo::from_der(&id.leaf_der).subject
+                });
                 if prefill != self.prefilled_from {
                     if let Some(n) = &prefill {
                         if self.name.trim().is_empty()
@@ -1300,7 +1295,7 @@ impl eframe::App for EnrollApp {
                     }
                     self.prefilled_from = prefill;
                 }
-                let needs_name = !icu_proto::passport::PassportV1::looks_like(&self.link);
+                let needs_name = registration.is_some();
                 let mut submit = false;
                 widgets::group_card(ui, "Einladung", |ui| {
                     widgets::card_note(ui, |ui| {
@@ -1310,7 +1305,7 @@ impl eframe::App for EnrollApp {
                                 .desired_rows(2)
                                 .desired_width(f32::INFINITY)
                                 .font(egui::TextStyle::Monospace)
-                                .hint_text("icu://… · ICU1-… · host:port · Passport"),
+                                .hint_text(icu_proto::passport::ARMOR_BEGIN),
                         );
                     });
                     if needs_name {

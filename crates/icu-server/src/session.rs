@@ -40,7 +40,12 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
         }
     };
 
-    match serve(&server, &conn, &identity).await {
+    let served = if identity.registration {
+        serve_registration(&server, &conn, &identity).await
+    } else {
+        serve(&server, &conn, &identity).await
+    };
+    match served {
         Ok(()) => Ok(()),
         Err(e) => {
             let code = e.code().unwrap_or(ec::PROTOCOL_VIOLATION);
@@ -62,6 +67,11 @@ struct Identity {
     /// says whether this client still holds a certificate carrying the current
     /// name, or has to catch up (`PROTOCOL.md` §2.2).
     cert_cn: String,
+    /// Authenticated with a registration certificate (`PROTOCOL.md` §2.3).
+    registration: bool,
+    /// SubjectPublicKeyInfo of the presented leaf. A registration has to
+    /// bring a different key.
+    cert_spki: Vec<u8>,
 }
 
 async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<Identity> {
@@ -108,10 +118,22 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
         user_id,
         cert_fp: fp,
         cert_cn,
+        registration: cert.registration,
+        cert_spki: ca::leaf_public_key(leaf),
     })
 }
 
-async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identity) -> Result<()> {
+/// What `Hello` said, plus the control stream it arrived on.
+struct Hello {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    minor: u16,
+    client: String,
+    initial: icu_proto::UserFlags,
+}
+
+/// Accepts the control stream and reads `Hello` within the timeout.
+async fn read_hello(server: &Arc<Server>, conn: &quinn::Connection) -> Result<Hello> {
     // 2. Control stream and `Hello` within the timeout (§6.4.2) — one
     //    deadline for both, not one each, or a client could take twice as
     //    long as the spec allows.
@@ -159,6 +181,23 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     // `Hello.name` is obsolete: the name lives in the certificate, and the
     // store mirrors the CN of the newest one (§6.4.2).
     let _ = name;
+    Ok(Hello {
+        send,
+        recv,
+        minor,
+        client,
+        initial,
+    })
+}
+
+async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identity) -> Result<()> {
+    let Hello {
+        send,
+        mut recv,
+        minor,
+        client,
+        initial,
+    } = read_hello(server, conn).await?;
     // The store lock is held from here across `room.join`. A revoke or
     // disable during the `Hello` wait happened after `authenticate` and
     // before this session is in the room, where `kick_user` cannot see it;
@@ -197,6 +236,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         users,
         min_client,
         is_admin,
+        registration: false,
     };
     let session = match server.room.join(
         identity.user_id,
@@ -266,6 +306,201 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     });
     tracing::info!(session, reason = ec::name(reason), "left");
     outcome
+}
+
+/// How long a registration session may stay open in total. Long enough for a
+/// user to retry a taken name a few times, short enough that a bundle cannot
+/// park a connection.
+const REGISTRATION_SESSION: Duration = Duration::from_secs(120);
+
+/// How long a finished registration session waits for the client to close.
+const REGISTRATION_LINGER: Duration = Duration::from_secs(5);
+
+/// `RenewRequest`s one registration session may send before it is closed.
+const REGISTRATION_ATTEMPTS: u32 = 10;
+
+/// A session authenticated with a registration certificate
+/// (`PROTOCOL.md` §2.3). It never joins the room: after `Welcome` with
+/// `registration = true` the only useful message is a `RenewRequest` with a
+/// fresh key. On success the answer is `RenewResponse`, the registration
+/// certificate is revoked, and the client reconnects with its own.
+async fn serve_registration(
+    server: &Arc<Server>,
+    conn: &quinn::Connection,
+    identity: &Identity,
+) -> Result<()> {
+    let allowed = server
+        .ip_limits
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allow_enroll(conn.remote_address().ip());
+    Counters::inc(&server.counters.enroll_attempts);
+    if !allowed {
+        Counters::inc(&server.counters.enroll_failed);
+        return Err(Error::coded(
+            ec::ENROLL_RATE_LIMITED,
+            "too many registrations",
+        ));
+    }
+
+    let Hello {
+        mut send,
+        mut recv,
+        minor,
+        client,
+        initial: _,
+    } = read_hello(server, conn).await?;
+    let (name, is_admin) = {
+        let store = server.store.lock().await;
+        let user = store.user(identity.user_id).ok_or_else(|| {
+            Error::coded(ec::AUTH_UNKNOWN_CERT, "registration user vanished")
+        })?;
+        (user.name.clone(), user.is_admin)
+    };
+    let welcome = ControlMsg::Welcome {
+        minor,
+        caps: icu_proto::CAPS,
+        you: UserInfo {
+            user_id: identity.user_id,
+            session: 0,
+            name,
+            flags: icu_proto::UserFlags::NONE,
+        },
+        audio: AudioParams::default(),
+        users: Vec::new(),
+        min_client: server.config.server.min_client.clone(),
+        is_admin,
+        registration: true,
+    };
+    write_msg(&mut send, &welcome).await?;
+    tracing::info!(
+        user_id = identity.user_id,
+        remote = %conn.remote_address(),
+        client = %client,
+        "registration session"
+    );
+
+    let deadline = tokio::time::Instant::now() + REGISTRATION_SESSION;
+    let mut attempts = 0u32;
+    loop {
+        let body = tokio::select! {
+            body = wire::read_frame(&mut recv, MAX_CONTROL_FRAME) => body,
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(Error::coded(ec::TIMEOUT, "registration took too long"));
+            }
+            _ = server.shutdown_requested() => {
+                return Err(Error::coded(ec::SHUTDOWN, "server is shutting down"));
+            }
+        };
+        let body = match body {
+            Ok(body) => body,
+            Err(e) if e.code() == Some(ec::PROTOCOL_VIOLATION) => return Err(e),
+            Err(_) => return Ok(()),
+        };
+        let msg = ControlMsg::decode(&body)
+            .map_err(|e| Error::coded(ec::PROTOCOL_VIOLATION, e.to_string()))?;
+        match msg {
+            ControlMsg::Ping { nonce } => {
+                let pong = ControlMsg::Pong {
+                    nonce,
+                    server_time_ms: unix_millis(),
+                };
+                write_msg(&mut send, &pong).await?;
+            }
+            ControlMsg::RenewRequest { csr_der } => {
+                attempts += 1;
+                match redeem(server, identity, &csr_der).await {
+                    Ok(leaf_der) => {
+                        Counters::inc(&server.counters.enroll_ok);
+                        write_msg(&mut send, &ControlMsg::RenewResponse { leaf_der }).await?;
+                        let _ = send.finish();
+                        // The client closes once it has the certificate; a
+                        // close from here could overtake the response.
+                        let _ = tokio::time::timeout(REGISTRATION_LINGER, conn.closed()).await;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        Counters::inc(&server.counters.enroll_failed);
+                        let code = e.code().unwrap_or(ec::RENEW_REJECTED);
+                        if ec::is_fatal(code) {
+                            return Err(e);
+                        }
+                        let error = ControlMsg::Error {
+                            code,
+                            detail: e.to_string(),
+                        };
+                        write_msg(&mut send, &error).await?;
+                        if attempts >= REGISTRATION_ATTEMPTS {
+                            return Err(Error::coded(
+                                ec::RATE_LIMITED_FATAL,
+                                "too many registration attempts",
+                            ));
+                        }
+                    }
+                }
+            }
+            other => {
+                return Err(Error::coded(
+                    ec::PROTOCOL_VIOLATION,
+                    format!("{} during registration", other.variant()),
+                ));
+            }
+        }
+    }
+}
+
+/// Signs the registering client's CSR and swaps the registration certificate
+/// for it. The CSR's CN is the name the user picked, its key must be new.
+async fn redeem(server: &Arc<Server>, identity: &Identity, csr_der: &[u8]) -> Result<Vec<u8>> {
+    let requested = ca::csr_common_name(csr_der)
+        .map_err(|e| Error::coded(ec::RENEW_REJECTED, e.to_string()))?;
+    if ca::csr_public_key(csr_der)? == identity.cert_spki {
+        return Err(Error::coded(
+            ec::RENEW_REJECTED,
+            "registration needs a freshly generated key",
+        ));
+    }
+    let mut store = server.store.lock().await;
+    if store.name_taken(&requested, Some(identity.user_id)) {
+        return Err(Error::coded(
+            ec::NAME_TAKEN,
+            format!("name {requested:?} is already taken"),
+        ));
+    }
+    let (leaf, cn) = {
+        let ca = server.ca.read().await;
+        ca.sign_client_csr(
+            csr_der,
+            server.config.tls.client_validity_days,
+            &server.config.public_host(),
+        )
+        .map_err(|e| Error::coded(ec::RENEW_REJECTED, e.to_string()))?
+    };
+    let issued = now();
+    let cert = CertRecord {
+        fingerprint: fingerprint(&leaf),
+        cn: cn.clone(),
+        issued: rfc3339(issued),
+        expires: rfc3339(
+            issued + Duration::from_secs(u64::from(server.config.tls.client_validity_days) * 86400),
+        ),
+        revoked: false,
+        renewed: None,
+        registration: false,
+    };
+    store.redeem_registration(identity.user_id, &identity.cert_fp, cert)?;
+    drop(store);
+    tracing::info!(user_id = identity.user_id, name = %cn, "registered");
+    Ok(leaf.to_vec())
+}
+
+/// Encodes and writes one control message straight onto the stream, for the
+/// registration session, which has no room queue.
+async fn write_msg(send: &mut quinn::SendStream, msg: &ControlMsg) -> Result<()> {
+    let frame = msg
+        .encode()
+        .map_err(|e| Error::coded(ec::PROTOCOL_VIOLATION, e.to_string()))?;
+    wire::write_frame(send, &frame).await
 }
 
 /// Drains the outgoing control queue onto the control stream.
@@ -563,7 +798,11 @@ async fn handle_renew(
 
     let signed = {
         let ca = server.ca.read().await;
-        ca.sign_client_csr(csr_der, server.config.tls.client_validity_days)
+        ca.sign_client_csr(
+            csr_der,
+            server.config.tls.client_validity_days,
+            &server.config.public_host(),
+        )
     };
     let (leaf, cn) = match signed {
         Ok(signed) => signed,
@@ -585,6 +824,7 @@ async fn handle_renew(
         ),
         revoked: false,
         renewed: None,
+        registration: false,
     };
     // Only a catch-up stamps the presented certificate: the same certificate
     // may be on a second device (passport) that still has to catch up itself.
@@ -617,8 +857,8 @@ async fn handle_renew(
     }
 }
 
-/// Mints an invite and returns it as a self-contained blob (`CreateInviteRequest`,
-/// `PROTOCOL.md` §2.3.1). Admin only; rejected non-fatally otherwise.
+/// Issues a registration and returns its bundle (`CreateInviteRequest`,
+/// `PROTOCOL.md` §2.3). Admin only; rejected non-fatally otherwise.
 async fn handle_create_invite(
     server: &Arc<Server>,
     session: Session,
@@ -628,54 +868,33 @@ async fn handle_create_invite(
 ) {
     let reject = |code: u32, detail: String| ControlMsg::Error { code, detail };
 
-    let mut store = server.store.lock().await;
-    if !store.is_admin(user_id) {
+    if !server.store.lock().await.is_admin(user_id) {
         server
             .room
             .send_to(session, &reject(ec::NOT_ADMIN, "not an admin".into()));
         return;
     }
-    let ttl = Duration::from_secs(if ttl_s == 0 { pl::INVITE_TTL_S } else { ttl_s });
-    // The label binds nothing (the invited user picks their own name), so the
-    // only failure here is a malformed label or a failed write. `NAME_TAKEN` is
-    // the non-fatal code the client already shows next to the invite field.
-    let (token, record) = match store.create_invite(name, ttl) {
-        Ok(v) => v,
+    // The label is only a placeholder name, so the failures are a malformed
+    // or taken one, or a failed write. `NAME_TAKEN` is the non-fatal code the
+    // client already shows next to the invite field.
+    match crate::registration::issue(server, name, ttl_s).await {
+        Ok(issued) => {
+            tracing::info!(user_id, invited = issued.user_id, "registration bundle minted");
+            server.room.send_to(
+                session,
+                &ControlMsg::CreateInviteResponse {
+                    bundle: issued.bundle,
+                    expires: issued.expires,
+                },
+            );
+        }
         Err(e) => {
             server.room.send_to(
                 session,
                 &reject(e.code().unwrap_or(ec::NAME_TAKEN), e.to_string()),
             );
-            return;
         }
-    };
-    drop(store);
-
-    let ca_der = server.ca.read().await.ca_der().to_vec();
-    let aad_blob = icu_proto::invite_blob::InviteBlob {
-        host_port: server.config.public_host(),
-        server_name: server.config.server.server_name.clone(),
-        ca_der,
-        expires: record.expires.clone(),
-        nonce: [0u8; 12],
-        sealed: Vec::new(),
-    };
-    let aad = aad_blob.aad();
-    let (nonce, sealed) = server.invite_key.seal(&token, &aad);
-    let blob = icu_proto::invite_blob::InviteBlob {
-        nonce,
-        sealed,
-        ..aad_blob
-    };
-
-    tracing::info!(user_id, name, "invite blob minted");
-    server.room.send_to(
-        session,
-        &ControlMsg::CreateInviteResponse {
-            blob: blob.encode(),
-            expires: record.expires,
-        },
-    );
+    }
 }
 
 /// Shared body of the in-band admin actions (`PROTOCOL.md` §2.2).

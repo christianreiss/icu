@@ -21,15 +21,18 @@ struct Cli {
 enum Command {
     /// Start the server. Creates CA and server certificate on first run.
     Run,
-    /// Create an invite token and print the link.
+    /// Issue a registration bundle and print it. The first one on an empty
+    /// server is for an admin.
     Invite {
-        /// Optional name prefill for the invited user's dialog. The name the
-        /// certificate carries is the one that user picks.
+        /// Placeholder name until the invited user picks their own.
         #[arg(long)]
         name: Option<String>,
-        /// Lifetime, e.g. `24h`, `30m`, `7d`.
+        /// Lifetime, e.g. `24h`, `30m`, `7d` (at most 7 days).
         #[arg(long, default_value = "24h")]
         ttl: String,
+        /// Write the bundle to this file (mode 0600) instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// List all users.
     Users {
@@ -104,7 +107,9 @@ async fn run(cli: Cli) -> Result<()> {
             handle.shutdown().await;
             Ok(())
         }
-        Command::Invite { name, ttl } => cli::invite::run(&config, name.as_deref(), &ttl).await,
+        Command::Invite { name, ttl, out } => {
+            cli::invite::run(&config, name.as_deref(), &ttl, out.as_deref()).await
+        }
         Command::Users { json } => cli::users::run(&config, json).await,
         Command::Revoke { user } => {
             cli::with_closed(&config, AdminRequest::Revoke { user }, "revoked").await

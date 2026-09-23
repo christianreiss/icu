@@ -25,11 +25,10 @@ pub mod ca;
 pub mod cli;
 pub mod config;
 pub mod endpoint;
-pub mod enroll;
 pub mod error;
-pub mod invite_key;
 pub mod limits;
 pub mod loss;
+pub mod registration;
 pub mod relay;
 pub mod room;
 pub mod session;
@@ -52,7 +51,6 @@ pub use crate::{
 
 use crate::{
     ca::Ca,
-    invite_key::InviteKey,
     limits::IpLimits,
     loss::LossTracker,
     room::{Counters, Room},
@@ -68,9 +66,6 @@ pub struct Server {
     pub ca: tokio::sync::RwLock<Ca>,
     /// Persistent state. The running server is its only writer (§5).
     pub store: tokio::sync::Mutex<Store>,
-    /// Seals/opens the bearer token carried inside an invite blob. Never
-    /// rotates in v1, so no lock is needed.
-    pub invite_key: InviteKey,
     /// The one room.
     pub room: Room,
     /// Relay counters.
@@ -111,7 +106,6 @@ impl Server {
             &config.tls,
             &config.server.server_name,
         )?;
-        let invite_key = InviteKey::load_or_create(&config.paths.state_dir)?;
         let (shutdown, _) = watch::channel(false);
         Ok(Arc::new(Server {
             room: Room::new(config.server.max_users),
@@ -121,7 +115,6 @@ impl Server {
             counters: Counters::default(),
             ca: tokio::sync::RwLock::new(ca),
             store: tokio::sync::Mutex::new(store),
-            invite_key,
             started: Instant::now(),
             shutdown,
             config,
@@ -175,7 +168,7 @@ impl Handle {
     }
 
     /// Runs one admin command through exactly the code path the Unix socket
-    /// uses. This is how an in-process test mints an invite token.
+    /// uses. This is how an in-process test issues a registration bundle.
     pub async fn admin(&self, request: AdminRequest) -> AdminResponse {
         admin::handle(&self.server, request).await
     }
@@ -226,16 +219,15 @@ pub async fn run(config: Config) -> Result<Handle> {
 
     // 1–4: state directory, lock, CA, server certificate.
     let mut store = Store::open(&config.paths.state_dir)?;
-    let purged = store.purge_expired_invites()?;
+    let purged = store.purge_expired_registrations()?;
     if purged > 0 {
-        tracing::info!(purged, "dropped expired invites");
+        tracing::info!(purged, "dropped expired registrations");
     }
     let ca = Ca::load_or_create(
         &config.paths.state_dir,
         &config.tls,
         &config.server.server_name,
     )?;
-    let invite_key = InviteKey::load_or_create(&config.paths.state_dir)?;
 
     // 5–7: TLS, QUIC, one endpoint per listen address.
     let quic_config = endpoint::server_config(&config, &ca)?;
@@ -256,7 +248,6 @@ pub async fn run(config: Config) -> Result<Handle> {
         counters: Counters::default(),
         ca: tokio::sync::RwLock::new(ca),
         store: tokio::sync::Mutex::new(store),
-        invite_key,
         started: Instant::now(),
         shutdown,
         config,

@@ -2498,7 +2498,6 @@ name = "icu-client"
 version = "0.1.0"
 dependencies = [
  "ashpd",
- "base64 0.22.1",
  "bytes",
  "calloop 0.14.4",
  "calloop-wayland-source 0.4.1",
@@ -2558,7 +2557,6 @@ dependencies = [
 name = "icu-server"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "bytes",
  "clap",
  "icu-proto",
@@ -2573,7 +2571,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2",
- "subtle",
  "tempfile",
  "time",
  "tokio",

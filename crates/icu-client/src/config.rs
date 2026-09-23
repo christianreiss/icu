@@ -351,19 +351,70 @@ impl Settings {
     }
 }
 
-/// `identity/server.toml`: the only place the server coordinates live.
+/// `identity/server.toml`: where to connect.
+///
+/// Derived from the certificates wherever they say it (`PROTOCOL.md` §2.3):
+/// the leaf's URI SAN `icu://host:port` and the CA's CN `ICU CA <server_name>`.
+/// The file keeps it for identities whose certificates predate that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerInfo {
-    /// Host from the invite link.
+    /// Host to dial.
     pub host: String,
-    /// Port from the invite link.
+    /// Port to dial.
     pub port: u16,
-    /// SNI from `EnrollResponse.server_name`.
+    /// SNI for the connection.
     pub server_name: String,
     /// Last known display name, mirrored from the certificate's CN at
-    /// enrollment and after every renewal. Informational: the certificate is
-    /// the authority (`PROTOCOL.md` §2.1).
+    /// registration and after every renewal. Informational: the certificate
+    /// is the authority (`PROTOCOL.md` §2.1).
     pub name: String,
+}
+
+impl ServerInfo {
+    /// Where to connect, read from the certificates: host and port from the
+    /// leaf's `icu://` URI SAN, SNI from the CA's CN `ICU CA <server_name>`
+    /// (the host when the CA predates that), name from the leaf's CN. `None`
+    /// when the leaf carries no such URI.
+    pub fn from_certs(leaf_der: &[u8], ca_der: &[u8]) -> Option<ServerInfo> {
+        use x509_parser::extensions::GeneralName;
+        let (_, leaf) = x509_parser::parse_x509_certificate(leaf_der).ok()?;
+        let authority = leaf
+            .subject_alternative_name()
+            .ok()??
+            .value
+            .general_names
+            .iter()
+            .find_map(|n| match n {
+                GeneralName::URI(u) => u.strip_prefix("icu://").map(str::to_string),
+                _ => None,
+            })?;
+        let (host, port) = crate::net::split_host_port(authority.trim_end_matches('/')).ok()?;
+        let name = leaf
+            .subject()
+            .iter_common_name()
+            .next()
+            .and_then(|cn| cn.as_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let server_name = x509_parser::parse_x509_certificate(ca_der)
+            .ok()
+            .and_then(|(_, ca)| {
+                ca.subject()
+                    .iter_common_name()
+                    .next()
+                    .and_then(|cn| cn.as_str().ok())
+                    .and_then(|cn| cn.strip_prefix("ICU CA "))
+                    .map(|s| s.trim().to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| host.clone());
+        Some(ServerInfo {
+            host,
+            port,
+            server_name,
+            name,
+        })
+    }
 }
 
 /// Key, leaf, CA and server coordinates.
@@ -395,37 +446,78 @@ impl std::fmt::Debug for Identity {
     }
 }
 
-impl From<&Identity> for icu_proto::passport::PassportV1 {
-    fn from(id: &Identity) -> Self {
-        icu_proto::passport::PassportV1 {
-            host: id.server.host.clone(),
-            port: id.server.port,
-            server_name: id.server.server_name.clone(),
-            name: id.server.name.clone(),
-            key_der: id.key_der.clone(),
-            leaf_der: id.leaf_der.clone(),
-            ca_der: id.ca_der.clone(),
-        }
-    }
-}
-
-impl From<icu_proto::passport::PassportV1> for Identity {
-    fn from(p: icu_proto::passport::PassportV1) -> Self {
-        Identity {
-            key_der: p.key_der,
-            leaf_der: p.leaf_der,
-            ca_der: p.ca_der,
-            server: ServerInfo {
-                host: p.host,
-                port: p.port,
-                server_name: p.server_name,
-                name: p.name,
-            },
-        }
-    }
-}
-
 impl Identity {
+    /// Reads a pasted passport or registration bundle.
+    ///
+    /// Version 2 carries no address of its own, so its certificates must say
+    /// where the server is; version 1 brings its fields. Either way the key
+    /// has to parse, since the codec only checks the wrapper.
+    pub fn from_passport(armored: &str) -> Result<Identity, String> {
+        use icu_proto::passport::Passport;
+        let passport = Passport::decode(armored).map_err(|e| format!("Passport unlesbar: {e}"))?;
+        let identity = match passport {
+            Passport::V1(p) => Identity {
+                key_der: p.key_der,
+                leaf_der: p.leaf_der,
+                ca_der: p.ca_der,
+                server: ServerInfo {
+                    host: p.host,
+                    port: p.port,
+                    server_name: p.server_name,
+                    name: p.name,
+                },
+            },
+            Passport::V2(p) => {
+                let server = ServerInfo::from_certs(&p.leaf_der, &p.ca_der).ok_or_else(|| {
+                    "Passport enthält keine Serveradresse im Zertifikat.".to_string()
+                })?;
+                Identity {
+                    key_der: p.key_der,
+                    leaf_der: p.leaf_der,
+                    ca_der: p.ca_der,
+                    server,
+                }
+            }
+        };
+        if rcgen::KeyPair::try_from(identity.key_der.as_slice()).is_err() {
+            return Err("Passport enthält keinen gültigen Schlüssel.".into());
+        }
+        Ok(identity)
+    }
+
+    /// The armored passport for this identity. Version 2 when the leaf says
+    /// where the server is, otherwise version 1 with the address spelled out —
+    /// a version 2 export of an older certificate would not know where to
+    /// connect.
+    pub fn to_passport(&self) -> String {
+        use icu_proto::passport::{PassportV1, PassportV2};
+        if ServerInfo::from_certs(&self.leaf_der, &self.ca_der).is_some() {
+            PassportV2 {
+                key_der: self.key_der.clone(),
+                leaf_der: self.leaf_der.clone(),
+                ca_der: self.ca_der.clone(),
+            }
+            .encode()
+        } else {
+            PassportV1 {
+                host: self.server.host.clone(),
+                port: self.server.port,
+                server_name: self.server.server_name.clone(),
+                name: self.server.name.clone(),
+                key_der: self.key_der.clone(),
+                leaf_der: self.leaf_der.clone(),
+                ca_der: self.ca_der.clone(),
+            }
+            .encode()
+        }
+    }
+
+    /// Whether this is a registration bundle that still has to be swapped for
+    /// a certificate of its own (`net::register`).
+    pub fn is_registration(&self) -> bool {
+        crate::net::register::is_registration(&self.leaf_der)
+    }
+
     /// Loads the identity, `Ok(None)` if not enrolled yet.
     pub fn load(paths: &Paths) -> Result<Option<Identity>, ConfigError> {
         if !paths.server().exists() {
@@ -554,6 +646,97 @@ mod tests {
         assert_eq!(s.audio.mode, ModeSetting::Vad);
         assert_eq!(s.audio.release_ms, 150);
         assert!(s.overlay.dim_non_speaking, "old settings.toml default on");
+    }
+
+    /// A CA named like a current server's and a leaf with the URI SAN, as
+    /// `(leaf, ca, key)` DER.
+    fn issued(uri: Option<&str>, ca_cn: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SanType};
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params.distinguished_name.push(DnType::CommonName, ca_cn);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(DnType::CommonName, "alice");
+        if let Some(uri) = uri {
+            params.subject_alt_names = vec![SanType::URI(uri.to_string().try_into().unwrap())];
+        }
+        let leaf = params.signed_by(&key, &issuer).unwrap();
+        (leaf.der().to_vec(), ca.der().to_vec(), key.serialize_der())
+    }
+
+    #[test]
+    fn server_info_comes_from_the_certificates() {
+        let (leaf, ca, _) = issued(Some("icu://icu.example.org:4711"), "ICU CA sni.example.org");
+        let info = ServerInfo::from_certs(&leaf, &ca).unwrap();
+        assert_eq!(info.host, "icu.example.org");
+        assert_eq!(info.port, 4711);
+        assert_eq!(info.server_name, "sni.example.org");
+        assert_eq!(info.name, "alice");
+
+        // A CA from before the FQDN moved into its CN: SNI falls back to the
+        // host.
+        let (leaf, ca, _) = issued(Some("icu://[::1]:5000"), "ICU CA");
+        let info = ServerInfo::from_certs(&leaf, &ca).unwrap();
+        assert_eq!((info.host.as_str(), info.port), ("::1", 5000));
+        assert_eq!(info.server_name, "::1");
+
+        let (leaf, ca, _) = issued(None, "ICU CA x");
+        assert!(ServerInfo::from_certs(&leaf, &ca).is_none());
+    }
+
+    /// Export picks the version the certificates can support, and import
+    /// reads either back to the same identity.
+    #[test]
+    fn passport_export_falls_back_to_v1_for_old_certificates() {
+        let old_server = ServerInfo {
+            host: "old.example.org".into(),
+            port: 4711,
+            server_name: "old.example.org".into(),
+            name: "alice".into(),
+        };
+        let (leaf, ca, key) = issued(None, "ICU CA");
+        let old = Identity {
+            key_der: key,
+            leaf_der: leaf,
+            ca_der: ca,
+            server: old_server,
+        };
+        let text = old.to_passport();
+        assert!(matches!(
+            icu_proto::passport::Passport::decode(&text).unwrap(),
+            icu_proto::passport::Passport::V1(_)
+        ));
+        assert_eq!(Identity::from_passport(&text).unwrap(), old);
+
+        let (leaf, ca, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA icu.example.org");
+        let server = ServerInfo::from_certs(&leaf, &ca).unwrap();
+        let new = Identity {
+            key_der: key,
+            leaf_der: leaf,
+            ca_der: ca,
+            server,
+        };
+        let text = new.to_passport();
+        assert!(matches!(
+            icu_proto::passport::Passport::decode(&text).unwrap(),
+            icu_proto::passport::Passport::V2(_)
+        ));
+        assert_eq!(Identity::from_passport(&text).unwrap(), new);
+        assert!(!new.is_registration());
+
+        let broken = icu_proto::passport::PassportV2 {
+            key_der: vec![1, 2, 3],
+            leaf_der: new.leaf_der.clone(),
+            ca_der: new.ca_der.clone(),
+        }
+        .encode();
+        assert!(Identity::from_passport(&broken).is_err());
     }
 
     #[test]

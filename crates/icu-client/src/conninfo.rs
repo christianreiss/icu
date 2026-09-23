@@ -128,8 +128,7 @@ fn unix_now() -> i64 {
 
 /// SHA-256 over `der`, as 32 colon-separated uppercase hex pairs — the form
 /// `openssl x509 -fingerprint -sha256` prints, so the two can be compared by
-/// eye. The client already hashes certificates this way for CA pinning in
-/// `net::enroll`.
+/// eye.
 fn fingerprint(der: &[u8]) -> String {
     let digest = Sha256::digest(der);
     let mut out = String::with_capacity(digest.len() * 3 - 1);

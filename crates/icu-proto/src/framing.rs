@@ -1,4 +1,4 @@
-//! Length prefixed framing for the control and enrollment streams
+//! Length prefixed framing for the control stream
 //! (`PROTOCOL.md` §2).
 //!
 //! ```text
@@ -16,13 +16,9 @@ pub const LEN_PREFIX: usize = 2;
 /// Maximum body size of a control frame (`PROTOCOL.md` §2, §7).
 pub const MAX_CONTROL_FRAME: usize = 16 * 1024;
 
-/// Maximum body size of an enrollment frame (`PROTOCOL.md` §2.3, §7).
-pub const MAX_ENROLL_FRAME: usize = 8 * 1024;
-
 /// Encodes `msg` into a complete frame (prefix + body).
 ///
-/// `max` is the applicable body limit, [`MAX_CONTROL_FRAME`] or
-/// [`MAX_ENROLL_FRAME`].
+/// `max` is the applicable body limit, normally [`MAX_CONTROL_FRAME`].
 pub fn encode_frame<T: Serialize>(msg: &T, max: usize) -> Result<Vec<u8>, ProtoError> {
     let body = postcard::to_stdvec(msg).map_err(ProtoError::Encode)?;
     check_len(body.len(), max)?;
@@ -161,13 +157,5 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(split_frame(&frame, MAX_CONTROL_FRAME).unwrap().is_some());
-    }
-
-    /// A huge declared length must not allocate before the bytes arrive
-    /// (A24). We only ever act on the prefix after `check_len`.
-    #[test]
-    fn enroll_limit_is_8_kib() {
-        assert!(check_len(8192, MAX_ENROLL_FRAME).is_ok());
-        assert!(check_len(8193, MAX_ENROLL_FRAME).is_err());
     }
 }

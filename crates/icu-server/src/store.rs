@@ -1,5 +1,9 @@
-//! Persistent state: `users.toml`, `invites.toml`, `state.lock`
-//! (`Server/IMPLEMENTATION.md` §4).
+//! Persistent state: `users.toml`, `state.lock` (`Server/IMPLEMENTATION.md`
+//! §4).
+//!
+//! There is no invite table: an invitation is a registration certificate,
+//! recorded like any other certificate with `registration = true`
+//! (`PROTOCOL.md` §2.3). A leftover `invites.toml` from before is ignored.
 //!
 //! All writes are atomic (temp file + rename) and happen while `state.lock` is
 //! held with `flock`. A running server holds that lock for its whole lifetime
@@ -14,27 +18,20 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use base64::Engine;
 use icu_proto::{error as ec, name_key, validate_name, UserId};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::error::{Context, Error, Result};
 
-/// Schema version of both state files.
+/// Schema version of the state file.
 pub const SCHEMA: u32 = 1;
 
 /// File name of the user database.
 pub const USERS_FILE: &str = "users.toml";
-/// File name of the invite database.
-pub const INVITES_FILE: &str = "invites.toml";
 /// File name of the lock file.
 pub const LOCK_FILE: &str = "state.lock";
-/// Longest invite lifetime; longer requests are clamped to it.
-pub const MAX_INVITE_TTL: Duration = Duration::from_secs(365 * 86400);
 
 /// Formats a timestamp as RFC 3339 in UTC.
 pub fn rfc3339(t: OffsetDateTime) -> String {
@@ -103,6 +100,19 @@ pub struct CertRecord {
     /// device that still has its own catch-up to do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renewed: Option<String>,
+    /// A registration certificate (`PROTOCOL.md` §2.3): its session may only
+    /// swap it for a certificate on the client's own key, and it is revoked
+    /// the moment that succeeds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub registration: bool,
+}
+
+impl CertRecord {
+    fn expired(&self, now: OffsetDateTime) -> bool {
+        parse_rfc3339(&self.expires)
+            .map(|e| e <= now)
+            .unwrap_or(false)
+    }
 }
 
 /// One user. A user has a stable [`UserId`] and over time several certificates.
@@ -138,6 +148,12 @@ impl UserRecord {
     pub fn is_revoked(&self) -> bool {
         !self.certs.is_empty() && self.certs.iter().all(|c| c.revoked)
     }
+
+    /// Whether the user was invited but has not registered yet: every
+    /// certificate is a registration certificate.
+    pub fn is_pending(&self) -> bool {
+        !self.certs.is_empty() && self.certs.iter().all(|c| c.registration)
+    }
 }
 
 /// `users.toml`
@@ -162,52 +178,18 @@ impl Default for UsersFile {
     }
 }
 
-/// One invite token.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InviteRecord {
-    /// Advisory label: it prefills the invited user's name dialog and does not
-    /// bind the certificate CN. May be empty.
-    pub name: String,
-    /// When it was created, RFC 3339 UTC.
-    pub created: String,
-    /// When it expires, RFC 3339 UTC.
-    pub expires: String,
-    /// `0` = unused, otherwise the `user_id` it produced.
-    pub used_by: UserId,
-}
-
-/// `invites.toml`
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InvitesFile {
-    /// Schema version.
-    pub schema: u32,
-    /// Invites, keyed by token.
-    #[serde(default, rename = "invite")]
-    pub invites: BTreeMap<String, InviteRecord>,
-}
-
-impl Default for InvitesFile {
-    fn default() -> Self {
-        InvitesFile {
-            schema: SCHEMA,
-            invites: BTreeMap::new(),
-        }
-    }
-}
-
 /// The persistent state, guarded by `flock(state.lock)`.
 #[derive(Debug)]
 pub struct Store {
     dir: PathBuf,
     users: UsersFile,
-    invites: InvitesFile,
     /// Held for as long as the `Store` lives; dropping it releases the lock.
     _lock: File,
 }
 
 impl Store {
-    /// Opens the state directory, takes the exclusive lock and loads both
-    /// files. Missing files are created empty.
+    /// Opens the state directory, takes the exclusive lock and loads the user
+    /// database. A missing file means an empty one.
     ///
     /// Fails with a clear error when another process holds the lock, which is
     /// exactly the "CLI while the server runs" case (§5).
@@ -232,23 +214,15 @@ impl Store {
         ))?;
 
         let users: UsersFile = load_or_default(&dir.join(USERS_FILE))?;
-        let invites: InvitesFile = load_or_default(&dir.join(INVITES_FILE))?;
         if users.schema != SCHEMA {
             return Err(Error::msg(format!(
                 "{USERS_FILE}: schema {} is not supported (expected {SCHEMA})",
                 users.schema
             )));
         }
-        if invites.schema != SCHEMA {
-            return Err(Error::msg(format!(
-                "{INVITES_FILE}: schema {} is not supported (expected {SCHEMA})",
-                invites.schema
-            )));
-        }
         Ok(Store {
             dir: dir.to_path_buf(),
             users,
-            invites,
             _lock: lock,
         })
     }
@@ -278,24 +252,13 @@ impl Store {
         Ok(out)
     }
 
-    /// [`Store::update_users`] for `invites.toml`.
-    fn update_invites<R>(
-        &mut self,
-        change: impl FnOnce(&mut InvitesFile) -> Result<R>,
-    ) -> Result<R> {
-        let mut next = self.invites.clone();
-        let out = change(&mut next)?;
-        write_atomic(&self.dir.join(INVITES_FILE), &toml::to_string(&next)?)?;
-        self.invites = next;
-        Ok(out)
-    }
-
     /// Whether `id` is an admin. `false` for an unknown id.
     pub fn is_admin(&self, id: UserId) -> bool {
         self.user(id).map(|u| u.is_admin).unwrap_or(false)
     }
 
-    /// Whether the store has no users at all yet (bootstrap gate, §6.3).
+    /// Whether the store has no users at all yet. The first registration
+    /// issued against an empty store is for an admin (§6.3).
     pub fn is_empty(&self) -> bool {
         self.users.users.is_empty()
     }
@@ -419,9 +382,7 @@ impl Store {
             // validity first), so their records are dead weight in every
             // fingerprint lookup. Revoked ones stay: they are what makes a
             // revoke visible, and what `is_revoked` counts.
-            record.certs.retain(|c| {
-                c.revoked || parse_rfc3339(&c.expires).map(|e| e > now).unwrap_or(true)
-            });
+            record.certs.retain(|c| keep_cert(c, now));
             record.certs.push(cert);
             if renewal {
                 record.last_renew = Some(stamp);
@@ -534,108 +495,86 @@ impl Store {
         })
     }
 
-    /// All invites.
-    pub fn invites(&self) -> &BTreeMap<String, InviteRecord> {
-        &self.invites.invites
+    /// Records an invited user with their registration certificate
+    /// (`PROTOCOL.md` §2.3). The certificate's CN is the placeholder name,
+    /// which has to be free like any other. The first registration against an
+    /// empty store is for an admin. Returns the new `user_id` and whether it is
+    /// an admin.
+    pub fn add_registration(&mut self, cert: CertRecord) -> Result<(UserId, bool)> {
+        let is_admin = self.is_empty();
+        let cert = CertRecord {
+            registration: true,
+            ..cert
+        };
+        let id = self.add_user(cert, is_admin)?;
+        Ok((id, is_admin))
     }
 
-    /// Creates an invite token, valid for `ttl`. `label` is advisory — it
-    /// prefills the invited user's name dialog and does not bind the
-    /// certificate CN — and may be empty.
-    pub fn create_invite(&mut self, label: &str, ttl: Duration) -> Result<(String, InviteRecord)> {
-        if !label.is_empty() {
-            validate_name(label)?;
+    /// Swaps a registration certificate for the user's first real one, in one
+    /// write: the new certificate is added, its CN becomes the name, and the
+    /// registration certificate is revoked so the bundle cannot be used again.
+    pub fn redeem_registration(
+        &mut self,
+        id: UserId,
+        registration_fp: &str,
+        cert: CertRecord,
+    ) -> Result<()> {
+        validate_name(&cert.cn)?;
+        if self.name_taken(&cert.cn, Some(id)) {
+            return Err(Error::coded(
+                ec::NAME_TAKEN,
+                format!("name {:?} taken", cert.cn),
+            ));
         }
-        let mut raw = [0u8; 16];
-        rand::rng().fill_bytes(&mut raw);
-        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
-        let created = now();
-        // `ttl` comes straight from an admin's request; unclamped, a huge
-        // value overflows the date arithmetic and aborts the server.
-        let ttl = ttl.min(MAX_INVITE_TTL);
-        let record = InviteRecord {
-            name: label.to_string(),
-            created: rfc3339(created),
-            expires: rfc3339(created + ttl),
-            used_by: 0,
-        };
-        self.update_invites(|invites| {
-            invites.invites.insert(token.clone(), record.clone());
+        self.update_users(|users| {
+            let record = user_entry(users, id)?;
+            if record.disabled {
+                return Err(Error::coded(ec::AUTH_DISABLED, "user is disabled"));
+            }
+            let reg = record
+                .certs
+                .iter_mut()
+                .find(|c| c.fingerprint == registration_fp && c.registration && !c.revoked)
+                .ok_or_else(|| {
+                    Error::coded(ec::AUTH_REVOKED, "registration certificate already used")
+                })?;
+            reg.revoked = true;
+            record.name = cert.cn.clone();
+            record.certs.push(CertRecord {
+                registration: false,
+                ..cert
+            });
             Ok(())
-        })?;
-        Ok((token, record))
+        })
     }
 
-    /// Drops expired, unused invites (called at startup, §6.1.4).
-    pub fn purge_expired_invites(&mut self) -> Result<usize> {
+    /// Drops users who were invited and never registered before their
+    /// registration certificate expired, which frees the placeholder name.
+    /// Called at startup (§6.1.4). `user_id`s are still never reused.
+    pub fn purge_expired_registrations(&mut self) -> Result<usize> {
         let now = now();
-        let live = |inv: &InviteRecord| {
-            inv.used_by != 0
-                || parse_rfc3339(&inv.expires)
-                    .map(|e| e > now)
-                    .unwrap_or(false)
-        };
-        let removed = self.invites.invites.values().filter(|i| !live(i)).count();
+        let stale = |u: &UserRecord| u.is_pending() && u.certs.iter().all(|c| c.expired(now));
+        let removed = self.users.users.values().filter(|u| stale(u)).count();
         if removed > 0 {
-            self.update_invites(|invites| {
-                invites.invites.retain(|_, inv| live(inv));
+            self.update_users(|users| {
+                users.users.retain(|_, u| !stale(u));
                 Ok(())
             })?;
         }
         Ok(removed)
     }
+}
 
-    /// Looks up a token in constant time and returns its record if it is
-    /// usable. Does **not** consume it.
-    pub fn peek_invite(&self, token: &str) -> Option<(String, InviteRecord)> {
-        let probe = token.as_bytes();
-        let mut found: Option<(String, InviteRecord)> = None;
-        for (key, record) in &self.invites.invites {
-            let same_len = key.len() == probe.len();
-            let equal = same_len && bool::from(key.as_bytes().ct_eq(probe));
-            if equal {
-                found = Some((key.clone(), record.clone()));
-            }
-        }
-        let (key, record) = found?;
-        if record.used_by != 0 {
-            return None;
-        }
-        if parse_rfc3339(&record.expires).ok()? <= now() {
-            return None;
-        }
-        Some((key, record))
+/// Whether a certificate record is still worth keeping. Expired certificates
+/// can no longer authenticate (rustls checks validity first), so their records
+/// are dead weight in every fingerprint lookup. Revoked ones stay: they are
+/// what makes a revoke visible, and what `is_revoked` counts — except a used
+/// registration certificate, whose revocation only ever meant "redeemed".
+fn keep_cert(c: &CertRecord, now: OffsetDateTime) -> bool {
+    if c.registration && c.revoked {
+        return !c.expired(now);
     }
-
-    /// Compare-and-set: marks the token used by `user_id`. Returns the record
-    /// as it was before. Fails if the token was consumed meanwhile (§6.3.2).
-    pub fn consume_invite(&mut self, token: &str, user_id: UserId) -> Result<InviteRecord> {
-        let (key, record) = self
-            .peek_invite(token)
-            .ok_or_else(|| Error::coded(ec::ENROLL_BAD_TOKEN, "token unknown, used or expired"))?;
-        self.update_invites(|invites| {
-            let entry = invites
-                .invites
-                .get_mut(&key)
-                .ok_or_else(|| Error::coded(ec::ENROLL_BAD_TOKEN, "token vanished"))?;
-            if entry.used_by != 0 {
-                return Err(Error::coded(ec::ENROLL_BAD_TOKEN, "token already used"));
-            }
-            entry.used_by = user_id;
-            Ok(())
-        })?;
-        Ok(record)
-    }
-
-    /// Releases a token again, used when a later step of the enrollment fails.
-    pub fn release_invite(&mut self, token: &str) -> Result<()> {
-        self.update_invites(|invites| {
-            if let Some(entry) = invites.invites.get_mut(token) {
-                entry.used_by = 0;
-            }
-            Ok(())
-        })
-    }
+    c.revoked || !c.expired(now)
 }
 
 /// Looks a user up by id for mutation. The `BTreeMap` key is the decimal
@@ -706,6 +645,7 @@ mod tests {
             expires: rfc3339(t + Duration::from_secs(365 * 86400)),
             revoked: false,
             renewed: None,
+            registration: false,
         }
     }
 
@@ -771,17 +711,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code(), Some(ec::AUTH_DISABLED));
         assert_eq!(s.user(bob).unwrap().certs.len(), 1);
-    }
-
-    /// An admin-supplied TTL of `u64::MAX` seconds must not overflow the
-    /// expiry date (that aborts the server).
-    #[test]
-    fn huge_invite_ttl_is_clamped() {
-        let (_dir, mut s) = store();
-        let (_, inv) = s.create_invite("", Duration::from_secs(u64::MAX)).unwrap();
-        let expires = OffsetDateTime::parse(&inv.expires, &Rfc3339).unwrap();
-        let created = OffsetDateTime::parse(&inv.created, &Rfc3339).unwrap();
-        assert_eq!(expires - created, MAX_INVITE_TTL);
     }
 
     /// §10: promote/demote updates `is_admin` and persists.
@@ -972,7 +901,7 @@ mod tests {
         {
             let mut s = Store::open(dir.path()).unwrap();
             let id = s.add_user(named_cert("aa", "alice"), false).unwrap();
-            s.create_invite("bob", Duration::from_secs(60)).unwrap();
+            s.add_registration(named_cert("bb", "bob")).unwrap();
             assert_eq!(id, 1);
         }
         let text = std::fs::read_to_string(dir.path().join(USERS_FILE)).unwrap();
@@ -982,8 +911,9 @@ mod tests {
 
         let s = Store::open(dir.path()).unwrap();
         assert_eq!(s.user(1).unwrap().name, "alice");
-        assert_eq!(s.invites().len(), 1);
-        assert_eq!(s.users.next_user_id, 2);
+        assert!(s.user(2).unwrap().is_pending());
+        assert!(s.user(2).unwrap().certs[0].registration);
+        assert_eq!(s.users.next_user_id, 3);
     }
 
     /// §10: schema check on load.
@@ -1011,41 +941,85 @@ mod tests {
         assert!(Store::open(dir.path()).is_ok());
     }
 
+    /// The first registration against an empty store is for an admin, every
+    /// later one is not; the placeholder name must be free.
     #[test]
-    fn invites_are_single_use_and_expire() {
+    fn registrations_create_pending_users() {
         let (_dir, mut s) = store();
-        let (token, record) = s.create_invite("bob", Duration::from_secs(3600)).unwrap();
-        assert_eq!(token.len(), 22, "128 bit base64url without padding");
-        assert_eq!(record.used_by, 0);
-        assert!(s.peek_invite(&token).is_some());
-        assert!(s.peek_invite("nope").is_none());
+        let (first, admin) = s.add_registration(named_cert("aa", "neu-0001")).unwrap();
+        assert!(admin);
+        assert!(s.is_admin(first));
+        assert!(s.user(first).unwrap().is_pending());
+        let (second, admin) = s.add_registration(named_cert("bb", "neu-0002")).unwrap();
+        assert!(!admin);
+        assert!(!s.is_admin(second));
+        let err = s.add_registration(named_cert("cc", "NEU-0001")).unwrap_err();
+        assert_eq!(err.code(), Some(ec::NAME_TAKEN));
+    }
 
-        s.consume_invite(&token, 7).unwrap();
-        assert!(s.peek_invite(&token).is_none(), "used once");
-        let err = s.consume_invite(&token, 8).unwrap_err();
-        assert_eq!(err.code(), Some(ec::ENROLL_BAD_TOKEN));
+    /// Redeeming revokes the registration certificate, adopts the new name,
+    /// and works exactly once.
+    #[test]
+    fn a_registration_is_redeemed_once() {
+        let (_dir, mut s) = store();
+        let (id, _) = s.add_registration(named_cert("reg", "neu-0001")).unwrap();
+        s.add_user(named_cert("bb", "bob"), false).unwrap();
 
-        // A released token works again (enrollment rollback path).
-        s.release_invite(&token).unwrap();
-        assert!(s.peek_invite(&token).is_some());
+        let err = s
+            .redeem_registration(id, "reg", named_cert("new", "Bob"))
+            .unwrap_err();
+        assert_eq!(err.code(), Some(ec::NAME_TAKEN));
+        assert!(!s.user(id).unwrap().certs[0].revoked, "nothing was written");
+
+        s.redeem_registration(id, "reg", named_cert("new", "alice"))
+            .unwrap();
+        let user = s.user(id).unwrap();
+        assert_eq!(user.name, "alice");
+        assert!(!user.is_pending());
+        assert!(!user.is_revoked());
+        let (_, _, reg) = s.by_fingerprint("reg").unwrap();
+        assert!(reg.revoked && reg.registration);
+        let (_, _, new) = s.by_fingerprint("new").unwrap();
+        assert!(!new.revoked && !new.registration);
+
+        let err = s
+            .redeem_registration(id, "reg", named_cert("again", "alice2"))
+            .unwrap_err();
+        assert_eq!(err.code(), Some(ec::AUTH_REVOKED));
+    }
+
+    /// An unused first bundle that expired must not cost the next one its
+    /// admin rights.
+    #[test]
+    fn the_admin_slot_frees_up_when_the_first_bundle_expires() {
+        let (_dir, mut s) = store();
+        let (first, admin) = s.add_registration(named_cert("aa", "neu-0001")).unwrap();
+        assert!(admin);
+        user_entry(&mut s.users, first).unwrap().certs[0].expires =
+            rfc3339(now() - Duration::from_secs(10));
+        s.purge_expired_registrations().unwrap();
+        let (_, admin) = s.add_registration(named_cert("bb", "neu-0002")).unwrap();
+        assert!(admin);
     }
 
     #[test]
-    fn expired_invites_are_purged_but_used_ones_are_kept() {
+    fn expired_unused_registrations_are_purged() {
         let (_dir, mut s) = store();
-        let (fresh, _) = s.create_invite("bob", Duration::from_secs(3600)).unwrap();
-        let (stale, _) = s.create_invite("carl", Duration::from_secs(3600)).unwrap();
-        let (used, _) = s.create_invite("dora", Duration::from_secs(3600)).unwrap();
-        s.consume_invite(&used, 1).unwrap();
-        // Backdate the stale one.
+        let (stale, _) = s.add_registration(named_cert("aa", "neu-0001")).unwrap();
+        let (fresh, _) = s.add_registration(named_cert("bb", "neu-0002")).unwrap();
+        let (used, _) = s.add_registration(named_cert("cc", "neu-0003")).unwrap();
+        s.redeem_registration(used, "cc", named_cert("dd", "carol"))
+            .unwrap();
         let past = rfc3339(now() - Duration::from_secs(10));
-        s.invites.invites.get_mut(&stale).unwrap().expires = past;
+        for id in [stale, used] {
+            user_entry(&mut s.users, id).unwrap().certs[0].expires = past.clone();
+        }
 
-        assert_eq!(s.purge_expired_invites().unwrap(), 1);
-        assert!(s.invites().contains_key(&fresh));
-        assert!(s.invites().contains_key(&used));
-        assert!(!s.invites().contains_key(&stale));
-        assert!(s.peek_invite(&stale).is_none());
+        assert_eq!(s.purge_expired_registrations().unwrap(), 1);
+        assert!(s.user(stale).is_none());
+        assert!(s.user(fresh).is_some());
+        assert!(s.user(used).is_some(), "a registered user stays");
+        assert!(!s.name_taken("neu-0001", None), "the placeholder is free again");
     }
 
     #[test]

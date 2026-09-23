@@ -539,11 +539,11 @@ pub struct Counters {
     pub control_in: AtomicU64,
     /// `Error(RATE_LIMITED)` sent.
     pub control_rate_limited: AtomicU64,
-    /// Enrollment attempts.
+    /// Registration sessions.
     pub enroll_attempts: AtomicU64,
-    /// Successful enrollments.
+    /// Completed registrations.
     pub enroll_ok: AtomicU64,
-    /// Rejected enrollments.
+    /// Rejected registration attempts.
     pub enroll_failed: AtomicU64,
 }
 

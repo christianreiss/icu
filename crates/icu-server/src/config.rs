@@ -47,9 +47,11 @@ pub struct Config {
 pub struct ServerSection {
     /// UDP addresses to bind. One endpoint per entry.
     pub listen: Vec<SocketAddr>,
-    /// SNI in the server certificate and in the invite link.
+    /// SNI in the server certificate; also part of the CA's CN, which is
+    /// where clients take their SNI from.
     pub server_name: String,
-    /// `host:port` as it appears in the invite link.
+    /// `host:port` clients dial. Written into every client certificate as
+    /// URI SAN `icu://<public_host>` (`PROTOCOL.md` §2.3).
     pub public_host: String,
     /// Room size, 1..=64.
     pub max_users: u16,
@@ -90,9 +92,9 @@ pub struct LimitsSection {
     pub video_frames_per_s: u32,
     /// Video bitrate per sender, sliding over 2 s.
     pub video_kbit_s: u32,
-    /// Enrollments per minute and IP.
+    /// Registration sessions per minute and IP.
     pub enroll_per_ip_per_min: u32,
-    /// Enrollments per minute, server wide.
+    /// Registration sessions per minute, server wide.
     pub enroll_global_per_min: u32,
     /// Handshakes per second and IP.
     pub handshakes_per_ip_per_s: u32,
@@ -256,10 +258,10 @@ impl Config {
         }
         // Must be exactly what a client's `ServerName::try_from` will accept,
         // since that's what TLS hostname verification runs against
-        // (`enroll::server_name_for`, `icu-client/src/net/enroll.rs`) — a
-        // value `ca.rs`'s laxer ASCII check would accept but this rejects
-        // gets silently rewritten to "localhost" client-side, which is a far
-        // more confusing failure than catching it here at startup.
+        // (`server_name_for`, `icu-client/src/net/mod.rs`) — a value
+        // `ca.rs`'s laxer ASCII check would accept but this rejects gets
+        // silently rewritten to "localhost" client-side, which is a far more
+        // confusing failure than catching it here at startup.
         if rustls::pki_types::ServerName::try_from(server_name.to_string()).is_err() {
             return Err(Error::msg(format!(
                 "server.server_name {server_name:?} is not a valid DNS name or IP address"
@@ -270,6 +272,21 @@ impl Config {
                 "server.max_users must be 1..={}, got {}",
                 pl::MAX_MAX_USERS,
                 self.server.max_users
+            )));
+        }
+        // Goes into every client certificate as `icu://<public_host>`, and a
+        // client splits it at the last colon.
+        let public_host = self.public_host();
+        // An IPv6 literal needs brackets, or the split lands inside it.
+        let port_ok = public_host
+            .rsplit_once(':')
+            .is_some_and(|(host, port)| {
+                let bare_v6 = host.contains(':') && !(host.starts_with('[') && host.ends_with(']'));
+                !host.is_empty() && !bare_v6 && port.parse::<u16>().is_ok()
+            });
+        if !public_host.is_ascii() || public_host.contains(char::is_whitespace) || !port_ok {
+            return Err(Error::msg(format!(
+                "server.public_host {public_host:?} must be ASCII host:port"
             )));
         }
         Version::parse(&self.server.min_client)
@@ -290,8 +307,8 @@ impl Config {
         Ok(())
     }
 
-    /// `host:port` for invite links; falls back to `server_name` and the port
-    /// of the first listen address.
+    /// `host:port` for client certificates; falls back to `server_name` and
+    /// the port of the first listen address. An IPv6 literal needs brackets.
     pub fn public_host(&self) -> String {
         if !self.server.public_host.is_empty() {
             return self.server.public_host.clone();
@@ -302,7 +319,12 @@ impl Config {
             .first()
             .map(|a| a.port())
             .unwrap_or(pl::DEFAULT_PORT);
-        format!("{}:{}", self.server.server_name, port)
+        let host = &self.server.server_name;
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        }
     }
 
     /// Path of the admin socket.
@@ -423,6 +445,25 @@ format = "text"
         let mut c = base();
         c.log.format = "xml".into();
         assert!(c.validate().is_err());
+
+        // `public_host` goes into client certificates as `icu://host:port`.
+        for (bad, ok) in [
+            ("icu.example.org", false),
+            ("::1:4711", false),
+            ("host name:4711", false),
+            ("[::1]:4711", true),
+            ("192.0.2.10:4711", true),
+        ] {
+            let mut c = base();
+            c.server.public_host = bad.into();
+            assert_eq!(c.validate().is_ok(), ok, "{bad}");
+        }
+
+        // The fallback brackets an IPv6 server name itself.
+        let mut c = base();
+        c.server.server_name = "::1".into();
+        c.server.public_host = String::new();
+        assert!(c.public_host().starts_with("[::1]:"), "{}", c.public_host());
     }
 
     #[test]

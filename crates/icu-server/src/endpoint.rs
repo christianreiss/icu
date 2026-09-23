@@ -19,9 +19,9 @@ use crate::{
 /// The order below is load bearing: `builder_with_provider` yields
 /// `WantsVersions`, so `with_protocol_versions` has to come **before** the
 /// client certificate verifier (A8). The verifier uses
-/// `allow_unauthenticated()`, because the enrollment ALPN must work without a
-/// client certificate; the requirement is enforced per ALPN in `session.rs`
-/// (`PROTOCOL.md` §1, Spike 2b).
+/// `allow_unauthenticated()` although every client needs a certificate: the
+/// requirement is enforced in `session.rs`, which closes with a readable
+/// `AUTH_REQUIRED` instead of a bare TLS alert (`PROTOCOL.md` §1, Spike 2b).
 pub fn server_config(config: &Config, ca: &Ca) -> Result<quinn::ServerConfig> {
     let mut roots = RootCertStore::empty();
     roots
@@ -45,7 +45,7 @@ pub fn server_config(config: &Config, ca: &Ca) -> Result<quinn::ServerConfig> {
     .with_single_cert(ca.server_chain(), ca.server_key()?)
     .context("cannot install the server certificate")?;
 
-    tls.alpn_protocols = vec![pl::ALPN_MAIN.to_vec(), pl::ALPN_ENROLL.to_vec()];
+    tls.alpn_protocols = vec![pl::ALPN_MAIN.to_vec()];
     // 0-RTT off (`PROTOCOL.md` §1).
     tls.max_early_data_size = 0;
     tls.send_half_rtt_data = false;
@@ -170,10 +170,6 @@ async fn dispatch(server: Arc<Server>, incoming: quinn::Incoming) -> Result<()> 
         .and_then(|data| data.protocol.clone());
 
     match alpn.as_deref() {
-        Some(p) if p == pl::ALPN_ENROLL => {
-            let conn = connecting.await?;
-            crate::enroll::handle(server, conn, remote).await
-        }
         Some(p) if p == pl::ALPN_MAIN => {
             let conn = connecting.await?;
             crate::session::handle(server, conn).await

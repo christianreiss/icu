@@ -1,6 +1,6 @@
 //! `icu` — the ICU voice client.
 //!
-//! `icu <icu://link>` enrolls (then starts), `icu` starts. `--config-dir`
+//! `icu <bundle> --name <name>` registers (then starts), `icu` starts. `--config-dir`
 //! allows two instances on one machine, `--headless` runs without a window,
 //! `--debug-stats` prints latency histograms to stderr every 2 s,
 //! `--test-tone` replaces the microphone with a synthetic voice.
@@ -11,19 +11,19 @@ use clap::Parser;
 use icu_client::{
     config::{Identity, Paths, Settings},
     engine::{Engine, EngineConfig},
-    net::enroll::{enroll, InviteLink},
+    net::register::register,
 };
 
 /// ICU voice client.
 #[derive(Debug, Parser)]
 #[command(name = "icu", version, about, long_about = None)]
 struct Cli {
-    /// Invite to enroll with: an `icu://host:port/enroll?t=…&ca=…&n=…` link,
-    /// an `ICU1-…` blob, or a bare `host[:port]` for first-run bootstrap.
-    link: Option<String>,
-    /// The name to enroll with. It goes into the certificate, so it is what
-    /// everyone sees. Only optional for an `icu://` link that carries an `n=`
-    /// prefill, which is then used as-is.
+    /// Registration bundle or passport to take over: a file, or the armored
+    /// text itself (`-----BEGIN ICU PASSPORT-----`).
+    bundle: Option<String>,
+    /// The name to register with. It goes into the certificate, so it is what
+    /// everyone sees. Needed for a registration bundle, ignored for a
+    /// passport.
     #[arg(long)]
     name: Option<String>,
     /// Configuration directory (default `$XDG_CONFIG_HOME/icu`).
@@ -85,27 +85,30 @@ fn run(cli: Cli) -> Result<(), String> {
     std::fs::create_dir_all(&paths.config_dir).map_err(|e| e.to_string())?;
     let settings = Settings::load(&paths).map_err(|e| e.to_string())?;
 
-    if let Some(link) = &cli.link {
-        let link = InviteLink::parse(link).map_err(|e| e.to_string())?;
-        let name = match (&link, &cli.name) {
-            (_, Some(name)) => name.clone(),
-            // An empty name lets `enroll` fall back to the link's `n=`.
-            (InviteLink::Link { name: Some(_), .. }, None) => String::new(),
-            (_, None) => {
-                return Err(
-                    "this invite needs --name <display name> (it carries none itself)".into(),
-                )
-            }
+    if let Some(bundle) = &cli.bundle {
+        let text = if icu_proto::passport::Passport::looks_like(bundle) {
+            bundle.clone()
+        } else {
+            std::fs::read_to_string(bundle).map_err(|e| format!("{bundle}: {e}"))?
         };
-        let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-        let identity = rt
-            .block_on(enroll(&link, &name, cli.server_addr))
-            .map_err(|e| e.to_string())?;
+        let mut identity = Identity::from_passport(&text)?;
+        if identity.is_registration() {
+            let name = cli
+                .name
+                .clone()
+                .ok_or("a registration bundle needs --name <display name>")?;
+            let client = format!("icu/{} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS);
+            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+            identity = rt
+                .block_on(register(&identity, &name, &client, cli.server_addr))
+                .map_err(|e| e.to_string())?;
+        }
         identity.save(&paths).map_err(|e| e.to_string())?;
-        let (host, port) = link.host_port();
         eprintln!(
-            "icu: enrolled as {} at {host}:{port}, identity stored in {}",
+            "icu: registered as {} at {}:{}, identity stored in {}",
             identity.server.name,
+            identity.server.host,
+            identity.server.port,
             paths.identity_dir().display()
         );
     }
@@ -125,7 +128,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 Some(id) => id,
                 None => {
                     return Err(format!(
-                        "not enrolled: run `icu <icu://link>` first (config dir {})",
+                        "not registered: run `icu <bundle> --name <name>` first (config dir {})",
                         paths.config_dir.display()
                     ))
                 }
