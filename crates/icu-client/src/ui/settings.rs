@@ -289,11 +289,7 @@ impl SettingsView {
             });
             if self.draft.audio.vad_auto {
                 widgets::setting_row(ui, true, "Aktuelle Schwelle", None, |ui| {
-                    ui.label(
-                        RichText::new(format!("{:.2}", state.vad_threshold))
-                            .monospace()
-                            .color(theme::tokens(ui.visuals()).dim_text),
-                    )
+                    widgets::chip(ui, &format!("{:.2}", state.vad_threshold), 0.0)
                 });
             }
             widgets::slider_row(
@@ -745,19 +741,11 @@ impl SettingsView {
                 });
             }
             widgets::setting_row(ui, true, "Server", None, |ui| {
-                ui.label(RichText::new(&state.server).monospace())
+                widgets::chip(ui, &state.server, 0.0)
             });
             widgets::setting_row(ui, true, "user_id", None, |ui| {
-                ui.label(
-                    RichText::new(
-                        state
-                            .me
-                            .as_ref()
-                            .map(|m| m.user_id.to_string())
-                            .unwrap_or_else(|| "—".to_string()),
-                    )
-                    .monospace(),
-                )
+                let id = state.me.as_ref().map(|m| m.user_id.to_string());
+                widgets::chip(ui, id.as_deref().unwrap_or("—"), 0.0)
             });
         });
 
@@ -989,10 +977,10 @@ impl SettingsView {
     fn about_tab(&mut self, ui: &mut Ui, state: &AppState) {
         widgets::group_card(ui, "Info", |ui| {
             widgets::setting_row(ui, false, "Version", None, |ui| {
-                ui.label(format!("ICU {}", env!("CARGO_PKG_VERSION")))
+                widgets::chip(ui, env!("CARGO_PKG_VERSION"), 0.0)
             });
             widgets::setting_row(ui, true, "Audio-Backend", None, |ui| {
-                ui.label(state.backend)
+                widgets::chip(ui, state.backend, 0.0)
             });
             widgets::card_note(ui, |ui| {
                 ui.label(
@@ -1011,36 +999,29 @@ impl SettingsView {
 
         widgets::group_card(ui, "Diagnose", |ui| {
             widgets::setting_row(ui, false, "RTT", None, |ui| {
-                ui.label(
-                    RichText::new(
-                        state
-                            .rtt_ms
-                            .map(|r| format!("{r:.0} ms"))
-                            .unwrap_or_else(|| "n/a".to_string()),
-                    )
-                    .monospace(),
-                )
+                let rtt = state.rtt_ms.map(|r| format!("{r:.0} ms"));
+                widgets::chip(ui, rtt.as_deref().unwrap_or("n/a"), 0.0)
             });
             widgets::setting_row(ui, true, "Jitter p50/p95", None, |ui| {
-                ui.label(RichText::new(&self.diagnose.jitter).monospace())
+                widgets::chip(ui, &self.diagnose.jitter, 0.0)
             });
             widgets::setting_row(ui, true, "Capture→Send p50/max", None, |ui| {
-                ui.label(RichText::new(&self.diagnose.capture_send).monospace())
+                widgets::chip(ui, &self.diagnose.capture_send, 0.0)
             });
             widgets::setting_row(ui, true, "DSP-Block p50/max", None, |ui| {
-                ui.label(RichText::new(&self.diagnose.dsp_block).monospace())
+                widgets::chip(ui, &self.diagnose.dsp_block, 0.0)
             });
             widgets::setting_row(ui, true, "Paketverlust", None, |ui| {
-                ui.label(RichText::new(&self.diagnose.packet_loss).monospace())
+                widgets::chip(ui, &self.diagnose.packet_loss, 0.0)
             });
             widgets::setting_row(ui, true, "FEC/PLC", None, |ui| {
-                ui.label(RichText::new(&self.diagnose.fec_plc).monospace())
+                widgets::chip(ui, &self.diagnose.fec_plc, 0.0)
             });
             widgets::setting_row(ui, true, "Referenz-Underruns", None, |ui| {
-                ui.label(RichText::new(&self.diagnose.ref_underruns).monospace())
+                widgets::chip(ui, &self.diagnose.ref_underruns, 0.0)
             });
             widgets::setting_row(ui, true, "Reconnects", None, |ui| {
-                ui.label(RichText::new(&self.diagnose.reconnects).monospace())
+                widgets::chip(ui, &self.diagnose.reconnects, 0.0)
             });
 
             ui.separator();
@@ -1377,9 +1358,15 @@ fn binding_row(
         .inner_margin(egui::Margin::symmetric(12, 11))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.add_sized(
-                    [92.0, 0.0],
-                    egui::Label::new(RichText::new(label).size(13.5)),
+                // A full-height, left-aligned label column: it sets the row
+                // height before the chips arrive, so they center on it too.
+                let (col, _) = ui.allocate_exact_size(egui::vec2(92.0, 30.0), egui::Sense::hover());
+                ui.painter().text(
+                    col.left_center(),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::new(13.5, egui::FontFamily::Proportional),
+                    ui.visuals().text_color(),
                 );
                 // An unset binding shows one dash, not two empty boxes.
                 let key = if binding.key.is_empty() {
@@ -1406,6 +1393,7 @@ fn binding_row(
                 });
             });
             if expanded.contains(label) {
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(92.0);
                     ui.add(

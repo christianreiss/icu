@@ -95,7 +95,12 @@ pub fn rtl<R>(ui: &mut Ui, height: f32, add_contents: impl FnOnce(&mut Ui) -> R)
 pub fn card_note<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::new()
         .inner_margin(egui::Margin::symmetric(12, 9))
-        .show(ui, add_contents)
+        .show(ui, |ui| {
+            // `group_card` zeroes item spacing for its rows; a note's
+            // paragraphs still need a little air between them.
+            ui.spacing_mut().item_spacing.y = 4.0;
+            add_contents(ui)
+        })
         .inner
 }
 
@@ -862,6 +867,10 @@ pub fn group_card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui
         ))
         .corner_radius(CornerRadius::same(R_CARD))
         .show(ui, |ui| {
+            // Rows carry their own margins; item spacing on top of them
+            // would pad only the bottom of each row (between it and the next
+            // divider), leaving every label above its row's center.
+            ui.spacing_mut().item_spacing.y = 0.0;
             result = Some(add_contents(ui));
         });
     ui.add_space(14.0);
@@ -888,15 +897,18 @@ pub fn setting_row<R>(
     Frame::new()
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
+            // The label goes straight into the row, where the placer centers
+            // it on the control; the help text runs underneath at full width
+            // rather than beside the label, where it would wrap under the
+            // control.
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(label).size(13.5));
-                    if let Some(h) = help {
-                        ui.label(RichText::new(h).size(11.5).color(tok.dim_text));
-                    }
-                });
+                ui.label(RichText::new(label).size(13.5));
                 result = Some(rtl(ui, 30.0, control));
             });
+            if let Some(h) = help {
+                ui.add_space(3.0);
+                ui.label(RichText::new(h).size(11.5).color(tok.dim_text));
+            }
         });
     result.expect("control closure always runs")
 }
