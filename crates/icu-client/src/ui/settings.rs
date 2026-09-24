@@ -15,7 +15,9 @@ use icu_proto::UserId;
 use super::{theme, widgets};
 use crate::{
     audio::DeviceKind,
-    config::{Corner, Expand, HotkeyBackend, Identity, ModeSetting, Paths, Settings, TileSize},
+    config::{
+        self, Corner, Expand, HotkeyBackend, Identity, ModeSetting, Paths, Settings, TileSize,
+    },
     engine::{AppState, Command},
     stats::DebugStats,
 };
@@ -23,6 +25,13 @@ use crate::{
 /// Text-field width wherever a row pairs a field with a button, so the
 /// fields line up down the panel.
 const FIELD_W: f32 = 150.0;
+/// Validity choices for an invite; the last is the server's cap.
+const INVITE_TTLS: [(u64, &str); 4] = [
+    (60 * 60, "1 Stunde"),
+    (icu_proto::limits::INVITE_TTL_S, "24 Stunden"),
+    (3 * 24 * 60 * 60, "3 Tage"),
+    (icu_proto::limits::MAX_INVITE_TTL_S, "7 Tage"),
+];
 /// One square of the overlay-position picker.
 const CORNER_SWATCH: f32 = 46.0;
 /// Gap between the picker's squares, and the wider gap before the two
@@ -76,6 +85,10 @@ pub struct SettingsView {
     confirm_import: Option<Instant>,
     /// Display name for the next invite to mint (admin only).
     pub invite_name: String,
+    /// Validity of the next invite, seconds.
+    invite_ttl_s: u64,
+    /// Result of the last "Speichern" of an invite.
+    invite_status: Option<String>,
     /// Hotkey backend in use, for display.
     pub hotkey_backend: String,
     /// Portal hint shown once.
@@ -134,6 +147,8 @@ impl SettingsView {
             passport_status: None,
             confirm_import: None,
             invite_name: String::new(),
+            invite_ttl_s: icu_proto::limits::INVITE_TTL_S,
+            invite_status: None,
             hotkey_backend,
             show_portal_hint: true,
             tab: Tab::Audio,
@@ -746,7 +761,21 @@ impl SettingsView {
 
         if state.is_admin {
             widgets::group_card(ui, "Einladung", |ui| {
-                widgets::setting_row(ui, false, "Wer soll dazukommen?", None, |ui| {
+                widgets::setting_row(ui, false, "Gültig für", None, |ui| {
+                    let current = INVITE_TTLS
+                        .iter()
+                        .find(|(s, _)| *s == self.invite_ttl_s)
+                        .map_or("", |(_, l)| l);
+                    egui::ComboBox::from_id_salt("invite_ttl")
+                        .selected_text(current)
+                        .width(FIELD_W)
+                        .show_ui(ui, |ui| {
+                            for (secs, label) in INVITE_TTLS {
+                                ui.selectable_value(&mut self.invite_ttl_s, secs, label);
+                            }
+                        });
+                });
+                widgets::setting_row(ui, true, "Wer soll dazukommen?", None, |ui| {
                     let width = FIELD_W + 6.0 + widgets::button_width(ui, icon::TICKET, "Einladen");
                     widgets::row_group(ui, width, |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
@@ -773,8 +802,9 @@ impl SettingsView {
                         {
                             cmds.push(Command::CreateInvite {
                                 name: self.invite_name.trim().to_string(),
-                                ttl_s: 0,
+                                ttl_s: self.invite_ttl_s,
                             });
+                            self.invite_status = None;
                         }
                     });
                 });
@@ -794,6 +824,7 @@ impl SettingsView {
                                     .color(tok.dim_text),
                             );
                             widgets::rtl(ui, 30.0, |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
                                 if widgets::button(
                                     ui,
                                     widgets::ButtonKind::Neutral,
@@ -804,8 +835,26 @@ impl SettingsView {
                                 {
                                     ui.ctx().copy_text(bundle.clone());
                                 }
+                                if widgets::button(
+                                    ui,
+                                    widgets::ButtonKind::Neutral,
+                                    icon::EXPORT,
+                                    "Speichern",
+                                )
+                                .on_hover_text("Als Datei neben die Konfiguration schreiben")
+                                .clicked()
+                                {
+                                    self.invite_status =
+                                        Some(match config::save_invite(&self.paths, bundle) {
+                                            Ok(path) => format!("Gespeichert: {}", path.display()),
+                                            Err(e) => format!("Fehlgeschlagen: {e}"),
+                                        });
+                                }
                             });
                         });
+                        if let Some(status) = &self.invite_status {
+                            ui.label(RichText::new(status).small().color(tok.dim_text));
+                        }
                         ui.add_space(4.0);
                         let mut copy = bundle.clone();
                         ui.add(
@@ -894,6 +943,8 @@ impl SettingsView {
             "widerrufen"
         } else if user.disabled {
             "deaktiviert"
+        } else if user.pending {
+            "eingeladen"
         } else {
             "aktiv"
         };

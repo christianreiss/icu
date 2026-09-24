@@ -444,6 +444,7 @@ mod tests {
                     disabled: true,
                     revoked: false,
                     online: true,
+                    pending: false,
                 }],
             },
             ControlMsg::AdminActionError {

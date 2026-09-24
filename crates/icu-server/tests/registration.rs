@@ -148,3 +148,47 @@ async fn a_non_admin_cannot_mint_a_bundle_and_the_connection_stays_open() {
     }
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_requested_ttl_bounds_the_bundle() {
+    let server = TestServer::start().await;
+    let mut admin = admin_client(&server).await;
+
+    let (bundle, _expires) = mint(&mut admin, "short", 3600).await;
+    let cert = common::identity_from_bundle(&bundle).cert;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(&cert).unwrap();
+    let left =
+        cert.validity().not_after.timestamp() - time::OffsetDateTime::now_utc().unix_timestamp();
+    assert!((3500..=3700).contains(&left), "{left}");
+    server.shutdown().await;
+}
+
+async fn user_list(client: &mut common::Client) -> Vec<icu_proto::UserSummary> {
+    client.send_msg(&ControlMsg::UserListRequest).await;
+    match client
+        .recv_matching(|m| matches!(m, ControlMsg::UserListResponse { .. }))
+        .await
+    {
+        Some(ControlMsg::UserListResponse { users }) => users,
+        other => panic!("expected UserListResponse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_invited_user_is_pending_until_registered() {
+    let server = TestServer::start().await;
+    let mut admin = admin_client(&server).await;
+
+    let (bundle, _expires) = mint(&mut admin, "guest", 0).await;
+    let pending = |users: &[icu_proto::UserSummary], name: &str| {
+        users.iter().find(|u| u.name == name).map(|u| u.pending)
+    };
+    let users = user_list(&mut admin).await;
+    assert_eq!(pending(&users, "guest"), Some(true));
+    assert_eq!(pending(&users, "admin"), Some(false));
+
+    server.register(&bundle, "guest").await.expect("registers");
+    let users = user_list(&mut admin).await;
+    assert_eq!(pending(&users, "guest"), Some(false));
+    server.shutdown().await;
+}

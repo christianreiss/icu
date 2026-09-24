@@ -173,6 +173,9 @@ pub struct UserSummary {
     pub revoked: bool,
     /// Whether the user is connected right now.
     pub online: bool,
+    /// Invited, but the registration has not been confirmed yet
+    /// (`PROTOCOL.md` §2.3).
+    pub pending: bool,
 }
 
 /// Audio parameters announced in `Welcome` (`PROTOCOL.md` §2.1).

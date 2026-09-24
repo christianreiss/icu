@@ -16,8 +16,8 @@ pub async fn run(config: &Config, json: bool) -> Result<()> {
         .cloned()
         .unwrap_or_default();
     println!(
-        "{:>4}  {:<20} {:<14} {:<21} {:<21} {:<8} {:<6} {:<9} online",
-        "id", "name", "fingerprint", "issued", "expires", "revoked", "admin", "disabled"
+        "{:>4}  {:<20} {:<14} {:<21} {:<21} {:<8} {:<6} {:<9} {:<8} online",
+        "id", "name", "fingerprint", "issued", "expires", "revoked", "admin", "disabled", "pending"
     );
     for user in users {
         let get = |key: &str| {
@@ -34,7 +34,7 @@ pub async fn run(config: &Config, json: bool) -> Result<()> {
             }
         };
         println!(
-            "{:>4}  {:<20} {:<14} {:<21} {:<21} {:<8} {:<6} {:<9} {}",
+            "{:>4}  {:<20} {:<14} {:<21} {:<21} {:<8} {:<6} {:<9} {:<8} {}",
             user.get("user_id").and_then(|v| v.as_u64()).unwrap_or(0),
             get("name"),
             get("fingerprint"),
@@ -43,6 +43,7 @@ pub async fn run(config: &Config, json: bool) -> Result<()> {
             flag("revoked"),
             flag("is_admin"),
             flag("disabled"),
+            flag("pending"),
             flag("online"),
         );
     }

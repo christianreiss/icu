@@ -1097,6 +1097,7 @@ async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor:
             disabled: u.disabled,
             revoked: u.is_revoked(),
             online: !server.room.sessions_of_user(id).is_empty(),
+            pending: u.is_pending(),
         })
         .collect();
     drop(store);

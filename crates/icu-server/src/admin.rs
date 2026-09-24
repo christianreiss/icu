@@ -137,6 +137,9 @@ pub struct AdminUser {
     pub is_admin: bool,
     /// Reversible login block, independent of `revoked`.
     pub disabled: bool,
+    /// Invited, registration not confirmed yet.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 impl AdminResponse {
@@ -229,6 +232,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     online: !server.room.sessions_of_user(user_id).is_empty(),
                     is_admin: record.is_admin,
                     disabled: record.disabled,
+                    pending: record.is_pending(),
                 });
             }
             AdminResponse::Users(users)

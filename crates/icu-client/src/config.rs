@@ -631,6 +631,45 @@ impl From<io::Error> for ConfigError {
     }
 }
 
+/// Saves an invite bundle as `invites/<name>.icu` next to the
+/// configuration, readable only by the owner — it lets anybody in. The name
+/// is the placeholder in the bundle's certificate, reduced to characters that
+/// are safe in a file name.
+pub fn save_invite(paths: &Paths, bundle: &str) -> Result<PathBuf, ConfigError> {
+    use icu_proto::passport::Passport;
+    let leaf_der = match Passport::decode(bundle) {
+        Ok(Passport::V1(p)) => p.leaf_der,
+        Ok(Passport::V2(p)) => p.leaf_der,
+        Err(e) => return Err(ConfigError::Parse(e.to_string())),
+    };
+    let name: String = x509_parser::parse_x509_certificate(&leaf_der)
+        .ok()
+        .and_then(|(_, leaf)| {
+            leaf.subject()
+                .iter_common_name()
+                .next()
+                .and_then(|cn| cn.as_str().ok().map(str::to_string))
+        })
+        .unwrap_or_default()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = if name.trim_matches('_').is_empty() {
+        "einladung".to_string()
+    } else {
+        name
+    };
+    let path = paths.config_dir.join("invites").join(format!("{name}.icu"));
+    write_atomic(&path, bundle.as_bytes(), true)?;
+    Ok(path)
+}
+
 /// Writes `data` to `path` via a temporary file and rename.
 pub fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
@@ -745,6 +784,30 @@ mod tests {
 
         let (leaf, ca, _) = issued(None, "ICU CA x");
         assert!(ServerInfo::from_certs(&leaf, &ca).is_none());
+    }
+
+    /// An invite lands under the certificate's name, owner-only.
+    #[test]
+    fn saved_invite_is_named_after_its_certificate_and_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf()));
+        let (leaf, ca, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA x");
+        let bundle = icu_proto::passport::PassportV2 {
+            key_der: key,
+            leaf_der: leaf,
+            ca_der: ca,
+        }
+        .encode();
+        let path = save_invite(&paths, &bundle).unwrap();
+        assert_eq!(path, dir.path().join("invites").join("alice.icu"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), bundle);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(save_invite(&paths, "kein bundle").is_err());
     }
 
     /// Export picks the version the certificates can support, and import
