@@ -92,7 +92,7 @@ struct App {
     last_stats: Instant,
     stats_text: String,
     stats: Arc<crate::stats::DebugStats>,
-    volume_open: Option<icu_proto::UserId>,
+    expanded: Option<icu_proto::UserId>,
     ptt_held: bool,
     #[cfg(feature = "tray")]
     tray: Option<crate::tray::Tray>,
@@ -186,7 +186,7 @@ impl App {
             last_stats: Instant::now(),
             stats_text: String::new(),
             stats,
-            volume_open: None,
+            expanded: None,
             ptt_held: false,
             #[cfg(feature = "tray")]
             tray,
@@ -273,7 +273,7 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(33));
         // A local sender, not `self.send`: a closure that calls a `&self`
         // method captures the *whole* `self` and would collide with the
-        // `&mut self.settings` / `&mut self.volume_open` these panels need.
+        // `&mut self.settings` / `&mut self.expanded` these panels need.
         let cmd = self.cmd.clone();
         let send = |c: Command| {
             let _ = cmd.send(c);
@@ -532,7 +532,7 @@ impl eframe::App for App {
                 ui.add_space(8.0);
             });
 
-        let volume_open = &mut self.volume_open;
+        let expanded = &mut self.expanded;
         let videos = &self.videos;
         egui::CentralPanel::default().show(root, |ui| {
             // The people get a card of their own, the same surface as the
@@ -561,10 +561,14 @@ impl eframe::App for App {
                                         mode: Some(state.mode),
                                         volume: None,
                                         is_admin: state.is_admin,
-                                        rtt_ms: state.rtt_ms.map(|ms| ms.round() as u16),
+                                        viewing: me.flags.viewing(),
+                                        rtt_ms: state.server_rtt_ms,
+                                        client_rtt_ms: state.rtt_ms.map(|ms| ms.round() as u16),
+                                        loss_permille: None,
+                                        session: me.session,
                                         video: self_video,
                                     },
-                                    volume_open,
+                                    expanded,
                                     &send,
                                 );
                             }
@@ -581,7 +585,11 @@ impl eframe::App for App {
                                         mode: None,
                                         volume: Some(p.volume),
                                         is_admin: p.info.flags.is_admin(),
+                                        viewing: p.info.flags.viewing(),
                                         rtt_ms: p.rtt_ms,
+                                        client_rtt_ms: None,
+                                        loss_permille: p.recv_loss_permille,
+                                        session: p.info.session,
                                         // The flag arrives with `UserState`, so the
                                         // picture goes the moment somebody switches
                                         // off — not three seconds later when the
@@ -593,7 +601,7 @@ impl eframe::App for App {
                                             .then(|| videos.get(p.info.session))
                                             .flatten(),
                                     },
-                                    volume_open,
+                                    expanded,
                                     &send,
                                 );
                             }
@@ -881,9 +889,17 @@ struct Participant<'a> {
     mode: Option<Mode>,
     volume: Option<f32>,
     is_admin: bool,
+    /// Looking at video right now (`UserFlags::VIEWING`).
+    viewing: bool,
     /// Server-measured RTT, milliseconds. `None` until the first
     /// `UserRtt` arrives (`PROTOCOL.md` §2.2).
     rtt_ms: Option<u16>,
+    /// Own `Ping`/`Pong` round trip; `Some` only for the local user.
+    client_rtt_ms: Option<u16>,
+    /// What this client loses of this person's audio, per mille; remote
+    /// participants only.
+    loss_permille: Option<u16>,
+    session: icu_proto::Session,
     /// This person's live picture, `None` when there is none to show. Goes
     /// into the avatar's circle in place of the initials.
     video: Option<egui::load::SizedTexture>,
@@ -915,11 +931,11 @@ impl Participant<'_> {
 fn participant_row(
     ui: &mut egui::Ui,
     p: Participant<'_>,
-    volume_open: &mut Option<icu_proto::UserId>,
+    open: &mut Option<icu_proto::UserId>,
     send: &impl Fn(Command),
 ) {
     let tok = theme::tokens(ui.visuals());
-    let expanded = p.volume.is_some() && *volume_open == Some(p.user_id);
+    let expanded = *open == Some(p.user_id);
     // Last frame's row rect: the volume handle only shows under the pointer,
     // and in immediate mode the row does not know its own rect until drawn.
     let rect_id = ui.id().with(("row", p.user_id));
@@ -933,102 +949,184 @@ fn participant_row(
     } else {
         Color32::TRANSPARENT
     };
-    let frame = egui::Frame::new()
-        .fill(fill)
-        .corner_radius(egui::CornerRadius::same(theme::R_ROW))
-        .inner_margin(egui::Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let mut hint = String::new();
-                if let Some(s) = p.subtitle() {
-                    hint.push_str(s);
-                }
-                let avatar = widgets::avatar(ui, p.name, p.user_id, p.speaking, 30.0, p.video);
-                ui.add_space(2.0);
-                let name = ui.label(if p.mode.is_some() {
-                    theme::strong_text(p.name)
-                } else {
-                    RichText::new(p.name).size(14.0)
-                });
-                if !hint.is_empty() {
-                    avatar.on_hover_text(&hint);
-                    name.on_hover_text(&hint);
-                }
-                if p.speaking {
-                    widgets::speaking_bars(ui);
-                }
-                widgets::rtl(ui, 36.0, |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    // Always the same glyph: the crossed-out speaker is the
-                    // badge for "this person hears nothing", and a volume
-                    // handle wearing it would read as that.
-                    if let Some(vol) = p.volume {
-                        if widgets::icon_button(ui, icon::SPEAKER_HIGH, 28.0, expanded)
-                            .on_hover_text(format!("Lautstärke {vol:.0} %"))
-                            .clicked()
-                        {
-                            *volume_open = if expanded { None } else { Some(p.user_id) };
-                        }
-                    }
-                    // Server-measured RTT (`PROTOCOL.md` §2.2 `UserRtt`), not
-                    // a client self-report: every viewer sees the same number
-                    // for a given peer. Plain text in a fixed box, so a
-                    // changing number never shoves the icons around.
-                    if let Some(ms) = p.rtt_ms {
-                        let color = if ms > SLOW_RTT_MS {
-                            tok.connecting
-                        } else {
-                            tok.dim_text
-                        };
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(44.0, 20.0),
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.label(
-                                    RichText::new(format!("{ms} ms"))
-                                        .monospace()
-                                        .size(11.0)
-                                        .color(color),
-                                )
-                            },
-                        );
-                    }
-                    for (on, color, glyph) in [
-                        (p.deafened, tok.error, icon::SPEAKER_SLASH),
-                        (p.muted, tok.error, icon::MICROPHONE_SLASH),
-                        (p.camera, tok.dim_text, icon::VIDEO_CAMERA),
-                    ] {
-                        if on {
-                            ui.label(RichText::new(glyph).size(15.0).color(color));
-                        }
-                    }
-                    if p.is_admin {
-                        ui.label(
-                            RichText::new(icon::SHIELD_STAR)
-                                .size(14.0)
-                                .color(tok.dim_text),
-                        )
-                        .on_hover_text("Admin");
-                    }
-                });
-            });
-            if expanded {
-                let mut v = p.volume.expect("expanded implies a remote participant");
-                ui.add_space(2.0);
+    // The whole row is the click target. The scope senses clicks before its
+    // children are added, so the volume button and the slider inside still
+    // take their own clicks first.
+    let row = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+        egui::Frame::new()
+            .fill(fill)
+            .corner_radius(egui::CornerRadius::same(theme::R_ROW))
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.add_space(40.0);
-                    widgets::rtl(ui, 22.0, |ui| {
-                        widgets::chip(ui, &format!("{v:.0} %"), 46.0);
-                        if widgets::slider(ui, &mut v, 0.0..=200.0).changed() {
-                            send(Command::SetVolume(p.user_id, v));
+                    let mut hint = String::new();
+                    if let Some(s) = p.subtitle() {
+                        hint.push_str(s);
+                    }
+                    let avatar = widgets::avatar(ui, p.name, p.user_id, p.speaking, 30.0, p.video);
+                    ui.add_space(2.0);
+                    let name = ui.label(if p.mode.is_some() {
+                        theme::strong_text(p.name)
+                    } else {
+                        RichText::new(p.name).size(14.0)
+                    });
+                    if !hint.is_empty() {
+                        avatar.on_hover_text(&hint);
+                        name.on_hover_text(&hint);
+                    }
+                    if p.speaking {
+                        widgets::speaking_bars(ui);
+                    }
+                    widgets::rtl(ui, 36.0, |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        // Always the same glyph: the crossed-out speaker is the
+                        // badge for "this person hears nothing", and a volume
+                        // handle wearing it would read as that.
+                        if let Some(vol) = p.volume {
+                            if widgets::icon_button(ui, icon::SPEAKER_HIGH, 28.0, expanded)
+                                .on_hover_text(format!("Lautstärke {vol:.0} %"))
+                                .clicked()
+                            {
+                                *open = if expanded { None } else { Some(p.user_id) };
+                            }
+                        }
+                        // Server-measured RTT (`PROTOCOL.md` §2.2 `UserRtt`), not
+                        // a client self-report: every viewer sees the same number
+                        // for a given peer. Plain text in a fixed box, so a
+                        // changing number never shoves the icons around.
+                        if let Some(ms) = p.rtt_ms {
+                            let color = if ms > SLOW_RTT_MS {
+                                tok.connecting
+                            } else {
+                                tok.dim_text
+                            };
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(44.0, 20.0),
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!("{ms} ms"))
+                                            .monospace()
+                                            .size(11.0)
+                                            .color(color),
+                                    )
+                                },
+                            );
+                        }
+                        for (on, color, glyph) in [
+                            (p.deafened, tok.error, icon::SPEAKER_SLASH),
+                            (p.muted, tok.error, icon::MICROPHONE_SLASH),
+                            (p.camera, tok.dim_text, icon::VIDEO_CAMERA),
+                        ] {
+                            if on {
+                                ui.label(RichText::new(glyph).size(15.0).color(color));
+                            }
+                        }
+                        if p.is_admin {
+                            ui.label(
+                                RichText::new(icon::SHIELD_STAR)
+                                    .size(14.0)
+                                    .color(tok.dim_text),
+                            )
+                            .on_hover_text("Admin");
                         }
                     });
                 });
-                ui.add_space(4.0);
-            }
-        });
-    let r = frame.response.rect;
+                if expanded {
+                    details(ui, &p, &tok, send);
+                }
+            });
+    });
+    let r = row.response.rect;
+    if row.response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if row.response.clicked() {
+        *open = if expanded { None } else { Some(p.user_id) };
+    }
     ui.data_mut(|d| d.insert_temp(rect_id, r));
+}
+
+/// The unfolded part of a participant row: what the client knows about this
+/// person, and for everyone but oneself the playback volume.
+fn details(ui: &mut egui::Ui, p: &Participant<'_>, tok: &theme::Tokens, send: &impl Fn(Command)) {
+    const NONE: &str = "—";
+    let ms = |v: Option<u16>| v.map_or_else(|| NONE.to_string(), |v| format!("{v} ms"));
+    let mut status = Vec::new();
+    for (on, word) in [
+        (p.speaking, "spricht"),
+        (p.muted, "stumm"),
+        (p.deafened, "hört nicht zu"),
+        (p.camera, "Kamera an"),
+        (p.viewing, "schaut Video"),
+    ] {
+        if on {
+            status.push(word);
+        }
+    }
+    let status = if status.is_empty() {
+        NONE.to_string()
+    } else {
+        status.join(" · ")
+    };
+    let mut rows = vec![
+        (
+            "Rolle",
+            if p.is_admin { "Admin" } else { "Mitglied" }.to_string(),
+        ),
+        ("Status", status),
+        ("Ping (Server)", ms(p.rtt_ms)),
+    ];
+    match p.mode {
+        Some(mode) => {
+            rows.push((
+                "Modus",
+                match mode {
+                    Mode::Ptt => "Push-to-Talk",
+                    Mode::Vad => "Sprachaktivierung",
+                }
+                .to_string(),
+            ));
+            rows.push(("Ping (eigen)", ms(p.client_rtt_ms)));
+        }
+        None => rows.push((
+            "Verlust",
+            p.loss_permille
+                .map_or_else(|| NONE.to_string(), |l| format!("{l} ‰")),
+        )),
+    }
+    rows.push((
+        "Nutzer · Sitzung",
+        format!("#{} · {}", p.user_id, p.session),
+    ));
+
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.add_space(40.0);
+        egui::Grid::new(("details", p.user_id))
+            .num_columns(2)
+            .spacing([12.0, 2.0])
+            .show(ui, |ui| {
+                for (label, value) in rows {
+                    ui.label(RichText::new(label).size(12.0).color(tok.dim_text));
+                    ui.label(RichText::new(value).monospace().size(12.0));
+                    ui.end_row();
+                }
+            });
+    });
+    if let Some(mut v) = p.volume {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(40.0);
+            widgets::rtl(ui, 22.0, |ui| {
+                widgets::chip(ui, &format!("{v:.0} %"), 46.0);
+                if widgets::slider(ui, &mut v, 0.0..=200.0).changed() {
+                    send(Command::SetVolume(p.user_id, v));
+                }
+            });
+        });
+    }
+    ui.add_space(4.0);
 }
 
 /// The empty state: connected, but the only person here is you.
