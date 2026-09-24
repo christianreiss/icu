@@ -1121,9 +1121,15 @@ impl SettingsView {
         let issued = state.last_invite.as_ref().map(|(b, _)| b.as_str());
         if issued != self.seen_invite.as_deref() {
             self.seen_invite = issued.map(str::to_string);
-            if issued.is_some() {
+            if let Some(bundle) = issued {
                 cmds.push(Command::RequestUserList);
                 self.fresh_invite = self.invite_open;
+                // Minted from this form: it goes straight to the clipboard,
+                // copying is what comes next anyway.
+                if self.fresh_invite {
+                    ui.ctx().copy_text(bundle.to_string());
+                    self.invite_status = Some("In die Zwischenablage kopiert.".into());
+                }
             }
         }
 
