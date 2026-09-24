@@ -27,14 +27,16 @@ const SPEAK_H: f32 = 52.0;
 const TILE_H: f32 = 54.0;
 /// The one gap of the control dock's grid, both ways.
 const DOCK_GAP: f32 = 8.0;
-/// A bottom-row toggle: glyph, tooltip, on, color role, rec dot, and the
-/// command a click sends (`None` when the feature is compiled out).
+/// A bottom-row toggle: glyph, tooltip, on, color role, rec dot, hover
+/// text, and the command a click sends (`None` when the feature is compiled
+/// out).
 type Toggle = (
     &'static str,
     &'static str,
     bool,
     widgets::Role,
-    bool,
+    widgets::RecDot,
+    Option<String>,
     Option<Command>,
 );
 
@@ -446,13 +448,20 @@ impl eframe::App for App {
         egui::Panel::bottom("controls")
             .show_separator_line(false)
             .show(root, |ui| {
+                let (rec, rec_hint) = camera_feedback(
+                    state.camera_on,
+                    state.conn == ConnStatus::Connected,
+                    &state.peers,
+                    VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8),
+                );
                 let toggles: [Toggle; 4] = [
                     (
                         icon::MICROPHONE_SLASH,
                         "Stumm",
                         state.muted,
                         widgets::Role::Danger,
-                        false,
+                        widgets::RecDot::Off,
+                        None,
                         Some(Command::SetMuted(!state.muted)),
                     ),
                     (
@@ -460,7 +469,8 @@ impl eframe::App for App {
                         "Taub",
                         state.deafened,
                         widgets::Role::Danger,
-                        false,
+                        widgets::RecDot::Off,
+                        None,
                         Some(Command::SetDeafened(!state.deafened)),
                     ),
                     (
@@ -468,7 +478,8 @@ impl eframe::App for App {
                         "Kamera",
                         state.camera_on,
                         widgets::Role::Accent,
-                        state.camera_on,
+                        rec,
+                        rec_hint,
                         cfg!(feature = "camera").then(|| Command::SetCamera(!state.camera_on)),
                     ),
                     (
@@ -476,11 +487,12 @@ impl eframe::App for App {
                         "Overlay",
                         state.overlay_on,
                         widgets::Role::Accent,
-                        false,
+                        widgets::RecDot::Off,
+                        None,
                         cfg!(feature = "overlay").then(|| Command::SetOverlay(!state.overlay_on)),
                     ),
                 ];
-                let toggles: Vec<_> = toggles.into_iter().filter(|t| t.5.is_some()).collect();
+                let toggles: Vec<_> = toggles.into_iter().filter(|t| t.6.is_some()).collect();
 
                 ui.add_space(6.0);
                 // One card, one grid: the tiles share their column width and
@@ -497,11 +509,14 @@ impl eframe::App for App {
                         let col = ((ui.available_width() - (n - 1.0) * DOCK_GAP) / n).floor();
                         let ptt = ui.horizontal(|ui| speak_row(ui, state, &send, col)).inner;
                         ui.horizontal(|ui| {
-                            for (glyph, label, active, role, rec, cmd) in toggles {
+                            for (glyph, label, active, role, rec, hint, cmd) in toggles {
                                 let size = egui::vec2(col, TILE_H);
-                                if widgets::tile(ui, glyph, label, active, role, rec, size)
-                                    .clicked()
-                                {
+                                let mut tile =
+                                    widgets::tile(ui, glyph, label, active, role, rec, size);
+                                if let Some(hint) = hint {
+                                    tile = tile.on_hover_text(hint);
+                                }
+                                if tile.clicked() {
                                     if let Some(c) = cmd {
                                         send(c);
                                     }
@@ -870,9 +885,17 @@ fn speak_row(
         (icon::WAVEFORM, "VAD", "Umschalten auf Push-to-Talk")
     };
     let size = egui::vec2(tile_w, SPEAK_H);
-    if widgets::tile(ui, glyph, label, false, widgets::Role::Accent, false, size)
-        .on_hover_text(next)
-        .clicked()
+    if widgets::tile(
+        ui,
+        glyph,
+        label,
+        false,
+        widgets::Role::Accent,
+        widgets::RecDot::Off,
+        size,
+    )
+    .on_hover_text(next)
+    .clicked()
     {
         send(Command::ToggleMode);
     }
@@ -886,6 +909,49 @@ fn speak_row(
 /// One row's worth of participant, local or remote. `mode` is `Some` only
 /// for the local user (it is a client-local setting); `volume` is `Some`
 /// only for everyone else (there is no local playback volume for oneself).
+/// The camera tile's dot and hover text: whether this client's picture is
+/// going out right now, and to whom. Follows [`crate::engine::send_tier`], the
+/// rule the camera thread encodes by, so the dot never claims an audience the
+/// encoder does not have.
+fn camera_feedback(
+    camera_on: bool,
+    connected: bool,
+    peers: &[crate::engine::Peer],
+    tier: VideoTier,
+) -> (widgets::RecDot, Option<String>) {
+    use widgets::RecDot;
+    if !camera_on {
+        return (RecDot::Off, None);
+    }
+    if !connected {
+        return (
+            RecDot::Idle,
+            Some("Nicht verbunden — Video geht an niemanden".into()),
+        );
+    }
+    let viewers: Vec<&str> = peers
+        .iter()
+        .filter(|p| p.info.flags.viewing())
+        .map(|p| p.info.name.as_str())
+        .collect();
+    if viewers.is_empty() {
+        return (
+            RecDot::Idle,
+            Some("Niemand schaut zu — Kamera pausiert".into()),
+        );
+    }
+    if crate::engine::send_tier(tier, peers).paused() {
+        return (
+            RecDot::Idle,
+            Some("Video pausiert — das Netz trägt es gerade nicht.".into()),
+        );
+    }
+    (
+        RecDot::Live,
+        Some(format!("Sichtbar für: {}", viewers.join(", "))),
+    )
+}
+
 struct Participant<'a> {
     name: &'a str,
     user_id: icu_proto::UserId,
@@ -1553,5 +1619,57 @@ impl eframe::App for EnrollApp {
         if submit && !busy && has_text {
             self.submit();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Peer;
+    use icu_proto::{UserFlags, UserInfo};
+    use widgets::RecDot;
+
+    fn peer(session: u16, name: &str, flags: u8) -> Peer {
+        Peer {
+            info: UserInfo {
+                user_id: u32::from(session),
+                session,
+                name: name.into(),
+                flags: UserFlags(flags),
+            },
+            speaking: false,
+            volume: 100.0,
+            rtt_ms: None,
+            recv_loss_permille: None,
+        }
+    }
+
+    #[test]
+    fn rec_dot_is_live_only_while_somebody_sees_the_picture() {
+        let watching = [
+            peer(1, "Anna", UserFlags::VIEWING),
+            peer(2, "Carl", 0),
+            peer(3, "Bob", UserFlags::VIEWING),
+        ];
+        assert_eq!(
+            camera_feedback(false, true, &watching, VideoTier::T0),
+            (RecDot::Off, None)
+        );
+        assert_eq!(
+            camera_feedback(true, false, &watching, VideoTier::T0).0,
+            RecDot::Idle
+        );
+        let away = [peer(2, "Carl", UserFlags::CAMERA_ON)];
+        let (dot, hint) = camera_feedback(true, true, &away, VideoTier::T0);
+        assert_eq!(dot, RecDot::Idle);
+        assert!(hint.unwrap().starts_with("Niemand schaut zu"));
+        assert_eq!(
+            camera_feedback(true, true, &watching, VideoTier::T4).0,
+            RecDot::Idle
+        );
+        assert_eq!(
+            camera_feedback(true, true, &watching, VideoTier::T1),
+            (RecDot::Live, Some("Sichtbar für: Anna, Bob".into()))
+        );
     }
 }
