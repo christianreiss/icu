@@ -258,7 +258,25 @@ impl Config {
         let config: Config =
             toml::from_str(&text).context(format!("cannot parse config {}", path.display()))?;
         config.validate()?;
+        config.validate_lifetimes()?;
         Ok(config)
+    }
+
+    /// Certificate lifetimes of at least a day. A certificate that expires
+    /// as it is issued would send a client with an expired one into a renewal
+    /// loop (`PROTOCOL.md` §2.3.3). Checked for configuration files only: the
+    /// in-process tests issue already expired certificates on purpose.
+    pub fn validate_lifetimes(&self) -> Result<()> {
+        for (key, days) in [
+            ("tls.ca_validity_days", self.tls.ca_validity_days),
+            ("tls.client_validity_days", self.tls.client_validity_days),
+            ("tls.server_validity_days", self.tls.server_validity_days),
+        ] {
+            if days < 1 {
+                return Err(Error::msg(format!("{key} must be at least 1, got {days}")));
+            }
+        }
+        Ok(())
     }
 
     /// Validates the configuration (`Server/IMPLEMENTATION.md` §6.1.1).
@@ -464,6 +482,14 @@ format = "text"
         let mut c = base();
         c.server.listen.clear();
         assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.tls.client_validity_days = 0;
+        assert!(c.validate_lifetimes().is_err());
+        c.tls.client_validity_days = 1;
+        assert!(c.validate_lifetimes().is_ok());
+        c.tls.server_validity_days = 0;
+        assert!(c.validate_lifetimes().is_err());
 
         let mut c = base();
         c.limits.max_connections = 31;
