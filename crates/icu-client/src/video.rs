@@ -142,15 +142,43 @@ pub struct Frame {
 pub trait VideoSink: Send + Sync + Clone + 'static {
     /// One complete frame.
     fn deliver(&self, session: Session, frame: EncodedFrame);
+    /// A frame was dropped because the decode thread is behind.
+    fn overflow(&self) {}
 }
 
+/// Frames waiting for the decode thread. At 15 fps per speaker this is a
+/// few seconds' worth; past it the decoder is hopelessly behind and dropping
+/// (then waiting for the next IDR) beats growing the queue.
+const DECODE_QUEUE: usize = 64;
+
 /// Accepts uni streams for the lifetime of the connection.
+///
+/// The frames are decoded on one dedicated thread, `icu-video-decode`, not
+/// on the tokio workers: an H.264 decode plus the RGBA conversion blocks a
+/// worker for milliseconds, and the same two workers drive QUIC and stamp
+/// the audio datagrams' arrival times (`Client/IMPLEMENTATION.md` §4). One
+/// thread also keeps a speaker's frames in arrival order, which
+/// `spawn_blocking` per frame would not.
 pub async fn accept_loop<S: VideoSink>(conn: quinn::Connection, sink: S) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Session, EncodedFrame)>(DECODE_QUEUE);
+    let decode_sink = sink.clone();
+    if let Err(e) = std::thread::Builder::new()
+        .name("icu-video-decode".into())
+        .spawn(move || {
+            while let Ok((session, frame)) = rx.recv() {
+                decode_sink.deliver(session, frame);
+            }
+        })
+    {
+        tracing::warn!(error = %e, "cannot spawn video decode thread");
+        return;
+    }
     loop {
         let mut recv = match conn.accept_uni().await {
             Ok(r) => r,
             Err(_) => return,
         };
+        let tx = tx.clone();
         let sink = sink.clone();
         tokio::spawn(async move {
             let bytes = match recv.read_to_end(VIDEO_HEADER_LEN + VIDEO_MAX_FRAME).await {
@@ -160,13 +188,13 @@ pub async fn accept_loop<S: VideoSink>(conn: quinn::Connection, sink: S) {
             let Ok(header) = VideoHeader::decode(&bytes) else {
                 return;
             };
-            sink.deliver(
-                header.speaker,
-                EncodedFrame {
-                    header,
-                    data: bytes[VIDEO_HEADER_LEN..].to_vec(),
-                },
-            );
+            let frame = EncodedFrame {
+                header,
+                data: bytes[VIDEO_HEADER_LEN..].to_vec(),
+            };
+            if tx.try_send((header.speaker, frame)).is_err() {
+                sink.overflow();
+            }
         });
     }
 }

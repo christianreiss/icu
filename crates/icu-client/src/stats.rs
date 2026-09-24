@@ -133,8 +133,16 @@ pub struct DebugStats {
     pub dsp_blocks: AtomicU64,
     /// Reference (AEC) underruns.
     pub reference_underruns: AtomicU64,
-    /// Capture ring overruns (DSP thread too slow).
+    /// Capture ring overruns (DSP thread too slow), including blocks lost
+    /// while a stream reopen held the ring.
     pub capture_overruns: AtomicU64,
+    /// Reference ring overruns, counted the same way.
+    pub reference_overruns: AtomicU64,
+    /// Capture samples skipped because the DSP thread fell more than 100 ms
+    /// behind (`engine::MAX_CAPTURE_BACKLOG`).
+    pub capture_backlog_dropped: AtomicU64,
+    /// Video frames dropped because the decode thread was behind.
+    pub video_decode_dropped: AtomicU64,
     /// `PACKET_LOSS_PERC` currently set on the encoder.
     pub packet_loss_perc: AtomicI64,
     /// Last RTT in microseconds, −1 if unknown.
@@ -192,7 +200,7 @@ impl DebugStats {
             format!("{:.2} ms", rtt as f64 / 1000.0)
         };
         format!(
-            "icu stats: sent={} recv={} bad={} decoded={} fec={} plc={} played={} play_underruns={} jb_late={} jb_underruns={} jb_skipped={} jb_dropped={} dsp_blocks={} ref_underruns={} cap_overruns={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
+            "icu stats: sent={} recv={} bad={} decoded={} fec={} plc={} played={} play_underruns={} jb_late={} jb_underruns={} jb_skipped={} jb_dropped={} dsp_blocks={} ref_underruns={} cap_overruns={} ref_overruns={} cap_backlog={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
             Self::get(&self.datagrams_sent),
             Self::get(&self.datagrams_received),
             Self::get(&self.datagrams_bad),
@@ -208,6 +216,8 @@ impl DebugStats {
             Self::get(&self.dsp_blocks),
             Self::get(&self.reference_underruns),
             Self::get(&self.capture_overruns),
+            Self::get(&self.reference_overruns),
+            Self::get(&self.capture_backlog_dropped),
             self.packet_loss_perc.load(Ordering::Relaxed),
             rtt,
             Self::get(&self.reconnects),

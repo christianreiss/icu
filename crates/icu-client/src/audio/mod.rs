@@ -6,6 +6,7 @@ pub mod cpal_fallback;
 pub mod fake;
 #[cfg(target_os = "linux")]
 pub mod pipewire;
+pub mod rt;
 #[cfg(target_os = "windows")]
 pub mod wasapi;
 

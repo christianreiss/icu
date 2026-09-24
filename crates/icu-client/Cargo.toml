@@ -82,6 +82,8 @@ directories = "6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire = { version = "0.10.1", features = ["v0_3_49"] }
+# `pthread_self` for `audio::rt` (real-time priority through module-rt).
+libc = "0.2"
 ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "global_shortcuts"] }
 evdev = { version = "0.13.2", features = ["tokio"] }
 futures-util = "0.3"

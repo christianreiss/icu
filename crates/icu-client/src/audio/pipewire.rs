@@ -201,6 +201,9 @@ fn pw_thread(
             return;
         }
     };
+    // module-rt, loaded by the client context, is what can lift the engine's
+    // audio threads to real-time priority (`super::rt`).
+    super::rt::register_context(context.as_raw_ptr() as *mut std::ffi::c_void);
     let core = match context.connect_rc(None) {
         Ok(c) => c,
         Err(e) => {
@@ -368,7 +371,9 @@ fn open_stream(
 
     let data = StreamData {
         handler,
-        scratch: Vec::with_capacity(BLOCK_SAMPLES * 8),
+        // Sized for PipeWire's largest default quantum (8192) so the
+        // real-time callback never reallocates, whatever the graph runs.
+        scratch: Vec::with_capacity(8192),
         kind,
         events,
     };

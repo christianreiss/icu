@@ -56,6 +56,10 @@ use crate::{
 
 /// Samples per DSP block (10 ms).
 pub const BLOCK: usize = 480;
+/// Capture samples the DSP thread may fall behind (100 ms) before it skips
+/// to the newest two blocks: bounds send latency after a stall of the thread
+/// and keeps its catch-up burst far below an RTTIME limit.
+pub const MAX_CAPTURE_BACKLOG: usize = 10 * BLOCK;
 
 /// How the engine is started.
 #[derive(Debug, Clone)]
@@ -287,6 +291,8 @@ pub enum Command {
     ForceKeyframe,
     /// The hotkey backend that came up (for the settings view).
     HotkeyBackend(String),
+    /// Reopen the audio streams after a backend error (`icu-audio-events`).
+    ReopenStreams,
     /// Stop everything.
     Quit,
 }
@@ -565,7 +571,10 @@ impl Engine {
         // Ring buffers between backend callbacks and the DSP/mixer threads.
         let (cap_prod, cap_cons) = HeapRb::<f32>::new(48_000).split();
         let (ref_prod, ref_cons) = HeapRb::<f32>::new(48_000).split();
-        let (play_prod, play_cons) = HeapRb::<f32>::new(8 * BLOCK).split();
+        // The playback ring only ever holds `lead` (2 blocks, or one graph
+        // quantum + 1 block); 1 s of capacity just makes sure `lead` is never
+        // clamped below what a large quantum (Bluetooth, pro audio) asks for.
+        let (play_prod, play_cons) = HeapRb::<f32>::new(48_000).split();
 
         let shared = Arc::new(Shared {
             state: state_tx,
@@ -604,6 +613,7 @@ impl Engine {
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Command>();
         let mut threads = Vec::new();
+        let reopen_tx = cmd_tx.clone();
 
         // DSP thread.
         {
@@ -634,10 +644,39 @@ impl Engine {
             std::thread::Builder::new()
                 .name("icu-audio-events".into())
                 .spawn(move || {
+                    // A stream that died is reopened through the connection
+                    // task (`Command::ReopenStreams`, which owns the settings
+                    // and the AEC reinit), after a backoff of 1, 2, 4 … 30 s
+                    // that starts over once a minute passes without an error.
+                    // One reopen at a time: capture and playback usually die
+                    // together when a device vanishes.
+                    let mut backoff = Duration::from_secs(1);
+                    let mut last_error: Option<Instant> = None;
+                    let pending = Arc::new(AtomicBool::new(false));
+                    let schedule_reopen = |delay: Duration| {
+                        if pending.swap(true, Ordering::Relaxed) {
+                            return;
+                        }
+                        let tx = reopen_tx.clone();
+                        let pending = pending.clone();
+                        let _ = std::thread::Builder::new()
+                            .name("icu-audio-reopen".into())
+                            .spawn(move || {
+                                std::thread::sleep(delay);
+                                pending.store(false, Ordering::Relaxed);
+                                let _ = tx.send(Command::ReopenStreams);
+                            });
+                    };
                     while let Ok(ev) = events.recv() {
                         match ev {
                             BackendEvent::DevicesChanged(list) => {
                                 shared.state.send_modify(|s| s.devices = list);
+                                // A device came or went shortly after an
+                                // error: most likely the one that failed
+                                // (USB re-plug); try right away.
+                                if last_error.is_some_and(|t| t.elapsed() < Duration::from_secs(300)) {
+                                    schedule_reopen(Duration::from_secs(1));
+                                }
                             }
                             BackendEvent::StreamError { stream, message } => {
                                 tracing::warn!(?stream, %message, "audio stream error");
@@ -651,6 +690,14 @@ impl Engine {
                                     ))
                                 });
                                 let _ = backend.lock().map(|mut b| b.close(stream));
+                                backoff = match last_error {
+                                    Some(t) if t.elapsed() < Duration::from_secs(60) => {
+                                        (backoff * 2).min(Duration::from_secs(30))
+                                    }
+                                    _ => Duration::from_secs(1),
+                                };
+                                last_error = Some(Instant::now());
+                                schedule_reopen(backoff);
                             }
                         }
                     }
@@ -769,11 +816,14 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
     if let Err(e) = backend.open_capture(
         settings.audio.input_device.as_deref(),
         Box::new(move |block| {
-            if let Ok(mut p) = cap_prod.try_lock() {
-                let n = p.push_slice(block);
-                if n < block.len() {
-                    DebugStats::inc(&stats.capture_overruns);
-                }
+            // A failed `try_lock` (stream reopen in flight) loses the block
+            // like a full ring does; count both.
+            let pushed = cap_prod
+                .try_lock()
+                .map(|mut p| p.push_slice(block))
+                .unwrap_or(0);
+            if pushed < block.len() {
+                DebugStats::inc(&stats.capture_overruns);
             }
             cycle.capture_pushed(block.len());
         }),
@@ -787,11 +837,16 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
     if settings.audio.aec {
         let ref_prod = shared.ref_prod.clone();
         let cycle = shared.cycle.clone();
+        let stats = shared.stats.clone();
         match backend.open_reference(
             settings.audio.output_device.as_deref(),
             Box::new(move |block| {
-                if let Ok(mut p) = ref_prod.try_lock() {
-                    let _ = p.push_slice(block);
+                let pushed = ref_prod
+                    .try_lock()
+                    .map(|mut p| p.push_slice(block))
+                    .unwrap_or(0);
+                if pushed < block.len() {
+                    DebugStats::inc(&stats.reference_overruns);
                 }
                 cycle.reference_pushed();
             }),
@@ -809,6 +864,9 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
     let play_cons = shared.play_cons.clone();
     let play_request = shared.play_request.clone();
     let stats = shared.stats.clone();
+    // The new device may run a smaller quantum; let the mixer's lead shrink
+    // back to it instead of keeping the old device's for the session.
+    play_request.store(0, Ordering::Relaxed);
     match backend.open_playback(
         settings.audio.output_device.as_deref(),
         Box::new(move |out| {
@@ -845,6 +903,7 @@ fn dsp_thread(
     mut reference: HeapCons<f32>,
     test_tone: bool,
 ) {
+    crate::audio::rt::promote_current_thread("icu-dsp");
     let ctl = shared.dsp.clone();
     let stats = shared.stats.clone();
     let mut aec = match Aec::new() {
@@ -888,6 +947,10 @@ fn dsp_thread(
     let mut block = vec![0.0f32; BLOCK];
     let mut ref_block = vec![0.0f32; BLOCK];
     let mut frame_acc: Vec<f32> = Vec::with_capacity(960);
+    // The previous frame, for the VAD pre-roll (`preroll_now`).
+    let mut prev_frame: Vec<f32> = Vec::with_capacity(960);
+    let mut prev_frame_valid = false;
+    let mut prev_sent = false;
     let mut seq: u16 = 0;
     let mut ts: u32 = 0;
     let mut voice_in_frame = false;
@@ -939,6 +1002,20 @@ fn dsp_thread(
                     a.reinitialize();
                 }
                 voice_chain.reset();
+            }
+            // Bound the backlog: after a stall of this thread, everything
+            // older than 100 ms is stale — sending it late only adds latency
+            // that the receiver's jitter buffer drops anyway, and catching up
+            // on a full second in one burst is exactly the no-sleep CPU burst
+            // an RTTIME limit kills. Skip the same amount from both rings so
+            // the reference lag `dsp::refalign` reads off their occupancy
+            // difference stays valid.
+            let backlog = cap.occupied_len();
+            if backlog > MAX_CAPTURE_BACKLOG {
+                let excess = backlog - 2 * BLOCK;
+                cap.skip(excess);
+                reference.skip(excess);
+                DebugStats::add(&stats.capture_backlog_dropped, excess as u64);
             }
             let mut waited = 0u32;
             let mut ready_since: Option<Instant> = None;
@@ -1102,7 +1179,9 @@ fn dsp_thread(
             ));
             gate.set_ptt(ctl.ptt_down.load(Ordering::Relaxed) || test_tone);
             let online = ctl.online.load(Ordering::Relaxed);
-            gate.set_muted(ctl.muted.load(Ordering::Relaxed) || !online);
+            let muted = ctl.muted.load(Ordering::Relaxed) || !online;
+            gate.set_muted(muted);
+            let was_open = gate.is_open();
             let decision = gate.update(now, voice_in_frame);
             voice_in_frame = false;
 
@@ -1122,42 +1201,49 @@ fn dsp_thread(
             let sending = decision != Decision::Silent && online;
             ctl.sending.store(sending, Ordering::Relaxed);
             if sending {
+                // Pre-roll: the frame before the one RNNoise reacted to
+                // carries the onset; send it first with the seq/ts it would
+                // have had, so the receiver sees an ordinary spurt start.
+                if preroll_now(was_open, prev_sent, decision, gate.mode())
+                    && prev_frame_valid
+                    && prev_frame.len() == frame_samples
+                {
+                    match encoder.encode(&prev_frame) {
+                        Ok(packet) => {
+                            send_audio(
+                                &shared,
+                                &stats,
+                                0,
+                                seq,
+                                ts.wrapping_sub(frame_samples as u32),
+                                packet,
+                                t_block,
+                            );
+                            seq = seq.wrapping_add(1);
+                        }
+                        Err(e) => tracing::warn!(%e, "opus encode (pre-roll)"),
+                    }
+                }
                 match encoder.encode(&frame_acc[..frame_samples]) {
                     Ok(packet) => {
-                        let header = AudioHeader {
-                            flags: if decision == Decision::SendEnd {
-                                AUDIO_FLAG_END
-                            } else {
-                                0
-                            },
-                            speaker: 0,
-                            seq,
-                            ts,
+                        let flags = if decision == Decision::SendEnd {
+                            AUDIO_FLAG_END
+                        } else {
+                            0
                         };
-                        if let Ok(datagram) = header.datagram(packet) {
-                            // `into()` moves the buffer, so take its length
-                            // first; it is only counted once the send is
-                            // accepted.
-                            let wire_bytes = datagram.len() as u64;
-                            let conn = shared.conn.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(c) = conn.as_ref() {
-                                if c.send_datagram(datagram.into()).is_ok() {
-                                    DebugStats::inc(&stats.datagrams_sent);
-                                    DebugStats::add(&stats.audio_bytes_sent, wire_bytes);
-                                    stats
-                                        .capture_to_send
-                                        .lock()
-                                        .unwrap()
-                                        .record(t_block.elapsed());
-                                }
-                            }
-                        }
+                        send_audio(&shared, &stats, flags, seq, ts, packet, t_block);
                         seq = seq.wrapping_add(1);
                     }
                     Err(e) => tracing::warn!(%e, "opus encode"),
                 }
             }
             ts = ts.wrapping_add(frame_samples as u32);
+            // Keep this frame as the next one's pre-roll, unless the gate was
+            // muted: nothing captured while muted may leave the machine.
+            prev_frame.clear();
+            prev_frame.extend_from_slice(&frame_acc[..frame_samples]);
+            prev_frame_valid = !muted;
+            prev_sent = sending;
             frame_acc.drain(..frame_samples);
         }
 
@@ -1182,11 +1268,60 @@ fn dsp_thread(
     }
 }
 
+/// Whether the frame before this one goes out first: the gate just opened in
+/// VAD mode. RNNoise flags voice a block or two into a word, so the onset is
+/// in the frame that was *not* sent; sending it too costs one packet and
+/// 20 ms of pre-speech audio per spurt, not latency — both packets arrive
+/// together and the jitter buffer's prefill starts on the pair
+/// (`Client/IMPLEMENTATION.md` §6). PTT users press before they speak. A
+/// frame that already went out (the END frame, when voice returns right
+/// after the hangover) is never sent twice.
+fn preroll_now(was_open: bool, prev_sent: bool, decision: Decision, mode: Mode) -> bool {
+    !was_open && !prev_sent && decision != Decision::Silent && mode == Mode::Vad
+}
+
+/// Wraps one encoded frame in its header and hands it to the connection.
+/// Counted only once quinn accepted it.
+fn send_audio(
+    shared: &Arc<Shared>,
+    stats: &DebugStats,
+    flags: u8,
+    seq: u16,
+    ts: u32,
+    packet: &[u8],
+    t_block: Instant,
+) {
+    let header = AudioHeader {
+        flags,
+        speaker: 0,
+        seq,
+        ts,
+    };
+    let Ok(datagram) = header.datagram(packet) else {
+        return;
+    };
+    // `into()` moves the buffer, so take its length first.
+    let wire_bytes = datagram.len() as u64;
+    let conn = shared.conn.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = conn.as_ref() {
+        if c.send_datagram(datagram.into()).is_ok() {
+            DebugStats::inc(&stats.datagrams_sent);
+            DebugStats::add(&stats.audio_bytes_sent, wire_bytes);
+            stats
+                .capture_to_send
+                .lock()
+                .unwrap()
+                .record(t_block.elapsed());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mixer thread
 // ---------------------------------------------------------------------------
 
 fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
+    crate::audio::rt::promote_current_thread("icu-mixer");
     let stats = shared.stats.clone();
     let mut out = vec![0.0f32; BLOCK];
     let mut inputs: Vec<(Vec<f32>, f32)> = Vec::new();
@@ -1237,10 +1372,14 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                                 stats.jitter_delay.lock().unwrap().record(d);
                             }
                             let n = sp.decoder.decode(&p.payload, &mut fec_scratch).unwrap_or(0);
-                            sp.pending.extend(fec_scratch[..n].iter().copied());
                             DebugStats::inc(&stats.frames_decoded);
                             if n == 0 {
-                                break;
+                                // Undecodable: keep the speaker's timeline by
+                                // filling its frame length, not a block.
+                                sp.pending
+                                    .extend(std::iter::repeat_n(0.0, sp.jitter.frame_samples() as usize));
+                            } else {
+                                sp.pending.extend(fec_scratch[..n].iter().copied());
                             }
                         }
                         Pop::Lost { fec_source, .. } => {
@@ -1257,7 +1396,8 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                                 }
                             };
                             if n == 0 {
-                                sp.pending.extend(std::iter::repeat_n(0.0, BLOCK));
+                                sp.pending
+                                    .extend(std::iter::repeat_n(0.0, sp.jitter.frame_samples() as usize));
                             } else {
                                 sp.pending.extend(fec_scratch[..n].iter().copied());
                             }
@@ -1806,6 +1946,10 @@ impl LocalState {
             }
             Command::HotkeyBackend(name) => {
                 shared.state.send_modify(|s| s.hotkey_backend = name);
+            }
+            Command::ReopenStreams => {
+                tracing::info!("reopening audio streams after a stream error");
+                self.reopen_streams(shared);
             }
             Command::RequestRename(_) => {
                 shared.state.send_modify(|s| {
@@ -2362,6 +2506,7 @@ async fn run_session(
                 }
             }
             _ = loss_tick.tick() => {
+                prune_stray_speakers(shared);
                 let (reports, measured) = collect_loss_reports(shared);
                 // After `collect_loss_reports` returned, so the `speakers`
                 // lock it holds is gone: `send_modify` while holding one is
@@ -2399,7 +2544,7 @@ async fn run_session(
                     sent_packets: stats.path.sent_packets,
                     cwnd: stats.path.cwnd,
                     udp_tx_bytes: stats.udp_tx.bytes,
-                    datagram_queue_bytes: icu_proto::limits::DATAGRAM_BUFFER_BYTES
+                    datagram_queue_bytes: icu_proto::limits::CLIENT_DATAGRAM_SEND_BUFFER_BYTES
                         .saturating_sub(connection.datagram_send_buffer_space())
                         as u64,
                 };
@@ -2488,6 +2633,10 @@ impl crate::video::VideoSink for Arc<Shared> {
             (icu_proto::header::VIDEO_HEADER_LEN + frame.data.len()) as u64,
         );
         self.video.lock().unwrap().push(session, frame);
+    }
+
+    fn overflow(&self) {
+        DebugStats::inc(&self.stats.video_decode_dropped);
     }
 }
 
@@ -2584,6 +2733,27 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
     }
 }
 
+/// Drops speakers that `datagram_reader` created for a session the peer
+/// list does not (or no longer) know, once their datagrams have stopped for
+/// 10 s: a straggler after `UserLeft` must not keep a decoder and jitter
+/// buffer alive for the rest of the session.
+fn prune_stray_speakers(shared: &Arc<Shared>) {
+    let known: Vec<Session> = shared
+        .state
+        .borrow()
+        .peers
+        .iter()
+        .map(|p| p.info.session)
+        .collect();
+    let mut speakers = shared.speakers.lock().unwrap_or_else(|e| e.into_inner());
+    speakers.retain(|session, sp| {
+        known.contains(session)
+            || sp
+                .last_packet
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+    });
+}
+
 /// `(session, loss per mille)` for every speaker with traffic this tick.
 type LossPerSpeaker = Vec<(Session, u16)>;
 
@@ -2613,6 +2783,14 @@ fn collect_loss_reports(shared: &Arc<Shared>) -> (LossPerSpeaker, LossPerSpeaker
         if permille.abs_diff(sp.last_reported_permille) >= 10 {
             sp.last_reported_permille = permille;
             report.push((*session, permille));
+        }
+        // What we reported is what the server hints this speaker with, and
+        // the hint is what turns the speaker's FEC on: keep one frame in the
+        // buffer for packet n+1 exactly then (`JitterBuffer::set_loss_hinted`).
+        let hinted = sp.last_reported_permille > 0;
+        if sp.loss_hinted != hinted {
+            sp.loss_hinted = hinted;
+            sp.jitter.set_loss_hinted(hinted);
         }
     }
     (report, all)
@@ -2813,18 +2991,9 @@ async fn handle_control(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .set_audio_loss_hint(loss_permille);
-            let hinted = loss_permille > 0;
-            for sp in shared
-                .speakers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .values_mut()
-            {
-                if sp.loss_hinted != hinted {
-                    sp.loss_hinted = hinted;
-                    sp.jitter.set_loss_hinted(hinted);
-                }
-            }
+            // This hint is about *our* outgoing audio (the encoder above);
+            // the incoming buffers' FEC floor follows what we reported for
+            // each speaker (`collect_loss_reports`).
         }
         ControlMsg::KeyframeRequest { .. } => {
             shared.keyframe_request.store(true, Ordering::Relaxed);
@@ -3080,6 +3249,19 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preroll_only_when_a_vad_spurt_opens() {
+        use super::{preroll_now, Decision, Mode};
+        assert!(preroll_now(false, false, Decision::Send, Mode::Vad));
+        assert!(!preroll_now(true, false, Decision::Send, Mode::Vad), "already open");
+        assert!(!preroll_now(false, false, Decision::Silent, Mode::Vad), "still closed");
+        assert!(!preroll_now(false, false, Decision::Send, Mode::Ptt), "PTT: no pre-roll");
+        assert!(
+            !preroll_now(false, true, Decision::Send, Mode::Vad),
+            "the previous frame was the END packet: never send it twice"
+        );
+    }
+
     use super::*;
 
     fn peer(session: Session, flags: u8) -> Peer {
