@@ -822,12 +822,14 @@ fn speak_row(
     tile_w: f32,
 ) -> Option<egui::Response> {
     let ptt = state.mode == Mode::Ptt;
-    let open = if ptt { state.ptt_down } else { state.sending };
+    let offline = state.conn != ConnStatus::Connected;
+    let open = !offline && if ptt { state.ptt_down } else { state.sending };
     let key = hotkey_label(state);
     let speak = widgets::Speak {
         ptt,
         open,
         muted: state.muted,
+        offline,
         level: if ptt {
             theme::meter_fraction(state.level.rms_db)
         } else {
@@ -836,7 +838,12 @@ fn speak_row(
         threshold: (!ptt).then_some(state.vad_threshold),
         key: ptt.then_some(key.as_str()),
     };
-    let tooltip = if ptt {
+    let tooltip = if offline {
+        format!(
+            "Nicht verbunden — es wird nichts gesendet\nPegel {:.0} dBFS",
+            state.level.rms_db
+        )
+    } else if ptt {
         format!(
             "Push-to-Talk — halten zum Sprechen\nPegel {:.0} dBFS",
             state.level.rms_db
