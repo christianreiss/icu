@@ -125,6 +125,8 @@ pub struct DebugStats {
     pub jitter_underruns: AtomicU64,
     /// Packets skipped to shed delay grown by underruns.
     pub jitter_skipped: AtomicU64,
+    /// Packets dropped to drain a backlog after a network stall.
+    pub jitter_dropped: AtomicU64,
     /// Samples handed to the playback ring.
     pub samples_played: AtomicU64,
     /// Capture blocks processed by the DSP thread.
@@ -190,7 +192,7 @@ impl DebugStats {
             format!("{:.2} ms", rtt as f64 / 1000.0)
         };
         format!(
-            "icu stats: sent={} recv={} bad={} decoded={} fec={} plc={} played={} play_underruns={} jb_late={} jb_underruns={} jb_skipped={} dsp_blocks={} ref_underruns={} cap_overruns={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
+            "icu stats: sent={} recv={} bad={} decoded={} fec={} plc={} played={} play_underruns={} jb_late={} jb_underruns={} jb_skipped={} jb_dropped={} dsp_blocks={} ref_underruns={} cap_overruns={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
             Self::get(&self.datagrams_sent),
             Self::get(&self.datagrams_received),
             Self::get(&self.datagrams_bad),
@@ -202,6 +204,7 @@ impl DebugStats {
             Self::get(&self.jitter_late),
             Self::get(&self.jitter_underruns),
             Self::get(&self.jitter_skipped),
+            Self::get(&self.jitter_dropped),
             Self::get(&self.dsp_blocks),
             Self::get(&self.reference_underruns),
             Self::get(&self.capture_overruns),

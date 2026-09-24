@@ -61,6 +61,9 @@ pub struct JitterStats {
     pub underruns: u64,
     /// Packets skipped before decode to shed delay grown by underruns.
     pub skipped: u64,
+    /// Packets dropped because the queue held more than `max_delay` (a
+    /// stall's burst); keeps the backlog from becoming lasting latency.
+    pub dropped: u64,
 }
 
 /// Configuration in frames and milliseconds.
@@ -303,9 +306,35 @@ impl JitterBuffer {
         self.grown = 0;
     }
 
+    /// Caps the queue at `max_delay` (or target + 2 frames, if larger): past
+    /// that, drops the oldest packets down to target + 1 frame (at least one
+    /// packet stays). Without this a stall longer than `max_loss_frames` ends
+    /// the spurt, the burst that follows is queued whole and the next prefill
+    /// starts at its oldest packet: packets then arrive as fast as they play,
+    /// and the backlog lasts until the next pause. Runs before the prefill for
+    /// that reason. Delay grown by underruns inside a spurt is left to the
+    /// gentler one-packet skip in `pop`.
+    ///
+    /// A hard cut is audible; dropping low-energy frames first, or only every
+    /// third frame until caught up, would be gentler.
+    fn drain_backlog(&mut self, frame: Duration) {
+        let cap = self.cfg.max_delay.max(self.target + frame * 2);
+        if self.grown > 0 || frame * self.queue.len() as u32 <= cap {
+            return;
+        }
+        while self.queue.len() > 1 && frame * self.queue.len() as u32 > self.target + frame {
+            self.queue.pop_first();
+            self.stats.dropped += 1;
+        }
+        if self.next.is_some() {
+            self.next = self.queue.keys().next().copied();
+        }
+    }
+
     /// Called once per frame period by the playout side.
     pub fn pop(&mut self, now: Instant) -> Pop {
         let frame = self.frame_duration();
+        self.drain_backlog(frame);
         if self.next.is_none() {
             // Prefill: start once the target delay has elapsed since the first
             // queued packet, or enough packets are queued to cover it.
@@ -619,5 +648,45 @@ mod tests {
         }
         assert!(jb.stats().skipped > 0, "grown delay is shed");
         assert_eq!(jb.stats().late, 0);
+    }
+
+    #[test]
+    fn backlog_after_a_long_stall_is_dropped_not_kept_as_latency() {
+        // Continuous speech, 20 ms frames, 20 ms network delay, playout every
+        // 20 ms. At t = 3 s the network stalls for 400 ms, and everything
+        // sent meanwhile arrives at once when it ends.
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        let arrival = |i: u64| {
+            let normal = 20 * i + 20;
+            if (3000..3400).contains(&normal) {
+                3400
+            } else {
+                normal
+            }
+        };
+        let mut sent = 0u64;
+        let mut delay_after = Duration::ZERO;
+        for tick in 0..300u64 {
+            let now_ms = 20 * tick + 10;
+            while arrival(sent) <= now_ms {
+                jb.push(
+                    pkt(sent as u16, sent as u32 * 960, false),
+                    t0 + ms(arrival(sent)),
+                );
+                sent += 1;
+            }
+            if let Pop::Packet(_) = jb.pop(t0 + ms(now_ms)) {
+                if now_ms >= 5000 {
+                    delay_after = delay_after.max(jb.last_delay().unwrap_or_default());
+                }
+            }
+        }
+        let dropped = jb.stats().dropped;
+        assert!(
+            delay_after < ms(100),
+            "backlog stays as latency: {delay_after:?} (dropped {dropped})"
+        );
+        assert!((10..=20).contains(&dropped), "dropped {dropped}");
     }
 }

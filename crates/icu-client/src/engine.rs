@@ -1255,6 +1255,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                 let after = sp.jitter.stats();
                 DebugStats::add(&stats.jitter_underruns, after.underruns - before.underruns);
                 DebugStats::add(&stats.jitter_skipped, after.skipped - before.skipped);
+                DebugStats::add(&stats.jitter_dropped, after.dropped - before.dropped);
                 let mut buf = vec![0.0f32; BLOCK];
                 for s in buf.iter_mut() {
                     *s = sp.pending.pop_front().unwrap_or(0.0);
