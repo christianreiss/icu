@@ -29,7 +29,7 @@ pub use control::{ControlMsg, CAPS, MINOR};
 pub use framing::MAX_CONTROL_FRAME;
 pub use header::{seq_diff, set_speaker_in_place, ts_diff, AudioHeader, VideoHeader};
 pub use types::{
-    name_key, validate_name, AudioParams, NameError, Session, UserFlags, UserId, UserInfo,
+    name_key, normalize_name, validate_name, AudioParams, NameError, Session, UserFlags, UserId, UserInfo,
     UserSummary, Version, VersionError,
 };
 

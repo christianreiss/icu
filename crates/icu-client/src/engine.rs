@@ -1700,7 +1700,11 @@ async fn run_session(
     addr: SocketAddr,
     was_connected: &mut bool,
 ) -> SessionEnd {
-    let (client_config, cert_failure) = match conn::client_config(&local.identity) {
+    let crl = crate::crl::load(&local.paths, &local.identity.ca_der);
+    let (client_config, cert_failure) = match conn::client_config_with_crl(
+        &local.identity,
+        crl.as_deref(),
+    ) {
         Ok(c) => c,
         Err(e) => return SessionEnd::Fatal(e.to_string()),
     };
@@ -1959,7 +1963,7 @@ async fn run_session(
                 match cmd {
                     Command::Quit => break SessionEnd::Quit,
                     Command::RequestRename(name) => {
-                        let name = name.trim().to_string();
+                        let name = icu_proto::normalize_name(&name);
                         if local.pending_renew.is_some() {
                             shared.state.send_modify(|s| {
                                 s.name_error = Some("Eine Änderung läuft noch".into())
@@ -1984,6 +1988,7 @@ async fn run_session(
                         break SessionEnd::Retry("Identität ersetzt".into());
                     }
                     Command::CreateInvite { name, ttl_s } => {
+                        let name = icu_proto::normalize_name(&name);
                         // Empty asks the server for a generated placeholder.
                         let checked = if name.is_empty() {
                             Ok(())
@@ -2309,6 +2314,15 @@ async fn handle_control(
     _send: &mut quinn::SendStream,
 ) -> Option<SessionEnd> {
     match msg {
+        // Kept for the next connect; the current one already passed the
+        // handshake (`crate::crl`).
+        ControlMsg::CrlUpdate { crl_der } => {
+            match crate::crl::accept(&local.paths, &local.identity.ca_der, &crl_der) {
+                Ok(true) => tracing::info!(bytes = crl_der.len(), "CRL updated"),
+                Ok(false) => tracing::debug!("CRL not newer, kept the stored one"),
+                Err(e) => tracing::warn!(error = %e, "CRL refused"),
+            }
+        }
         ControlMsg::UserJoined { user } => {
             let frame_samples = shared.dsp.frame_samples.load(Ordering::Relaxed);
             let volume = shared

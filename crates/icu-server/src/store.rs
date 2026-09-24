@@ -71,6 +71,18 @@ pub fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Inverse of [`encode_hex`]; `None` for anything that is not even-length
+/// hex.
+pub fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 /// SHA-256 over a certificate DER, lowercase hex without separators.
 pub fn fingerprint(der: &[u8]) -> String {
     encode_hex(&Sha256::digest(der))
@@ -106,6 +118,12 @@ pub struct CertRecord {
     /// ([`Store::consume_registration`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub registration: bool,
+    /// Serial number, lowercase hex of the DER integer's content octets —
+    /// what the CRL lists (`PROTOCOL.md` §1). `None` for records written
+    /// before the CRL existed; those stay covered by the fingerprint check
+    /// alone, since the DER is not kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
 }
 
 impl CertRecord {
@@ -168,9 +186,26 @@ pub struct UsersFile {
     pub schema: u32,
     /// Next `user_id` to hand out.
     pub next_user_id: UserId,
+    /// Number of the most recently issued CRL; strictly increasing, so a
+    /// client can refuse an older one (`PROTOCOL.md` §2.2 `CrlUpdate`).
+    #[serde(default)]
+    pub crl_number: u64,
+    /// Server leaves replaced by `rotate-server-cert`. They stay on the CRL
+    /// until they expire, so a leaked old server key is worthless.
+    #[serde(default, rename = "revoked_server")]
+    pub revoked_server: Vec<RevokedServerCert>,
     /// Users, keyed by the decimal `user_id` (TOML keys are strings).
     #[serde(default, rename = "user")]
     pub users: BTreeMap<String, UserRecord>,
+}
+
+/// A server leaf on the CRL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokedServerCert {
+    /// Serial, lowercase hex (see [`CertRecord::serial`]).
+    pub serial: String,
+    /// When it expires, RFC 3339 UTC; afterwards it leaves the CRL.
+    pub expires: String,
 }
 
 impl Default for UsersFile {
@@ -178,6 +213,8 @@ impl Default for UsersFile {
         UsersFile {
             schema: SCHEMA,
             next_user_id: 1,
+            crl_number: 0,
+            revoked_server: Vec::new(),
             users: BTreeMap::new(),
         }
     }
@@ -586,6 +623,50 @@ impl Store {
         })
     }
 
+    /// Serials for the CRL: every revoked certificate that has a recorded
+    /// serial and has not expired yet — client leaves, consumed registration
+    /// certificates and replaced server leaves.
+    pub fn crl_serials(&self) -> Vec<String> {
+        let now = now();
+        let clients = self
+            .users
+            .users
+            .values()
+            .flat_map(|u| &u.certs)
+            .filter(|c| c.revoked && !c.expired(now))
+            .filter_map(|c| c.serial.clone());
+        let servers = self
+            .users
+            .revoked_server
+            .iter()
+            .filter(|s| parse_rfc3339(&s.expires).map(|e| e > now).unwrap_or(true))
+            .map(|s| s.serial.clone());
+        clients.chain(servers).collect()
+    }
+
+    /// Reserves the next CRL number and drops expired server entries in the
+    /// same write.
+    pub fn next_crl_number(&mut self) -> Result<u64> {
+        let now = now();
+        self.update_users(|users| {
+            users.crl_number += 1;
+            users
+                .revoked_server
+                .retain(|s| parse_rfc3339(&s.expires).map(|e| e > now).unwrap_or(true));
+            Ok(users.crl_number)
+        })
+    }
+
+    /// Puts a server leaf on the CRL (`rotate-server-cert`).
+    pub fn revoke_server_cert(&mut self, serial: String, expires: String) -> Result<()> {
+        self.update_users(|users| {
+            if !users.revoked_server.iter().any(|s| s.serial == serial) {
+                users.revoked_server.push(RevokedServerCert { serial, expires });
+            }
+            Ok(())
+        })
+    }
+
     /// Drops users who were invited and never confirmed a registration before
     /// their registration certificate expired, which frees the name. A redeem
     /// that was never confirmed counts as unused: nobody may hold its
@@ -693,6 +774,7 @@ mod tests {
             revoked: false,
             renewed: None,
             registration: false,
+            serial: None,
         }
     }
 

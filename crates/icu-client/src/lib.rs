@@ -6,6 +6,7 @@ pub mod audio;
 pub mod camera;
 pub mod config;
 pub mod conninfo;
+pub mod crl;
 pub mod cues;
 pub mod dsp;
 pub mod engine;

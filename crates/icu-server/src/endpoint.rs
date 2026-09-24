@@ -9,12 +9,13 @@ use std::{
 
 use icu_proto::limits as pl;
 use quinn::{crypto::rustls::QuicServerConfig, Endpoint, VarInt};
-use rustls::RootCertStore;
+use rustls::{pki_types::CertificateRevocationListDer, RootCertStore};
 
 use crate::{
     ca::Ca,
     config::Config,
     error::{Context, Error, Result},
+    store::Store,
     Server,
 };
 
@@ -26,7 +27,15 @@ use crate::{
 /// `allow_unauthenticated()` although every client needs a certificate: the
 /// requirement is enforced in `session.rs`, which closes with a readable
 /// `AUTH_REQUIRED` instead of a bare TLS alert (`PROTOCOL.md` §1, Spike 2b).
-pub fn server_config(config: &Config, ca: &Ca) -> Result<quinn::ServerConfig> {
+///
+/// `crl` makes a revoked client certificate fail the handshake itself
+/// (`certificate_revoked` alert). Only the leaf is checked; the CA is the
+/// issuer of both, so the CRL always speaks for it.
+pub fn server_config(
+    config: &Config,
+    ca: &Ca,
+    crl: &CertificateRevocationListDer<'static>,
+) -> Result<quinn::ServerConfig> {
     let mut roots = RootCertStore::empty();
     roots
         .add(ca.ca_der().clone())
@@ -37,6 +46,8 @@ pub fn server_config(config: &Config, ca: &Ca) -> Result<quinn::ServerConfig> {
         Arc::new(rustls::crypto::ring::default_provider()),
     )
     .allow_unauthenticated()
+    .with_crls([crl.clone()])
+    .only_check_end_entity_revocation()
     .build()
     .context("cannot build the client certificate verifier")?;
 
@@ -73,6 +84,49 @@ pub fn server_config(config: &Config, ca: &Ca) -> Result<quinn::ServerConfig> {
     quic.transport_config(Arc::new(transport));
 
     Ok(quic)
+}
+
+/// Signs a fresh CRL from the store under the next CRL number.
+pub fn build_crl(store: &mut Store, ca: &Ca) -> Result<CertificateRevocationListDer<'static>> {
+    let number = store.next_crl_number()?;
+    ca.crl(number, &store.crl_serials())
+}
+
+/// Puts the current revocations and server leaf into force without a
+/// restart: a new CRL, a new TLS config on every endpoint (new handshakes
+/// only; live connections are the kick's business), and a `CrlUpdate` to
+/// every client in the room. Call it after anything that revokes a
+/// certificate or replaces the server leaf, never while holding the store
+/// lock.
+pub async fn reload_tls(server: &Arc<Server>) -> Result<()> {
+    let crl = {
+        let mut store = server.store.lock().await;
+        let ca = server.ca.read().await;
+        let crl = build_crl(&mut store, &ca)?;
+        if !server.endpoints.is_empty() {
+            let quic = server_config(&server.config, &ca, &crl)?;
+            for endpoint in &server.endpoints {
+                endpoint.set_server_config(Some(quic.clone()));
+            }
+        }
+        crl
+    };
+    *server.crl.write().unwrap_or_else(|e| e.into_inner()) = crl.to_vec();
+    server.room.broadcast(&icu_proto::ControlMsg::CrlUpdate {
+        crl_der: crl.to_vec(),
+    });
+    tracing::info!(bytes = crl.len(), "CRL and TLS config reloaded");
+    Ok(())
+}
+
+/// [`reload_tls`] for callers that cannot do anything about a failure but
+/// log it: the store change it follows is already written, and the
+/// fingerprint check still refuses a revoked certificate after the
+/// handshake.
+pub async fn reload_tls_logged(server: &Arc<Server>) {
+    if let Err(e) = reload_tls(server).await {
+        tracing::warn!(error = %e, "cannot reload the CRL");
+    }
 }
 
 /// Binds one endpoint.

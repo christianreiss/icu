@@ -47,6 +47,9 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
         }
     };
 
+    // One live connection per certificate: this one wins (`PROTOCOL.md` §7).
+    let _live = LiveCert::claim(&server, &identity.cert_fp, &conn);
+
     let served = if identity.registration {
         serve_registration(&server, &conn, &identity).await
     } else {
@@ -59,6 +62,64 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
             tracing::info!(%remote, user_id = identity.user_id, error = %e, "closing");
             conn.close(quinn::VarInt::from_u32(code), ec::name(code).as_bytes());
             Err(e)
+        }
+    }
+}
+
+/// Holds a certificate's slot in [`Server::live_certs`] for as long as its
+/// connection lives. A newer connection with the same certificate takes the
+/// slot over and closes this one with `SESSION_REPLACED`: newest wins, so a
+/// client whose old path is still waiting for its idle timeout is not locked
+/// out, and a stolen passport in use shows up as a kicked owner.
+struct LiveCert {
+    server: Arc<Server>,
+    fp: String,
+    id: usize,
+}
+
+impl LiveCert {
+    fn claim(server: &Arc<Server>, fp: &str, conn: &quinn::Connection) -> LiveCert {
+        let old = server
+            .live_certs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(fp.to_string(), conn.clone());
+        if let Some(old) = old.filter(|old| old.stable_id() != conn.stable_id()) {
+            // Mark before closing, like `kick_user`, so `UserLeft` carries the
+            // code. An old session still before `room.join` sees its closed
+            // connection right after joining and leaves again.
+            if let Some(session) = server.room.session_of_connection(old.stable_id()) {
+                server.room.mark_closing(session, ec::SESSION_REPLACED);
+            }
+            old.close(
+                quinn::VarInt::from_u32(ec::SESSION_REPLACED),
+                ec::name(ec::SESSION_REPLACED).as_bytes(),
+            );
+            tracing::info!(
+                fingerprint = fp,
+                old = %old.remote_address(),
+                new = %conn.remote_address(),
+                "certificate connected again, older connection replaced"
+            );
+        }
+        LiveCert {
+            server: server.clone(),
+            fp: fp.to_string(),
+            id: conn.stable_id(),
+        }
+    }
+}
+
+impl Drop for LiveCert {
+    fn drop(&mut self) {
+        let mut live = self
+            .server
+            .live_certs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Only our own entry: a replacement already sits there otherwise.
+        if live.get(&self.fp).is_some_and(|c| c.stable_id() == self.id) {
+            live.remove(&self.fp);
         }
     }
 }
@@ -124,15 +185,18 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
     let registration = cert.registration;
     // The first login with a real certificate proves the client stored it,
     // whether or not the registration session saw the clean close.
-    if !registration {
-        store.consume_registration(user_id)?;
+    let consumed = !registration && store.consume_registration(user_id)?;
+    let spki = ca::leaf_public_key(leaf);
+    drop(store);
+    if consumed {
+        crate::endpoint::reload_tls_logged(server).await;
     }
     Ok(Identity {
         user_id,
         cert_fp: fp,
         cert_cn,
         registration,
-        cert_spki: ca::leaf_public_key(leaf),
+        cert_spki: spki,
     })
 }
 
@@ -266,6 +330,14 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         }
     };
     drop(store);
+    // The client checks the server leaf against the newest CRL it holds;
+    // this is how it gets one (`PROTOCOL.md` §2.2).
+    let crl_der = server.crl.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if !crl_der.is_empty() {
+        server
+            .room
+            .send_to(session, &ControlMsg::CrlUpdate { crl_der });
+    }
 
     let writer = tokio::spawn(writer_task(send, out_rx));
     tracing::info!(
@@ -439,12 +511,15 @@ async fn serve_registration(
                             Ok(quinn::ConnectionError::ApplicationClosed(ref c))
                                 if u64::from(c.error_code) == u64::from(ec::NO_ERROR)
                         ) {
-                            server
+                            let consumed = server
                                 .store
                                 .lock()
                                 .await
                                 .consume_registration(identity.user_id)?;
                             tracing::info!(user_id = identity.user_id, "registration confirmed");
+                            if consumed {
+                                crate::endpoint::reload_tls_logged(server).await;
+                            }
                         }
                         return Ok(());
                     }
@@ -516,9 +591,12 @@ async fn redeem(server: &Arc<Server>, identity: &Identity, csr_der: &[u8]) -> Re
         revoked: false,
         renewed: None,
         registration: false,
+        serial: Some(ca::leaf_serial(&leaf)),
     };
     store.redeem_registration(identity.user_id, &identity.cert_fp, cert)?;
     drop(store);
+    // A repeated redeem revoked the certificates of earlier ones.
+    crate::endpoint::reload_tls_logged(server).await;
     tracing::info!(user_id = identity.user_id, name = %cn, "registered");
     Ok(leaf.to_vec())
 }
@@ -859,6 +937,7 @@ async fn handle_renew(
         revoked: false,
         renewed: None,
         registration: false,
+        serial: Some(ca::leaf_serial(&leaf)),
     };
     // Only a catch-up stamps the presented certificate: the same certificate
     // may be on a second device (passport) that still has to catch up itself.
@@ -945,7 +1024,7 @@ async fn admin_action(
     target: UserId,
     change: impl FnOnce(&mut Store) -> Result<bool>,
     done: impl FnOnce() -> ControlMsg,
-) {
+) -> bool {
     let outcome = {
         let mut store = server.store.lock().await;
         if !store.is_admin(actor) {
@@ -956,6 +1035,7 @@ async fn admin_action(
             change(&mut store)
         }
     };
+    let applied = outcome.is_ok();
     let answer = match outcome {
         Ok(_) => done(),
         Err(e) => ControlMsg::AdminActionError {
@@ -965,6 +1045,7 @@ async fn admin_action(
         },
     };
     server.room.send_to(session, &answer);
+    applied
 }
 
 /// `AdminSetRole`: `UserAdminChanged` goes to every one of the target's own
@@ -993,7 +1074,7 @@ async fn handle_admin_set_role(
             }
         },
     )
-    .await
+    .await;
 }
 
 /// Puts a role change live without a reconnect: `UserAdminChanged` to every
@@ -1041,7 +1122,7 @@ async fn handle_admin_set_disabled(
             }
         },
     )
-    .await
+    .await;
 }
 
 /// `AdminRevokeUser`: revokes every certificate of `target` and kicks any live
@@ -1052,7 +1133,7 @@ async fn handle_admin_revoke_user(
     actor: UserId,
     target: UserId,
 ) {
-    admin_action(
+    let revoked = admin_action(
         server,
         session,
         actor,
@@ -1067,7 +1148,10 @@ async fn handle_admin_revoke_user(
             }
         },
     )
-    .await
+    .await;
+    if revoked {
+        crate::endpoint::reload_tls_logged(server).await;
+    }
 }
 
 /// `UserListRequest` (`PROTOCOL.md` §2.2). Admin only; every registered user,

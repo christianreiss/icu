@@ -281,6 +281,16 @@ impl Room {
         member
     }
 
+    /// The session riding on the connection with this `stable_id`, if it is
+    /// in the room.
+    pub fn session_of_connection(&self, stable_id: usize) -> Option<Session> {
+        self.lock()
+            .members
+            .values()
+            .find(|m| m.conn.stable_id() == stable_id)
+            .map(|m| m.session)
+    }
+
     /// One participant, cloned.
     pub fn member(&self, session: Session) -> Option<Member> {
         self.lock().members.get(&session).cloned()

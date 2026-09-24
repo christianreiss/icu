@@ -26,6 +26,10 @@ struct Cli {
     /// passport.
     #[arg(long)]
     name: Option<String>,
+    /// Take the bundle or passport without asking. Without it the server,
+    /// address and name it leads to are shown and have to be confirmed.
+    #[arg(long)]
+    yes: bool,
     /// Configuration directory (default `$XDG_CONFIG_HOME/icu`).
     #[arg(long)]
     config_dir: Option<PathBuf>,
@@ -69,6 +73,26 @@ fn main() -> ExitCode {
     }
 }
 
+/// Asks on the terminal whether to take the shown bundle or passport. Without
+/// a terminal there is nobody to ask: that needs `--yes`.
+fn confirm_import() -> Result<bool, String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Err("no terminal to confirm the import on; check the lines above and pass --yes".into());
+    }
+    eprint!("icu: Diesen Server übernehmen? [j/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    Ok(matches!(
+        answer.trim().to_lowercase().as_str(),
+        "j" | "ja" | "y" | "yes"
+    ))
+}
+
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -92,6 +116,16 @@ fn run(cli: Cli) -> Result<(), String> {
             std::fs::read_to_string(bundle).map_err(|e| format!("{bundle}: {e}"))?
         };
         let mut identity = Identity::from_passport(&text)?;
+        // A passport brings its own CA and address: show where it leads
+        // before anything is replaced (`PROTOCOL.md` §2.3.1).
+        let current = Identity::load(&paths).ok().flatten();
+        let summary = icu_client::config::ImportSummary::of(&identity, current.as_ref());
+        for line in summary.lines() {
+            eprintln!("icu: {line}");
+        }
+        if !cli.yes && !confirm_import()? {
+            return Err("import cancelled".into());
+        }
         if identity.is_registration() {
             let name = cli
                 .name

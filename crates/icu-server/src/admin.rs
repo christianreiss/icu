@@ -248,6 +248,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     // A revoke takes effect immediately (§5).
                     let closed = session::kick_user(server, user_id, ec::KICKED);
                     tracing::info!(user_id, closed, "revoked");
+                    crate::endpoint::reload_tls_logged(server).await;
                     AdminResponse::Revoke { user_id, closed }
                 }
                 Err(e) => store_err(e, "REVOKE_FAILED"),
@@ -259,11 +260,29 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
         AdminRequest::Disable { user } => set_disabled(server, &user, true).await,
         AdminRequest::Status => AdminResponse::Status(status(server)),
         AdminRequest::RotateServerCert => {
-            let mut ca = server.ca.write().await;
-            match ca.rotate_server_cert(&server.config.tls, &server.config.server.server_name) {
-                // The new leaf only takes effect on restart: quinn holds the
-                // rustls config from startup. Reported as a deviation.
-                Ok(()) => AdminResponse::Ok,
+            // The old leaf goes on the CRL first: if rotating is the answer
+            // to a leaked server key, clients must refuse that leaf, and a
+            // failed rotation afterwards only leaves a spare entry.
+            let rotated = {
+                let mut store = server.store.lock().await;
+                let mut ca = server.ca.write().await;
+                let old = ca.server_der().clone();
+                let expires = crate::ca::leaf_not_after(&old);
+                store
+                    .revoke_server_cert(crate::ca::leaf_serial(&old), expires)
+                    .and_then(|()| {
+                        ca.rotate_server_cert(
+                            &server.config.tls,
+                            &server.config.server.server_name,
+                        )
+                    })
+            };
+            match rotated {
+                // The new leaf and the CRL go live without a restart.
+                Ok(()) => match crate::endpoint::reload_tls(server).await {
+                    Ok(()) => AdminResponse::Ok,
+                    Err(e) => AdminResponse::err("ROTATE_FAILED", e),
+                },
                 Err(e) => AdminResponse::err("ROTATE_FAILED", e),
             }
         }

@@ -46,6 +46,7 @@ pub async fn register(
     addr_override: Option<SocketAddr>,
     paths: &Paths,
 ) -> Result<Identity, NetError> {
+    let name = &icu_proto::normalize_name(name);
     icu_proto::validate_name(name).map_err(|e| NetError::BadLink(e.to_string()))?;
     let (config, cert_failure) = conn::client_config(bundle)?;
     let addr = match addr_override {

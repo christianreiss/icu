@@ -74,6 +74,7 @@ pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issu
         revoked: false,
         renewed: None,
         registration: true,
+        serial: Some(crate::ca::leaf_serial(&leaf)),
     };
     let expires = cert.expires.clone();
     let (user_id, is_admin) = store.add_registration(cert)?;

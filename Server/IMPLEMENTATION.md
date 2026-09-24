@@ -108,13 +108,13 @@ Zeitstempel durchgehend RFC 3339 in UTC; Fingerprints lowercase Hex ohne Trenner
 | `icu-server run [--config PATH]` | Server starten; beim ersten Start CA und Server-Leaf erzeugen. |
 | `icu-server invite [--name neu-bob] [--ttl 24h] [--out datei]` | Registrierungs-Bundle ausstellen (`PROTOCOL.md` §2.3): Schlüssel + Registrierungszertifikat + CA als Passport, auf stdout oder mit Modus 0600 in `--out`. `--name` ist nur der Platzhaltername, bis der Eingeladene seinen eigenen wählt; ohne ihn wird `neu-xxxx` erzeugt. `--ttl` höchstens 7 Tage. Das erste Bundle auf einem leeren Server ist das des Admins; es geht auch ohne laufenden Server. |
 | `icu-server users` | Tabelle: `user_id`, Name, Fingerprint (gekürzt), ausgestellt, läuft ab, revoked, admin, disabled, pending (eingeladen, Registrierung nicht quittiert — `UserRecord::is_pending`), online. |
-| `icu-server revoke <name\|user_id\|fingerprint>` | `revoked = true` auf **allen** Certs des Nutzers; eine laufende Verbindung wird sofort mit `KICKED` geschlossen. |
+| `icu-server revoke <name\|user_id\|fingerprint>` | `revoked = true` auf **allen** Certs des Nutzers; eine laufende Verbindung wird sofort mit `KICKED` geschlossen. Danach neue CRL, ohne Neustart in Kraft (`endpoint::reload_tls`, §6.3): der nächste Handshake scheitert mit `certificate_revoked`. |
 | `icu-server promote <name\|user_id\|fingerprint>` | `is_admin = true`. Pusht `UserAdminChanged { is_admin: true }` an jede eigene Sitzung des Nutzers, wenn online. |
 | `icu-server demote <name\|user_id\|fingerprint>` | `is_admin = false`. Abgelehnt mit `LAST_ADMIN`, wenn der Nutzer der letzte funktionsfähige Admin ist. Sonst wie `promote`, mit `is_admin: false`. |
 | `icu-server disable <name\|user_id\|fingerprint>` | `disabled = true`; eine laufende Verbindung wird sofort mit `AUTH_DISABLED` geschlossen. Abgelehnt mit `LAST_ADMIN`, wenn der Nutzer der letzte funktionsfähige Admin ist. |
 | `icu-server enable <name\|user_id\|fingerprint>` | `disabled = false`; bestehende, nicht widerrufene Zertifikate sind sofort wieder gültig. |
 | `icu-server status` | Online-Liste, Uptime, Relay-Zähler. |
-| `icu-server rotate-server-cert` | Neues Server-Leaf von derselben CA; Clients brauchen nichts. |
+| `icu-server rotate-server-cert` | Neues Server-Leaf von derselben CA, sofort in Kraft (kein Neustart mehr); das alte kommt auf die CRL (`users.toml` `[[revoked_server]]`), damit Clients es ab ihrer nächsten Verbindung ablehnen — für den Fall, dass sein Schlüssel abhandengekommen ist. Clients brauchen nichts. |
 
 Einladen geht auch über die authentifizierte `icu/1`-Verbindung (`CreateInviteRequest`, `PROTOCOL.md` §2.2) — ein eingeloggter Admin braucht dafür weder CLI noch Host-Zugriff, nur `Welcome.is_admin`. Alle drei Wege laufen über `registration::issue`.
 
@@ -153,6 +153,8 @@ Fehlerform einheitlich `{"ok":false,"error":"<kurzform>","detail":"<text>"}`.
 
 ### 6.2 Accept
 
+**Eine Verbindung pro Zertifikat** (2026-09-24, `PROTOCOL.md` §7): nach `authenticate` trägt `session::LiveCert` die Verbindung unter dem Leaf-Fingerprint in `Server.live_certs` ein, für normale und Registrierungssitzungen. Stand dort schon eine andere, wird sie mit `SESSION_REPLACED` geschlossen (Raum-Sitzung vorher per `mark_closing` markiert, damit `UserLeft` den Code trägt); der Eintrag wird beim Ende nur entfernt, wenn er noch dieser Verbindung gehört (`stable_id`).
+
 ```
 incoming = endpoint.accept()
   if offene Verbindungen ≥ max_connections (256) → incoming.refuse()   // Handshake oder etabliert, alle Endpoints
@@ -185,6 +187,8 @@ Ablauf und Regeln normativ in `PROTOCOL.md` §2.3; hier nur die Umsetzung.
 4. Nach `RenewResponse` wartet der Server bis zu 5 s darauf, dass der Client schließt, statt selbst zu schließen — ein eigenes Close könnte die Antwort überholen. Schließt der Client mit `NO_ERROR`, hat er das Zertifikat gespeichert: `store.consume_registration` widerruft das Registrierungszertifikat. Jeder andere Ausgang (anderer Code, Timeout, Abbruch) lässt das Bundle gültig, damit eine verlorene Antwort oder ein gescheitertes Speichern es nicht verbrennt. `authenticate` verbraucht die Registrierung zusätzlich beim ersten Login mit einem echten Zertifikat des Nutzers (Absturz nach dem Speichern, vor der Quittung).
 
 **Client-Zertifikate** (`sign_client_csr`, auch für Renewals): Subject nur der geprüfte CN aus der CSR (als UTF8String neu gebaut), einziger SAN die URI `icu://<public_host>`, EKU ClientAuth, keine Key Usage, `not_before = now − 1 h`, `not_after = now + client_validity_days`, Serial = 16 Zufallsbytes; nur P-256- und P-384-Schlüssel. Der CN wird mit x509-parser aus dem rohen DER gelesen (nicht über rcgens `DistinguishedName`, das zwei CNs still zu einem verschmelzen würde): genau einer, als UTF-8 lesbar, `validate_name` erfüllt.
+
+**CRL** (2026-09-24, `PROTOCOL.md` §1): `CertRecord.serial` (Hex der Serial, beim Ausstellen gesetzt; alte Einträge ohne) und `UsersFile.revoked_server`/`crl_number` liefern `Store::crl_serials`; `Ca::crl` signiert daraus eine CRL (rcgen, CRL-Nummer aus `Store::next_crl_number`, streng monoton, `nextUpdate` +30 d, nicht erzwungen). `endpoint::server_config` hängt sie an den `WebPkiClientVerifier` (`with_crls`, `only_check_end_entity_revocation`). `endpoint::reload_tls` baut CRL und TLS-Konfiguration neu, setzt sie per `set_server_config` auf alle Endpoints (`Server.endpoints`) und broadcastet `CrlUpdate`; aufgerufen beim Start (Offline-Widerrufe greifen ab dem ersten Handshake), nach `revoke` (Socket und in-band), nach jeder verbrauchten oder wiederholten Registrierung und nach `rotate-server-cert`. Nie unter dem Store-Lock aufrufen; Lock-Reihenfolge überall Store → CA. Neue Sitzungen bekommen die aktuelle CRL direkt nach `Welcome`.
 
 ### 6.4 Session (`session.rs`)
 
