@@ -1133,8 +1133,8 @@ pub fn run_enroll(
         viewport: egui::ViewportBuilder::default()
             .with_title("ICU — Einladung")
             .with_app_id("icu")
-            .with_inner_size([440.0, 380.0])
-            .with_min_inner_size([400.0, 300.0]),
+            .with_inner_size([460.0, 460.0])
+            .with_min_inner_size([420.0, 380.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -1260,159 +1260,265 @@ impl eframe::App for EnrollApp {
             }
         }
         let busy = self.pending.is_some();
+        let tok = theme::tokens(root.visuals());
 
-        egui::CentralPanel::default().show(root, |ui| {
-            // An error banner wraps to however many lines it needs, so the
-            // content can outgrow the window; it scrolls rather than clips.
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let tok = theme::tokens(ui.visuals());
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let (badge, _) =
-                        ui.allocate_exact_size(egui::vec2(36.0, 36.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(badge, theme::R_CTRL, tok.accent_tint_2);
-                    ui.painter().text(
-                        badge.center(),
-                        egui::Align2::CENTER_CENTER,
-                        icon::WAVEFORM,
-                        egui::FontId::new(18.0, egui::FontFamily::Proportional),
-                        tok.accent,
-                    );
-                    ui.add_space(2.0);
-                    ui.vertical(|ui| {
-                        ui.label(theme::strong_text("Mit ICU verbinden"));
-                        ui.label(
-                            RichText::new(
-                                "Füge die Einladung ein, die du bekommen hast — oder deinen \
-                                 Passport von einem anderen Gerät.",
-                            )
-                                .size(12.0)
-                                .color(tok.muted_text),
-                        );
-                    });
-                });
-                ui.add_space(14.0);
-
-                // A passport carries its own certificate; a registration
-                // bundle needs a name, prefilled from its placeholder.
-                let parsed = Identity::from_passport(&self.link).ok();
-                // Where the pasted text leads, shown before joining: it brings
-                // its own CA and address (`PROTOCOL.md` §2.3.1).
-                let summary = parsed
-                    .as_ref()
-                    .map(|id| crate::config::ImportSummary::of(id, None));
-                let registration = parsed.filter(Identity::is_registration);
-                let prefill = registration.as_ref().map(|id| {
-                    crate::conninfo::CertInfo::from_der(&id.leaf_der).subject
-                });
-                if prefill != self.prefilled_from {
-                    if let Some(n) = &prefill {
-                        if self.name.trim().is_empty()
-                            || Some(self.name.as_str()) == self.prefilled_from.as_deref()
-                        {
-                            self.name = n.clone();
-                        }
-                    }
-                    self.prefilled_from = prefill;
+        // A passport carries its own certificate; a registration bundle
+        // needs a name, prefilled from its placeholder.
+        let parsed = Identity::from_passport(&self.link).ok();
+        // Where the pasted text leads, shown before joining: it brings its
+        // own CA and address (`PROTOCOL.md` §2.3.1).
+        let summary = parsed
+            .as_ref()
+            .map(|id| crate::config::ImportSummary::of(id, None));
+        let registration = parsed.filter(Identity::is_registration);
+        let prefill = registration
+            .as_ref()
+            .map(|id| crate::conninfo::CertInfo::from_der(&id.leaf_der).subject);
+        if prefill != self.prefilled_from {
+            if let Some(n) = &prefill {
+                if self.name.trim().is_empty()
+                    || Some(self.name.as_str()) == self.prefilled_from.as_deref()
+                {
+                    self.name = n.clone();
                 }
-                let needs_name = registration.is_some();
-                let mut submit = false;
-                widgets::group_card(ui, "Einladung", |ui| {
-                    widgets::card_note(ui, |ui| {
-                        ui.add_enabled(
-                            !busy,
-                            egui::TextEdit::multiline(&mut self.link)
-                                .desired_rows(2)
-                                .desired_width(f32::INFINITY)
-                                .font(egui::TextStyle::Monospace)
-                                .hint_text(icu_proto::passport::ARMOR_BEGIN),
+            }
+            self.prefilled_from = prefill;
+        }
+        let needs_name = registration.is_some();
+        let valid = summary.is_some();
+        let has_text = !self.link.trim().is_empty();
+        let can_submit = !busy && valid && (!needs_name || !self.name.trim().is_empty());
+        let mut submit = false;
+
+        // The action sits at the bottom edge, so the window has a floor
+        // instead of trailing off into empty panel.
+        egui::Panel::bottom("enroll_actions")
+            .frame(
+                egui::Frame::new()
+                    .fill(root.visuals().panel_fill)
+                    .inner_margin(egui::Margin {
+                        left: 24,
+                        right: 24,
+                        top: 14,
+                        bottom: 18,
+                    }),
+            )
+            .show(root, |ui| {
+                // Not-ready is neutral grey rather than a faded accent, which
+                // read as a broken button.
+                let kind = if can_submit {
+                    widgets::ButtonKind::Primary
+                } else {
+                    widgets::ButtonKind::Neutral
+                };
+                let label = if busy {
+                    "Verbinde…"
+                } else {
+                    "Diesem Server beitreten"
+                };
+                let clicked = ui
+                    .allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 36.0),
+                        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                        |ui| {
+                            ui.add_enabled_ui(can_submit, |ui| {
+                                widgets::button(ui, kind, icon::SIGN_IN, label)
+                            })
+                            .inner
+                        },
+                    )
+                    .inner
+                    .clicked();
+                if clicked {
+                    submit = true;
+                }
+            });
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(root.style()).inner_margin(egui::Margin {
+                    left: 24,
+                    right: 24,
+                    top: 22,
+                    bottom: 8,
+                }),
+            )
+            .show(root, |ui| {
+                // An error banner wraps to however many lines it needs, so the
+                // content can outgrow the window; it scrolls rather than clips.
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (badge, _) =
+                            ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(badge, theme::R_CARD, tok.accent_tint_2);
+                        ui.painter().text(
+                            badge.center(),
+                            egui::Align2::CENTER_CENTER,
+                            icon::WAVEFORM,
+                            egui::FontId::new(22.0, egui::FontFamily::Proportional),
+                            tok.accent,
                         );
-                    });
-                    if needs_name {
-                        widgets::setting_row(
-                            ui,
-                            true,
-                            "Dein Name",
-                            Some("Steht später in deinem Zertifikat."),
-                            |ui| {
-                                let field = ui.add_enabled(
-                                    !busy,
-                                    egui::TextEdit::singleline(&mut self.name)
-                                        .desired_width(150.0)
-                                        .hint_text("Name"),
-                                );
-                                if field.lost_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                                {
-                                    submit = true;
-                                }
-                            },
-                        );
-                    }
-                });
-                if let Some(summary) = &summary {
-                    widgets::group_card(ui, "Server", |ui| {
-                        widgets::card_note(ui, |ui| {
-                            for line in summary.lines() {
-                                ui.label(RichText::new(line).size(12.0).monospace());
-                            }
-                        });
-                        widgets::card_note(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            ui.label(
+                                RichText::new("Mit ICU verbinden")
+                                    .text_style(egui::TextStyle::Heading),
+                            );
                             ui.label(
                                 RichText::new(
-                                    "Nur beitreten, wenn das der Server ist, den du erwartest.",
+                                    "Füge die Einladung ein, die du bekommen hast — oder \
+                                     deinen Passport von einem anderen Gerät.",
                                 )
-                                .size(11.5)
-                                .color(tok.dim_text),
+                                .size(12.5)
+                                .color(tok.muted_text),
                             );
                         });
                     });
-                }
+                    ui.add_space(20.0);
 
-                ui.horizontal(|ui| {
-                    let can_submit = !busy
-                        && summary.is_some()
-                        && (!needs_name || !self.name.trim().is_empty());
-                    if ui
-                        .add_enabled_ui(can_submit, |ui| {
-                            widgets::button(
-                                ui,
-                                widgets::ButtonKind::Primary,
-                                icon::SIGN_IN,
-                                "Diesem Server beitreten",
+                    // The paste field is the whole point of the window: one
+                    // plain well whose border says whether what is in it works.
+                    ui.label(theme::caps_text("Einladung"));
+                    ui.add_space(4.0);
+                    let well = egui::Frame::new()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .corner_radius(egui::CornerRadius::same(theme::R_ROW))
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            ui.add_enabled(
+                                !busy,
+                                egui::TextEdit::multiline(&mut self.link)
+                                    .frame(egui::Frame::NONE)
+                                    .margin(egui::Margin::ZERO)
+                                    .desired_rows(4)
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::FontId::new(12.0, egui::FontFamily::Monospace))
+                                    .hint_text(
+                                        RichText::new("Einladung hier einfügen (Strg+V)")
+                                            .size(13.0)
+                                            .color(tok.dim_text),
+                                    ),
                             )
-                        })
-                        .inner
-                        .clicked()
-                    {
-                        submit = true;
-                    }
-                    if busy {
-                        widgets::status_pill(ui, tok.connecting, "verbinde");
-                    }
-                });
-                if submit && !busy && !self.link.trim().is_empty() {
-                    self.submit();
-                }
-
-                ui.add_space(10.0);
-                match &self.status {
-                    Some(EnrollStatus::Busy(text)) => {
-                        ui.label(RichText::new(text).size(12.0).color(tok.muted_text));
-                    }
-                    Some(EnrollStatus::Failed(text)) => {
-                        widgets::banner(
-                            ui,
-                            widgets::BannerKind::Error,
-                            "Beitritt fehlgeschlagen",
-                            text,
-                            None::<fn()>,
+                        });
+                    let border = if valid {
+                        tok.connected
+                    } else if has_text {
+                        tok.error.gamma_multiply(0.6)
+                    } else if well.inner.has_focus() {
+                        tok.accent
+                    } else {
+                        ui.visuals().widgets.inactive.bg_stroke.color
+                    };
+                    ui.painter().rect_stroke(
+                        well.response.rect,
+                        egui::CornerRadius::same(theme::R_ROW),
+                        egui::Stroke::new(1.0, border),
+                        egui::StrokeKind::Inside,
+                    );
+                    let verdict = if valid {
+                        let what = if needs_name {
+                            "Einladung erkannt"
+                        } else {
+                            "Passport erkannt"
+                        };
+                        Some((icon::CHECK, what, tok.connected))
+                    } else if has_text {
+                        Some((
+                            icon::WARNING_CIRCLE,
+                            "Das ist keine gültige ICU-Einladung.",
+                            tok.error,
+                        ))
+                    } else {
+                        None
+                    };
+                    if let Some((glyph, text, color)) = verdict {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(format!("{glyph}  {text}"))
+                                .size(12.0)
+                                .color(color),
+                        );
+                    } else {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  Noch keine Einladung? Frag die Person, die den \
+                                 Server betreibt.",
+                                icon::INFO
+                            ))
+                            .size(12.0)
+                            .color(tok.dim_text),
                         );
                     }
-                    None => {}
-                }
+
+                    if needs_name {
+                        ui.add_space(16.0);
+                        ui.label(theme::caps_text("Dein Name"));
+                        ui.add_space(4.0);
+                        let field = ui.add_enabled(
+                            !busy,
+                            egui::TextEdit::singleline(&mut self.name)
+                                .desired_width(f32::INFINITY)
+                                .margin(egui::Margin::symmetric(10, 8))
+                                .hint_text("Name"),
+                        );
+                        if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            submit = true;
+                        }
+                        ui.label(
+                            RichText::new("Steht später in deinem Zertifikat.")
+                                .size(11.5)
+                                .color(tok.dim_text),
+                        );
+                    }
+
+                    if let Some(summary) = &summary {
+                        ui.add_space(18.0);
+                        widgets::group_card(ui, "Server", |ui| {
+                            widgets::card_note(ui, |ui| {
+                                for line in summary.lines() {
+                                    ui.label(RichText::new(line).size(12.0).monospace());
+                                }
+                            });
+                            ui.separator();
+                            widgets::card_note(ui, |ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}  Nur beitreten, wenn das der Server ist, den du \
+                                         erwartest.",
+                                        icon::SHIELD_STAR
+                                    ))
+                                    .size(11.5)
+                                    .color(tok.dim_text),
+                                );
+                            });
+                        });
+                    } else {
+                        ui.add_space(14.0);
+                    }
+
+                    match &self.status {
+                        Some(EnrollStatus::Busy(text)) => {
+                            ui.label(RichText::new(text).size(12.0).color(tok.muted_text));
+                        }
+                        Some(EnrollStatus::Failed(text)) => {
+                            widgets::banner(
+                                ui,
+                                widgets::BannerKind::Error,
+                                "Beitritt fehlgeschlagen",
+                                text,
+                                None::<fn()>,
+                            );
+                        }
+                        None => {}
+                    }
+                });
             });
-        });
+
+        if submit && !busy && has_text {
+            self.submit();
+        }
     }
 }
