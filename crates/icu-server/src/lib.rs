@@ -345,6 +345,13 @@ async fn housekeeping(server: Arc<Server>) {
                 .send_to(speaker, &icu_proto::ControlMsg::LossHint { loss_permille });
         }
 
+        // Hourly (36 000 ticks of 100 ms), and on the first tick: the server
+        // leaf is renewed before it expires, because an expired leaf locks
+        // every client out and only the server can fix it.
+        if prune_counter.is_multiple_of(36_000) {
+            tokio::spawn(check_cert_expiry(server.clone()));
+        }
+
         prune_counter += 1;
 
         // Every 2 s (20 ticks of 100 ms): server-measured RTT per participant
@@ -364,6 +371,35 @@ async fn housekeeping(server: Arc<Server>) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .prune();
+        }
+    }
+}
+
+/// Rotates the server leaf once less than `min(30, validity / 3)` (at least
+/// one) days are
+/// left; warns about the CA, which cannot be renewed without re-enrolling
+/// everyone (`deploy/README.md`).
+async fn check_cert_expiry(server: Arc<Server>) {
+    const WARN_DAYS: i64 = 30;
+    let (leaf_left, ca_left) = {
+        let ca = server.ca.read().await;
+        (
+            ca::leaf_days_left(ca.server_der()),
+            ca::leaf_days_left(ca.ca_der()),
+        )
+    };
+    if ca_left < WARN_DAYS {
+        tracing::warn!(days_left = ca_left, "the CA expires soon");
+    }
+    let threshold = WARN_DAYS.min(i64::from(server.config.tls.server_validity_days) / 3).max(1);
+    if leaf_left < threshold {
+        tracing::warn!(
+            days_left = leaf_left,
+            "server certificate expires soon, rotating"
+        );
+        match admin::rotate_server_cert(&server).await {
+            Ok(()) => tracing::info!("server certificate rotated"),
+            Err(e) => tracing::error!(error = %e, "automatic server certificate rotation failed"),
         }
     }
 }

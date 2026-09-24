@@ -856,6 +856,36 @@ async fn rotating_the_server_certificate_revokes_the_old_one_live() {
     server.shutdown().await;
 }
 
+/// A server leaf close to expiry is rotated by the server itself, right at
+/// startup: served live, the old one on the CRL, and `status` reports it.
+#[tokio::test]
+async fn an_expiring_server_certificate_is_rotated_automatically() {
+    // One day of validity is below the rotation threshold from the start.
+    let server = TestServer::start_with(|c| c.tls.server_validity_days = 1).await;
+    let alice = server.enroll("alice").await;
+    let mut rotated = None;
+    for _ in 0..100 {
+        let mut client = server.connect(&alice).await.expect("connect");
+        let leaf = server_leaf(&client.conn);
+        client.hello("alice").await;
+        client.expect_silence().await;
+        let serials = crl_serials(client.crl.as_ref().expect("CrlUpdate"), &server.ca());
+        if !serials.is_empty() && !serials.contains(&serial_of(&leaf)) {
+            rotated = Some(leaf);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(rotated.is_some(), "the old leaf is on the CRL, the new one served");
+
+    let AdminResponse::Status(status) = server.handle.admin(AdminRequest::Status).await else {
+        panic!("status");
+    };
+    assert!(status["tls"]["server_cert_days_left"].as_i64().unwrap() <= 1);
+    assert!(status["tls"]["ca_days_left"].as_i64().unwrap() > 3000);
+    server.shutdown().await;
+}
+
 /// The server leaf a test connection saw.
 fn server_leaf(conn: &quinn::Connection) -> Vec<u8> {
     conn.peer_identity()

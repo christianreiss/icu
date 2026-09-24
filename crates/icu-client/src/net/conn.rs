@@ -198,6 +198,28 @@ fn unix_now() -> i64 {
 }
 
 /// Turns a certificate-verification failure into a clear, user-facing reason.
+/// Maps a failed check of the *server's* certificate. Expired or revoked are
+/// the server operator's to fix (automatic rotation, `rotate-server-cert`),
+/// not the user's: the client keeps retrying and picks up the new leaf, while
+/// verification still refuses the old one. Everything else — wrong CA, wrong
+/// name — will not heal by waiting.
+fn certificate_error(server_name: &str, ce: &rustls::CertificateError) -> ConnectError {
+    match ce {
+        rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. } => {
+            ConnectError::Transport(
+                "Serverzertifikat abgelaufen – warte auf Erneuerung durch den Server".into(),
+            )
+        }
+        rustls::CertificateError::Revoked => ConnectError::Transport(
+            "Serverzertifikat widerrufen – warte auf ein neues vom Server".into(),
+        ),
+        _ => ConnectError::Certificate {
+            server_name: server_name.to_string(),
+            detail: describe_certificate_error(ce),
+        },
+    }
+}
+
 fn describe_certificate_error(ce: &rustls::CertificateError) -> String {
     match ce {
         rustls::CertificateError::NotValidForName
@@ -265,10 +287,7 @@ pub async fn connect(
         Ok(c) => c,
         Err(e) => {
             return Err(match cert_failure.take() {
-                Some(rustls::Error::InvalidCertificate(ce)) => ConnectError::Certificate {
-                    server_name: server_name.to_string(),
-                    detail: describe_certificate_error(&ce),
-                },
+                Some(rustls::Error::InvalidCertificate(ce)) => certificate_error(server_name, &ce),
                 _ => ConnectError::from_connection_error(e),
             });
         }
@@ -482,6 +501,17 @@ mod tests {
             detail: "y".into(),
         }
         .is_fatal());
+    }
+
+    #[test]
+    fn an_expired_or_revoked_server_certificate_is_retried() {
+        let expired = certificate_error("x", &rustls::CertificateError::Expired);
+        assert!(matches!(expired, ConnectError::Transport(_)));
+        assert!(!expired.is_fatal());
+        assert!(!certificate_error("x", &rustls::CertificateError::Revoked).is_fatal());
+        let wrong_name = certificate_error("x", &rustls::CertificateError::NotValidForName);
+        assert!(matches!(wrong_name, ConnectError::Certificate { .. }));
+        assert!(wrong_name.is_fatal());
     }
 
     #[test]

@@ -31,7 +31,8 @@ camera = ["dep:nokhwa", "dep:openh264"]
 overlay = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:calloop", "dep:calloop-wayland-source"]
 # Tray icon (ksni on Linux).
 tray = ["dep:tray-icon"]
-# Emergency audio host through cpal (ALSA) instead of pipewire-rs.
+# Emergency audio host through cpal (ALSA) instead of pipewire-rs. Always on
+# for Windows (see the target dependencies below).
 cpal-fallback = ["dep:cpal"]
 # MJPEG receive/debug path (never sent in v1).
 mjpeg = ["dep:zune-jpeg"]
@@ -91,6 +92,8 @@ calloop-wayland-source = { version = "0.4", optional = true }
 tray-icon = { version = "0.25.1", default-features = false, features = ["ksni"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# Windows audio until the WASAPI backend (M3); see audio::native_backend.
+cpal = "0.18.2"
 windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_UI_Input", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Security_Cryptography"] }
 tray-icon = { version = "0.25.1", optional = true }
 

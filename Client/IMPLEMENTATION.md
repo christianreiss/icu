@@ -34,7 +34,9 @@ audio/
                    #   aktiven Sink (Monitor-Ports = Systemmix inkl. Spielton), selbe node.group
   wasapi.rs        # Windows: IAudioClient3 shared event-driven, Fallback IAudioClient 10 ms;
                    #   AEC-Referenz offen (Research/aec.md A1)
-  cpal_fallback.rs # Notfall-Host (ALSA/andere), hinter Feature-Flag; ohne AEC-Referenz → AEC aus
+  cpal_fallback.rs # Notfall-Host (ALSA/andere), hinter Feature-Flag; ohne AEC-Referenz → AEC aus.
+                   #   Unter Windows immer gebaut: bis M3 (wasapi.rs ist ein Stub) läuft das
+                   #   Audio dort über cpals WASAPI-Host (Shared Mode, 48 kHz angefordert)
   capture.rs       # Blöcke à 480 Samples → dsp → encoder
   playback.rs      # Mixer: Summe der Speaker-Puffer, Limiter, Ausgabe
 dsp/
@@ -217,6 +219,7 @@ Tray: tray-icon 0.25 (Linux `default-features = false, features = ["ksni"]`), Ic
 
   Rückbau: `sudo rm /usr/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-objcopy`. GNU- und LLVM-objcopy beherrschen beide `--redefine-sym` und `@file`, der Symlink ist also inhaltlich korrekt und kein Hack am Ergebnis, nur an der Pfadsuche. Vor M1 ist zu prüfen, ob es dafür ein Upstream-Issue gibt (sonst eines aufmachen) — eine dauerhafte Änderung an `/usr` gehört nicht in eine Build-Anleitung.
 - **Der Windows-Cross-Build kann `aec` derzeit nicht bauen**: `build.rs` ruft `meson setup` ohne `--cross-file`, die im Windows-Target erzeugte `libwebrtc-audio-processing-2.a` enthält ELF-x86-64-Objekte. Der Windows-Build läuft deshalb vorerst **ohne** Feature `aec`; die Entscheidung steht als A1 in `Research/aec.md`.
+- **Windows-Audio bis M3 über cpal** (2026-09-24): `audio::native_backend()` fällt unter Windows auf `CpalBackend` zurück, `cpal` ist dort eine feste Abhängigkeit. Einschränkungen: Shared-Mode-Puffer statt IAudioClient3, keine AEC-Referenz, Geräte mit 44,1-kHz-Mixformat können die feste 48-kHz-Anforderung ablehnen (Resampling über `rubato` wäre der nächste Schritt), PTT nur über den UI-Button. Nur gebaut und gelinkt (`--no-default-features --features gui,camera,tray`; `overlay` baut für Windows derzeit nicht), auf Windows noch nicht gelaufen.
 - `cargo build --release -p icu-client` (Linux), `cargo build --release --target x86_64-pc-windows-gnu -p icu-client` (Windows). Release-Profil: `lto = "fat"`, `codegen-units = 1`, `strip = true`, `panic = "abort"`.
 - Prüfung im CI: `x86_64-w64-mingw32-objdump -p icu.exe | grep "DLL Name"` darf nur System-DLLs zeigen; `ldd icu` (Linux) listet keine GTK/Qt.
 - Release: `icu-<ver>-windows-x86_64.zip` (exe + THIRD-PARTY-LICENSES + README), für Linux statt eines Tarballs `.rpm` (Fedora 42/43) und `.deb` (Debian 13) je Distro, gebaut von `packaging/build.sh` mit nfpm in Distro-Containern und als GitHub-Release veröffentlicht (`packaging/release.sh`, revidiert 2026-09-24; Binary + .desktop + Icon + Lizenzen, Abhängigkeiten aus `ldd` abgeleitet). THIRD-PARTY-LICENSES wird mit `cargo-about` erzeugt (Generator laut `packaging-licensing.md` Punkt 10 eigentlich noch offen, hier bewusst festgelegt). `cargo-deny` nutzt die **eine** Workspace-`deny.toml` aus `Server/IMPLEMENTATION.md` §9 — MIT, Apache-2.0, ISC, BSD-2-Clause, BSD-3-Clause, Zlib, Unicode-3.0 — plus `IJG` ausschließlich, wenn das Feature `mjpeg` gebaut wird. Die Lizenz von ICU selbst ist **Apache-2.0** (entschieden 2026-09-24).

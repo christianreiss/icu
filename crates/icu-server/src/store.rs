@@ -663,7 +663,11 @@ impl Store {
     pub fn next_crl_number(&mut self) -> Result<u64> {
         let now = now();
         self.update_users(|users| {
-            users.crl_number += 1;
+            // Never below the clock: a state restored from a backup would
+            // otherwise count up from an older number, and clients, which
+            // only take a higher one, would ignore every CRL until it caught
+            // up (`deploy/README.md`, restore).
+            users.crl_number = (users.crl_number + 1).max(now.unix_timestamp().max(0) as u64);
             users
                 .revoked_server
                 .retain(|s| parse_rfc3339(&s.expires).map(|e| e > now).unwrap_or(true));
@@ -675,7 +679,9 @@ impl Store {
     pub fn revoke_server_cert(&mut self, serial: String, expires: String) -> Result<()> {
         self.update_users(|users| {
             if !users.revoked_server.iter().any(|s| s.serial == serial) {
-                users.revoked_server.push(RevokedServerCert { serial, expires });
+                users
+                    .revoked_server
+                    .push(RevokedServerCert { serial, expires });
             }
             Ok(())
         })
@@ -739,7 +745,27 @@ fn load_or_default<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Resul
 /// Writes `contents` atomically: temp file in the same directory, fsync,
 /// rename, fsync of the directory (`Server/IMPLEMENTATION.md` §4). `mode` is
 /// the permission bits of the temp file, and therefore of the result.
+///
+/// The fsyncs can take tens of milliseconds on network storage, and every
+/// caller is async code on a runtime worker. `block_in_place` hands that
+/// worker's other tasks — quinn's endpoint driver among them — to another
+/// worker meanwhile, so audio keeps flowing.
 fn write_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
+    blocking(|| write_mode_now(path, contents, mode))
+}
+
+/// Runs `f` with `block_in_place` on a multi-thread runtime, directly
+/// everywhere else (`current_thread` runtimes such as `#[tokio::test]`, where
+/// `block_in_place` would panic, and plain threads).
+fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+fn write_mode_now(path: &Path, contents: &str, mode: u32) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().unwrap_or(Path::new("."));
     let tmp = dir.join(format!(
@@ -796,6 +822,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         (dir, store)
+    }
+
+    /// The CRL number never falls below the clock, so a state restored from
+    /// a backup still issues numbers above what clients have stored.
+    #[test]
+    fn crl_numbers_follow_the_clock_and_stay_monotonic() {
+        let (_dir, mut s) = store();
+        let now = super::now().unix_timestamp() as u64;
+        let a = s.next_crl_number().unwrap();
+        let b = s.next_crl_number().unwrap();
+        assert!(a >= now, "{a} < {now}");
+        assert!(b > a);
     }
 
     /// §10: `user_id` assignment and stability across renewal.
