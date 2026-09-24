@@ -93,6 +93,9 @@ impl Default for JitterConfig {
 const BUCKET_MS: f64 = 5.0;
 const BUCKETS: usize = 64; // 0..320 ms
 const FORGET: f64 = 0.983;
+/// Consecutive pops with more than target + 1 frame queued before one
+/// packet is skipped to shed the excess: half a second at 20 ms frames.
+const EXCESS_POPS: u32 = 25;
 
 /// The buffer.
 #[derive(Debug)]
@@ -123,6 +126,12 @@ pub struct JitterBuffer {
     last_delay: Option<Duration>,
     /// Frames inserted by underruns this spurt and not yet shed again.
     grown: u32,
+    /// Consecutive pops that found more than target + 1 frame queued.
+    excess_pops: u32,
+    /// Unwrapped seq of the last slot `pop` consumed (played or written off
+    /// as lost). Survives the end of a spurt: a straggler from a finished
+    /// spurt is late, not the start of a new one.
+    played_hwm: Option<i64>,
 }
 
 impl JitterBuffer {
@@ -145,6 +154,8 @@ impl JitterBuffer {
             last_end: false,
             last_delay: None,
             grown: 0,
+            excess_pops: 0,
+            played_hwm: None,
         }
     }
 
@@ -245,11 +256,11 @@ impl JitterBuffer {
         } else if self.prefill_since.is_none() {
             self.prefill_since = Some(now);
         }
-        if let Some(next) = self.next {
-            if u < next {
-                self.stats.late += 1;
-                return;
-            }
+        // Late: its slot has been consumed already — inside the spurt, or in
+        // a spurt that has since ended (`played_hwm` outlives `next`).
+        if self.played_hwm.is_some_and(|h| u <= h) || self.next.is_some_and(|n| u < n) {
+            self.stats.late += 1;
+            return;
         }
         if ts_diff(packet.ts, self.last_ts.unwrap_or(packet.ts)) >= 0 {
             self.last_ts = Some(packet.ts);
@@ -304,6 +315,7 @@ impl JitterBuffer {
         self.misses = 0;
         self.prefill_since = None;
         self.grown = 0;
+        self.excess_pops = 0;
     }
 
     /// Caps the queue at `max_delay` (or target + 2 frames, if larger): past
@@ -323,7 +335,11 @@ impl JitterBuffer {
             return;
         }
         while self.queue.len() > 1 && frame * self.queue.len() as u32 > self.target + frame {
-            self.queue.pop_first();
+            if let Some((k, _)) = self.queue.pop_first() {
+                // Dropped counts as consumed: a late twin must not be queued
+                // behind the packets that replaced it.
+                self.played_hwm = Some(self.played_hwm.map_or(k, |h| h.max(k)));
+            }
             self.stats.dropped += 1;
         }
         if self.next.is_some() {
@@ -356,12 +372,24 @@ impl JitterBuffer {
             self.stats.spurts += 1;
         }
         let mut next = self.next.unwrap_or(0);
-        // Delay grown by underruns beyond what the target asks for is shed by
-        // skipping one packet before decode (RFC 6716 §4.4.1).
+        // Delay beyond what the target asks for is shed by skipping one
+        // packet before decode (RFC 6716 §4.4.1): at once when underruns
+        // grew it (`grown`) and two frames of slack are exceeded; otherwise
+        // — a burst at spurt start, a sender whose clock runs fast — down
+        // to the same target + 1 frame `drain_backlog` trims to, but only
+        // once the excess has persisted for `EXCESS_POPS` pops, so a jitter
+        // spike the target is still absorbing is not mistaken for it.
         let queued = frame * self.queue.range(next..).count() as u32;
-        if self.grown > 0 && queued > self.target + 2 * frame && self.queue.remove(&next).is_some()
-        {
-            self.grown -= 1;
+        self.excess_pops = if queued > self.target + frame {
+            self.excess_pops + 1
+        } else {
+            0
+        };
+        let shed = (self.grown > 0 && queued > self.target + 2 * frame)
+            || self.excess_pops >= EXCESS_POPS;
+        if shed && self.queue.remove(&next).is_some() {
+            self.grown = self.grown.saturating_sub(1);
+            self.excess_pops = 0;
             self.stats.skipped += 1;
             next += 1;
             self.next = Some(next);
@@ -372,6 +400,7 @@ impl JitterBuffer {
             self.stats.played += 1;
             let end = pkt.end;
             self.next = Some(next + 1);
+            self.played_hwm = Some(next);
             if end {
                 self.end_spurt();
             }
@@ -391,6 +420,7 @@ impl JitterBuffer {
                 let fec_source = if k == next + 1 { Some(pkt) } else { None };
                 let seq = (next & 0xFFFF) as u16;
                 self.next = Some(next + 1);
+                self.played_hwm = Some(next);
                 Pop::Lost { seq, fec_source }
             }
             None => {
@@ -551,6 +581,82 @@ mod tests {
         assert!(matches!(jb.pop(t0 + ms(60)), Pop::Packet(_)));
         jb.push(pkt(0, 0, false), t0 + ms(61));
         assert_eq!(jb.stats().late, 1);
+    }
+
+    #[test]
+    fn straggler_after_spurt_end_is_late_not_a_new_spurt() {
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        jb.push(pkt(0, 0, false), t0);
+        jb.push(pkt(1, 960, false), t0 + ms(20));
+        jb.push(pkt(3, 3 * 960, true), t0 + ms(60));
+        assert!(matches!(jb.pop(t0 + ms(60)), Pop::Packet(p) if p.seq == 0));
+        assert!(matches!(jb.pop(t0 + ms(80)), Pop::Packet(p) if p.seq == 1));
+        assert!(matches!(jb.pop(t0 + ms(100)), Pop::Lost { seq: 2, .. }));
+        assert!(matches!(jb.pop(t0 + ms(120)), Pop::Packet(p) if p.seq == 3));
+        assert!(!jb.active(), "END ended the spurt");
+        // Packet 2 turns up now, reordered behind the END packet. Before the
+        // high-water mark it prefilled and played as a 20 ms spurt of its own.
+        jb.push(pkt(2, 2 * 960, false), t0 + ms(130));
+        assert_eq!(jb.pop(t0 + ms(140)), Pop::Silence, "straggler must stay silent");
+        assert_eq!(jb.pop(t0 + ms(400)), Pop::Silence);
+        let st = jb.stats();
+        assert_eq!((st.late, st.spurts, st.played), (1, 1, 3));
+        // The next real spurt starts normally.
+        jb.push(pkt(4, 4 * 960 + 48_000, false), t0 + ms(1200));
+        jb.push(pkt(5, 5 * 960 + 48_000, false), t0 + ms(1220));
+        assert!(matches!(jb.pop(t0 + ms(1220)), Pop::Packet(p) if p.seq == 4));
+        assert_eq!(jb.stats().spurts, 2);
+    }
+
+    #[test]
+    fn excess_depth_from_a_start_burst_is_shed_one_packet_at_a_time() {
+        // Five packets land at once (the receiver joined a running stream
+        // during a stall of its own), then the stream continues at pace.
+        // With a 40 ms target the buffer would otherwise play 100 ms behind
+        // for as long as the sender never pauses.
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        for i in 0..5u16 {
+            jb.push(pkt(i, i as u32 * 960, false), t0);
+        }
+        let mut t = t0;
+        let mut delays = Vec::new();
+        for i in 0..150u16 {
+            if let Pop::Packet(_) = jb.pop(t) {
+                delays.push(jb.last_delay().unwrap());
+            }
+            t += ms(20);
+            let seq = 5 + i;
+            jb.push(pkt(seq, seq as u32 * 960, false), t);
+        }
+        let st = jb.stats();
+        assert!(st.skipped >= 1, "excess must be shed: {st:?}");
+        assert!(st.skipped <= 3, "but gently: {st:?}");
+        assert_eq!(st.lost + st.late + st.underruns, 0, "{st:?}");
+        // Steady state before the skip: four frames queued at every pop.
+        let before = delays[10];
+        let after = *delays.last().unwrap();
+        assert!(before >= ms(75), "burst depth {before:?}");
+        assert!(
+            after + ms(15) < before,
+            "delay should have dropped by a frame: {before:?} → {after:?}"
+        );
+        assert!(after <= jb.target() + ms(25), "{after:?} vs target {:?}", jb.target());
+    }
+
+    #[test]
+    fn steady_stream_within_target_is_never_skipped() {
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        let mut t = t0;
+        for i in 0..200u16 {
+            jb.push(pkt(i, i as u32 * 960, false), t);
+            let _ = jb.pop(t + ms(5));
+            t += ms(20);
+        }
+        let st = jb.stats();
+        assert_eq!((st.skipped, st.lost, st.underruns), (0, 0, 0), "{st:?}");
     }
 
     #[test]

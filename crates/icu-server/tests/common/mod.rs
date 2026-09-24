@@ -552,7 +552,7 @@ pub fn client_endpoint(
             .unwrap(),
     ));
     transport.datagram_receive_buffer_size(Some(icu_proto::limits::DATAGRAM_BUFFER_BYTES));
-    transport.datagram_send_buffer_size(icu_proto::limits::DATAGRAM_BUFFER_BYTES);
+    transport.datagram_send_buffer_size(icu_proto::limits::CLIENT_DATAGRAM_SEND_BUFFER_BYTES);
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(
         icu_proto::limits::max_uni_streams(icu_proto::limits::DEFAULT_MAX_USERS),
     ));

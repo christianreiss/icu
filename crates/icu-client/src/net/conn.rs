@@ -163,7 +163,7 @@ pub fn client_config_with_crl(
             .expect("idle timeout fits"),
     ));
     transport.datagram_receive_buffer_size(Some(pl::DATAGRAM_BUFFER_BYTES));
-    transport.datagram_send_buffer_size(pl::DATAGRAM_BUFFER_BYTES);
+    transport.datagram_send_buffer_size(pl::CLIENT_DATAGRAM_SEND_BUFFER_BYTES);
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(pl::max_uni_streams(
         pl::MAX_MAX_USERS,
     )));

@@ -15,7 +15,7 @@ Stand 2026-09-20. Abgeleitet aus `Research/transport.md`, `Research/protocol/wir
 | 0-RTT | Aus (`max_early_data_size = 0`, kein `into_0rtt()`). |
 | Idle / Keepalive | `max_idle_timeout` 60 s beidseitig; Client `keep_alive_interval` 15 s. |
 | Migration | quinn-Default (erlaubt). |
-| Datagram-Puffer | Server und Client `datagram_receive_buffer_size` = 64 KiB, `datagram_send_buffer_size` = 64 KiB (klein, damit `send_datagram` alte Frames verwirft statt Latenz aufzubauen). Wert in Implementierung messen. |
+| Datagram-Puffer | `datagram_receive_buffer_size` = 64 KiB auf beiden Seiten; `datagram_send_buffer_size` Server 64 KiB (die Sendewarteschlange trägt die Audio aller Sprecher an einen Empfänger), Client **8 KiB** (2026-09-24; nur die eigene Audio, 20–50 Pakete = 0,4–1 s). `send_datagram` verwirft bei vollem Puffer das älteste Datagram: 64 KiB wären beim Client 3–8 s Audio gewesen, die nach einem Netzhänger verspätet ankämen, der Jitter-Buffer des Empfängers (Klemme 200 ms, `drain_backlog`) sowieso verwirft und die als Burst das Ratenlimit des Servers (110/s) reißen. |
 | Streams | Client eröffnet genau einen bidirektionalen Control-Stream. Video: ein unidirektionaler Stream pro Frame, in beide Richtungen. `max_concurrent_uni_streams` = `2 × max_users + 4` pro Richtung, vom Server aus seiner Config gesetzt und vom Client übernommen (bei `max_users` = 16 also 36). Das Protokoll deckelt die Zahl gleichzeitig aktiver Kameras nicht. |
 | Datagram-Größe | Laufzeitwert `max_datagram_size()` (Spike 2: 1162 B nach Handshake, 1414 B nach MTU-Discovery). Audio-Datagrams sind ≤ 410 B. |
 

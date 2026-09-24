@@ -51,8 +51,15 @@ pub const HELLO_TIMEOUT_S: u64 = 5;
 pub const MAX_IDLE_TIMEOUT_S: u64 = 60;
 /// Client keepalive interval.
 pub const KEEP_ALIVE_INTERVAL_S: u64 = 15;
-/// Datagram send and receive buffer size.
+/// Datagram receive buffer size on both sides, and the server's send buffer
+/// (its send queue carries every speaker's audio to one receiver).
 pub const DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
+/// The client's datagram send buffer: only its own audio queues here, and
+/// quinn drops the oldest datagram once it is full. 8 KiB is 20–50 packets
+/// (0.4–1 s); the receiver's jitter buffer caps at 200 ms and drains any
+/// post-stall backlog anyway, so queueing more only sends stale audio late
+/// and bursts past the server's per-second rate limit (`PROTOCOL.md` §1).
+pub const CLIENT_DATAGRAM_SEND_BUFFER_BYTES: usize = 8 * 1024;
 
 /// Silence after which a speaker is considered to have stopped, and below
 /// which a new datagram starts a talk spurt (`PROTOCOL.md` §2.1).

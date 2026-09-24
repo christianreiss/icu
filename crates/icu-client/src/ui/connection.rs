@@ -994,9 +994,21 @@ fn audio_section(state: &AppState, stats: &DebugStats, jitter: &str) -> Section 
         .row(Row::mono(
             "Über-/Unterläufe",
             format!(
-                "{} Aufnahme · {} Referenz",
+                "{} Aufnahme · {} Referenz · {} Wiedergabe",
                 DebugStats::get(&stats.capture_overruns),
                 DebugStats::get(&stats.reference_underruns)
+                    + DebugStats::get(&stats.reference_overruns),
+                DebugStats::get(&stats.playback_underruns)
+            ),
+        ))
+        .row(Row::mono(
+            "Jitterpuffer",
+            format!(
+                "{} spät · {} gewartet · {} übersprungen · {} verworfen",
+                DebugStats::get(&stats.jitter_late),
+                DebugStats::get(&stats.jitter_underruns),
+                DebugStats::get(&stats.jitter_skipped),
+                DebugStats::get(&stats.jitter_dropped)
             ),
         ))
         .note(
