@@ -154,7 +154,9 @@ impl TestServer {
             self.addr(),
             "localhost",
             "icu-test/0.1.0 linux",
-            icu_proto::UserFlags::NONE,
+            // Stands in for a peer with its window open: without `VIEWING`
+            // the server relays no video to it and senders pause.
+            icu_proto::UserFlags(icu_proto::UserFlags::VIEWING),
             name,
             &cert_failure,
         )

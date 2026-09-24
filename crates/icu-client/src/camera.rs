@@ -201,7 +201,7 @@ pub fn encoder(tier: VideoTier) -> Result<Encoder, String> {
 /// settings preview keeps working even while video is paused for everyone
 /// else.
 ///
-/// The encoder is rebuilt whenever `link.video_tier()` changes: openh264's
+/// The encoder is rebuilt whenever `link.send_tier()` changes: openh264's
 /// safe Rust binding exposes no runtime bitrate mutator, so a tier change
 /// means a fresh `Encoder`. That is cheap relative to how rarely
 /// `QualityController` actually steps (bounded by its own hysteresis), and a
@@ -214,7 +214,7 @@ pub fn run_sender(
     stop: Arc<AtomicBool>,
     preview: Arc<PreviewSlot>,
 ) {
-    let mut tier = link.video_tier();
+    let mut tier = link.send_tier();
     let mut enc = if tier.paused() {
         None
     } else {
@@ -241,7 +241,7 @@ pub fn run_sender(
         };
         preview.put(frame.clone());
 
-        let new_tier = link.video_tier();
+        let new_tier = link.send_tier();
         if new_tier != tier {
             tier = new_tier;
             enc = if tier.paused() {

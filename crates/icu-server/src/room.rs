@@ -350,7 +350,7 @@ impl Room {
         self.lock()
             .members
             .values()
-            .filter(|m| m.session != sender)
+            .filter(|m| m.session != sender && m.flags.viewing())
             .map(|m| (m.session, m.conn.clone()))
             .collect()
     }

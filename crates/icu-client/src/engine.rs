@@ -266,6 +266,10 @@ pub enum Command {
     SetCamera(bool),
     /// Overlay on/off.
     SetOverlay(bool),
+    /// The main window became visible (`true`) or went to the tray or was
+    /// minimized (`false`). Together with the overlay this decides
+    /// `UserFlags::VIEWING`.
+    SetWindowVisible(bool),
     /// Clear the banner.
     DismissBanner,
     /// Force an IDR (from a `KeyframeRequest`, or tests).
@@ -1210,7 +1214,9 @@ async fn net_task(
         identity: cfg.identity.clone(),
         pending_renew: None,
         renew_attempted: false,
+        window_visible: !cfg.settings.ui.start_minimized,
     };
+    local.update_viewing();
     let mut attempt: u32 = 0;
     let mut first = true;
     loop {
@@ -1338,6 +1344,9 @@ struct LocalState {
     pending_renew: Option<PendingRenew>,
     /// Whether the once-per-start automatic renewal has already been tried.
     renew_attempted: bool,
+    /// Whether the main window is on screen. Starts from
+    /// `start_minimized`, so a client without a window (tests) views.
+    window_visible: bool,
 }
 
 /// A renewal in flight: which name it asks for, and why it was sent.
@@ -1421,6 +1430,15 @@ fn renewal_due(cert: &crate::conninfo::CertInfo, stored: &str) -> Option<RenewRe
 const RENEW_BEFORE_EXPIRY_DAYS: i64 = 30;
 
 impl LocalState {
+    /// Recomputes `UserFlags::VIEWING`: overlay on or main window visible.
+    /// Returns `true` when the bit changed and `SetState` is due.
+    fn update_viewing(&mut self) -> bool {
+        let viewing = self.settings.overlay.enabled || self.window_visible;
+        let changed = self.flags.viewing() != viewing;
+        self.flags = self.flags.with_bit(UserFlags::VIEWING, viewing);
+        changed
+    }
+
     /// Commands that do not need a connection. Returns `true` if `SetState`
     /// should be sent.
     async fn handle_local(
@@ -1541,6 +1559,7 @@ impl LocalState {
                     s.overlay_on = s.settings.overlay.enabled;
                 });
                 let _ = self.settings.save(&self.paths);
+                set_state |= self.update_viewing();
             }
             Command::SetCamera(on) => {
                 self.flags = self.flags.with_bit(UserFlags::CAMERA_ON, on);
@@ -1555,6 +1574,11 @@ impl LocalState {
                     s.settings = settings;
                 });
                 let _ = self.settings.save(&self.paths);
+                set_state = self.update_viewing();
+            }
+            Command::SetWindowVisible(visible) => {
+                self.window_visible = visible;
+                set_state = self.update_viewing();
             }
             Command::DismissBanner => {
                 shared.state.send_modify(|s| {
@@ -2658,6 +2682,14 @@ impl CameraLink {
         VideoTier::from_u8(self.shared.video_tier.load(Ordering::Relaxed))
     }
 
+    /// The tier the camera thread encodes at: [`CameraLink::video_tier`],
+    /// or paused while no peer is viewing (`UserFlags::VIEWING`) — the
+    /// server would relay the frames to nobody. Resuming builds a fresh
+    /// encoder, whose first frame is an IDR.
+    pub fn send_tier(&self) -> VideoTier {
+        send_tier(self.video_tier(), &self.shared.state.borrow().peers)
+    }
+
     /// Whether an IDR was requested since the last call (server
     /// `KeyframeRequest` or `Command::ForceKeyframe`).
     pub fn take_keyframe_request(&self) -> bool {
@@ -2671,6 +2703,15 @@ impl CameraLink {
     /// Whether frames can be sent right now.
     pub fn connected(&self) -> bool {
         self.shared.video_tx.lock().unwrap().is_some()
+    }
+}
+
+/// [`CameraLink::send_tier`], without the engine.
+fn send_tier(tier: VideoTier, peers: &[Peer]) -> VideoTier {
+    if peers.iter().any(|p| p.info.flags.viewing()) {
+        tier
+    } else {
+        VideoTier::T4
     }
 }
 
@@ -2714,5 +2755,34 @@ impl Engine {
         VideoFrames {
             shared: self.shared.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn peer(session: Session, flags: u8) -> Peer {
+        Peer {
+            info: UserInfo {
+                user_id: u32::from(session),
+                session,
+                name: format!("p{session}"),
+                flags: UserFlags(flags),
+            },
+            speaking: false,
+            volume: 100.0,
+            rtt_ms: None,
+            recv_loss_permille: None,
+        }
+    }
+
+    #[test]
+    fn camera_pauses_while_no_peer_is_viewing() {
+        assert_eq!(send_tier(VideoTier::T1, &[]), VideoTier::T4);
+        let watching = [peer(1, 0), peer(2, UserFlags::VIEWING)];
+        assert_eq!(send_tier(VideoTier::T1, &watching), VideoTier::T1);
+        let away = [peer(1, UserFlags::CAMERA_ON), peer(2, 0)];
+        assert_eq!(send_tier(VideoTier::T0, &away), VideoTier::T4);
     }
 }

@@ -31,8 +31,8 @@ async fn keyframe_request_produces_an_idr() {
     camera.start_with(Box::new(SyntheticSource::new()));
 
     let bob = server.raw_client("bob").await;
-    // Bob joined after the camera started: the first frame he sees is most
-    // likely a P frame, unless the 2 s IDR interval hit.
+    // Bob joined after the camera started. Until then nobody was viewing and
+    // the camera was paused, so his first frame comes from a fresh encoder.
     let (first, _) = bob.recv_video(SOON).await.expect("a video frame arrives");
     assert_eq!(first.speaker, alice);
     assert_eq!(first.codec, icu_proto::header::VIDEO_CODEC_H264);

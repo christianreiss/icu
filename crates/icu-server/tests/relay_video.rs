@@ -27,11 +27,23 @@ async fn camera_on(client: &mut common::Client, session: icu_proto::Session) {
         .expect("camera on");
 }
 
+/// A client that is looking at video (`UserFlags::VIEWING` from `Hello` on),
+/// so the relay forwards frames to it.
+async fn viewer(server: &TestServer, name: &str) -> common::Client {
+    let identity = server.enroll(name).await;
+    let mut client = server.connect(&identity).await.expect("connect");
+    client
+        .hello_with(name, icu_proto::MINOR, UserFlags(UserFlags::VIEWING))
+        .await
+        .expect("Welcome");
+    client
+}
+
 #[tokio::test]
 async fn video_reaches_the_other_clients_with_the_speaker_set() {
     let server = TestServer::start().await;
     let mut alice = server.client("alice").await;
-    let bob = server.client("bob").await;
+    let bob = viewer(&server, "bob").await;
 
     camera_on(&mut alice, 1).await;
 
@@ -50,7 +62,7 @@ async fn video_reaches_the_other_clients_with_the_speaker_set() {
 async fn video_without_camera_on_is_dropped() {
     let server = TestServer::start().await;
     let alice = server.client("alice").await;
-    let bob = server.client("bob").await;
+    let bob = viewer(&server, "bob").await;
 
     alice.send_video(1, 0, true, &[0x42; 200]).await;
     assert!(bob.recv_video(BRIEFLY).await.is_none());
@@ -82,6 +94,40 @@ async fn a_video_frame_without_receivers_is_drained() {
     server.shutdown().await;
 }
 
+/// §6.5: video goes only to peers that are viewing; a peer that starts
+/// viewing gets the next frame.
+#[tokio::test]
+async fn video_reaches_only_viewers() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let mut bob = server.client("bob").await;
+    let carol = viewer(&server, "carol").await;
+    camera_on(&mut alice, 1).await;
+
+    alice.send_video(1, 0, true, &[0x42; 64]).await;
+    assert!(carol.recv_video(SOON).await.is_some(), "the viewer gets it");
+    assert!(
+        bob.recv_video(BRIEFLY).await.is_none(),
+        "a non-viewer does not"
+    );
+
+    bob.send_msg(&ControlMsg::SetState {
+        flags: UserFlags(UserFlags::VIEWING),
+    })
+    .await;
+    let bob_session = bob.session;
+    alice
+        .recv_matching(
+            |m| matches!(m, ControlMsg::UserState { session, flags } if *session == bob_session && flags.viewing()),
+        )
+        .await
+        .expect("bob is viewing");
+    alice.send_video(2, 3200, false, &[0x43; 64]).await;
+    let (header, _) = bob.recv_video(SOON).await.expect("now bob gets it");
+    assert_eq!(header.seq, 2);
+    server.shutdown().await;
+}
+
 /// §10: the video frame rate limit drops frames instead of the connection.
 #[tokio::test]
 async fn video_over_the_frame_rate_limit_is_dropped() {
@@ -90,7 +136,7 @@ async fn video_over_the_frame_rate_limit_is_dropped() {
     })
     .await;
     let mut alice = server.client("alice").await;
-    let bob = server.client("bob").await;
+    let bob = viewer(&server, "bob").await;
     camera_on(&mut alice, 1).await;
 
     for seq in 0..12u16 {
@@ -192,7 +238,7 @@ async fn expired_loss_reports_send_a_zero_hint() {
 async fn no_congestion_sends_no_video_congestion_hint() {
     let server = TestServer::start().await;
     let mut alice = server.client("alice").await;
-    let bob = server.client("bob").await;
+    let bob = viewer(&server, "bob").await;
 
     camera_on(&mut alice, 1).await;
 

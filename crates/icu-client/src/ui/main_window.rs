@@ -94,8 +94,11 @@ struct App {
     /// from the capture thread's preview slot.
     #[cfg(feature = "camera")]
     self_video: Option<crate::camera::CameraPreview>,
-    #[cfg_attr(not(feature = "tray"), allow(dead_code))]
+    /// Hidden to the tray (or never shown: `start_minimized`).
     hidden: bool,
+    /// What was last reported as `Command::SetWindowVisible`; the engine
+    /// starts from the same `start_minimized` value.
+    window_visible: bool,
     quit_requested: bool,
 }
 
@@ -105,14 +108,16 @@ impl App {
         engine: Arc<Mutex<Option<Engine>>>,
         debug_stats: bool,
     ) -> App {
-        let (state_rx, cmd, stats, theme_name) = {
+        let (state_rx, cmd, stats, theme_name, start_minimized) = {
             let guard = engine.lock().unwrap();
             let e = guard.as_ref().expect("engine");
+            let snapshot = e.snapshot();
             (
                 e.state(),
                 e.command_sender(),
                 e.stats(),
-                e.snapshot().settings.ui.theme.clone(),
+                snapshot.settings.ui.theme.clone(),
+                snapshot.settings.ui.start_minimized,
             )
         };
         fonts::install(&cc.egui_ctx);
@@ -177,7 +182,8 @@ impl App {
             videos,
             #[cfg(feature = "camera")]
             self_video,
-            hidden: false,
+            hidden: start_minimized,
+            window_visible: !start_minimized,
             quit_requested: false,
         }
     }
@@ -234,6 +240,16 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 self.hidden = true;
             }
+        }
+
+        // Window on screen = this user views video (`UserFlags::VIEWING`,
+        // together with the overlay). `minimized` is unknown on Wayland and
+        // then counts as visible: better a frame too many than a black tile.
+        let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        let visible = !self.hidden && !minimized;
+        if visible != self.window_visible {
+            self.window_visible = visible;
+            let _ = self.cmd.send(Command::SetWindowVisible(visible));
         }
     }
 
