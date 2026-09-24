@@ -46,6 +46,7 @@ pub async fn register(
     addr_override: Option<SocketAddr>,
     paths: &Paths,
 ) -> Result<Identity, NetError> {
+    let name = &icu_proto::normalize_name(name);
     icu_proto::validate_name(name).map_err(|e| NetError::BadLink(e.to_string()))?;
     let (config, cert_failure) = conn::client_config(bundle)?;
     let addr = match addr_override {
@@ -166,7 +167,9 @@ pub async fn complete(
 /// renewal must not drift apart, because the server reads the CN as the
 /// display name (`PROTOCOL.md` §2.3).
 pub fn csr_for(cn: &str, key: &rcgen::KeyPair) -> Result<Vec<u8>, NetError> {
-    icu_proto::validate_name(cn).map_err(|e| NetError::BadLink(e.to_string()))?;
+    // Only the rules every issued name met: renewals carry a stored name that
+    // may predate the strict ones. New names are checked by the callers.
+    icu_proto::validate_stored_name(cn).map_err(|e| NetError::BadLink(e.to_string()))?;
     let mut params = rcgen::CertificateParams::default();
     params
         .distinguished_name

@@ -179,6 +179,19 @@ impl TestServer {
         connect_with(self.addr(), self.ca(), Some(identity.clone())).await
     }
 
+    /// Connects with `identity` and returns the code the connection ends
+    /// with, handshake alert or application close, whichever comes.
+    pub async fn rejection(&self, identity: &Identity) -> Option<u32> {
+        let endpoint = client_endpoint(self.ca(), Some(identity.clone()), icu_proto::limits::ALPN_MAIN);
+        let conn = match endpoint.connect(self.addr(), "localhost").ok()?.await {
+            Ok(conn) => conn,
+            Err(e) => return code_of(&e),
+        };
+        let _ = conn.open_bi().await;
+        let reason = tokio::time::timeout(SOON, conn.closed()).await.ok()?;
+        code_of(&reason)
+    }
+
     /// Connects without a client certificate.
     pub async fn connect_anonymous(&self) -> Result<Client, String> {
         connect_with(self.addr(), self.ca(), None).await
@@ -268,6 +281,9 @@ pub struct Client {
     pub recv: RecvStream,
     pub session: Session,
     pub user_id: UserId,
+    /// The newest `CrlUpdate` seen; the receive helpers take it out of the
+    /// stream, since it can arrive at any time.
+    pub crl: Option<Vec<u8>>,
 }
 
 impl Client {
@@ -322,11 +338,20 @@ impl Client {
 
     /// Waits at most `timeout` for the next control message.
     pub async fn recv_timeout(&mut self, timeout: Duration) -> Option<ControlMsg> {
-        let body = tokio::time::timeout(timeout, read_frame(&mut self.recv, MAX_CONTROL_FRAME))
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let body = tokio::time::timeout_at(
+                deadline,
+                read_frame(&mut self.recv, MAX_CONTROL_FRAME),
+            )
             .await
             .ok()?
             .ok()?;
-        ControlMsg::decode(&body).ok()
+            match ControlMsg::decode(&body).ok()? {
+                ControlMsg::CrlUpdate { crl_der } => self.crl = Some(crl_der),
+                msg => return Some(msg),
+            }
+        }
     }
 
     /// Waits for the next message of a kind the predicate accepts, skipping
@@ -435,10 +460,20 @@ impl Client {
     }
 }
 
-/// The application close code of a connection error, if any.
+/// QUIC's code for the TLS alert `certificate_revoked` (0x100 + 44): what a
+/// certificate on the server's CRL gets during the handshake.
+pub const TLS_CERTIFICATE_REVOKED: u32 = 0x100 + 44;
+
+/// The application close code of a connection error, or `0x100 + alert` for
+/// a TLS alert.
 pub fn code_of(error: &quinn::ConnectionError) -> Option<u32> {
     match error {
         quinn::ConnectionError::ApplicationClosed(closed) => {
+            Some(u64::from(closed.error_code) as u32)
+        }
+        quinn::ConnectionError::ConnectionClosed(closed)
+            if (0x100..0x200).contains(&u64::from(closed.error_code)) =>
+        {
             Some(u64::from(closed.error_code) as u32)
         }
         _ => None,
@@ -523,6 +558,7 @@ pub async fn connect_with(
         recv,
         session: 0,
         user_id: 0,
+        crl: None,
     })
 }
 

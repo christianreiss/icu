@@ -217,6 +217,41 @@ impl Ca {
         Ok((cert.der().clone(), key.serialize_der()))
     }
 
+    /// Signs a CRL listing `serials` (lowercase hex, see [`leaf_serial`]) with
+    /// the CA key (`PROTOCOL.md` §1). One CRL covers client and server leaves:
+    /// the server checks client certificates against it during the
+    /// handshake, clients check the server leaf.
+    pub fn crl(
+        &self,
+        number: u64,
+        serials: &[String],
+    ) -> Result<rustls::pki_types::CertificateRevocationListDer<'static>> {
+        let now = OffsetDateTime::from(std::time::SystemTime::now());
+        let revoked_certs = serials
+            .iter()
+            .filter_map(|hex| store::decode_hex(hex))
+            .filter(|raw| !raw.is_empty())
+            .map(|raw| rcgen::RevokedCertParams {
+                serial_number: SerialNumber::from_slice(&raw),
+                revocation_time: now,
+                reason_code: None,
+                invalidity_date: None,
+            })
+            .collect();
+        let params = rcgen::CertificateRevocationListParams {
+            this_update: now - time::Duration::hours(1),
+            next_update: now + CRL_NEXT_UPDATE,
+            crl_number: SerialNumber::from_slice(&minimal_be(number)),
+            issuing_distribution_point: None,
+            revoked_certs,
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        let crl = params
+            .signed_by(&self.issuer()?)
+            .map_err(|e| Error::msg(format!("cannot sign the CRL: {e}")))?;
+        Ok(crl.der().clone())
+    }
+
     /// The CA certificate in DER form.
     pub fn ca_der(&self) -> &CertificateDer<'static> {
         &self.ca_der
@@ -252,7 +287,10 @@ impl Ca {
 }
 
 /// The display name a CSR asks for: exactly one subject CN, readable as UTF-8,
-/// passing `validate_name` (`PROTOCOL.md` §2.3).
+/// passing `validate_stored_name` (`PROTOCOL.md` §2.3). Whether it also has
+/// to pass the strict `validate_name` is the caller's business: a new name
+/// does, a stored name carried into a renewal does not, or a user whose name
+/// predates the strict rules could never renew.
 ///
 /// Parsed with x509-parser on the raw DER rather than through rcgen's
 /// `DistinguishedName`: that one is a map keyed by `DnType`, so a CSR carrying
@@ -295,7 +333,7 @@ pub fn csr_common_name(csr_der: &[u8]) -> Result<String> {
             "csr common name is not readable as utf-8",
         )
     })?;
-    icu_proto::validate_name(cn)
+    icu_proto::validate_stored_name(cn)
         .map_err(|e| Error::coded(icu_proto::error::ENROLL_BAD_CSR, format!("bad name: {e}")))?;
     Ok(cn.to_string())
 }
@@ -321,6 +359,31 @@ pub fn leaf_public_key(der: &[u8]) -> Vec<u8> {
         .map(|(_, cert)| cert.public_key().raw.to_vec())
         .unwrap_or_default()
 }
+
+/// Serial number of a certificate as lowercase hex of the DER integer's
+/// content octets, the form the store keeps for the CRL. Empty when it does
+/// not parse.
+pub fn leaf_serial(der: &[u8]) -> String {
+    use x509_parser::prelude::FromDer;
+    x509_parser::certificate::X509Certificate::from_der(der)
+        .map(|(_, cert)| store::encode_hex(cert.raw_serial()))
+        .unwrap_or_default()
+}
+
+/// A certificate's notAfter as RFC 3339 UTC; far future when it does not
+/// parse, so an unreadable entry stays on the CRL rather than drop off.
+pub fn leaf_not_after(der: &[u8]) -> String {
+    use x509_parser::prelude::FromDer;
+    x509_parser::certificate::X509Certificate::from_der(der)
+        .ok()
+        .map(|(_, cert)| store::rfc3339(cert.validity().not_after.to_datetime()))
+        .unwrap_or_else(|| "9999-12-31T23:59:59Z".to_string())
+}
+
+/// How long a CRL claims to be current. Nobody enforces it (rustls does not
+/// by default, and the client keeps the newest it has); the server issues a
+/// fresh one on every revocation and at startup anyway.
+const CRL_NEXT_UPDATE: time::Duration = time::Duration::days(30);
 
 /// `icu://<public_host>` as a URI SAN.
 fn server_uri(public_host: &str) -> Result<SanType> {
@@ -374,6 +437,13 @@ fn set_validity(params: &mut CertificateParams, days: u32) {
     let now = OffsetDateTime::from(std::time::SystemTime::now());
     params.not_before = now - time::Duration::hours(1);
     params.not_after = now + time::Duration::days(i64::from(days));
+}
+
+/// Big-endian bytes of `n` without leading zeros (at least one byte).
+fn minimal_be(n: u64) -> Vec<u8> {
+    let bytes = n.to_be_bytes();
+    let skip = bytes.iter().take(7).take_while(|b| **b == 0).count();
+    bytes[skip..].to_vec()
 }
 
 fn random_serial() -> SerialNumber {

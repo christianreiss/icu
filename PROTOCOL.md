@@ -11,6 +11,7 @@ Stand 2026-09-20. Abgeleitet aus `Research/transport.md`, `Research/protocol/wir
 | TLS | TLS 1.3, Server-Cert und Client-Cert von der ICU-CA des Servers. Client vertraut nur dieser CA. |
 | ALPN | `icu/1`. ALPN ist das Major-Versions-Gate. Das frühere `icu-enroll/1` gibt es nicht mehr (revidiert 2026-09-24, §2.3). |
 | Client-Auth | Server: `WebPkiClientVerifier` mit `allow_unauthenticated()`; die Pflicht erzwingt die Anwendung und schließt ohne Cert mit `AUTH_REQUIRED` statt eines nackten TLS-Alerts (Spike 2b: `peer_identity()` ohne Cert = `None`). |
+| Widerruf (CRL) | Der Server signiert mit seiner CA eine CRL über alle widerrufenen, noch nicht abgelaufenen Zertifikate: Client-Leaves, verbrauchte Registrierungszertifikate und durch `rotate-server-cert` ersetzte Server-Leaves. Der Client-Verifier des Servers prüft das Client-Leaf dagegen (`only_check_end_entity_revocation`), ein widerrufenes scheitert also schon im Handshake mit dem TLS-Alert `certificate_revoked` (QUIC-Code `0x100 + 44`); der Client zeigt das fatal an. Die CRL wird bei jedem Start und nach jedem Widerruf neu gebaut und ohne Neustart in die TLS-Konfiguration aller Endpoints übernommen (`CrlUpdate`, §2.2). Die CRL-Nummer steigt streng monoton (`users.toml`); `nextUpdate` = +30 Tage wird nirgends erzwungen. Der Fingerprint-Abgleich gegen `users.toml` bleibt die eigentliche Zulassung; Zertifikatseinträge von vor der CRL haben keine Seriennummer und sind nur darüber abgedeckt. Der Client prüft das Server-Leaf gegen die neueste gespeicherte CRL (`CrlUpdate`). (2026-09-24) |
 | 0-RTT | Aus (`max_early_data_size = 0`, kein `into_0rtt()`). |
 | Idle / Keepalive | `max_idle_timeout` 60 s beidseitig; Client `keep_alive_interval` 15 s. |
 | Migration | quinn-Default (erlaubt). |
@@ -42,7 +43,15 @@ Session:   u16     serverseitig vergeben, ab 1, monoton; nach 65 535 läuft der 
 UserId:    u32     beim Ausstellen der Registrierung vergeben, ab 1, monoton, nie wiederverwendet; stabil über Cert-Renewals, Reconnects
                    und Server-Neustarts hinweg, in `users.toml` persistiert. Schlüssel für alles, was ein Client
                    dauerhaft je Peer speichert (Lautstärken, Notizen). 0 = „unbekannt“.
-Name:      String  UTF-8, 1–32 Bytes, keine Steuerzeichen; serverweit eindeutig, Vergleich case-insensitive
+Name:      String  UTF-8, 1–32 Bytes, in NFC; keine Steuer-, Format- (Bidi, Zero-Width), Private-Use-, nicht
+                   zugewiesenen oder Zeilen-/Absatztrennzeichen; als Leerraum nur U+0020, nicht am Anfang, nicht am Ende,
+                   nicht doppelt; kein kombinierendes Zeichen am Anfang; eine einzige Schrift (UTS #39 „single script“,
+                   Ziffern und Satzzeichen gehen mit jeder). Clients bringen Eingaben vorher mit `normalize_name` in Form
+                   (trimmen, Leerraum zusammenfassen, NFC). Serverweit eindeutig über `name_key` = UTS-#39-Skeleton von
+                   NFKC + Kleinschreibung: „Chris“, „chris“ und ein kyrillisches „Сһris“ gelten als derselbe Name
+                   (2026-09-24). Schon gespeicherte Namen werden nicht nachgeprüft, nur neue: ein Renewal oder Nachzügler,
+                   der den gespeicherten Namen unverändert weiterträgt, braucht nur 1–32 Bytes ohne Steuerzeichen
+                   (`validate_stored_name`) und keine erneute Eindeutigkeitsprüfung.
                    Der Name steht im Subject-CN des Client-Zertifikats. Er wird bei der Registrierung durch die CSR gesetzt
                    und danach ausschließlich dadurch geändert, dass ein neues Zertifikat ausgestellt wird (§2.2 Nr. 9).
                    `users.toml` spiegelt den CN des zuletzt ausgestellten Zertifikats; dieser Spiegel füllt alle
@@ -90,6 +99,7 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | 27 | `UserListResponse` | S→C | `users: Vec<UserSummary>` | Jeder registrierte Nutzer, online oder nicht. `UserSummary { user_id, name, created, is_admin, disabled, revoked, online, pending }` — `pending`: eingeladen, Registrierung noch nicht quittiert (§2.3). Größe durch `MAX_CONTROL_FRAME` begrenzt (§7): ~230 Nutzer passen in einen Frame, keine Paginierung gebaut. |
 | 28 | `AdminActionError` | S→C | `user_id: UserId`, `code: u32`, `detail: String` | Ablehnung von Variante 19/22/24/26. `user_id = 0` bei einem `UserListRequest`-Fehler, da kein einzelnes Ziel benannt ist. Eigene Variante statt der generischen `Error`, damit `NOT_ADMIN` nicht zwischen Einladung und Nutzerverwaltung mehrdeutig wird. |
 | 29 | `UserRtt` | S→C | `rtts: Vec<(Session, u16)>` | Broadcast alle ~2 s, solange der Raum ≥ 2 Teilnehmer hat: ein Eintrag je Online-Teilnehmer mit dessen serverseitig gemessener QUIC-Pfad-RTT in Millisekunden (`Connection::stats().path.rtt`, gesättigt auf `u16::MAX`). Das ist die Sicht des Servers, kein vom Client selbst gemeldeter `Ping`/`Pong`-Wert — jeder Betrachter sieht für einen gegebenen Peer dieselbe Zahl. Bei einem Raum mit nur einem Teilnehmer entfällt der Broadcast. |
+| 30 | `CrlUpdate` | S→C | `crl_der: Vec<u8>` | Die aktuelle CRL des Servers (§1), DER, von der CA signiert. Direkt nach `Welcome` und an alle, sobald sie sich ändert (Widerruf, verbrauchte Registrierung, `rotate-server-cert`). Der Client speichert sie nur, wenn Aussteller und Signatur zur eigenen CA passen und ihre CRL-Nummer größer ist als die der gespeicherten, und prüft das Server-Leaf ab der nächsten Verbindung dagegen. Die Datei liegt neben der Identität (`crl.der`), nicht darin, damit die Nummer ein Renewal überlebt. Größe durch `MAX_CONTROL_FRAME` begrenzt: ~350 Einträge (2026-09-24). |
 
 Varianten 19–28 sind die ersten C→S-Nachrichten, bei denen der sendende Client eine **andere** `user_id` benennt als seine eigene.
 
@@ -104,7 +114,7 @@ Es gibt kein Einladungs-Token, keinen Link, keinen Blob und kein eigenes Enrollm
 3. Der Server antwortet auf `Hello` mit `Welcome { registration: true, users: [], … }`. Die Sitzung tritt dem Raum nicht bei.
 4. Der Client erzeugt einen **eigenen** Schlüssel und sendet `RenewRequest` mit einer CSR, deren CN der gewählte Name ist.
 5. Der Server prüft: Schlüssel ≠ Schlüssel des Registrierungszertifikats (sonst `RENEW_REJECTED`), Name frei (sonst `NAME_TAKEN`, das Bundle bleibt gültig, der Nutzer kann einen anderen Namen versuchen), CSR-Regeln wie bei jedem Renewal (sonst `RENEW_REJECTED`). Dann stellt er das echte Zertifikat aus, übernimmt den Namen und antwortet `RenewResponse`. Das Registrierungszertifikat bleibt noch gültig.
-6. Der Client **speichert** Schlüssel und Zertifikat und schließt erst danach mit `NO_ERROR` — das ist die Quittung. Mit ihr widerruft der Server das Registrierungszertifikat; ebenso beim ersten Login mit einem echten Zertifikat dieses Nutzers. Ab dann ist das Bundle wertlos (`AUTH_REVOKED`).
+6. Der Client **speichert** Schlüssel und Zertifikat und schließt erst danach mit `NO_ERROR` — das ist die Quittung. Mit ihr widerruft der Server das Registrierungszertifikat; ebenso beim ersten Login mit einem echten Zertifikat dieses Nutzers. Ab dann ist das Bundle wertlos: es steht auf der CRL und scheitert im Handshake (`certificate_revoked`, §1).
 
 **Ohne Quittung bleibt das Bundle gültig** (revidiert 2026-09-24): Geht `RenewResponse` verloren, bricht die Verbindung ab oder scheitert das Speichern, schließt der Client mit einem anderen Code (oder gar nicht) und kann dasselbe Bundle erneut einlösen. Eine erneute Einlösung widerruft die Zertifikate früherer, unquittierter Einlösungen — die sollte niemand halten, sonst hätte ihr erster Login die Registrierung verbraucht. Das Bundle bleibt also zwischen Einlösung und Quittung (Millisekunden, schlimmstenfalls bis zum nächsten Client-Start) ein Inhaber-Nachweis: wer eine Kopie in diesem Fenster einlöst, übernimmt den Zugang. Es bleibt derselbe Nutzer (`user_id`). Vorher widerrief schon die Einlösung das Bundle; ein verlorenes Antwortpaket hinterließ dann einen Nutzer mit einem Zertifikat, das niemand besaß, und einen dauerhaft belegten Namen.
 
@@ -139,9 +149,11 @@ Armor: `-----BEGIN ICU PASSPORT-----`, Base64 (Standard-Alphabet mit Padding) au
 
 Der Client exportiert Version 2, wenn sein Zertifikat die Adresse trägt, sonst Version 1 mit ausgeschriebener Adresse (ein Zertifikat von vor 2026-09-24, bis zum nächsten Renewal). Beim Import von Version 2 ohne Adresse im Zertifikat lehnt er ab.
 
-**Der Body ist Klartext.** Ein Passport ist bis zum Ablauf des Zertifikats oder bis zum Widerruf ein vollwertiger Identitätsnachweis: wer den Text liest, kann sich als dieser Nutzer anmelden. Der Client warnt entsprechend, schreibt die Datei mit Mode 0600 und zeigt den Text nie am Bildschirm. Er pinnt auch nichts — wer einen gefälschten Passport einspielt, landet auf fremdem Server mit fremder CA. Für ein Registrierungs-Bundle gilt dasselbe, bis es quittiert oder abgelaufen ist.
+**Der Body ist Klartext.** Ein Passport ist bis zum Ablauf des Zertifikats oder bis zum Widerruf ein vollwertiger Identitätsnachweis: wer den Text liest, kann sich als dieser Nutzer anmelden. Der Client warnt entsprechend, schreibt die Datei mit Mode 0600 und zeigt den Text nie am Bildschirm. Für ein Registrierungs-Bundle gilt dasselbe, bis es quittiert oder abgelaufen ist.
 
-Beide Geräte halten danach dasselbe Zertifikat. Der Server akzeptiert das (Identität ist der Fingerprint, mehrere Sitzungen je `user_id` sind erlaubt); benennt sich eines der Geräte um, zieht das andere beim nächsten Start über den Nachzügler-Pfad aus §2.2 Nr. 9 nach.
+**Import nur nach Bestätigung** (2026-09-24). Ein Passport bringt CA und Adresse selbst mit; wer einen gefälschten einspielt, landet auf einem fremden Server mit fremder CA. Deshalb zeigt der Client vor jedem Import Server-Name (SNI), Adresse und den eigenen Namen aus dem Zertifikat (`ImportSummary`) und übernimmt erst nach Bestätigung: im Einstellungsfenster „Prüfen“ → „Übernehmen“, im Erststart-Fenster „Diesem Server beitreten“, auf der Kommandozeile eine Rückfrage `[j/N]` oder `--yes`. Vertraut die vorhandene Identität einer anderen CA, steht zusätzlich die Warnung „anderer Server als bisher“ dabei.
+
+Beide Geräte halten danach dasselbe Zertifikat. Der Server lässt davon **eine** Verbindung gleichzeitig zu (§7): verbindet sich das zweite Gerät, schließt der Server das erste mit `SESSION_REPLACED`. Benennt sich eines der Geräte um, zieht das andere beim nächsten Start über den Nachzügler-Pfad aus §2.2 Nr. 9 nach.
 
 ## 3. Audio-Datagram
 
@@ -202,7 +214,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | 0x01 | `PROTOCOL_VIOLATION` | ja | Framing/Decode-Fehler, falsche erste Message, Limit überschritten; kein Reconnect (würde loopen) |
 | 0x02 | `VERSION_UNSUPPORTED` | ja | `Hello.minor` nicht bedienbar |
 | 0x03 | `AUTH_UNKNOWN_CERT` | ja | Cert gültig gegen CA, Fingerprint unbekannt |
-| 0x04 | `AUTH_REVOKED` | ja | Fingerprint revoked |
+| 0x04 | `AUTH_REVOKED` | ja | Fingerprint revoked. Seit der CRL (§1) nur noch für Zertifikate ohne Seriennummer in `users.toml` und für ein Zertifikat, das zwischen Handshake und Anmeldung widerrufen wurde; sonst endet schon der Handshake mit `certificate_revoked` |
 | 0x05 | `SERVER_FULL` | nein | `max_users` erreicht; Client reconnectet mit Backoff |
 | 0x06 | `KICKED` | ja | Admin-Aktion (= Revoke mit sofortigem Close) |
 | 0x07 | `HELLO_TIMEOUT` | nein | kein `Hello` binnen 5 s; Client reconnectet mit Backoff |
@@ -221,6 +233,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | 0x16 | `LAST_ADMIN` | nein | Admin-Aktion würde den letzten funktionsfähigen Admin entfernen (Demote/Disable/Revoke); nur als `AdminActionError`, nie als Close |
 | 0x17 | `AUTH_DISABLED` | ja | Nutzer ist deaktiviert (`UserRecord.disabled`); geprüft beim Handshake, auch der Close-Code beim sofortigen Kick eines Online-Nutzers durch `AdminSetDisabled` |
 | 0x18 | `NO_SUCH_USER` | nein | Admin-Aktion nennt eine unbekannte `user_id`; nur als `AdminActionError`, nie als Close |
+| 0x19 | `SESSION_REPLACED` | ja | Dasselbe Client-Zertifikat hat sich erneut verbunden; die neuere Verbindung gewinnt, die ältere wird damit geschlossen (§7). Fatal, damit zwei Geräte mit demselben Passport sich nicht abwechselnd verdrängen |
 
 ## 7. Limits (Server erzwingt)
 
@@ -236,6 +249,8 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | `Welcome`-Größe | Server validiert beim Start, dass `max_users` × 100 B + Reserve unter dem 16-KiB-Frame-Limit bleibt |
 | Handshakes | 10/s pro IP (IPv6: pro /64), 100/s global; ≤ 10 s je Handshake; ab 32 offenen Verbindungen Retry (Adressvalidierung) |
 | Verbindungen | ≤ 256 offen (Handshake oder etabliert, über alle Listen-Adressen), darüber `refuse` |
+| Verbindungen je Zertifikat | 1 (Fingerprint des Client-Leafs, Registrierungssitzungen eingeschlossen); die neueste gewinnt, die ältere endet mit `SESSION_REPLACED` (2026-09-24) |
+| CRL | ≤ `MAX_CONTROL_FRAME` als `CrlUpdate`, ~350 Einträge; abgelaufene Zertifikate fallen heraus |
 | Registrierung | 5/min pro IP (IPv6: pro /64), 20/min global; je Sitzung ≤ 10 `RenewRequest`, ≤ 120 s; Registrierungszertifikat ≤ 7 Tage |
 | Hello | ≤ 5 s nach Handshake |
 

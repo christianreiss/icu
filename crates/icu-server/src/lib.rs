@@ -79,6 +79,14 @@ pub struct Server {
     /// Connection tasks alive right now, handshaking or established, over
     /// all endpoints (`limits.max_connections`).
     pub open_connections: std::sync::atomic::AtomicUsize,
+    /// The one live connection per client certificate fingerprint; a newer
+    /// one replaces it (`PROTOCOL.md` §7).
+    pub live_certs: std::sync::Mutex<std::collections::HashMap<String, quinn::Connection>>,
+    /// The QUIC endpoints, so a new CRL or server leaf reaches the TLS
+    /// config without a restart (`endpoint::reload_tls`). Empty offline.
+    pub endpoints: Vec<quinn::Endpoint>,
+    /// The current CRL, DER, as last sent to clients (`CrlUpdate`).
+    pub crl: std::sync::RwLock<Vec<u8>>,
     /// Flipped to `true` on shutdown.
     pub shutdown: watch::Sender<bool>,
     started: Instant,
@@ -115,7 +123,10 @@ impl Server {
             ip_limits: std::sync::Mutex::new(IpLimits::new(&config.limits)),
             loss: std::sync::Mutex::new(LossTracker::default()),
             keyframes: std::sync::Mutex::new(std::collections::HashMap::new()),
-        open_connections: std::sync::atomic::AtomicUsize::new(0),
+            open_connections: std::sync::atomic::AtomicUsize::new(0),
+            live_certs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            endpoints: Vec::new(),
+            crl: std::sync::RwLock::new(Vec::new()),
             counters: Counters::default(),
             ca: tokio::sync::RwLock::new(ca),
             store: tokio::sync::Mutex::new(store),
@@ -234,7 +245,11 @@ pub async fn run(config: Config) -> Result<Handle> {
     )?;
 
     // 5–7: TLS, QUIC, one endpoint per listen address.
-    let quic_config = endpoint::server_config(&config, &ca)?;
+    // The CRL is rebuilt from the store on every start, so revocations made
+    // offline (CLI without a running server) are in force from the first
+    // handshake.
+    let crl = endpoint::build_crl(&mut store, &ca)?;
+    let quic_config = endpoint::server_config(&config, &ca, &crl)?;
     let mut endpoints = Vec::new();
     let mut addrs = Vec::new();
     for addr in &config.server.listen {
@@ -250,6 +265,9 @@ pub async fn run(config: Config) -> Result<Handle> {
         loss: std::sync::Mutex::new(LossTracker::default()),
         keyframes: std::sync::Mutex::new(std::collections::HashMap::new()),
         open_connections: std::sync::atomic::AtomicUsize::new(0),
+        live_certs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        endpoints: endpoints.clone(),
+        crl: std::sync::RwLock::new(crl.to_vec()),
         counters: Counters::default(),
         ca: tokio::sync::RwLock::new(ca),
         store: tokio::sync::Mutex::new(store),

@@ -1202,7 +1202,7 @@ impl EnrollApp {
         let slot: EnrollSlot = Arc::new(Mutex::new(None));
         self.pending = Some(slot.clone());
         let addr = self.server_addr;
-        let name = self.name.trim().to_string();
+        let name = icu_proto::normalize_name(&self.name);
         let client = format!("icu/{} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS);
         let paths = self.paths.clone();
         std::thread::spawn(move || {
@@ -1280,9 +1280,13 @@ impl eframe::App for EnrollApp {
 
                 // A passport carries its own certificate; a registration
                 // bundle needs a name, prefilled from its placeholder.
-                let registration = Identity::from_passport(&self.link)
-                    .ok()
-                    .filter(Identity::is_registration);
+                let parsed = Identity::from_passport(&self.link).ok();
+                // Where the pasted text leads, shown before joining: it brings
+                // its own CA and address (`PROTOCOL.md` §2.3.1).
+                let summary = parsed
+                    .as_ref()
+                    .map(|id| crate::config::ImportSummary::of(id, None));
+                let registration = parsed.filter(Identity::is_registration);
                 let prefill = registration.as_ref().map(|id| {
                     crate::conninfo::CertInfo::from_der(&id.leaf_der).subject
                 });
@@ -1331,10 +1335,28 @@ impl eframe::App for EnrollApp {
                         );
                     }
                 });
+                if let Some(summary) = &summary {
+                    widgets::group_card(ui, "Server", |ui| {
+                        widgets::card_note(ui, |ui| {
+                            for line in summary.lines() {
+                                ui.label(RichText::new(line).size(12.0).monospace());
+                            }
+                        });
+                        widgets::card_note(ui, |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Nur beitreten, wenn das der Server ist, den du erwartest.",
+                                )
+                                .size(11.5)
+                                .color(tok.dim_text),
+                            );
+                        });
+                    });
+                }
 
                 ui.horizontal(|ui| {
                     let can_submit = !busy
-                        && !self.link.trim().is_empty()
+                        && summary.is_some()
                         && (!needs_name || !self.name.trim().is_empty());
                     if ui
                         .add_enabled_ui(can_submit, |ui| {
@@ -1342,7 +1364,7 @@ impl eframe::App for EnrollApp {
                                 ui,
                                 widgets::ButtonKind::Primary,
                                 icon::SIGN_IN,
-                                "Beitreten",
+                                "Diesem Server beitreten",
                             )
                         })
                         .inner

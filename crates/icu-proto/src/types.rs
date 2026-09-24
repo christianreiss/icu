@@ -25,6 +25,18 @@ pub enum NameError {
     TooLong,
     /// Contains a Unicode control character.
     ControlChar,
+    /// Contains an invisible, formatting, private-use, unassigned or
+    /// separator character (bidi overrides, zero-width space, …).
+    InvisibleChar,
+    /// Leading, trailing or doubled whitespace, or whitespace other than
+    /// U+0020.
+    Whitespace,
+    /// Not in Unicode Normalization Form C ([`normalize_name`] fixes it).
+    NotNormalized,
+    /// Starts with a combining mark.
+    LeadingMark,
+    /// Mixes scripts, e.g. Latin with a Cyrillic look-alike.
+    MixedScript,
 }
 
 impl core::fmt::Display for NameError {
@@ -33,14 +45,25 @@ impl core::fmt::Display for NameError {
             NameError::Empty => write!(f, "name is empty"),
             NameError::TooLong => write!(f, "name longer than {NAME_MAX_LEN} bytes"),
             NameError::ControlChar => write!(f, "name contains a control character"),
+            NameError::InvisibleChar => write!(f, "name contains an invisible character"),
+            NameError::Whitespace => write!(
+                f,
+                "name has leading, trailing, doubled or unusual whitespace"
+            ),
+            NameError::NotNormalized => write!(f, "name is not in Unicode NFC"),
+            NameError::LeadingMark => write!(f, "name starts with a combining mark"),
+            NameError::MixedScript => write!(f, "name mixes scripts"),
         }
     }
 }
 
 impl std::error::Error for NameError {}
 
-/// Validates a display name: 1–32 bytes UTF-8, no control characters.
-pub fn validate_name(name: &str) -> Result<(), NameError> {
+/// The rules every name ever issued met: 1–32 bytes UTF-8, no control
+/// characters. Enough for a name that is already stored and only carried
+/// into a new certificate (plain renewal); a new name has to pass
+/// [`validate_name`].
+pub fn validate_stored_name(name: &str) -> Result<(), NameError> {
     if name.len() < NAME_MIN_LEN {
         return Err(NameError::Empty);
     }
@@ -53,9 +76,80 @@ pub fn validate_name(name: &str) -> Result<(), NameError> {
     Ok(())
 }
 
-/// Normalized lookup key for the case-insensitive uniqueness check.
+/// Validates a display name (`PROTOCOL.md` §2.1): 1–32 bytes UTF-8 in NFC,
+/// no control, formatting, private-use, unassigned or separator characters,
+/// single spaces (U+0020) only between words, no leading combining mark, and
+/// a single script (UTS #39; digits and punctuation go with any).
+pub fn validate_name(name: &str) -> Result<(), NameError> {
+    use unicode_general_category::{get_general_category, GeneralCategory as G};
+    use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
+    use unicode_security::MixedScript;
+
+    validate_stored_name(name)?;
+    for c in name.chars() {
+        match get_general_category(c) {
+            G::Format
+            | G::Surrogate
+            | G::PrivateUse
+            | G::Unassigned
+            | G::LineSeparator
+            | G::ParagraphSeparator => return Err(NameError::InvisibleChar),
+            G::SpaceSeparator if c != ' ' => return Err(NameError::Whitespace),
+            // Hangul fillers and friends render as nothing but are letters.
+            _ if c.is_whitespace() && c != ' ' => return Err(NameError::Whitespace),
+            _ if matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}') => {
+                return Err(NameError::InvisibleChar)
+            }
+            _ => {}
+        }
+    }
+    if name.starts_with(' ') || name.ends_with(' ') || name.contains("  ") {
+        return Err(NameError::Whitespace);
+    }
+    let nfc = match is_nfc_quick(name.chars()) {
+        IsNormalized::Yes => true,
+        _ => name.chars().nfc().eq(name.chars()),
+    };
+    if !nfc {
+        return Err(NameError::NotNormalized);
+    }
+    if name.chars().next().is_some_and(|c| {
+        matches!(
+            get_general_category(c),
+            G::NonspacingMark | G::SpacingMark | G::EnclosingMark
+        )
+    }) {
+        return Err(NameError::LeadingMark);
+    }
+    if !name.is_single_script() {
+        return Err(NameError::MixedScript);
+    }
+    Ok(())
+}
+
+/// Brings typed input into the form [`validate_name`] expects: trimmed,
+/// inner whitespace runs collapsed to one U+0020, NFC. It does not make an
+/// invalid name valid, it only removes what a user cannot see.
+pub fn normalize_name(input: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    input
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .nfc()
+        .collect()
+}
+
+/// Lookup key for the uniqueness check: two names with the same key count as
+/// the same name. Case-insensitive and confusable-insensitive: NFKC, lower
+/// case, then the UTS #39 skeleton, so "Chris", "chris" and "Сhris" with a
+/// Cyrillic "С" collide.
 pub fn name_key(name: &str) -> String {
-    name.to_lowercase()
+    use unicode_normalization::UnicodeNormalization;
+    let folded: String = name.nfkc().collect::<String>().to_lowercase();
+    unicode_security::skeleton(&folded)
+        .collect::<String>()
+        .to_lowercase()
 }
 
 /// Per-user state bits (`PROTOCOL.md` §2.1).
@@ -274,6 +368,48 @@ mod tests {
         // 32 bytes, not 32 chars.
         assert_eq!(validate_name(&"ä".repeat(17)), Err(NameError::TooLong));
         assert!(validate_name(&"ä".repeat(16)).is_ok());
+    }
+
+    #[test]
+    fn names_hide_nothing() {
+        for ok in ["Chris", "Ärger", "neu-1a2b", "Anna Lena", "日本語", "Ωμέγα", "o'Neil 2"] {
+            assert_eq!(validate_name(ok), Ok(()), "{ok:?}");
+        }
+        assert_eq!(validate_name("abc\u{202E}def"), Err(NameError::InvisibleChar));
+        assert_eq!(validate_name("ad\u{200B}min"), Err(NameError::InvisibleChar));
+        assert_eq!(validate_name("x\u{E000}"), Err(NameError::InvisibleChar));
+        assert_eq!(validate_name("x\u{3164}"), Err(NameError::InvisibleChar));
+        assert_eq!(validate_name("a\u{2028}b"), Err(NameError::InvisibleChar));
+        assert_eq!(validate_name(" chris"), Err(NameError::Whitespace));
+        assert_eq!(validate_name("chris "), Err(NameError::Whitespace));
+        assert_eq!(validate_name("a  b"), Err(NameError::Whitespace));
+        assert_eq!(validate_name("a\u{00A0}b"), Err(NameError::Whitespace));
+        assert_eq!(validate_name("a\u{3000}b"), Err(NameError::Whitespace));
+        assert_eq!(validate_name("\u{0301}a"), Err(NameError::LeadingMark));
+        // Latin C, Cyrillic "hris": looks like "Chris".
+        assert_eq!(validate_name("C\u{0445}ris"), Err(NameError::MixedScript));
+        assert_eq!(validate_name("\u{0421}hris"), Err(NameError::MixedScript));
+        assert_eq!(validate_name("Ωmega"), Err(NameError::MixedScript));
+    }
+
+    #[test]
+    fn decomposed_names_are_normalized_first() {
+        let nfd = "A\u{0308}rger";
+        assert_eq!(validate_name(nfd), Err(NameError::NotNormalized));
+        let fixed = normalize_name(nfd);
+        assert_eq!(fixed, "Ärger");
+        assert_eq!(validate_name(&fixed), Ok(()));
+        assert_eq!(normalize_name("  Anna \t  Lena "), "Anna Lena");
+    }
+
+    #[test]
+    fn look_alikes_share_a_key() {
+        assert_eq!(name_key("Chris"), name_key("chris"));
+        // Fully Cyrillic look-alike passes the script check, but is taken.
+        assert_eq!(name_key("Chris"), name_key("\u{0421}\u{04BB}ris"));
+        assert_eq!(name_key("admin"), name_key("adrnin"));
+        assert_eq!(name_key("ｃｈｒｉｓ"), name_key("chris"));
+        assert_ne!(name_key("chris"), name_key("chrissy"));
     }
 
     #[test]

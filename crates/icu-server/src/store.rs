@@ -71,6 +71,18 @@ pub fn encode_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Inverse of [`encode_hex`]; `None` for anything that is not even-length
+/// hex.
+pub fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 /// SHA-256 over a certificate DER, lowercase hex without separators.
 pub fn fingerprint(der: &[u8]) -> String {
     encode_hex(&Sha256::digest(der))
@@ -106,6 +118,12 @@ pub struct CertRecord {
     /// ([`Store::consume_registration`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub registration: bool,
+    /// Serial number, lowercase hex of the DER integer's content octets —
+    /// what the CRL lists (`PROTOCOL.md` §1). `None` for records written
+    /// before the CRL existed; those stay covered by the fingerprint check
+    /// alone, since the DER is not kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
 }
 
 impl CertRecord {
@@ -168,9 +186,26 @@ pub struct UsersFile {
     pub schema: u32,
     /// Next `user_id` to hand out.
     pub next_user_id: UserId,
+    /// Number of the most recently issued CRL; strictly increasing, so a
+    /// client can refuse an older one (`PROTOCOL.md` §2.2 `CrlUpdate`).
+    #[serde(default)]
+    pub crl_number: u64,
+    /// Server leaves replaced by `rotate-server-cert`. They stay on the CRL
+    /// until they expire, so a leaked old server key is worthless.
+    #[serde(default, rename = "revoked_server")]
+    pub revoked_server: Vec<RevokedServerCert>,
     /// Users, keyed by the decimal `user_id` (TOML keys are strings).
     #[serde(default, rename = "user")]
     pub users: BTreeMap<String, UserRecord>,
+}
+
+/// A server leaf on the CRL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokedServerCert {
+    /// Serial, lowercase hex (see [`CertRecord::serial`]).
+    pub serial: String,
+    /// When it expires, RFC 3339 UTC; afterwards it leaves the CRL.
+    pub expires: String,
 }
 
 impl Default for UsersFile {
@@ -178,6 +213,8 @@ impl Default for UsersFile {
         UsersFile {
             schema: SCHEMA,
             next_user_id: 1,
+            crl_number: 0,
+            revoked_server: Vec::new(),
             users: BTreeMap::new(),
         }
     }
@@ -278,19 +315,26 @@ impl Store {
         None
     }
 
-    /// Resolves a CLI selector: `user_id`, name (case-insensitive) or
-    /// certificate fingerprint.
+    /// Resolves a CLI selector: `user_id`, name or certificate fingerprint.
+    /// A name matches exactly first, else case-insensitively if that is
+    /// unambiguous. Never by `name_key`: that also folds look-alikes, and a
+    /// revoke must not land on the wrong account.
     pub fn resolve(&self, selector: &str) -> Option<UserId> {
         if let Ok(id) = selector.parse::<UserId>() {
             if self.user(id).is_some() {
                 return Some(id);
             }
         }
-        let key = name_key(selector);
-        for (id, user) in self.users() {
-            if name_key(&user.name) == key {
-                return Some(id);
-            }
+        if let Some((id, _)) = self.users().find(|(_, u)| u.name == selector) {
+            return Some(id);
+        }
+        let lower = selector.to_lowercase();
+        let mut folded = self
+            .users()
+            .filter(|(_, u)| u.name.to_lowercase() == lower)
+            .map(|(id, _)| id);
+        if let (Some(id), None) = (folded.next(), folded.next()) {
+            return Some(id);
         }
         self.by_fingerprint(selector).map(|(id, _, _)| id)
     }
@@ -357,12 +401,19 @@ impl Store {
         supersedes: Option<&str>,
         renewal: bool,
     ) -> Result<bool> {
-        validate_name(&cert.cn)?;
-        if self.name_taken(&cert.cn, Some(id)) {
-            return Err(Error::coded(
-                ec::NAME_TAKEN,
-                format!("name {:?} taken", cert.cn),
-            ));
+        // The stored name carried into a new certificate is kept as it is:
+        // it may predate today's rules, or collide under today's
+        // `name_key` with a name issued since, and its owner must still be
+        // able to renew.
+        let keeps_name = self.user(id).is_some_and(|u| u.name == cert.cn);
+        if !keeps_name {
+            validate_name(&cert.cn)?;
+            if self.name_taken(&cert.cn, Some(id)) {
+                return Err(Error::coded(
+                    ec::NAME_TAKEN,
+                    format!("name {:?} taken", cert.cn),
+                ));
+            }
         }
         let now = now();
         let stamp = rfc3339(now);
@@ -586,6 +637,50 @@ impl Store {
         })
     }
 
+    /// Serials for the CRL: every revoked certificate that has a recorded
+    /// serial and has not expired yet — client leaves, consumed registration
+    /// certificates and replaced server leaves.
+    pub fn crl_serials(&self) -> Vec<String> {
+        let now = now();
+        let clients = self
+            .users
+            .users
+            .values()
+            .flat_map(|u| &u.certs)
+            .filter(|c| c.revoked && !c.expired(now))
+            .filter_map(|c| c.serial.clone());
+        let servers = self
+            .users
+            .revoked_server
+            .iter()
+            .filter(|s| parse_rfc3339(&s.expires).map(|e| e > now).unwrap_or(true))
+            .map(|s| s.serial.clone());
+        clients.chain(servers).collect()
+    }
+
+    /// Reserves the next CRL number and drops expired server entries in the
+    /// same write.
+    pub fn next_crl_number(&mut self) -> Result<u64> {
+        let now = now();
+        self.update_users(|users| {
+            users.crl_number += 1;
+            users
+                .revoked_server
+                .retain(|s| parse_rfc3339(&s.expires).map(|e| e > now).unwrap_or(true));
+            Ok(users.crl_number)
+        })
+    }
+
+    /// Puts a server leaf on the CRL (`rotate-server-cert`).
+    pub fn revoke_server_cert(&mut self, serial: String, expires: String) -> Result<()> {
+        self.update_users(|users| {
+            if !users.revoked_server.iter().any(|s| s.serial == serial) {
+                users.revoked_server.push(RevokedServerCert { serial, expires });
+            }
+            Ok(())
+        })
+    }
+
     /// Drops users who were invited and never confirmed a registration before
     /// their registration certificate expired, which frees the name. A redeem
     /// that was never confirmed counts as unused: nobody may hold its
@@ -693,6 +788,7 @@ mod tests {
             revoked: false,
             renewed: None,
             registration: false,
+            serial: None,
         }
     }
 
@@ -872,6 +968,31 @@ mod tests {
 
     /// A renewal carrying a new CN is how a rename happens, and the stored
     /// name follows the newest certificate.
+    #[test]
+    fn resolve_never_picks_a_look_alike() {
+        let (_dir, mut s) = store();
+        let latin = s.add_user(named_cert("aa", "Chris"), true).unwrap();
+        // Stored before the skeleton key existed: both names coexist.
+        s.users.users.insert(
+            "9".into(),
+            UserRecord {
+                name: "\u{0421}\u{04BB}ris".into(),
+                created: rfc3339(now()),
+                last_renew: None,
+                certs: vec![named_cert("bb", "\u{0421}\u{04BB}ris")],
+                is_admin: false,
+                disabled: false,
+            },
+        );
+        assert_eq!(s.resolve("Chris"), Some(latin));
+        assert_eq!(s.resolve("chris"), Some(latin));
+        assert_eq!(s.resolve("\u{0421}\u{04BB}ris"), Some(9));
+        // A renewal keeping a name that now collides still goes through.
+        let mut renewed = named_cert("cc", "\u{0421}\u{04BB}ris");
+        renewed.expires = rfc3339(now() + Duration::from_secs(86400));
+        assert!(!s.add_cert(9, renewed, None, true).unwrap(), "name unchanged");
+    }
+
     #[test]
     fn add_cert_adopts_the_cn_and_reports_the_change() {
         let (_dir, mut s) = store();

@@ -80,9 +80,10 @@ pub struct SettingsView {
     passport_import: String,
     /// Result of the last passport export or import.
     passport_status: Option<String>,
-    /// Importing a passport replaces the identity: first click arms, second
-    /// within ~3 s does it — same shape as [`Self::confirm_revoke`].
-    confirm_import: Option<Instant>,
+    /// A parsed passport waiting for confirmation: importing replaces the
+    /// identity, and the passport brings its own server, so the user sees
+    /// which one first (`PROTOCOL.md` §2.3.1).
+    import_preview: Option<(Box<Identity>, config::ImportSummary)>,
     /// Display name for the next invite to mint (admin only).
     pub invite_name: String,
     /// Validity of the next invite, seconds.
@@ -145,7 +146,7 @@ impl SettingsView {
                 .unwrap_or_default(),
             passport_import: String::new(),
             passport_status: None,
-            confirm_import: None,
+            import_preview: None,
             invite_name: String::new(),
             invite_ttl_s: icu_proto::limits::INVITE_TTL_S,
             invite_status: None,
@@ -451,42 +452,79 @@ impl SettingsView {
             });
 
             widgets::setting_row(ui, true, "Passport einspielen", None, |ui| {
-                let armed = self
-                    .confirm_import
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
-                let label = if armed {
-                    "Wirklich? Ersetzt deine Identität"
-                } else {
-                    "Einspielen"
-                };
-                let width = widgets::button_width(ui, icon::EXPORT, label);
+                let width = widgets::button_width(ui, icon::MAGNIFYING_GLASS, "Prüfen");
                 widgets::row_group(ui, width, |ui| {
                     let clicked = ui
-                        .add_enabled_ui(!self.passport_import.trim().is_empty(), |ui| {
-                            widgets::button(ui, widgets::ButtonKind::Danger, icon::EXPORT, label)
-                        })
+                        .add_enabled_ui(
+                            !self.passport_import.trim().is_empty() && self.import_preview.is_none(),
+                            |ui| {
+                                widgets::button(
+                                    ui,
+                                    widgets::ButtonKind::Neutral,
+                                    icon::MAGNIFYING_GLASS,
+                                    "Prüfen",
+                                )
+                            },
+                        )
                         .inner
-                        .on_hover_text("Ersetzt Schlüssel, Zertifikat und Serverdaten dieses Geräts")
+                        .on_hover_text("Zeigt, zu welchem Server der Passport gehört")
                         .clicked();
                     if clicked {
-                        if armed {
-                            self.confirm_import = None;
-                            self.import_passport(cmds);
-                        } else {
-                            self.confirm_import = Some(Instant::now());
-                        }
+                        self.preview_passport();
                     }
                 });
             });
+            if let Some((_, summary)) = &self.import_preview {
+                let lines = summary.lines();
+                let warn = summary.ca_changed;
+                widgets::card_note(ui, |ui| {
+                    let tok = theme::tokens(ui.visuals());
+                    for (i, line) in lines.iter().enumerate() {
+                        let text = RichText::new(line).size(11.5).monospace();
+                        if warn && i == lines.len() - 1 {
+                            ui.colored_label(tok.error, text);
+                        } else {
+                            ui.label(text);
+                        }
+                    }
+                });
+                widgets::setting_row(ui, true, "Diesen Server übernehmen?", None, |ui| {
+                    let width = widgets::button_width(ui, icon::CHECK, "Übernehmen")
+                        + 6.0
+                        + widgets::button_width(ui, icon::X, "Abbrechen");
+                    widgets::row_group(ui, width, |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if widgets::button(ui, widgets::ButtonKind::Danger, icon::CHECK, "Übernehmen")
+                            .on_hover_text("Ersetzt Schlüssel, Zertifikat und Serverdaten dieses Geräts")
+                            .clicked()
+                        {
+                            self.import_passport(cmds);
+                        }
+                        if widgets::button(ui, widgets::ButtonKind::Neutral, icon::X, "Abbrechen")
+                            .clicked()
+                        {
+                            self.import_preview = None;
+                            self.passport_status = Some("Import abgebrochen.".into());
+                        }
+                    });
+                });
+            }
+            let mut edited = false;
             widgets::card_note(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.passport_import)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(icu_proto::passport::ARMOR_BEGIN)
-                        .font(egui::TextStyle::Monospace),
-                );
+                edited = ui
+                    .add(
+                        egui::TextEdit::multiline(&mut self.passport_import)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(icu_proto::passport::ARMOR_BEGIN)
+                            .font(egui::TextStyle::Monospace),
+                    )
+                    .changed();
             });
+            // A confirmation belongs to the text it was made for.
+            if edited {
+                self.import_preview = None;
+            }
             if let Some(status) = &self.passport_status {
                 widgets::card_note(ui, |ui| {
                     ui.label(
@@ -510,17 +548,28 @@ impl SettingsView {
         }
     }
 
-    fn import_passport(&mut self, cmds: &mut Vec<Command>) {
+    /// Reads the pasted text and shows what it would switch to.
+    fn preview_passport(&mut self) {
         // `from_passport` also checks the key: a passport whose key does not
         // parse would brick the next connection. A registration bundle is
         // taken as well; the engine registers it under its placeholder name.
         match Identity::from_passport(&self.passport_import) {
             Ok(identity) => {
-                cmds.push(Command::ReplaceIdentity(Box::new(identity)));
-                self.passport_import.clear();
-                self.passport_status = Some("Identität ersetzt, verbinde neu…".into());
+                let current = Identity::load(&self.paths).ok().flatten();
+                let summary = config::ImportSummary::of(&identity, current.as_ref());
+                self.import_preview = Some((Box::new(identity), summary));
+                self.passport_status = None;
             }
             Err(e) => self.passport_status = Some(e),
+        }
+    }
+
+    /// Takes the confirmed passport into use.
+    fn import_passport(&mut self, cmds: &mut Vec<Command>) {
+        if let Some((identity, _)) = self.import_preview.take() {
+            cmds.push(Command::ReplaceIdentity(identity));
+            self.passport_import.clear();
+            self.passport_status = Some("Identität ersetzt, verbinde neu…".into());
         }
     }
 
@@ -717,7 +766,7 @@ impl SettingsView {
                         .inner;
                     let entered =
                         field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let changed = self.name.trim() != state.me.as_ref().map_or("", |m| &m.name);
+                    let changed = icu_proto::normalize_name(&self.name) != state.me.as_ref().map_or("", |m| &m.name);
                     let apply = ui
                         .add_enabled_ui(editable && changed, |ui| {
                             widgets::button(ui, widgets::ButtonKind::Primary, icon::CHECK, "")
@@ -729,7 +778,7 @@ impl SettingsView {
                             "Namen übernehmen"
                         });
                     if editable && (apply.clicked() || entered) && changed {
-                        cmds.push(Command::RequestRename(self.name.trim().to_string()));
+                        cmds.push(Command::RequestRename(icu_proto::normalize_name(&self.name)));
                     }
                 });
             });
@@ -787,7 +836,7 @@ impl SettingsView {
                         // The name is only a placeholder until the invited
                         // person picks their own; empty means a generated one.
                         let valid = self.invite_name.trim().is_empty()
-                            || icu_proto::validate_name(self.invite_name.trim()).is_ok();
+                            || icu_proto::validate_name(&icu_proto::normalize_name(&self.invite_name)).is_ok();
                         if ui
                             .add_enabled_ui(valid, |ui| {
                                 widgets::button(
@@ -801,7 +850,7 @@ impl SettingsView {
                             .clicked()
                         {
                             cmds.push(Command::CreateInvite {
-                                name: self.invite_name.trim().to_string(),
+                                name: icu_proto::normalize_name(&self.invite_name),
                                 ttl_s: self.invite_ttl_s,
                             });
                             self.invite_status = None;

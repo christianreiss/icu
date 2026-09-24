@@ -598,6 +598,65 @@ impl Identity {
     }
 }
 
+/// What importing a passport or registration bundle would switch this client
+/// to, shown for the user to confirm before anything is replaced
+/// (`PROTOCOL.md` §2.3.1). A passport brings its own CA and address, so a
+/// forged one would lead to somebody else's server; this is where the user
+/// sees which one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportSummary {
+    /// The server's name (TLS SNI).
+    pub server_name: String,
+    /// `host:port` the client would dial.
+    pub address: String,
+    /// The own display name in the certificate; for a registration bundle the
+    /// placeholder until a name is picked.
+    pub name: String,
+    /// A registration bundle (invite) rather than a passport.
+    pub registration: bool,
+    /// An identity exists and trusts a different CA: another server.
+    pub ca_changed: bool,
+}
+
+impl ImportSummary {
+    /// Summarises `identity`, compared with the one in force, if any.
+    pub fn of(identity: &Identity, current: Option<&Identity>) -> ImportSummary {
+        let host = &identity.server.host;
+        let address = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{}", identity.server.port)
+        } else {
+            format!("{host}:{}", identity.server.port)
+        };
+        ImportSummary {
+            server_name: identity.server.server_name.clone(),
+            address,
+            name: crate::conninfo::CertInfo::from_der(&identity.leaf_der).subject,
+            registration: identity.is_registration(),
+            ca_changed: current.is_some_and(|c| c.ca_der != identity.ca_der),
+        }
+    }
+
+    /// The summary as lines of text, for the CLI and the windows.
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = vec![
+            format!("Server:  {}", self.server_name),
+            format!("Adresse: {}", self.address),
+            if self.registration {
+                format!("Name:    {} (Einladung, eigener Name folgt)", self.name)
+            } else {
+                format!("Name:    {}", self.name)
+            },
+        ];
+        if self.ca_changed {
+            lines.push(
+                "Achtung: anderer Server als bisher — nur übernehmen, wenn du das erwartest."
+                    .into(),
+            );
+        }
+        lines
+    }
+}
+
 fn remove_dir_if_present(dir: &Path) -> Result<(), ConfigError> {
     match fs::remove_dir_all(dir) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
@@ -808,6 +867,44 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         assert!(save_invite(&paths, "kein bundle").is_err());
+    }
+
+    /// The import confirmation names server, address and own name, and
+    /// warns when the CA differs from the identity in force.
+    #[test]
+    fn import_summary_names_the_server_and_flags_a_new_ca() {
+        let (leaf, ca, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA icu.example.org");
+        let server = ServerInfo::from_certs(&leaf, &ca).unwrap();
+        let incoming = Identity {
+            key_der: key,
+            leaf_der: leaf,
+            ca_der: ca,
+            server,
+        };
+        let summary = ImportSummary::of(&incoming, None);
+        assert_eq!(summary.server_name, "icu.example.org");
+        assert_eq!(summary.address, "icu.example.org:4711");
+        assert!(!summary.registration);
+        assert!(!summary.ca_changed, "nothing to compare with on first import");
+        assert_eq!(summary.lines().len(), 3);
+        assert!(!ImportSummary::of(&incoming, Some(&incoming)).ca_changed);
+
+        let (leaf, ca, key) = issued(Some("icu://[2001:db8::1]:4711"), "ICU CA other");
+        let current = Identity {
+            key_der: key,
+            leaf_der: leaf,
+            ca_der: ca,
+            server: ServerInfo {
+                host: "2001:db8::1".into(),
+                port: 4711,
+                server_name: "other".into(),
+                name: "alice".into(),
+            },
+        };
+        assert_eq!(ImportSummary::of(&current, None).address, "[2001:db8::1]:4711");
+        let changed = ImportSummary::of(&incoming, Some(&current));
+        assert!(changed.ca_changed);
+        assert!(changed.lines().last().unwrap().contains("anderer Server"));
     }
 
     /// Export picks the version the certificates can support, and import

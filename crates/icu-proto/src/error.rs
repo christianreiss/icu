@@ -62,6 +62,10 @@ pub const AUTH_DISABLED: u32 = 0x17;
 /// An admin action named a `user_id` that does not exist. Only ever sent as
 /// `AdminActionError`. Not fatal.
 pub const NO_SUCH_USER: u32 = 0x18;
+/// The same certificate connected again; the newer connection wins and the
+/// older one is closed with this code (`PROTOCOL.md` §7). Fatal, so two
+/// devices sharing a passport do not take turns kicking each other.
+pub const SESSION_REPLACED: u32 = 0x19;
 
 /// All codes defined by v1, in ascending order.
 pub const ALL_CODES: &[u32] = &[
@@ -88,6 +92,7 @@ pub const ALL_CODES: &[u32] = &[
     LAST_ADMIN,
     AUTH_DISABLED,
     NO_SUCH_USER,
+    SESSION_REPLACED,
 ];
 
 /// Fatal codes (`PROTOCOL.md` §5/§6): the client must not reconnect.
@@ -108,6 +113,7 @@ pub fn is_fatal(code: u32) -> bool {
             | ENROLL_RATE_LIMITED
             | ENROLL_BOOTSTRAP_CLOSED
             | AUTH_DISABLED
+            | SESSION_REPLACED
     )
 }
 
@@ -137,6 +143,7 @@ pub fn name(code: u32) -> &'static str {
         LAST_ADMIN => "LAST_ADMIN",
         AUTH_DISABLED => "AUTH_DISABLED",
         NO_SUCH_USER => "NO_SUCH_USER",
+        SESSION_REPLACED => "SESSION_REPLACED",
         _ => "UNKNOWN",
     }
 }
@@ -160,6 +167,7 @@ mod tests {
             ENROLL_RATE_LIMITED,
             ENROLL_BOOTSTRAP_CLOSED,
             AUTH_DISABLED,
+            SESSION_REPLACED,
         ];
         for code in ALL_CODES {
             assert_eq!(

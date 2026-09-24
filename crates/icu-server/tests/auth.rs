@@ -73,12 +73,22 @@ async fn connections_past_the_limit_are_refused() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    let bob = server.enroll("bob").await;
+    let carol = server.enroll("carol").await;
+    for _ in 0..200 {
+        if open.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     assert_eq!(open.load(std::sync::atomic::Ordering::Relaxed), 0);
     // Connected but silent: each holds a slot until the `Hello` timeout.
+    // Three certificates, since a second connection with the same one would
+    // replace the first instead of adding to it.
     let _a = server.connect(&alice).await.expect("first connection");
-    let _b = server.connect(&alice).await.expect("second connection");
+    let _b = server.connect(&bob).await.expect("second connection");
     assert!(
-        server.connect(&alice).await.is_err(),
+        server.connect(&carol).await.is_err(),
         "the third is refused during the handshake"
     );
     server.shutdown().await;
@@ -152,8 +162,11 @@ async fn a_revoked_certificate_cannot_reconnect() {
         .handle
         .admin(AdminRequest::Revoke { user: "bob".into() })
         .await;
-    let client = server.connect(&identity).await.expect("connect");
-    assert_eq!(client.closed_code().await, Some(ec::AUTH_REVOKED));
+    // On the CRL: refused in the handshake already, no restart needed.
+    assert_eq!(
+        server.rejection(&identity).await,
+        Some(common::TLS_CERTIFICATE_REVOKED)
+    );
     server.shutdown().await;
 }
 
@@ -269,8 +282,10 @@ async fn a_bundle_works_exactly_once() {
     }
 
     let reused = common::identity_from_bundle(&bundle);
-    let client = server.connect(&reused).await.expect("connect");
-    assert_eq!(client.closed_code().await, Some(ec::AUTH_REVOKED));
+    assert_eq!(
+        server.rejection(&reused).await,
+        Some(common::TLS_CERTIFICATE_REVOKED)
+    );
     server.shutdown().await;
 }
 
@@ -286,10 +301,9 @@ async fn a_confirmed_registration_consumes_the_bundle() {
     // since every early attempt would spend the per-IP registration budget.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let reused = common::identity_from_bundle(&bundle);
-    let client = server.connect(&reused).await.expect("connect");
     assert_eq!(
-        client.closed_code().await,
-        Some(ec::AUTH_REVOKED),
+        server.rejection(&reused).await,
+        Some(common::TLS_CERTIFICATE_REVOKED),
         "the clean close must consume the bundle"
     );
     server.shutdown().await;
@@ -311,10 +325,9 @@ async fn an_unconfirmed_registration_can_be_repeated() {
         .await
         .expect("the unconfirmed bundle redeems again");
 
-    let client = server.connect(&lost).await.expect("connect");
     assert_eq!(
-        client.closed_code().await,
-        Some(ec::AUTH_REVOKED),
+        server.rejection(&lost).await,
+        Some(common::TLS_CERTIFICATE_REVOKED),
         "the lost certificate is replaced"
     );
     let mut client = server.connect(&bob).await.expect("connect");
@@ -521,16 +534,18 @@ async fn renewal_issues_a_second_certificate_and_both_connect() {
         other => panic!("expected Welcome, got {other:?}"),
     }
 
-    // ...and the old one still does, until it expires.
+    // ...and the old one still does, until it expires. Connecting it again
+    // replaces the first connection that used it (one per certificate).
     let mut with_old = server.connect(&old).await.expect("connect old");
     let welcome = with_old.hello("alice").await;
     assert!(matches!(welcome, ControlMsg::Welcome { .. }));
+    assert_eq!(client.closed_code().await, Some(ec::SESSION_REPLACED));
 
     // A second renewal on the same day is rejected.
-    client
+    with_old
         .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
         .await;
-    let answer = client
+    let answer = with_old
         .recv_matching(|m| matches!(m, ControlMsg::Error { .. }))
         .await;
     assert!(
@@ -624,6 +639,214 @@ async fn plain_renewal_is_refused_outside_the_window() {
                 ControlMsg::Error { .. } | ControlMsg::RenewResponse { .. }
             )
         })
+        .await;
+    assert!(
+        matches!(answer, Some(ControlMsg::Error { code, .. }) if code == ec::RENEW_REJECTED),
+        "{answer:?}"
+    );
+    server.shutdown().await;
+}
+
+/// Serials a CRL lists, lowercase hex, after checking its CA signature.
+fn crl_serials(crl_der: &[u8], ca: &[u8]) -> Vec<String> {
+    use x509_parser::prelude::FromDer;
+    let (_, ca) = x509_parser::certificate::X509Certificate::from_der(ca).unwrap();
+    let (_, crl) =
+        x509_parser::revocation_list::CertificateRevocationList::from_der(crl_der).unwrap();
+    crl.verify_signature(ca.public_key())
+        .expect("the CRL is signed by the CA");
+    crl.iter_revoked_certificates()
+        .map(|r| icu_server::store::encode_hex(r.raw_serial()))
+        .collect()
+}
+
+/// The serial of a leaf, lowercase hex.
+fn serial_of(der: &[u8]) -> String {
+    icu_server::ca::leaf_serial(der)
+}
+
+/// `PROTOCOL.md` §7: one live connection per certificate, the newest wins
+/// and the older one ends with the fatal `SESSION_REPLACED`.
+#[tokio::test]
+async fn a_second_connection_with_the_same_certificate_replaces_the_first() {
+    let server = TestServer::start().await;
+    let mut watcher = server.client("alice").await;
+    let bob = server.enroll("bob").await;
+    let mut first = server.connect(&bob).await.expect("connect");
+    first.hello("bob").await;
+    let first_session = first.session;
+    watcher
+        .recv_matching(|m| matches!(m, ControlMsg::UserJoined { .. }))
+        .await
+        .expect("UserJoined");
+
+    let mut second = server.connect(&bob).await.expect("connect again");
+    second.hello("bob").await;
+    assert_eq!(first.closed_code().await, Some(ec::SESSION_REPLACED));
+    assert!(ec::is_fatal(ec::SESSION_REPLACED), "no reconnect ping-pong");
+    let left = watcher
+        .recv_matching(|m| matches!(m, ControlMsg::UserLeft { .. }))
+        .await;
+    assert!(
+        matches!(left, Some(ControlMsg::UserLeft { session, reason })
+            if session == first_session && u32::from(reason) == ec::SESSION_REPLACED),
+        "{left:?}"
+    );
+
+    // The replacement works normally.
+    second.send_msg(&ControlMsg::Ping { nonce: 7 }).await;
+    assert!(matches!(
+        second.recv_matching(|m| matches!(m, ControlMsg::Pong { .. })).await,
+        Some(ControlMsg::Pong { nonce: 7, .. })
+    ));
+    server.shutdown().await;
+}
+
+/// The same rule holds for registration sessions: two holders of one bundle
+/// cannot run in parallel.
+#[tokio::test]
+async fn a_registration_session_is_replaced_by_a_newer_one() {
+    let server = TestServer::start().await;
+    let bundle = server.invite("").await;
+    let identity = common::identity_from_bundle(&bundle);
+    let mut first = server.connect(&identity).await.expect("connect");
+    first.hello("x").await;
+    let mut second = server.connect(&identity).await.expect("connect again");
+    second.hello("x").await;
+    assert_eq!(first.closed_code().await, Some(ec::SESSION_REPLACED));
+    server.shutdown().await;
+}
+
+/// `PROTOCOL.md` §1/§2.2: the CRL follows `Welcome`, and a revoke puts the
+/// certificate on a new one that reaches everybody online at once.
+#[tokio::test]
+async fn a_revoke_updates_the_crl_live() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    alice.expect_silence().await;
+    let first = alice.crl.clone().expect("CrlUpdate after Welcome");
+    let ca = server.ca();
+    crl_serials(&first, &ca); // signed by the CA
+
+    let bob = server.enroll("bob").await;
+    server
+        .handle
+        .admin(AdminRequest::Revoke { user: "bob".into() })
+        .await;
+    alice.expect_silence().await;
+    let updated = alice.crl.clone().expect("a new CRL was broadcast");
+    assert_ne!(updated, first);
+    assert!(crl_serials(&updated, &ca).contains(&serial_of(&bob.cert)));
+
+    // Refused in the handshake, without a restart.
+    assert_eq!(
+        server.rejection(&bob).await,
+        Some(common::TLS_CERTIFICATE_REVOKED)
+    );
+    server.shutdown().await;
+}
+
+/// `rotate-server-cert` takes effect without a restart, and the old leaf is
+/// on the CRL clients get.
+#[tokio::test]
+async fn rotating_the_server_certificate_revokes_the_old_one_live() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let before = server.connect(&alice).await.expect("connect");
+    let old_leaf = server_leaf(&before.conn);
+    drop(before);
+
+    let response = server.handle.admin(AdminRequest::RotateServerCert).await;
+    assert!(matches!(response, AdminResponse::Ok), "{response:?}");
+
+    let mut after = server.connect(&alice).await.expect("connect after rotation");
+    let new_leaf = server_leaf(&after.conn);
+    assert_ne!(new_leaf, old_leaf, "the new leaf is served without a restart");
+    after.hello("alice").await;
+    after.expect_silence().await;
+    let crl = after.crl.clone().expect("CrlUpdate after Welcome");
+    let serials = crl_serials(&crl, &server.ca());
+    assert!(serials.contains(&serial_of(&old_leaf)));
+    assert!(!serials.contains(&serial_of(&new_leaf)));
+    server.shutdown().await;
+}
+
+/// The server leaf a test connection saw.
+fn server_leaf(conn: &quinn::Connection) -> Vec<u8> {
+    conn.peer_identity()
+        .and_then(|any| {
+            any.downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+                .ok()
+        })
+        .and_then(|certs| certs.first().map(|c| c.to_vec()))
+        .expect("server certificate")
+}
+
+/// A name stored before the strict rules (`PROTOCOL.md` §2.1, 2026-09-24)
+/// is carried into new certificates as it is: catch-up and plain renewal
+/// both work, or its owner would be locked out once the certificate expires.
+#[tokio::test]
+async fn a_name_from_before_the_strict_rules_still_renews() {
+    let server = TestServer::start_with(|c| c.tls.client_validity_days = 20).await;
+    let alice = server.enroll("alice").await;
+    let TestServer { dir, handle } = server;
+    handle.shutdown().await;
+
+    // Mixed script: valid then, invalid now.
+    let legacy = "Ωmega";
+    assert!(icu_proto::validate_name(legacy).is_err());
+    let users = dir.path().join("users.toml");
+    let text = std::fs::read_to_string(&users).unwrap();
+    std::fs::write(&users, text.replace("name = \"alice\"", &format!("name = \"{legacy}\""))).unwrap();
+    let mut config = icu_server::config::Config::for_test(dir.path());
+    config.tls.client_validity_days = 20;
+    let server = TestServer {
+        handle: icu_server::run(config).await.expect("restarts"),
+        dir,
+    };
+
+    let renew = || {
+        let (key, csr) = common::csr_with_cn(legacy);
+        (key, ControlMsg::RenewRequest { csr_der: csr })
+    };
+    let mut client = server.connect(&alice).await.expect("connect");
+    let welcome = client.hello("alice").await;
+    assert!(matches!(&welcome, ControlMsg::Welcome { you, .. } if you.name == legacy));
+
+    // Catch-up: the certificate still says "alice".
+    let (key, request) = renew();
+    client.send_msg(&request).await;
+    let answer = client
+        .recv_matching(|m| matches!(m, ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }))
+        .await;
+    let Some(ControlMsg::RenewResponse { leaf_der }) = answer else {
+        panic!("catch-up with the stored name must work, got {answer:?}");
+    };
+    let caught_up = common::Identity {
+        cert: rustls::pki_types::CertificateDer::from(leaf_der),
+        key_pem: key.serialize_pem(),
+        key_der: key.serialize_der(),
+        ca: server.ca(),
+    };
+
+    // Plain renewal with a certificate that already carries the name.
+    let mut client = server.connect(&caught_up).await.expect("connect");
+    client.hello(legacy).await;
+    let (_, request) = renew();
+    client.send_msg(&request).await;
+    let answer = client
+        .recv_matching(|m| matches!(m, ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }))
+        .await;
+    assert!(
+        matches!(answer, Some(ControlMsg::RenewResponse { .. })),
+        "plain renewal with the stored name must work, got {answer:?}"
+    );
+
+    // A rename to a name that breaks today's rules is still refused.
+    let (_, csr) = common::csr_with_cn("Chri\u{0455}");
+    client.send_msg(&ControlMsg::RenewRequest { csr_der: csr }).await;
+    let answer = client
+        .recv_matching(|m| matches!(m, ControlMsg::Error { .. }))
         .await;
     assert!(
         matches!(answer, Some(ControlMsg::Error { code, .. }) if code == ec::RENEW_REJECTED),

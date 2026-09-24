@@ -96,6 +96,16 @@ impl ServerCertVerifier for ReportingVerifier {
 /// [`CertFailure`] captures the specific TLS error (if any) from the next
 /// handshake attempt made with this config, for [`connect`] to inspect.
 pub fn client_config(identity: &Identity) -> Result<(quinn::ClientConfig, CertFailure), NetError> {
+    client_config_with_crl(identity, None)
+}
+
+/// [`client_config`], with the server leaf also checked against `crl`, the
+/// newest CRL the server sent (`crate::crl`). A leaf on it fails the
+/// handshake like any other certificate error.
+pub fn client_config_with_crl(
+    identity: &Identity,
+    crl: Option<&[u8]>,
+) -> Result<(quinn::ClientConfig, CertFailure), NetError> {
     // The server would refuse an expired certificate with a bare TLS alert,
     // which reads like a network error and would be retried forever. No
     // reconnect can fix it, so say so before trying.
@@ -105,10 +115,18 @@ pub fn client_config(identity: &Identity) -> Result<(quinn::ClientConfig, CertFa
         .add(CertificateDer::from(identity.ca_der.clone()))
         .map_err(|e| NetError::Tls(format!("ca: {e}")))?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let webpki_verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+    let mut builder = rustls::client::WebPkiServerVerifier::builder_with_provider(
         Arc::new(roots),
         provider.clone(),
-    )
+    );
+    if let Some(crl) = crl {
+        builder = builder
+            .with_crls([rustls::pki_types::CertificateRevocationListDer::from(
+                crl.to_vec(),
+            )])
+            .only_check_end_entity_revocation();
+    }
+    let webpki_verifier = builder
     .build()
     .map_err(|e| NetError::Tls(e.to_string()))?;
     let cert_failure = CertFailure::default();
@@ -357,6 +375,14 @@ impl ConnectError {
             quinn::ConnectionError::ConnectionClosed(c)
                 if (0x100..0x200).contains(&u64::from(c.error_code)) =>
             {
+                // 44 = certificate_revoked: the server's CRL lists our leaf
+                // (`PROTOCOL.md` §1).
+                if u64::from(c.error_code) - 0x100 == 44 {
+                    return ConnectError::Certificate {
+                        server_name: String::new(),
+                        detail: "Der Server hat dieses Zertifikat widerrufen.".into(),
+                    };
+                }
                 ConnectError::Certificate {
                     server_name: String::new(),
                     detail: format!(
@@ -392,6 +418,9 @@ impl ConnectError {
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ConnectError::Closed { code, .. } if *code == icu_proto::error::SESSION_REPLACED => {
+                f.write_str("Diese Identität wurde auf einem anderen Gerät verbunden.")
+            }
             ConnectError::Closed { code, reason } => {
                 write!(f, "{} ({code}) {reason}", icu_proto::error::name(*code))
             }

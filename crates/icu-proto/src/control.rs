@@ -255,6 +255,15 @@ pub enum ControlMsg {
         /// `(session, rtt_ms)` pairs, one per online participant.
         rtts: Vec<(Session, u16)>,
     },
+    /// 30, S→C. The server's current CRL, DER, signed by its CA
+    /// (`PROTOCOL.md` §1, §2.2). Sent right after `Welcome` and to everyone
+    /// whenever it changes. The client keeps the one with the highest CRL
+    /// number whose signature its CA verifies and checks the server leaf
+    /// against it on every connect.
+    CrlUpdate {
+        /// The CRL, DER.
+        crl_der: Vec<u8>,
+    },
 }
 
 impl ControlMsg {
@@ -306,6 +315,7 @@ impl ControlMsg {
             ControlMsg::UserListResponse { .. } => "UserListResponse",
             ControlMsg::AdminActionError { .. } => "AdminActionError",
             ControlMsg::UserRtt { .. } => "UserRtt",
+            ControlMsg::CrlUpdate { .. } => "CrlUpdate",
         }
     }
 
@@ -455,6 +465,9 @@ mod tests {
             ControlMsg::UserRtt {
                 rtts: vec![(2, 34), (3, 128)],
             },
+            ControlMsg::CrlUpdate {
+                crl_der: vec![0x30, 0x03, 0x02, 0x01, 0x01],
+            },
         ]
     }
 
@@ -462,7 +475,7 @@ mod tests {
     #[test]
     fn roundtrip_all_control_variants() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 30, "v1 has exactly 30 control variants");
+        assert_eq!(variants.len(), 31, "v1 has exactly 31 control variants");
         for msg in variants {
             let frame = msg.encode().unwrap();
             let body = framing::split_frame(&frame, MAX_CONTROL_FRAME)
@@ -491,8 +504,8 @@ mod tests {
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
     #[test]
     fn unknown_variant_is_an_error() {
-        // Discriminant 30 does not exist yet.
-        let body = [30u8, 0, 0];
+        // Discriminant 31 does not exist yet.
+        let body = [31u8, 0, 0];
         let err = ControlMsg::decode(&body).unwrap_err();
         assert!(
             matches!(err, ProtoError::UnknownVariant),
@@ -548,6 +561,7 @@ mod tests {
         assert!(!ControlMsg::UserAdminChanged { is_admin: true }.is_client_to_server());
         assert!(!ControlMsg::UserListResponse { users: vec![] }.is_client_to_server());
         assert!(!ControlMsg::UserRtt { rtts: vec![] }.is_client_to_server());
+        assert!(!ControlMsg::CrlUpdate { crl_der: vec![] }.is_client_to_server());
         // Obsolete: renaming runs through `RenewRequest`, so a server that
         // sees variant 14 treats it as a protocol violation.
         assert!(!ControlMsg::SetName {
