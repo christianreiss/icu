@@ -613,6 +613,16 @@ impl eframe::App for App {
 
         let expanded = &mut self.expanded;
         let videos = &self.videos;
+        // `UserFlags::VIEWING` only says the window or overlay is up; someone
+        // actually watches video only while another person's camera is on.
+        let cameras = usize::from(state.camera_on)
+            + state
+                .peers
+                .iter()
+                .filter(|p| p.info.flags.camera_on())
+                .count();
+        let watches =
+            |viewing: bool, own_camera: bool| viewing && cameras > usize::from(own_camera);
         egui::CentralPanel::default().show(root, |ui| {
             // The people get a card of their own, the same surface as the
             // control dock below, so the window reads as two calm blocks.
@@ -640,7 +650,7 @@ impl eframe::App for App {
                                         mode: Some(state.mode),
                                         volume: None,
                                         is_admin: state.is_admin,
-                                        viewing: me.flags.viewing(),
+                                        viewing: watches(me.flags.viewing(), state.camera_on),
                                         rtt_ms: state.server_rtt_ms,
                                         client_rtt_ms: state.rtt_ms.map(|ms| ms.round() as u16),
                                         loss_permille: None,
@@ -664,7 +674,10 @@ impl eframe::App for App {
                                         mode: None,
                                         volume: Some(p.volume),
                                         is_admin: p.info.flags.is_admin(),
-                                        viewing: p.info.flags.viewing(),
+                                        viewing: watches(
+                                            p.info.flags.viewing(),
+                                            p.info.flags.camera_on(),
+                                        ),
                                         rtt_ms: p.rtt_ms,
                                         client_rtt_ms: None,
                                         loss_permille: p.recv_loss_permille,
@@ -1031,7 +1044,8 @@ struct Participant<'a> {
     mode: Option<Mode>,
     volume: Option<f32>,
     is_admin: bool,
-    /// Looking at video right now (`UserFlags::VIEWING`).
+    /// Looking at video right now: `UserFlags::VIEWING` while somebody
+    /// else's camera is on.
     viewing: bool,
     /// Server-measured RTT, milliseconds. `None` until the first
     /// `UserRtt` arrives (`PROTOCOL.md` §2.2).
