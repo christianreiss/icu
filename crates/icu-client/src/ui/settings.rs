@@ -17,6 +17,7 @@ use crate::{
     audio::DeviceKind,
     config::{
         self, Corner, Expand, HotkeyBackend, Identity, ModeSetting, Paths, Settings, TileSize,
+        VoiceStrength,
     },
     engine::{AppState, Command},
     stats::DebugStats,
@@ -346,6 +347,26 @@ impl SettingsView {
             widgets::setting_row(ui, true, "Rauschunterdrückung", Some("RNNoise"), |ui| {
                 widgets::toggle(ui, &mut self.draft.audio.denoise)
             });
+            widgets::setting_row(
+                ui,
+                true,
+                "Stimmoptimierung",
+                Some("Hochpass, Kompressor, Limiter – gleichmäßigere Lautstärke."),
+                |ui| widgets::toggle(ui, &mut self.draft.audio.voice_opt),
+            );
+            if self.draft.audio.voice_opt {
+                widgets::setting_row(ui, true, "Stärke", None, |ui| {
+                    widgets::segmented(
+                        ui,
+                        &mut self.draft.audio.voice_strength,
+                        &[
+                            (VoiceStrength::Light, "Leicht"),
+                            (VoiceStrength::Medium, "Mittel"),
+                            (VoiceStrength::Strong, "Stark"),
+                        ],
+                    )
+                });
+            }
             widgets::setting_row(
                 ui,
                 true,

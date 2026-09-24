@@ -41,6 +41,7 @@ dsp/
   aec.rs           # webrtc-audio-processing AEC3, 480-Sample-Frames, Referenz- und Capture-Pfad,
                    #   get_stats()-Selbstdiagnose; hinter Feature `aec`, zur Laufzeit schaltbar
   denoise.rs       # nnnoiseless, schaltbar
+  voice.rs         # Stimmoptimierung: Hochpass → Kompressor → Limiter, schaltbar
   vad.rs           # RNNoise-VAD-Wahrscheinlichkeit oder Energie-Gate, Hangover
   gate.rs          # PTT/VAD-Zustandsautomat, Release-Delay, END-Flag
   opus.rs          # Encoder (VOIP, 48k mono, 48 kbit/s, FEC) / Decoder je Speaker, PLC, FEC-Decode
@@ -76,7 +77,7 @@ Plattformcode liegt ausschließlich in `audio/pipewire.rs|wasapi.rs`, `hotkey/po
 | --- | --- | --- |
 | Audio-Capture (Backend-Callback, RT-Priorität) | Samples in Ringpuffer | 5–10 ms |
 | AEC-Referenz-Capture (Backend-Callback, RT; Linux: dritter PipeWire-Stream auf dem Sink-Monitor) | Systemmix-Samples in eigenen Ringpuffer | 5–10 ms |
-| DSP/Encode (eigener Thread, hohe Priorität) | 480-Sample-Blöcke: **AEC** (erst `process_render_frame` mit dem Referenzblock, dann `process_capture_frame` mit dem Mikrofonblock) → denoise → VAD/PTT-Gate → Opus (20 ms = 2 Blöcke) → Datagram | 10 ms |
+| DSP/Encode (eigener Thread, hohe Priorität) | 480-Sample-Blöcke: **AEC** (erst `process_render_frame` mit dem Referenzblock, dann `process_capture_frame` mit dem Mikrofonblock) → denoise → VAD → Stimmoptimierung (optional)/PTT-Gate → Opus (20 ms = 2 Blöcke) → Datagram | 10 ms |
 | Netz (tokio, 2 Worker) | QUIC, Control, Datagram-Empfang → Jitter-Buffer | ereignisgetrieben |
 | Audio-Playback (Backend-Callback, RT) | pro Callback: aus jedem Jitter-Buffer nächsten Frame holen (Decode/PLC/FEC), summieren, Limiter | 5–10 ms |
 | Kamera + H.264 (eigener Thread) | Capture → Encode → Uni-Stream | 15 fps |
@@ -113,6 +114,7 @@ Kommunikation: `tokio::sync::watch<AppState>` für UI/Tray/Overlay (nur lesen), 
 | **AEC** | `webrtc-audio-processing` ~2.1 (`bundled`), `Processor::new(48_000)`, `Config { echo_canceller: Some(EchoCanceller::Full { stream_delay_ms: None }), high_pass_filter: None, noise_suppression: None, gain_controller: None, .. }`. Frames **480 Samples = 10 ms** (vom APM erzwungen, sonst Panic), non-interleaved, f32 in **±1.0** — danach für `nnnoiseless` auf ±32768 skalieren. Je Tick erst `process_render_frame` (Referenz), dann `process_capture_frame` (Mikrofon); Reihenfolge ist zwingend, weil das Echo in Capture-Frame *k* aus Render-Frames ≤ *k* stammt. **Kein `set_stream_delay_ms`**: AEC3 schätzt das Delay selbst und ignoriert den Wert (`use_external_delay_estimator = false` im Upstream-Default; sechs Werte von 0–200 ms ergaben identische ERLE). **Kein AGC** (Dynamik bleibt unangetastet, `audio-io.md`). **Kein `set_output_will_be_muted`**: das Flag meint den *Capture*-Ausgang, und AEC3 setzt dann die Suppressor-Verstärkung auf 0 (`echo_remover.cc`) — bei Mute würde das Pegelmeter und die Auto-VAD-Schwelle blind, bei Deafen wäre es falsch, weil die Systemmix-Referenz weiter den Spielton trägt | `aec.md`, Spike 6: 36,8 dB ERLE, 8,96 ms, 47 µs/Frame |
 | Denoise | nnnoiseless 0.5, 480 Samples, Default an; ob der erste Ausgabeblock verworfen werden muss, ist offen (`audio-io.md` I4, RNNoise-Impulsantwort nicht gemessen) — in M1 messen und hier festschreiben | Spike 3: 1,15 ms/Frame |
 | VAD | RNNoise-Wahrscheinlichkeit (Schwelle Default 0,5, im Pegelmeter sichtbar) oder Energie-Gate in dBFS; Nachlauf (`hangover_ms`) Default 1000 ms, im Settings-Dialog 0–3000 ms. **Automatisch** (`AudioSettings.vad_auto`, Default an, Schalter neben dem Schwelle-Regler, benötigt RNNoise): `dsp::vad_auto::AutoThreshold` verfolgt einen laufenden Rauschboden auf dem RNNoise-Wahrscheinlichkeitssignal — asymmetrischer EMA (schnell abwärts, langsam aufwärts), gespeist nur aus Blöcken bei geschlossenem Gate und mit 150 ms Cooldown nach dem Schließen (RNNoise-Nachlauf). Effektive Schwelle = Boden + 0,18, geklemmt auf [0,15; 0,9]. Ein 4-s-Timeout speist den Tracker auch bei offenem Gate langsam nach, damit eine zu niedrig gestartete Schwelle sich nicht dauerhaft selbst blockiert. `hangover_ms` bleibt davon unberührt | |
+| Stimmoptimierung | `dsp::voice::VoiceChain`, Default **aus** (`voice_opt`), Stärke `voice_strength` = leicht/mittel/stark (−18/−24/−30 dBFS, 2:1/3:1/4:1, +3/+6/+9 dB Makeup). Butterworth-Hochpass 80 Hz → Kompressor (Soft-Knee 6 dB, Attack 5 ms, Release 120 ms) → Peak-Limiter −1 dBFS ohne Lookahead (0 ms Latenz). Nichtlinear, daher **hinter AEC**. Liegt auch hinter Pegelmeter und VAD, damit das Makeup-Gain die Schwellen nicht verschiebt. Kein AGC: die Kennlinie ist fest. `aec_probe` Fall (d)/(e): `mean_prob` unverändert, Rest-Echo steigt genau um das Makeup (−56 → −50/−47 dB). | 2026-09-24 |
 | PTT-Gate | Press → sofort senden; Release → Release-Delay 150 ms (konfigurierbar) → letztes Paket mit `END`; Doppeldruck-Halten optional. Das Gate liegt **hinter** AEC und Denoise: beide laufen im PTT-Modus durchgehend weiter, auch bei losgelassener Taste. Grund: der adaptive Filter lernt den Echopfad genau in den Sprechpausen — ein tastengesteuertes AEC wäre bei jedem Burst unkonvergiert (nach einer Störung braucht AEC3 rund 1 s, Spike 6 §5), und `process_render_frame` muss ohnehin lückenlos laufen, sonst reißt die Zeitachse der Referenz ab | `feature-freeze.md`, `aec.md` |
 | Encoder | opus 0.4.0 (opusic-sys 0.7.5, libopus 1.6.1 bundled): `Encoder::new(48000, Channels::Mono, Application::Voip)`, `set_signal(Signal::Voice)`, `set_bitrate(Bitrate::Bits(48_000))`, `set_vbr(true)` + `set_vbr_constraint(true)`, `set_inband_fec(true)`, `set_packet_loss_perc(i32)` aus `LossHint` (**i32**, nicht u32), `set_dtx(false)`, `set_complexity(10)`, Frame 20 ms (Option 10 ms). Der Cross-Build mit opusic-sys statt audiopus_sys ist laut `codec.md` C1 noch zu belegen (Spike 1 lief mit opus 0.3) | `codec.md` |
 | Sender | `seq` +1 je Paket, `ts` +960 (bzw. 480), `speaker = 0`; `send_datagram` (nicht `_wait`) | `PROTOCOL.md §3` |
@@ -189,7 +191,7 @@ Tray: tray-icon 0.25 (Linux `default-features = false, features = ["ksni"]`), Ic
 
 ```toml
 # Serverkoordinaten stehen ausschließlich in identity/server.toml (siehe §5), nicht hier.
-[audio]       input_device, output_device, mode = "vad"|"ptt", vad_threshold, vad_auto = true, hangover_ms = 1000, gain_db, denoise = true,
+[audio]       input_device, output_device, mode = "vad"|"ptt", vad_threshold, vad_auto = true, hangover_ms = 1000, gain_db, denoise = true, voice_opt = false, voice_strength = "medium",
               aec = true, release_ms = 150, frame_ms = 20, cue_join = true, cue_tx = false, cue_mute = true
 [hotkeys]     ptt = {...}, mute = {...}, deafen = {...}, toggle_mode = {...}, backend = "auto"|"portal"|"evdev"
 [camera]      device, enabled = false

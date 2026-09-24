@@ -1,4 +1,5 @@
-//! Signal processing: AEC, denoise, VAD, gate, codec, jitter buffer, mixer.
+//! Signal processing: AEC, denoise, VAD, gate, voice optimizer, codec, jitter
+//! buffer, mixer.
 
 pub mod aec;
 pub mod denoise;
@@ -11,3 +12,4 @@ pub mod refalign;
 pub mod testsignal;
 pub mod vad;
 pub mod vad_auto;
+pub mod voice;

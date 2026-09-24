@@ -108,6 +108,7 @@ Tabelle „Feature | v1 | Grund". „Perfekt" = das Kriterium in der Grund-Spalt
 | Loopback-Test | ja | Teil der Pegelanzeige im Settings-Dialog; billigste Antwort auf „hört man mich?". |
 | Sende-Cue (Ton bei PTT-Start/Ende) | ja, Default aus | Trivial, von Mumble-Nutzern erwartet, Default aus, weil es den Sprecher stört. |
 | Automatische Mikrofon-Verstärkung (AGC, TeamSpeak „automatic microphone volume adjustment") | nein | Manuelle Verstärkung („Max Amplification"-Regler) plus sichtbarer Pegel reicht; AGC pumpt und verstärkt Rauschen. Prüfen in v2, falls Pegelbeschwerden auftreten. |
+| Stimmoptimierung (Hochpass, Kompressor, Limiter) | ja, Default aus (2026-09-24) | Kein AGC: feste Kennlinie ohne Adaption, also kein Pumpen und kein Hochziehen von Rauschen in Pausen (VAD und Gate sehen das Signal vor der Kette). Der Nutzer entscheidet sich bewusst gegen „unverfälscht“, der Default bleibt glasklar. |
 
 ## Verworfen, mit Grund
 
