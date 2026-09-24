@@ -72,6 +72,11 @@ pub const SESSION_REPLACED: u32 = 0x19;
 /// closes a dropped connection implicitly with code 0, which must not count.
 /// Only ever a client close code. Not fatal.
 pub const REGISTRATION_STORED: u32 = 0x1A;
+/// The presented certificate has expired: the session is renew-only and never
+/// joins the room. Sent right after `Welcome` and in answer to anything but
+/// `RenewRequest`/`Ping`; the client renews with its existing key and
+/// reconnects with the new leaf (`PROTOCOL.md` §2.2). Not fatal.
+pub const RENEW_REQUIRED: u32 = 0x1B;
 
 /// All codes defined by v1, in ascending order.
 pub const ALL_CODES: &[u32] = &[
@@ -100,6 +105,7 @@ pub const ALL_CODES: &[u32] = &[
     NO_SUCH_USER,
     SESSION_REPLACED,
     REGISTRATION_STORED,
+    RENEW_REQUIRED,
 ];
 
 /// Fatal codes (`PROTOCOL.md` §5/§6): the client must not reconnect.
@@ -152,6 +158,7 @@ pub fn name(code: u32) -> &'static str {
         NO_SUCH_USER => "NO_SUCH_USER",
         SESSION_REPLACED => "SESSION_REPLACED",
         REGISTRATION_STORED => "REGISTRATION_STORED",
+        RENEW_REQUIRED => "RENEW_REQUIRED",
         _ => "UNKNOWN",
     }
 }

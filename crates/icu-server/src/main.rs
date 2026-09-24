@@ -73,6 +73,8 @@ enum Command {
     },
     /// Issue a fresh server leaf from the same CA.
     RotateServerCert,
+    /// Re-issue the CA certificate under the same key with a fresh validity.
+    RenewCa,
 }
 
 fn main() -> ExitCode {
@@ -134,7 +136,15 @@ async fn run(cli: Cli) -> Result<()> {
             cli::simple(
                 &config,
                 AdminRequest::RotateServerCert,
-                "new server certificate issued; restart the server to present it",
+                "new server certificate issued and in use",
+            )
+            .await
+        }
+        Command::RenewCa => {
+            cli::simple(
+                &config,
+                AdminRequest::RenewCa,
+                "CA certificate re-issued under the same key; clients need nothing",
             )
             .await
         }

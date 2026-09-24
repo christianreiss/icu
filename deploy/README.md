@@ -164,6 +164,7 @@ icu-server revoke alice                    # alle Certs sperren, sofort kicken
 icu-server status                          # Uptime, online, Relay-Zähler
 icu-server status --json                   # dasselbe für Monitoring
 icu-server rotate-server-cert              # neues Server-Leaf derselben CA
+icu-server renew-ca                        # CA-Zertifikat neu, selber Schlüssel
 ```
 
 **Erster Admin:** das erste Bundle auf einem leeren Server ist das des Admins —
@@ -189,10 +190,16 @@ beim Start und stündlich. Ein abgelaufenes oder widerrufenes Server-Leaf ist
 für die Clients kein fataler Fehler: sie versuchen es weiter und verbinden
 sich, sobald das neue Leaf da ist.
 
-**Die CA** (Default 3650 Tage) erneuert sich nicht. Läuft sie ab, müssen sich
-alle Nutzer neu registrieren; Journal und Checkmk-Check warnen ab 30 Tagen
-vorher. Rechtzeitig einen neuen Server aufsetzen (neue CA) und alle neu
-einladen.
+**Die CA** (Default 3650 Tage) stellt der Server ein Jahr vor Ablauf selbst
+neu aus — mit demselben Schlüssel und Subject, also ohne dass ein Client etwas
+tun muss (von Hand: `icu-server renew-ca`). Clients vertrauen dem Schlüssel,
+nicht den Daten; auch eine abgelaufene CA-Datei beim Client verankert weiter.
+
+**Abgelaufene Client-Zertifikate** erneuern sich selbst: der Client verbindet
+sich mit dem alten Zertifikat, bekommt eine renew-only-Sitzung und ein neues
+Zertifikat auf denselben Schlüssel (`PROTOCOL.md` §2.3.3) — egal, wie lange es
+her ist. Wer einen Zugang wirklich beenden will, nimmt `revoke` oder
+`disable`; ein bloß abgelaufenes Zertifikat sperrt niemanden aus.
 
 ## 4. Container (`FROM scratch`)
 

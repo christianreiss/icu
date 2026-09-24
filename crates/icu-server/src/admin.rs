@@ -69,6 +69,8 @@ pub enum AdminRequest {
     Status,
     /// Issue a fresh server leaf from the same CA.
     RotateServerCert,
+    /// Re-issue the CA certificate under the same key with a fresh validity.
+    RenewCa,
 }
 
 /// The answer to an [`AdminRequest`].
@@ -263,6 +265,10 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
             Ok(()) => AdminResponse::Ok,
             Err(e) => AdminResponse::err("ROTATE_FAILED", e),
         },
+        AdminRequest::RenewCa => match renew_ca(server).await {
+            Ok(()) => AdminResponse::Ok,
+            Err(e) => AdminResponse::err("RENEW_CA_FAILED", e),
+        },
     }
 }
 
@@ -283,6 +289,19 @@ pub async fn rotate_server_cert(server: &Arc<Server>) -> Result<()> {
         ca.rotate_server_cert(&server.config.tls, &server.config.server.server_name)?;
     }
     // The new leaf and the CRL go live without a restart.
+    crate::endpoint::reload_tls(server).await
+}
+
+/// Re-issues the CA certificate with the same key and subject, live without
+/// a restart. Behind `renew-ca` and the automatic renewal a year before the CA
+/// expires (`housekeeping`). Clients keep their stored CA certificate: the
+/// trust anchor is subject and key, not the dates (`Ca::renew_ca_cert`).
+pub async fn renew_ca(server: &Arc<Server>) -> Result<()> {
+    server
+        .ca
+        .write()
+        .await
+        .renew_ca_cert(&server.config.tls)?;
     crate::endpoint::reload_tls(server).await
 }
 
@@ -539,6 +558,10 @@ mod tests {
         assert!(matches!(
             serde_json::from_str::<AdminRequest>(r#"{"cmd":"rotate-server-cert"}"#).unwrap(),
             AdminRequest::RotateServerCert
+        ));
+        assert!(matches!(
+            serde_json::from_str::<AdminRequest>(r#"{"cmd":"renew-ca"}"#).unwrap(),
+            AdminRequest::RenewCa
         ));
         // An invite without a ttl is allowed and means the default.
         assert!(matches!(

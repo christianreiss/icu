@@ -135,6 +135,26 @@ impl Ca {
         Ok(())
     }
 
+    /// Re-issues the CA certificate under the **same key and subject** with a
+    /// fresh validity. Nothing else has to follow: rustls anchors trust on
+    /// subject and public key only, never on the anchor's dates, and the key
+    /// identifier is derived from the key, so every leaf, CRL and client
+    /// holding the old `ca.der` keeps verifying. It keeps tooling that does
+    /// look at the dates (openssl, Checkmk) quiet, and new bundles carry it.
+    pub fn renew_ca_cert(&mut self, tls: &TlsSection) -> Result<()> {
+        let key = KeyPair::from_pem(&self.ca_key_pem).context("cannot load ca.key")?;
+        // The subject is rebuilt exactly as `create_ca` built it, a lone CN;
+        // `ca_renewal_keeps_subject_and_key` pins the bytes.
+        let cn = leaf_common_name(&self.ca_der);
+        if cn.is_empty() {
+            return Err(Error::msg("ca.crt has no readable CN"));
+        }
+        let cert = ca_params(&cn, tls.ca_validity_days).self_signed(&key)?;
+        store::write_atomic(&self.dir.join(CA_CRT), &cert.pem())?;
+        self.ca_der = cert.der().clone();
+        Ok(())
+    }
+
     /// Signs a client CSR. The public key and the validated subject CN come
     /// from the CSR; SAN, EKU, basic constraints, key usage, validity and
     /// serial are server-set. The only SAN is `icu://<public_host>`. Returns
@@ -381,13 +401,27 @@ pub fn leaf_not_after(der: &[u8]) -> String {
 }
 
 /// Whole days until a certificate's notAfter, negative once it has passed.
-/// `i64::MAX` when it does not parse, so nothing rotates or alarms on an
-/// unreadable file.
-pub fn leaf_days_left(der: &[u8]) -> i64 {
+/// `None` when it does not parse.
+pub fn leaf_days_left_checked(der: &[u8]) -> Option<i64> {
     use x509_parser::prelude::FromDer;
     x509_parser::certificate::X509Certificate::from_der(der)
+        .ok()
         .map(|(_, cert)| (cert.validity().not_after.to_datetime() - store::now()).whole_days())
-        .unwrap_or(i64::MAX)
+}
+
+/// [`leaf_days_left_checked`] for reporting: `i64::MAX` when it does not
+/// parse, so monitoring does not alarm on a number that means nothing.
+pub fn leaf_days_left(der: &[u8]) -> i64 {
+    leaf_days_left_checked(der).unwrap_or(i64::MAX)
+}
+
+/// Whether a certificate's notAfter has passed. `false` when it does not
+/// parse: such a leaf never got through the handshake anyway.
+pub fn leaf_expired(der: &[u8]) -> bool {
+    use x509_parser::prelude::FromDer;
+    x509_parser::certificate::X509Certificate::from_der(der)
+        .map(|(_, cert)| cert.validity().not_after.to_datetime() <= store::now())
+        .unwrap_or(false)
 }
 
 /// How long a CRL claims to be current. Nobody enforces it (rustls does not
@@ -427,20 +461,27 @@ fn create_ca(
     server_name: &str,
 ) -> Result<(CertificateDer<'static>, String)> {
     let key = KeyPair::generate()?; // P-256 by default (Spike 2b)
+    let cert = ca_params(&format!("{CA_COMMON_NAME} {server_name}"), tls.ca_validity_days)
+        .self_signed(&key)?;
+    let key_pem = key.serialize_pem();
+    store::write_atomic(&dir.join(CA_CRT), &cert.pem())?;
+    store::write_private(&dir.join(CA_KEY), &key_pem)?;
+    Ok((cert.der().clone(), key_pem))
+}
+
+/// Parameters of the self-signed CA certificate: new, and re-issued under the
+/// same key by [`Ca::renew_ca_cert`].
+fn ca_params(common_name: &str, days: u32) -> CertificateParams {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.distinguished_name = DistinguishedName::new();
     params
         .distinguished_name
-        .push(DnType::CommonName, format!("{CA_COMMON_NAME} {server_name}"));
-    set_validity(&mut params, tls.ca_validity_days);
+        .push(DnType::CommonName, common_name);
+    set_validity(&mut params, days);
     params.serial_number = Some(random_serial());
-    let cert = params.self_signed(&key)?;
-    let key_pem = key.serialize_pem();
-    store::write_atomic(&dir.join(CA_CRT), &cert.pem())?;
-    store::write_private(&dir.join(CA_KEY), &key_pem)?;
-    Ok((cert.der().clone(), key_pem))
+    params
 }
 
 fn set_validity(params: &mut CertificateParams, days: u32) {
@@ -824,5 +865,66 @@ mod tests {
             .general_names
             .iter()
             .any(|n| matches!(n, x509_parser::extensions::GeneralName::IPAddress(_))));
+    }
+
+    /// Verifies `ca`'s server leaf the way a client does, with `root` as the
+    /// only trust anchor, chain as presented.
+    fn client_accepts(
+        root: &CertificateDer<'static>,
+        ca: &Ca,
+    ) -> std::result::Result<(), rustls::Error> {
+        use rustls::client::danger::ServerCertVerifier;
+        use std::sync::Arc;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(root.clone()).unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        let chain = ca.server_chain();
+        verifier
+            .verify_server_cert(
+                &chain[0],
+                &chain[1..],
+                &rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .map(|_| ())
+    }
+
+    /// The trust anchor is subject and key, never the dates: a client holding
+    /// an expired CA certificate still accepts the server, before and after
+    /// the server re-issues its CA certificate under the same key.
+    #[test]
+    fn ca_renewal_keeps_subject_and_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let expired = TlsSection {
+            ca_validity_days: 0,
+            ..tls()
+        };
+        let mut ca = Ca::load_or_create(dir.path(), &expired, "localhost").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let old = ca.ca_der().clone();
+        assert!(leaf_expired(&old));
+        client_accepts(&old, &ca).expect("an expired anchor still anchors");
+
+        ca.renew_ca_cert(&tls()).unwrap();
+        let new = ca.ca_der().clone();
+        assert!(!leaf_expired(&new));
+        assert!(leaf_days_left(&new) > 3600);
+        assert_eq!(parse(&new).subject().as_raw(), parse(&old).subject().as_raw());
+        assert_eq!(leaf_public_key(&new), leaf_public_key(&old));
+        assert_ne!(leaf_serial(&new), leaf_serial(&old));
+        client_accepts(&new, &ca).expect("renewed anchor, old leaf");
+        ca.rotate_server_cert(&tls(), "localhost").unwrap();
+        client_accepts(&old, &ca).expect("old anchor, new leaf");
+        client_accepts(&new, &ca).expect("renewed anchor, new leaf");
+
+        // Written to disk: a restart presents the renewed one.
+        let reloaded = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert_eq!(reloaded.ca_der(), &new);
     }
 }

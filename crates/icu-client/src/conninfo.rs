@@ -38,6 +38,8 @@ pub struct CertInfo {
     pub not_after: String,
     /// Days until `not_after`; negative once expired.
     pub expires_in_days: i64,
+    /// Whole days from `not_before` to `not_after`.
+    pub valid_days: i64,
     /// SHA-256 over the DER, as 32 colon-separated uppercase hex pairs.
     pub fingerprint: String,
     /// Signature algorithm short name, e.g. `ecdsa-with-SHA256`.
@@ -52,6 +54,7 @@ impl Default for CertInfo {
             not_before: UNKNOWN.to_string(),
             not_after: UNKNOWN.to_string(),
             expires_in_days: 0,
+            valid_days: 0,
             fingerprint: UNKNOWN.to_string(),
             sig_alg: UNKNOWN.to_string(),
         }
@@ -75,6 +78,9 @@ impl CertInfo {
         out.not_before = fmt_date(cert.validity().not_before.timestamp());
         out.not_after = fmt_date(cert.validity().not_after.timestamp());
         out.expires_in_days = (cert.validity().not_after.timestamp() - unix_now()) / 86_400;
+        out.valid_days = (cert.validity().not_after.timestamp()
+            - cert.validity().not_before.timestamp())
+            / 86_400;
         out.sig_alg = x509_parser::objects::oid2sn(
             &cert.signature_algorithm.algorithm,
             x509_parser::objects::oid_registry(),

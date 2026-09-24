@@ -116,6 +116,7 @@ pub fn code_text(code: u32) -> String {
              hier wurde deshalb getrennt."
         }
         codes::REGISTRATION_STORED => "Registrierung abgeschlossen.",
+        codes::RENEW_REQUIRED => "Das eigene Zertifikat ist abgelaufen und wird erneuert …",
         other => return format!("Unerwarteter Fehler (Code {other})."),
     };
     s.to_string()

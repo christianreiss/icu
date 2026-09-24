@@ -203,6 +203,27 @@ impl TestServer {
     pub async fn shutdown(self) {
         self.handle.shutdown().await;
     }
+
+    /// Stops the server and starts it again on the same state directory,
+    /// letting the caller adjust the configuration. The port changes.
+    pub async fn restart_with(self, adjust: impl FnOnce(&mut Config)) -> TestServer {
+        let TestServer { dir, handle } = self;
+        handle.shutdown().await;
+        let mut config = Config::for_test(dir.path());
+        adjust(&mut config);
+        let handle = icu_server::run(config).await.expect("server restarts");
+        TestServer { dir, handle }
+    }
+}
+
+/// A CSR asking for `cn` on an existing identity's key: a renewal.
+pub fn renewal_csr(identity: &Identity, cn: &str) -> Vec<u8> {
+    let key = rcgen::KeyPair::from_pem(&identity.key_pem).expect("identity key");
+    let mut params = rcgen::CertificateParams::default();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    params.serialize_request(&key).expect("csr").der().to_vec()
 }
 
 /// A PKCS#10 CSR asking for `cn`, plus the key that signed it. The one place

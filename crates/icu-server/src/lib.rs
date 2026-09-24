@@ -376,25 +376,33 @@ async fn housekeeping(server: Arc<Server>) {
 }
 
 /// Rotates the server leaf once less than `min(30, validity / 3)` (at least
-/// one) days are
-/// left; warns about the CA, which cannot be renewed without re-enrolling
-/// everyone (`deploy/README.md`).
+/// one) days are left, and re-issues the CA certificate under the same key a
+/// year (at most a third of its validity) before it expires. A certificate
+/// that does not parse counts as due.
 async fn check_cert_expiry(server: Arc<Server>) {
     const WARN_DAYS: i64 = 30;
+    const CA_RENEW_DAYS: i64 = 365;
     let (leaf_left, ca_left) = {
         let ca = server.ca.read().await;
         (
-            ca::leaf_days_left(ca.server_der()),
-            ca::leaf_days_left(ca.ca_der()),
+            ca::leaf_days_left_checked(ca.server_der()),
+            ca::leaf_days_left_checked(ca.ca_der()),
         )
     };
-    if ca_left < WARN_DAYS {
-        tracing::warn!(days_left = ca_left, "the CA expires soon");
+    let ca_threshold = CA_RENEW_DAYS
+        .min(i64::from(server.config.tls.ca_validity_days) / 3)
+        .max(1);
+    if ca_left.is_none_or(|left| left < ca_threshold) {
+        tracing::warn!(days_left = ?ca_left, "the CA certificate expires soon, renewing");
+        match admin::renew_ca(&server).await {
+            Ok(()) => tracing::info!("CA certificate renewed under the same key"),
+            Err(e) => tracing::error!(error = %e, "automatic CA certificate renewal failed"),
+        }
     }
     let threshold = WARN_DAYS.min(i64::from(server.config.tls.server_validity_days) / 3).max(1);
-    if leaf_left < threshold {
+    if leaf_left.is_none_or(|left| left < threshold) {
         tracing::warn!(
-            days_left = leaf_left,
+            days_left = ?leaf_left,
             "server certificate expires soon, rotating"
         );
         match admin::rotate_server_cert(&server).await {
