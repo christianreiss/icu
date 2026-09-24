@@ -62,7 +62,7 @@ video_kbit_s = 400
 enroll_per_ip_per_min = 5
 enroll_global_per_min = 20
 
-[tls]
+[tls]                                # jeweils mindestens 1 Tag
 ca_validity_days = 3650
 client_validity_days = 365
 server_validity_days = 365
