@@ -1000,6 +1000,224 @@ pub fn rail_button(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool 
     resp.clicked()
 }
 
+/// Height of a [`nav_item`].
+const NAV_H: f32 = 34.0;
+
+/// One entry of the settings window's sidebar: icon and label side by side
+/// at body size, full width of the sidebar. The active entry gets the accent
+/// tint the header's toggled icon buttons use, so "where am I" reads the
+/// same everywhere.
+pub fn nav_item(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
+    let tok = theme::tokens(ui.visuals());
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), NAV_H), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let (fill, color) = if active {
+            (tok.accent_tint, tok.accent)
+        } else if resp.hovered() {
+            (tok.hover_overlay, ui.visuals().text_color())
+        } else {
+            (Color32::TRANSPARENT, tok.muted_text)
+        };
+        painter.rect_filled(rect, CornerRadius::same(R_CTRL), fill);
+        painter.text(
+            egui::pos2(rect.left() + 20.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            FontId::new(17.0, egui::FontFamily::Proportional),
+            color,
+        );
+        let font = if active {
+            FontId::new(13.5, super::fonts::semibold())
+        } else {
+            FontId::new(13.5, egui::FontFamily::Proportional)
+        };
+        painter.text(
+            egui::pos2(rect.left() + 38.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            font,
+            if active {
+                ui.visuals().text_color()
+            } else {
+                color
+            },
+        );
+    }
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.clicked()
+}
+
+/// The top of a settings page: its name as a heading, one plain sentence
+/// on what lives here, and optional actions right-aligned beside the title.
+pub fn page_header<R>(
+    ui: &mut Ui,
+    title: &str,
+    description: &str,
+    actions: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let tok = theme::tokens(ui.visuals());
+    let result = ui
+        .horizontal(|ui| {
+            ui.label(RichText::new(title).text_style(egui::TextStyle::Heading));
+            rtl(ui, 30.0, actions)
+        })
+        .inner;
+    ui.add_space(2.0);
+    ui.label(RichText::new(description).size(12.5).color(tok.muted_text));
+    ui.add_space(16.0);
+    result
+}
+
+/// Opens the expert part of a [`group_card`]: a divider and a small
+/// "Erweitert" caption, so a row that only shows in expert mode is visibly
+/// set apart from the everyday ones above it. The first row after it takes
+/// `divider: false`.
+pub fn advanced_caption(ui: &mut Ui) {
+    let tok = theme::tokens(ui.visuals());
+    ui.separator();
+    Frame::new()
+        .inner_margin(egui::Margin {
+            left: 12,
+            right: 12,
+            top: 9,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("{}  ERWEITERT", icon::WRENCH))
+                    .font(FontId::new(10.5, super::fonts::semibold()))
+                    .color(tok.dim_text),
+            );
+        });
+}
+
+/// What a [`badge`] says about someone, which picks its color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgeKind {
+    /// Neutral fact ("du").
+    Neutral,
+    /// A role worth noticing ("Admin").
+    Accent,
+    /// Something is wrong or restricted ("Gesperrt").
+    Danger,
+    /// Waiting on somebody ("Eingeladen").
+    Pending,
+}
+
+/// A small rounded label for a status or role, in proportional type — the
+/// word-sized sibling of the monospace value [`chip`].
+pub fn badge(ui: &mut Ui, text: &str, kind: BadgeKind) -> egui::Response {
+    let tok = theme::tokens(ui.visuals());
+    let (fill, border, color) = match kind {
+        BadgeKind::Neutral => (
+            ui.visuals().extreme_bg_color,
+            ui.visuals().widgets.inactive.bg_stroke.color,
+            tok.muted_text,
+        ),
+        BadgeKind::Accent => (tok.accent_tint, tok.accent.gamma_multiply(0.35), tok.accent),
+        BadgeKind::Danger => (tok.error_tint, tok.error.gamma_multiply(0.35), tok.error),
+        BadgeKind::Pending => (
+            tok.warning_tint,
+            tok.connecting.gamma_multiply(0.35),
+            tok.connecting,
+        ),
+    };
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        FontId::new(11.0, super::fonts::semibold()),
+        color,
+    );
+    let size = egui::vec2(galley.size().x + 14.0, galley.size().y + 6.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(R_CHIP), fill);
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(R_CHIP),
+            Stroke::new(1.0, border),
+            StrokeKind::Inside,
+        );
+        painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+    }
+    response
+}
+
+/// A quiet square button with three dots, for a row's overflow menu.
+/// Painted rather than taken from Phosphor: every "⋯" glyph it has sits on
+/// a codepoint Inter also fills, and Inter comes first in the chain.
+pub fn more_button(ui: &mut Ui) -> egui::Response {
+    let tok = theme::tokens(ui.visuals());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+        let (fill, color) = if open {
+            (tok.accent_tint, tok.accent)
+        } else if response.hovered() {
+            (tok.hover_overlay, ui.visuals().text_color())
+        } else {
+            (Color32::TRANSPARENT, tok.muted_text)
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, CornerRadius::same(R_CTRL), fill);
+        for dx in [-5.5, 0.0, 5.5] {
+            painter.circle_filled(rect.center() + egui::vec2(dx, 0.0), 1.8, color);
+        }
+    }
+    response
+}
+
+/// A small disclosure triangle, pointing right when closed and down when
+/// open — painted for the same reason as [`more_button`].
+pub fn disclosure(ui: &mut Ui, open: bool, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+    let c = rect.center();
+    let points = if open {
+        vec![
+            c + egui::vec2(-4.0, -2.0),
+            c + egui::vec2(4.0, -2.0),
+            c + egui::vec2(0.0, 3.0),
+        ]
+    } else {
+        vec![
+            c + egui::vec2(-2.0, -4.0),
+            c + egui::vec2(3.0, 0.0),
+            c + egui::vec2(-2.0, 4.0),
+        ]
+    };
+    ui.painter()
+        .add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+}
+
+/// One entry of a popup menu: icon and label, quiet until hovered.
+/// `danger` paints it in the error color for the destructive entry.
+pub fn menu_item(ui: &mut Ui, glyph: &str, label: &str, danger: bool) -> egui::Response {
+    let tok = theme::tokens(ui.visuals());
+    let color = if danger {
+        tok.error
+    } else {
+        ui.visuals().text_color()
+    };
+    ui.add(
+        egui::Button::new(RichText::new(caption(glyph, label)).size(13.0).color(color))
+            .frame(false)
+            .min_size(egui::vec2(0.0, 28.0)),
+    )
+}
+
+/// A small presence dot at the lower right of an [`avatar`] drawn into
+/// `avatar_rect`, ringed in the card color so it reads on any fill.
+pub fn presence_dot(ui: &Ui, avatar_rect: egui::Rect, color: Color32) {
+    let center = avatar_rect.right_bottom() - egui::vec2(7.0, 7.0);
+    let painter = ui.painter();
+    painter.circle_filled(center, 5.5, ui.visuals().faint_bg_color);
+    painter.circle_filled(center, 4.0, color);
+}
+
 // ---------------------------------------------------------------------------
 // Settings layout
 // ---------------------------------------------------------------------------

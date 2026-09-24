@@ -817,8 +817,8 @@ impl App {
             egui::ViewportId::from_hash_of("icu-settings"),
             egui::ViewportBuilder::default()
                 .with_title("ICU — Einstellungen")
-                .with_inner_size([640.0, 580.0])
-                .with_min_inner_size([520.0, 440.0])
+                .with_inner_size([820.0, 640.0])
+                .with_min_inner_size([640.0, 480.0])
                 .with_resizable(true),
             |vctx, _class| {
                 egui::CentralPanel::default().show(vctx, |ui| {
@@ -1631,7 +1631,7 @@ impl eframe::App for EnrollApp {
                             RichText::new(format!(
                                 "{}  Noch keine Einladung? Frag die Person, die den \
                                  Server betreibt.",
-                                icon::INFO
+                                icon::QUESTION
                             ))
                             .size(12.0)
                             .color(tok.dim_text),

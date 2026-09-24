@@ -3,7 +3,6 @@
 //! Every change is applied at once through `Command::UpdateSettings`.
 
 use std::{
-    collections::HashMap,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
@@ -29,10 +28,15 @@ const FIELD_W: f32 = 150.0;
 /// Validity choices for an invite; the last is the server's cap.
 const INVITE_TTLS: [(u64, &str); 4] = [
     (60 * 60, "1 Stunde"),
-    (icu_proto::limits::INVITE_TTL_S, "24 Stunden"),
+    (icu_proto::limits::INVITE_TTL_S, "1 Tag"),
     (3 * 24 * 60 * 60, "3 Tage"),
     (icu_proto::limits::MAX_INVITE_TTL_S, "7 Tage"),
 ];
+/// Width of the settings sidebar.
+const NAV_W: f32 = 184.0;
+/// Content column cap: cards wider than this only put more empty space
+/// between a label and its control.
+const CONTENT_MAX_W: f32 = 600.0;
 /// One square of the overlay-position picker.
 const CORNER_SWATCH: f32 = 46.0;
 /// Gap between the picker's squares, and the wider gap before the two
@@ -105,10 +109,20 @@ pub struct SettingsView {
     paths: Paths,
     diagnose: DiagnoseCache,
     export_status: Option<String>,
-    /// Revoke is destructive: first click starts a ~3s confirm window
-    /// (in-row, no modal per §10), second click within it actually sends
-    /// `Command::RevokeUser`.
-    confirm_revoke: HashMap<UserId, Instant>,
+    /// Revoke is destructive: "Entfernen…" in a member's menu swaps that
+    /// row's right side for an inline confirmation (no modal per §10); only
+    /// its "Entfernen" sends `Command::RevokeUser`.
+    confirm_revoke: Option<UserId>,
+    /// The invite form above the member list is open.
+    invite_open: bool,
+    /// An invite was minted while the form was open; show its result there.
+    fresh_invite: bool,
+    /// The removed-accounts section is expanded.
+    show_removed: bool,
+    /// When the member list was last asked for. The Nutzer tab re-asks on
+    /// its own: a request sent while the connection is down is dropped, and
+    /// online status goes stale while the tab stays open.
+    users_requested: Option<Instant>,
     /// Logging out is destructive too: same two-click window as revoke.
     confirm_logout: Option<Instant>,
     /// Set once the user confirmed logging out. `App` closes the window;
@@ -161,13 +175,17 @@ impl SettingsView {
             seen_invite: None,
             hotkey_backend,
             show_portal_hint: true,
-            tab: Tab::Audio,
+            tab: Tab::General,
             expanded_bindings: std::collections::HashSet::new(),
             stats,
             paths,
             diagnose: DiagnoseCache::default(),
             export_status: None,
-            confirm_revoke: HashMap::new(),
+            confirm_revoke: None,
+            invite_open: false,
+            fresh_invite: false,
+            show_removed: false,
+            users_requested: None,
             confirm_logout: None,
             logout_requested: false,
             debug_window_open: false,
@@ -202,59 +220,83 @@ impl SettingsView {
         let tab_before = self.tab;
 
         let mut tabs = vec![
-            (Tab::Audio, icon::SLIDERS, "Audio"),
-            (Tab::Hotkeys, icon::COMMAND, "Hotkeys"),
-            (Tab::Camera, icon::VIDEO_CAMERA, "Kamera"),
             (Tab::General, icon::GEAR_FINE, "Allgemein"),
-            (Tab::About, icon::QUESTION, "Über"),
+            (Tab::Audio, icon::MICROPHONE, "Audio"),
+            (Tab::Hotkeys, icon::COMMAND, "Tastenkürzel"),
+            (Tab::Camera, icon::VIDEO_CAMERA, "Kamera"),
+            (Tab::About, icon::QUESTION, "Über ICU"),
         ];
         if state.is_admin {
-            tabs.insert(3, (Tab::Users, icon::USERS_THREE, "Nutzer"));
+            tabs.insert(4, (Tab::Users, icon::USERS_THREE, "Nutzer"));
         }
 
-        egui::Panel::left("settings_rail")
+        egui::Panel::left("settings_nav")
             .resizable(false)
-            // 64px buttons + 3px frame inset each side + the panel's own
-            // 8px side margins = 86px; 72px clipped the rail frame's right
-            // edge and rounded corner.
-            .default_size(88.0)
-            .show(ui, |ui| {
-                ui.add_space(4.0);
+            .exact_size(NAV_W)
+            .frame(
                 egui::Frame::new()
                     .fill(ui.visuals().extreme_bg_color)
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        ui.visuals().widgets.inactive.bg_stroke.color,
-                    ))
-                    .corner_radius(egui::CornerRadius::same(theme::R_CARD))
-                    .inner_margin(3)
-                    .show(ui, |ui| {
-                        for (tab, glyph, label) in tabs {
-                            if widgets::rail_button(ui, glyph, label, self.tab == tab) {
-                                self.tab = tab;
-                            }
-                            ui.add_space(3.0);
-                        }
+                    .inner_margin(egui::Margin::symmetric(10, 12)),
+            )
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for (tab, glyph, label) in tabs {
+                    if widgets::nav_item(ui, glyph, label, self.tab == tab) {
+                        self.tab = tab;
+                    }
+                }
+                // The expert switch sits at the foot of the sidebar: it
+                // changes every page, so it belongs to none of them.
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    let tok = theme::tokens(ui.visuals());
+                    ui.label(
+                        RichText::new("Zeigt technische Einstellungen und Diagnose.")
+                            .size(11.0)
+                            .color(tok.dim_text),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Erweitert").size(13.0));
+                        widgets::rtl(ui, 24.0, |ui| {
+                            widgets::toggle(ui, &mut self.draft.ui.show_advanced)
+                                .on_hover_text("Erweiterte Einstellungen anzeigen")
+                        });
                     });
+                    ui.add_space(4.0);
+                    ui.separator();
+                });
             });
 
         if self.tab != tab_before {
             match self.tab {
-                Tab::Users => cmds.push(Command::RequestUserList),
+                Tab::Users => self.users_requested = None,
                 #[cfg(feature = "camera")]
                 Tab::Camera => self.cameras_stale = true,
                 _ => {}
             }
         }
 
-        egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
-            Tab::Audio => self.audio_tab(ui, state),
-            Tab::Hotkeys => self.hotkeys_tab(ui),
-            Tab::Camera => self.camera_tab(ui, state),
-            Tab::General => self.general_tab(ui, state, &mut cmds),
-            Tab::Users => self.users_tab(ui, state, &mut cmds),
-            Tab::About => self.about_tab(ui, state),
-        });
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: 22,
+                        right: 22,
+                        top: 18,
+                        bottom: 24,
+                    })
+                    .show(ui, |ui| {
+                        ui.set_max_width(ui.available_width().min(CONTENT_MAX_W));
+                        match self.tab {
+                            Tab::Audio => self.audio_tab(ui, state),
+                            Tab::Hotkeys => self.hotkeys_tab(ui),
+                            Tab::Camera => self.camera_tab(ui, state),
+                            Tab::General => self.general_tab(ui, state, &mut cmds),
+                            Tab::Users => self.users_tab(ui, state, &mut cmds),
+                            Tab::About => self.about_tab(ui, state),
+                        }
+                    });
+            });
 
         if self.draft != before {
             cmds.push(Command::UpdateSettings(Box::new(self.draft.clone())));
@@ -263,6 +305,13 @@ impl SettingsView {
     }
 
     fn audio_tab(&mut self, ui: &mut Ui, state: &AppState) {
+        let adv = self.draft.ui.show_advanced;
+        widgets::page_header(
+            ui,
+            "Audio",
+            "Mikrofon, Lautsprecher und wie deine Stimme bei den anderen ankommt.",
+            |_| {},
+        );
         let inputs: Vec<_> = state
             .devices
             .iter()
@@ -275,93 +324,110 @@ impl SettingsView {
             .collect();
 
         widgets::group_card(ui, "Geräte", |ui| {
-            device_combo(ui, "Mikrofon", &mut self.draft.audio.input_device, &inputs);
+            device_combo(ui, false, "Mikrofon", &mut self.draft.audio.input_device, &inputs);
             device_combo(
                 ui,
-                "Wiedergabe",
+                true,
+                "Lautsprecher",
                 &mut self.draft.audio.output_device,
                 &outputs,
             );
-        });
-
-        widgets::group_card(ui, "Verarbeitung", |ui| {
-            widgets::setting_row(ui, false, "Modus", None, |ui| {
-                widgets::segmented(
-                    ui,
-                    &mut self.draft.audio.mode,
-                    &[
-                        (ModeSetting::Ptt, "Push-to-Talk"),
-                        (ModeSetting::Vad, "Sprachaktivierung"),
-                    ],
-                )
-            });
-            ui.add_enabled_ui(!self.draft.audio.vad_auto, |ui| {
-                widgets::slider_row(
-                    ui,
-                    true,
-                    "VAD-Schwelle",
-                    &mut self.draft.audio.vad_threshold,
-                    0.0..=1.0,
-                    "",
-                )
-            });
-            ui.add_enabled_ui(self.draft.audio.denoise, |ui| {
-                widgets::setting_row(
-                    ui,
-                    true,
-                    "VAD automatisch",
-                    Some("Kalibriert die Schwelle laufend auf den Umgebungspegel; benötigt Rauschunterdrückung."),
-                    |ui| widgets::toggle(ui, &mut self.draft.audio.vad_auto),
-                )
-            });
-            if self.draft.audio.vad_auto {
-                widgets::setting_row(ui, true, "Aktuelle Schwelle", None, |ui| {
-                    widgets::chip(ui, &format!("{:.2}", state.vad_threshold), 0.0)
-                });
-            }
             widgets::slider_row(
                 ui,
                 true,
-                "Verstärkung",
-                &mut self.draft.audio.gain_db,
-                -20.0..=20.0,
-                " dB",
-            );
-            let mut release = self.draft.audio.release_ms as f32;
-            if widgets::slider_row(ui, true, "PTT-Nachlauf", &mut release, 0.0..=1000.0, " ms")
-                .changed()
-            {
-                self.draft.audio.release_ms = release as u32;
-            }
-            let mut hangover = self.draft.audio.hangover_ms as f32;
-            if widgets::slider_row(ui, true, "VAD-Nachlauf", &mut hangover, 0.0..=3000.0, " ms")
-                .changed()
-            {
-                self.draft.audio.hangover_ms = hangover as u32;
-            }
-            widgets::slider_row(
-                ui,
-                true,
-                "Wiedergabe",
+                "Lautstärke",
                 &mut self.draft.audio.output_volume,
                 0.0..=200.0,
                 " %",
             );
-            widgets::setting_row(ui, true, "Opus-Frame", None, |ui| {
-                widgets::segmented(
+        });
+
+        widgets::group_card(ui, "Sprechen", |ui| {
+            widgets::setting_row(
+                ui,
+                false,
+                "Senden",
+                Some(match self.draft.audio.mode {
+                    ModeSetting::Ptt => "Du bist nur zu hören, solange du die Taste hältst.",
+                    ModeSetting::Vad => "Du bist automatisch zu hören, sobald du sprichst.",
+                }),
+                |ui| {
+                    widgets::segmented(
+                        ui,
+                        &mut self.draft.audio.mode,
+                        &[
+                            (ModeSetting::Ptt, "Taste halten"),
+                            (ModeSetting::Vad, "Automatisch"),
+                        ],
+                    )
+                },
+            );
+            if self.draft.audio.mode == ModeSetting::Vad {
+                ui.add_enabled_ui(self.draft.audio.denoise, |ui| {
+                    widgets::setting_row(
+                        ui,
+                        true,
+                        "Schwelle automatisch",
+                        Some("Passt sich laufend an deine Umgebung an. Braucht die Rauschunterdrückung."),
+                        |ui| widgets::toggle(ui, &mut self.draft.audio.vad_auto),
+                    )
+                });
+                if !self.draft.audio.vad_auto {
+                    widgets::slider_row(
+                        ui,
+                        true,
+                        "Schwelle",
+                        &mut self.draft.audio.vad_threshold,
+                        0.0..=1.0,
+                        "",
+                    );
+                }
+            }
+            if adv {
+                widgets::advanced_caption(ui);
+                let mut first = true;
+                let mut divider = || !std::mem::take(&mut first);
+                if self.draft.audio.vad_auto {
+                    widgets::setting_row(ui, divider(), "Aktuelle Schwelle", None, |ui| {
+                        widgets::chip(ui, &format!("{:.2}", state.vad_threshold), 0.0)
+                    });
+                }
+                widgets::slider_row(
                     ui,
-                    &mut self.draft.audio.frame_ms,
-                    &[(20u8, "20 ms"), (10u8, "10 ms")],
-                )
-            });
-            widgets::setting_row(ui, true, "Rauschunterdrückung", Some("RNNoise"), |ui| {
-                widgets::toggle(ui, &mut self.draft.audio.denoise)
-            });
+                    divider(),
+                    "Verstärkung",
+                    &mut self.draft.audio.gain_db,
+                    -20.0..=20.0,
+                    " dB",
+                );
+                let mut release = self.draft.audio.release_ms as f32;
+                if widgets::slider_row(ui, divider(), "PTT-Nachlauf", &mut release, 0.0..=1000.0, " ms")
+                    .changed()
+                {
+                    self.draft.audio.release_ms = release as u32;
+                }
+                let mut hangover = self.draft.audio.hangover_ms as f32;
+                if widgets::slider_row(ui, divider(), "VAD-Nachlauf", &mut hangover, 0.0..=3000.0, " ms")
+                    .changed()
+                {
+                    self.draft.audio.hangover_ms = hangover as u32;
+                }
+            }
+        });
+
+        widgets::group_card(ui, "Klang", |ui| {
+            widgets::setting_row(
+                ui,
+                false,
+                "Rauschunterdrückung",
+                Some("Filtert Tastatur, Lüfter und Hintergrundgeräusche heraus."),
+                |ui| widgets::toggle(ui, &mut self.draft.audio.denoise),
+            );
             widgets::setting_row(
                 ui,
                 true,
                 "Stimmoptimierung",
-                Some("Hochpass, Kompressor, Limiter – gleichmäßigere Lautstärke."),
+                Some("Gleicht leise und laute Stellen aus, damit du gleichmäßig klingst."),
                 |ui| widgets::toggle(ui, &mut self.draft.audio.voice_opt),
             );
             if self.draft.audio.voice_opt {
@@ -377,60 +443,75 @@ impl SettingsView {
                     )
                 });
             }
-            widgets::setting_row(
-                ui,
-                true,
-                "Echo-Unterdrückung",
-                Some(
-                    "Entfernt auch den eigenen Spielton aus dem gesendeten Signal (AEC3, ~9 ms Latenz).",
-                ),
-                |ui| widgets::toggle(ui, &mut self.draft.audio.aec),
-            );
-            let tok = theme::tokens(ui.visuals());
-            widgets::card_note(ui, |ui| {
-                if !state.aec_available {
-                    ui.label(
-                        RichText::new("Auf dieser Installation nicht verfügbar")
-                            .small()
-                            .color(tok.dim_text),
-                    );
-                } else if self.draft.audio.aec && !state.aec_reference {
-                    ui.label(
-                        RichText::new(
-                            "Keine Referenz vom Audio-Backend — Echo-Unterdrückung inaktiv",
-                        )
-                        .small()
-                        .color(tok.dim_text),
-                    );
-                } else if let (Some(erl), Some(erle)) =
-                    (state.aec_stats.erl_db, state.aec_stats.erle_db)
-                {
-                    let delay = state
-                        .aec_stats
-                        .delay_ms
-                        .map_or(String::new(), |d| format!(" · Delay {d} ms"));
-                    ui.label(
-                        RichText::new(format!("ERL {erl:.0} dB · ERLE {erle:.0} dB{delay}"))
-                            .monospace()
-                            .small(),
-                    );
-                    if state.aec_suspect {
-                        ui.label(
-                            RichText::new(
-                                "Echo erkannt, wird aber nicht entfernt — Referenzgerät prüfen",
-                            )
-                            .small(),
-                        );
-                    }
-                }
+            ui.add_enabled_ui(state.aec_available, |ui| {
+                widgets::setting_row(
+                    ui,
+                    true,
+                    "Echo-Unterdrückung",
+                    Some(if state.aec_available {
+                        "Verhindert, dass die anderen sich selbst hören, wenn du ohne Kopfhörer sprichst."
+                    } else {
+                        "Auf dieser Installation nicht verfügbar."
+                    }),
+                    |ui| widgets::toggle(ui, &mut self.draft.audio.aec),
+                )
             });
+            let tok = theme::tokens(ui.visuals());
+            if state.aec_available && self.draft.audio.aec {
+                if !state.aec_reference {
+                    widgets::card_note(ui, |ui| {
+                        ui.colored_label(
+                            tok.connecting,
+                            RichText::new(
+                                "Gerade wirkungslos: das Audiosystem liefert nicht, was du hörst.",
+                            )
+                            .size(11.5),
+                        );
+                    });
+                } else if state.aec_suspect {
+                    widgets::card_note(ui, |ui| {
+                        ui.colored_label(
+                            tok.connecting,
+                            RichText::new(
+                                "Echo erkannt, wird aber nicht entfernt — Lautsprecher-Auswahl prüfen.",
+                            )
+                            .size(11.5),
+                        );
+                    });
+                }
+            }
+            if adv {
+                widgets::advanced_caption(ui);
+                widgets::setting_row(
+                    ui,
+                    false,
+                    "Opus-Frame",
+                    Some("10 ms senkt die Latenz, kostet aber etwas Bandbreite."),
+                    |ui| {
+                        widgets::segmented(
+                            ui,
+                            &mut self.draft.audio.frame_ms,
+                            &[(20u8, "20 ms"), (10u8, "10 ms")],
+                        )
+                    },
+                );
+                if let (Some(erl), Some(erle)) = (state.aec_stats.erl_db, state.aec_stats.erle_db) {
+                    widgets::setting_row(ui, true, "Echo-Messwerte", None, |ui| {
+                        let delay = state
+                            .aec_stats
+                            .delay_ms
+                            .map_or(String::new(), |d| format!(" · {d} ms"));
+                        widgets::chip(ui, &format!("ERL {erl:.0} dB · ERLE {erle:.0} dB{delay}"), 0.0)
+                    });
+                }
+            }
         });
 
-        widgets::group_card(ui, "Töne", |ui| {
-            widgets::setting_row(ui, false, "Beitritt/Verlassen", None, |ui| {
+        widgets::group_card(ui, "Hinweistöne", |ui| {
+            widgets::setting_row(ui, false, "Jemand kommt oder geht", None, |ui| {
                 widgets::toggle(ui, &mut self.draft.audio.cue_join)
             });
-            widgets::setting_row(ui, true, "Sendebeginn/-ende", None, |ui| {
+            widgets::setting_row(ui, true, "Senden beginnt oder endet", None, |ui| {
                 widgets::toggle(ui, &mut self.draft.audio.cue_tx)
             });
             widgets::setting_row(ui, true, "Stummschalten", None, |ui| {
@@ -445,8 +526,8 @@ impl SettingsView {
     /// clear, and a settings window is exactly the thing people have open
     /// during a screen share.
     fn passport_card(&mut self, ui: &mut Ui, cmds: &mut Vec<Command>) {
-        widgets::group_card(ui, "Passport", |ui| {
-            widgets::setting_row(ui, false, "Auf ein anderes Gerät mitnehmen", None, |ui| {
+        widgets::group_card(ui, "Auf ein anderes Gerät mitnehmen", |ui| {
+            widgets::setting_row(ui, false, "Passport", None, |ui| {
                 let width = widgets::button_width(ui, icon::COPY, "Kopieren")
                     + 6.0
                     + widgets::button_width(ui, icon::EXPORT, "Speichern");
@@ -502,7 +583,12 @@ impl SettingsView {
                 );
             });
 
-            widgets::setting_row(ui, true, "Passport einspielen", None, |ui| {
+            if !self.draft.ui.show_advanced {
+                self.passport_status_note(ui);
+                return;
+            }
+            widgets::advanced_caption(ui);
+            widgets::setting_row(ui, false, "Passport einspielen", None, |ui| {
                 let width = widgets::button_width(ui, icon::MAGNIFYING_GLASS, "Prüfen");
                 widgets::row_group(ui, width, |ui| {
                     let clicked = ui
@@ -576,16 +662,21 @@ impl SettingsView {
             if edited {
                 self.import_preview = None;
             }
-            if let Some(status) = &self.passport_status {
-                widgets::card_note(ui, |ui| {
-                    ui.label(
-                        RichText::new(status)
-                            .size(11.5)
-                            .color(theme::tokens(ui.visuals()).dim_text),
-                    );
-                });
-            }
+            self.passport_status_note(ui);
         });
+    }
+
+    /// The outcome of the last passport copy, save or import, if any.
+    fn passport_status_note(&self, ui: &mut Ui) {
+        if let Some(status) = &self.passport_status {
+            widgets::card_note(ui, |ui| {
+                ui.label(
+                    RichText::new(status)
+                        .size(11.5)
+                        .color(theme::tokens(ui.visuals()).dim_text),
+                );
+            });
+        }
     }
 
     /// Deletes this device's identity and goes back to the invite window.
@@ -619,7 +710,7 @@ impl SettingsView {
                 ui.label(
                     RichText::new(
                         "Löscht Schlüssel und Zertifikat auf diesem Gerät. Zurück nur mit \
-                         deinem Passport oder einer neuen Einladung — vorher oben sichern.",
+                         deinem Passport oder einer neuen Einladung — sichere ihn vorher oben.",
                     )
                     .size(11.5)
                     .color(theme::tokens(ui.visuals()).dim_text),
@@ -668,76 +759,134 @@ impl SettingsView {
     }
 
     fn hotkeys_tab(&mut self, ui: &mut Ui) {
-        widgets::group_card(ui, "Backend", |ui| {
-            widgets::setting_row(ui, false, "Backend", None, |ui| {
-                widgets::segmented(
+        let adv = self.draft.ui.show_advanced;
+        widgets::page_header(
+            ui,
+            "Tastenkürzel",
+            "Sprechen und Stummschalten per Taste – auch wenn ICU im Hintergrund läuft.",
+            |_| {},
+        );
+        // `crate::hotkey::start` reports "portal", "evdev (n devices)" or
+        // "none"; the empty string means it was never started
+        // (`--no-hotkeys`).
+        match self.hotkey_backend.as_str() {
+            "" => {
+                widgets::banner(
                     ui,
-                    &mut self.draft.hotkeys.backend,
-                    &[
-                        (HotkeyBackend::Auto, "auto"),
-                        (HotkeyBackend::Portal, "Portal"),
-                        (HotkeyBackend::Evdev, "evdev"),
-                    ],
-                )
-            });
-            widgets::setting_row(ui, true, "Aktiv", None, |ui| {
-                let tok = theme::tokens(ui.visuals());
-                // `crate::hotkey::start` reports "portal", "evdev (n devices)"
-                // or "none"; the empty string means it was never started
-                // (`--no-hotkeys`).
-                let (color, text) = match self.hotkey_backend.as_str() {
-                    "" => (tok.connecting, "abgeschaltet"),
-                    "none" => (tok.error, "keiner"),
-                    backend => (tok.connected, backend),
-                };
-                widgets::status_pill(ui, color, text)
-            });
-        });
+                    widgets::BannerKind::Warning,
+                    "Tastenkürzel sind abgeschaltet",
+                    "ICU wurde ohne Tastenkürzel gestartet. Bedienen geht weiter über das Hauptfenster.",
+                    None::<fn()>,
+                );
+                ui.add_space(14.0);
+            }
+            "none" => {
+                widgets::banner(
+                    ui,
+                    widgets::BannerKind::Error,
+                    "Tastenkürzel funktionieren gerade nicht",
+                    "Das System hat keinen Weg angeboten, Tasten im Hintergrund zu lesen. \
+                     Unter „Erweitert“ lässt sich ein anderer Weg wählen.",
+                    None::<fn()>,
+                );
+                ui.add_space(14.0);
+            }
+            _ => {}
+        }
 
         widgets::group_card(ui, "Belegung", |ui| {
             binding_row(
                 ui,
                 false,
                 &mut self.expanded_bindings,
-                "PTT",
+                "Push-to-Talk",
                 &mut self.draft.hotkeys.ptt,
             );
             binding_row(
                 ui,
                 true,
                 &mut self.expanded_bindings,
-                "Mute",
+                "Stummschalten",
                 &mut self.draft.hotkeys.mute,
             );
             binding_row(
                 ui,
                 true,
                 &mut self.expanded_bindings,
-                "Deafen",
+                "Ton aus",
                 &mut self.draft.hotkeys.deafen,
             );
             binding_row(
                 ui,
                 true,
                 &mut self.expanded_bindings,
-                "PTT/VAD",
+                "Modus wechseln",
                 &mut self.draft.hotkeys.toggle_mode,
             );
+            widgets::card_note(ui, |ui| {
+                ui.label(
+                    RichText::new("Änderungen gelten ab dem nächsten Start von ICU.")
+                        .size(11.5)
+                        .color(theme::tokens(ui.visuals()).dim_text),
+                );
+            });
         });
 
-        widgets::banner(
-            ui,
-            widgets::BannerKind::Warning,
-            "evdev liest alle Tasten",
-            "evdev-Namen wie KEY_RIGHTCTRL, BTN_SIDE oder code:97; Portal-Trigger wie \
-             CTRL+SHIFT+F12. evdev braucht Gruppe input und liest technisch jeden \
-             Tastendruck mit (Keylogger-Aspekt). Änderungen gelten ab dem nächsten Start.",
-            None::<fn()>,
-        );
+        if adv {
+            widgets::group_card(ui, "Tasten lesen über", |ui| {
+                widgets::setting_row(ui, false, "Methode", None, |ui| {
+                    widgets::segmented(
+                        ui,
+                        &mut self.draft.hotkeys.backend,
+                        &[
+                            (HotkeyBackend::Auto, "Automatisch"),
+                            (HotkeyBackend::Portal, "Portal"),
+                            (HotkeyBackend::Evdev, "evdev"),
+                        ],
+                    )
+                });
+                widgets::setting_row(ui, true, "Aktiv", None, |ui| {
+                    let tok = theme::tokens(ui.visuals());
+                    let (color, text) = match self.hotkey_backend.as_str() {
+                        "" => (tok.connecting, "abgeschaltet"),
+                        "none" => (tok.error, "keiner"),
+                        backend => (tok.connected, backend),
+                    };
+                    widgets::status_pill(ui, color, text)
+                });
+                widgets::card_note(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Tastennamen: evdev wie KEY_RIGHTCTRL, BTN_SIDE oder code:97; \
+                             Portal-Trigger wie CTRL+SHIFT+F12.",
+                        )
+                        .size(11.5)
+                        .color(theme::tokens(ui.visuals()).dim_text),
+                    );
+                });
+            });
+        }
+        if adv || self.draft.hotkeys.backend == HotkeyBackend::Evdev {
+            widgets::banner(
+                ui,
+                widgets::BannerKind::Warning,
+                "evdev liest alle Tasten",
+                "evdev braucht die Gruppe input und liest technisch jeden Tastendruck mit, \
+                 nicht nur die hier belegten.",
+                None::<fn()>,
+            );
+        }
     }
 
     #[cfg_attr(not(feature = "camera"), allow(unused_variables))]
     fn camera_tab(&mut self, ui: &mut Ui, state: &AppState) {
+        let adv = self.draft.ui.show_advanced;
+        widgets::page_header(
+            ui,
+            "Kamera",
+            "Deine Kamera und die Video-Kacheln, die über anderen Fenstern schweben.",
+            |_| {},
+        );
         widgets::group_card(ui, "Kamera", |ui| {
             widgets::setting_row(ui, false, "Beim Start einschalten", None, |ui| {
                 widgets::toggle(ui, &mut self.draft.camera.enabled)
@@ -769,65 +918,76 @@ impl SettingsView {
             }
         });
 
-        widgets::group_card(ui, "Overlay", |ui| {
-            widgets::setting_row(ui, false, "Anzeigen", None, |ui| {
-                widgets::toggle(ui, &mut self.draft.overlay.enabled)
-            });
-            widgets::setting_row(ui, true, "Ecke", None, |ui| {
-                widgets::row_group(ui, CORNER_PICKER_W, |ui| {
-                    corner_picker(ui, &mut self.draft.overlay.corner)
+        widgets::group_card(ui, "Video-Overlay", |ui| {
+            widgets::setting_row(
+                ui,
+                false,
+                "Anzeigen",
+                Some("Zeigt die Kameras der anderen als kleine Kacheln über allen Fenstern."),
+                |ui| widgets::toggle(ui, &mut self.draft.overlay.enabled),
+            );
+            ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {
+                widgets::setting_row(ui, true, "Position", None, |ui| {
+                    widgets::row_group(ui, CORNER_PICKER_W, |ui| {
+                        corner_picker(ui, &mut self.draft.overlay.corner)
+                    });
                 });
-            });
-            let edge = matches!(self.draft.overlay.corner, Corner::Top | Corner::Bottom);
-            widgets::setting_row(ui, true, "Ausrichtung", None, |ui| {
-                ui.add_enabled_ui(!edge, |ui| {
+                widgets::setting_row(ui, true, "Kachelgröße", None, |ui| {
                     widgets::segmented(
                         ui,
-                        &mut self.draft.overlay.expand,
+                        &mut self.draft.overlay.size,
                         &[
-                            (Expand::Vertical, "vertikal"),
-                            (Expand::Horizontal, "horizontal"),
+                            (TileSize::Small, "Klein"),
+                            (TileSize::Medium, "Mittel"),
+                            (TileSize::Large, "Groß"),
                         ],
                     )
-                })
-                .inner
-            });
-            widgets::setting_row(ui, true, "Abstand", None, |ui| {
-                const DRAG_W: f32 = 62.0;
-                widgets::row_group(ui, DRAG_W * 2.0 + 6.0, |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    for (axis, prefix) in [(0, "x "), (1, "y ")] {
-                        ui.add_sized(
-                            [DRAG_W, 24.0],
-                            egui::DragValue::new(&mut self.draft.overlay.offset[axis])
-                                .prefix(prefix)
-                                .range(0..=2000),
-                        );
-                    }
                 });
-            });
-            widgets::setting_row(ui, true, "Kachelgröße", None, |ui| {
-                widgets::segmented(
-                    ui,
-                    &mut self.draft.overlay.size,
-                    &[
-                        (TileSize::Small, "klein"),
-                        (TileSize::Medium, "mittel"),
-                        (TileSize::Large, "groß"),
-                    ],
-                )
-            });
-            widgets::setting_row(ui, true, "Stille Teilnehmer abdunkeln", None, |ui| {
-                widgets::toggle(ui, &mut self.draft.overlay.dim_non_speaking)
-            });
-            widgets::setting_row(ui, true, "Rahmen um sprechende Person", None, |ui| {
-                widgets::toggle(ui, &mut self.draft.overlay.speaking_frame)
-            });
-            widgets::setting_row(ui, true, "Rahmenfarbe", None, |ui| {
-                ui.add_enabled_ui(self.draft.overlay.speaking_frame, |ui| {
-                    ui.color_edit_button_srgb(&mut self.draft.overlay.frame_color)
-                })
-                .inner
+                widgets::setting_row(ui, true, "Sprechende Person umranden", None, |ui| {
+                    widgets::toggle(ui, &mut self.draft.overlay.speaking_frame)
+                });
+                if !adv {
+                    return;
+                }
+                widgets::advanced_caption(ui);
+                let edge = matches!(self.draft.overlay.corner, Corner::Top | Corner::Bottom);
+                widgets::setting_row(ui, false, "Anordnung", None, |ui| {
+                    ui.add_enabled_ui(!edge, |ui| {
+                        widgets::segmented(
+                            ui,
+                            &mut self.draft.overlay.expand,
+                            &[
+                                (Expand::Vertical, "Untereinander"),
+                                (Expand::Horizontal, "Nebeneinander"),
+                            ],
+                        )
+                    })
+                    .inner
+                });
+                widgets::setting_row(ui, true, "Abstand zum Rand", None, |ui| {
+                    const DRAG_W: f32 = 84.0;
+                    widgets::row_group(ui, DRAG_W * 2.0 + 6.0, |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        for (axis, prefix) in [(0, "x "), (1, "y ")] {
+                            ui.add_sized(
+                                [DRAG_W, 24.0],
+                                egui::DragValue::new(&mut self.draft.overlay.offset[axis])
+                                    .prefix(prefix)
+                                    .suffix(" px")
+                                    .range(0..=2000),
+                            );
+                        }
+                    });
+                });
+                widgets::setting_row(ui, true, "Stille Personen abdunkeln", None, |ui| {
+                    widgets::toggle(ui, &mut self.draft.overlay.dim_non_speaking)
+                });
+                widgets::setting_row(ui, true, "Rahmenfarbe", None, |ui| {
+                    ui.add_enabled_ui(self.draft.overlay.speaking_frame, |ui| {
+                        ui.color_edit_button_srgb(&mut self.draft.overlay.frame_color)
+                    })
+                    .inner
+                });
             });
         });
     }
@@ -843,9 +1003,16 @@ impl SettingsView {
             self.name_synced = current.to_string();
         }
 
-        widgets::group_card(ui, "Identität", |ui| {
+        let adv = self.draft.ui.show_advanced;
+        widgets::page_header(
+            ui,
+            "Allgemein",
+            "Dein Name, wie ICU aussieht und was beim Start passiert.",
+            |_| {},
+        );
+        widgets::group_card(ui, "Profil", |ui| {
             let editable = state.me.is_some() && !state.rename_pending;
-            widgets::setting_row(ui, false, "Anzeigename", None, |ui| {
+            widgets::setting_row(ui, false, "Anzeigename", Some("So sehen dich die anderen."), |ui| {
                 let width = FIELD_W + 6.0 + widgets::button_width(ui, icon::CHECK, "");
                 widgets::row_group(ui, width, |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -876,45 +1043,37 @@ impl SettingsView {
                     }
                 });
             });
-            widgets::card_note(ui, |ui| {
-                ui.label(
-                    RichText::new(
-                        "Der Name steht im Zertifikat. Eine Änderung stellt ein neues aus; \
-                         das alte bleibt bis zum Ablauf gültig.",
-                    )
-                    .size(11.5)
-                    .color(theme::tokens(ui.visuals()).dim_text),
-                );
-            });
             if let Some(err) = &state.name_error {
                 widgets::card_note(ui, |ui| {
                     ui.colored_label(theme::tokens(ui.visuals()).error, err);
                 });
             }
-            widgets::setting_row(ui, true, "Server", None, |ui| {
-                widgets::chip(ui, &state.server, 0.0)
-            });
-            widgets::setting_row(ui, true, "user_id", None, |ui| {
-                let id = state.me.as_ref().map(|m| m.user_id.to_string());
-                widgets::chip(ui, id.as_deref().unwrap_or("—"), 0.0)
-            });
-        });
-
-        self.passport_card(ui, cmds);
-        self.logout_card(ui);
-
-        widgets::group_card(ui, "Start und Fenster", |ui| {
-            widgets::setting_row(ui, false, "Minimiert starten", None, |ui| {
-                widgets::toggle(ui, &mut self.draft.ui.start_minimized)
-            });
-            widgets::setting_row(ui, true, "icu://-Links mit ICU öffnen", None, |ui| {
-                widgets::toggle(ui, &mut self.draft.ui.register_uri_handler)
-            });
+            if adv {
+                widgets::advanced_caption(ui);
+                widgets::card_note(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Der Name steht im Zertifikat. Eine Änderung stellt ein neues aus; \
+                             das alte bleibt bis zum Ablauf gültig.",
+                        )
+                        .size(11.5)
+                        .color(theme::tokens(ui.visuals()).dim_text),
+                    );
+                });
+                widgets::setting_row(ui, true, "Server", None, |ui| {
+                    widgets::chip(ui, &state.server, 0.0)
+                });
+                widgets::setting_row(ui, true, "Nutzer-ID", None, |ui| {
+                    let id = state.me.as_ref().map(|m| m.user_id.to_string());
+                    widgets::chip(ui, id.as_deref().unwrap_or("—"), 0.0)
+                });
+            }
         });
 
         widgets::group_card(ui, "Darstellung", |ui| {
             widgets::card_note(ui, |ui| {
-                widgets::ltr(ui, |ui| {
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     for (value, label) in
                         [("system", "System"), ("light", "Hell"), ("dark", "Dunkel")]
@@ -923,339 +1082,416 @@ impl SettingsView {
                     }
                 });
             });
+            widgets::setting_row(
+                ui,
+                true,
+                "Erweiterte Einstellungen",
+                Some("Zeigt überall zusätzlich die technischen Stellschrauben und die Diagnose."),
+                |ui| widgets::toggle(ui, &mut self.draft.ui.show_advanced),
+            );
         });
+
+        widgets::group_card(ui, "Start", |ui| {
+            widgets::setting_row(
+                ui,
+                false,
+                "Minimiert starten",
+                Some("ICU startet unsichtbar im Infobereich der Taskleiste."),
+                |ui| widgets::toggle(ui, &mut self.draft.ui.start_minimized),
+            );
+            widgets::setting_row(
+                ui,
+                true,
+                "Einladungslinks mit ICU öffnen",
+                Some("Ein Klick auf einen icu://-Link öffnet direkt ICU."),
+                |ui| widgets::toggle(ui, &mut self.draft.ui.register_uri_handler),
+            );
+        });
+
+        self.passport_card(ui, cmds);
+        self.logout_card(ui);
     }
 
     /// Admin-only "Nutzer" tab: inviting, and managing who is already in
     /// (`ControlMsg::UserListRequest`/`AdminSetRole`/`AdminSetDisabled`/
     /// `AdminRevokeUser`, `PROTOCOL.md` §2.2).
     fn users_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
-        self.invite_card(ui, state, cmds);
-
-        let me = state.me.as_ref().map(|m| m.user_id);
-        let (removed, mut members): (Vec<_>, Vec<_>) =
-            state.user_list.iter().partition(|u| u.revoked);
-        // You first, then admins, then everyone else; open invitations last.
-        members.sort_by_key(|u| {
-            (
-                Some(u.user_id) != me,
-                u.pending,
-                !u.is_admin,
-                u.name.to_lowercase(),
-            )
-        });
-        let title = if members.is_empty() {
-            "Mitglieder".to_string()
-        } else {
-            format!("Mitglieder ({})", members.len())
-        };
-        widgets::group_card(ui, &title, |ui| {
-            widgets::card_note(ui, |ui| {
-                let tok = theme::tokens(ui.visuals());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(
-                            "Admins dürfen einladen und Mitglieder verwalten. Gesperrte \
-                             Mitglieder können sich nicht verbinden, bis du sie entsperrst.",
-                        )
-                        .size(11.5)
-                        .color(tok.dim_text),
-                    );
-                    widgets::rtl(ui, 28.0, |ui| {
-                        if widgets::button(
-                            ui,
-                            widgets::ButtonKind::Neutral,
-                            icon::ARROWS_CLOCKWISE,
-                            "",
-                        )
-                        .on_hover_text("Liste neu laden")
-                        .clicked()
-                        {
-                            cmds.push(Command::RequestUserList);
-                        }
-                    });
-                });
-            });
-            if let Some(err) = &state.user_action_error {
-                widgets::card_note(ui, |ui| {
-                    ui.colored_label(theme::tokens(ui.visuals()).error, err);
-                });
-            }
-            if members.is_empty() {
-                ui.separator();
-                widgets::card_note(ui, |ui| {
-                    ui.label(
-                        RichText::new("Liste wird geladen …")
-                            .color(theme::tokens(ui.visuals()).dim_text),
-                    );
-                });
-            }
-            for user in members {
-                self.member_row(ui, user, Some(user.user_id) == me, cmds);
-            }
-        });
-
-        if !removed.is_empty() {
-            egui::CollapsingHeader::new(theme::caps_text(&format!(
-                "Entfernte Zugänge ({})",
-                removed.len()
-            )))
-            .id_salt("removed-users")
-            .default_open(false)
-            .show(ui, |ui| {
-                let tok = theme::tokens(ui.visuals());
-                ui.label(
-                    RichText::new(
-                        "Diese Zugänge wurden endgültig entfernt. Wer wieder dazukommen soll, \
-                         braucht eine neue Einladung.",
-                    )
-                    .size(11.5)
-                    .color(tok.dim_text),
-                );
-                ui.add_space(4.0);
-                let mut names: Vec<_> = removed.iter().map(|u| u.name.as_str()).collect();
-                names.sort_by_key(|n| n.to_lowercase());
-                ui.label(RichText::new(names.join(", ")).color(tok.muted_text));
-            });
-        }
-    }
-
-    /// One member: avatar, name, a plain-words status line, and the actions
-    /// that make sense for them.
-    fn member_row(
-        &mut self,
-        ui: &mut Ui,
-        user: &icu_proto::UserSummary,
-        is_self: bool,
-        cmds: &mut Vec<Command>,
-    ) {
-        ui.separator();
-        let tok = theme::tokens(ui.visuals());
-        let confirming = self
-            .confirm_revoke
-            .get(&user.user_id)
-            .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
-        if confirming {
-            // Let the armed button fall back on its own after 3 s.
-            ui.ctx().request_repaint_after(Duration::from_millis(250));
-        }
-        egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(12, 8))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    widgets::avatar(ui, &user.name, user.user_id, false, 28.0, None);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 1.0;
-                        let name = if is_self {
-                            format!("{} (du)", user.name)
-                        } else {
-                            user.name.clone()
-                        };
-                        ui.label(RichText::new(name).size(13.5));
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            let small = |t: &str, c| RichText::new(t).size(11.5).color(c);
-                            if user.pending {
-                                ui.label(small("Einladung noch nicht eingelöst", tok.connecting));
-                            } else if user.online {
-                                ui.label(small("●", tok.connected));
-                                ui.label(small("online", tok.muted_text));
-                            } else {
-                                ui.label(small("offline", tok.dim_text));
-                            }
-                            if user.is_admin {
-                                ui.label(small("· Admin", tok.muted_text));
-                            }
-                            if user.disabled {
-                                ui.label(small("· gesperrt", tok.error));
-                            }
-                        });
-                    });
-                    widgets::rtl(ui, 30.0, |ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        if is_self {
-                            ui.label(RichText::new("Das bist du").size(11.5).color(tok.dim_text));
-                            return;
-                        }
-                        // Right to left: the irreversible action sits at the
-                        // edge, away from the everyday ones.
-                        let remove_label = match (confirming, user.pending) {
-                            (true, _) => "Wirklich?",
-                            (false, true) => "Zurückziehen",
-                            (false, false) => "Entfernen",
-                        };
-                        let hover = if user.pending {
-                            "Einladung ungültig machen"
-                        } else {
-                            "Zugang endgültig entfernen – lässt sich nicht rückgängig machen"
-                        };
-                        if widgets::button(
-                            ui,
-                            widgets::ButtonKind::Danger,
-                            icon::TRASH,
-                            remove_label,
-                        )
-                        .on_hover_text(hover)
-                        .clicked()
-                        {
-                            if confirming {
-                                self.confirm_revoke.remove(&user.user_id);
-                                cmds.push(Command::RevokeUser {
-                                    user_id: user.user_id,
-                                });
-                                cmds.push(Command::RequestUserList);
-                            } else {
-                                self.confirm_revoke.insert(user.user_id, Instant::now());
-                            }
-                        }
-                        if user.pending {
-                            return;
-                        }
-                        let (glyph, label, hover) = if user.disabled {
-                            (icon::LOCK_OPEN, "Entsperren", "Darf sich wieder verbinden")
-                        } else {
-                            (
-                                icon::LOCK,
-                                "Sperren",
-                                "Darf sich vorerst nicht mehr verbinden",
-                            )
-                        };
-                        if widgets::button(ui, widgets::ButtonKind::Neutral, glyph, label)
-                            .on_hover_text(hover)
-                            .clicked()
-                        {
-                            cmds.push(Command::SetUserDisabled {
-                                user_id: user.user_id,
-                                disabled: !user.disabled,
-                            });
-                            cmds.push(Command::RequestUserList);
-                        }
-                        let (label, hover) = if user.is_admin {
-                            ("Kein Admin", "Admin-Rechte entziehen")
-                        } else {
-                            ("Admin", "Zum Admin machen: darf einladen und verwalten")
-                        };
-                        if widgets::button(ui, widgets::ButtonKind::Neutral, icon::CROWN, label)
-                            .on_hover_text(hover)
-                            .clicked()
-                        {
-                            cmds.push(Command::SetUserAdmin {
-                                user_id: user.user_id,
-                                is_admin: !user.is_admin,
-                            });
-                            cmds.push(Command::RequestUserList);
-                        }
-                    });
-                });
-            });
-    }
-
-    /// Minting an invitation: validity, an optional placeholder name, and
-    /// the text to hand over once the server has issued it.
-    fn invite_card(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
-        // A fresh invite adds a pending member; show it without a click.
+        // A fresh invite adds a pending entry; fetch the list without a click
+        // and keep the result in the open form.
         let issued = state.last_invite.as_ref().map(|(b, _)| b.as_str());
         if issued != self.seen_invite.as_deref() {
             self.seen_invite = issued.map(str::to_string);
             if issued.is_some() {
                 cmds.push(Command::RequestUserList);
+                self.fresh_invite = self.invite_open;
             }
         }
-        widgets::group_card(ui, "Neue Person einladen", |ui| {
-            widgets::card_note(ui, |ui| {
-                ui.label(
-                    RichText::new(
-                        "Erzeugt einen Einladungstext, der einmal eingelöst werden kann. \
-                         Schick ihn der Person – sie fügt ihn beim ersten Start von ICU ein \
-                         und wählt dort ihren Namen.",
-                    )
-                    .size(11.5)
-                    .color(theme::tokens(ui.visuals()).dim_text),
-                );
-            });
-            ui.separator();
-            widgets::setting_row(ui, false, "Gültig für", None, |ui| {
-                let current = INVITE_TTLS
-                    .iter()
-                    .find(|(s, _)| *s == self.invite_ttl_s)
-                    .map_or("", |(_, l)| l);
-                egui::ComboBox::from_id_salt("invite_ttl")
-                    .selected_text(current)
-                    .width(FIELD_W)
-                    .show_ui(ui, |ui| {
-                        for (secs, label) in INVITE_TTLS {
-                            ui.selectable_value(&mut self.invite_ttl_s, secs, label);
-                        }
-                    });
-            });
-            widgets::setting_row(ui, true, "Wer soll dazukommen?", None, |ui| {
-                let width = FIELD_W + 6.0 + widgets::button_width(ui, icon::TICKET, "Einladen");
-                widgets::row_group(ui, width, |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.invite_name)
-                            .desired_width(FIELD_W)
-                            .hint_text("Name (optional)"),
-                    );
-                    // The name is only a placeholder until the invited
-                    // person picks their own; empty means a generated one.
-                    let valid = self.invite_name.trim().is_empty()
-                        || icu_proto::validate_name(&icu_proto::normalize_name(&self.invite_name))
-                            .is_ok();
-                    if ui
-                        .add_enabled_ui(valid, |ui| {
-                            widgets::button(
-                                ui,
-                                widgets::ButtonKind::Primary,
-                                icon::TICKET,
-                                "Einladen",
-                            )
-                        })
-                        .inner
+
+        // Retry quickly while nothing has arrived, then keep online status
+        // fresh at a relaxed pace.
+        let every = if state.user_list.is_empty() {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(10)
+        };
+        if self.users_requested.is_none_or(|t| t.elapsed() >= every) {
+            self.users_requested = Some(Instant::now());
+            cmds.push(Command::RequestUserList);
+        }
+        ui.ctx().request_repaint_after(every);
+
+        let me = state.me.as_ref().map(|m| m.user_id);
+        let (removed, rest): (Vec<_>, Vec<_>) = state.user_list.iter().partition(|u| u.revoked);
+        let (mut pending, mut members): (Vec<_>, Vec<_>) =
+            rest.into_iter().partition(|u| u.pending);
+        // You first, then admins, then everyone else, each by name.
+        members.sort_by_key(|u| (Some(u.user_id) != me, !u.is_admin, u.name.to_lowercase()));
+        pending.sort_by_key(|u| std::cmp::Reverse(u.created.clone()));
+
+        widgets::page_header(
+            ui,
+            "Nutzer",
+            "Wer auf diesen Server darf. Nur Admins sehen diese Seite.",
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if self.invite_open {
+                    if widgets::button(ui, widgets::ButtonKind::Neutral, icon::X, "Schließen")
                         .clicked()
                     {
-                        cmds.push(Command::CreateInvite {
-                            name: icu_proto::normalize_name(&self.invite_name),
-                            ttl_s: self.invite_ttl_s,
-                        });
-                        self.invite_status = None;
+                        self.invite_open = false;
+                        self.fresh_invite = false;
                     }
-                });
+                } else if widgets::button(
+                    ui,
+                    widgets::ButtonKind::Primary,
+                    icon::USER_PLUS,
+                    "Einladen",
+                )
+                .clicked()
+                {
+                    self.invite_open = true;
+                    self.fresh_invite = false;
+                    self.invite_status = None;
+                }
+            },
+        );
+
+        if let Some(err) = &state.user_action_error {
+            widgets::banner(
+                ui,
+                widgets::BannerKind::Error,
+                "Das hat nicht geklappt",
+                err,
+                None::<fn()>,
+            );
+            ui.add_space(14.0);
+        }
+
+        if self.invite_open {
+            self.invite_card(ui, state, cmds);
+        }
+
+        if state.user_list.is_empty() {
+            widgets::group_card(ui, "Mitglieder", |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(12, 22))
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.spinner();
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("Liste wird geladen …")
+                                    .color(theme::tokens(ui.visuals()).dim_text),
+                            );
+                        });
+                    });
             });
-            if let Some(err) = &state.invite_error {
-                widgets::card_note(ui, |ui| {
-                    ui.colored_label(theme::tokens(ui.visuals()).error, err);
-                });
+            return;
+        }
+
+        widgets::group_card(ui, &format!("Mitglieder · {}", members.len()), |ui| {
+            for (i, user) in members.iter().enumerate() {
+                self.member_row(ui, i > 0, user, Some(user.user_id) == me, cmds);
             }
-            if let Some((bundle, expires)) = &state.last_invite {
+            if members.len() == 1 && pending.is_empty() {
                 ui.separator();
                 widgets::card_note(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Noch bist du allein hier. Über „Einladen“ holst du jemanden dazu.",
+                        )
+                        .size(11.5)
+                        .color(theme::tokens(ui.visuals()).dim_text),
+                    );
+                });
+            }
+        });
+
+        if !pending.is_empty() {
+            widgets::group_card(ui, &format!("Offene Einladungen · {}", pending.len()), |ui| {
+                for (i, user) in pending.iter().enumerate() {
+                    self.member_row(ui, i > 0, user, false, cmds);
+                }
+            });
+        }
+
+        if !removed.is_empty() {
+            let open = self.show_removed;
+            let header = ui
+                .horizontal(|ui| {
                     let tok = theme::tokens(ui.visuals());
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("Einmal einlösbar, gültig bis {expires}"))
+                    widgets::disclosure(ui, open, tok.muted_text);
+                    ui.label(theme::caps_text(&format!(
+                        "Entfernte Zugänge · {}",
+                        removed.len()
+                    )));
+                })
+                .response
+                .interact(egui::Sense::click());
+            if header.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if header.clicked() {
+                self.show_removed = !open;
+            }
+            ui.add_space(4.0);
+            if open {
+                let mut names: Vec<_> = removed.iter().map(|u| u.name.as_str()).collect();
+                names.sort_by_key(|n| n.to_lowercase());
+                egui::Frame::new()
+                    .fill(ui.visuals().faint_bg_color)
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        ui.visuals().widgets.inactive.bg_stroke.color,
+                    ))
+                    .corner_radius(egui::CornerRadius::same(theme::R_CARD))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        widgets::card_note(ui, |ui| {
+                            let tok = theme::tokens(ui.visuals());
+                            ui.label(
+                                RichText::new(
+                                    "Diese Zugänge sind endgültig entfernt. Wer wieder dazukommen \
+                                     soll, braucht eine neue Einladung.",
+                                )
                                 .size(11.5)
                                 .color(tok.dim_text),
-                        );
-                        widgets::rtl(ui, 30.0, |ui| {
+                            );
+                            ui.add_space(2.0);
+                            ui.label(RichText::new(names.join(", ")).color(tok.muted_text));
+                        });
+                    });
+            }
+        }
+    }
+
+    /// One person: avatar with presence dot, name with role badges, a quiet
+    /// status line, and everything you can do to them behind one "⋯" menu —
+    /// or, while a removal waits for its confirmation, that confirmation.
+    fn member_row(
+        &mut self,
+        ui: &mut Ui,
+        divider: bool,
+        user: &icu_proto::UserSummary,
+        is_self: bool,
+        cmds: &mut Vec<Command>,
+    ) {
+        if divider {
+            ui.separator();
+        }
+        let tok = theme::tokens(ui.visuals());
+        let confirming = self.confirm_revoke == Some(user.user_id);
+        let row = egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let avatar = widgets::avatar(ui, &user.name, user.user_id, false, 32.0, None);
+                    if !user.pending {
+                        let dot = if user.disabled {
+                            tok.error
+                        } else if user.online {
+                            tok.connected
+                        } else {
+                            tok.dim_text
+                        };
+                        widgets::presence_dot(ui, avatar.rect, dot);
+                    }
+                    ui.add_space(2.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                RichText::new(&user.name)
+                                    .font(egui::FontId::new(13.5, super::fonts::semibold()))
+                                    .color(ui.visuals().text_color()),
+                            );
+                            if is_self {
+                                widgets::badge(ui, "Du", widgets::BadgeKind::Neutral);
+                            }
+                            if user.is_admin {
+                                widgets::badge(ui, "Admin", widgets::BadgeKind::Accent)
+                                    .on_hover_text("Darf einladen und Mitglieder verwalten");
+                            }
+                            if user.disabled {
+                                widgets::badge(ui, "Gesperrt", widgets::BadgeKind::Danger)
+                                    .on_hover_text("Kann sich nicht verbinden, bis jemand entsperrt");
+                            }
+                        });
+                        let since = short_date(&user.created);
+                        let status = if user.pending {
+                            format!("Eingeladen am {since} · noch nicht eingelöst")
+                        } else if user.online {
+                            "Online".to_string()
+                        } else {
+                            format!("Offline · dabei seit {since}")
+                        };
+                        ui.label(RichText::new(status).size(11.5).color(tok.dim_text));
+                    });
+                    widgets::rtl(ui, 38.0, |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if is_self {
+                            return;
+                        }
+                        if confirming {
+                            let label = if user.pending {
+                                "Zurückziehen"
+                            } else {
+                                "Entfernen"
+                            };
+                            if widgets::button(ui, widgets::ButtonKind::Danger, icon::TRASH, label)
+                                .clicked()
+                            {
+                                self.confirm_revoke = None;
+                                cmds.push(Command::RevokeUser {
+                                    user_id: user.user_id,
+                                });
+                                cmds.push(Command::RequestUserList);
+                            }
+                            if widgets::button(ui, widgets::ButtonKind::Neutral, "", "Abbrechen")
+                                .clicked()
+                            {
+                                self.confirm_revoke = None;
+                            }
+                            ui.label(
+                                RichText::new(if user.pending {
+                                    "Einladung ungültig machen?"
+                                } else {
+                                    "Endgültig entfernen?"
+                                })
+                                .size(12.0)
+                                .color(tok.error),
+                            );
+                            return;
+                        }
+                        if user.pending {
+                            if widgets::button(ui, widgets::ButtonKind::Neutral, "", "Zurückziehen")
+                                .on_hover_text("Die Einladung wird ungültig")
+                                .clicked()
+                            {
+                                self.confirm_revoke = Some(user.user_id);
+                            }
+                            return;
+                        }
+                        let menu = widgets::more_button(ui).on_hover_text("Aktionen");
+                        egui::Popup::menu(&menu)
+                            .align(egui::RectAlign::BOTTOM_END)
+                            .gap(4.0)
+                            .show(|ui| {
+                                ui.set_min_width(210.0);
+                                let (glyph, label) = if user.is_admin {
+                                    (icon::CROWN_SIMPLE, "Admin-Rechte entziehen")
+                                } else {
+                                    (icon::CROWN, "Zum Admin machen")
+                                };
+                                if widgets::menu_item(ui, glyph, label, false).clicked() {
+                                    cmds.push(Command::SetUserAdmin {
+                                        user_id: user.user_id,
+                                        is_admin: !user.is_admin,
+                                    });
+                                    cmds.push(Command::RequestUserList);
+                                }
+                                let (glyph, label) = if user.disabled {
+                                    (icon::LOCK_OPEN, "Entsperren")
+                                } else {
+                                    (icon::LOCK, "Vorübergehend sperren")
+                                };
+                                if widgets::menu_item(ui, glyph, label, false).clicked() {
+                                    cmds.push(Command::SetUserDisabled {
+                                        user_id: user.user_id,
+                                        disabled: !user.disabled,
+                                    });
+                                    cmds.push(Command::RequestUserList);
+                                }
+                                ui.separator();
+                                if widgets::menu_item(ui, icon::TRASH, "Entfernen …", true)
+                                    .clicked()
+                                {
+                                    self.confirm_revoke = Some(user.user_id);
+                                }
+                            });
+                    });
+                });
+            });
+        if confirming {
+            // Tint the whole row so it is obvious which person is meant.
+            ui.painter().rect_filled(
+                row.response.rect,
+                egui::CornerRadius::ZERO,
+                tok.error_tint.gamma_multiply(0.5),
+            );
+        }
+    }
+
+    /// Minting an invitation: an optional placeholder name, how long it
+    /// stays valid, and — once the server has issued it — copy or save.
+    /// The text itself is never shown: it is a key to this server, and a
+    /// settings window is exactly what people have open during a screen
+    /// share.
+    fn invite_card(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
+        widgets::group_card(ui, "Neue Person einladen", |ui| {
+            let tok = theme::tokens(ui.visuals());
+            if let (true, Some((bundle, expires))) = (self.fresh_invite, &state.last_invite) {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(12, 12))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(icon::CHECK_CIRCLE).size(22.0).color(tok.connected));
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.label(theme::strong_text("Einladung erstellt"));
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Einmal einlösbar, gültig bis {expires}. Schick sie über \
+                                         einen Weg, dem du vertraust – die Person fügt sie beim \
+                                         ersten Start von ICU ein."
+                                    ))
+                                    .size(12.0)
+                                    .color(tok.muted_text),
+                                );
+                            });
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             if widgets::button(
                                 ui,
-                                widgets::ButtonKind::Neutral,
+                                widgets::ButtonKind::Primary,
                                 icon::COPY,
                                 "Kopieren",
                             )
                             .clicked()
                             {
                                 ui.ctx().copy_text(bundle.clone());
+                                self.invite_status = Some("In die Zwischenablage kopiert.".into());
                             }
                             if widgets::button(
                                 ui,
                                 widgets::ButtonKind::Neutral,
                                 icon::EXPORT,
-                                "Speichern",
+                                "Als Datei speichern",
                             )
-                            .on_hover_text("Als Datei neben die Konfiguration schreiben")
                             .clicked()
                             {
                                 self.invite_status =
@@ -1264,32 +1500,112 @@ impl SettingsView {
                                         Err(e) => crate::problem::storage("Die Einladung", &e).text,
                                     });
                             }
+                            if widgets::button(
+                                ui,
+                                widgets::ButtonKind::Neutral,
+                                icon::USER_PLUS,
+                                "Noch jemanden",
+                            )
+                            .clicked()
+                            {
+                                self.fresh_invite = false;
+                                self.invite_name.clear();
+                                self.invite_status = None;
+                            }
                         });
+                        if let Some(status) = &self.invite_status {
+                            ui.add_space(6.0);
+                            ui.label(RichText::new(status).size(11.5).color(tok.dim_text));
+                        }
                     });
-                    if let Some(status) = &self.invite_status {
-                        ui.label(RichText::new(status).small().color(tok.dim_text));
-                    }
-                    ui.add_space(4.0);
-                    let mut copy = bundle.clone();
+                return;
+            }
+
+            widgets::setting_row(
+                ui,
+                false,
+                "Name",
+                Some("Nur ein Platzhalter, bis die Person ihren eigenen Namen wählt."),
+                |ui| {
                     ui.add(
-                        egui::TextEdit::multiline(&mut copy)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace),
-                    );
+                        egui::TextEdit::singleline(&mut self.invite_name)
+                            .desired_width(200.0)
+                            .hint_text("optional"),
+                    )
+                },
+            );
+            widgets::setting_row(ui, true, "Gültig für", None, |ui| {
+                widgets::segmented(ui, &mut self.invite_ttl_s, &INVITE_TTLS)
+            });
+            if let Some(err) = &state.invite_error {
+                widgets::card_note(ui, |ui| {
+                    ui.colored_label(tok.error, RichText::new(err).size(12.0));
                 });
             }
+            ui.separator();
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    // The name is only a placeholder until the invited
+                    // person picks their own; empty means a generated one.
+                    let valid = self.invite_name.trim().is_empty()
+                        || icu_proto::validate_name(&icu_proto::normalize_name(&self.invite_name))
+                            .is_ok();
+                    ui.horizontal(|ui| {
+                        if !valid {
+                            ui.label(
+                                RichText::new("Dieser Name geht nicht.")
+                                    .size(11.5)
+                                    .color(tok.error),
+                            );
+                        }
+                        widgets::rtl(ui, 30.0, |ui| {
+                            if ui
+                                .add_enabled_ui(valid, |ui| {
+                                    widgets::button(
+                                        ui,
+                                        widgets::ButtonKind::Primary,
+                                        icon::TICKET,
+                                        "Einladung erstellen",
+                                    )
+                                })
+                                .inner
+                                .clicked()
+                            {
+                                cmds.push(Command::CreateInvite {
+                                    name: icu_proto::normalize_name(&self.invite_name),
+                                    ttl_s: self.invite_ttl_s,
+                                });
+                                self.invite_status = None;
+                            }
+                        });
+                    });
+                });
         });
     }
 
     fn about_tab(&mut self, ui: &mut Ui, state: &AppState) {
-        widgets::group_card(ui, "Info", |ui| {
+        let adv = self.draft.ui.show_advanced;
+        widgets::page_header(
+            ui,
+            "Über ICU",
+            if adv {
+                "Version, Lizenzen und Messwerte zur Verbindung."
+            } else {
+                "Version und Lizenzen."
+            },
+            |_| {},
+        );
+        widgets::group_card(ui, "ICU", |ui| {
             widgets::setting_row(ui, false, "Version", None, |ui| {
                 widgets::chip(ui, env!("CARGO_PKG_VERSION"), 0.0)
             });
-            widgets::setting_row(ui, true, "Audio-Backend", None, |ui| {
-                widgets::chip(ui, state.backend, 0.0)
-            });
+            if adv {
+                widgets::setting_row(ui, true, "Audio-Backend", None, |ui| {
+                    widgets::chip(ui, state.backend, 0.0)
+                });
+            }
+            ui.separator();
             widgets::card_note(ui, |ui| {
                 ui.label(
                     RichText::new(
@@ -1298,11 +1614,15 @@ impl SettingsView {
                          Lizenzgewährung für Binaries), Inter (OFL-1.1), Phosphor-Icons (MIT/Apache-2.0). \
                          Lizenztexte liegen dem Release bei.",
                     )
-                    .small(),
+                    .small()
+                    .color(theme::tokens(ui.visuals()).dim_text),
                 );
             });
         });
 
+        if !adv {
+            return;
+        }
         self.refresh_diagnose();
 
         widgets::group_card(ui, "Diagnose", |ui| {
@@ -1334,7 +1654,7 @@ impl SettingsView {
 
             ui.separator();
             widgets::card_note(ui, |ui| {
-                widgets::ltr(ui, |ui| {
+                ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if widgets::button(ui, widgets::ButtonKind::Neutral, icon::COPY, "Bericht")
                         .on_hover_text("Den vollen Statistikbericht in die Zwischenablage")
@@ -1427,6 +1747,14 @@ impl SettingsView {
         );
         self.diagnose.ref_underruns = DebugStats::get(&self.stats.reference_underruns).to_string();
         self.diagnose.reconnects = DebugStats::get(&self.stats.reconnects).to_string();
+    }
+}
+
+/// `2026-09-24T…` → `24.09.2026`; anything unexpected comes back as is.
+fn short_date(rfc3339: &str) -> String {
+    match rfc3339.get(..10).map(|d| d.split('-').collect::<Vec<_>>()).as_deref() {
+        Some([y, m, d]) => format!("{d}.{m}.{y}"),
+        _ => rfc3339.to_string(),
     }
 }
 
@@ -1611,12 +1939,13 @@ fn theme_swatch(ui: &mut Ui, current: &mut String, value: &str, label: &str) {
         if resp.clicked() {
             *current = value.to_string();
         }
-        ui.label(RichText::new(label).size(10.5));
+        ui.label(RichText::new(label).size(11.5));
     });
 }
 
 fn device_combo(
     ui: &mut Ui,
+    divider: bool,
     label: &str,
     selected: &mut Option<String>,
     devices: &[&crate::audio::DeviceInfo],
@@ -1629,10 +1958,10 @@ fn device_combo(
             .map(|d| d.description.clone())
             .unwrap_or_else(|| format!("{id} (nicht vorhanden)")),
     };
-    widgets::setting_row(ui, false, label, None, |ui| {
+    widgets::setting_row(ui, divider, label, None, |ui| {
         egui::ComboBox::from_id_salt(label)
             .selected_text(current)
-            .width(200.0)
+            .width(240.0)
             .show_ui(ui, |ui| {
                 if ui
                     .selectable_label(selected.is_none(), "Standard")
@@ -1649,6 +1978,9 @@ fn device_combo(
             });
     });
 }
+
+/// Label column of a [`binding_row`], wide enough for "Modus wechseln".
+const BINDING_LABEL_W: f32 = 124.0;
 
 /// A hotkey binding row: two read-only `kbd` chips plus an "Ändern" button
 /// that reveals the editable evdev/Portal text fields.
@@ -1668,7 +2000,8 @@ fn binding_row(
             ui.horizontal(|ui| {
                 // A full-height, left-aligned label column: it sets the row
                 // height before the chips arrive, so they center on it too.
-                let (col, _) = ui.allocate_exact_size(egui::vec2(92.0, 30.0), egui::Sense::hover());
+                let (col, _) =
+                    ui.allocate_exact_size(egui::vec2(BINDING_LABEL_W, 30.0), egui::Sense::hover());
                 ui.painter().text(
                     col.left_center(),
                     egui::Align2::LEFT_CENTER,
@@ -1703,7 +2036,7 @@ fn binding_row(
             if expanded.contains(label) {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(92.0);
+                    ui.add_space(BINDING_LABEL_W);
                     ui.add(
                         egui::TextEdit::singleline(&mut binding.key)
                             .desired_width(120.0)
