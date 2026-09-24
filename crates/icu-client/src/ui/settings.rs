@@ -91,6 +91,8 @@ pub struct SettingsView {
     invite_ttl_s: u64,
     /// Result of the last "Speichern" of an invite.
     invite_status: Option<String>,
+    /// The invite last seen in `AppState`, to notice a new one.
+    seen_invite: Option<String>,
     /// Hotkey backend in use, for display.
     pub hotkey_backend: String,
     /// Portal hint shown once.
@@ -151,6 +153,7 @@ impl SettingsView {
             invite_name: String::new(),
             invite_ttl_s: icu_proto::limits::INVITE_TTL_S,
             invite_status: None,
+            seen_invite: None,
             hotkey_backend,
             show_portal_hint: true,
             tab: Tab::Audio,
@@ -852,117 +855,6 @@ impl SettingsView {
 
         self.passport_card(ui, cmds);
 
-        if state.is_admin {
-            widgets::group_card(ui, "Einladung", |ui| {
-                widgets::setting_row(ui, false, "Gültig für", None, |ui| {
-                    let current = INVITE_TTLS
-                        .iter()
-                        .find(|(s, _)| *s == self.invite_ttl_s)
-                        .map_or("", |(_, l)| l);
-                    egui::ComboBox::from_id_salt("invite_ttl")
-                        .selected_text(current)
-                        .width(FIELD_W)
-                        .show_ui(ui, |ui| {
-                            for (secs, label) in INVITE_TTLS {
-                                ui.selectable_value(&mut self.invite_ttl_s, secs, label);
-                            }
-                        });
-                });
-                widgets::setting_row(ui, true, "Wer soll dazukommen?", None, |ui| {
-                    let width = FIELD_W + 6.0 + widgets::button_width(ui, icon::TICKET, "Einladen");
-                    widgets::row_group(ui, width, |ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.invite_name)
-                                .desired_width(FIELD_W)
-                                .hint_text("Name (optional)"),
-                        );
-                        // The name is only a placeholder until the invited
-                        // person picks their own; empty means a generated one.
-                        let valid = self.invite_name.trim().is_empty()
-                            || icu_proto::validate_name(&icu_proto::normalize_name(&self.invite_name)).is_ok();
-                        if ui
-                            .add_enabled_ui(valid, |ui| {
-                                widgets::button(
-                                    ui,
-                                    widgets::ButtonKind::Primary,
-                                    icon::TICKET,
-                                    "Einladen",
-                                )
-                            })
-                            .inner
-                            .clicked()
-                        {
-                            cmds.push(Command::CreateInvite {
-                                name: icu_proto::normalize_name(&self.invite_name),
-                                ttl_s: self.invite_ttl_s,
-                            });
-                            self.invite_status = None;
-                        }
-                    });
-                });
-                if let Some(err) = &state.invite_error {
-                    widgets::card_note(ui, |ui| {
-                        ui.colored_label(theme::tokens(ui.visuals()).error, err);
-                    });
-                }
-                if let Some((bundle, expires)) = &state.last_invite {
-                    ui.separator();
-                    widgets::card_note(ui, |ui| {
-                        let tok = theme::tokens(ui.visuals());
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("Einmal einlösbar, gültig bis {expires}"))
-                                    .size(11.5)
-                                    .color(tok.dim_text),
-                            );
-                            widgets::rtl(ui, 30.0, |ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                if widgets::button(
-                                    ui,
-                                    widgets::ButtonKind::Neutral,
-                                    icon::COPY,
-                                    "Kopieren",
-                                )
-                                .clicked()
-                                {
-                                    ui.ctx().copy_text(bundle.clone());
-                                }
-                                if widgets::button(
-                                    ui,
-                                    widgets::ButtonKind::Neutral,
-                                    icon::EXPORT,
-                                    "Speichern",
-                                )
-                                .on_hover_text("Als Datei neben die Konfiguration schreiben")
-                                .clicked()
-                                {
-                                    self.invite_status =
-                                        Some(match config::save_invite(&self.paths, bundle) {
-                                            Ok(path) => format!("Gespeichert: {}", path.display()),
-                                            Err(e) => {
-                                                crate::problem::storage("Die Einladung", &e).text
-                                            }
-                                        });
-                                }
-                            });
-                        });
-                        if let Some(status) = &self.invite_status {
-                            ui.label(RichText::new(status).small().color(tok.dim_text));
-                        }
-                        ui.add_space(4.0);
-                        let mut copy = bundle.clone();
-                        ui.add(
-                            egui::TextEdit::multiline(&mut copy)
-                                .desired_rows(4)
-                                .desired_width(f32::INFINITY)
-                                .font(egui::TextStyle::Monospace),
-                        );
-                    });
-                }
-            });
-        }
-
         widgets::group_card(ui, "Start und Fenster", |ui| {
             widgets::setting_row(ui, false, "Minimiert starten", None, |ui| {
                 widgets::toggle(ui, &mut self.draft.ui.start_minimized)
@@ -986,133 +878,359 @@ impl SettingsView {
         });
     }
 
-    /// Admin-only "Nutzer" tab: promote/demote, disable/enable, revoke
+    /// Admin-only "Nutzer" tab: inviting, and managing who is already in
     /// (`ControlMsg::UserListRequest`/`AdminSetRole`/`AdminSetDisabled`/
     /// `AdminRevokeUser`, `PROTOCOL.md` §2.2).
     fn users_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
-        widgets::group_card(ui, "Nutzer", |ui| {
-            widgets::setting_row(ui, false, "Registrierte Nutzer", None, |ui| {
-                if widgets::button(
-                    ui,
-                    widgets::ButtonKind::Neutral,
-                    icon::ARROWS_CLOCKWISE,
-                    "Aktualisieren",
-                )
-                .clicked()
-                {
-                    cmds.push(Command::RequestUserList);
-                }
+        self.invite_card(ui, state, cmds);
+
+        let me = state.me.as_ref().map(|m| m.user_id);
+        let (removed, mut members): (Vec<_>, Vec<_>) =
+            state.user_list.iter().partition(|u| u.revoked);
+        // You first, then admins, then everyone else; open invitations last.
+        members.sort_by_key(|u| {
+            (
+                Some(u.user_id) != me,
+                u.pending,
+                !u.is_admin,
+                u.name.to_lowercase(),
+            )
+        });
+        let title = if members.is_empty() {
+            "Mitglieder".to_string()
+        } else {
+            format!("Mitglieder ({})", members.len())
+        };
+        widgets::group_card(ui, &title, |ui| {
+            widgets::card_note(ui, |ui| {
+                let tok = theme::tokens(ui.visuals());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(
+                            "Admins dürfen einladen und Mitglieder verwalten. Gesperrte \
+                             Mitglieder können sich nicht verbinden, bis du sie entsperrst.",
+                        )
+                        .size(11.5)
+                        .color(tok.dim_text),
+                    );
+                    widgets::rtl(ui, 28.0, |ui| {
+                        if widgets::button(
+                            ui,
+                            widgets::ButtonKind::Neutral,
+                            icon::ARROWS_CLOCKWISE,
+                            "",
+                        )
+                        .on_hover_text("Liste neu laden")
+                        .clicked()
+                        {
+                            cmds.push(Command::RequestUserList);
+                        }
+                    });
+                });
             });
             if let Some(err) = &state.user_action_error {
                 widgets::card_note(ui, |ui| {
                     ui.colored_label(theme::tokens(ui.visuals()).error, err);
                 });
             }
-            let me = state.me.as_ref().map(|m| m.user_id);
-            let mut users: Vec<_> = state.user_list.iter().collect();
-            users.sort_by_key(|u| u.name.to_lowercase());
-            for (i, user) in users.into_iter().enumerate() {
-                self.user_row(ui, i > 0, user, me, cmds);
-            }
-            if state.user_list.is_empty() {
+            if members.is_empty() {
+                ui.separator();
                 widgets::card_note(ui, |ui| {
                     ui.label(
-                        RichText::new("Noch keine Liste geladen.")
+                        RichText::new("Liste wird geladen …")
                             .color(theme::tokens(ui.visuals()).dim_text),
                     );
                 });
             }
+            for user in members {
+                self.member_row(ui, user, Some(user.user_id) == me, cmds);
+            }
         });
+
+        if !removed.is_empty() {
+            egui::CollapsingHeader::new(theme::caps_text(&format!(
+                "Entfernte Zugänge ({})",
+                removed.len()
+            )))
+            .id_salt("removed-users")
+            .default_open(false)
+            .show(ui, |ui| {
+                let tok = theme::tokens(ui.visuals());
+                ui.label(
+                    RichText::new(
+                        "Diese Zugänge wurden endgültig entfernt. Wer wieder dazukommen soll, \
+                         braucht eine neue Einladung.",
+                    )
+                    .size(11.5)
+                    .color(tok.dim_text),
+                );
+                ui.add_space(4.0);
+                let mut names: Vec<_> = removed.iter().map(|u| u.name.as_str()).collect();
+                names.sort_by_key(|n| n.to_lowercase());
+                ui.label(RichText::new(names.join(", ")).color(tok.muted_text));
+            });
+        }
     }
 
-    fn user_row(
+    /// One member: avatar, name, a plain-words status line, and the actions
+    /// that make sense for them.
+    fn member_row(
         &mut self,
         ui: &mut Ui,
-        divider: bool,
         user: &icu_proto::UserSummary,
-        me: Option<UserId>,
+        is_self: bool,
         cmds: &mut Vec<Command>,
     ) {
-        let is_self = Some(user.user_id) == me;
-        let status = if user.revoked {
-            "widerrufen"
-        } else if user.disabled {
-            "deaktiviert"
-        } else if user.pending {
-            "eingeladen"
-        } else {
-            "aktiv"
-        };
-        let help = format!("{status}{}", if user.is_admin { " · Admin" } else { "" });
+        ui.separator();
+        let tok = theme::tokens(ui.visuals());
         let confirming = self
             .confirm_revoke
             .get(&user.user_id)
             .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
-        let revoke_label = if confirming { "Wirklich?" } else { "" };
-        widgets::setting_row(ui, divider, &user.name, Some(&help), |ui| {
-            let width = widgets::button_width(ui, icon::SHIELD_STAR, "")
-                + widgets::button_width(ui, icon::PROHIBIT, "")
-                + widgets::button_width(ui, icon::TRASH, revoke_label)
-                + 12.0;
-            widgets::row_group(ui, width, |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let action = |ui: &mut Ui, kind, glyph, label: &str, hover: &str| {
-                    ui.add_enabled_ui(!is_self, |ui| widgets::button(ui, kind, glyph, label))
-                        .inner
-                        .on_hover_text(hover.to_string())
-                        .clicked()
-                };
-                if action(
-                    ui,
-                    widgets::ButtonKind::Neutral,
-                    icon::SHIELD_STAR,
-                    "",
-                    if user.is_admin {
-                        "Admin-Rechte entziehen"
-                    } else {
-                        "Zum Admin machen"
-                    },
-                ) {
-                    cmds.push(Command::SetUserAdmin {
-                        user_id: user.user_id,
-                        is_admin: !user.is_admin,
-                    });
-                }
-                if action(
-                    ui,
-                    widgets::ButtonKind::Neutral,
-                    icon::PROHIBIT,
-                    "",
-                    if user.disabled {
-                        "Wieder aktivieren"
-                    } else {
-                        "Deaktivieren — darf sich nicht mehr verbinden"
-                    },
-                ) {
-                    cmds.push(Command::SetUserDisabled {
-                        user_id: user.user_id,
-                        disabled: !user.disabled,
-                    });
-                }
-                // Two clicks, because this cannot be undone: the first arms
-                // the button for three seconds, the second sends it.
-                if action(
-                    ui,
-                    widgets::ButtonKind::Danger,
-                    icon::TRASH,
-                    revoke_label,
-                    "Zugang endgültig widerrufen",
-                ) {
-                    if confirming {
-                        self.confirm_revoke.remove(&user.user_id);
-                        cmds.push(Command::RevokeUser {
-                            user_id: user.user_id,
+        if confirming {
+            // Let the armed button fall back on its own after 3 s.
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    widgets::avatar(ui, &user.name, user.user_id, false, 28.0, None);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        let name = if is_self {
+                            format!("{} (du)", user.name)
+                        } else {
+                            user.name.clone()
+                        };
+                        ui.label(RichText::new(name).size(13.5));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            let small = |t: &str, c| RichText::new(t).size(11.5).color(c);
+                            if user.pending {
+                                ui.label(small("Einladung noch nicht eingelöst", tok.connecting));
+                            } else if user.online {
+                                ui.label(small("●", tok.connected));
+                                ui.label(small("online", tok.muted_text));
+                            } else {
+                                ui.label(small("offline", tok.dim_text));
+                            }
+                            if user.is_admin {
+                                ui.label(small("· Admin", tok.muted_text));
+                            }
+                            if user.disabled {
+                                ui.label(small("· gesperrt", tok.error));
+                            }
                         });
-                    } else {
-                        self.confirm_revoke.insert(user.user_id, Instant::now());
+                    });
+                    widgets::rtl(ui, 30.0, |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if is_self {
+                            ui.label(RichText::new("Das bist du").size(11.5).color(tok.dim_text));
+                            return;
+                        }
+                        // Right to left: the irreversible action sits at the
+                        // edge, away from the everyday ones.
+                        let remove_label = match (confirming, user.pending) {
+                            (true, _) => "Wirklich?",
+                            (false, true) => "Zurückziehen",
+                            (false, false) => "Entfernen",
+                        };
+                        let hover = if user.pending {
+                            "Einladung ungültig machen"
+                        } else {
+                            "Zugang endgültig entfernen – lässt sich nicht rückgängig machen"
+                        };
+                        if widgets::button(
+                            ui,
+                            widgets::ButtonKind::Danger,
+                            icon::TRASH,
+                            remove_label,
+                        )
+                        .on_hover_text(hover)
+                        .clicked()
+                        {
+                            if confirming {
+                                self.confirm_revoke.remove(&user.user_id);
+                                cmds.push(Command::RevokeUser {
+                                    user_id: user.user_id,
+                                });
+                                cmds.push(Command::RequestUserList);
+                            } else {
+                                self.confirm_revoke.insert(user.user_id, Instant::now());
+                            }
+                        }
+                        if user.pending {
+                            return;
+                        }
+                        let (glyph, label, hover) = if user.disabled {
+                            (icon::LOCK_OPEN, "Entsperren", "Darf sich wieder verbinden")
+                        } else {
+                            (
+                                icon::LOCK,
+                                "Sperren",
+                                "Darf sich vorerst nicht mehr verbinden",
+                            )
+                        };
+                        if widgets::button(ui, widgets::ButtonKind::Neutral, glyph, label)
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            cmds.push(Command::SetUserDisabled {
+                                user_id: user.user_id,
+                                disabled: !user.disabled,
+                            });
+                            cmds.push(Command::RequestUserList);
+                        }
+                        let (label, hover) = if user.is_admin {
+                            ("Kein Admin", "Admin-Rechte entziehen")
+                        } else {
+                            ("Admin", "Zum Admin machen: darf einladen und verwalten")
+                        };
+                        if widgets::button(ui, widgets::ButtonKind::Neutral, icon::CROWN, label)
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            cmds.push(Command::SetUserAdmin {
+                                user_id: user.user_id,
+                                is_admin: !user.is_admin,
+                            });
+                            cmds.push(Command::RequestUserList);
+                        }
+                    });
+                });
+            });
+    }
+
+    /// Minting an invitation: validity, an optional placeholder name, and
+    /// the text to hand over once the server has issued it.
+    fn invite_card(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
+        // A fresh invite adds a pending member; show it without a click.
+        let issued = state.last_invite.as_ref().map(|(b, _)| b.as_str());
+        if issued != self.seen_invite.as_deref() {
+            self.seen_invite = issued.map(str::to_string);
+            if issued.is_some() {
+                cmds.push(Command::RequestUserList);
+            }
+        }
+        widgets::group_card(ui, "Neue Person einladen", |ui| {
+            widgets::card_note(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Erzeugt einen Einladungstext, der einmal eingelöst werden kann. \
+                         Schick ihn der Person – sie fügt ihn beim ersten Start von ICU ein \
+                         und wählt dort ihren Namen.",
+                    )
+                    .size(11.5)
+                    .color(theme::tokens(ui.visuals()).dim_text),
+                );
+            });
+            ui.separator();
+            widgets::setting_row(ui, false, "Gültig für", None, |ui| {
+                let current = INVITE_TTLS
+                    .iter()
+                    .find(|(s, _)| *s == self.invite_ttl_s)
+                    .map_or("", |(_, l)| l);
+                egui::ComboBox::from_id_salt("invite_ttl")
+                    .selected_text(current)
+                    .width(FIELD_W)
+                    .show_ui(ui, |ui| {
+                        for (secs, label) in INVITE_TTLS {
+                            ui.selectable_value(&mut self.invite_ttl_s, secs, label);
+                        }
+                    });
+            });
+            widgets::setting_row(ui, true, "Wer soll dazukommen?", None, |ui| {
+                let width = FIELD_W + 6.0 + widgets::button_width(ui, icon::TICKET, "Einladen");
+                widgets::row_group(ui, width, |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.invite_name)
+                            .desired_width(FIELD_W)
+                            .hint_text("Name (optional)"),
+                    );
+                    // The name is only a placeholder until the invited
+                    // person picks their own; empty means a generated one.
+                    let valid = self.invite_name.trim().is_empty()
+                        || icu_proto::validate_name(&icu_proto::normalize_name(&self.invite_name))
+                            .is_ok();
+                    if ui
+                        .add_enabled_ui(valid, |ui| {
+                            widgets::button(
+                                ui,
+                                widgets::ButtonKind::Primary,
+                                icon::TICKET,
+                                "Einladen",
+                            )
+                        })
+                        .inner
+                        .clicked()
+                    {
+                        cmds.push(Command::CreateInvite {
+                            name: icu_proto::normalize_name(&self.invite_name),
+                            ttl_s: self.invite_ttl_s,
+                        });
+                        self.invite_status = None;
                     }
-                }
-            })
+                });
+            });
+            if let Some(err) = &state.invite_error {
+                widgets::card_note(ui, |ui| {
+                    ui.colored_label(theme::tokens(ui.visuals()).error, err);
+                });
+            }
+            if let Some((bundle, expires)) = &state.last_invite {
+                ui.separator();
+                widgets::card_note(ui, |ui| {
+                    let tok = theme::tokens(ui.visuals());
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("Einmal einlösbar, gültig bis {expires}"))
+                                .size(11.5)
+                                .color(tok.dim_text),
+                        );
+                        widgets::rtl(ui, 30.0, |ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if widgets::button(
+                                ui,
+                                widgets::ButtonKind::Neutral,
+                                icon::COPY,
+                                "Kopieren",
+                            )
+                            .clicked()
+                            {
+                                ui.ctx().copy_text(bundle.clone());
+                            }
+                            if widgets::button(
+                                ui,
+                                widgets::ButtonKind::Neutral,
+                                icon::EXPORT,
+                                "Speichern",
+                            )
+                            .on_hover_text("Als Datei neben die Konfiguration schreiben")
+                            .clicked()
+                            {
+                                self.invite_status =
+                                    Some(match config::save_invite(&self.paths, bundle) {
+                                        Ok(path) => format!("Gespeichert: {}", path.display()),
+                                        Err(e) => crate::problem::storage("Die Einladung", &e).text,
+                                    });
+                            }
+                        });
+                    });
+                    if let Some(status) = &self.invite_status {
+                        ui.label(RichText::new(status).small().color(tok.dim_text));
+                    }
+                    ui.add_space(4.0);
+                    let mut copy = bundle.clone();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut copy)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                });
+            }
         });
     }
 
