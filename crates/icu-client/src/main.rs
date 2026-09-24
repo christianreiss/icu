@@ -224,7 +224,7 @@ fn run(cli: Cli) -> Result<(), String> {
             return run_headless(engine, cli.debug_stats);
         }
         #[cfg(feature = "gui")]
-        match icu_client::ui::run_main_window(engine, cli.debug_stats)? {
+        match icu_client::ui::run_main_window(engine, cli.debug_stats, logged_out)? {
             icu_client::ui::Exit::Quit => return Ok(()),
             // Back to the invite window; closing that one quits.
             icu_client::ui::Exit::LoggedOut => logged_out = true,

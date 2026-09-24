@@ -18,8 +18,8 @@ use crate::{
 pub use main_window::Exit;
 
 /// Runs the main window until the user quits or logs out. Owns the engine.
-pub fn run_main_window(engine: Engine, debug_stats: bool) -> Result<Exit, String> {
-    main_window::run(engine, debug_stats)
+pub fn run_main_window(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String> {
+    main_window::run(engine, debug_stats, show)
 }
 
 /// Shows the enrollment window; returns the identity once enrolled (and

@@ -56,9 +56,10 @@ pub enum Exit {
     LoggedOut,
 }
 
-/// Runs the main window.
-pub fn run(engine: Engine, debug_stats: bool) -> Result<Exit, String> {
-    let start_minimized = engine.snapshot().settings.ui.start_minimized;
+/// Runs the main window. `show` overrides `start_minimized`: right after
+/// logging back in the window must not vanish to the tray.
+pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String> {
+    let start_minimized = engine.snapshot().settings.ui.start_minimized && !show;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ICU")
@@ -80,6 +81,9 @@ pub fn run(engine: Engine, debug_stats: bool) -> Result<Exit, String> {
         Box::new(move |cc| {
             let mut app = App::new(cc, engine_for_app, debug_stats);
             app.logged_out = logged_out_app;
+            // `window_visible` keeps the engine's view, so `logic` reports
+            // the difference.
+            app.hidden = start_minimized;
             Ok(Box::new(app))
         }),
     )
