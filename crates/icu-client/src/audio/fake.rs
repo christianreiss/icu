@@ -2,7 +2,8 @@
 //! callback and collects whatever the playback callback produces.
 //!
 //! Used by the integration tests (no hardware) and by `--test-tone` style
-//! checks. Blocks are 240 samples every 5 ms, like the PipeWire backend.
+//! checks. Blocks are 240 samples every 5 ms, like the PipeWire backend, unless
+//! a test picks another quantum.
 
 use std::{
     sync::{
@@ -54,6 +55,8 @@ struct Shared {
     /// Whether the playback output is fed back into the reference stream,
     /// like a sink monitor would.
     loop_reference: bool,
+    /// Samples per callback: the graph quantum.
+    block: usize,
 }
 
 /// The fake backend.
@@ -73,6 +76,17 @@ impl FakeBackend {
     /// `loop_reference = true` feeds the playback output into the reference
     /// stream, like a sink monitor would.
     pub fn with_options(generator: Generator, loop_reference: bool) -> (FakeBackend, FakeProbe) {
+        Self::with_block(generator, loop_reference, BLOCK_SAMPLES)
+    }
+
+    /// Like [`FakeBackend::with_options`], with `block` samples per callback
+    /// — a graph quantum other than the requested 240, as PipeWire runs
+    /// when another client asks for more.
+    pub fn with_block(
+        generator: Generator,
+        loop_reference: bool,
+        block: usize,
+    ) -> (FakeBackend, FakeProbe) {
         let probe = FakeProbe::default();
         let shared = Arc::new(Shared {
             capture: Mutex::new(None),
@@ -82,6 +96,7 @@ impl FakeBackend {
             running: AtomicBool::new(true),
             probe: probe.clone(),
             loop_reference,
+            block,
         });
         let (tx, rx) = mpsc::channel();
         let thread_shared = shared.clone();
@@ -116,11 +131,11 @@ impl Drop for FakeBackend {
 }
 
 fn run(shared: Arc<Shared>) {
-    let period = Duration::from_micros(BLOCK_SAMPLES as u64 * 1_000_000 / SAMPLE_RATE as u64);
+    let period = Duration::from_micros(shared.block as u64 * 1_000_000 / SAMPLE_RATE as u64);
     let start = Instant::now();
     let mut tick: u64 = 0;
-    let mut block = vec![0.0f32; BLOCK_SAMPLES];
-    let mut out = vec![0.0f32; BLOCK_SAMPLES];
+    let mut block = vec![0.0f32; shared.block];
+    let mut out = vec![0.0f32; shared.block];
     while shared.running.load(Ordering::Relaxed) {
         let deadline = start + period * (tick as u32 + 1);
         let now = Instant::now();
@@ -149,7 +164,7 @@ fn run(shared: Arc<Shared>) {
         }
         if let Some(cb) = shared.capture.lock().unwrap().as_mut() {
             if let Some(g) = shared.generator.lock().unwrap().as_mut() {
-                g(tick * BLOCK_SAMPLES as u64, &mut block);
+                g(tick * shared.block as u64, &mut block);
             } else {
                 block.fill(0.0);
             }

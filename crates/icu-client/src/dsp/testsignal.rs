@@ -165,6 +165,81 @@ pub fn best_lag(x: &[f32], y: &[f32], max_lag: usize, step: usize) -> usize {
     best
 }
 
+/// How cleanly a received copy of a looped source plays: the received
+/// signal is followed window by window at a running alignment; a window
+/// that no longer matches there is a glitch (gap, concealment, skipped or
+/// inserted frame).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Continuity {
+    /// Windows judged (the source is voiced there).
+    pub windows: usize,
+    /// Windows that did not match the source at the running alignment.
+    pub glitches: usize,
+    /// Of those, windows nearly silent where the source is not (dropouts).
+    pub dropouts: usize,
+    /// Times the alignment moved: frames were skipped or inserted.
+    pub realigned: usize,
+}
+
+/// Compares `received` against the loop `source` in windows of `window`
+/// samples. `received` must start after the stream has settled.
+pub fn continuity(received: &[f32], source: &[f32], window: usize) -> Continuity {
+    const MATCH: f64 = 0.8;
+    let len = source.len();
+    let looped: Vec<f32> = source.iter().chain(source.iter()).copied().collect();
+    let at = |pos: usize, n: usize| -> &[f32] { &looped[pos % len..pos % len + n] };
+    let voiced_rms = {
+        let active: Vec<f32> = source.iter().copied().filter(|v| v.abs() > 1e-4).collect();
+        rms(&active)
+    };
+    let mut out = Continuity::default();
+    let anchor = SR / 10;
+    if received.len() < SR / 2 + anchor || len < anchor {
+        return out;
+    }
+    // Anchor on the loudest 100 ms of the first half second, searched over
+    // the whole loop.
+    let start = (0..SR / 2)
+        .step_by(SR / 100)
+        .max_by(|&a, &b| rms(&received[a..a + anchor]).total_cmp(&rms(&received[b..b + anchor])))
+        .unwrap_or(0);
+    let seg = &received[start..start + anchor];
+    let coarse = best_lag(seg, &looped, len - 1, 4);
+    let lo = coarse.saturating_sub(4);
+    let found = lo + best_lag(seg, &looped[lo..], 8, 1);
+    let mut lag = (found + len - start % len) % len;
+    let search = 3 * window;
+    let mut i = 0;
+    while (i + 1) * window <= received.len() {
+        let got = &received[i * window..(i + 1) * window];
+        let pos = lag + i * window;
+        let want = at(pos, window);
+        i += 1;
+        if rms(want) < 0.5 * voiced_rms {
+            continue;
+        }
+        out.windows += 1;
+        if pearson(got, want) >= MATCH {
+            continue;
+        }
+        out.glitches += 1;
+        if rms(got) < 0.1 * rms(want) {
+            out.dropouts += 1;
+        }
+        // Look for where the stream went: ± three windows.
+        let base = (pos + len - search) % len;
+        let span = &looped[base..base + 2 * search + window];
+        let coarse = best_lag(got, span, 2 * search, 4);
+        let lo = coarse.saturating_sub(4);
+        let fine = lo + best_lag(got, &span[lo..], 8.min(2 * search - lo), 1);
+        if pearson(got, &span[fine..fine + window]) >= MATCH && fine != search {
+            lag = (lag + len + fine - search) % len;
+            out.realigned += 1;
+        }
+    }
+    out
+}
+
 /// Harmonic voice-like tone: a 180 Hz fundamental with decaying harmonics and
 /// a syllable envelope. Opus preserves it waveform-exactly enough for
 /// correlation tests, unlike noise.
@@ -190,4 +265,45 @@ pub fn harmonic_voice(n: usize, rms_target: f32) -> Vec<f32> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window_at(source: &[f32], pos: usize) -> Vec<f32> {
+        (0..960).map(|i| source[(pos + i) % source.len()]).collect()
+    }
+
+    #[test]
+    fn continuity_counts_gaps_and_skips() {
+        let source = harmonic_voice(SR * 2, 0.15);
+        let phase = 12_345;
+        let clean: Vec<f32> = source
+            .iter()
+            .cycle()
+            .skip(phase)
+            .take(SR * 3)
+            .copied()
+            .collect();
+        let c = continuity(&clean, &source, 960);
+        assert!(c.windows > 50, "{c:?}");
+        assert_eq!((c.glitches, c.realigned), (0, 0), "{c:?}");
+
+        // Zero 20 ms in a voiced stretch, and cut one 20 ms frame elsewhere.
+        let voiced = |from: usize| {
+            (from..)
+                .step_by(960)
+                .find(|&p| rms(&window_at(&source, phase + p)) > 0.1)
+                .unwrap()
+        };
+        let mut glitched = clean.clone();
+        let gap = voiced(SR);
+        glitched[gap..gap + 960].fill(0.0);
+        let cut = voiced(2 * SR);
+        glitched.drain(cut..cut + 960);
+        let c = continuity(&glitched, &source, 960);
+        assert!(c.dropouts >= 1, "{c:?}");
+        assert!(c.realigned >= 1, "{c:?}");
+    }
 }
