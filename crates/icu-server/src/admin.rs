@@ -259,34 +259,31 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
         AdminRequest::Enable { user } => set_disabled(server, &user, false).await,
         AdminRequest::Disable { user } => set_disabled(server, &user, true).await,
         AdminRequest::Status => AdminResponse::Status(status(server)),
-        AdminRequest::RotateServerCert => {
-            // The old leaf goes on the CRL first: if rotating is the answer
-            // to a leaked server key, clients must refuse that leaf, and a
-            // failed rotation afterwards only leaves a spare entry.
-            let rotated = {
-                let mut store = server.store.lock().await;
-                let mut ca = server.ca.write().await;
-                let old = ca.server_der().clone();
-                let expires = crate::ca::leaf_not_after(&old);
-                store
-                    .revoke_server_cert(crate::ca::leaf_serial(&old), expires)
-                    .and_then(|()| {
-                        ca.rotate_server_cert(
-                            &server.config.tls,
-                            &server.config.server.server_name,
-                        )
-                    })
-            };
-            match rotated {
-                // The new leaf and the CRL go live without a restart.
-                Ok(()) => match crate::endpoint::reload_tls(server).await {
-                    Ok(()) => AdminResponse::Ok,
-                    Err(e) => AdminResponse::err("ROTATE_FAILED", e),
-                },
-                Err(e) => AdminResponse::err("ROTATE_FAILED", e),
-            }
-        }
+        AdminRequest::RotateServerCert => match rotate_server_cert(server).await {
+            Ok(()) => AdminResponse::Ok,
+            Err(e) => AdminResponse::err("ROTATE_FAILED", e),
+        },
     }
+}
+
+/// Issues a fresh server leaf and puts the old one on the CRL, live without a
+/// restart. Behind `rotate-server-cert` and the automatic rotation before
+/// expiry (`housekeeping`). Handshakes already done keep the old leaf until
+/// they reconnect.
+pub async fn rotate_server_cert(server: &Arc<Server>) -> Result<()> {
+    // The old leaf goes on the CRL first: if rotating is the answer to a
+    // leaked server key, clients must refuse that leaf, and a failed rotation
+    // afterwards only leaves a spare entry.
+    {
+        let mut store = server.store.lock().await;
+        let mut ca = server.ca.write().await;
+        let old = ca.server_der().clone();
+        let expires = crate::ca::leaf_not_after(&old);
+        store.revoke_server_cert(crate::ca::leaf_serial(&old), expires)?;
+        ca.rotate_server_cert(&server.config.tls, &server.config.server.server_name)?;
+    }
+    // The new leaf and the CRL go live without a restart.
+    crate::endpoint::reload_tls(server).await
 }
 
 /// Shared resolve→mutate→map-error body of `Promote`/`Demote`. On success,
@@ -351,6 +348,7 @@ fn status(server: &Arc<Server>) -> serde_json::Value {
         "max_users": server.config.server.max_users,
         "server_time_ms": unix_millis(),
         "connections": Counters::get(&c.connections),
+        "tls": tls_status(server),
         "relay": {
             "datagrams_in": Counters::get(&c.datagrams_in),
             "datagrams_out": Counters::get(&c.datagrams_out),
@@ -377,6 +375,21 @@ fn status(server: &Arc<Server>) -> serde_json::Value {
             "ok": Counters::get(&c.enroll_ok),
             "failed": Counters::get(&c.enroll_failed),
         }
+    })
+}
+
+/// Expiry of the server leaf and the CA. The days are integers for the
+/// Checkmk check, the timestamps are for people.
+fn tls_status(server: &Arc<Server>) -> serde_json::Value {
+    let Ok(ca) = server.ca.try_read() else {
+        // A rotation holds the lock right now; the next poll has it.
+        return json!({});
+    };
+    json!({
+        "server_cert_expires": crate::ca::leaf_not_after(ca.server_der()),
+        "server_cert_days_left": crate::ca::leaf_days_left(ca.server_der()),
+        "ca_expires": crate::ca::leaf_not_after(ca.ca_der()),
+        "ca_days_left": crate::ca::leaf_days_left(ca.ca_der()),
     })
 }
 

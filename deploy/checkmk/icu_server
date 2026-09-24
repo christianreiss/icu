@@ -47,6 +47,13 @@ CONNECTIONS=$(field connections)
 IN=$(nested relay datagrams_in)
 OUT=$(nested relay datagrams_out)
 
+# Days until the server leaf and the CA expire; negative once expired.
+days() {
+    echo "$JSON" | sed -n "s/.*\"$1\":\(-\{0,1\}[0-9]*\).*/\1/p" | head -1
+}
+LEAF_DAYS=$(days server_cert_days_left)
+CA_DAYS=$(days ca_days_left)
+
 [ -n "$ONLINE" ] || ONLINE=0
 [ -n "$MAX" ] || MAX=0
 [ -n "$UPTIME" ] || UPTIME=0
@@ -63,3 +70,18 @@ if [ "$MAX" -gt 0 ] && [ "$ONLINE" -ge "$MAX" ]; then
 fi
 
 echo "$STATUS ICU_Server online=$ONLINE;;;0;$MAX|uptime=$UPTIME|connections=$CONNECTIONS|datagrams_in=$IN|datagrams_out=$OUT $TEXT"
+
+# Certificates: WARN below 30 days, CRIT below 7. The server renews its own
+# leaf 30 days ahead, so a WARN on it means the automatic rotation failed
+# (journal). The CA is not renewed automatically (deploy/README.md).
+cert_line() {
+    item=$1 left=$2 what=$3
+    [ -n "$left" ] || return 0
+    st=0
+    if [ "$left" -lt 7 ]; then st=2; elif [ "$left" -lt 30 ]; then st=1; fi
+    text="$what expires in $left days"
+    [ "$left" -ge 0 ] || text="$what EXPIRED $((-left)) days ago"
+    echo "$st $item days_left=$left;30;7 $text"
+}
+cert_line ICU_Server_Certificate "$LEAF_DAYS" "server certificate"
+cert_line ICU_CA_Certificate "$CA_DAYS" "CA certificate"

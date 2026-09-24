@@ -168,6 +168,9 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
         .ok_or_else(|| Error::coded(ec::AUTH_REQUIRED, "empty certificate chain"))?;
     let fp = fingerprint(leaf);
 
+    // This lookup is the admission, not a second line behind the CRL: on a
+    // TLS 1.3 resumption rustls does not run the client verifier again, so
+    // the CRL is not checked there. Never drop it as redundant.
     let mut store = server.store.lock().await;
     let (user_id, user, cert) = store
         .by_fingerprint(&fp)

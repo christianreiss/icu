@@ -115,6 +115,12 @@ und `state.lock`. **`ca.key` ist das einzige Geheimnis, das zählt** — geht es
 verloren, müssen sich alle Nutzer neu registrieren. Ein Backup von
 `/var/lib/icu/` gehört zur Inbetriebnahme.
 
+**Nach dem Zurückspielen eines Backups** `icu-server rotate-server-cert`
+ausführen. Lag zwischen Backup und Restore eine Rotation, präsentiert der Server
+sonst ein Leaf, das die Clients schon auf ihrer CRL haben; sie versuchen es dann
+im Backoff weiter, bis das neue Leaf da ist. Die CRL-Nummer folgt der Uhr und
+fällt durch einen Restore nicht unter die der Clients.
+
 Die Unit bindet IPv4 und IPv6 getrennt auf denselben Port; der Server setzt
 dafür `IPV6_V6ONLY` auf dem v6-Socket. Für einen Port unter 1024 siehe den
 Kommentar in `icu-server.service` (`AmbientCapabilities=CAP_NET_BIND_SERVICE`).
@@ -140,7 +146,8 @@ die Angriffsfläche für Unbekannte ist genau dieser Handshake. Dafür gilt
 * Verbindungen ohne Zertifikat loggt der Server nur auf `debug`.
 
 Der Admin-Socket ist ein Unix-Socket und nie im Netz. Die Unit begrenzt den
-Speicher mit `MemoryMax=1G` als Rückfallebene. Gegen volumetrische UDP-Floods
+Speicher mit `MemoryMax=1G` als Rückfallebene und ist so weit gehärtet, dass
+`systemd-analyze security icu-server` 1,4 meldet (vorher 3,5). Gegen volumetrische UDP-Floods
 hilft nur Upstream-Filterung (Provider, Firewall) — das kann kein Prozess
 selbst.
 
@@ -174,9 +181,18 @@ Läuft **kein** Server, erledigt die CLI dieselbe Arbeit selbst und hält dabei
 CLI mit `cannot lock … (is a server running?)` ab — das ist Absicht, damit CLI
 und Server einander nie eine Änderung überschreiben.
 
-`rotate-server-cert` schreibt das neue Leaf auf Platte; präsentiert wird es
-nach einem `systemctl restart icu-server` (quinn hält die rustls-Config aus dem
-Start fest). Clients brauchen nichts, die CA bleibt dieselbe.
+`rotate-server-cert` stellt ein neues Leaf derselben CA aus, setzt das alte auf
+die CRL und wirkt ohne Neustart für jede neue Verbindung. Clients brauchen
+nichts. **Der Server rotiert selbst**, sobald sein Leaf weniger als 30 Tage
+(höchstens ein Drittel von `server_validity_days`) Restlaufzeit hat, geprüft
+beim Start und stündlich. Ein abgelaufenes oder widerrufenes Server-Leaf ist
+für die Clients kein fataler Fehler: sie versuchen es weiter und verbinden
+sich, sobald das neue Leaf da ist.
+
+**Die CA** (Default 3650 Tage) erneuert sich nicht. Läuft sie ab, müssen sich
+alle Nutzer neu registrieren; Journal und Checkmk-Check warnen ab 30 Tagen
+vorher. Rechtzeitig einen neuen Server aufsetzen (neue CA) und alle neu
+einladen.
 
 ## 4. Container (`FROM scratch`)
 
@@ -202,7 +218,10 @@ cp target/musl/x86_64-unknown-linux-musl/release/icu-server \
 ```
 
 Der Admin-Socket liegt im Container unter `/run/icu/admin.sock`; die CLI läuft
-deshalb per `podman exec` **im selben Container**, nicht auf dem Host.
+deshalb per `podman exec` **im selben Container**, nicht auf dem Host. `/run/icu`
+und `/var/lib/icu` legt das Image für uid 65532 an; ein neues benanntes Volume
+übernimmt diesen Besitzer. Für einen Bind-Mount statt eines Volumes unter
+rootless podman `-v ./state:/var/lib/icu:U` verwenden.
 
 ## 5. Monitoring
 
@@ -215,6 +234,9 @@ sudo usermod -aG icu root      # oder den Agent-User in die Gruppe icu
 
 Er ruft `icu-server status --json` auf und liefert `online`, `uptime` und die
 Relay-Zähler als Metriken. Ist der Server unten, geht der Check auf CRIT.
+Dazu kommen `ICU_Server_Certificate` und `ICU_CA_Certificate` (`tls` im
+Status-JSON): WARN unter 30, CRIT unter 7 Tagen Restlaufzeit. Beim Server-Leaf
+heißt WARN, dass die automatische Rotation gescheitert ist (Journal).
 
 ## 6. Grenzen
 

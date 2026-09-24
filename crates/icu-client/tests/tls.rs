@@ -73,7 +73,8 @@ async fn a_connected_client_stores_the_servers_crl() {
 }
 
 /// A server leaf on the stored CRL — replaced by `rotate-server-cert`, its
-/// key possibly leaked — fails the handshake, fatally.
+/// key possibly leaked — fails the handshake. Not fatally: only the server
+/// can fix it, so the client keeps retrying and refusing that leaf.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_server_leaf_on_the_crl_is_refused() {
     let server = TestServer::start().await;
@@ -99,7 +100,7 @@ async fn a_server_leaf_on_the_crl_is_refused() {
     .await
     .err()
     .expect("the handshake fails");
-    assert!(err.is_fatal(), "{err}");
+    assert!(!err.is_fatal(), "{err}");
     assert!(
         err.to_string().to_lowercase().contains("revoked")
             || err.to_string().contains("widerrufen"),

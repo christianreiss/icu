@@ -22,8 +22,22 @@ PrivateTmp=yes
 PrivateDevices=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallFilter=@system-service
+# Not ~@privileged: it contains @chown, and the server chgrps the admin socket
+# to `admin_socket_group` (fchownat), so it would die with SIGSYS at startup.
+SystemCallFilter=~@resources
+SystemCallArchitectures=native
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
 CapabilityBoundingSet=
 # Backstop for an open-internet server: the server caps connections itself
 # (limits.max_connections), this caps what a bug could still make it hold.

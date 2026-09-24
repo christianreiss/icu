@@ -1,6 +1,8 @@
-//! Emergency host through cpal (ALSA under PipeWire). No AEC reference; the
-//! block size is whatever the host delivers (Spike 3: `BufferSize::Fixed` is
-//! ignored, set `PIPEWIRE_LATENCY=240/48000` in the environment).
+//! Host through cpal: the emergency path on Linux (ALSA under PipeWire,
+//! feature `cpal-fallback`) and the only one on Windows until the WASAPI
+//! backend (M3) exists (cpal's WASAPI host, shared mode). No AEC reference;
+//! the block size is whatever the host delivers (Spike 3: `BufferSize::Fixed`
+//! is ignored, set `PIPEWIRE_LATENCY=240/48000` in the environment).
 
 use std::sync::mpsc;
 
@@ -23,6 +25,7 @@ pub struct CpalBackend {
 impl CpalBackend {
     /// Opens the default host.
     pub fn new() -> Result<CpalBackend, BackendError> {
+        #[cfg(target_os = "linux")]
         if std::env::var_os("PIPEWIRE_LATENCY").is_none() {
             // Safety: set before any audio thread exists.
             std::env::set_var("PIPEWIRE_LATENCY", format!("240/{SAMPLE_RATE}"));
@@ -43,9 +46,7 @@ impl CpalBackend {
             DeviceKind::Output => self.host.output_devices().ok()?,
         };
         match id {
-            Some(id) => devices
-                .into_iter()
-                .find(|d| d.name().ok().as_deref() == Some(id)),
+            Some(id) => devices.into_iter().find(|d| d.to_string() == id),
             None => match kind {
                 DeviceKind::Input => self.host.default_input_device(),
                 DeviceKind::Output => self.host.default_output_device(),
@@ -63,24 +64,22 @@ impl AudioBackend for CpalBackend {
         let mut out = Vec::new();
         if let Ok(devs) = self.host.input_devices() {
             for d in devs {
-                if let Ok(name) = d.name() {
-                    out.push(DeviceInfo {
-                        id: name.clone(),
-                        description: name,
-                        kind: DeviceKind::Input,
-                    });
-                }
+                let name = d.to_string();
+                out.push(DeviceInfo {
+                    id: name.clone(),
+                    description: name,
+                    kind: DeviceKind::Input,
+                });
             }
         }
         if let Ok(devs) = self.host.output_devices() {
             for d in devs {
-                if let Ok(name) = d.name() {
-                    out.push(DeviceInfo {
-                        id: name.clone(),
-                        description: name,
-                        kind: DeviceKind::Output,
-                    });
-                }
+                let name = d.to_string();
+                out.push(DeviceInfo {
+                    id: name.clone(),
+                    description: name,
+                    kind: DeviceKind::Output,
+                });
             }
         }
         out
@@ -106,7 +105,7 @@ impl AudioBackend for CpalBackend {
         let mut mono = Vec::new();
         let stream = dev
             .build_input_stream(
-                &config,
+                config,
                 move |data: &[f32], _| {
                     mono.clear();
                     mono.extend(data.chunks(channels).map(|c| c[0]));
@@ -147,7 +146,7 @@ impl AudioBackend for CpalBackend {
         let mut mono = Vec::new();
         let stream = dev
             .build_output_stream(
-                &config,
+                config,
                 move |data: &mut [f32], _| {
                     let frames = data.len() / channels;
                     mono.clear();

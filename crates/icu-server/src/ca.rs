@@ -380,6 +380,16 @@ pub fn leaf_not_after(der: &[u8]) -> String {
         .unwrap_or_else(|| "9999-12-31T23:59:59Z".to_string())
 }
 
+/// Whole days until a certificate's notAfter, negative once it has passed.
+/// `i64::MAX` when it does not parse, so nothing rotates or alarms on an
+/// unreadable file.
+pub fn leaf_days_left(der: &[u8]) -> i64 {
+    use x509_parser::prelude::FromDer;
+    x509_parser::certificate::X509Certificate::from_der(der)
+        .map(|(_, cert)| (cert.validity().not_after.to_datetime() - store::now()).whole_days())
+        .unwrap_or(i64::MAX)
+}
+
 /// How long a CRL claims to be current. Nobody enforces it (rustls does not
 /// by default, and the client keeps the newest it has); the server issues a
 /// fresh one on every revocation and at startup anyway.

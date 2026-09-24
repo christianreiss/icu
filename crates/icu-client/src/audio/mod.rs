@@ -1,7 +1,7 @@
 //! Audio backends and the capture/playback glue.
 
 pub mod backend;
-#[cfg(feature = "cpal-fallback")]
+#[cfg(any(feature = "cpal-fallback", target_os = "windows"))]
 pub mod cpal_fallback;
 pub mod fake;
 #[cfg(target_os = "linux")]
@@ -31,9 +31,17 @@ pub fn native_backend() -> Result<Box<dyn AudioBackend>, BackendError> {
             }
         }
     }
+    // Until the WASAPI backend (M3) exists, cpal's WASAPI host (shared mode,
+    // no AEC reference) is what Windows plays and records with.
     #[cfg(target_os = "windows")]
     {
-        wasapi::WasapiBackend::new().map(|b| Box::new(b) as _)
+        match wasapi::WasapiBackend::new() {
+            Ok(b) => Ok(Box::new(b)),
+            Err(e) => {
+                tracing::warn!(error = %e, "wasapi unavailable, using cpal");
+                cpal_fallback::CpalBackend::new().map(|b| Box::new(b) as _)
+            }
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {

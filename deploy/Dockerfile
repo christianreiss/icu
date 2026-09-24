@@ -21,8 +21,16 @@
 #
 #   podman exec <container> /icu-server invite --name alice
 
+# A scratch image has no /run and no /var/lib. The server runs as 65532 and
+# cannot create them under the root-owned /, so without these the admin
+# socket (/run/icu/admin.sock) is missing and a fresh named volume on
+# /var/lib/icu is not writable: no `invite`, no first admin.
+FROM docker.io/library/alpine:3 AS dirs
+RUN mkdir -p /out/run/icu /out/var/lib/icu
+
 FROM scratch
 
+COPY --from=dirs --chown=65532:65532 /out/ /
 COPY target/x86_64-unknown-linux-musl/release/icu-server /icu-server
 
 # State, runtime and configuration. Declare the state volume so an accidental
@@ -31,8 +39,9 @@ VOLUME ["/var/lib/icu"]
 
 EXPOSE 4711/udp
 
-# Numeric, because a scratch image has no /etc/passwd. Give the volume and
-# /run/icu to the same uid on the host.
+# Numeric, because a scratch image has no /etc/passwd. A new named volume
+# takes the owner of /var/lib/icu from the image; a bind mount must belong to
+# this uid (under rootless podman: `-v …:/var/lib/icu:U`).
 USER 65532:65532
 
 ENTRYPOINT ["/icu-server"]
