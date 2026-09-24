@@ -3,7 +3,10 @@
 
 use std::{
     net::SocketAddr,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -43,9 +46,20 @@ type Toggle = (
 /// Above this round-trip time a row's ping turns amber.
 const SLOW_RTT_MS: u16 = 150;
 
-/// Runs the main window.
-pub fn run(engine: Engine, debug_stats: bool) -> Result<(), String> {
-    let start_minimized = engine.snapshot().settings.ui.start_minimized;
+/// How the main window ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exit {
+    /// The user quit.
+    Quit,
+    /// The user logged out; the identity is gone and the caller shows the
+    /// invite window again.
+    LoggedOut,
+}
+
+/// Runs the main window. `show` overrides `start_minimized`: right after
+/// logging back in the window must not vanish to the tray.
+pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String> {
+    let start_minimized = engine.snapshot().settings.ui.start_minimized && !show;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ICU")
@@ -56,18 +70,34 @@ pub fn run(engine: Engine, debug_stats: bool) -> Result<(), String> {
             .with_visible(!start_minimized),
         ..Default::default()
     };
+    let paths = engine.paths();
     let engine = Arc::new(Mutex::new(Some(engine)));
     let engine_for_app = engine.clone();
+    let logged_out = Arc::new(AtomicBool::new(false));
+    let logged_out_app = logged_out.clone();
     eframe::run_native(
         "ICU",
         options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, engine_for_app, debug_stats)))),
+        Box::new(move |cc| {
+            let mut app = App::new(cc, engine_for_app, debug_stats);
+            app.logged_out = logged_out_app;
+            // `window_visible` keeps the engine's view, so `logic` reports
+            // the difference.
+            app.hidden = start_minimized;
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| e.to_string())?;
     if let Some(engine) = engine.lock().unwrap().take() {
         engine.shutdown();
     }
-    Ok(())
+    if !logged_out.load(Ordering::Relaxed) {
+        return Ok(Exit::Quit);
+    }
+    // Only now: a running engine may still save a renewed certificate.
+    crate::config::Identity::remove(&paths)
+        .map_err(|e| format!("Die Zugangsdaten ließen sich nicht löschen: {e}"))?;
+    Ok(Exit::LoggedOut)
 }
 
 struct App {
@@ -117,6 +147,8 @@ struct App {
     /// starts from the same `start_minimized` value.
     window_visible: bool,
     quit_requested: bool,
+    /// Set when the user logged out from the settings; read by `run`.
+    logged_out: Arc<AtomicBool>,
 }
 
 impl App {
@@ -202,6 +234,7 @@ impl App {
             hidden: start_minimized,
             window_visible: !start_minimized,
             quit_requested: false,
+            logged_out: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -797,7 +830,12 @@ impl App {
             }
             let _ = self.cmd.send(c);
         }
-        if !still_open {
+        if self.settings.as_ref().is_some_and(|v| v.logout_requested) {
+            self.logged_out.store(true, Ordering::Relaxed);
+            self.settings = None;
+            self.quit_requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if !still_open {
             self.settings = None;
         }
         if debug_open != self.debug_window_open {

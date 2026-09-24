@@ -613,6 +613,16 @@ impl Identity {
         let _ = remove_dir_if_present(&previous);
         Ok(())
     }
+
+    /// Deletes the identity from this device: logging out. The leftovers of
+    /// an interrupted `save` go first, or `load` would bring `identity.old/`
+    /// back. An exported `icu-passport.txt` stays: it is the way back in.
+    pub fn remove(paths: &Paths) -> Result<(), ConfigError> {
+        let dir = paths.identity_dir();
+        remove_dir_if_present(&dir.with_extension("new"))?;
+        remove_dir_if_present(&dir.with_extension("old"))?;
+        remove_dir_if_present(&dir)
+    }
 }
 
 /// What importing a passport or registration bundle would switch this client
@@ -1050,5 +1060,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(Identity::load(&paths).unwrap().unwrap(), other);
+
+        // Logging out leaves nothing `load` could revive.
+        other.save(&paths).unwrap();
+        fs::create_dir_all(paths.identity_dir().with_extension("old")).unwrap();
+        fs::write(
+            paths
+                .identity_dir()
+                .with_extension("old")
+                .join("server.toml"),
+            "",
+        )
+        .unwrap();
+        Identity::remove(&paths).unwrap();
+        assert!(Identity::load(&paths).unwrap().is_none());
+        assert!(!paths.identity_dir().with_extension("old").exists());
+        Identity::remove(&paths).unwrap();
     }
 }

@@ -109,6 +109,11 @@ pub struct SettingsView {
     /// (in-row, no modal per §10), second click within it actually sends
     /// `Command::RevokeUser`.
     confirm_revoke: HashMap<UserId, Instant>,
+    /// Logging out is destructive too: same two-click window as revoke.
+    confirm_logout: Option<Instant>,
+    /// Set once the user confirmed logging out. `App` closes the window;
+    /// the identity is deleted after the engine is down (`main_window::run`).
+    pub logout_requested: bool,
     /// Debug window open state, mirrored in/out by `main_window.rs` each
     /// frame (the window itself is owned by `App`, not this view — moved
     /// here from a top-bar button so it doesn't compete for header space).
@@ -163,6 +168,8 @@ impl SettingsView {
             diagnose: DiagnoseCache::default(),
             export_status: None,
             confirm_revoke: HashMap::new(),
+            confirm_logout: None,
+            logout_requested: false,
             debug_window_open: false,
             #[cfg(feature = "camera")]
             preview: None,
@@ -581,6 +588,46 @@ impl SettingsView {
         });
     }
 
+    /// Deletes this device's identity and goes back to the invite window.
+    fn logout_card(&mut self, ui: &mut Ui) {
+        let confirming = self
+            .confirm_logout
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
+        if confirming {
+            // Let the armed button fall back on its own after 3 s.
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        }
+        widgets::group_card(ui, "Abmelden", |ui| {
+            widgets::setting_row(ui, false, "Von diesem Gerät abmelden", None, |ui| {
+                let label = if confirming { "Wirklich?" } else { "Abmelden" };
+                let width = widgets::button_width(ui, icon::SIGN_OUT, label);
+                widgets::row_group(ui, width, |ui| {
+                    if widgets::button(ui, widgets::ButtonKind::Danger, icon::SIGN_OUT, label)
+                        .on_hover_text("Löscht Schlüssel und Zertifikat auf diesem Gerät")
+                        .clicked()
+                    {
+                        if confirming {
+                            self.confirm_logout = None;
+                            self.logout_requested = true;
+                        } else {
+                            self.confirm_logout = Some(Instant::now());
+                        }
+                    }
+                });
+            });
+            widgets::card_note(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Löscht Schlüssel und Zertifikat auf diesem Gerät. Zurück nur mit \
+                         deinem Passport oder einer neuen Einladung — vorher oben sichern.",
+                    )
+                    .size(11.5)
+                    .color(theme::tokens(ui.visuals()).dim_text),
+                );
+            });
+        });
+    }
+
     /// The armored passport for the identity on disk. Disk, not `AppState`:
     /// that one is cloned ten times a second and has no business carrying a
     /// private key.
@@ -854,6 +901,7 @@ impl SettingsView {
         });
 
         self.passport_card(ui, cmds);
+        self.logout_card(ui);
 
         widgets::group_card(ui, "Start und Fenster", |ui| {
             widgets::setting_row(ui, false, "Minimiert starten", None, |ui| {
