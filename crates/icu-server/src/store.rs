@@ -149,9 +149,10 @@ pub struct UserRecord {
     /// All certificates ever issued to this user.
     #[serde(default, rename = "cert")]
     pub certs: Vec<CertRecord>,
-    /// Grants `CreateInviteRequest` and other admin actions. Set once, at the
-    /// first enrollment that completes against an empty store; changed
-    /// afterwards only through `Store::set_admin`.
+    /// Grants `CreateInviteRequest` and other admin actions. Set for the first
+    /// user to confirm a registration while no confirmed admin exists
+    /// (`Store::consume_registration`; marked provisionally before that);
+    /// changed afterwards only through `Store::set_admin`.
     #[serde(default)]
     pub is_admin: bool,
     /// Reversible login block, independent of certificate revocation. Unlike
@@ -498,6 +499,15 @@ impl Store {
             .count()
     }
 
+    /// Whether someone other than `except` is a functional admin who has
+    /// confirmed their registration. A pending admin — an unused first bundle,
+    /// or a redeem that was never confirmed — does not count: they may never
+    /// arrive, and the first user who does must become admin (§6.3).
+    fn has_enrolled_admin(&self, except: UserId) -> bool {
+        self.users()
+            .any(|(id, u)| id != except && !u.is_pending() && self.is_functional_admin(id))
+    }
+
     /// Rejects an action against `id` that would leave zero functional
     /// admins. A no-op for anyone who is not currently a functional admin
     /// (e.g. already disabled or fully revoked), so it never blocks cleanup
@@ -554,8 +564,9 @@ impl Store {
     /// Records an invited user with their registration certificate
     /// (`PROTOCOL.md` §2.3). The certificate's CN is the placeholder name,
     /// which has to be free like any other. The first registration against an
-    /// empty store is for an admin. Returns the new `user_id` and whether it is
-    /// an admin.
+    /// empty store is marked admin — provisionally: who ends up admin is
+    /// decided when a registration is confirmed ([`Store::consume_registration`]).
+    /// Returns the new `user_id` and whether it is marked admin.
     pub fn add_registration(&mut self, cert: CertRecord) -> Result<(UserId, bool)> {
         let is_admin = self.is_empty();
         let cert = CertRecord {
@@ -574,6 +585,9 @@ impl Store {
     /// bundle again. Such a repeat revokes the certificates earlier redeems
     /// produced — nobody can hold them, or the registration would have been
     /// consumed by their first login.
+    ///
+    /// Without a confirmed admin on the server, the redeemer is marked admin
+    /// provisionally; [`Store::consume_registration`] makes that final.
     pub fn redeem_registration(
         &mut self,
         id: UserId,
@@ -587,6 +601,7 @@ impl Store {
                 format!("name {:?} taken", cert.cn),
             ));
         }
+        let promote = !self.has_enrolled_admin(id);
         self.update_users(|users| {
             let record = user_entry(users, id)?;
             if record.disabled {
@@ -606,6 +621,9 @@ impl Store {
                 earlier.revoked = true;
             }
             record.name = cert.cn.clone();
+            if promote {
+                record.is_admin = true;
+            }
             record.certs.push(CertRecord {
                 registration: false,
                 ..cert
@@ -618,6 +636,11 @@ impl Store {
     /// provably stored its own: a clean close after `RenewResponse`, or the
     /// first login with a real certificate. From then on the bundle is
     /// worthless. Returns whether anything changed.
+    ///
+    /// The first user to confirm while the server has no confirmed admin
+    /// becomes admin, and every admin mark on a still pending user — the
+    /// first bundle's, or a provisional one from an earlier redeem — is
+    /// dropped in the same write, so exactly one admin comes out of it.
     pub fn consume_registration(&mut self, id: UserId) -> Result<bool> {
         let open = self
             .user(id)
@@ -625,13 +648,20 @@ impl Store {
         if !open {
             return Ok(false);
         }
+        let first_admin = !self.has_enrolled_admin(id);
         self.update_users(|users| {
-            for cert in user_entry(users, id)?
-                .certs
-                .iter_mut()
-                .filter(|c| c.registration)
-            {
+            let record = user_entry(users, id)?;
+            for cert in record.certs.iter_mut().filter(|c| c.registration) {
                 cert.revoked = true;
+            }
+            if first_admin {
+                record.is_admin = true;
+                let key = id.to_string();
+                for (other_key, other) in users.users.iter_mut() {
+                    if *other_key != key && other.is_pending() {
+                        other.is_admin = false;
+                    }
+                }
             }
             Ok(true)
         })
@@ -1218,6 +1248,66 @@ mod tests {
         s.purge_expired_registrations().unwrap();
         let (_, admin) = s.add_registration(named_cert("bb", "neu-0002")).unwrap();
         assert!(admin);
+    }
+
+    /// Registers `id` completely: redeem, then the client's confirmation.
+    fn confirm(s: &mut Store, id: UserId, reg_fp: &str, fp: &str, name: &str) {
+        s.redeem_registration(id, reg_fp, named_cert(fp, name))
+            .unwrap();
+        s.consume_registration(id).unwrap();
+    }
+
+    /// The first user to confirm is admin, not the holder of the first bundle.
+    #[test]
+    fn the_first_to_confirm_is_admin_not_the_first_bundle() {
+        let (_dir, mut s) = store();
+        let (a, admin) = s.add_registration(named_cert("ra", "neu-0001")).unwrap();
+        assert!(admin, "marked at issue time");
+        let (b, _) = s.add_registration(named_cert("rb", "neu-0002")).unwrap();
+        confirm(&mut s, b, "rb", "b1", "bob");
+        assert!(s.is_admin(b));
+        assert!(!s.is_admin(a), "the unused first bundle lost its mark");
+        confirm(&mut s, a, "ra", "a1", "alice");
+        assert!(!s.is_admin(a));
+        assert!(s.is_admin(b));
+    }
+
+    /// A redeem whose answer was lost holds only a provisional mark: someone
+    /// else confirming first takes the admin slot, and the lost one's later
+    /// expiry leaves the server with that admin.
+    #[test]
+    fn a_lost_response_does_not_block_the_admin_slot() {
+        let (_dir, mut s) = store();
+        let (a, _) = s.add_registration(named_cert("ra", "neu-0001")).unwrap();
+        let (b, _) = s.add_registration(named_cert("rb", "neu-0002")).unwrap();
+        s.redeem_registration(b, "rb", named_cert("b1", "bob"))
+            .unwrap();
+        assert!(s.is_admin(b), "provisional");
+        confirm(&mut s, a, "ra", "a1", "alice");
+        assert!(s.is_admin(a));
+        assert!(!s.is_admin(b), "the provisional mark is gone");
+
+        user_entry(&mut s.users, b).unwrap().certs[0].expires =
+            rfc3339(now() - Duration::from_secs(10));
+        assert_eq!(s.purge_expired_registrations().unwrap(), 1);
+        assert!(s.is_admin(a));
+        assert_eq!(s.functional_admin_count(), 1);
+    }
+
+    /// Once a confirmed admin exists, later registrations stay plain users.
+    #[test]
+    fn a_later_confirm_does_not_steal_admin() {
+        let (_dir, mut s) = store();
+        let (a, _) = s.add_registration(named_cert("ra", "neu-0001")).unwrap();
+        confirm(&mut s, a, "ra", "a1", "alice");
+        let (b, admin) = s.add_registration(named_cert("rb", "neu-0002")).unwrap();
+        assert!(!admin);
+        s.redeem_registration(b, "rb", named_cert("b1", "bob"))
+            .unwrap();
+        assert!(!s.is_admin(b), "no provisional mark either");
+        s.consume_registration(b).unwrap();
+        assert!(s.is_admin(a));
+        assert!(!s.is_admin(b));
     }
 
     #[test]
