@@ -97,12 +97,13 @@ pub async fn register(
     result
 }
 
-/// The close code that ends a registration session: `NO_ERROR` only once the
-/// new identity is stored, which tells the server to revoke the bundle.
-/// Anything else keeps it valid (`PROTOCOL.md` §2.3).
+/// The close code that ends a registration session: `REGISTRATION_STORED`
+/// only once the new identity is stored, which tells the server to revoke the
+/// bundle. Anything else keeps it valid, including the code 0 quinn closes
+/// with when a connection is merely dropped (`PROTOCOL.md` §2.3).
 pub fn receipt(stored: bool) -> quinn::VarInt {
     quinn::VarInt::from_u32(if stored {
-        icu_proto::error::NO_ERROR
+        icu_proto::error::REGISTRATION_STORED
     } else {
         icu_proto::error::SHUTDOWN
     })

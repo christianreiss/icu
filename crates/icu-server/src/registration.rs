@@ -49,7 +49,7 @@ pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issu
     // admin rights until a restart.
     store.purge_expired_registrations()?;
     let name = if label.is_empty() {
-        placeholder(&store)
+        placeholder(&store)?
     } else {
         validate_name(label)?;
         if store.name_taken(label, None) {
@@ -96,14 +96,25 @@ pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issu
     })
 }
 
-/// A free placeholder name, `neu-` plus four hex digits.
-fn placeholder(store: &Store) -> String {
-    loop {
-        let mut raw = [0u8; 2];
-        rand::rng().fill_bytes(&mut raw);
-        let name = format!("neu-{}", encode_hex(&raw));
-        if !store.name_taken(&name, None) {
-            return name;
+/// Random draws per length before [`placeholder`] tries a longer suffix.
+const PLACEHOLDER_TRIES: usize = 64;
+
+/// A free placeholder name, `neu-` plus four hex digits, or eight once four
+/// are crowded. Bounded: it runs under the store lock, and a store full of
+/// pending invites must not hang the server.
+fn placeholder(store: &Store) -> Result<String> {
+    for len in [2usize, 4] {
+        for _ in 0..PLACEHOLDER_TRIES {
+            let mut raw = [0u8; 4];
+            rand::rng().fill_bytes(&mut raw[..len]);
+            let name = format!("neu-{}", encode_hex(&raw[..len]));
+            if !store.name_taken(&name, None) {
+                return Ok(name);
+            }
         }
     }
+    Err(Error::coded(
+        ec::NAME_TAKEN,
+        "no free placeholder name, pass one explicitly",
+    ))
 }

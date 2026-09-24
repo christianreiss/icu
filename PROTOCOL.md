@@ -115,11 +115,11 @@ Es gibt kein Einladungs-Token, keinen Link, keinen Blob und kein eigenes Enrollm
 3. Der Server antwortet auf `Hello` mit `Welcome { registration: true, users: [], … }`. Die Sitzung tritt dem Raum nicht bei.
 4. Der Client erzeugt einen **eigenen** Schlüssel und sendet `RenewRequest` mit einer CSR, deren CN der gewählte Name ist.
 5. Der Server prüft: Schlüssel ≠ Schlüssel des Registrierungszertifikats (sonst `RENEW_REJECTED`), Name frei (sonst `NAME_TAKEN`, das Bundle bleibt gültig, der Nutzer kann einen anderen Namen versuchen), CSR-Regeln wie bei jedem Renewal (sonst `RENEW_REJECTED`). Dann stellt er das echte Zertifikat aus, übernimmt den Namen und antwortet `RenewResponse`. Das Registrierungszertifikat bleibt noch gültig.
-6. Der Client **speichert** Schlüssel und Zertifikat und schließt erst danach mit `NO_ERROR` — das ist die Quittung. Mit ihr widerruft der Server das Registrierungszertifikat; ebenso beim ersten Login mit einem echten Zertifikat dieses Nutzers. Ab dann ist das Bundle wertlos: es steht auf der CRL und scheitert im Handshake (`certificate_revoked`, §1).
+6. Der Client **speichert** Schlüssel und Zertifikat und schließt erst danach mit `REGISTRATION_STORED` (§6) — das ist die Quittung. `NO_ERROR` ist keine: QUIC-Implementierungen schließen eine bloß fallengelassene Verbindung implizit mit Code 0 (revidiert 2026-09-24). Mit ihr widerruft der Server das Registrierungszertifikat; ebenso beim ersten Login mit einem echten Zertifikat dieses Nutzers. Ab dann ist das Bundle wertlos: es steht auf der CRL und scheitert im Handshake (`certificate_revoked`, §1).
 
 **Ohne Quittung bleibt das Bundle gültig** (revidiert 2026-09-24): Geht `RenewResponse` verloren, bricht die Verbindung ab oder scheitert das Speichern, schließt der Client mit einem anderen Code (oder gar nicht) und kann dasselbe Bundle erneut einlösen. Eine erneute Einlösung widerruft die Zertifikate früherer, unquittierter Einlösungen — die sollte niemand halten, sonst hätte ihr erster Login die Registrierung verbraucht. Das Bundle bleibt also zwischen Einlösung und Quittung (Millisekunden, schlimmstenfalls bis zum nächsten Client-Start) ein Inhaber-Nachweis: wer eine Kopie in diesem Fenster einlöst, übernimmt den Zugang. Es bleibt derselbe Nutzer (`user_id`). Vorher widerrief schon die Einlösung das Bundle; ein verlorenes Antwortpaket hinterließ dann einen Nutzer mit einem Zertifikat, das niemand besaß, und einen dauerhaft belegten Namen.
 
-Eine Registrierungssitzung darf außer `Ping` und `RenewRequest` nichts senden (sonst `PROTOCOL_VIOLATION`), höchstens 10 `RenewRequest` stellen und höchstens 120 s offen bleiben. Registrierungssitzungen sind auf 5/min pro IP und 20/min global begrenzt (`ENROLL_RATE_LIMITED`). Ein Registrierungszertifikat ist höchstens 7 Tage gültig (Default 24 h); ein nie quittiertes wird nach Ablauf samt Nutzer entfernt, sein Name ist dann wieder frei. Das gilt auch nach einer unquittierten Einlösung: wer das Zertifikat doch gespeichert, sich aber bis zum Ablauf des Bundles nie damit angemeldet hat, braucht eine neue Einladung.
+Eine Registrierungssitzung darf außer `Ping` und `RenewRequest` nichts senden (sonst `PROTOCOL_VIOLATION`), höchstens 10 `RenewRequest` stellen und höchstens 120 s offen bleiben. Registrierungssitzungen sind auf 5/min pro IP und 20/min global begrenzt (`ENROLL_RATE_LIMITED`); ein abgewiesener Versuch verdrängt eine laufende Sitzung desselben Bundles nicht. Ein Registrierungszertifikat ist höchstens 7 Tage gültig (Default 24 h); ein nie quittiertes wird nach Ablauf samt Nutzer entfernt (beim Start, bei jeder neuen Einladung und bei jeder Einlösung), sein Name ist dann wieder frei. Das gilt auch nach einer unquittierten Einlösung: wer das Zertifikat doch gespeichert, sich aber bis zum Ablauf des Bundles nie damit angemeldet hat, braucht eine neue Einladung.
 
 **Wer wird Admin:** das erste Registrierungszertifikat, das gegen einen leeren Bestand ausgestellt wird. Den ersten Admin erzeugt man also mit `icu-server invite` auf dem Host, auch ohne laufenden Server.
 
@@ -198,7 +198,7 @@ Incoming ─accept─▶ Handshaking ─ALPN icu/1, TLS ok─▶ Authenticating 
                                                                    │ unbekannt/revoked            │ Timeout
                                                                    │                              │ Registrierungszertifikat
                                                                    ▼                              ▼
-                                                                close(AUTH_*)                  Registering ─RenewResponse, Close NO_ERROR─▶ Closed
+                                                                close(AUTH_*)                  Registering ─RenewResponse, Close REGISTRATION_STORED─▶ Closed
 ```
 
 Client-Sicht: `Connecting → Handshaking → SendHello → AwaitWelcome → Active → Closed`. Reconnect bei jedem nicht-fatalen Close und bei Netzfehlern: Backoff 1, 2, 4, 8, 15 s, dann 15 s, unbegrenzt; lokaler Zustand (Mute, Deafen, Lautstärken) bleibt. Fatal (kein Reconnect, UI-Hinweis) sind genau die in §6 mit „ja“ markierten Codes: PROTOCOL_VIOLATION, VERSION_UNSUPPORTED, AUTH_*, KICKED, RATE_LIMITED_FATAL, ENROLL_*. Alle anderen → Reconnect mit Backoff.
@@ -235,6 +235,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | 0x17 | `AUTH_DISABLED` | ja | Nutzer ist deaktiviert (`UserRecord.disabled`); geprüft beim Handshake, auch der Close-Code beim sofortigen Kick eines Online-Nutzers durch `AdminSetDisabled` |
 | 0x18 | `NO_SUCH_USER` | nein | Admin-Aktion nennt eine unbekannte `user_id`; nur als `AdminActionError`, nie als Close |
 | 0x19 | `SESSION_REPLACED` | ja | Dasselbe Client-Zertifikat hat sich erneut verbunden; die neuere Verbindung gewinnt, die ältere wird damit geschlossen (§7). Fatal, damit zwei Geräte mit demselben Passport sich nicht abwechselnd verdrängen |
+| 0x1A | `REGISTRATION_STORED` | – | Nur als Close des Clients am Ende einer Registrierungssitzung: Identität gespeichert, der Server widerruft das Bundle (§2.3). Jeder andere Code, auch `NO_ERROR`, lässt es gültig |
 
 ## 7. Limits (Server erzwingt)
 

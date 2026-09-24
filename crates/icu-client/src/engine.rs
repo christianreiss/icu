@@ -1853,10 +1853,15 @@ async fn run_session(
                     ))
                 }
             },
-            // No answer: the bundle is still valid, so try again.
+            // No answer: the bundle is still valid, so try again — unless the
+            // server closed with a fatal code (replaced by another device,
+            // revoked), where retrying would only burn the registration budget.
             Err(e @ crate::net::NetError::Connect(_)) => {
-                connection.close(crate::net::register::receipt(false), b"");
                 shared.state.send_modify(|s| s.banner = None);
+                if let Some(reason) = connection.close_reason() {
+                    return close_end(ConnectError::from_connection_error(reason));
+                }
+                connection.close(crate::net::register::receipt(false), b"");
                 SessionEnd::Retry(format!("Registrierung unterbrochen: {e}"))
             }
             Err(e) => {

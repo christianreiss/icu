@@ -99,12 +99,13 @@ impl TestServer {
         key: rcgen::KeyPair,
         csr: Vec<u8>,
     ) -> Result<Identity, EnrollFail> {
-        self.register_closing(bundle, key, csr, ec::NO_ERROR).await
+        self.register_closing(bundle, key, csr, ec::REGISTRATION_STORED)
+            .await
     }
 
     /// Registers like [`TestServer::register`] but ends the session with
-    /// `close_code` — anything but `NO_ERROR` is a client that did not
-    /// confirm it stored the certificate (`PROTOCOL.md` §2.3).
+    /// `SHUTDOWN` — anything but `REGISTRATION_STORED` is a client that did
+    /// not confirm it stored the certificate (`PROTOCOL.md` §2.3).
     pub async fn register_unconfirmed(
         &self,
         bundle: &str,
@@ -114,7 +115,8 @@ impl TestServer {
         self.register_closing(bundle, key, csr, ec::SHUTDOWN).await
     }
 
-    async fn register_closing(
+    /// Registers and ends the session with `close_code`.
+    pub async fn register_closing(
         &self,
         bundle: &str,
         key: rcgen::KeyPair,
