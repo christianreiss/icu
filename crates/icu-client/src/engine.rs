@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -448,6 +448,9 @@ struct Shared {
     cap_prod: Arc<Mutex<HeapProd<f32>>>,
     ref_prod: Arc<Mutex<HeapProd<f32>>>,
     play_cons: Arc<Mutex<HeapCons<f32>>>,
+    /// Largest block the playback callback has asked for; the mixer keeps
+    /// at least that much plus a block queued, whatever the graph quantum.
+    play_request: Arc<AtomicUsize>,
     /// Encoder loss percent mirrored for the tests.
     loss_perc: AtomicI64,
     /// Detected network condition (RTT, loss, congestion pressure); folded
@@ -582,6 +585,7 @@ impl Engine {
             cap_prod: Arc::new(Mutex::new(cap_prod)),
             ref_prod: Arc::new(Mutex::new(ref_prod)),
             play_cons: Arc::new(Mutex::new(play_cons)),
+            play_request: Arc::new(AtomicUsize::new(0)),
             loss_perc: AtomicI64::new(0),
             net: Mutex::new(NetworkTracker::new()),
             video_tier: AtomicU8::new(VideoTier::T0.as_u8()),
@@ -789,13 +793,20 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
         .state
         .send_modify(|s| s.aec_reference = reference_open);
     let play_cons = shared.play_cons.clone();
+    let play_request = shared.play_request.clone();
+    let stats = shared.stats.clone();
     match backend.open_playback(
         settings.audio.output_device.as_deref(),
         Box::new(move |out| {
+            play_request.fetch_max(out.len(), Ordering::Relaxed);
             let n = match play_cons.try_lock() {
                 Ok(mut c) => c.pop_slice(out),
                 Err(_) => 0,
             };
+            if n < out.len() {
+                // The mixer always queues (silence included): a gap.
+                DebugStats::inc(&stats.playback_underruns);
+            }
             out[n..].fill(0.0);
         }),
     ) {
@@ -1172,8 +1183,12 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
         if shared.dsp.stop.load(Ordering::Relaxed) {
             return;
         }
-        // Keep two blocks (20 ms) ahead of the playback callback.
-        if play.occupied_len() >= 2 * BLOCK {
+        // Keep two blocks (20 ms) ahead of the playback callback, or one
+        // callback plus a block when the graph quantum is larger than that.
+        let lead = (2 * BLOCK)
+            .max(shared.play_request.load(Ordering::Relaxed) + BLOCK)
+            .min(play.capacity().get() - BLOCK);
+        if play.occupied_len() >= lead {
             // If nobody consumes (no playback stream), keep the jitter buffers
             // flowing by discarding.
             let stalled = match stalled_since {
@@ -1261,7 +1276,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
             }
         }
         mixer::mix(&refs, &mut out);
-        if play.occupied_len() < 2 * BLOCK {
+        if play.occupied_len() < lead {
             let n = play.push_slice(&out);
             DebugStats::add(&stats.samples_played, n as u64);
         }
