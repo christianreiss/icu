@@ -916,6 +916,7 @@ fn dsp_thread(
                     ref_open,
                     shared.cycle.cycle_complete(),
                     ready_since.map_or(Duration::ZERO, |t| t.elapsed()),
+                    shared.cycle.stall_wait(),
                 );
                 match step {
                     refalign::Step::Wait => {

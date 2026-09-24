@@ -25,9 +25,14 @@ use std::{
 
 /// How long a ready capture block waits for the other half of its cycle.
 pub const HALF_WAIT: Duration = Duration::from_millis(1);
-/// How long it waits for a reference that has not delivered a block at all
-/// before a silent reference is fed and an underrun counted.
+/// Minimum time it waits for a reference that has not delivered a block
+/// before a silent reference is fed and an underrun counted. The engine
+/// stretches it to 1.5 graph cycles ([`CycleClock::stall_wait`]).
 pub const STALL_WAIT: Duration = Duration::from_millis(5);
+/// Two pushes this close together belong to the same graph cycle. Both
+/// streams run in one `node.group`, so their callbacks follow each other
+/// within microseconds; a real gap is a whole cycle (≥ 2.7 ms at 128).
+const SAME_CYCLE_NS: u64 = 500_000;
 
 /// What the DSP thread should do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,8 +56,9 @@ pub enum Step {
 ///
 /// `cap`/`reference` are the ring occupancies, `block` the DSP block size,
 /// `ref_open` whether a reference stream is running, `cycle_complete`
-/// whether both streams have pushed in the current graph cycle, and
-/// `waited` how long the ready capture block has been waiting.
+/// whether both streams have pushed in the current graph cycle, `waited`
+/// how long the ready capture block has been waiting, and `stall_wait` when
+/// to give up on the reference.
 pub fn step(
     cap: usize,
     reference: usize,
@@ -60,6 +66,7 @@ pub fn step(
     ref_open: bool,
     cycle_complete: bool,
     waited: Duration,
+    stall_wait: Duration,
 ) -> Step {
     if cap < block {
         return Step::Wait;
@@ -72,13 +79,18 @@ pub fn step(
         if reference - drop_ref >= block {
             return Step::Pair { drop_ref };
         }
+        if cap >= reference + block {
+            // The reference runs a whole block early (capture started
+            // first). Skip one reference block; it stays early, never late.
+            return Step::Silent { underrun: false };
+        }
     } else if waited < HALF_WAIT {
         return Step::Wait;
     } else if reference >= block {
         // The other half is late; pair without trusting the difference.
         return Step::Pair { drop_ref: 0 };
     }
-    if waited < STALL_WAIT {
+    if waited < stall_wait {
         Step::Wait
     } else {
         Step::Silent { underrun: true }
@@ -120,13 +132,22 @@ impl CycleClock {
         self.ref_ns.store(self.now_ns(), Ordering::Release);
     }
 
-    /// Both streams pushed within half a quantum of each other, i.e. in
-    /// the same graph cycle.
+    /// Both streams pushed in the same graph cycle.
     pub fn cycle_complete(&self) -> bool {
+        self.skew() < Duration::from_nanos(SAME_CYCLE_NS)
+    }
+
+    /// Distance between the last capture and reference push.
+    pub fn skew(&self) -> Duration {
         let c = self.cap_ns.load(Ordering::Acquire);
         let r = self.ref_ns.load(Ordering::Acquire);
-        let half_quantum_ns = self.cap_len.load(Ordering::Relaxed) * 1_000_000_000 / 48_000 / 2;
-        c.abs_diff(r) < half_quantum_ns
+        Duration::from_nanos(c.abs_diff(r))
+    }
+
+    /// [`STALL_WAIT`], stretched to 1.5 graph cycles for large quanta.
+    pub fn stall_wait(&self) -> Duration {
+        let cycle_ns = self.cap_len.load(Ordering::Relaxed) * 1_000_000_000 / 48_000;
+        STALL_WAIT.max(Duration::from_nanos(cycle_ns * 3 / 2))
     }
 }
 
@@ -141,6 +162,10 @@ mod tests {
     use std::collections::VecDeque;
 
     const BLOCK: usize = 480;
+
+    fn st(cap: usize, r: usize, block: usize, open: bool, complete: bool, w: Duration) -> Step {
+        step(cap, r, block, open, complete, w, STALL_WAIT)
+    }
 
     struct Sim {
         cap: VecDeque<usize>,
@@ -208,7 +233,7 @@ mod tests {
 
     fn fixed(sim: &mut Sim, waited: Duration) -> bool {
         let complete = sim.cap_cycle == sim.ref_cycle;
-        match step(
+        match st(
             sim.cap.len(),
             sim.reference.len(),
             BLOCK,
@@ -301,25 +326,48 @@ mod tests {
     }
 
     #[test]
+    fn reference_starting_late_ends_less_than_a_block_early() {
+        for quantum in [240usize, 1024] {
+            for start in 1..6 {
+                for seed in 0..10 {
+                    let s = simulate(quantum, 2000, 0..start, seed, fixed);
+                    assert!(s.lags.iter().all(|&l| l <= 0), "q={quantum} start={start}");
+                    let tail = &s.lags[s.lags.len() / 2..];
+                    assert!(
+                        tail.iter().all(|&l| l > -(BLOCK as i64)),
+                        "q={quantum} start={start} seed={seed} lag {:?}",
+                        tail.iter().min()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn edge_cases() {
         let z = Duration::ZERO;
         assert_eq!(
-            step(480, 0, 480, false, false, z),
+            st(480, 0, 480, false, false, z),
             Step::Silent { underrun: false }
         );
-        assert_eq!(step(479, 960, 480, true, true, z), Step::Wait);
+        assert_eq!(st(479, 960, 480, true, true, z), Step::Wait);
         assert_eq!(
-            step(480, 960, 480, true, true, z),
+            st(480, 960, 480, true, true, z),
             Step::Pair { drop_ref: 480 }
         );
-        assert_eq!(step(480, 960, 480, true, false, z), Step::Wait);
+        assert_eq!(st(480, 960, 480, true, false, z), Step::Wait);
         assert_eq!(
-            step(480, 960, 480, true, false, HALF_WAIT),
+            st(480, 960, 480, true, false, HALF_WAIT),
             Step::Pair { drop_ref: 0 }
         );
-        assert_eq!(step(480, 100, 480, true, true, HALF_WAIT), Step::Wait);
+        assert_eq!(st(480, 100, 480, true, true, HALF_WAIT), Step::Wait);
+        // Reference a whole block early: skip it without an underrun.
         assert_eq!(
-            step(480, 100, 480, true, true, STALL_WAIT),
+            st(960, 400, 480, true, true, z),
+            Step::Silent { underrun: false }
+        );
+        assert_eq!(
+            st(480, 100, 480, true, true, STALL_WAIT),
             Step::Silent { underrun: true }
         );
     }
