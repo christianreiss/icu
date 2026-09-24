@@ -480,7 +480,10 @@ impl Identity {
     /// has to parse, since the codec only checks the wrapper.
     pub fn from_passport(armored: &str) -> Result<Identity, String> {
         use icu_proto::passport::Passport;
-        let passport = Passport::decode(armored).map_err(|e| format!("Passport unlesbar: {e}"))?;
+        let passport = Passport::decode(armored).map_err(|e| {
+            tracing::info!(%e, "passport does not decode");
+            crate::problem::passport_text(&e)
+        })?;
         let identity = match passport {
             Passport::V1(p) => Identity {
                 key_der: p.key_der,
@@ -495,7 +498,9 @@ impl Identity {
             },
             Passport::V2(p) => {
                 let server = ServerInfo::from_certs(&p.leaf_der, &p.ca_der).ok_or_else(|| {
-                    "Passport enthält keine Serveradresse im Zertifikat.".to_string()
+                    "Dieser Passport ist unvollständig (keine Serveradresse). Bitte auf dem \
+                     anderen Gerät neu exportieren."
+                        .to_string()
                 })?;
                 Identity {
                     key_der: p.key_der,
@@ -506,7 +511,11 @@ impl Identity {
             }
         };
         if rcgen::KeyPair::try_from(identity.key_der.as_slice()).is_err() {
-            return Err("Passport enthält keinen gültigen Schlüssel.".into());
+            return Err(
+                "Dieser Passport ist beschädigt (kein gültiger Schlüssel). Bitte auf \
+                        dem anderen Gerät neu exportieren."
+                    .into(),
+            );
         }
         Ok(identity)
     }

@@ -189,6 +189,8 @@ Regeln: keine modalen Fehlerdialoge (Banner im Fenster), alle Settings sofort wi
 
 Tray: tray-icon 0.25 (Linux `default-features = false, features = ["ksni"]`), Icon-Varianten verbunden/getrennt/mute/deafen, Menü Mute/Deafen/Fenster/Beenden.
 
+**Fehlertexte** (2026-09-24): Alles, was der Nutzer als Fehler sieht, läuft über `crate::problem::Problem { text, technical }`. `text` ist ein bis zwei Sätze Deutsch ohne Codenamen oder Bibliotheksjargon und sagt, was passiert ist und was zu tun ist. `technical` ist der bisherige Fehlerstring für Log und Support. `ConnectError::problem()` / `NetError::problem()` übersetzen Netzfehler, `problem::code_text` jeden Protokollcode (`PROTOCOL.md` §6), `name_error_text` / `passport_text` die Namens- und Passport-Regeln. Die `Display`-Impls bleiben technisch fürs Log. Ein fataler Verbindungsfehler steht als Banner „Keine Verbindung“ direkt im Hauptfenster (Nicht-Techniker hovern nicht), ab dem zweiten Wiederholversuch ein Warnbanner. Im Verbindungsfenster klappt „Technische Details“ den Rohtext aus. Zugangsdaten einer anderen CA (Server neu eingerichtet) lesen sich als „Zugangsdaten passen nicht (mehr) … neue Einladung anfordern“. Nicht abgedeckt: Kamera- und CRL-Meldungen (nur Log) sowie CLI-Texte.
+
 ## 11. Konfiguration
 
 `settings.toml` unter `$XDG_CONFIG_HOME/icu/` bzw. `%APPDATA%\icu\`:

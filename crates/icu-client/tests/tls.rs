@@ -36,13 +36,77 @@ async fn wrong_server_name_is_a_fatal_certificate_error() {
     let ConnStatus::Fatal(reason) = &state.conn else {
         unreachable!("predicate guarantees Fatal");
     };
+    let technical = reason.technical.as_deref().unwrap_or_default();
     assert!(
-        reason.contains("wrong.invalid"),
-        "reason should name the mismatched FQDN, got: {reason}"
+        technical.contains("wrong.invalid"),
+        "the technical detail should name the mismatched FQDN, got: {technical}"
+    );
+    assert!(
+        reason.text.contains("Serveradresse passt nicht"),
+        "user text: {}",
+        reason.text
     );
 
     engine.shutdown();
     server.handle.shutdown().await;
+    drop(dir);
+}
+
+/// A client whose credentials come from another CA — the server was set up
+/// anew since — is told in plain words to ask for a new invitation, with
+/// the raw TLS error kept only as technical detail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn credentials_from_another_ca_read_as_a_plain_request_for_an_invite() {
+    let old_server = TestServer::start().await;
+    let (identity, paths, dir) = old_server.enroll("alice").await;
+    let new_server = TestServer::start().await;
+
+    let (backend, _probe) = FakeBackend::silent();
+    let mut settings = Settings::default();
+    settings.audio.aec = false;
+    settings.audio.denoise = false;
+    settings.ui.register_uri_handler = false;
+    let mut cfg = EngineConfig::new(identity, settings, paths);
+    cfg.server_addr = Some(new_server.addr());
+    let engine = Engine::start(cfg, Box::new(backend)).expect("engine starts");
+
+    let state = wait_for(&engine, SOON, |s| matches!(&s.conn, ConnStatus::Fatal(_))).await;
+    let ConnStatus::Fatal(problem) = &state.conn else {
+        unreachable!("predicate guarantees Fatal");
+    };
+    assert!(
+        problem.text.contains("neue Einladung"),
+        "user text: {}",
+        problem.text
+    );
+    for jargon in [
+        "UnknownIssuer",
+        "BadSignature",
+        "TLS",
+        "Zertifikatsprüfung",
+        "tls:",
+    ] {
+        assert!(
+            !problem.text.contains(jargon),
+            "{jargon} in {}",
+            problem.text
+        );
+    }
+    assert!(
+        // `UnknownIssuer` in the field; `BadSignature` here, where both test
+        // CAs carry the same subject.
+        problem
+            .technical
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Zertifikatsprüfung fehlgeschlagen"),
+        "technical: {:?}",
+        problem.technical
+    );
+
+    engine.shutdown();
+    old_server.handle.shutdown().await;
+    new_server.handle.shutdown().await;
     drop(dir);
 }
 

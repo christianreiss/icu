@@ -14,7 +14,10 @@ use rustls::{
     DigitallySignedStruct, SignatureScheme,
 };
 
-use crate::config::Identity;
+use crate::{
+    config::Identity,
+    problem::{self, Problem},
+};
 
 use super::{read_frame, NetError};
 
@@ -182,7 +185,7 @@ fn check_not_expired(leaf_der: &[u8], now: i64) -> Result<(), NetError> {
             "Das eigene Zertifikat ist abgelaufen — Passport eines anderen Geräts \
              importieren oder eine neue Einladung anfordern"
         };
-        return Err(NetError::Tls(format!(
+        return Err(NetError::Expired(format!(
             "{what} (gültig bis {})",
             cert.validity().not_after
         )));
@@ -206,15 +209,22 @@ fn unix_now() -> i64 {
 fn certificate_error(server_name: &str, ce: &rustls::CertificateError) -> ConnectError {
     match ce {
         rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. } => {
-            ConnectError::Transport(
+            ConnectError::ServerCert(
                 "Serverzertifikat abgelaufen – warte auf Erneuerung durch den Server".into(),
             )
         }
-        rustls::CertificateError::Revoked => ConnectError::Transport(
+        rustls::CertificateError::Revoked => ConnectError::ServerCert(
             "Serverzertifikat widerrufen – warte auf ein neues vom Server".into(),
         ),
+        rustls::CertificateError::NotValidForName
+        | rustls::CertificateError::NotValidForNameContext { .. } => ConnectError::Certificate {
+            server_name: server_name.to_string(),
+            issue: CertIssue::NameMismatch,
+            detail: describe_certificate_error(ce),
+        },
         _ => ConnectError::Certificate {
             server_name: server_name.to_string(),
+            issue: CertIssue::Untrusted,
             detail: describe_certificate_error(ce),
         },
     }
@@ -373,6 +383,9 @@ pub enum ConnectError {
     },
     /// Transport failure (timeout, reset, unreachable).
     Transport(String),
+    /// The server's own certificate is expired or revoked: the operator's to
+    /// fix, and it heals on its own once the server rotates it. Not fatal.
+    ServerCert(String),
     /// We could not make sense of what the server sent.
     Protocol(String),
     /// TLS certificate verification failed for `server_name`. Never
@@ -380,9 +393,23 @@ pub enum ConnectError {
     Certificate {
         /// The FQDN/IP TLS verification ran against.
         server_name: String,
+        /// Which kind of failure, for the user-facing text.
+        issue: CertIssue,
         /// What went wrong.
         detail: String,
     },
+}
+
+/// Why a certificate check failed, as far as the user is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertIssue {
+    /// The server's certificate is not for the address we dialled.
+    NameMismatch,
+    /// The server lists our certificate as revoked.
+    RevokedByServer,
+    /// The two sides do not trust each other: a different CA, typically
+    /// after the server was set up anew.
+    Untrusted,
 }
 
 impl ConnectError {
@@ -404,11 +431,13 @@ impl ConnectError {
                 if u64::from(c.error_code) - 0x100 == 44 {
                     return ConnectError::Certificate {
                         server_name: String::new(),
+                        issue: CertIssue::RevokedByServer,
                         detail: "Der Server hat dieses Zertifikat widerrufen.".into(),
                     };
                 }
                 ConnectError::Certificate {
                     server_name: String::new(),
+                    issue: CertIssue::Untrusted,
                     detail: format!(
                         "Server hat das Client-Zertifikat abgelehnt (TLS-Alert {}): {}",
                         u64::from(c.error_code) - 0x100,
@@ -424,9 +453,37 @@ impl ConnectError {
     pub fn is_fatal(&self) -> bool {
         match self {
             ConnectError::Closed { code, .. } => icu_proto::error::is_fatal(*code),
-            ConnectError::Transport(_) => false,
+            ConnectError::Transport(_) | ConnectError::ServerCert(_) => false,
             ConnectError::Protocol(_) => true,
             ConnectError::Certificate { .. } => true,
+        }
+    }
+
+    /// What the user reads (`crate::problem`); `Display` stays technical
+    /// for the log.
+    pub fn problem(&self) -> Problem {
+        let technical = self.to_string();
+        match self {
+            ConnectError::Closed { code, reason } => problem::from_code(*code, reason),
+            ConnectError::Transport(_) => Problem::new(problem::UNREACHABLE, technical),
+            ConnectError::ServerCert(_) => Problem::new(
+                "Das Zertifikat des Servers ist abgelaufen oder gesperrt. Das muss der \
+                 Server-Betreiber beheben – ICU versucht es weiter.",
+                technical,
+            ),
+            ConnectError::Protocol(_) => Problem::new(problem::UPDATE_NEEDED, technical),
+            ConnectError::Certificate { issue, .. } => match issue {
+                CertIssue::NameMismatch => Problem::new(
+                    "Die Serveradresse passt nicht zum Zertifikat des Servers. Bitte beim \
+                     Admin eine neue Einladung anfordern.",
+                    technical,
+                ),
+                CertIssue::RevokedByServer => Problem::new(
+                    problem::code_text(icu_proto::error::AUTH_REVOKED),
+                    technical,
+                ),
+                CertIssue::Untrusted => Problem::new(problem::CREDENTIALS_STALE, technical),
+            },
         }
     }
 
@@ -449,14 +506,17 @@ impl std::fmt::Display for ConnectError {
                 write!(f, "{} ({code}) {reason}", icu_proto::error::name(*code))
             }
             ConnectError::Transport(s) => write!(f, "transport: {s}"),
+            ConnectError::ServerCert(s) => f.write_str(s),
             ConnectError::Protocol(s) => write!(f, "protocol: {s}"),
             ConnectError::Certificate {
                 server_name,
                 detail,
+                ..
             } if server_name.is_empty() => f.write_str(detail),
             ConnectError::Certificate {
                 server_name,
                 detail,
+                ..
             } => write!(f, "Zertifikat für „{server_name}“ ungültig: {detail}"),
         }
     }
@@ -498,6 +558,7 @@ mod tests {
         assert!(ConnectError::Protocol("x".into()).is_fatal());
         assert!(ConnectError::Certificate {
             server_name: "x".into(),
+            issue: CertIssue::Untrusted,
             detail: "y".into(),
         }
         .is_fatal());
@@ -506,12 +567,37 @@ mod tests {
     #[test]
     fn an_expired_or_revoked_server_certificate_is_retried() {
         let expired = certificate_error("x", &rustls::CertificateError::Expired);
-        assert!(matches!(expired, ConnectError::Transport(_)));
+        assert!(matches!(expired, ConnectError::ServerCert(_)));
         assert!(!expired.is_fatal());
         assert!(!certificate_error("x", &rustls::CertificateError::Revoked).is_fatal());
         let wrong_name = certificate_error("x", &rustls::CertificateError::NotValidForName);
         assert!(matches!(wrong_name, ConnectError::Certificate { .. }));
         assert!(wrong_name.is_fatal());
+    }
+
+    /// Every connection failure reads as plain German; the raw error stays
+    /// in `technical`.
+    #[test]
+    fn connection_failures_read_as_plain_german() {
+        let cases = [
+            ConnectError::Closed {
+                code: icu_proto::error::AUTH_UNKNOWN_CERT,
+                reason: "AUTH_UNKNOWN_CERT".into(),
+            },
+            ConnectError::Transport("timed out".into()),
+            ConnectError::ServerCert("Serverzertifikat abgelaufen".into()),
+            ConnectError::Protocol("expected Welcome".into()),
+            certificate_error("x", &rustls::CertificateError::UnknownIssuer),
+            certificate_error("x", &rustls::CertificateError::NotValidForName),
+        ];
+        for e in cases {
+            let p = e.problem();
+            crate::problem::tests::assert_readable(&p);
+            assert!(p.technical.is_some(), "{e}");
+        }
+        let untrusted = certificate_error("x", &rustls::CertificateError::UnknownIssuer).problem();
+        assert_eq!(untrusted.text, crate::problem::CREDENTIALS_STALE);
+        assert!(untrusted.technical.unwrap().contains("UnknownIssuer"));
     }
 
     #[test]

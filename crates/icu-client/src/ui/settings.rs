@@ -464,7 +464,7 @@ impl SettingsView {
                                 let path = self.paths.config_dir.join("icu-passport.txt");
                                 match crate::config::write_atomic(&path, text.as_bytes(), true) {
                                     Ok(()) => format!("Gespeichert: {}", path.display()),
-                                    Err(e) => format!("Speichern fehlgeschlagen: {e}"),
+                                    Err(e) => crate::problem::storage("Der Passport", &e).text,
                                 }
                             }
                             Err(e) => e,
@@ -585,7 +585,10 @@ impl SettingsView {
         match Identity::load(&self.paths) {
             Ok(Some(id)) => Ok(id.to_passport()),
             Ok(None) => Err("Keine Identität gefunden.".into()),
-            Err(e) => Err(format!("Fehlgeschlagen: {e}")),
+            Err(e) => {
+                tracing::warn!(%e, "identity unreadable");
+                Err("Die gespeicherten Zugangsdaten lassen sich nicht lesen.".into())
+            }
         }
     }
 
@@ -937,7 +940,9 @@ impl SettingsView {
                                     self.invite_status =
                                         Some(match config::save_invite(&self.paths, bundle) {
                                             Ok(path) => format!("Gespeichert: {}", path.display()),
-                                            Err(e) => format!("Fehlgeschlagen: {e}"),
+                                            Err(e) => {
+                                                crate::problem::storage("Die Einladung", &e).text
+                                            }
                                         });
                                 }
                             });
@@ -1184,7 +1189,7 @@ impl SettingsView {
                         self.export_status =
                             Some(match std::fs::write(&path, self.stats.report()) {
                                 Ok(()) => format!("Geschrieben: {}", path.display()),
-                                Err(e) => format!("Fehlgeschlagen: {e}"),
+                                Err(e) => crate::problem::storage("Die Statistik", &e).text,
                             });
                     }
                     if widgets::button(

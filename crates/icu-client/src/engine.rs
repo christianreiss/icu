@@ -48,6 +48,7 @@ use crate::{
         NetError,
     },
     netcond::{NetworkTracker, Sample},
+    problem::Problem,
     quality::QualityController,
     stats::DebugStats,
     video::VideoTier,
@@ -93,8 +94,8 @@ impl EngineConfig {
 pub enum ConnStatus {
     /// Not connected, will retry after `retry_in`.
     Disconnected {
-        /// Why.
-        reason: String,
+        /// Why, worded for the user.
+        reason: Problem,
         /// Attempt counter.
         attempt: u32,
     },
@@ -103,7 +104,7 @@ pub enum ConnStatus {
     /// `Welcome` received.
     Connected,
     /// Fatal close; no reconnect.
-    Fatal(String),
+    Fatal(Problem),
 }
 
 /// One participant as the UI sees it.
@@ -171,8 +172,10 @@ pub struct AppState {
     pub conn_stats: Option<crate::conninfo::ConnStats>,
     /// `Welcome.min_client` is above our version.
     pub update_required: Option<String>,
-    /// Non-modal banner.
-    pub banner: Option<String>,
+    /// Non-modal error banner, dismissible.
+    pub banner: Option<Problem>,
+    /// Something in progress worth a line (a registration running).
+    pub notice: Option<String>,
     /// Rename error (`NAME_TAKEN`, `RENEW_REJECTED`, or a local one).
     pub name_error: Option<String>,
     /// A rename the user asked for is waiting for its new certificate.
@@ -533,6 +536,7 @@ impl Engine {
             conn_stats: None,
             update_required: None,
             banner: None,
+            notice: None,
             name_error: None,
             rename_pending: false,
             is_admin: false,
@@ -638,7 +642,13 @@ impl Engine {
                             BackendEvent::StreamError { stream, message } => {
                                 tracing::warn!(?stream, %message, "audio stream error");
                                 shared.state.send_modify(|s| {
-                                    s.banner = Some(format!("Audio {stream:?}: {message}"))
+                                    s.banner = Some(crate::problem::audio(
+                                        match stream {
+                                            StreamKind::Playback => "Der Lautsprecher",
+                                            _ => "Das Mikrofon",
+                                        },
+                                        &format!("{stream:?}: {message}"),
+                                    ))
                                 });
                                 let _ = backend.lock().map(|mut b| b.close(stream));
                             }
@@ -771,7 +781,7 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
         tracing::warn!(error = %e, "cannot open capture");
         shared
             .state
-            .send_modify(|s| s.banner = Some(format!("Mikrofon: {e}")));
+            .send_modify(|s| s.banner = Some(crate::problem::audio("Das Mikrofon", &e)));
     }
     let mut reference_open = false;
     if settings.audio.aec {
@@ -820,7 +830,7 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
             tracing::warn!(error = %e, "cannot open playback");
             shared
                 .state
-                .send_modify(|s| s.banner = Some(format!("Wiedergabe: {e}")));
+                .send_modify(|s| s.banner = Some(crate::problem::audio("Der Lautsprecher", &e)));
         }
     }
 }
@@ -1348,6 +1358,7 @@ async fn net_task(
         backend,
         identity: cfg.identity.clone(),
         pending_renew: None,
+        invite_pending: false,
         renew_attempted_at: None,
         window_visible: !cfg.settings.ui.start_minimized,
     };
@@ -1381,7 +1392,7 @@ async fn net_task(
                 )
                 .await
             }
-            Err(e) => SessionEnd::Retry(e.to_string()),
+            Err(e) => SessionEnd::Retry(e.problem()),
         };
         if was_connected {
             attempt = 0;
@@ -1462,8 +1473,23 @@ async fn net_task(
 
 enum SessionEnd {
     Quit,
-    Fatal(String),
-    Retry(String),
+    Fatal(Problem),
+    Retry(Problem),
+}
+
+/// A control-stream write failed: the connection is gone.
+fn send_failed() -> SessionEnd {
+    SessionEnd::Retry(Problem::new(
+        "Die Verbindung zum Server ist abgebrochen. ICU verbindet sich neu.",
+        "send failed",
+    ))
+}
+
+/// Deliberate reconnect with new credentials; not a failure.
+fn reconnect_with_new_identity() -> SessionEnd {
+    SessionEnd::Retry(Problem::plain(
+        "Neue Zugangsdaten übernommen – verbinde neu …",
+    ))
 }
 
 struct LocalState {
@@ -1478,6 +1504,8 @@ struct LocalState {
     identity: Identity,
     /// The renewal this client is waiting for, if any.
     pending_renew: Option<PendingRenew>,
+    /// A `CreateInviteRequest` is waiting for its answer.
+    invite_pending: bool,
     /// When the last automatic renewal was sent. The server allows one a
     /// day, so the next try waits that long.
     renew_attempted_at: Option<Instant>,
@@ -1529,11 +1557,17 @@ async fn send_renew(
         RenewReason::UserRename => icu_proto::validate_name(cn),
         RenewReason::CatchUp | RenewReason::Expiry => icu_proto::validate_stored_name(cn),
     };
-    checked.map_err(|e| RenewSendError::Local(e.to_string()))?;
-    let key = rcgen::KeyPair::try_from(local.identity.key_der.as_slice())
-        .map_err(|e| RenewSendError::Local(format!("eigener Schlüssel unlesbar: {e}")))?;
-    let csr_der =
-        crate::net::register::csr_for(cn, &key).map_err(|e| RenewSendError::Local(e.to_string()))?;
+    checked.map_err(|e| RenewSendError::Local(crate::problem::name_error_text(&e)))?;
+    let key = rcgen::KeyPair::try_from(local.identity.key_der.as_slice()).map_err(|e| {
+        tracing::warn!(%e, "own key unreadable");
+        RenewSendError::Local(
+            "Die gespeicherten Zugangsdaten sind beschädigt. Bitte den Passport erneut \
+             importieren."
+                .into(),
+        )
+    })?;
+    let csr_der = crate::net::register::csr_for(cn, &key)
+        .map_err(|e| RenewSendError::Local(e.problem().text))?;
     if conn::write_msg(send, &ControlMsg::RenewRequest { csr_der })
         .await
         .is_err()
@@ -1769,9 +1803,13 @@ impl LocalState {
                 shared.state.send_modify(|s| s.hotkey_backend = name);
             }
             Command::RequestRename(_) => {
-                shared
-                    .state
-                    .send_modify(|s| s.name_error = Some("Nicht verbunden".into()));
+                shared.state.send_modify(|s| {
+                    s.name_error = Some(
+                        "Nicht mit dem Server verbunden – der Name lässt sich erst ändern, \
+                             wenn die Verbindung steht."
+                            .into(),
+                    )
+                });
             }
             Command::ReplaceIdentity(identity) => {
                 self.replace_identity(*identity, shared);
@@ -1805,7 +1843,7 @@ impl LocalState {
             s.name_error = None;
             s.rename_pending = false;
             if let Err(e) = &saved {
-                s.banner = Some(format!("Passport konnte nicht gespeichert werden: {e}"));
+                s.banner = Some(crate::problem::storage("Der Passport", e));
             }
         });
         tracing::info!(name = %self.name, "identity replaced");
@@ -1838,7 +1876,11 @@ impl LocalState {
             shared.state.send_modify(|s| {
                 s.rename_pending = false;
                 if user_asked {
-                    s.name_error = Some(detail);
+                    s.name_error = Some(
+                        "Der Server hat die Namensänderung falsch beantwortet. Der bisherige Name \
+                         bleibt."
+                            .into(),
+                    );
                 }
             });
             return;
@@ -1858,7 +1900,7 @@ impl LocalState {
             s.rename_pending = false;
             s.name_error = None;
             if let Err(e) = &saved {
-                s.banner = Some(format!("Neues Zertifikat nicht gespeichert: {e}"));
+                s.banner = Some(crate::problem::storage("Das neue Zertifikat", e));
             }
             // Otherwise the Verbindung window keeps showing the old subject
             // and fingerprint for the rest of the session.
@@ -1907,16 +1949,14 @@ async fn run_session(
     was_connected: &mut bool,
 ) -> SessionEnd {
     let crl = crate::crl::load(&local.paths, &local.identity.ca_der);
-    let (client_config, cert_failure) = match conn::client_config_with_crl(
-        &local.identity,
-        crl.as_deref(),
-    ) {
-        Ok(c) => c,
-        Err(e) => return SessionEnd::Fatal(e.to_string()),
-    };
+    let (client_config, cert_failure) =
+        match conn::client_config_with_crl(&local.identity, crl.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return SessionEnd::Fatal(e.problem()),
+        };
     let endpoint = match crate::net::bind_endpoint(addr) {
         Ok(e) => e,
-        Err(e) => return SessionEnd::Retry(e.to_string()),
+        Err(e) => return SessionEnd::Retry(e.problem()),
     };
     let sni = crate::net::server_name_for(&local.identity.server.server_name);
     let hello_flags = local.flags;
@@ -1941,9 +1981,9 @@ async fn run_session(
         Ok(s) => s,
         Err(e) => {
             return if e.is_fatal() {
-                SessionEnd::Fatal(e.to_string())
+                SessionEnd::Fatal(e.problem())
             } else {
-                SessionEnd::Retry(e.to_string())
+                SessionEnd::Retry(e.problem())
             };
         }
     };
@@ -1961,7 +2001,7 @@ async fn run_session(
     if welcome.registration {
         shared.state.send_modify(|s| {
             s.conn = ConnStatus::Connecting;
-            s.banner = Some("Registrierung läuft…".into());
+            s.notice = Some("Anmeldung läuft …".into());
         });
         let name = welcome.you.name.clone();
         let bundle = local.identity.clone();
@@ -1979,32 +2019,37 @@ async fn run_session(
                 Ok(()) => {
                     connection.close(crate::net::register::receipt(true), b"");
                     local.replace_identity(identity, shared);
-                    shared.state.send_modify(|s| s.banner = None);
-                    SessionEnd::Retry("registriert".into())
+                    shared.state.send_modify(|s| s.notice = None);
+                    SessionEnd::Retry(Problem::plain("Anmeldung gespeichert – verbinde neu …"))
                 }
                 Err(e) => {
                     connection.close(crate::net::register::receipt(false), b"");
-                    shared.state.send_modify(|s| s.banner = None);
-                    SessionEnd::Fatal(format!(
-                        "Registrierung nicht gespeichert: {e} — die Einladung bleibt gültig"
-                    ))
+                    shared.state.send_modify(|s| s.notice = None);
+                    let mut p = crate::problem::storage("Die Anmeldung", &e);
+                    p.text.push_str(" Die Einladung bleibt gültig.");
+                    SessionEnd::Fatal(p)
                 }
             },
             // No answer: the bundle is still valid, so try again — unless the
             // server closed with a fatal code (replaced by another device,
             // revoked), where retrying would only burn the registration budget.
             Err(e @ crate::net::NetError::Connect(_)) => {
-                shared.state.send_modify(|s| s.banner = None);
+                shared.state.send_modify(|s| s.notice = None);
                 if let Some(reason) = connection.close_reason() {
                     return close_end(ConnectError::from_connection_error(reason));
                 }
                 connection.close(crate::net::register::receipt(false), b"");
-                SessionEnd::Retry(format!("Registrierung unterbrochen: {e}"))
+                SessionEnd::Retry(Problem::new(
+                    "Die Anmeldung wurde unterbrochen. ICU versucht es gleich noch einmal.",
+                    e.to_string(),
+                ))
             }
             Err(e) => {
                 connection.close(crate::net::register::receipt(false), b"");
-                shared.state.send_modify(|s| s.banner = None);
-                SessionEnd::Fatal(format!("Registrierung fehlgeschlagen: {e}"))
+                shared.state.send_modify(|s| s.notice = None);
+                let mut p = e.problem();
+                p.text = format!("Anmeldung fehlgeschlagen: {}", p.text);
+                SessionEnd::Fatal(p)
             }
         };
     }
@@ -2098,7 +2143,7 @@ async fn run_session(
             flags: local.flags.sanitized(),
         };
         if conn::write_msg(&mut send, &msg).await.is_err() {
-            return SessionEnd::Retry("send failed".into());
+            return send_failed();
         }
     }
 
@@ -2106,7 +2151,7 @@ async fn run_session(
     // certificate that is about to expire (`PROTOCOL.md` §2.2); again every
     // hour, since a session can outlive the window.
     if maybe_auto_renew(&mut send, local, &welcome.you.name).await.is_err() {
-        return SessionEnd::Retry("send failed".into());
+        return send_failed();
     }
     let mut renew_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(3600),
@@ -2155,7 +2200,10 @@ async fn run_session(
                 let Some(msg) = msg else {
                     break match connection.close_reason() {
                         Some(e) => close_end(ConnectError::from_connection_error(e)),
-                        None => SessionEnd::Retry("control stream ended".into()),
+                        None => SessionEnd::Retry(Problem::new(
+                            "Die Verbindung zum Server ist abgebrochen. ICU verbindet sich neu.",
+                            "control stream ended",
+                        )),
                     };
                 };
                 if let Some(end) = handle_control(msg, shared, local, &mut pings, &mut send).await {
@@ -2170,7 +2218,10 @@ async fn run_session(
                         let name = icu_proto::normalize_name(&name);
                         if local.pending_renew.is_some() {
                             shared.state.send_modify(|s| {
-                                s.name_error = Some("Eine Änderung läuft noch".into())
+                                s.name_error = Some(
+                                    "Die letzte Namensänderung läuft noch – bitte kurz warten."
+                                        .into(),
+                                )
                             });
                         } else {
                             match send_renew(&mut send, local, &name, RenewReason::UserRename).await {
@@ -2182,14 +2233,14 @@ async fn run_session(
                                     shared.state.send_modify(|s| s.name_error = Some(e));
                                 }
                                 Err(RenewSendError::Transport) => {
-                                    break SessionEnd::Retry("send failed".into());
+                                    break send_failed();
                                 }
                             }
                         }
                     }
                     Command::ReplaceIdentity(identity) => {
                         local.replace_identity(*identity, shared);
-                        break SessionEnd::Retry("Identität ersetzt".into());
+                        break reconnect_with_new_identity();
                     }
                     Command::CreateInvite { name, ttl_s } => {
                         let name = icu_proto::normalize_name(&name);
@@ -2200,29 +2251,33 @@ async fn run_session(
                             icu_proto::validate_name(&name)
                         };
                         if let Err(e) = checked {
-                            shared.state.send_modify(|s| s.invite_error = Some(e.to_string()));
+                            shared.state.send_modify(|s| {
+                                s.invite_error = Some(crate::problem::name_error_text(&e))
+                            });
                         } else if conn::write_msg(&mut send, &ControlMsg::CreateInviteRequest { name, ttl_s }).await.is_err() {
-                            break SessionEnd::Retry("send failed".into());
+                            break send_failed();
+                        } else {
+                            local.invite_pending = true;
                         }
                     }
                     Command::SetUserAdmin { user_id, is_admin } => {
                         if conn::write_msg(&mut send, &ControlMsg::AdminSetRole { user_id, is_admin }).await.is_err() {
-                            break SessionEnd::Retry("send failed".into());
+                            break send_failed();
                         }
                     }
                     Command::SetUserDisabled { user_id, disabled } => {
                         if conn::write_msg(&mut send, &ControlMsg::AdminSetDisabled { user_id, disabled }).await.is_err() {
-                            break SessionEnd::Retry("send failed".into());
+                            break send_failed();
                         }
                     }
                     Command::RevokeUser { user_id } => {
                         if conn::write_msg(&mut send, &ControlMsg::AdminRevokeUser { user_id }).await.is_err() {
-                            break SessionEnd::Retry("send failed".into());
+                            break send_failed();
                         }
                     }
                     Command::RequestUserList => {
                         if conn::write_msg(&mut send, &ControlMsg::UserListRequest).await.is_err() {
-                            break SessionEnd::Retry("send failed".into());
+                            break send_failed();
                         }
                     }
                     cmd => {
@@ -2230,7 +2285,7 @@ async fn run_session(
                         if send_state && set_state_budget.take() {
                             let msg = ControlMsg::SetState { flags: local.flags.sanitized() };
                             if conn::write_msg(&mut send, &msg).await.is_err() {
-                                break SessionEnd::Retry("send failed".into());
+                                break send_failed();
                             }
                         }
                     }
@@ -2239,7 +2294,7 @@ async fn run_session(
             _ = renew_tick.tick() => {
                 let stored = local.name.clone();
                 if maybe_auto_renew(&mut send, local, &stored).await.is_err() {
-                    break SessionEnd::Retry("send failed".into());
+                    break send_failed();
                 }
             }
             _ = ping.tick() => {
@@ -2248,7 +2303,7 @@ async fn run_session(
                 pings.insert(nonce, Instant::now());
                 pings.retain(|_, t| t.elapsed() < Duration::from_secs(30));
                 if conn::write_msg(&mut send, &ControlMsg::Ping { nonce }).await.is_err() {
-                    break SessionEnd::Retry("send failed".into());
+                    break send_failed();
                 }
             }
             _ = loss_tick.tick() => {
@@ -2383,9 +2438,9 @@ impl crate::video::VideoSink for Arc<Shared> {
 
 fn close_end(e: ConnectError) -> SessionEnd {
     if e.is_fatal() {
-        SessionEnd::Fatal(e.to_string())
+        SessionEnd::Fatal(e.problem())
     } else {
-        SessionEnd::Retry(e.to_string())
+        SessionEnd::Retry(e.problem())
     }
 }
 
@@ -2404,7 +2459,7 @@ async fn drain_until_quit(
                 let replaced = matches!(cmd, Command::ReplaceIdentity(_));
                 local.handle_local(cmd, shared, None).await;
                 if replaced {
-                    return SessionEnd::Retry("Identität ersetzt".into());
+                    return reconnect_with_new_identity();
                 }
             }
         }
@@ -2652,7 +2707,16 @@ async fn handle_control(
         }
         ControlMsg::Error { code, detail } => {
             tracing::warn!(code, %detail, "server error");
-            if code == codes::NAME_TAKEN || code == codes::RENEW_REJECTED {
+            let text = crate::problem::from_code(code, &detail).text;
+            // A failed invite answers with the placeholder name's code; it
+            // belongs under the invite field, not under the own name.
+            if local.invite_pending
+                && local.pending_renew.is_none()
+                && code != codes::RENEW_REJECTED
+            {
+                local.invite_pending = false;
+                shared.state.send_modify(|s| s.invite_error = Some(text));
+            } else if code == codes::NAME_TAKEN || code == codes::RENEW_REJECTED {
                 // A background renewal must not paint a red error under the
                 // name field: only a rename the user asked for lands there.
                 let pending = local.pending_renew.take();
@@ -2662,18 +2726,18 @@ async fn handle_control(
                 shared.state.send_modify(|s| {
                     s.rename_pending = false;
                     if asked_for_it {
-                        s.name_error = Some(detail.clone());
+                        s.name_error = Some(text.clone());
                     }
                 });
                 if !asked_for_it {
                     tracing::warn!(code, %detail, "background renewal rejected");
                 }
             } else if code == codes::NOT_ADMIN {
-                shared.state.send_modify(|s| s.invite_error = Some(detail));
+                shared.state.send_modify(|s| s.invite_error = Some(text));
             } else {
                 shared
                     .state
-                    .send_modify(|s| s.banner = Some(format!("{}: {detail}", codes::name(code))));
+                    .send_modify(|s| s.banner = Some(crate::problem::from_code(code, &detail)));
             }
         }
         ControlMsg::LossHint { loss_permille } => {
@@ -2732,6 +2796,7 @@ async fn handle_control(
             local.apply_renewed_leaf(leaf_der, shared);
         }
         ControlMsg::CreateInviteResponse { bundle, expires } => {
+            local.invite_pending = false;
             shared.state.send_modify(|s| {
                 s.last_invite = Some((bundle, expires));
                 s.invite_error = None;
@@ -2748,10 +2813,12 @@ async fn handle_control(
         ControlMsg::UserListResponse { users } => {
             shared.state.send_modify(|s| s.user_list = users);
         }
-        ControlMsg::AdminActionError { detail, .. } => {
+        ControlMsg::AdminActionError { code, detail, .. } => {
+            tracing::warn!(code, %detail, "admin action rejected");
+            let text = crate::problem::from_code(code, &detail).text;
             shared
                 .state
-                .send_modify(|s| s.user_action_error = Some(detail));
+                .send_modify(|s| s.user_action_error = Some(text));
         }
         ControlMsg::UserAdminChanged { is_admin } => {
             shared.state.send_modify(|s| {
@@ -2763,7 +2830,10 @@ async fn handle_control(
             });
         }
         ControlMsg::Welcome { .. } => {
-            return Some(SessionEnd::Fatal("second Welcome".into()));
+            return Some(SessionEnd::Fatal(Problem::new(
+                crate::problem::UPDATE_NEEDED,
+                "second Welcome",
+            )));
         }
         ControlMsg::Hello { .. }
         | ControlMsg::SetState { .. }
@@ -2776,9 +2846,9 @@ async fn handle_control(
         | ControlMsg::AdminSetDisabled { .. }
         | ControlMsg::AdminRevokeUser { .. }
         | ControlMsg::UserListRequest => {
-            return Some(SessionEnd::Fatal(format!(
-                "server sent client message {}",
-                msg.variant()
+            return Some(SessionEnd::Fatal(Problem::new(
+                crate::problem::UPDATE_NEEDED,
+                format!("server sent client message {}", msg.variant()),
             )));
         }
     }

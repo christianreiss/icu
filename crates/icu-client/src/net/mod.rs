@@ -14,6 +14,14 @@ pub enum NetError {
     Resolve(String),
     /// TLS configuration.
     Tls(String),
+    /// Our own certificate or the invitation has expired (German text).
+    Expired(String),
+    /// A name that breaks the rules.
+    Name(icu_proto::NameError),
+    /// The handshake failed without an application code.
+    Handshake(conn::ConnectError),
+    /// Already worded for the user.
+    User(crate::problem::Problem),
     /// Connection setup or transport.
     Connect(String),
     /// The server answered with an error code.
@@ -33,6 +41,10 @@ impl std::fmt::Display for NetError {
             NetError::BadLink(s) => write!(f, "invalid bundle or name: {s}"),
             NetError::Resolve(s) => write!(f, "cannot resolve: {s}"),
             NetError::Tls(s) => write!(f, "tls: {s}"),
+            NetError::Expired(s) => f.write_str(s),
+            NetError::Name(e) => write!(f, "invalid name: {e}"),
+            NetError::Handshake(e) => write!(f, "connection: {e}"),
+            NetError::User(p) => f.write_str(&p.full()),
             NetError::Connect(s) => write!(f, "connection: {s}"),
             NetError::Rejected { code, detail } => {
                 write!(f, "{} ({code}): {detail}", icu_proto::error::name(*code))
@@ -43,6 +55,44 @@ impl std::fmt::Display for NetError {
 }
 
 impl std::error::Error for NetError {}
+
+impl NetError {
+    /// What the user reads (`crate::problem`); `Display` stays technical.
+    pub fn problem(&self) -> crate::problem::Problem {
+        use crate::problem::{self, Problem};
+        let technical = self.to_string();
+        match self {
+            NetError::BadLink(_) => Problem::new(
+                "Die Serveradresse in der Einladung ist ungültig. Bitte beim Admin eine neue \
+                 Einladung anfordern.",
+                technical,
+            ),
+            NetError::Resolve(_) => Problem::new(
+                "Der Server wurde nicht gefunden. Stimmt die Adresse und besteht eine \
+                 Internetverbindung? ICU versucht es weiter.",
+                technical,
+            ),
+            NetError::Tls(_) => Problem::new(
+                "Die gespeicherten Zugangsdaten sind beschädigt. Bitte die Einladung oder den \
+                 Passport erneut öffnen.",
+                technical,
+            ),
+            NetError::Expired(s) => Problem::plain(s.clone()),
+            NetError::Name(e) => problem::from_name_error(e),
+            NetError::Handshake(e) => e.problem(),
+            NetError::User(p) => p.clone(),
+            NetError::Connect(_) => Problem::new(
+                "Die Verbindung zum Server ist abgebrochen. Bitte noch einmal versuchen.",
+                technical,
+            ),
+            NetError::Rejected { code, detail } => problem::from_code(*code, detail),
+            NetError::Other(_) => Problem::new(
+                "Etwas ist unerwartet schiefgegangen. Bitte noch einmal versuchen.",
+                technical,
+            ),
+        }
+    }
+}
 
 /// Resolves `host:port` to the first address.
 pub async fn resolve(host: &str, port: u16) -> Result<SocketAddr, NetError> {

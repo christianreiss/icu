@@ -533,15 +533,21 @@ fn tone_color(tone: Tone, tok: &theme::Tokens) -> Option<egui::Color32> {
 /// The strip above the cards: who we are connected to, since when, how fast.
 fn hero(ui: &mut Ui, state: &AppState) {
     let tok = theme::tokens(ui.visuals());
-    let (color, word, detail) = match &state.conn {
-        ConnStatus::Connected => (tok.connected, "Verbunden", String::new()),
-        ConnStatus::Connecting => (tok.connecting, "Verbindet", String::new()),
+    let (color, word, detail, technical) = match &state.conn {
+        ConnStatus::Connected => (tok.connected, "Verbunden", String::new(), None),
+        ConnStatus::Connecting => (tok.connecting, "Verbindet", String::new(), None),
         ConnStatus::Disconnected { reason, attempt } => (
             tok.connecting,
             "Getrennt",
-            format!("{reason} — Versuch {attempt}"),
+            format!("{} (Versuch {attempt})", reason.text),
+            reason.technical.clone(),
         ),
-        ConnStatus::Fatal(reason) => (tok.error, "Fehler", reason.clone()),
+        ConnStatus::Fatal(reason) => (
+            tok.error,
+            "Fehler",
+            reason.text.clone(),
+            reason.technical.clone(),
+        ),
     };
 
     egui::Frame::new()
@@ -577,11 +583,28 @@ fn hero(ui: &mut Ui, state: &AppState) {
                                 .color(tok.muted_text),
                             );
                         }
-                        if !detail.is_empty() {
-                            ui.label(RichText::new("·").size(12.0).color(tok.dim_text));
-                            ui.label(RichText::new(&detail).size(12.0).color(tok.muted_text));
-                        }
                     });
+                    // Its own line: a sentence that tells the user what to
+                    // do does not fit behind a dot.
+                    if !detail.is_empty() {
+                        ui.label(RichText::new(&detail).size(12.0).color(tok.muted_text));
+                    }
+                    // For whoever helps: the raw error, selectable to copy.
+                    if let Some(technical) = &technical {
+                        egui::CollapsingHeader::new(
+                            RichText::new("Technische Details")
+                                .size(11.0)
+                                .color(tok.dim_text),
+                        )
+                        .id_salt("conn-technical")
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(technical).monospace().size(11.0))
+                                    .selectable(true)
+                                    .wrap(),
+                            );
+                        });
+                    }
                 });
 
                 widgets::rtl(ui, 26.0, |ui| {
