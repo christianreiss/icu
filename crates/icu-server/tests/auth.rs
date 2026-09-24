@@ -289,7 +289,7 @@ async fn a_bundle_works_exactly_once() {
     server.shutdown().await;
 }
 
-/// A clean close after `RenewResponse` is the client's receipt: the bundle
+/// `REGISTRATION_STORED` after `RenewResponse` is the client's receipt: the bundle
 /// is dead from then on, even before the first login.
 #[tokio::test]
 async fn a_confirmed_registration_consumes_the_bundle() {
@@ -310,7 +310,7 @@ async fn a_confirmed_registration_consumes_the_bundle() {
 }
 
 /// A client that got no answer, or could not store it, closes without
-/// `NO_ERROR`: the bundle stays valid, and redeeming it again replaces the
+/// `REGISTRATION_STORED`: the bundle stays valid, and redeeming it again replaces the
 /// certificate nobody holds (`PROTOCOL.md` §2.3).
 #[tokio::test]
 async fn an_unconfirmed_registration_can_be_repeated() {
@@ -338,6 +338,91 @@ async fn an_unconfirmed_registration_can_be_repeated() {
         }
         other => panic!("expected Welcome, got {other:?}"),
     }
+    server.shutdown().await;
+}
+
+/// `NO_ERROR` is no receipt: quinn closes a dropped connection implicitly with
+/// code 0, so a client that quit between `RenewResponse` and saving would
+/// otherwise burn its bundle (`PROTOCOL.md` §2.3).
+#[tokio::test]
+async fn a_plain_close_is_no_receipt() {
+    let server = TestServer::start().await;
+    let bundle = server.invite("").await;
+    let (key, csr) = common::csr_with_cn("bob");
+    server
+        .register_closing(&bundle, key, csr, ec::NO_ERROR)
+        .await
+        .expect("registers");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let bob = server
+        .register(&bundle, "bob")
+        .await
+        .expect("the bundle is still valid");
+    let mut client = server.connect(&bob).await.expect("connect");
+    assert!(matches!(
+        client.hello("bob").await,
+        ControlMsg::Welcome { .. }
+    ));
+    server.shutdown().await;
+}
+
+/// A placeholder whose bundle expired unused frees its name for a
+/// registration right away, not only after the next invite or a restart.
+#[tokio::test]
+async fn an_expired_placeholder_frees_its_name() {
+    let server = TestServer::start().await;
+    let bundle = server.invite("").await;
+    match server
+        .handle
+        .admin(AdminRequest::Invite {
+            name: "dora".into(),
+            ttl_s: Some(1),
+        })
+        .await
+    {
+        AdminResponse::Invite { .. } => {}
+        other => panic!("invite failed: {other:?}"),
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    server
+        .register(&bundle, "dora")
+        .await
+        .expect("the expired placeholder no longer holds the name");
+    server.shutdown().await;
+}
+
+/// A registration refused by the rate limit must not first replace a
+/// session of the same bundle that is still in progress.
+#[tokio::test]
+async fn a_rate_limited_attempt_leaves_the_live_registration_alone() {
+    let server = TestServer::start_with(|config| {
+        config.limits.enroll_per_ip_per_min = 1;
+    })
+    .await;
+    let bundle = server.invite("").await;
+    let registration = common::identity_from_bundle(&bundle);
+    let mut live = server.connect(&registration).await.expect("connect");
+    assert!(matches!(
+        live.hello("").await,
+        ControlMsg::Welcome {
+            registration: true,
+            ..
+        }
+    ));
+    assert_eq!(
+        server.rejection(&registration).await,
+        Some(ec::ENROLL_RATE_LIMITED)
+    );
+    let (_key, csr) = common::csr_with_cn("erin");
+    live.send_msg(&ControlMsg::RenewRequest { csr_der: csr })
+        .await;
+    let answer = live
+        .recv_matching(|m| !matches!(m, ControlMsg::Pong { .. }))
+        .await;
+    assert!(
+        matches!(answer, Some(ControlMsg::RenewResponse { .. })),
+        "{answer:?}"
+    );
     server.shutdown().await;
 }
 

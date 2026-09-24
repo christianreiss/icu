@@ -66,6 +66,12 @@ pub const NO_SUCH_USER: u32 = 0x18;
 /// older one is closed with this code (`PROTOCOL.md` §7). Fatal, so two
 /// devices sharing a passport do not take turns kicking each other.
 pub const SESSION_REPLACED: u32 = 0x19;
+/// The receipt that ends a registration session: the client closes with this
+/// code once it has stored its new identity, and only then does the server
+/// revoke the bundle (`PROTOCOL.md` §2.3). Deliberately not `NO_ERROR`: quinn
+/// closes a dropped connection implicitly with code 0, which must not count.
+/// Only ever a client close code. Not fatal.
+pub const REGISTRATION_STORED: u32 = 0x1A;
 
 /// All codes defined by v1, in ascending order.
 pub const ALL_CODES: &[u32] = &[
@@ -93,6 +99,7 @@ pub const ALL_CODES: &[u32] = &[
     AUTH_DISABLED,
     NO_SUCH_USER,
     SESSION_REPLACED,
+    REGISTRATION_STORED,
 ];
 
 /// Fatal codes (`PROTOCOL.md` §5/§6): the client must not reconnect.
@@ -144,6 +151,7 @@ pub fn name(code: u32) -> &'static str {
         AUTH_DISABLED => "AUTH_DISABLED",
         NO_SUCH_USER => "NO_SUCH_USER",
         SESSION_REPLACED => "SESSION_REPLACED",
+        REGISTRATION_STORED => "REGISTRATION_STORED",
         _ => "UNKNOWN",
     }
 }

@@ -51,6 +51,17 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
         }
     };
 
+    // The registration budget comes before the slot: a refused attempt must
+    // not first close a registration of the same bundle that is in progress.
+    if identity.registration {
+        if let Err(e) = enroll_budget(&server, &conn) {
+            tracing::info!(%remote, user_id = identity.user_id, error = %e, "rejected");
+            let code = ec::ENROLL_RATE_LIMITED;
+            conn.close(quinn::VarInt::from_u32(code), ec::name(code).as_bytes());
+            return Err(e);
+        }
+    }
+
     // One live connection per certificate: this one wins (`PROTOCOL.md` §7).
     let _live = LiveCert::claim(&server, &identity.cert_fp, &conn);
 
@@ -424,6 +435,20 @@ async fn serve_registration(
     conn: &quinn::Connection,
     identity: &Identity,
 ) -> Result<()> {
+    // The cap covers the whole session, writes included: a client that stops
+    // reading stalls a write on flow control, where no `select!` around a
+    // read could end it.
+    let deadline = tokio::time::Instant::now() + REGISTRATION_SESSION;
+    tokio::time::timeout_at(
+        deadline + REGISTRATION_LINGER,
+        registration_exchange(server, conn, identity, deadline),
+    )
+    .await
+    .unwrap_or_else(|_| Err(Error::coded(ec::TIMEOUT, "registration took too long")))
+}
+
+/// Registration sessions: 5/min per IP, 20/min global (`PROTOCOL.md` §7).
+fn enroll_budget(server: &Arc<Server>, conn: &quinn::Connection) -> Result<()> {
     let allowed = server
         .ip_limits
         .lock()
@@ -437,17 +462,7 @@ async fn serve_registration(
             "too many registrations",
         ));
     }
-
-    // The cap covers the whole session, writes included: a client that stops
-    // reading stalls a write on flow control, where no `select!` around a
-    // read could end it.
-    let deadline = tokio::time::Instant::now() + REGISTRATION_SESSION;
-    tokio::time::timeout_at(
-        deadline + REGISTRATION_LINGER,
-        registration_exchange(server, conn, identity, deadline),
-    )
-    .await
-    .unwrap_or_else(|_| Err(Error::coded(ec::TIMEOUT, "registration took too long")))
+    Ok(())
 }
 
 /// Hello, `Welcome` and the `RenewRequest` loop of [`serve_registration`].
@@ -531,17 +546,19 @@ async fn registration_exchange(
                         Counters::inc(&server.counters.enroll_ok);
                         write_msg(&mut send, &ControlMsg::RenewResponse { leaf_der }).await?;
                         let _ = send.finish();
-                        // The client closes with NO_ERROR once it has stored
-                        // the certificate; a close from here could overtake the
-                        // response. Anything else — another code, a timeout, a
-                        // dropped path — leaves the bundle valid, so a lost
-                        // answer or a failed save does not burn it. The first
+                        // The client closes with REGISTRATION_STORED once it
+                        // has stored the certificate; a close from here could
+                        // overtake the response. Anything else — another code,
+                        // NO_ERROR (quinn's implicit close of a dropped
+                        // connection), a timeout, a dropped path — leaves the
+                        // bundle valid, so a lost answer, a failed save or a
+                        // client that quit mid-way does not burn it. The first
                         // login with the new certificate consumes it as well.
                         let closed = tokio::time::timeout(REGISTRATION_LINGER, conn.closed()).await;
                         if matches!(
                             closed,
                             Ok(quinn::ConnectionError::ApplicationClosed(ref c))
-                                if u64::from(c.error_code) == u64::from(ec::NO_ERROR)
+                                if u64::from(c.error_code) == u64::from(ec::REGISTRATION_STORED)
                         ) {
                             let consumed = server
                                 .store
@@ -599,6 +616,18 @@ async fn redeem(server: &Arc<Server>, identity: &Identity, csr_der: &[u8]) -> Re
         ));
     }
     let mut store = server.store.lock().await;
+    // A placeholder whose bundle expired unused frees its name (`PROTOCOL.md`
+    // §2.3); otherwise only the next invite or a restart would. This user is
+    // among them only if its own bundle expired during the session.
+    if store.purge_expired_registrations()? > 0 {
+        tracing::info!("expired registrations purged");
+    }
+    if store.user(identity.user_id).is_none() {
+        return Err(Error::coded(
+            ec::AUTH_UNKNOWN_CERT,
+            "registration expired during the session",
+        ));
+    }
     if store.name_taken(&requested, Some(identity.user_id)) {
         return Err(Error::coded(
             ec::NAME_TAKEN,
