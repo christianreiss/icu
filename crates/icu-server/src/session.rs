@@ -33,12 +33,16 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
     let identity = match authenticate(&server, &conn).await {
         Ok(identity) => identity,
         Err(e) => {
-            let code = e.code().unwrap_or(ec::AUTH_REQUIRED);
+            // An error without a code is the server's own trouble, not the
+            // client's: close with a code it retries on, not a fatal one.
+            let code = e.code().unwrap_or(ec::SHUTDOWN);
             // Anyone on the internet can complete a handshake without a
             // certificate; logging each one at `info` would let scanners
             // fill the journal.
             if code == ec::AUTH_REQUIRED {
                 tracing::debug!(%remote, error = %e, "rejected");
+            } else if e.code().is_none() {
+                tracing::warn!(%remote, error = %e, "cannot authenticate");
             } else {
                 tracing::info!(%remote, error = %e, "rejected");
             }
@@ -184,8 +188,14 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
     }
     let registration = cert.registration;
     // The first login with a real certificate proves the client stored it,
-    // whether or not the registration session saw the clean close.
-    let consumed = !registration && store.consume_registration(user_id)?;
+    // whether or not the registration session saw the clean close. A failed
+    // write must not cost the login: the bundle just stays valid a little
+    // longer, as before the receipt, and the next login tries again.
+    let consumed = !registration
+        && store.consume_registration(user_id).unwrap_or_else(|e| {
+            tracing::warn!(user_id, error = %e, "cannot consume the registration");
+            false
+        });
     let spki = ca::leaf_public_key(leaf);
     drop(store);
     if consumed {
@@ -428,6 +438,25 @@ async fn serve_registration(
         ));
     }
 
+    // The cap covers the whole session, writes included: a client that stops
+    // reading stalls a write on flow control, where no `select!` around a
+    // read could end it.
+    let deadline = tokio::time::Instant::now() + REGISTRATION_SESSION;
+    tokio::time::timeout_at(
+        deadline + REGISTRATION_LINGER,
+        registration_exchange(server, conn, identity, deadline),
+    )
+    .await
+    .unwrap_or_else(|_| Err(Error::coded(ec::TIMEOUT, "registration took too long")))
+}
+
+/// Hello, `Welcome` and the `RenewRequest` loop of [`serve_registration`].
+async fn registration_exchange(
+    server: &Arc<Server>,
+    conn: &quinn::Connection,
+    identity: &Identity,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
     let Hello {
         mut send,
         mut recv,
@@ -465,7 +494,8 @@ async fn serve_registration(
         "registration session"
     );
 
-    let deadline = tokio::time::Instant::now() + REGISTRATION_SESSION;
+    // Nothing else bounds `Ping` here; past the rate it goes unanswered.
+    let mut pings = TokenBucket::per_second(server.config.limits.control_msgs_per_s);
     let mut attempts = 0u32;
     loop {
         let body = tokio::select! {
@@ -486,11 +516,13 @@ async fn serve_registration(
             .map_err(|e| Error::coded(ec::PROTOCOL_VIOLATION, e.to_string()))?;
         match msg {
             ControlMsg::Ping { nonce } => {
-                let pong = ControlMsg::Pong {
-                    nonce,
-                    server_time_ms: unix_millis(),
-                };
-                write_msg(&mut send, &pong).await?;
+                if pings.take_one() {
+                    let pong = ControlMsg::Pong {
+                        nonce,
+                        server_time_ms: unix_millis(),
+                    };
+                    write_msg(&mut send, &pong).await?;
+                }
             }
             ControlMsg::RenewRequest { csr_der } => {
                 attempts += 1;

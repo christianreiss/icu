@@ -1213,7 +1213,7 @@ async fn net_task(
         backend,
         identity: cfg.identity.clone(),
         pending_renew: None,
-        renew_attempted: false,
+        renew_attempted_at: None,
         window_visible: !cfg.settings.ui.start_minimized,
     };
     local.update_viewing();
@@ -1342,8 +1342,9 @@ struct LocalState {
     identity: Identity,
     /// The renewal this client is waiting for, if any.
     pending_renew: Option<PendingRenew>,
-    /// Whether the once-per-start automatic renewal has already been tried.
-    renew_attempted: bool,
+    /// When the last automatic renewal was sent. The server allows one a
+    /// day, so the next try waits that long.
+    renew_attempted_at: Option<Instant>,
     /// Whether the main window is on screen. Starts from
     /// `start_minimized`, so a client without a window (tests) views.
     window_visible: bool,
@@ -1419,7 +1420,9 @@ fn renewal_due(cert: &crate::conninfo::CertInfo, stored: &str) -> Option<RenewRe
     if cert.subject != stored {
         return Some(RenewReason::CatchUp);
     }
-    if cert.expires_in_days <= RENEW_BEFORE_EXPIRY_DAYS {
+    // `expires_in_days` is floored: 30 means up to 31 days left, which the
+    // server still refuses (`PROTOCOL.md` §2.2 Nr. 9).
+    if cert.expires_in_days < RENEW_BEFORE_EXPIRY_DAYS {
         return Some(RenewReason::Expiry);
     }
     None
@@ -1428,6 +1431,42 @@ fn renewal_due(cert: &crate::conninfo::CertInfo, stored: &str) -> Option<RenewRe
 /// Renew this many days before the certificate expires
 /// (`Client/IMPLEMENTATION.md` §5).
 const RENEW_BEFORE_EXPIRY_DAYS: i64 = 30;
+
+/// How long an automatic renewal waits after the previous one, matching the
+/// server's one per day.
+const AUTO_RENEW_RETRY: Duration = Duration::from_secs(24 * 3600);
+
+/// Sends the automatic renewal if one is due and none was tried within
+/// [`AUTO_RENEW_RETRY`]: catch-up after a rename on another device, or the
+/// last 30 days before expiry. `stored` is the name the server holds. Silent:
+/// no banner, no `name_error`, and `rename_pending` stays false — this is not
+/// something the user asked for. `Err` only when the control stream broke.
+async fn maybe_auto_renew(
+    send: &mut quinn::SendStream,
+    local: &mut LocalState,
+    stored: &str,
+) -> Result<(), ()> {
+    if local.pending_renew.is_some()
+        || local
+            .renew_attempted_at
+            .is_some_and(|t| t.elapsed() < AUTO_RENEW_RETRY)
+    {
+        return Ok(());
+    }
+    let cert = crate::conninfo::CertInfo::from_der(&local.identity.leaf_der);
+    let Some(reason) = renewal_due(&cert, stored) else {
+        return Ok(());
+    };
+    local.renew_attempted_at = Some(Instant::now());
+    match send_renew(send, local, stored, reason).await {
+        Ok(()) => Ok(()),
+        Err(RenewSendError::Local(e)) => {
+            tracing::warn!(error = %e, ?reason, "automatic renewal not possible");
+            Ok(())
+        }
+        Err(RenewSendError::Transport) => Err(()),
+    }
+}
 
 impl LocalState {
     /// Recomputes `UserFlags::VIEWING`: overlay on or main window visible.
@@ -1616,7 +1655,7 @@ impl LocalState {
     fn replace_identity(&mut self, identity: Identity, shared: &Arc<Shared>) {
         self.identity = identity;
         self.pending_renew = None;
-        self.renew_attempted = false;
+        self.renew_attempted_at = None;
         self.name = crate::conninfo::CertInfo::from_der(&self.identity.leaf_der).subject;
         let saved = self.identity.save(&self.paths);
         let server = format!(
@@ -1920,25 +1959,17 @@ async fn run_session(
         }
     }
 
-    // Once per start: pick up a rename that happened on another device, or
-    // renew a certificate that is about to expire (`PROTOCOL.md` §2.2).
-    if !local.renew_attempted && local.pending_renew.is_none() {
-        let cert = crate::conninfo::CertInfo::from_der(&local.identity.leaf_der);
-        if let Some(reason) = renewal_due(&cert, &welcome.you.name) {
-            local.renew_attempted = true;
-            // Silent: no banner, no `name_error`, and `rename_pending` stays
-            // false — this is not something the user asked for.
-            match send_renew(&mut send, local, &welcome.you.name, reason).await {
-                Ok(()) => {}
-                Err(RenewSendError::Local(e)) => {
-                    tracing::warn!(error = %e, ?reason, "automatic renewal not possible");
-                }
-                Err(RenewSendError::Transport) => {
-                    return SessionEnd::Retry("send failed".into());
-                }
-            }
-        }
+    // Pick up a rename that happened on another device, or renew a
+    // certificate that is about to expire (`PROTOCOL.md` §2.2); again every
+    // hour, since a session can outlive the window.
+    if maybe_auto_renew(&mut send, local, &welcome.you.name).await.is_err() {
+        return SessionEnd::Retry("send failed".into());
     }
+    let mut renew_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(3600),
+        Duration::from_secs(3600),
+    );
+    renew_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut ping = tokio::time::interval(Duration::from_secs(5));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2060,6 +2091,12 @@ async fn run_session(
                             }
                         }
                     }
+                }
+            }
+            _ = renew_tick.tick() => {
+                let stored = local.name.clone();
+                if maybe_auto_renew(&mut send, local, &stored).await.is_err() {
+                    break SessionEnd::Retry("send failed".into());
                 }
             }
             _ = ping.tick() => {
@@ -2784,5 +2821,18 @@ mod tests {
         assert_eq!(send_tier(VideoTier::T1, &watching), VideoTier::T1);
         let away = [peer(1, UserFlags::CAMERA_ON), peer(2, 0)];
         assert_eq!(send_tier(VideoTier::T0, &away), VideoTier::T4);
+    }
+
+    #[test]
+    fn expiry_renewal_waits_until_the_server_accepts_it() {
+        let cert = |days| crate::conninfo::CertInfo {
+            subject: "alice".into(),
+            expires_in_days: days,
+            ..Default::default()
+        };
+        // 30 floored days are up to 31 left: the server would refuse.
+        assert_eq!(renewal_due(&cert(30), "alice"), None);
+        assert_eq!(renewal_due(&cert(29), "alice"), Some(RenewReason::Expiry));
+        assert_eq!(renewal_due(&cert(200), "bob"), Some(RenewReason::CatchUp));
     }
 }

@@ -854,3 +854,74 @@ async fn a_name_from_before_the_strict_rules_still_renews() {
     );
     server.shutdown().await;
 }
+
+/// Consuming the bundle at the first real login is a write; when it fails,
+/// the login still goes through instead of ending in a fatal code, and the
+/// bundle stays valid until a later login consumes it.
+#[tokio::test]
+async fn a_failed_store_write_does_not_lock_out_the_first_login() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = TestServer::start().await;
+    let _alice = server.client("alice").await;
+    let bundle = server.invite("").await;
+    let bob = server
+        .register_unconfirmed(&bundle, "bob")
+        .await
+        .expect("registers");
+
+    let dir = server.dir.path().to_path_buf();
+    let set_mode = |mode| std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
+    set_mode(0o500).expect("chmod");
+    if std::fs::write(dir.join("probe"), b"").is_ok() {
+        // Root ignores the mode; nothing to test then.
+        set_mode(0o700).expect("chmod back");
+        server.shutdown().await;
+        return;
+    }
+    let mut client = server.connect(&bob).await.expect("connect");
+    let welcome = client.hello("bob").await;
+    set_mode(0o700).expect("chmod back");
+    match welcome {
+        ControlMsg::Welcome { you, registration, .. } => {
+            assert_eq!(you.name, "bob");
+            assert!(!registration);
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+    server.shutdown().await;
+}
+
+/// A registration session answers `Ping`, but not at any rate.
+#[tokio::test]
+async fn registration_pings_are_rate_limited() {
+    let server = TestServer::start().await;
+    let _alice = server.client("alice").await;
+    let bundle = server.invite("").await;
+    let mut client = server
+        .connect(&common::identity_from_bundle(&bundle))
+        .await
+        .expect("connect");
+    assert!(matches!(
+        client.hello("").await,
+        ControlMsg::Welcome {
+            registration: true,
+            ..
+        }
+    ));
+    const SENT: u64 = 200;
+    for nonce in 0..SENT {
+        client.send_msg(&ControlMsg::Ping { nonce }).await;
+    }
+    let mut pongs = 0;
+    while let Some(msg) = client
+        .recv_timeout(std::time::Duration::from_millis(300))
+        .await
+    {
+        assert!(matches!(msg, ControlMsg::Pong { .. }), "{msg:?}");
+        pongs += 1;
+    }
+    assert!(pongs > 0, "some Pings are answered");
+    assert!(pongs < SENT, "{pongs} of {SENT} Pings answered");
+    server.shutdown().await;
+}

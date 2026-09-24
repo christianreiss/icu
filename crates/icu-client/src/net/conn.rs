@@ -284,9 +284,14 @@ pub async fn connect(
         initial: initial.sanitized(),
         name: name.to_string(),
     };
+    // A server that refuses us may close while `Hello` is still on its way;
+    // its code decides whether to retry, as on the read below.
     write_msg(&mut send, &hello)
         .await
-        .map_err(|e| ConnectError::Transport(e.to_string()))?;
+        .map_err(|e| match conn.close_reason() {
+            Some(reason) => ConnectError::from_connection_error(reason),
+            None => ConnectError::Transport(e.to_string()),
+        })?;
     let body = tokio::time::timeout(
         Duration::from_secs(pl::HELLO_TIMEOUT_S + 5),
         read_frame(&mut recv, MAX_CONTROL_FRAME),
