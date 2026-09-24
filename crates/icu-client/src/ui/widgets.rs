@@ -266,6 +266,9 @@ pub struct Speak<'a> {
     /// The gate is open and audio is leaving this client.
     pub open: bool,
     pub muted: bool,
+    /// No connection: nothing can leave this client, whatever the gate or
+    /// the key says, so the surface never lights up.
+    pub offline: bool,
     /// 0…1: the microphone level in PTT mode, the speech probability in
     /// voice activation — whatever decides whether the gate opens.
     pub level: f32,
@@ -292,10 +295,12 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         return response;
     }
     let painter = ui.painter();
-    let open = ui.ctx().animate_bool_with_time(response.id, s.open, 0.08);
+    let open = ui
+        .ctx()
+        .animate_bool_with_time(response.id, s.open && !s.offline, 0.08);
     let hot = open > 0.5;
     painter.rect_filled(rect, R_ROW, lerp_color(tok.surface_hi, tok.accent, open));
-    if s.ptt && response.hovered() {
+    if s.ptt && !s.offline && response.hovered() {
         painter.rect_filled(rect, R_ROW, tok.hover_overlay);
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -344,6 +349,8 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
 
     let (glyph, label, color) = if s.muted {
         (icon::MICROPHONE_SLASH, "Stumm", tok.error)
+    } else if s.offline {
+        (icon::PLUGS, "Getrennt", tok.muted_text)
     } else if hot {
         (icon::MICROPHONE, "Sendet", tok.on_accent)
     } else if s.ptt {
@@ -356,7 +363,7 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         FontId::new(14.0, super::fonts::semibold()),
         color,
     );
-    let key = s.key.filter(|_| !hot && !s.muted).map(|k| {
+    let key = s.key.filter(|_| !hot && !s.muted && !s.offline).map(|k| {
         painter.layout_no_wrap(
             k.to_string(),
             FontId::new(10.5, egui::FontFamily::Monospace),

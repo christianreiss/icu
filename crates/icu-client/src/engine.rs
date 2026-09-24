@@ -293,6 +293,9 @@ pub enum Command {
 pub struct DspControl {
     muted: AtomicBool,
     ptt_down: AtomicBool,
+    /// A connection is up; without one the gate stays shut, so nothing is
+    /// encoded and the UI never claims to be sending into the void.
+    online: AtomicBool,
     vad_mode: AtomicBool,
     denoise: AtomicBool,
     aec: AtomicBool,
@@ -323,6 +326,7 @@ impl DspControl {
         let ctl = DspControl {
             muted: AtomicBool::new(false),
             ptt_down: AtomicBool::new(false),
+            online: AtomicBool::new(false),
             vad_mode: AtomicBool::new(false),
             denoise: AtomicBool::new(false),
             aec: AtomicBool::new(false),
@@ -1087,7 +1091,8 @@ fn dsp_thread(
                 ctl.hangover_ms.load(Ordering::Relaxed) as u64,
             ));
             gate.set_ptt(ctl.ptt_down.load(Ordering::Relaxed) || test_tone);
-            gate.set_muted(ctl.muted.load(Ordering::Relaxed));
+            let online = ctl.online.load(Ordering::Relaxed);
+            gate.set_muted(ctl.muted.load(Ordering::Relaxed) || !online);
             let decision = gate.update(now, voice_in_frame);
             voice_in_frame = false;
 
@@ -1104,7 +1109,7 @@ fn dsp_thread(
                     .store(encoder.loss_perc() as i64, Ordering::Relaxed);
             }
 
-            let sending = decision != Decision::Silent;
+            let sending = decision != Decision::Silent && online;
             ctl.sending.store(sending, Ordering::Relaxed);
             if sending {
                 match encoder.encode(&frame_acc[..frame_samples]) {
@@ -1382,6 +1387,7 @@ async fn net_task(
             attempt = 0;
         }
         *shared.conn.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        shared.dsp.online.store(false, Ordering::Relaxed);
         shared
             .speakers
             .lock()
@@ -2063,6 +2069,7 @@ async fn run_session(
         });
     }
     *shared.conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection.clone());
+    shared.dsp.online.store(true, Ordering::Relaxed);
     *was_connected = true;
     tracing::info!(
         session = welcome.you.session,
@@ -2352,6 +2359,7 @@ async fn run_session(
     video_reader.abort();
     *shared.video_tx.lock().unwrap() = None;
     *shared.conn.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    shared.dsp.online.store(false, Ordering::Relaxed);
     if matches!(end, SessionEnd::Quit) {
         connection.close(quinn::VarInt::from_u32(codes::NO_ERROR), b"bye");
     }

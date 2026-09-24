@@ -182,6 +182,7 @@ mod tests {
             egui_phosphor::regular::MICROPHONE_SLASH,
             egui_phosphor::regular::LOCK_KEY,
             egui_phosphor::regular::PENCIL_SIMPLE,
+            egui_phosphor::regular::PLUGS,
             egui_phosphor::regular::PLUGS_CONNECTED,
             egui_phosphor::regular::PROHIBIT,
             egui_phosphor::regular::SHIELD_STAR,
