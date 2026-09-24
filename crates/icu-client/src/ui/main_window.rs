@@ -19,12 +19,27 @@ use crate::{
     video::VideoTier,
 };
 
-/// Header height, and with it the size of the logo badge and the gear.
+/// Header height, and with it the size of the header's icon buttons.
 const HEADER: f32 = 32.0;
-/// The speak button and the mode button beside it.
-const SPEAK_H: f32 = 46.0;
-/// The four icon-over-label switches along the bottom.
-const SWITCH_H: f32 = 54.0;
+/// The speak surface and the mode tile beside it.
+const SPEAK_H: f32 = 52.0;
+/// The control tiles along the bottom.
+const TILE_H: f32 = 54.0;
+/// The one gap of the control dock's grid, both ways.
+const DOCK_GAP: f32 = 8.0;
+/// A bottom-row toggle: glyph, tooltip, on, color role, rec dot, and the
+/// command a click sends (`None` when the feature is compiled out).
+type Toggle = (
+    &'static str,
+    &'static str,
+    bool,
+    widgets::Role,
+    bool,
+    Option<Command>,
+);
+
+/// Above this round-trip time a row's ping turns amber.
+const SLOW_RTT_MS: u16 = 150;
 
 /// Runs the main window.
 pub fn run(engine: Engine, debug_stats: bool) -> Result<(), String> {
@@ -285,269 +300,320 @@ impl eframe::App for App {
         let self_video = None;
 
         let state = &self.state;
-        egui::Panel::top("status").show(root, |ui| {
-            let tok = theme::tokens(ui.visuals());
-            // One row, one explicit height, everything centered on a shared
-            // baseline — `allocate_ui_with_layout` with an explicit height,
-            // not `with_layout`: the latter claims the parent's *entire*
-            // remaining height, and `Align::Center` then centers the content
-            // inside that tall rect, which balloons the row's `min_rect` and
-            // pushes everything after it off-screen.
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), HEADER),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    let (badge, _) =
-                        ui.allocate_exact_size(egui::vec2(HEADER, HEADER), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(badge, theme::R_CTRL, tok.accent_tint_2);
-                    ui.painter().text(
-                        badge.center(),
-                        egui::Align2::CENTER_CENTER,
-                        icon::WAVEFORM,
-                        egui::FontId::new(16.0, egui::FontFamily::Proportional),
-                        tok.accent,
-                    );
-
-                    // The server, then one pill for the connection. The own
-                    // name is not repeated here — it is the first row of the
-                    // list right below.
-                    ui.label(RichText::new(&state.server_name));
-                    let (color, short, detail) = conn_status(state, &tok);
-                    // Clickable in every state, not just Connected: a failed
-                    // or retrying connection is exactly when the details are
-                    // worth a window instead of a one-line tooltip.
-                    let hint = if detail.is_empty() {
-                        "Klicken für Verbindungsdetails".to_string()
-                    } else {
-                        format!("{detail}\n\nKlicken für Verbindungsdetails")
-                    };
-                    if widgets::status_pill_button(ui, color, &short)
-                        .on_hover_text(hint)
-                        .clicked()
-                    {
-                        self.connection = match self.connection.take() {
-                            Some(_) => None,
-                            None => Some(ConnectionView::new(self.stats.clone())),
+        let mut new_theme: Option<&'static str> = None;
+        egui::Panel::top("status")
+            .show_separator_line(false)
+            .show(root, |ui| {
+                let tok = theme::tokens(ui.visuals());
+                ui.add_space(4.0);
+                // One row, one explicit height, everything centered on a shared
+                // baseline — `allocate_ui_with_layout` with an explicit height,
+                // not `with_layout`: the latter claims the parent's *entire*
+                // remaining height, and `Align::Center` then centers the content
+                // inside that tall rect, which balloons the row's `min_rect` and
+                // pushes everything after it off-screen.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), HEADER),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.add_space(4.0);
+                        // The server, then the connection as a dot and a word.
+                        // The own name is not repeated here — it is the first
+                        // row of the list right below.
+                        ui.label(theme::strong_text(&state.server_name));
+                        let (color, short, detail) = conn_status(state, &tok);
+                        // Clickable in every state, not just Connected: a failed
+                        // or retrying connection is exactly when the details are
+                        // worth a window instead of a one-line tooltip.
+                        let hint = if detail.is_empty() {
+                            format!("{short}\n\nKlicken für Verbindungsdetails")
+                        } else {
+                            format!("{short} — {detail}\n\nKlicken für Verbindungsdetails")
                         };
-                    }
-
-                    // Own outgoing video quality tier, set by
-                    // `crate::quality::QualityController`. Automatic, no
-                    // settings toggle (`Research/feature-freeze.md`'s bias
-                    // against exposing adaptive behavior as a dial) — but
-                    // shown, since a tier-down is visible to other people as
-                    // this client's video degrading.
-                    let tier =
-                        VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8);
-                    let hint = match tier {
-                        VideoTier::T0 => None,
-                        VideoTier::T4 => Some("Video pausiert — das Netz trägt es gerade nicht."),
-                        _ => Some("Video reduziert — weniger Bitrate für eine stabile Stimme."),
-                    };
-                    if let Some(hint) = hint {
-                        widgets::status_pill(ui, tok.connecting, "Video").on_hover_text(hint);
-                    }
-
-                    widgets::rtl(ui, HEADER, |ui| {
-                        if widgets::icon_button(
-                            ui,
-                            icon::GEAR_FINE,
-                            HEADER,
-                            self.settings.is_some(),
-                        )
-                        .on_hover_text("Einstellungen")
-                        .clicked()
+                        if widgets::status_link(ui, color, &short)
+                            .on_hover_text(hint)
+                            .clicked()
                         {
-                            self.settings = match self.settings.take() {
+                            self.connection = match self.connection.take() {
                                 Some(_) => None,
-                                None => {
-                                    let paths = self
-                                        .engine
-                                        .lock()
-                                        .unwrap()
-                                        .as_ref()
-                                        .map(|e| e.paths())
-                                        .unwrap_or_else(|| Paths::new(None));
-                                    #[cfg_attr(not(feature = "camera"), allow(unused_mut))]
-                                    let mut view = SettingsView::new(
-                                        state,
-                                        state.hotkey_backend.clone(),
-                                        self.stats.clone(),
-                                        paths,
-                                    );
-                                    #[cfg(feature = "camera")]
-                                    if let Some(camera) = &self.camera {
-                                        view = view.with_preview(camera.preview_source());
-                                    }
-                                    Some(view)
-                                }
+                                None => Some(ConnectionView::new(self.stats.clone())),
                             };
                         }
-                    });
-                },
-            );
 
-            if let Some(min) = &state.update_required {
-                widgets::banner(
-                    ui,
-                    widgets::BannerKind::Warning,
-                    "Update nötig",
-                    &format!(
-                        "Der Server verlangt mindestens Version {min} (diese: {}).",
-                        env!("CARGO_PKG_VERSION")
-                    ),
-                    None::<fn()>,
+                        // Own outgoing video quality tier, set by
+                        // `crate::quality::QualityController`. Automatic, no
+                        // settings toggle (`Research/feature-freeze.md`'s bias
+                        // against exposing adaptive behavior as a dial) — but
+                        // shown, since a tier-down is visible to other people as
+                        // this client's video degrading.
+                        let tier =
+                            VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8);
+                        let hint = match tier {
+                            VideoTier::T0 => None,
+                            VideoTier::T4 => {
+                                Some("Video pausiert — das Netz trägt es gerade nicht.")
+                            }
+                            _ => Some("Video reduziert — weniger Bitrate für eine stabile Stimme."),
+                        };
+                        if let Some(hint) = hint {
+                            ui.label(
+                                RichText::new(icon::VIDEO_CAMERA_SLASH)
+                                    .size(15.0)
+                                    .color(tok.connecting),
+                            )
+                            .on_hover_text(hint);
+                        }
+
+                        widgets::rtl(ui, HEADER, |ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            if widgets::icon_button(
+                                ui,
+                                icon::GEAR_FINE,
+                                HEADER,
+                                self.settings.is_some(),
+                            )
+                            .on_hover_text("Einstellungen")
+                            .clicked()
+                            {
+                                self.settings = match self.settings.take() {
+                                    Some(_) => None,
+                                    None => {
+                                        let paths = self
+                                            .engine
+                                            .lock()
+                                            .unwrap()
+                                            .as_ref()
+                                            .map(|e| e.paths())
+                                            .unwrap_or_else(|| Paths::new(None));
+                                        #[cfg_attr(not(feature = "camera"), allow(unused_mut))]
+                                        let mut view = SettingsView::new(
+                                            state,
+                                            state.hotkey_backend.clone(),
+                                            self.stats.clone(),
+                                            paths,
+                                        );
+                                        #[cfg(feature = "camera")]
+                                        if let Some(camera) = &self.camera {
+                                            view = view.with_preview(camera.preview_source());
+                                        }
+                                        Some(view)
+                                    }
+                                };
+                            }
+                            // Flips whatever is on screen right now, so from
+                            // `system` it always does something visible.
+                            let dark = ui.visuals().dark_mode;
+                            let (glyph, hint, next) = if dark {
+                                (icon::SUN, "Hell", "light")
+                            } else {
+                                (icon::MOON, "Dunkel", "dark")
+                            };
+                            if widgets::icon_button(ui, glyph, HEADER, false)
+                                .on_hover_text(hint)
+                                .clicked()
+                            {
+                                new_theme = Some(next);
+                            }
+                        });
+                    },
                 );
-            }
-            if let Some(banner) = &state.banner {
-                widgets::banner(
-                    ui,
-                    widgets::BannerKind::Error,
-                    "Fehler",
-                    banner,
-                    Some(|| send(Command::DismissBanner)),
-                );
-            }
-        });
+                ui.add_space(4.0);
 
-        egui::Panel::bottom("controls").show(root, |ui| {
-            ui.add_space(8.0);
-            widgets::level_meter(ui, state.level.rms_db, state.level.peak_db, state.sending);
-            ui.add_space(6.0);
-            input_readout(ui, state);
-
-            ui.add_space(8.0);
-            let ptt = speak_row(ui, state, &send);
-            // Hold semantics: a press that starts on the button keeps the
-            // gate open until the primary button is released anywhere, even
-            // if the pointer drifts off the widget or egui stops treating it
-            // as "down on" (observed in the live test: transmission ended
-            // after a few seconds while the button was still held).
-            let primary_down = ui.input(|i| i.pointer.primary_down());
-            let held = match &ptt {
-                Some(_) if self.ptt_held => primary_down,
-                Some(button) => button.is_pointer_button_down_on() && primary_down,
-                None => false,
-            };
-            if held {
-                ui.ctx().request_repaint();
-            }
-            if held != self.ptt_held {
-                self.ptt_held = held;
-                send(Command::Ptt(held));
-            }
-
-            ui.add_space(8.0);
-            ui.columns(4, |cols| {
-                if switch(
-                    &mut cols[0],
-                    icon::MICROPHONE_SLASH,
-                    "Mute",
-                    state.muted,
-                    false,
-                    SWITCH_H,
-                ) {
-                    send(Command::SetMuted(!state.muted));
+                if let Some(min) = &state.update_required {
+                    widgets::banner(
+                        ui,
+                        widgets::BannerKind::Warning,
+                        "Update nötig",
+                        &format!(
+                            "Der Server verlangt mindestens Version {min} (diese: {}).",
+                            env!("CARGO_PKG_VERSION")
+                        ),
+                        None::<fn()>,
+                    );
                 }
-                if switch(
-                    &mut cols[1],
-                    icon::SPEAKER_SLASH,
-                    "Deafen",
-                    state.deafened,
-                    false,
-                    SWITCH_H,
-                ) {
-                    send(Command::SetDeafened(!state.deafened));
-                }
-                #[cfg(feature = "camera")]
-                if switch(
-                    &mut cols[2],
-                    icon::VIDEO_CAMERA,
-                    "Video",
-                    state.camera_on,
-                    state.camera_on,
-                    SWITCH_H,
-                ) {
-                    send(Command::SetCamera(!state.camera_on));
-                }
-                #[cfg(feature = "overlay")]
-                if switch(
-                    &mut cols[3],
-                    icon::SQUARES_FOUR,
-                    "Overlay",
-                    state.overlay_on,
-                    false,
-                    SWITCH_H,
-                ) {
-                    send(Command::SetOverlay(!state.overlay_on));
+                if let Some(banner) = &state.banner {
+                    widgets::banner(
+                        ui,
+                        widgets::BannerKind::Error,
+                        "Fehler",
+                        banner,
+                        Some(|| send(Command::DismissBanner)),
+                    );
                 }
             });
-            ui.add_space(8.0);
-        });
+
+        egui::Panel::bottom("controls")
+            .show_separator_line(false)
+            .show(root, |ui| {
+                let toggles: [Toggle; 4] = [
+                    (
+                        icon::MICROPHONE_SLASH,
+                        "Stumm",
+                        state.muted,
+                        widgets::Role::Danger,
+                        false,
+                        Some(Command::SetMuted(!state.muted)),
+                    ),
+                    (
+                        icon::SPEAKER_SLASH,
+                        "Taub",
+                        state.deafened,
+                        widgets::Role::Danger,
+                        false,
+                        Some(Command::SetDeafened(!state.deafened)),
+                    ),
+                    (
+                        icon::VIDEO_CAMERA,
+                        "Kamera",
+                        state.camera_on,
+                        widgets::Role::Accent,
+                        state.camera_on,
+                        cfg!(feature = "camera").then(|| Command::SetCamera(!state.camera_on)),
+                    ),
+                    (
+                        icon::SQUARES_FOUR,
+                        "Overlay",
+                        state.overlay_on,
+                        widgets::Role::Accent,
+                        false,
+                        cfg!(feature = "overlay").then(|| Command::SetOverlay(!state.overlay_on)),
+                    ),
+                ];
+                let toggles: Vec<_> = toggles.into_iter().filter(|t| t.5.is_some()).collect();
+
+                ui.add_space(6.0);
+                // One card, one grid: the tiles share their column width and
+                // gap with the speak row above, so every edge in the dock
+                // lines up with another.
+                let ptt = egui::Frame::new()
+                    .fill(ui.visuals().faint_bg_color)
+                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                    .corner_radius(egui::CornerRadius::same(theme::R_CARD))
+                    .inner_margin(egui::Margin::same(DOCK_GAP as i8))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(DOCK_GAP, DOCK_GAP);
+                        let n = toggles.len().max(1) as f32;
+                        let col = ((ui.available_width() - (n - 1.0) * DOCK_GAP) / n).floor();
+                        let ptt = ui.horizontal(|ui| speak_row(ui, state, &send, col)).inner;
+                        ui.horizontal(|ui| {
+                            for (glyph, label, active, role, rec, cmd) in toggles {
+                                let size = egui::vec2(col, TILE_H);
+                                if widgets::tile(ui, glyph, label, active, role, rec, size)
+                                    .clicked()
+                                {
+                                    if let Some(c) = cmd {
+                                        send(c);
+                                    }
+                                }
+                            }
+                        });
+                        ptt
+                    })
+                    .inner;
+                // Hold semantics: a press that starts on the button keeps the
+                // gate open until the primary button is released anywhere, even
+                // if the pointer drifts off the widget or egui stops treating it
+                // as "down on" (observed in the live test: transmission ended
+                // after a few seconds while the button was still held).
+                let primary_down = ui.input(|i| i.pointer.primary_down());
+                let held = match &ptt {
+                    Some(_) if self.ptt_held => primary_down,
+                    Some(button) => button.is_pointer_button_down_on() && primary_down,
+                    None => false,
+                };
+                if held {
+                    ui.ctx().request_repaint();
+                }
+                if held != self.ptt_held {
+                    self.ptt_held = held;
+                    send(Command::Ptt(held));
+                }
+                ui.add_space(8.0);
+            });
 
         let volume_open = &mut self.volume_open;
         let videos = &self.videos;
         egui::CentralPanel::default().show(root, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
+            // The people get a card of their own, the same surface as the
+            // control dock below, so the window reads as two calm blocks.
+            egui::Frame::new()
+                .fill(ui.visuals().faint_bg_color)
+                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                .corner_radius(egui::CornerRadius::same(theme::R_CARD))
+                .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    ui.add_space(2.0);
-                    if let Some(me) = &state.me {
-                        participant_row(
-                            ui,
-                            Participant {
-                                name: &me.name,
-                                user_id: me.user_id,
-                                speaking: state.sending,
-                                muted: state.muted,
-                                deafened: state.deafened,
-                                camera: state.camera_on,
-                                mode: Some(state.mode),
-                                volume: None,
-                                is_admin: state.is_admin,
-                                rtt_ms: state.rtt_ms.map(|ms| ms.round() as u16),
-                                video: self_video,
-                            },
-                            volume_open,
-                            &send,
-                        );
-                    }
-                    for p in &state.peers {
-                        participant_row(
-                            ui,
-                            Participant {
-                                name: &p.info.name,
-                                user_id: p.info.user_id,
-                                speaking: p.speaking,
-                                muted: p.info.flags.muted(),
-                                deafened: p.info.flags.deafened(),
-                                camera: p.info.flags.camera_on(),
-                                mode: None,
-                                volume: Some(p.volume),
-                                is_admin: p.info.flags.is_admin(),
-                                rtt_ms: p.rtt_ms,
-                                // The flag arrives with `UserState`, so the
-                                // picture goes the moment somebody switches
-                                // off — not three seconds later when the
-                                // last frame goes stale.
-                                video: p
-                                    .info
-                                    .flags
-                                    .camera_on()
-                                    .then(|| videos.get(p.info.session))
-                                    .flatten(),
-                            },
-                            volume_open,
-                            &send,
-                        );
-                    }
-                    if state.peers.is_empty() && state.conn == ConnStatus::Connected {
-                        alone(ui);
-                    }
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            ui.add_space(2.0);
+                            if let Some(me) = &state.me {
+                                participant_row(
+                                    ui,
+                                    Participant {
+                                        name: &me.name,
+                                        user_id: me.user_id,
+                                        speaking: state.sending,
+                                        muted: state.muted,
+                                        deafened: state.deafened,
+                                        camera: state.camera_on,
+                                        mode: Some(state.mode),
+                                        volume: None,
+                                        is_admin: state.is_admin,
+                                        rtt_ms: state.rtt_ms.map(|ms| ms.round() as u16),
+                                        video: self_video,
+                                    },
+                                    volume_open,
+                                    &send,
+                                );
+                            }
+                            for p in &state.peers {
+                                participant_row(
+                                    ui,
+                                    Participant {
+                                        name: &p.info.name,
+                                        user_id: p.info.user_id,
+                                        speaking: p.speaking,
+                                        muted: p.info.flags.muted(),
+                                        deafened: p.info.flags.deafened(),
+                                        camera: p.info.flags.camera_on(),
+                                        mode: None,
+                                        volume: Some(p.volume),
+                                        is_admin: p.info.flags.is_admin(),
+                                        rtt_ms: p.rtt_ms,
+                                        // The flag arrives with `UserState`, so the
+                                        // picture goes the moment somebody switches
+                                        // off — not three seconds later when the
+                                        // last frame goes stale.
+                                        video: p
+                                            .info
+                                            .flags
+                                            .camera_on()
+                                            .then(|| videos.get(p.info.session))
+                                            .flatten(),
+                                    },
+                                    volume_open,
+                                    &send,
+                                );
+                            }
+                            if state.peers.is_empty() && state.conn == ConnStatus::Connected {
+                                alone(ui);
+                            }
+                        });
                 });
         });
+
+        if let Some(next) = new_theme {
+            self.theme = next.to_string();
+            theme::apply(&ctx, next);
+            let mut settings = self.state.settings.clone();
+            settings.ui.theme = next.to_string();
+            if let Some(view) = &mut self.settings {
+                view.draft.ui.theme = next.to_string();
+            }
+            send(Command::UpdateSettings(Box::new(settings)));
+        }
     }
 
     fn on_exit(&mut self) {
@@ -719,46 +785,6 @@ fn conn_status(state: &AppState, tok: &theme::Tokens) -> (Color32, String, Strin
 // Bottom bar
 // ---------------------------------------------------------------------------
 
-/// The line under the level meter: the microphone level on the left, and on
-/// the right whatever the current mode makes the meter mean — the key to
-/// hold, the voice-activation probability, or that audio is going out.
-fn input_readout(ui: &mut egui::Ui, state: &AppState) {
-    let tok = theme::tokens(ui.visuals());
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("{:.0} dBFS", state.level.rms_db))
-                .monospace()
-                .size(10.5)
-                .color(tok.dim_text),
-        );
-        widgets::rtl(ui, 16.0, |ui| {
-            if state.sending {
-                ui.label(
-                    RichText::new("SENDET")
-                        .size(10.5)
-                        .color(tok.accent)
-                        .font(egui::FontId::new(10.5, fonts::semibold())),
-                );
-                widgets::speaking_bars(ui);
-            } else if state.mode == Mode::Vad {
-                widgets::vad_bar(ui, state.vad_prob, state.vad_threshold).on_hover_text(format!(
-                    "Stimme {:.2}, Schwelle {:.2}{}",
-                    state.vad_prob,
-                    state.vad_threshold,
-                    if state.settings.audio.vad_auto {
-                        " (automatisch)"
-                    } else {
-                        ""
-                    }
-                ));
-            } else {
-                widgets::chip(ui, &hotkey_label(state), 0.0)
-                    .on_hover_text("Diese Taste halten, um zu sprechen");
-            }
-        });
-    });
-}
-
 /// The push-to-talk binding as a person would say it: `KEY_RIGHTCTRL`
 /// becomes `RIGHTCTRL`, and the Portal backend shows its own trigger
 /// (`CTRL+SHIFT+F12`) because that is what it actually bound.
@@ -777,173 +803,65 @@ fn hotkey_label(state: &AppState) -> String {
         .to_string()
 }
 
-/// The speak button plus the PTT/VAD switch beside it. Returns the speak
-/// button's response only in push-to-talk mode — in voice activation there
-/// is nothing to press, so it is drawn as a status surface instead of a
-/// button that would do nothing.
+/// The speak surface plus the PTT/VAD tile beside it, `tile_w` wide. Returns the
+/// surface's response only in push-to-talk mode — in voice activation there
+/// is nothing to press, so it is a readout instead of a button that would do
+/// nothing.
 fn speak_row(
     ui: &mut egui::Ui,
     state: &AppState,
     send: &impl Fn(Command),
+    tile_w: f32,
 ) -> Option<egui::Response> {
-    let tok = theme::tokens(ui.visuals());
-    let open = match state.mode {
-        Mode::Ptt => state.ptt_down,
-        Mode::Vad => state.sending,
+    let ptt = state.mode == Mode::Ptt;
+    let open = if ptt { state.ptt_down } else { state.sending };
+    let key = hotkey_label(state);
+    let speak = widgets::Speak {
+        ptt,
+        open,
+        muted: state.muted,
+        level: if ptt {
+            theme::meter_fraction(state.level.rms_db)
+        } else {
+            state.vad_prob
+        },
+        threshold: (!ptt).then_some(state.vad_threshold),
+        key: ptt.then_some(key.as_str()),
     };
-    let (label, fill, text_color) = if open {
-        ("Mikrofon offen", tok.accent, tok.on_accent)
-    } else if state.mode == Mode::Ptt {
-        (
-            "Sprechen",
-            ui.visuals().faint_bg_color,
-            ui.visuals().text_color(),
+    let tooltip = if ptt {
+        format!(
+            "Push-to-Talk — halten zum Sprechen\nPegel {:.0} dBFS",
+            state.level.rms_db
         )
     } else {
-        (
-            "Wartet auf Stimme",
-            ui.visuals().faint_bg_color,
-            tok.muted_text,
+        format!(
+            "Sprachaktivierung\nStimme {:.2}, Schwelle {:.2}{}\nPegel {:.0} dBFS",
+            state.vad_prob,
+            state.vad_threshold,
+            if state.settings.audio.vad_auto {
+                " (automatisch)"
+            } else {
+                ""
+            },
+            state.level.rms_db
         )
     };
-    let caption = format!("{}  {label}", icon::MICROPHONE);
 
-    // Right-to-left: the mode switch claims its natural width first
-    // (rightmost), then the speak surface fills whatever remains to its
-    // left. The height is allocated explicitly — see `widgets::rtl`.
-    widgets::rtl(ui, SPEAK_H, |ui| {
-        let (glyph, mode_label, next) = match state.mode {
-            Mode::Ptt => (icon::HAND_TAP, "PTT", "Sprachaktivierung"),
-            Mode::Vad => (icon::WAVEFORM, "VAD", "Push-to-Talk"),
-        };
-        let mode = ui.allocate_ui(egui::vec2(62.0, SPEAK_H), |ui| {
-            switch(ui, glyph, mode_label, false, false, SPEAK_H)
-        });
-        if mode.inner {
-            send(Command::ToggleMode);
-        }
-        mode.response
-            .on_hover_text(format!("Umschalten auf {next}"));
-
-        let size = egui::vec2(ui.available_width(), SPEAK_H);
-        match state.mode {
-            Mode::Ptt => Some(
-                ui.add(
-                    egui::Button::new(RichText::new(caption).size(14.5).color(text_color))
-                        .fill(fill)
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            if open {
-                                tok.accent
-                            } else {
-                                ui.visuals().widgets.noninteractive.bg_stroke.color
-                            },
-                        ))
-                        .corner_radius(egui::CornerRadius::same(theme::R_ROW))
-                        .min_size(size),
-                ),
-            ),
-            Mode::Vad => {
-                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-                let painter = ui.painter();
-                painter.rect_filled(rect, theme::R_ROW, fill);
-                painter.rect_stroke(
-                    rect,
-                    theme::R_ROW,
-                    egui::Stroke::new(
-                        1.0,
-                        if open {
-                            tok.accent
-                        } else {
-                            ui.visuals().widgets.noninteractive.bg_stroke.color
-                        },
-                    ),
-                    egui::StrokeKind::Inside,
-                );
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    caption,
-                    egui::FontId::new(14.5, fonts::semibold()),
-                    text_color,
-                );
-                None
-            }
-        }
-    })
-}
-
-/// One icon-over-label switch: the four along the bottom bar and the
-/// PTT/VAD mode button. `active` tints it by role — error for the two that
-/// take something away (mute, deafen), accent for the two that add
-/// something (camera, overlay). `rec_dot` draws the pulsing "on air" dot
-/// that says this client's own video is going out. The window already
-/// repaints continuously (`request_repaint_after` in `App::ui`), so the
-/// pulse animates for free.
-fn switch(
-    ui: &mut egui::Ui,
-    glyph: &str,
-    label: &str,
-    active: bool,
-    rec_dot: bool,
-    height: f32,
-) -> bool {
-    let tok = theme::tokens(ui.visuals());
-    let is_error_role = glyph == icon::MICROPHONE_SLASH || glyph == icon::SPEAKER_SLASH;
-    let (accent, tint) = if is_error_role {
-        (tok.error, tok.error_tint)
+    let size = egui::vec2(ui.available_width() - tile_w - DOCK_GAP, SPEAK_H);
+    let response = widgets::speak_surface(ui, &speak, size).on_hover_text(tooltip);
+    let (glyph, label, next) = if ptt {
+        (icon::HAND_TAP, "PTT", "Umschalten auf Sprachaktivierung")
     } else {
-        (tok.accent, tok.accent_tint)
+        (icon::WAVEFORM, "VAD", "Umschalten auf Push-to-Talk")
     };
-    let (fill, border, text_color) = if active {
-        (tint, accent.gamma_multiply(0.47), accent)
-    } else {
-        (
-            ui.visuals().faint_bg_color,
-            ui.visuals().widgets.noninteractive.bg_stroke.color,
-            tok.muted_text,
-        )
-    };
-    let resp = ui.add(
-        egui::Button::new("")
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, border))
-            .corner_radius(egui::CornerRadius::same(theme::R_ROW))
-            .min_size(egui::vec2(ui.available_width(), height)),
-    );
-    let rect = resp.rect;
-    let painter = ui.painter();
-    let text_color = if resp.hovered() && !active {
-        ui.visuals().text_color()
-    } else {
-        text_color
-    };
-    painter.text(
-        egui::pos2(rect.center().x, rect.top() + 18.0),
-        egui::Align2::CENTER_CENTER,
-        glyph,
-        egui::FontId::new(19.0, egui::FontFamily::Proportional),
-        text_color,
-    );
-    painter.text(
-        egui::pos2(rect.center().x, rect.bottom() - 12.0),
-        egui::Align2::CENTER_CENTER,
-        label,
-        egui::FontId::new(10.5, fonts::semibold()),
-        text_color,
-    );
-    if rec_dot {
-        let t = ui.input(|i| i.time);
-        let pulse = ((t * 2.4).sin() as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
-        let pos = egui::pos2(rect.right() - 12.0, rect.top() + 12.0);
-        painter.circle_filled(
-            pos,
-            5.0 + pulse * 2.0,
-            tok.error.gamma_multiply(0.18 + pulse * 0.12),
-        );
-        painter.circle_filled(pos, 3.5, tok.error);
+    let size = egui::vec2(tile_w, SPEAK_H);
+    if widgets::tile(ui, glyph, label, false, widgets::Role::Accent, false, size)
+        .on_hover_text(next)
+        .clicked()
+    {
+        send(Command::ToggleMode);
     }
-    resp.clicked()
+    ptt.then_some(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,58 +920,83 @@ fn participant_row(
 ) {
     let tok = theme::tokens(ui.visuals());
     let expanded = p.volume.is_some() && *volume_open == Some(p.user_id);
+    // Last frame's row rect: the volume handle only shows under the pointer,
+    // and in immediate mode the row does not know its own rect until drawn.
+    let rect_id = ui.id().with(("row", p.user_id));
+    let hovered = ui
+        .data(|d| d.get_temp::<egui::Rect>(rect_id))
+        .is_some_and(|r| ui.rect_contains_pointer(r));
     let fill = if p.speaking {
         tok.accent_tint
-    } else if expanded {
-        ui.visuals().faint_bg_color
+    } else if expanded || hovered {
+        tok.surface_hi
     } else {
         Color32::TRANSPARENT
     };
-    egui::Frame::new()
+    let frame = egui::Frame::new()
         .fill(fill)
         .corner_radius(egui::CornerRadius::same(theme::R_ROW))
-        .inner_margin(egui::Margin::symmetric(8, 6))
+        .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                widgets::avatar(ui, p.name, p.user_id, p.speaking, 34.0, p.video);
-                ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    // Tight enough that a two-line row is still shorter than
-                    // the avatar beside it, which is what keeps every row the
-                    // same height whether or not there is a second line.
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.horizontal(|ui| {
-                        ui.label(if p.mode.is_some() {
-                            theme::strong_text(p.name)
-                        } else {
-                            RichText::new(p.name).size(14.0)
-                        });
-                        if p.speaking {
-                            widgets::speaking_bars(ui);
-                        }
-                    });
-                    ui.label(
-                        RichText::new(p.subtitle().unwrap_or(" "))
-                            .size(11.5)
-                            .color(tok.dim_text),
-                    );
+                let mut hint = String::new();
+                if let Some(s) = p.subtitle() {
+                    hint.push_str(s);
+                }
+                let avatar = widgets::avatar(ui, p.name, p.user_id, p.speaking, 30.0, p.video);
+                ui.add_space(2.0);
+                let name = ui.label(if p.mode.is_some() {
+                    theme::strong_text(p.name)
+                } else {
+                    RichText::new(p.name).size(14.0)
                 });
-                widgets::rtl(ui, 34.0, |ui| {
+                if !hint.is_empty() {
+                    avatar.on_hover_text(&hint);
+                    name.on_hover_text(&hint);
+                }
+                if p.speaking {
+                    widgets::speaking_bars(ui);
+                }
+                widgets::rtl(ui, 36.0, |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
                     // Always the same glyph: the crossed-out speaker is the
                     // badge for "this person hears nothing", and a volume
                     // handle wearing it would read as that.
                     if let Some(vol) = p.volume {
-                        if widgets::icon_button(ui, icon::SPEAKER_HIGH, 30.0, expanded)
+                        if widgets::icon_button(ui, icon::SPEAKER_HIGH, 28.0, expanded)
                             .on_hover_text(format!("Lautstärke {vol:.0} %"))
                             .clicked()
                         {
                             *volume_open = if expanded { None } else { Some(p.user_id) };
                         }
                     }
+                    // Server-measured RTT (`PROTOCOL.md` §2.2 `UserRtt`), not
+                    // a client self-report: every viewer sees the same number
+                    // for a given peer. Plain text in a fixed box, so a
+                    // changing number never shoves the icons around.
+                    if let Some(ms) = p.rtt_ms {
+                        let color = if ms > SLOW_RTT_MS {
+                            tok.connecting
+                        } else {
+                            tok.dim_text
+                        };
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(44.0, 20.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    RichText::new(format!("{ms} ms"))
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(color),
+                                )
+                            },
+                        );
+                    }
                     for (on, color, glyph) in [
                         (p.deafened, tok.error, icon::SPEAKER_SLASH),
                         (p.muted, tok.error, icon::MICROPHONE_SLASH),
-                        (p.camera, tok.muted_text, icon::VIDEO_CAMERA),
+                        (p.camera, tok.dim_text, icon::VIDEO_CAMERA),
                     ] {
                         if on {
                             ui.label(RichText::new(glyph).size(15.0).color(color));
@@ -1062,16 +1005,10 @@ fn participant_row(
                     if p.is_admin {
                         ui.label(
                             RichText::new(icon::SHIELD_STAR)
-                                .size(15.0)
-                                .color(tok.accent),
+                                .size(14.0)
+                                .color(tok.dim_text),
                         )
                         .on_hover_text("Admin");
-                    }
-                    // Server-measured RTT (`PROTOCOL.md` §2.2 `UserRtt`), not
-                    // a client self-report: every viewer sees the same
-                    // number for a given peer.
-                    if let Some(ms) = p.rtt_ms {
-                        widgets::chip(ui, &format!("{ms} ms"), 0.0);
                     }
                 });
             });
@@ -1079,7 +1016,7 @@ fn participant_row(
                 let mut v = p.volume.expect("expanded implies a remote participant");
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(38.0);
+                    ui.add_space(40.0);
                     widgets::rtl(ui, 22.0, |ui| {
                         widgets::chip(ui, &format!("{v:.0} %"), 46.0);
                         if widgets::slider(ui, &mut v, 0.0..=200.0).changed() {
@@ -1087,33 +1024,21 @@ fn participant_row(
                         }
                     });
                 });
+                ui.add_space(4.0);
             }
         });
+    let r = frame.response.rect;
+    ui.data_mut(|d| d.insert_temp(rect_id, r));
 }
 
 /// The empty state: connected, but the only person here is you.
 fn alone(ui: &mut egui::Ui) {
     let tok = theme::tokens(ui.visuals());
     ui.vertical_centered(|ui| {
-        ui.add_space(28.0);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
-        ui.painter()
-            .circle_filled(rect.center(), 28.0, ui.visuals().faint_bg_color);
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            icon::USERS,
-            egui::FontId::new(24.0, egui::FontFamily::Proportional),
-            tok.dim_text,
-        );
-        ui.add_space(10.0);
-        ui.label(theme::strong_text("Niemand sonst ist da"));
+        ui.add_space(48.0);
+        ui.label(RichText::new(icon::USERS).size(30.0).color(tok.dim_text));
         ui.add_space(2.0);
-        ui.label(
-            RichText::new("Teile den Einladungslink, um jemanden hierher zu holen.")
-                .size(12.0)
-                .color(tok.dim_text),
-        );
+        ui.label(RichText::new("Allein hier").size(12.5).color(tok.dim_text));
     });
 }
 
@@ -1129,6 +1054,9 @@ pub fn run_enroll(
 ) -> Result<Option<Identity>, String> {
     let result: Arc<Mutex<Option<Identity>>> = Arc::new(Mutex::new(None));
     let result_app = result.clone();
+    let enroll_theme = crate::config::Settings::load(&paths)
+        .map(|s| s.ui.theme)
+        .unwrap_or_else(|_| "system".to_string());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ICU — Einladung")
@@ -1142,7 +1070,7 @@ pub fn run_enroll(
         options,
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx);
-            theme::apply(&cc.egui_ctx, "dark");
+            theme::apply(&cc.egui_ctx, &enroll_theme);
             Ok(Box::new(EnrollApp {
                 paths,
                 server_addr,

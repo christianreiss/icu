@@ -152,11 +152,8 @@ pub fn button(ui: &mut Ui, kind: ButtonKind, glyph: &str, label: &str) -> egui::
     // `Button::fill` is used for every interaction state, so hover has to be
     // drawn here or the button would be visually dead under the cursor.
     if response.hovered() {
-        ui.painter().rect_filled(
-            response.rect,
-            CornerRadius::same(R_CTRL),
-            Color32::from_white_alpha(12),
-        );
+        ui.painter()
+            .rect_filled(response.rect, CornerRadius::same(R_CTRL), tok.hover_overlay);
     }
     response
 }
@@ -170,7 +167,7 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, active: bool) -> egui::R
         let (fill, color) = if active {
             (tok.accent_tint, tok.accent)
         } else if response.hovered() {
-            (ui.visuals().faint_bg_color, ui.visuals().text_color())
+            (tok.hover_overlay, ui.visuals().text_color())
         } else {
             (Color32::TRANSPARENT, tok.muted_text)
         };
@@ -182,6 +179,238 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, active: bool) -> egui::R
             glyph,
             FontId::new((size * 0.5).round(), egui::FontFamily::Proportional),
             color,
+        );
+    }
+    response
+}
+
+/// Which color a [`tile`] takes when it is on: `Danger` for the switches
+/// that take something away (mute, deafen), `Accent` for the ones that add
+/// something (camera, overlay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Accent,
+    Danger,
+}
+
+/// One cell of the main window's control dock: an icon over a short label.
+/// Off is a quiet raised surface; on is a tint in its [`Role`] color, with
+/// icon and label in that color — never a solid fill, so a row of them stays
+/// calm. `rec_dot` pulses a small red dot at the top right, for "this
+/// client's own video is going out".
+pub fn tile(
+    ui: &mut Ui,
+    glyph: &str,
+    label: &str,
+    active: bool,
+    role: Role,
+    rec_dot: bool,
+    size: egui::Vec2,
+) -> egui::Response {
+    let tok = theme::tokens(ui.visuals());
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let t = ui.ctx().animate_bool_responsive(response.id, active);
+        let (on, on_tint) = match role {
+            Role::Accent => (tok.accent, tok.accent_tint_2),
+            Role::Danger => (tok.error, tok.error_tint),
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, R_ROW, lerp_color(tok.surface_hi, on_tint, t));
+        if t > 0.0 {
+            painter.rect_stroke(
+                rect,
+                R_ROW,
+                Stroke::new(1.0, on.gamma_multiply(0.45 * t)),
+                StrokeKind::Inside,
+            );
+        }
+        if response.hovered() {
+            painter.rect_filled(rect, R_ROW, tok.hover_overlay);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let idle = if response.hovered() {
+            ui.visuals().text_color()
+        } else {
+            tok.muted_text
+        };
+        let color = lerp_color(idle, on, t);
+        painter.text(
+            egui::pos2(rect.center().x, rect.center().y - 8.0),
+            egui::Align2::CENTER_CENTER,
+            glyph,
+            FontId::new(19.0, egui::FontFamily::Proportional),
+            color,
+        );
+        painter.text(
+            egui::pos2(rect.center().x, rect.center().y + 12.0),
+            egui::Align2::CENTER_CENTER,
+            label,
+            FontId::new(10.5, super::fonts::semibold()),
+            color,
+        );
+        if rec_dot {
+            let time = ui.input(|i| i.time);
+            let pulse = ((time * 2.4).sin() as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
+            let pos = egui::pos2(rect.right() - 10.0, rect.top() + 10.0);
+            painter.circle_filled(pos, 3.0 + pulse, tok.error);
+        }
+    }
+    response
+}
+
+/// What the speak surface shows; see [`speak_surface`].
+pub struct Speak<'a> {
+    /// Push-to-talk (`true`) or voice activation.
+    pub ptt: bool,
+    /// The gate is open and audio is leaving this client.
+    pub open: bool,
+    pub muted: bool,
+    /// 0…1: the microphone level in PTT mode, the speech probability in
+    /// voice activation — whatever decides whether the gate opens.
+    pub level: f32,
+    /// The voice-activation threshold on the same axis as `level`.
+    pub threshold: Option<f32>,
+    /// The push-to-talk key, shown as a keycap beside the label.
+    pub key: Option<&'a str>,
+}
+
+/// The big control: the speak button in push-to-talk, a readout in voice
+/// activation. A short label in the middle and a thin level line along the
+/// bottom edge; open, the whole surface turns accent. Senses clicks only in
+/// PTT mode, so a caller's hold logic can keep reading
+/// `is_pointer_button_down_on` off the returned response.
+pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Response {
+    let tok = theme::tokens(ui.visuals());
+    let sense = if s.ptt {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let painter = ui.painter();
+    let open = ui.ctx().animate_bool_with_time(response.id, s.open, 0.08);
+    let hot = open > 0.5;
+    painter.rect_filled(rect, R_ROW, lerp_color(tok.surface_hi, tok.accent, open));
+    if s.ptt && response.hovered() {
+        painter.rect_filled(rect, R_ROW, tok.hover_overlay);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    // The level line, eased so it glides instead of flickering at 30 fps.
+    let level = ui.ctx().animate_value_with_time(
+        response.id.with("level"),
+        if s.muted {
+            0.0
+        } else {
+            s.level.clamp(0.0, 1.0)
+        },
+        0.12,
+    );
+    let line = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 14.0, rect.bottom() - 9.0),
+        egui::pos2(rect.right() - 14.0, rect.bottom() - 6.0),
+    );
+    let (track, fill) = if hot {
+        (
+            tok.on_accent.gamma_multiply(0.18),
+            tok.on_accent.gamma_multiply(0.7),
+        )
+    } else {
+        (
+            ui.visuals().widgets.inactive.bg_stroke.color,
+            if s.ptt { tok.level } else { tok.accent },
+        )
+    };
+    painter.rect_filled(line, 1.5, track);
+    if level > 0.0 {
+        let mut bar = line;
+        bar.max.x = line.left() + line.width() * level;
+        painter.rect_filled(bar, 1.5, fill);
+    }
+    if let Some(th) = s.threshold {
+        let x = line.left() + line.width() * th.clamp(0.0, 1.0);
+        painter.line_segment(
+            [
+                egui::pos2(x, line.top() - 2.0),
+                egui::pos2(x, line.bottom() + 2.0),
+            ],
+            Stroke::new(1.5, if hot { tok.on_accent } else { tok.muted_text }),
+        );
+    }
+
+    let (glyph, label, color) = if s.muted {
+        (icon::MICROPHONE_SLASH, "Stumm", tok.error)
+    } else if hot {
+        (icon::MICROPHONE, "Sendet", tok.on_accent)
+    } else if s.ptt {
+        (icon::MICROPHONE, "Halten", ui.visuals().text_color())
+    } else {
+        (icon::MICROPHONE, "Bereit", tok.muted_text)
+    };
+    let text = painter.layout_no_wrap(
+        format!("{glyph}  {label}"),
+        FontId::new(14.0, super::fonts::semibold()),
+        color,
+    );
+    let key = s.key.filter(|_| !hot && !s.muted).map(|k| {
+        painter.layout_no_wrap(
+            k.to_string(),
+            FontId::new(10.5, egui::FontFamily::Monospace),
+            tok.dim_text,
+        )
+    });
+    const KEY_PAD: egui::Vec2 = egui::vec2(6.0, 2.0);
+    const KEY_GAP: f32 = 8.0;
+    let key_w = key
+        .as_ref()
+        .map_or(0.0, |k| k.size().x + KEY_PAD.x * 2.0 + KEY_GAP);
+    let cy = rect.center().y - 3.0;
+    let left = rect.center().x - (text.size().x + key_w) / 2.0;
+    let text_w = text.size().x;
+    painter.galley(egui::pos2(left, cy - text.size().y / 2.0), text, color);
+    if let Some(k) = key {
+        let cap = egui::Rect::from_min_size(
+            egui::pos2(left + text_w + KEY_GAP, cy - k.size().y / 2.0 - KEY_PAD.y),
+            k.size() + KEY_PAD * 2.0,
+        );
+        painter.rect_stroke(
+            cap,
+            CornerRadius::same(R_CHIP),
+            Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+            StrokeKind::Inside,
+        );
+        painter.galley(cap.min + KEY_PAD, k, tok.dim_text);
+    }
+    response
+}
+
+/// The header's connection indicator: a dot and one quiet word, clickable
+/// as a whole. Anything longer belongs in the caller's tooltip.
+pub fn status_link(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
+    let tok = theme::tokens(ui.visuals());
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        FontId::new(12.0, egui::FontFamily::Proportional),
+        tok.muted_text,
+    );
+    let size = egui::vec2(galley.size().x + 26.0, 24.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(rect, R_CTRL, tok.hover_overlay);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let dot = egui::pos2(rect.left() + 10.0, rect.center().y);
+        painter.circle_filled(dot, 3.5, color);
+        painter.galley(
+            egui::pos2(rect.left() + 19.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            tok.muted_text,
         );
     }
     response
@@ -366,93 +595,6 @@ pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui:
 // ---------------------------------------------------------------------------
 // Audio indicators
 // ---------------------------------------------------------------------------
-
-/// The microphone level, as 28 segments over −60…0 dBFS plus a one-segment
-/// peak marker. `hot` means the gate is open and audio is actually leaving
-/// this client, which recolors the bar from "level" to "accent" — the
-/// difference between "the microphone hears you" and "they hear you".
-pub fn level_meter(ui: &mut Ui, rms_db: f32, peak_db: f32, hot: bool) -> egui::Response {
-    const SEGMENTS: u32 = 28;
-    const HEIGHT: f32 = 9.0;
-    const GAP: f32 = 2.0;
-
-    let tok = theme::tokens(ui.visuals());
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), HEIGHT), Sense::hover());
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let seg_w = (rect.width() - GAP * (SEGMENTS as f32 - 1.0)) / SEGMENTS as f32;
-        let upto = |db: f32| (theme::meter_fraction(db) * SEGMENTS as f32).round() as u32;
-        let filled = upto(rms_db);
-        // A peak below the meter's own floor has no segment to sit on, so
-        // it lights nothing — otherwise digital silence would still show a
-        // marker parked on the first segment.
-        let peak = (peak_db > -60.0).then(|| upto(peak_db).clamp(1, SEGMENTS) - 1);
-        let empty = ui.visuals().widgets.noninteractive.bg_stroke.color;
-        for i in 0..SEGMENTS {
-            let color = if i + 3 >= SEGMENTS {
-                tok.level_clip
-            } else if hot {
-                tok.accent
-            } else {
-                tok.level
-            };
-            let color = if i < filled {
-                color
-            } else if peak == Some(i) {
-                color.gamma_multiply(0.55)
-            } else {
-                empty
-            };
-            let seg = egui::Rect::from_min_size(
-                egui::pos2(rect.left() + i as f32 * (seg_w + GAP), rect.top()),
-                egui::vec2(seg_w, HEIGHT),
-            );
-            painter.rect_filled(seg, 2.0, color);
-        }
-    }
-    response
-}
-
-/// Voice-activation readout: the current speech probability as a small bar,
-/// with a tick at the threshold it has to cross. Probability and threshold
-/// share the 0…1 axis — unlike the dBFS [`level_meter`], which is why this
-/// is a separate widget rather than a marker on that one.
-pub fn vad_bar(ui: &mut Ui, prob: f32, threshold: f32) -> egui::Response {
-    const WIDTH: f32 = 72.0;
-    const HEIGHT: f32 = 7.0;
-
-    let tok = theme::tokens(ui.visuals());
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(WIDTH, HEIGHT + 4.0), Sense::hover());
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let track = egui::Rect::from_center_size(rect.center(), egui::vec2(WIDTH, HEIGHT));
-        painter.rect_filled(track, HEIGHT / 2.0, ui.visuals().extreme_bg_color);
-        painter.rect_stroke(
-            track,
-            HEIGHT / 2.0,
-            Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
-            StrokeKind::Inside,
-        );
-        let mut fill = track;
-        fill.max.x = track.left() + track.width() * prob.clamp(0.0, 1.0);
-        painter.rect_filled(
-            fill,
-            HEIGHT / 2.0,
-            if prob >= threshold {
-                tok.accent
-            } else {
-                tok.dim_text
-            },
-        );
-        let tx = track.left() + track.width() * threshold.clamp(0.0, 1.0);
-        painter.line_segment(
-            [egui::pos2(tx, rect.top()), egui::pos2(tx, rect.bottom())],
-            Stroke::new(2.0, ui.visuals().text_color()),
-        );
-    }
-    response
-}
 
 /// Five static accent bars indicating "currently speaking". Always
 /// allocates its footprint so rows don't reflow when this toggles.
@@ -686,20 +828,6 @@ const PILL_GAP: f32 = 5.0;
 pub fn status_pill(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
     let (rect, response, galley) = pill_shape(ui, text, Sense::hover());
     paint_pill(ui, rect, color, galley, false);
-    response
-}
-
-/// [`status_pill`] that reacts to a click and says so — hand cursor and a
-/// brighter fill under the pointer. Identical geometry, because the header
-/// row it lives in is height-constrained (`main_window.rs`) and must not
-/// reflow when the pill gains an affordance.
-pub fn status_pill_button(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
-    let (rect, response, galley) = pill_shape(ui, text, Sense::click());
-    let hovered = response.hovered();
-    paint_pill(ui, rect, color, galley, hovered);
-    if hovered {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
     response
 }
 

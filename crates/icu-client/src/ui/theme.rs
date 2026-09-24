@@ -1,5 +1,5 @@
-//! Colors and visual constants for the dark-first (default), Discord/Mumble-
-//! style palette; follows the configured theme (`system`/`light`/`dark`).
+//! Colors and visual constants: a calm near-black dark palette and a clean
+//! light one; follows the configured theme (`system` by default).
 //!
 //! Every color role differs between the dark and light theme (2026 design
 //! pass), so almost nothing here is a flat constant: [`tokens`] returns the
@@ -43,6 +43,12 @@ pub struct Tokens {
     pub muted_text: Color32,
     /// Dim/tertiary text (min/max labels, chip captions).
     pub dim_text: Color32,
+    /// Translucent wash laid over any surface under the pointer: light on
+    /// dark, dark on light, so hover is visible in both themes.
+    pub hover_overlay: Color32,
+    /// A surface one step above `faint_bg_color`: round toggles, the speak
+    /// surface's resting fill.
+    pub surface_hi: Color32,
 }
 
 /// Corner-radius scale. Four steps, nested smallest-inside-largest: a chip
@@ -62,8 +68,8 @@ pub fn tokens(visuals: &Visuals) -> Tokens {
         Tokens {
             accent: Color32::from_rgb(0x2e, 0x9b, 0xff),
             on_accent: Color32::from_rgb(0x06, 0x12, 0x1f),
-            accent_tint: Color32::from_rgb(0x11, 0x1d, 0x2b),
-            accent_tint_2: Color32::from_rgb(0x14, 0x26, 0x3a),
+            accent_tint: Color32::from_rgb(0x10, 0x1b, 0x29),
+            accent_tint_2: Color32::from_rgb(0x13, 0x24, 0x38),
             connected: Color32::from_rgb(0x46, 0xb6, 0x7c),
             connecting: Color32::from_rgb(0xe3, 0xa3, 0x3b),
             error: Color32::from_rgb(0xe5, 0x56, 0x5b),
@@ -73,6 +79,8 @@ pub fn tokens(visuals: &Visuals) -> Tokens {
             level_clip: Color32::from_rgb(0xe5, 0x56, 0x5b),
             muted_text: Color32::from_rgb(0xa2, 0xa9, 0xb8),
             dim_text: Color32::from_rgb(0x76, 0x7e, 0x8f),
+            hover_overlay: Color32::from_white_alpha(14),
+            surface_hi: Color32::from_rgb(0x24, 0x28, 0x31),
         }
     } else {
         Tokens {
@@ -89,6 +97,8 @@ pub fn tokens(visuals: &Visuals) -> Tokens {
             level_clip: Color32::from_rgb(0xc0, 0x34, 0x2f),
             muted_text: Color32::from_rgb(0x4e, 0x57, 0x66),
             dim_text: Color32::from_rgb(0x6e, 0x77, 0x86),
+            hover_overlay: Color32::from_black_alpha(12),
+            surface_hi: Color32::from_rgb(0xec, 0xee, 0xf2),
         }
     }
 }
@@ -153,10 +163,10 @@ pub fn caps_text(text: &str) -> egui::RichText {
 fn dark_visuals() -> Visuals {
     let mut v = Visuals::dark();
     let t = tokens(&v);
-    v.panel_fill = Color32::from_rgb(0x0e, 0x0f, 0x13);
+    v.panel_fill = Color32::from_rgb(0x0b, 0x0c, 0x10);
     v.window_fill = v.panel_fill;
-    v.extreme_bg_color = Color32::from_rgb(0x0a, 0x0b, 0x0e);
-    v.faint_bg_color = Color32::from_rgb(0x16, 0x18, 0x21);
+    v.extreme_bg_color = Color32::from_rgb(0x07, 0x08, 0x0b);
+    v.faint_bg_color = Color32::from_rgb(0x1a, 0x1d, 0x24);
     v.override_text_color = Some(Color32::from_rgb(0xec, 0xee, 0xf3));
     v.hyperlink_color = t.accent;
     v.selection.bg_fill = t.accent.gamma_multiply(0.5);
@@ -173,7 +183,7 @@ fn dark_visuals() -> Visuals {
     ] {
         w.corner_radius = CornerRadius::same(R_CTRL);
     }
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x23, 0x26, 0x2f));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x25, 0x29, 0x32));
     // Differentiate the "track" role (bg_fill: checkbox/slider background)
     // from the "button chrome" role (weak_bg_fill) — stock egui keeps these
     // equal in every state.
@@ -189,9 +199,9 @@ fn dark_visuals() -> Visuals {
 fn light_visuals() -> Visuals {
     let mut v = Visuals::light();
     let t = tokens(&v);
-    v.panel_fill = Color32::from_rgb(0xf4, 0xf6, 0xf9);
+    v.panel_fill = Color32::from_rgb(0xf6, 0xf7, 0xf9);
     v.window_fill = v.panel_fill;
-    v.extreme_bg_color = Color32::from_rgb(0xe7, 0xea, 0xf0);
+    v.extreme_bg_color = Color32::from_rgb(0xec, 0xee, 0xf2);
     v.faint_bg_color = Color32::from_rgb(0xff, 0xff, 0xff);
     v.override_text_color = Some(Color32::from_rgb(0x14, 0x16, 0x1b));
     v.hyperlink_color = t.accent;
@@ -208,7 +218,7 @@ fn light_visuals() -> Visuals {
     ] {
         w.corner_radius = CornerRadius::same(R_CTRL);
     }
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xe2, 0xe5, 0xec));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xe4, 0xe7, 0xec));
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xcf, 0xd5, 0xdf));
     v.widgets.active.weak_bg_fill = t.accent;
     v.widgets.active.fg_stroke = Stroke::new(1.0, t.on_accent);
