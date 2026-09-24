@@ -234,7 +234,9 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | Users | `max_users` (Default 16, Obergrenze 64); beim Erreichen `close(SERVER_FULL)` |
 | Uni-Streams | `max_concurrent_uni_streams` = `2 × max_users + 4` je Richtung |
 | `Welcome`-Größe | Server validiert beim Start, dass `max_users` × 100 B + Reserve unter dem 16-KiB-Frame-Limit bleibt |
-| Registrierung | 5/min pro IP, 20/min global; je Sitzung ≤ 10 `RenewRequest`, ≤ 120 s; Registrierungszertifikat ≤ 7 Tage |
+| Handshakes | 10/s pro IP (IPv6: pro /64), 100/s global; ≤ 10 s je Handshake; ab 32 offenen Verbindungen Retry (Adressvalidierung) |
+| Verbindungen | ≤ 256 offen (Handshake oder etabliert, über alle Listen-Adressen), darüber `refuse` |
+| Registrierung | 5/min pro IP (IPv6: pro /64), 20/min global; je Sitzung ≤ 10 `RenewRequest`, ≤ 120 s; Registrierungszertifikat ≤ 7 Tage |
 | Hello | ≤ 5 s nach Handshake |
 
 ## 8. Versionierung

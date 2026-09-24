@@ -155,10 +155,11 @@ Fehlerform einheitlich `{"ok":false,"error":"<kurzform>","detail":"<text>"}`.
 
 ```
 incoming = endpoint.accept()
-  if under_load (≥ 32 handshakes in flight) → incoming.retry()      // Adressvalidierung, kostet kein Budget
-  if limits.ip_bucket(remote).exhausted → incoming.refuse()
-  if IP-Tabelle voll (4096) → validiert: durchlassen, sonst retry()/refuse()
-connecting = incoming.accept()
+  if offene Verbindungen ≥ max_connections (256) → incoming.refuse()   // Handshake oder etabliert, alle Endpoints
+  if under_load (≥ 32 offene Verbindungen) → incoming.retry()      // Adressvalidierung, kostet kein Budget
+  if limits.ip_bucket(/64 bzw. IPv4).exhausted || global_bucket.exhausted → incoming.refuse()
+  if IP-Tabelle voll (4096) → validiert: nur globales Budget, sonst retry()/refuse()
+connecting = incoming.accept()                // ab hier ≤ 10 s bis Handshake-Ende, sonst verworfen
 // handshake_data() nimmt &mut self und liefert Box<dyn Any>; Downcast auf quinn::crypto::rustls::HandshakeData
 alpn = connecting.handshake_data().await?
          .downcast::<quinn::crypto::rustls::HandshakeData>()?.protocol   // Spike 2b: vor Handshake-Ende lesbar
@@ -227,7 +228,7 @@ Ist die Empfängermenge leer (niemand sonst `Active`, oder alle `deafened`), wir
 
 ### 6.6 Limits (`limits.rs`)
 
-Token-Buckets pro Client (Control 50/s, Audio 110/s, Video 20/s und 400 kbit/s) und pro IP (Registrierungssitzungen 5/min, Handshakes 10/s). Überschreitung: Datagram/Frame verwerfen und zählen; bei Control `Error(RATE_LIMITED)` (nicht fatal, Verbindung bleibt), beim dritten Verstoß binnen 60 s `close(RATE_LIMITED_FATAL)` — ein eigener, fataler Code, damit der Client nicht in einen Reconnect-Loop läuft (`PROTOCOL.md` §5/§6).
+Token-Buckets pro Client (Control 50/s, Audio 110/s, Video 20/s und 400 kbit/s) und pro IP (Registrierungssitzungen 5/min, Handshakes 10/s; IPv6 zählt pro /64, weil ein Host meist ein ganzes /64 hält, IPv4-mapped als IPv4), dazu global (Handshakes 100/s, Registrierungen 20/min, höchstens 256 offene Verbindungen, Handshake ≤ 10 s). Konfigurierbar als `limits.handshakes_global_per_s`, `limits.max_connections` (mindestens `2 × max_users`) und `timing.handshake_timeout_ms`. Abgewiesene Verbindungen ohne Zertifikat (`AUTH_REQUIRED`) loggt der Server nur auf `debug`, damit Scanner das Journal nicht füllen. Überschreitung: Datagram/Frame verwerfen und zählen; bei Control `Error(RATE_LIMITED)` (nicht fatal, Verbindung bleibt), beim dritten Verstoß binnen 60 s `close(RATE_LIMITED_FATAL)` — ein eigener, fataler Code, damit der Client nicht in einen Reconnect-Loop läuft (`PROTOCOL.md` §5/§6).
 
 ## 7. Logging und Metriken
 

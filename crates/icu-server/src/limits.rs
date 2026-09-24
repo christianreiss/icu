@@ -138,12 +138,31 @@ impl ViolationCounter {
     }
 }
 
-/// Per-IP buckets, shared across connections.
+/// The key a source address is rate limited under: IPv4 as is, IPv6 by its
+/// /64 ([`icu_proto::limits::IPV6_LIMIT_PREFIX`]). One host commonly holds a
+/// whole /64 and can pick any source address in it, so a per-address bucket
+/// would give it 2^64 budgets. An IPv4-mapped address counts as the IPv4 one.
+pub fn limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let prefix = u32::from(icu_proto::limits::IPV6_LIMIT_PREFIX);
+                let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+                IpAddr::V6((u128::from(v6) & mask).into())
+            }
+        },
+    }
+}
+
+/// Per-IP buckets, shared across connections. Keyed by [`limit_key`].
 #[derive(Debug)]
 pub struct IpLimits {
     handshakes: HashMap<IpAddr, TokenBucket>,
     enrollments: HashMap<IpAddr, TokenBucket>,
     global_enroll: TokenBucket,
+    global_handshakes: TokenBucket,
     handshakes_per_s: u32,
     enroll_per_min: u32,
 }
@@ -155,15 +174,18 @@ impl IpLimits {
             handshakes: HashMap::new(),
             enrollments: HashMap::new(),
             global_enroll: TokenBucket::per_minute(limits.enroll_global_per_min),
+            global_handshakes: TokenBucket::per_second(limits.handshakes_global_per_s),
             handshakes_per_s: limits.handshakes_per_ip_per_s,
             enroll_per_min: limits.enroll_per_ip_per_min,
         }
     }
 
-    /// Whether this IP may start another handshake. `None` when the IP is
-    /// not tracked yet and the table is full even after pruning — the
-    /// caller then decides without a per-IP budget.
+    /// Whether this IP may start another handshake: its own bucket first,
+    /// then the server wide one. `None` when the IP is not tracked yet and
+    /// the table is full even after pruning — the caller then decides
+    /// without a per-IP budget, see [`IpLimits::allow_untracked_handshake`].
     pub fn allow_handshake(&mut self, ip: IpAddr) -> Option<bool> {
+        let ip = limit_key(ip);
         if !self.handshakes.contains_key(&ip) && self.handshakes.len() >= MAX_TRACKED_IPS {
             self.prune();
             if self.handshakes.len() >= MAX_TRACKED_IPS {
@@ -171,12 +193,18 @@ impl IpLimits {
             }
         }
         let per_s = self.handshakes_per_s;
-        Some(
-            self.handshakes
-                .entry(ip)
-                .or_insert_with(|| TokenBucket::per_second(per_s))
-                .take_one(),
-        )
+        let ok = self
+            .handshakes
+            .entry(ip)
+            .or_insert_with(|| TokenBucket::per_second(per_s))
+            .take_one();
+        Some(ok && self.global_handshakes.take_one())
+    }
+
+    /// A handshake from an address the full table could not take: only the
+    /// server wide budget applies.
+    pub fn allow_untracked_handshake(&mut self) -> bool {
+        self.global_handshakes.take_one()
     }
 
     /// Whether this IP may start another enrollment. Checks the per-IP bucket
@@ -185,7 +213,7 @@ impl IpLimits {
         let per_min = self.enroll_per_min;
         let ok = self
             .enrollments
-            .entry(ip)
+            .entry(limit_key(ip))
             .or_insert_with(|| TokenBucket::per_minute(per_min))
             .take_one();
         ok && self.global_enroll.take_one()
@@ -290,8 +318,54 @@ mod tests {
     }
 
     #[test]
-    fn the_handshake_table_has_a_ceiling() {
+    fn ipv6_is_limited_per_64() {
         let mut limits = IpLimits::new(&crate::config::LimitsSection::default());
+        for i in 0..10u16 {
+            let ip: IpAddr = format!("2001:db8:1:2::{i:x}").parse().unwrap();
+            assert_eq!(limits.allow_handshake(ip), Some(true), "handshake {i}");
+        }
+        let same_64: IpAddr = "2001:db8:1:2:ffff::1".parse().unwrap();
+        assert_eq!(
+            limits.allow_handshake(same_64),
+            Some(false),
+            "11th from the /64"
+        );
+        let other_64: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(limits.allow_handshake(other_64), Some(true));
+    }
+
+    #[test]
+    fn a_mapped_ipv4_address_shares_the_ipv4_bucket() {
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        assert_eq!(limit_key(mapped), v4);
+    }
+
+    #[test]
+    fn the_global_handshake_limit_bites_across_addresses() {
+        let mut limits = IpLimits::new(&crate::config::LimitsSection {
+            handshakes_global_per_s: 25,
+            ..Default::default()
+        });
+        let allowed = (0..50u32)
+            .filter(|i| {
+                let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
+                limits.allow_handshake(ip) == Some(true)
+            })
+            .count();
+        assert_eq!(allowed, 25);
+        assert!(
+            !limits.allow_untracked_handshake(),
+            "shared with untracked ones"
+        );
+    }
+
+    #[test]
+    fn the_handshake_table_has_a_ceiling() {
+        let mut limits = IpLimits::new(&crate::config::LimitsSection {
+            handshakes_global_per_s: u32::MAX,
+            ..Default::default()
+        });
         for i in 0..MAX_TRACKED_IPS as u32 {
             let ip = IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i));
             assert_eq!(limits.allow_handshake(ip), Some(true));

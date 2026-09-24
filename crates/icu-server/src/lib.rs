@@ -76,6 +76,9 @@ pub struct Server {
     pub loss: std::sync::Mutex<LossTracker>,
     /// Last forwarded `KeyframeRequest` per speaker.
     pub keyframes: std::sync::Mutex<std::collections::HashMap<icu_proto::Session, Instant>>,
+    /// Connection tasks alive right now, handshaking or established, over
+    /// all endpoints (`limits.max_connections`).
+    pub open_connections: std::sync::atomic::AtomicUsize,
     /// Flipped to `true` on shutdown.
     pub shutdown: watch::Sender<bool>,
     started: Instant,
@@ -112,6 +115,7 @@ impl Server {
             ip_limits: std::sync::Mutex::new(IpLimits::new(&config.limits)),
             loss: std::sync::Mutex::new(LossTracker::default()),
             keyframes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        open_connections: std::sync::atomic::AtomicUsize::new(0),
             counters: Counters::default(),
             ca: tokio::sync::RwLock::new(ca),
             store: tokio::sync::Mutex::new(store),
@@ -245,6 +249,7 @@ pub async fn run(config: Config) -> Result<Handle> {
         ip_limits: std::sync::Mutex::new(IpLimits::new(&config.limits)),
         loss: std::sync::Mutex::new(LossTracker::default()),
         keyframes: std::sync::Mutex::new(std::collections::HashMap::new()),
+        open_connections: std::sync::atomic::AtomicUsize::new(0),
         counters: Counters::default(),
         ca: tokio::sync::RwLock::new(ca),
         store: tokio::sync::Mutex::new(store),

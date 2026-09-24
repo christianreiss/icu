@@ -27,8 +27,21 @@ pub const ENROLL_PER_IP_PER_MIN: u32 = 5;
 pub const ENROLL_GLOBAL_PER_MIN: u32 = 20;
 /// Handshakes per second and source IP (`Server/IMPLEMENTATION.md` §6.6).
 pub const HANDSHAKES_PER_IP_PER_S: u32 = 10;
-/// Handshakes in flight above which the server sends a Retry.
+/// Handshakes per second, server wide. Caps what many source addresses
+/// together can make the server spend on TLS.
+pub const HANDSHAKES_GLOBAL_PER_S: u32 = 100;
+/// Open connections, handshaking or established, above which the server
+/// sends a Retry.
 pub const HANDSHAKES_IN_FLIGHT_RETRY: usize = 32;
+/// Open connections, handshaking or established, above which the server
+/// refuses new ones outright.
+pub const MAX_CONNECTIONS: u32 = 256;
+/// Seconds a QUIC handshake may take before the server drops it. Without
+/// this, a half-open handshake lives for the whole idle timeout.
+pub const HANDSHAKE_TIMEOUT_S: u64 = 10;
+/// IPv6 sources are rate limited per prefix of this length: a single host
+/// usually holds a whole /64, so per-address buckets would not limit it.
+pub const IPV6_LIMIT_PREFIX: u8 = 64;
 /// `KeyframeRequest` forwards per second and speaker.
 pub const KEYFRAME_REQUESTS_PER_S: u32 = 1;
 

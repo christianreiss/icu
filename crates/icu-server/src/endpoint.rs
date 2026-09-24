@@ -1,7 +1,11 @@
 //! QUIC endpoint: TLS configuration, binding and the accept loop
 //! (`Server/IMPLEMENTATION.md` §6.1.5–§6.2).
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
 use icu_proto::limits as pl;
 use quinn::{crypto::rustls::QuicServerConfig, Endpoint, VarInt};
@@ -112,11 +116,17 @@ pub async fn accept_loop(server: Arc<Server>, endpoint: Endpoint) {
         };
 
         let remote = incoming.remote_address();
+        // Hard ceiling over all endpoints, handshaking or established (§6.2):
+        // whatever gets past the rate limits cannot pile up connection state.
+        let open = server.open_connections.load(Ordering::Relaxed);
+        if open >= server.config.limits.max_connections as usize {
+            tracing::debug!(%remote, open, "connection limit, refusing");
+            incoming.refuse();
+            continue;
+        }
         // Address validation under load (§6.2) comes first: a Retry costs
         // no budget, so spoofed Initials cannot spend somebody else's.
-        let incoming = if endpoint.open_connections() >= pl::HANDSHAKES_IN_FLIGHT_RETRY
-            && incoming.may_retry()
-        {
+        let incoming = if open >= pl::HANDSHAKES_IN_FLIGHT_RETRY && incoming.may_retry() {
             match incoming.retry() {
                 Ok(()) => continue,
                 Err(e) => e.into_incoming(),
@@ -132,8 +142,20 @@ pub async fn accept_loop(server: Arc<Server>, endpoint: Endpoint) {
         match allowed {
             Some(true) => {}
             // The table is full of addresses nobody validated: a validated
-            // one passes untracked, anything else has to prove its address.
-            None if incoming.remote_address_validated() => {}
+            // one passes on the server wide budget alone, anything else has
+            // to prove its address.
+            None if incoming.remote_address_validated() => {
+                let ok = server
+                    .ip_limits
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .allow_untracked_handshake();
+                if !ok {
+                    tracing::debug!(%remote, "global handshake rate limit, refusing");
+                    incoming.refuse();
+                    continue;
+                }
+            }
             None if incoming.may_retry() => {
                 if let Err(e) = incoming.retry() {
                     e.into_incoming().refuse();
@@ -148,7 +170,9 @@ pub async fn accept_loop(server: Arc<Server>, endpoint: Endpoint) {
         }
 
         let server = server.clone();
+        let guard = OpenConnection::new(&server);
         tokio::spawn(async move {
+            let _guard = guard;
             if let Err(e) = dispatch(server, incoming).await {
                 tracing::debug!(%remote, error = %e, "connection ended");
             }
@@ -156,29 +180,52 @@ pub async fn accept_loop(server: Arc<Server>, endpoint: Endpoint) {
     }
 }
 
+/// Counts one connection task in [`Server::open_connections`] for as long as
+/// it lives, handshake included.
+struct OpenConnection(Arc<Server>);
+
+impl OpenConnection {
+    fn new(server: &Arc<Server>) -> OpenConnection {
+        server.open_connections.fetch_add(1, Ordering::Relaxed);
+        OpenConnection(server.clone())
+    }
+}
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        self.0.open_connections.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 async fn dispatch(server: Arc<Server>, incoming: quinn::Incoming) -> Result<()> {
     let remote = incoming.remote_address();
     let mut connecting = incoming.accept()?;
 
+    // One deadline for the whole handshake. Otherwise only the idle timeout
+    // (60 s) ends one that stalls, and a peer that answers just enough to
+    // keep it alive holds server state for that long. Dropping `connecting`
+    // closes the connection.
+    let deadline = tokio::time::Instant::now() + server.config.timing.handshake_timeout();
+    let too_slow = || Error::msg("handshake timed out");
+
     // Spike 2b: `handshake_data()` resolves before the handshake completes and
     // takes `&mut self`; the result needs a downcast (A2).
-    let alpn = connecting
-        .handshake_data()
+    let alpn = tokio::time::timeout_at(deadline, connecting.handshake_data())
         .await
+        .map_err(|_| too_slow())?
         .ok()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
         .and_then(|data| data.protocol.clone());
+    let conn = tokio::time::timeout_at(deadline, connecting)
+        .await
+        .map_err(|_| too_slow())??;
 
     match alpn.as_deref() {
-        Some(p) if p == pl::ALPN_MAIN => {
-            let conn = connecting.await?;
-            crate::session::handle(server, conn).await
-        }
+        Some(p) if p == pl::ALPN_MAIN => crate::session::handle(server, conn).await,
         other => {
             // rustls refuses an unknown ALPN during the handshake, so this is
             // only reachable when no ALPN was offered at all.
             tracing::debug!(%remote, alpn = ?other, "no usable ALPN");
-            let conn = connecting.await?;
             conn.close(
                 VarInt::from_u32(icu_proto::error::PROTOCOL_VIOLATION),
                 b"alpn",

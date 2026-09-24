@@ -34,7 +34,14 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
         Ok(identity) => identity,
         Err(e) => {
             let code = e.code().unwrap_or(ec::AUTH_REQUIRED);
-            tracing::info!(%remote, error = %e, "rejected");
+            // Anyone on the internet can complete a handshake without a
+            // certificate; logging each one at `info` would let scanners
+            // fill the journal.
+            if code == ec::AUTH_REQUIRED {
+                tracing::debug!(%remote, error = %e, "rejected");
+            } else {
+                tracing::info!(%remote, error = %e, "rejected");
+            }
             conn.close(quinn::VarInt::from_u32(code), ec::name(code).as_bytes());
             return Err(e);
         }
@@ -646,6 +653,11 @@ async fn control_loop(
                     },
                 );
             }
+            // Both name a speaker, and both key server state by it: only a
+            // peer that is in the room right now counts, or a client could
+            // fill the maps with all 65 535 ids.
+            ControlMsg::LossReport { speaker, .. } | ControlMsg::KeyframeRequest { speaker }
+                if speaker == session || server.room.flags(speaker).is_none() => {}
             ControlMsg::LossReport {
                 speaker,
                 loss_permille,

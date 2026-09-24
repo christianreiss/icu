@@ -25,6 +25,9 @@ SystemCallFilter=@system-service
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
 CapabilityBoundingSet=
+# Backstop for an open-internet server: the server caps connections itself
+# (limits.max_connections), this caps what a bug could still make it hold.
+MemoryMax=1G
 Restart=on-failure
 RestartSec=2
 

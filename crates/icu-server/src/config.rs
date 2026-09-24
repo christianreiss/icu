@@ -96,8 +96,13 @@ pub struct LimitsSection {
     pub enroll_per_ip_per_min: u32,
     /// Registration sessions per minute, server wide.
     pub enroll_global_per_min: u32,
-    /// Handshakes per second and IP.
+    /// Handshakes per second and IP (IPv6: per /64).
     pub handshakes_per_ip_per_s: u32,
+    /// Handshakes per second, server wide.
+    pub handshakes_global_per_s: u32,
+    /// Open connections, handshaking or established, before new ones are
+    /// refused.
+    pub max_connections: u32,
 }
 
 impl Default for LimitsSection {
@@ -111,6 +116,8 @@ impl Default for LimitsSection {
             enroll_per_ip_per_min: pl::ENROLL_PER_IP_PER_MIN,
             enroll_global_per_min: pl::ENROLL_GLOBAL_PER_MIN,
             handshakes_per_ip_per_s: pl::HANDSHAKES_PER_IP_PER_S,
+            handshakes_global_per_s: pl::HANDSHAKES_GLOBAL_PER_S,
+            max_connections: pl::MAX_CONNECTIONS,
         }
     }
 }
@@ -197,6 +204,8 @@ pub struct TimingSection {
     pub shutdown_grace_ms: u64,
     /// Idle timeout announced to peers.
     pub max_idle_timeout_ms: u64,
+    /// How long a QUIC handshake may take.
+    pub handshake_timeout_ms: u64,
 }
 
 impl Default for TimingSection {
@@ -209,6 +218,7 @@ impl Default for TimingSection {
             rate_violation_window_ms: pl::RATE_VIOLATION_WINDOW_S * 1000,
             shutdown_grace_ms: 1000,
             max_idle_timeout_ms: pl::MAX_IDLE_TIMEOUT_S * 1000,
+            handshake_timeout_ms: pl::HANDSHAKE_TIMEOUT_S * 1000,
         }
     }
 }
@@ -217,6 +227,10 @@ impl TimingSection {
     /// `hello_timeout_ms` as a `Duration`.
     pub fn hello_timeout(&self) -> Duration {
         Duration::from_millis(self.hello_timeout_ms)
+    }
+    /// `handshake_timeout_ms` as a `Duration`.
+    pub fn handshake_timeout(&self) -> Duration {
+        Duration::from_millis(self.handshake_timeout_ms)
     }
     /// `speaking_silence_ms` as a `Duration`.
     pub fn speaking_silence(&self) -> Duration {
@@ -291,6 +305,15 @@ impl Config {
         }
         Version::parse(&self.server.min_client)
             .context("server.min_client is not a semver version")?;
+        // Room for everybody plus handshakes in flight, or a full server
+        // would turn away its own users.
+        if self.limits.max_connections < u32::from(self.server.max_users) * 2 {
+            return Err(Error::msg(format!(
+                "limits.max_connections must be at least 2 x max_users = {}, got {}",
+                u32::from(self.server.max_users) * 2,
+                self.limits.max_connections
+            )));
+        }
         if !pl::welcome_fits(self.server.max_users) {
             return Err(Error::msg(format!(
                 "a full Welcome for {} users does not fit into a {} byte control frame",
@@ -441,6 +464,10 @@ format = "text"
         let mut c = base();
         c.server.listen.clear();
         assert!(c.validate().is_err());
+
+        let mut c = base();
+        c.limits.max_connections = 31;
+        assert!(c.validate().is_err(), "below 2 x max_users");
 
         let mut c = base();
         c.log.format = "xml".into();

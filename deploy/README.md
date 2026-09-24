@@ -100,6 +100,25 @@ Firewall:
 sudo firewall-cmd --permanent --add-port=4711/udp && sudo firewall-cmd --reload
 ```
 
+### Im offenen Internet
+
+Freigeben muss man nur den einen UDP-Port; der Server braucht keinen
+Reverse-Proxy und kein TLS davor, er terminiert QUIC/TLS 1.3 selbst. Ohne
+gültiges Zertifikat der eigenen CA kommt niemand über den Handshake hinaus —
+die Angriffsfläche für Unbekannte ist genau dieser Handshake. Dafür gilt
+(`PROTOCOL.md` §7, Werte in `[limits]`/`[timing]` überschreibbar):
+
+* Handshakes 10/s pro Quell-IP, IPv6 pro /64, und 100/s global; ab 32 offenen
+  Verbindungen muss jede neue Quelle ihre Adresse per Retry beweisen.
+* Höchstens 256 offene Verbindungen (`limits.max_connections`), ein Handshake
+  darf höchstens 10 s dauern.
+* Verbindungen ohne Zertifikat loggt der Server nur auf `debug`.
+
+Der Admin-Socket ist ein Unix-Socket und nie im Netz. Die Unit begrenzt den
+Speicher mit `MemoryMax=1G` als Rückfallebene. Gegen volumetrische UDP-Floods
+hilft nur Upstream-Filterung (Provider, Firewall) — das kann kein Prozess
+selbst.
+
 ## 3. Bedienen
 
 Alle Kommandos außer `run` sprechen über `/run/icu/admin.sock` mit dem

@@ -53,6 +53,37 @@ async fn connect_without_a_certificate_is_auth_required() {
     server.shutdown().await;
 }
 
+/// `PROTOCOL.md` §7: past `max_connections` open connections — handshaking
+/// or established, `Hello` or not — the server refuses new ones outright
+/// instead of accumulating state.
+#[tokio::test]
+async fn connections_past_the_limit_are_refused() {
+    let server = TestServer::start_with(|config| {
+        config.server.max_users = 1;
+        config.limits.max_connections = 2;
+    })
+    .await;
+    let alice = server.enroll("alice").await;
+    // The registration task outlives the client's close by a store write;
+    // wait until it has let go of its slot.
+    let open = &server.handle.server().open_connections;
+    for _ in 0..200 {
+        if open.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(open.load(std::sync::atomic::Ordering::Relaxed), 0);
+    // Connected but silent: each holds a slot until the `Hello` timeout.
+    let _a = server.connect(&alice).await.expect("first connection");
+    let _b = server.connect(&alice).await.expect("second connection");
+    assert!(
+        server.connect(&alice).await.is_err(),
+        "the third is refused during the handshake"
+    );
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn an_unknown_certificate_from_our_own_ca_is_auth_unknown_cert() {
     let server = TestServer::start().await;
