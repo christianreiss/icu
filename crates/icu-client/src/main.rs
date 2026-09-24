@@ -104,6 +104,8 @@ fn init_tracing() {
     );
 }
 
+// Without `gui` there is no logout, so nothing loops.
+#[cfg_attr(not(feature = "gui"), allow(unused_mut, clippy::never_loop))]
 fn run(cli: Cli) -> Result<(), String> {
     let paths = Paths::new(cli.config_dir.clone());
     std::fs::create_dir_all(&paths.config_dir).map_err(|e| e.to_string())?;
@@ -148,29 +150,6 @@ fn run(cli: Cli) -> Result<(), String> {
         );
     }
 
-    let identity = match Identity::load(&paths).map_err(|e| e.to_string())? {
-        Some(id) => id,
-        None => {
-            #[cfg(feature = "gui")]
-            let enrolled = if cli.headless {
-                None
-            } else {
-                icu_client::ui::run_enroll_window(paths.clone(), cli.server_addr)?
-            };
-            #[cfg(not(feature = "gui"))]
-            let enrolled: Option<Identity> = None;
-            match enrolled {
-                Some(id) => id,
-                None => {
-                    return Err(format!(
-                        "not registered: run `icu <bundle> --name <name>` first (config dir {})",
-                        paths.config_dir.display()
-                    ))
-                }
-            }
-        }
-    };
-
     if settings.ui.register_uri_handler && !cli.no_uri_handler && !cli.headless {
         match icu_client::uri::register() {
             Ok(p) => tracing::info!(path = %p.display(), "URI handler registered"),
@@ -178,56 +157,82 @@ fn run(cli: Cli) -> Result<(), String> {
         }
     }
 
-    let backend: Box<dyn icu_client::audio::AudioBackend> = if cli.fake_audio {
-        Box::new(icu_client::audio::fake::FakeBackend::silent().0)
-    } else {
-        match icu_client::audio::native_backend() {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(%e, "no audio backend, using the silent fake backend");
-                Box::new(icu_client::audio::fake::FakeBackend::silent().0)
+    let mut logged_out = false;
+    loop {
+        let identity = match Identity::load(&paths).map_err(|e| e.to_string())? {
+            Some(id) => id,
+            None => {
+                #[cfg(feature = "gui")]
+                let enrolled = if cli.headless {
+                    None
+                } else {
+                    icu_client::ui::run_enroll_window(paths.clone(), cli.server_addr)?
+                };
+                #[cfg(not(feature = "gui"))]
+                let enrolled: Option<Identity> = None;
+                match enrolled {
+                    Some(id) => id,
+                    None if logged_out => return Ok(()),
+                    None => return Err(format!(
+                        "not registered: run `icu <bundle> --name <name>` first (config dir {})",
+                        paths.config_dir.display()
+                    )),
+                }
             }
+        };
+
+        let backend: Box<dyn icu_client::audio::AudioBackend> = if cli.fake_audio {
+            Box::new(icu_client::audio::fake::FakeBackend::silent().0)
+        } else {
+            match icu_client::audio::native_backend() {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!(%e, "no audio backend, using the silent fake backend");
+                    Box::new(icu_client::audio::fake::FakeBackend::silent().0)
+                }
+            }
+        };
+
+        let mut settings = Settings::load(&paths).map_err(|e| e.to_string())?;
+        if let Some(cam) = &cli.camera {
+            settings.camera.device = Some(cam.clone());
+            settings.camera.enabled = true;
         }
-    };
+        let mut cfg = EngineConfig::new(identity, settings.clone(), paths.clone());
+        cfg.server_addr = cli.server_addr;
+        cfg.test_tone = cli.test_tone;
+        let engine = Engine::start(cfg, backend).map_err(|e| e.to_string())?;
 
-    let mut settings = settings;
-    if let Some(cam) = &cli.camera {
-        settings.camera.device = Some(cam.clone());
-        settings.camera.enabled = true;
-    }
-    let mut cfg = EngineConfig::new(identity, settings.clone(), paths.clone());
-    cfg.server_addr = cli.server_addr;
-    cfg.test_tone = cli.test_tone;
-    let engine = Engine::start(cfg, backend).map_err(|e| e.to_string())?;
+        // Hotkeys come up in the background: the Portal may show a dialog and
+        // the window must not wait for it. The guard lives on the runtime.
+        if !cli.no_hotkeys {
+            let cmd = engine.command_sender();
+            let hk_settings = settings.hotkeys.clone();
+            engine.runtime().spawn(async move {
+                let hotkeys = icu_client::hotkey::start(&hk_settings, cmd.clone()).await;
+                tracing::info!(backend = %hotkeys.backend, "hotkeys");
+                let _ = cmd.send(icu_client::engine::Command::HotkeyBackend(
+                    hotkeys.backend.clone(),
+                ));
+                // Keep the guard alive for the lifetime of the runtime.
+                std::future::pending::<()>().await;
+                drop(hotkeys);
+            });
+        }
 
-    // Hotkeys come up in the background: the Portal may show a dialog and
-    // the window must not wait for it. The guard lives on the runtime.
-    if !cli.no_hotkeys {
-        let cmd = engine.command_sender();
-        let hk_settings = settings.hotkeys.clone();
-        engine.runtime().spawn(async move {
-            let hotkeys = icu_client::hotkey::start(&hk_settings, cmd.clone()).await;
-            tracing::info!(backend = %hotkeys.backend, "hotkeys");
-            let _ = cmd.send(icu_client::engine::Command::HotkeyBackend(
-                hotkeys.backend.clone(),
-            ));
-            // Keep the guard alive for the lifetime of the runtime.
-            std::future::pending::<()>().await;
-            drop(hotkeys);
-        });
-    }
-
-    if cli.headless {
-        run_headless(engine, cli.debug_stats)
-    } else {
+        if cli.headless {
+            return run_headless(engine, cli.debug_stats);
+        }
         #[cfg(feature = "gui")]
-        {
-            icu_client::ui::run_main_window(engine, cli.debug_stats).map_err(|e| e.to_string())
+        match icu_client::ui::run_main_window(engine, cli.debug_stats)? {
+            icu_client::ui::Exit::Quit => return Ok(()),
+            // Back to the invite window; closing that one quits.
+            icu_client::ui::Exit::LoggedOut => logged_out = true,
         }
         #[cfg(not(feature = "gui"))]
         {
             tracing::warn!("built without feature `gui`, running headless");
-            run_headless(engine, cli.debug_stats)
+            return run_headless(engine, cli.debug_stats);
         }
     }
 }
