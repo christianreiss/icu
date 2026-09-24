@@ -291,6 +291,10 @@ pub struct UiSettings {
     pub register_uri_handler: bool,
     /// Theme: `system`, `light`, `dark`.
     pub theme: String,
+    /// Settings window shows the technical knobs (codec frame, hangover
+    /// times, hotkey backend, passport, diagnostics) next to the everyday
+    /// ones. Off by default: most people never need them.
+    pub show_advanced: bool,
 }
 
 impl Default for UiSettings {
@@ -300,6 +304,7 @@ impl Default for UiSettings {
             start_minimized: false,
             register_uri_handler: true,
             theme: "system".into(),
+            show_advanced: false,
         }
     }
 }
