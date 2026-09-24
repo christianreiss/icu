@@ -1,7 +1,8 @@
-//! An expired client certificate renews itself on a renew-only session
-//! (`PROTOCOL.md` §2.3), however long ago it expired, without anyone
-//! trusting anything new: the key is proven in the handshake, the record in
-//! the store admits it, the CA still vouches for the server.
+//! Certificate lifetimes. An expired client certificate renews itself on a
+//! renew-only session (`PROTOCOL.md` §2.3.3), however long ago it expired,
+//! without anyone trusting anything new: the key is proven in the handshake,
+//! the record in the store admits it, the CA still vouches for the server.
+//! And no re-issue outside the renewal window extends a certificate.
 
 mod common;
 
@@ -179,5 +180,55 @@ async fn an_expired_certificate_from_another_ca_fails_the_handshake() {
         code.is_some_and(|c| c >= 0x100),
         "a TLS alert, not a session: {code:?}"
     );
+    server.shutdown().await;
+}
+
+/// Renames `identity` to `name` on a fresh session and returns the new leaf.
+async fn rename(server: &TestServer, identity: &Identity, old: &str, name: &str) -> Vec<u8> {
+    let mut client = server.connect(identity).await.expect("connect");
+    client.hello(old).await;
+    client
+        .send_msg(&ControlMsg::RenewRequest {
+            csr_der: renewal_csr(identity, name),
+        })
+        .await;
+    let answer = client
+        .recv_matching(|m| matches!(m, ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }))
+        .await;
+    let Some(ControlMsg::RenewResponse { leaf_der }) = answer else {
+        panic!("rename must work, got {answer:?}");
+    };
+    leaf_der
+}
+
+fn validity(der: &[u8]) -> (i64, i64) {
+    let (_, cert) = x509_parser::parse_x509_certificate(der).expect("leaf parses");
+    (
+        cert.validity().not_before.timestamp(),
+        cert.validity().not_after.timestamp(),
+    )
+}
+
+/// A re-issue outside the renewal window never extends a certificate: a
+/// rename gets exactly the old validity (`PROTOCOL.md` §2.2 Nr. 9).
+#[tokio::test]
+async fn a_rename_outside_the_window_keeps_the_validity() {
+    let server = TestServer::start().await;
+    let _admin = server.enroll("admin").await;
+    let alice = server.enroll("alice").await;
+    let leaf = rename(&server, &alice, "alice", "alicia").await;
+    assert_eq!(validity(&leaf), validity(&alice.cert));
+    server.shutdown().await;
+}
+
+/// Inside the window a rename is a renewal as well: a fresh lifetime.
+#[tokio::test]
+async fn a_rename_inside_the_window_gets_a_fresh_lifetime() {
+    let server = TestServer::start_with(|c| c.tls.client_validity_days = 20).await;
+    let _admin = server.enroll("admin").await;
+    let alice = server.enroll("alice").await;
+    let server = server.restart_with(|_| {}).await;
+    let leaf = rename(&server, &alice, "alice", "alicia").await;
+    assert!(days_left(&leaf) > 360, "fresh lifetime, got {}", days_left(&leaf));
     server.shutdown().await;
 }

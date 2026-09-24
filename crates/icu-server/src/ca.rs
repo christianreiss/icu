@@ -162,7 +162,7 @@ impl Ca {
     pub fn sign_client_csr(
         &self,
         csr_der: &[u8],
-        validity_days: u32,
+        lifetime: impl Into<Lifetime>,
         public_host: &str,
     ) -> Result<(CertificateDer<'static>, String)> {
         let common_name = csr_common_name(csr_der)?;
@@ -194,7 +194,16 @@ impl Ca {
         csr.params.key_usages = Vec::new();
         csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         csr.params.use_authority_key_identifier_extension = true;
-        set_validity(&mut csr.params, validity_days);
+        match lifetime.into() {
+            Lifetime::Days(days) => set_validity(&mut csr.params, days),
+            Lifetime::Keep {
+                not_before,
+                not_after,
+            } => {
+                csr.params.not_before = not_before;
+                csr.params.not_after = not_after;
+            }
+        }
         csr.params.serial_number = Some(random_serial());
 
         let issuer = self.issuer()?;
@@ -398,6 +407,36 @@ pub fn leaf_not_after(der: &[u8]) -> String {
         .ok()
         .map(|(_, cert)| store::rfc3339(cert.validity().not_after.to_datetime()))
         .unwrap_or_else(|| "9999-12-31T23:59:59Z".to_string())
+}
+
+/// How long a signed client certificate is valid.
+#[derive(Debug, Clone, Copy)]
+pub enum Lifetime {
+    /// From an hour ago for this many days: a fresh lifetime.
+    Days(u32),
+    /// Exactly the validity of the certificate it replaces: a re-issue that
+    /// must not extend it (rename or catch-up outside the renewal window,
+    /// `PROTOCOL.md` §2.2 Nr. 9).
+    Keep {
+        not_before: OffsetDateTime,
+        not_after: OffsetDateTime,
+    },
+}
+
+impl From<u32> for Lifetime {
+    fn from(days: u32) -> Lifetime {
+        Lifetime::Days(days)
+    }
+}
+
+/// A certificate's notBefore and notAfter, `None` when it does not parse.
+pub fn leaf_validity(der: &[u8]) -> Option<(OffsetDateTime, OffsetDateTime)> {
+    use x509_parser::prelude::FromDer;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+    Some((
+        cert.validity().not_before.to_datetime(),
+        cert.validity().not_after.to_datetime(),
+    ))
 }
 
 /// Whole days until a certificate's notAfter, negative once it has passed.

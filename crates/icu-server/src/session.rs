@@ -162,6 +162,9 @@ struct Identity {
     /// The presented leaf has expired: a renew-only session
     /// (`PROTOCOL.md` §2.3).
     expired: bool,
+    /// notBefore and notAfter of the presented leaf, `None` when it does not
+    /// parse. A re-issue outside the renewal window carries them over.
+    cert_validity: Option<(time::OffsetDateTime, time::OffsetDateTime)>,
 }
 
 async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<Identity> {
@@ -239,6 +242,7 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
         registration,
         cert_spki: spki,
         expired,
+        cert_validity: ca::leaf_validity(leaf),
     })
 }
 
@@ -1116,47 +1120,66 @@ async fn renew_leaf(
             return Err((ec::RENEW_REJECTED, "at most one renewal per day".into()));
         }
     }
-    // A plain renewal only inside the last third of the presented
-    // certificate's lifetime; otherwise one renewal a day would pile up a
-    // year's worth of live certificates.
-    if !rename && !per_cert {
-        let window = store
-            .by_fingerprint(&identity.cert_fp)
-            .and_then(|(_, _, c)| {
-                let expires = parse_rfc3339(&c.expires).ok()?;
-                Some((expires, renew_window(&c.issued, &c.expires)))
-            });
-        if let Some((expires, window)) = window {
-            if expires - now() > window {
-                return Err((
-                    ec::RENEW_REJECTED,
-                    format!(
-                        "renewal opens {} days before expiry",
-                        window.whole_days()
-                    ),
-                ));
-            }
-        }
+    // Only inside the last third of the presented certificate's lifetime, or
+    // after it expired, does a new certificate get a fresh lifetime. A plain
+    // renewal is refused before that (otherwise one renewal a day would pile
+    // up a year's worth of live certificates); a rename or catch-up still
+    // goes through, but the new certificate keeps the old one's validity, so
+    // no re-issue ever extends a certificate early.
+    let presented = store
+        .by_fingerprint(&identity.cert_fp)
+        .map(|(_, _, c)| (c.issued.clone(), c.expires.clone()));
+    let window = presented.as_ref().and_then(|(issued, expires)| {
+        let expires_at = parse_rfc3339(expires).ok()?;
+        Some((expires_at, renew_window(issued, expires)))
+    });
+    let in_window = identity.expired
+        || window.is_none_or(|(expires, window)| expires - now() <= window);
+    if !in_window && !rename && !catch_up {
+        let days = window.map(|(_, w)| w.whole_days()).unwrap_or_default();
+        return Err((
+            ec::RENEW_REJECTED,
+            format!("renewal opens {days} days before expiry"),
+        ));
     }
+    let keep = match (in_window, identity.cert_validity, &presented) {
+        (false, Some((not_before, not_after)), Some(record)) => {
+            Some((not_before, not_after, record.clone()))
+        }
+        _ => None,
+    };
 
     let (leaf, cn) = {
         let ca = server.ca.read().await;
-        ca.sign_client_csr(
-            csr_der,
-            server.config.tls.client_validity_days,
-            &server.config.public_host(),
-        )
-        .map_err(|e| (ec::RENEW_REJECTED, e.to_string()))?
+        let lifetime = match &keep {
+            Some((not_before, not_after, _)) => ca::Lifetime::Keep {
+                not_before: *not_before,
+                not_after: *not_after,
+            },
+            None => ca::Lifetime::Days(server.config.tls.client_validity_days),
+        };
+        ca.sign_client_csr(csr_der, lifetime, &server.config.public_host())
+            .map_err(|e| (ec::RENEW_REJECTED, e.to_string()))?
     };
 
     let issued = now();
+    let (issued, expires) = match keep {
+        Some((_, _, record)) => record,
+        None => (
+            rfc3339(issued),
+            rfc3339(
+                issued
+                    + Duration::from_secs(
+                        u64::from(server.config.tls.client_validity_days) * 86400,
+                    ),
+            ),
+        ),
+    };
     let cert = CertRecord {
         fingerprint: fingerprint(&leaf),
         cn: cn.clone(),
-        issued: rfc3339(issued),
-        expires: rfc3339(
-            issued + Duration::from_secs(u64::from(server.config.tls.client_validity_days) * 86400),
-        ),
+        issued,
+        expires,
         revoked: false,
         renewed: None,
         registration: false,
