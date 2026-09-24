@@ -4,13 +4,32 @@
 //!
 //! `cargo run --release -p icu-client --features aec --example aec_probe`
 
-use icu_client::dsp::{aec::Aec, denoise::Denoiser, testsignal::*};
+use icu_client::dsp::{
+    aec::Aec,
+    denoise::Denoiser,
+    testsignal::*,
+    voice::{VoiceChain, VoiceStrength},
+};
 
 const SECS: usize = 8;
 const N: usize = SR * SECS;
 const FRAME: usize = 480;
 
 fn run_case(name: &str, near: &[f32], reference: &[f32], use_aec: bool, use_denoise: bool) {
+    run_case_voice(name, near, reference, use_aec, use_denoise, None);
+}
+
+/// Like `run_case`, with the voice optimizer after AEC and denoise, as in
+/// the engine. `mean_prob` stays the pre-chain RNNoise probability.
+fn run_case_voice(
+    name: &str,
+    near: &[f32],
+    reference: &[f32],
+    use_aec: bool,
+    use_denoise: bool,
+    voice: Option<VoiceStrength>,
+) {
+    let mut chain = voice.map(VoiceChain::new);
     let mut aec = Aec::new().expect("apm (build with --features aec)");
     let mut dn = Denoiser::new();
     let mut out = vec![0.0f32; N];
@@ -22,6 +41,9 @@ fn run_case(name: &str, near: &[f32], reference: &[f32], use_aec: bool, use_deno
             aec.process(&reference[a..a + FRAME], &mut cap);
         }
         let p = if use_denoise { dn.process(&mut cap) } else { 0.0 };
+        if let Some(c) = chain.as_mut() {
+            c.process(&mut cap);
+        }
         probs.push(p);
         out[a..a + FRAME].copy_from_slice(&cap);
     }
@@ -87,4 +109,32 @@ fn main() {
         true,
         true,
     );
+
+    // (d) Voice optimizer after AEC+denoise. Near-end level rises by the
+    // makeup/compression; mean_prob must match (c) because the chain runs
+    // after the probability is taken.
+    for strength in [VoiceStrength::Medium, VoiceStrength::Strong] {
+        run_case_voice(
+            &format!("(d) (c) + voice optimizer {strength:?}"),
+            &mic_with_echo,
+            &far,
+            true,
+            true,
+            Some(strength),
+        );
+    }
+
+    // (e) Far-end only: residual echo after AEC+denoise, without and with
+    // the optimizer. The optimizer may lift it by at most its makeup gain.
+    run_case("(e) far-end only (echo), AEC+denoise", &echo, &far, true, true);
+    for strength in [VoiceStrength::Medium, VoiceStrength::Strong] {
+        run_case_voice(
+            &format!("(e) far-end only + voice optimizer {strength:?}"),
+            &echo,
+            &far,
+            true,
+            true,
+            Some(strength),
+        );
+    }
 }

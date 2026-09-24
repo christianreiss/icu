@@ -41,6 +41,7 @@ use crate::{
         mixer, opus,
         refalign::{self, CycleClock},
         vad, vad_auto,
+        voice::{VoiceChain, VoiceStrength},
     },
     net::{
         conn::{self, ConnectError},
@@ -295,6 +296,8 @@ pub struct DspControl {
     vad_mode: AtomicBool,
     denoise: AtomicBool,
     aec: AtomicBool,
+    voice_opt: AtomicBool,
+    voice_strength: AtomicU32,
     vad_threshold_bits: AtomicU32,
     vad_auto: AtomicBool,
     vad_effective_threshold_bits: AtomicU32,
@@ -323,6 +326,8 @@ impl DspControl {
             vad_mode: AtomicBool::new(false),
             denoise: AtomicBool::new(false),
             aec: AtomicBool::new(false),
+            voice_opt: AtomicBool::new(false),
+            voice_strength: AtomicU32::new(0),
             vad_threshold_bits: AtomicU32::new(0),
             vad_auto: AtomicBool::new(false),
             vad_effective_threshold_bits: AtomicU32::new(0),
@@ -351,6 +356,10 @@ impl DspControl {
         self.denoise
             .store(s.audio.denoise && !test_tone, Ordering::Relaxed);
         self.aec.store(s.audio.aec && !test_tone, Ordering::Relaxed);
+        self.voice_opt
+            .store(s.audio.voice_opt && !test_tone, Ordering::Relaxed);
+        self.voice_strength
+            .store(s.audio.voice_strength.to_u32(), Ordering::Relaxed);
         self.vad_threshold_bits
             .store(s.audio.vad_threshold.to_bits(), Ordering::Relaxed);
         self.vad_auto.store(s.audio.vad_auto, Ordering::Relaxed);
@@ -825,6 +834,9 @@ fn dsp_thread(
         }
     };
     let mut denoiser = Denoiser::new();
+    let mut voice_strength = VoiceStrength::from_u32(ctl.voice_strength.load(Ordering::Relaxed));
+    let mut voice_chain = VoiceChain::new(voice_strength);
+    let mut voice_on = false;
     let mut encoder = match opus::Encoder::new() {
         Ok(e) => e,
         Err(e) => {
@@ -901,6 +913,7 @@ fn dsp_thread(
                 if let Some(a) = aec.as_mut() {
                     a.reinitialize();
                 }
+                voice_chain.reset();
             }
             let mut waited = 0u32;
             let mut ready_since: Option<Instant> = None;
@@ -1029,6 +1042,22 @@ fn dsp_thread(
             .store(threshold.to_bits(), Ordering::Relaxed);
         let voice = vad::is_voice(vad::VadSource::Rnnoise { threshold }, prob, level);
         voice_in_frame |= voice;
+
+        // Voice optimizer: nonlinear, so after AEC; after the meter and VAD,
+        // so its makeup gain does not move the thresholds.
+        let strength = VoiceStrength::from_u32(ctl.voice_strength.load(Ordering::Relaxed));
+        if strength != voice_strength {
+            voice_strength = strength;
+            voice_chain.set_strength(strength);
+        }
+        let on = ctl.voice_opt.load(Ordering::Relaxed);
+        if on && !voice_on {
+            voice_chain.reset();
+        }
+        voice_on = on;
+        if on {
+            voice_chain.process(&mut block);
+        }
 
         // 4. Accumulate to an Opus frame.
         frame_acc.extend_from_slice(&block);

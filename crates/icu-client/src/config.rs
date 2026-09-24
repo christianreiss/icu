@@ -9,6 +9,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::dsp::voice::VoiceStrength;
+
 /// Where this client keeps its files.
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -85,6 +87,10 @@ pub struct AudioSettings {
     pub denoise: bool,
     /// AEC3 on.
     pub aec: bool,
+    /// Voice optimizer (high-pass, compressor, limiter) on.
+    pub voice_opt: bool,
+    /// Voice optimizer preset.
+    pub voice_strength: VoiceStrength,
     /// PTT release delay in ms.
     pub release_ms: u32,
     /// VAD hangover in ms.
@@ -112,6 +118,8 @@ impl Default for AudioSettings {
             gain_db: 0.0,
             denoise: true,
             aec: true,
+            voice_opt: false,
+            voice_strength: VoiceStrength::Medium,
             release_ms: 150,
             hangover_ms: 1000,
             frame_ms: 20,
@@ -767,6 +775,8 @@ mod tests {
         s.audio.vad_threshold = 0.7;
         s.audio.vad_auto = false;
         s.audio.hangover_ms = 1500;
+        s.audio.voice_opt = true;
+        s.audio.voice_strength = VoiceStrength::Strong;
         s.audio.input_device = Some("alsa_input.foo".into());
         s.hotkeys.ptt.key = "BTN_SIDE".into();
         s.overlay.corner = Corner::BottomLeft;
@@ -792,6 +802,7 @@ mod tests {
 
         let text = fs::read_to_string(paths.settings()).unwrap();
         assert!(text.contains("mode = \"ptt\""));
+        assert!(text.contains("voice_strength = \"strong\""));
         assert!(text.contains("corner = \"bottom-left\""));
         assert!(text.contains("[volumes]"));
     }
@@ -803,6 +814,8 @@ mod tests {
         assert_eq!(s.audio.release_ms, 150);
         assert_eq!(s.audio.hangover_ms, 1000);
         assert!(s.audio.vad_auto);
+        assert!(!s.audio.voice_opt);
+        assert_eq!(s.audio.voice_strength, VoiceStrength::Medium);
         assert!(s.overlay.dim_non_speaking, "old settings.toml default on");
     }
 
