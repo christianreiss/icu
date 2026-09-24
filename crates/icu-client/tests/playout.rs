@@ -30,6 +30,19 @@ async fn record(engine_b: &Engine, probe_b: &icu_client::audio::fake::FakeProbe)
     .await;
     // Let the jitter buffer find its depth first.
     tokio::time::sleep(Duration::from_secs(1)).await;
+    let st = engine_b.stats();
+    let counters = || {
+        [
+            &st.frames_plc,
+            &st.frames_fec,
+            &st.playback_underruns,
+            &st.jitter_late,
+            &st.jitter_underruns,
+            &st.jitter_skipped,
+        ]
+        .map(DebugStats::get)
+    };
+    let before = counters();
     probe_b.clear();
     tokio::time::sleep(RECORD).await;
     let played = probe_b.played();
@@ -43,15 +56,11 @@ async fn record(engine_b: &Engine, probe_b: &icu_client::audio::fake::FakeProbe)
         let _ = std::fs::write(format!("{dir}/{name}.f32"), bytes);
     }
     let c = continuity(&played, &codec_reference(), 960);
-    let st = engine_b.stats();
+    let after = counters();
+    let d: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
     eprintln!(
-        "{c:?} plc={} fec={} play_underruns={} jb_late={} jb_underruns={} jb_skipped={}",
-        DebugStats::get(&st.frames_plc),
-        DebugStats::get(&st.frames_fec),
-        DebugStats::get(&st.playback_underruns),
-        DebugStats::get(&st.jitter_late),
-        DebugStats::get(&st.jitter_underruns),
-        DebugStats::get(&st.jitter_skipped),
+        "{c:?} while recording: plc={} fec={} play_underruns={} jb_late={} jb_underruns={} jb_skipped={}",
+        d[0], d[1], d[2], d[3], d[4], d[5],
     );
     assert!(c.windows > 100, "too little voiced audio compared: {c:?}");
     c
@@ -84,6 +93,25 @@ fn codec_reference() -> Vec<f32> {
         out.extend_from_slice(&pcm[..n]);
     }
     out[2 * lap..3 * lap].to_vec()
+}
+
+/// The link of `playout_survives_network_jitter`; override with
+/// `ICU_JITTER=<spread ms>,<stall chance>,<stall min ms>,<stall max ms>`.
+fn jitter_model() -> Jitter {
+    let ms = Duration::from_millis;
+    if let Ok(v) = std::env::var("ICU_JITTER") {
+        let f: Vec<f32> = v.split(',').map(|x| x.trim().parse().unwrap()).collect();
+        return Jitter {
+            spread: ms(f[0] as u64),
+            stall_chance: f[1],
+            stall: (ms(f[2] as u64), ms(f[3] as u64)),
+        };
+    }
+    Jitter {
+        spread: ms(15),
+        stall_chance: 0.03,
+        stall: (ms(30), ms(70)),
+    }
 }
 
 /// Share of judged windows that glitched, in percent.
@@ -133,22 +161,13 @@ async fn playout_is_clean_at_a_large_quantum() {
     server.handle.shutdown().await;
 }
 
-/// B sits behind a Wi-Fi-like link: up to 8 ms jitter per packet and
-/// stalls of 40–80 ms. The first stalls may cost a concealed frame while
+/// B sits behind a Wi-Fi-like link: up to 15 ms jitter per packet and
+/// stalls of 30–70 ms. The first stalls may cost a concealed frame while
 /// the buffer deepens; after that the stream has to stay clean.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn playout_survives_network_jitter() {
     let server = TestServer::start().await;
-    let proxy = JitterProxy::start(
-        server.addr(),
-        Jitter {
-            spread: Duration::from_millis(8),
-            stall_chance: 0.01,
-            stall: (Duration::from_millis(40), Duration::from_millis(80)),
-        },
-        7,
-    )
-    .await;
+    let proxy = JitterProxy::start(server.addr(), jitter_model(), 7).await;
     let (backend_a, _) = FakeBackend::silent();
     let (engine_a, _dir_a) = server.engine("alice", Box::new(backend_a), true).await;
     let (backend_b, probe_b) = FakeBackend::silent();
@@ -158,7 +177,9 @@ async fn playout_survives_network_jitter() {
     wait_connected(&engine_a).await;
 
     let c = record(&engine_b, &probe_b).await;
-    assert!(glitch_pct(&c) < 3.0, "{c:?}");
+    // Before the jitter buffer waited for late packets, each stall cost an
+    // audible gap: 3 glitches per 6 s at this profile.
+    assert!(c.glitches <= 1, "{c:?}");
 
     engine_a.shutdown();
     engine_b.shutdown();

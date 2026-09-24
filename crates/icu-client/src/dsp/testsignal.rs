@@ -179,12 +179,14 @@ pub struct Continuity {
     pub dropouts: usize,
     /// Times the alignment moved: frames were skipped or inserted.
     pub realigned: usize,
+    /// Lowest correlation of a judged window at the running alignment.
+    pub worst: f64,
 }
 
 /// Compares `received` against the loop `source` in windows of `window`
 /// samples. `received` must start after the stream has settled.
 pub fn continuity(received: &[f32], source: &[f32], window: usize) -> Continuity {
-    const MATCH: f64 = 0.8;
+    const MATCH: f64 = 0.95;
     let len = source.len();
     let looped: Vec<f32> = source.iter().chain(source.iter()).copied().collect();
     let at = |pos: usize, n: usize| -> &[f32] { &looped[pos % len..pos % len + n] };
@@ -219,7 +221,13 @@ pub fn continuity(received: &[f32], source: &[f32], window: usize) -> Continuity
             continue;
         }
         out.windows += 1;
-        if pearson(got, want) >= MATCH {
+        let r = pearson(got, want);
+        out.worst = if out.windows == 1 {
+            r
+        } else {
+            out.worst.min(r)
+        };
+        if r >= MATCH {
             continue;
         }
         out.glitches += 1;
