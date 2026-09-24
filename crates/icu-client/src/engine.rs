@@ -2892,8 +2892,9 @@ impl CameraLink {
     }
 }
 
-/// [`CameraLink::send_tier`], without the engine.
-fn send_tier(tier: VideoTier, peers: &[Peer]) -> VideoTier {
+/// [`CameraLink::send_tier`], without the engine. Also the main window's
+/// camera tile, so its rec dot follows the same rule as the camera thread.
+pub(crate) fn send_tier(tier: VideoTier, peers: &[Peer]) -> VideoTier {
     if peers.iter().any(|p| p.info.flags.viewing()) {
         tier
     } else {

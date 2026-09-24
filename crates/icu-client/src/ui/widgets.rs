@@ -193,18 +193,29 @@ pub enum Role {
     Danger,
 }
 
+/// The dot on a [`tile`]: whether this client's own video is going out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecDot {
+    /// No dot: the tile has nothing to do with video, or the camera is off.
+    Off,
+    /// A quiet grey dot: the camera is on, but nothing leaves this client —
+    /// nobody is watching, no connection, or the network paused video.
+    Idle,
+    /// A pulsing red dot: somebody is seeing this client's picture right now.
+    Live,
+}
+
 /// One cell of the main window's control dock: an icon over a short label.
 /// Off is a quiet raised surface; on is a tint in its [`Role`] color, with
 /// icon and label in that color — never a solid fill, so a row of them stays
-/// calm. `rec_dot` pulses a small red dot at the top right, for "this
-/// client's own video is going out".
+/// calm. `rec` puts a small dot at the top right; see [`RecDot`].
 pub fn tile(
     ui: &mut Ui,
     glyph: &str,
     label: &str,
     active: bool,
     role: Role,
-    rec_dot: bool,
+    rec: RecDot,
     size: egui::Vec2,
 ) -> egui::Response {
     let tok = theme::tokens(ui.visuals());
@@ -249,11 +260,17 @@ pub fn tile(
             FontId::new(10.5, super::fonts::semibold()),
             color,
         );
-        if rec_dot {
-            let time = ui.input(|i| i.time);
-            let pulse = ((time * 2.4).sin() as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
-            let pos = egui::pos2(rect.right() - 10.0, rect.top() + 10.0);
-            painter.circle_filled(pos, 3.0 + pulse, tok.error);
+        let pos = egui::pos2(rect.right() - 10.0, rect.top() + 10.0);
+        match rec {
+            RecDot::Off => {}
+            RecDot::Idle => {
+                painter.circle_filled(pos, 3.0, tok.muted_text);
+            }
+            RecDot::Live => {
+                let time = ui.input(|i| i.time);
+                let pulse = ((time * 2.4).sin() as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
+                painter.circle_filled(pos, 3.0 + pulse, tok.error);
+            }
         }
     }
     response
