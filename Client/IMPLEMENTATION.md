@@ -18,7 +18,7 @@ Kein Auto-Update: `Welcome.min_client` > eigene Version → Banner „Update nö
 ## 3. Modul-Layout (`crates/icu-client/src/`)
 
 ```
-main.rs            # Start, Argument Registrierungs-Bundle/Passport (Datei oder Text) + --name
+main.rs            # Start, Argument Registrierungs-Bundle/Passport (Datei oder Text) + --name, Bestätigung [j/N] oder --yes
 app.rs             # Zustand (AppState), Kommando-Bus zwischen Modulen (tokio mpsc/watch)
 config.rs          # settings.toml + identity/ (key, leaf, ca), Pfade je OS
 net/

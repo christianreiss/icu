@@ -1377,7 +1377,13 @@ async fn send_renew(
     cn: &str,
     reason: RenewReason,
 ) -> Result<(), RenewSendError> {
-    icu_proto::validate_name(cn).map_err(|e| RenewSendError::Local(e.to_string()))?;
+    // A new name has to meet today's rules; the stored one is carried over
+    // as it is, or a name from before them could never be renewed.
+    let checked = match reason {
+        RenewReason::UserRename => icu_proto::validate_name(cn),
+        RenewReason::CatchUp | RenewReason::Expiry => icu_proto::validate_stored_name(cn),
+    };
+    checked.map_err(|e| RenewSendError::Local(e.to_string()))?;
     let key = rcgen::KeyPair::try_from(local.identity.key_der.as_slice())
         .map_err(|e| RenewSendError::Local(format!("eigener Schlüssel unlesbar: {e}")))?;
     let csr_der =

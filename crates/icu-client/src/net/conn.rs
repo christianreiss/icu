@@ -418,6 +418,9 @@ impl ConnectError {
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ConnectError::Closed { code, .. } if *code == icu_proto::error::SESSION_REPLACED => {
+                f.write_str("Diese Identität wurde auf einem anderen Gerät verbunden.")
+            }
             ConnectError::Closed { code, reason } => {
                 write!(f, "{} ({code}) {reason}", icu_proto::error::name(*code))
             }

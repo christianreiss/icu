@@ -59,15 +59,11 @@ impl core::fmt::Display for NameError {
 
 impl std::error::Error for NameError {}
 
-/// Validates a display name (`PROTOCOL.md` §2.1): 1–32 bytes UTF-8 in NFC,
-/// no control, formatting, private-use, unassigned or separator characters,
-/// single spaces (U+0020) only between words, no leading combining mark, and
-/// a single script (UTS #39; digits and punctuation go with any).
-pub fn validate_name(name: &str) -> Result<(), NameError> {
-    use unicode_general_category::{get_general_category, GeneralCategory as G};
-    use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
-    use unicode_security::MixedScript;
-
+/// The rules every name ever issued met: 1–32 bytes UTF-8, no control
+/// characters. Enough for a name that is already stored and only carried
+/// into a new certificate (plain renewal); a new name has to pass
+/// [`validate_name`].
+pub fn validate_stored_name(name: &str) -> Result<(), NameError> {
     if name.len() < NAME_MIN_LEN {
         return Err(NameError::Empty);
     }
@@ -77,6 +73,19 @@ pub fn validate_name(name: &str) -> Result<(), NameError> {
     if name.chars().any(|c| c.is_control()) {
         return Err(NameError::ControlChar);
     }
+    Ok(())
+}
+
+/// Validates a display name (`PROTOCOL.md` §2.1): 1–32 bytes UTF-8 in NFC,
+/// no control, formatting, private-use, unassigned or separator characters,
+/// single spaces (U+0020) only between words, no leading combining mark, and
+/// a single script (UTS #39; digits and punctuation go with any).
+pub fn validate_name(name: &str) -> Result<(), NameError> {
+    use unicode_general_category::{get_general_category, GeneralCategory as G};
+    use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
+    use unicode_security::MixedScript;
+
+    validate_stored_name(name)?;
     for c in name.chars() {
         match get_general_category(c) {
             G::Format

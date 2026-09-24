@@ -167,7 +167,9 @@ pub async fn complete(
 /// renewal must not drift apart, because the server reads the CN as the
 /// display name (`PROTOCOL.md` §2.3).
 pub fn csr_for(cn: &str, key: &rcgen::KeyPair) -> Result<Vec<u8>, NetError> {
-    icu_proto::validate_name(cn).map_err(|e| NetError::BadLink(e.to_string()))?;
+    // Only the rules every issued name met: renewals carry a stored name that
+    // may predate the strict ones. New names are checked by the callers.
+    icu_proto::validate_stored_name(cn).map_err(|e| NetError::BadLink(e.to_string()))?;
     let mut params = rcgen::CertificateParams::default();
     params
         .distinguished_name

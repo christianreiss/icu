@@ -287,7 +287,10 @@ impl Ca {
 }
 
 /// The display name a CSR asks for: exactly one subject CN, readable as UTF-8,
-/// passing `validate_name` (`PROTOCOL.md` §2.3).
+/// passing `validate_stored_name` (`PROTOCOL.md` §2.3). Whether it also has
+/// to pass the strict `validate_name` is the caller's business: a new name
+/// does, a stored name carried into a renewal does not, or a user whose name
+/// predates the strict rules could never renew.
 ///
 /// Parsed with x509-parser on the raw DER rather than through rcgen's
 /// `DistinguishedName`: that one is a map keyed by `DnType`, so a CSR carrying
@@ -330,7 +333,7 @@ pub fn csr_common_name(csr_der: &[u8]) -> Result<String> {
             "csr common name is not readable as utf-8",
         )
     })?;
-    icu_proto::validate_name(cn)
+    icu_proto::validate_stored_name(cn)
         .map_err(|e| Error::coded(icu_proto::error::ENROLL_BAD_CSR, format!("bad name: {e}")))?;
     Ok(cn.to_string())
 }

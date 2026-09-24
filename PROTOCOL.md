@@ -49,7 +49,9 @@ Name:      String  UTF-8, 1–32 Bytes, in NFC; keine Steuer-, Format- (Bidi, Ze
                    Ziffern und Satzzeichen gehen mit jeder). Clients bringen Eingaben vorher mit `normalize_name` in Form
                    (trimmen, Leerraum zusammenfassen, NFC). Serverweit eindeutig über `name_key` = UTS-#39-Skeleton von
                    NFKC + Kleinschreibung: „Chris“, „chris“ und ein kyrillisches „Сһris“ gelten als derselbe Name
-                   (2026-09-24). Schon gespeicherte Namen werden nicht nachgeprüft, nur neue.
+                   (2026-09-24). Schon gespeicherte Namen werden nicht nachgeprüft, nur neue: ein Renewal oder Nachzügler,
+                   der den gespeicherten Namen unverändert weiterträgt, braucht nur 1–32 Bytes ohne Steuerzeichen
+                   (`validate_stored_name`) und keine erneute Eindeutigkeitsprüfung.
                    Der Name steht im Subject-CN des Client-Zertifikats. Er wird bei der Registrierung durch die CSR gesetzt
                    und danach ausschließlich dadurch geändert, dass ein neues Zertifikat ausgestellt wird (§2.2 Nr. 9).
                    `users.toml` spiegelt den CN des zuletzt ausgestellten Zertifikats; dieser Spiegel füllt alle

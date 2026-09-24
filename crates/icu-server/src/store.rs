@@ -315,19 +315,26 @@ impl Store {
         None
     }
 
-    /// Resolves a CLI selector: `user_id`, name (case-insensitive) or
-    /// certificate fingerprint.
+    /// Resolves a CLI selector: `user_id`, name or certificate fingerprint.
+    /// A name matches exactly first, else case-insensitively if that is
+    /// unambiguous. Never by `name_key`: that also folds look-alikes, and a
+    /// revoke must not land on the wrong account.
     pub fn resolve(&self, selector: &str) -> Option<UserId> {
         if let Ok(id) = selector.parse::<UserId>() {
             if self.user(id).is_some() {
                 return Some(id);
             }
         }
-        let key = name_key(selector);
-        for (id, user) in self.users() {
-            if name_key(&user.name) == key {
-                return Some(id);
-            }
+        if let Some((id, _)) = self.users().find(|(_, u)| u.name == selector) {
+            return Some(id);
+        }
+        let lower = selector.to_lowercase();
+        let mut folded = self
+            .users()
+            .filter(|(_, u)| u.name.to_lowercase() == lower)
+            .map(|(id, _)| id);
+        if let (Some(id), None) = (folded.next(), folded.next()) {
+            return Some(id);
         }
         self.by_fingerprint(selector).map(|(id, _, _)| id)
     }
@@ -394,12 +401,19 @@ impl Store {
         supersedes: Option<&str>,
         renewal: bool,
     ) -> Result<bool> {
-        validate_name(&cert.cn)?;
-        if self.name_taken(&cert.cn, Some(id)) {
-            return Err(Error::coded(
-                ec::NAME_TAKEN,
-                format!("name {:?} taken", cert.cn),
-            ));
+        // The stored name carried into a new certificate is kept as it is:
+        // it may predate today's rules, or collide under today's
+        // `name_key` with a name issued since, and its owner must still be
+        // able to renew.
+        let keeps_name = self.user(id).is_some_and(|u| u.name == cert.cn);
+        if !keeps_name {
+            validate_name(&cert.cn)?;
+            if self.name_taken(&cert.cn, Some(id)) {
+                return Err(Error::coded(
+                    ec::NAME_TAKEN,
+                    format!("name {:?} taken", cert.cn),
+                ));
+            }
         }
         let now = now();
         let stamp = rfc3339(now);
@@ -954,6 +968,31 @@ mod tests {
 
     /// A renewal carrying a new CN is how a rename happens, and the stored
     /// name follows the newest certificate.
+    #[test]
+    fn resolve_never_picks_a_look_alike() {
+        let (_dir, mut s) = store();
+        let latin = s.add_user(named_cert("aa", "Chris"), true).unwrap();
+        // Stored before the skeleton key existed: both names coexist.
+        s.users.users.insert(
+            "9".into(),
+            UserRecord {
+                name: "\u{0421}\u{04BB}ris".into(),
+                created: rfc3339(now()),
+                last_renew: None,
+                certs: vec![named_cert("bb", "\u{0421}\u{04BB}ris")],
+                is_admin: false,
+                disabled: false,
+            },
+        );
+        assert_eq!(s.resolve("Chris"), Some(latin));
+        assert_eq!(s.resolve("chris"), Some(latin));
+        assert_eq!(s.resolve("\u{0421}\u{04BB}ris"), Some(9));
+        // A renewal keeping a name that now collides still goes through.
+        let mut renewed = named_cert("cc", "\u{0421}\u{04BB}ris");
+        renewed.expires = rfc3339(now() + Duration::from_secs(86400));
+        assert!(!s.add_cert(9, renewed, None, true).unwrap(), "name unchanged");
+    }
+
     #[test]
     fn add_cert_adopts_the_cn_and_reports_the_change() {
         let (_dir, mut s) = store();

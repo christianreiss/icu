@@ -558,6 +558,8 @@ async fn serve_registration(
 async fn redeem(server: &Arc<Server>, identity: &Identity, csr_der: &[u8]) -> Result<Vec<u8>> {
     let requested = ca::csr_common_name(csr_der)
         .map_err(|e| Error::coded(ec::RENEW_REJECTED, e.to_string()))?;
+    icu_proto::validate_name(&requested)
+        .map_err(|e| Error::coded(ec::RENEW_REJECTED, format!("bad name: {e}")))?;
     if ca::csr_public_key(csr_der)? == identity.cert_spki {
         return Err(Error::coded(
             ec::RENEW_REJECTED,
@@ -853,6 +855,17 @@ async fn handle_renew(
     };
     let stored = user.name.clone();
     let rename = requested != stored;
+    // A new name meets today's rules; the stored one is carried over as it
+    // is, even if it predates them.
+    if rename {
+        if let Err(e) = icu_proto::validate_name(&requested) {
+            server.room.send_to(
+                session,
+                &reject(ec::RENEW_REJECTED, format!("bad name: {e}")),
+            );
+            return;
+        }
+    }
 
     // Uniqueness before the rate check, so a taken name reports NAME_TAKEN
     // instead of a confusing rate message.

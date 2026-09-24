@@ -781,3 +781,76 @@ fn server_leaf(conn: &quinn::Connection) -> Vec<u8> {
         .and_then(|certs| certs.first().map(|c| c.to_vec()))
         .expect("server certificate")
 }
+
+/// A name stored before the strict rules (`PROTOCOL.md` §2.1, 2026-09-24)
+/// is carried into new certificates as it is: catch-up and plain renewal
+/// both work, or its owner would be locked out once the certificate expires.
+#[tokio::test]
+async fn a_name_from_before_the_strict_rules_still_renews() {
+    let server = TestServer::start_with(|c| c.tls.client_validity_days = 20).await;
+    let alice = server.enroll("alice").await;
+    let TestServer { dir, handle } = server;
+    handle.shutdown().await;
+
+    // Mixed script: valid then, invalid now.
+    let legacy = "Ωmega";
+    assert!(icu_proto::validate_name(legacy).is_err());
+    let users = dir.path().join("users.toml");
+    let text = std::fs::read_to_string(&users).unwrap();
+    std::fs::write(&users, text.replace("name = \"alice\"", &format!("name = \"{legacy}\""))).unwrap();
+    let mut config = icu_server::config::Config::for_test(dir.path());
+    config.tls.client_validity_days = 20;
+    let server = TestServer {
+        handle: icu_server::run(config).await.expect("restarts"),
+        dir,
+    };
+
+    let renew = || {
+        let (key, csr) = common::csr_with_cn(legacy);
+        (key, ControlMsg::RenewRequest { csr_der: csr })
+    };
+    let mut client = server.connect(&alice).await.expect("connect");
+    let welcome = client.hello("alice").await;
+    assert!(matches!(&welcome, ControlMsg::Welcome { you, .. } if you.name == legacy));
+
+    // Catch-up: the certificate still says "alice".
+    let (key, request) = renew();
+    client.send_msg(&request).await;
+    let answer = client
+        .recv_matching(|m| matches!(m, ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }))
+        .await;
+    let Some(ControlMsg::RenewResponse { leaf_der }) = answer else {
+        panic!("catch-up with the stored name must work, got {answer:?}");
+    };
+    let caught_up = common::Identity {
+        cert: rustls::pki_types::CertificateDer::from(leaf_der),
+        key_pem: key.serialize_pem(),
+        key_der: key.serialize_der(),
+        ca: server.ca(),
+    };
+
+    // Plain renewal with a certificate that already carries the name.
+    let mut client = server.connect(&caught_up).await.expect("connect");
+    client.hello(legacy).await;
+    let (_, request) = renew();
+    client.send_msg(&request).await;
+    let answer = client
+        .recv_matching(|m| matches!(m, ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }))
+        .await;
+    assert!(
+        matches!(answer, Some(ControlMsg::RenewResponse { .. })),
+        "plain renewal with the stored name must work, got {answer:?}"
+    );
+
+    // A rename to a name that breaks today's rules is still refused.
+    let (_, csr) = common::csr_with_cn("Chri\u{0455}");
+    client.send_msg(&ControlMsg::RenewRequest { csr_der: csr }).await;
+    let answer = client
+        .recv_matching(|m| matches!(m, ControlMsg::Error { .. }))
+        .await;
+    assert!(
+        matches!(answer, Some(ControlMsg::Error { code, .. }) if code == ec::RENEW_REJECTED),
+        "{answer:?}"
+    );
+    server.shutdown().await;
+}
