@@ -102,7 +102,8 @@ pub struct CertRecord {
     pub renewed: Option<String>,
     /// A registration certificate (`PROTOCOL.md` §2.3): its session may only
     /// swap it for a certificate on the client's own key, and it is revoked
-    /// the moment that succeeds.
+    /// once the client confirms it stored that one
+    /// ([`Store::consume_registration`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub registration: bool,
 }
@@ -149,10 +150,14 @@ impl UserRecord {
         !self.certs.is_empty() && self.certs.iter().all(|c| c.revoked)
     }
 
-    /// Whether the user was invited but has not registered yet: every
-    /// certificate is a registration certificate.
+    /// Whether the user was invited but has not confirmed a registration yet:
+    /// every certificate is a registration certificate, or one is still
+    /// unrevoked — then a redeem was never confirmed, and the certificate it
+    /// produced may never have reached anybody.
     pub fn is_pending(&self) -> bool {
-        !self.certs.is_empty() && self.certs.iter().all(|c| c.registration)
+        !self.certs.is_empty()
+            && (self.certs.iter().all(|c| c.registration)
+                || self.certs.iter().any(|c| c.registration && !c.revoked))
     }
 }
 
@@ -510,9 +515,14 @@ impl Store {
         Ok((id, is_admin))
     }
 
-    /// Swaps a registration certificate for the user's first real one, in one
-    /// write: the new certificate is added, its CN becomes the name, and the
-    /// registration certificate is revoked so the bundle cannot be used again.
+    /// Records the user's first real certificate for a registration, in one
+    /// write: the new certificate is added and its CN becomes the name. The
+    /// registration certificate stays valid until the client confirms it has
+    /// stored the new one ([`Store::consume_registration`]); until then a lost
+    /// `RenewResponse` or a failed save can be repaired by redeeming the same
+    /// bundle again. Such a repeat revokes the certificates earlier redeems
+    /// produced — nobody can hold them, or the registration would have been
+    /// consumed by their first login.
     pub fn redeem_registration(
         &mut self,
         id: UserId,
@@ -531,14 +541,19 @@ impl Store {
             if record.disabled {
                 return Err(Error::coded(ec::AUTH_DISABLED, "user is disabled"));
             }
-            let reg = record
+            if !record
                 .certs
-                .iter_mut()
-                .find(|c| c.fingerprint == registration_fp && c.registration && !c.revoked)
-                .ok_or_else(|| {
-                    Error::coded(ec::AUTH_REVOKED, "registration certificate already used")
-                })?;
-            reg.revoked = true;
+                .iter()
+                .any(|c| c.fingerprint == registration_fp && c.registration && !c.revoked)
+            {
+                return Err(Error::coded(
+                    ec::AUTH_REVOKED,
+                    "registration certificate already used",
+                ));
+            }
+            for earlier in record.certs.iter_mut().filter(|c| !c.registration) {
+                earlier.revoked = true;
+            }
             record.name = cert.cn.clone();
             record.certs.push(CertRecord {
                 registration: false,
@@ -548,12 +563,44 @@ impl Store {
         })
     }
 
-    /// Drops users who were invited and never registered before their
-    /// registration certificate expired, which frees the placeholder name.
-    /// Called at startup (§6.1.4). `user_id`s are still never reused.
+    /// Revokes the user's registration certificates once the client has
+    /// provably stored its own: a clean close after `RenewResponse`, or the
+    /// first login with a real certificate. From then on the bundle is
+    /// worthless. Returns whether anything changed.
+    pub fn consume_registration(&mut self, id: UserId) -> Result<bool> {
+        let open = self
+            .user(id)
+            .is_some_and(|u| u.certs.iter().any(|c| c.registration && !c.revoked));
+        if !open {
+            return Ok(false);
+        }
+        self.update_users(|users| {
+            for cert in user_entry(users, id)?
+                .certs
+                .iter_mut()
+                .filter(|c| c.registration)
+            {
+                cert.revoked = true;
+            }
+            Ok(true)
+        })
+    }
+
+    /// Drops users who were invited and never confirmed a registration before
+    /// their registration certificate expired, which frees the name. A redeem
+    /// that was never confirmed counts as unused: nobody may hold its
+    /// certificate, and a user who does but never logged in within the
+    /// bundle's lifetime needs a new invite. Called at startup (§6.1.4).
+    /// `user_id`s are still never reused.
     pub fn purge_expired_registrations(&mut self) -> Result<usize> {
         let now = now();
-        let stale = |u: &UserRecord| u.is_pending() && u.certs.iter().all(|c| c.expired(now));
+        let stale = |u: &UserRecord| {
+            u.is_pending()
+                && u.certs
+                    .iter()
+                    .filter(|c| c.registration)
+                    .all(|c| c.expired(now))
+        };
         let removed = self.users.users.values().filter(|u| stale(u)).count();
         if removed > 0 {
             self.update_users(|users| {
@@ -568,8 +615,8 @@ impl Store {
 /// Whether a certificate record is still worth keeping. Expired certificates
 /// can no longer authenticate (rustls checks validity first), so their records
 /// are dead weight in every fingerprint lookup. Revoked ones stay: they are
-/// what makes a revoke visible, and what `is_revoked` counts — except a used
-/// registration certificate, whose revocation only ever meant "redeemed".
+/// what makes a revoke visible, and what `is_revoked` counts — except a
+/// consumed registration certificate, whose revocation only ever meant "used".
 fn keep_cert(c: &CertRecord, now: OffsetDateTime) -> bool {
     if c.registration && c.revoked {
         return !c.expired(now);
@@ -957,14 +1004,14 @@ mod tests {
         assert_eq!(err.code(), Some(ec::NAME_TAKEN));
     }
 
-    /// Redeeming revokes the registration certificate, adopts the new name,
-    /// and works exactly once.
+    /// Redeeming adopts the new name but keeps the bundle usable until the
+    /// client confirms; a repeat redeem replaces the unconfirmed certificate,
+    /// and once consumed the bundle is dead.
     #[test]
-    fn a_registration_is_redeemed_once() {
+    fn a_registration_is_redeemed_until_consumed() {
         let (_dir, mut s) = store();
         let (id, _) = s.add_registration(named_cert("reg", "neu-0001")).unwrap();
         s.add_user(named_cert("bb", "bob"), false).unwrap();
-
         let err = s
             .redeem_registration(id, "reg", named_cert("new", "Bob"))
             .unwrap_err();
@@ -975,15 +1022,27 @@ mod tests {
             .unwrap();
         let user = s.user(id).unwrap();
         assert_eq!(user.name, "alice");
-        assert!(!user.is_pending());
+        assert!(user.is_pending(), "unconfirmed");
         assert!(!user.is_revoked());
         let (_, _, reg) = s.by_fingerprint("reg").unwrap();
-        assert!(reg.revoked && reg.registration);
-        let (_, _, new) = s.by_fingerprint("new").unwrap();
-        assert!(!new.revoked && !new.registration);
+        assert!(!reg.revoked, "unconfirmed: the bundle still works");
 
+        // The answer was lost: the same bundle redeems again, and the first
+        // certificate, which nobody holds, is revoked.
+        s.redeem_registration(id, "reg", named_cert("again", "alice2"))
+            .unwrap();
+        assert_eq!(s.user(id).unwrap().name, "alice2");
+        assert!(s.by_fingerprint("new").unwrap().2.revoked);
+        assert!(!s.by_fingerprint("again").unwrap().2.revoked);
+
+        assert!(s.consume_registration(id).unwrap());
+        assert!(!s.consume_registration(id).unwrap(), "idempotent");
+        assert!(!s.user(id).unwrap().is_pending());
+        let (_, _, reg) = s.by_fingerprint("reg").unwrap();
+        assert!(reg.revoked && reg.registration);
+        assert!(!s.by_fingerprint("again").unwrap().2.revoked);
         let err = s
-            .redeem_registration(id, "reg", named_cert("again", "alice2"))
+            .redeem_registration(id, "reg", named_cert("third", "alice3"))
             .unwrap_err();
         assert_eq!(err.code(), Some(ec::AUTH_REVOKED));
     }
@@ -1010,15 +1069,22 @@ mod tests {
         let (used, _) = s.add_registration(named_cert("cc", "neu-0003")).unwrap();
         s.redeem_registration(used, "cc", named_cert("dd", "carol"))
             .unwrap();
+        s.consume_registration(used).unwrap();
+        // Redeemed, but the answer never arrived and nobody tried again.
+        let (lost, _) = s.add_registration(named_cert("ee", "neu-0004")).unwrap();
+        s.redeem_registration(lost, "ee", named_cert("ff", "dave"))
+            .unwrap();
         let past = rfc3339(now() - Duration::from_secs(10));
-        for id in [stale, used] {
+        for id in [stale, used, lost] {
             user_entry(&mut s.users, id).unwrap().certs[0].expires = past.clone();
         }
 
-        assert_eq!(s.purge_expired_registrations().unwrap(), 1);
+        assert_eq!(s.purge_expired_registrations().unwrap(), 2);
         assert!(s.user(stale).is_none());
         assert!(s.user(fresh).is_some());
         assert!(s.user(used).is_some(), "a registered user stays");
+        assert!(s.user(lost).is_none(), "an unconfirmed redeem is no ghost");
+        assert!(!s.name_taken("dave", None), "its name is free again");
         assert!(!s.name_taken("neu-0001", None), "the placeholder is free again");
     }
 

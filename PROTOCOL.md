@@ -103,10 +103,12 @@ Es gibt kein Einladungs-Token, keinen Link, keinen Blob und kein eigenes Enrollm
 2. Der Eingeladene verbindet sich damit ganz normal über `icu/1`. Er vertraut der CA aus dem Bundle; Adresse und SNI stehen in den Zertifikaten (unten). Nichts wird gepinnt, nichts ist TOFU.
 3. Der Server antwortet auf `Hello` mit `Welcome { registration: true, users: [], … }`. Die Sitzung tritt dem Raum nicht bei.
 4. Der Client erzeugt einen **eigenen** Schlüssel und sendet `RenewRequest` mit einer CSR, deren CN der gewählte Name ist.
-5. Der Server prüft: Schlüssel ≠ Schlüssel des Registrierungszertifikats (sonst `RENEW_REJECTED`), Name frei (sonst `NAME_TAKEN`, das Bundle bleibt gültig, der Nutzer kann einen anderen Namen versuchen), CSR-Regeln wie bei jedem Renewal (sonst `RENEW_REJECTED`). Dann stellt er das echte Zertifikat aus und widerruft **in derselben Schreiboperation** das Registrierungszertifikat. Antwort `RenewResponse`.
-6. Der Client schließt und verbindet sich mit dem neuen Zertifikat. Das Bundle ist damit wertlos (`AUTH_REVOKED`).
+5. Der Server prüft: Schlüssel ≠ Schlüssel des Registrierungszertifikats (sonst `RENEW_REJECTED`), Name frei (sonst `NAME_TAKEN`, das Bundle bleibt gültig, der Nutzer kann einen anderen Namen versuchen), CSR-Regeln wie bei jedem Renewal (sonst `RENEW_REJECTED`). Dann stellt er das echte Zertifikat aus, übernimmt den Namen und antwortet `RenewResponse`. Das Registrierungszertifikat bleibt noch gültig.
+6. Der Client **speichert** Schlüssel und Zertifikat und schließt erst danach mit `NO_ERROR` — das ist die Quittung. Mit ihr widerruft der Server das Registrierungszertifikat; ebenso beim ersten Login mit einem echten Zertifikat dieses Nutzers. Ab dann ist das Bundle wertlos (`AUTH_REVOKED`).
 
-Eine Registrierungssitzung darf außer `Ping` und `RenewRequest` nichts senden (sonst `PROTOCOL_VIOLATION`), höchstens 10 `RenewRequest` stellen und höchstens 120 s offen bleiben. Registrierungssitzungen sind auf 5/min pro IP und 20/min global begrenzt (`ENROLL_RATE_LIMITED`). Ein Registrierungszertifikat ist höchstens 7 Tage gültig (Default 24 h); ein nie eingelöstes wird nach Ablauf samt Nutzer entfernt, sein Platzhaltername ist dann wieder frei.
+**Ohne Quittung bleibt das Bundle gültig** (revidiert 2026-09-24): Geht `RenewResponse` verloren, bricht die Verbindung ab oder scheitert das Speichern, schließt der Client mit einem anderen Code (oder gar nicht) und kann dasselbe Bundle erneut einlösen. Eine erneute Einlösung widerruft die Zertifikate früherer, unquittierter Einlösungen — die sollte niemand halten, sonst hätte ihr erster Login die Registrierung verbraucht. Das Bundle bleibt also zwischen Einlösung und Quittung (Millisekunden, schlimmstenfalls bis zum nächsten Client-Start) ein Inhaber-Nachweis: wer eine Kopie in diesem Fenster einlöst, übernimmt den Zugang. Es bleibt derselbe Nutzer (`user_id`). Vorher widerrief schon die Einlösung das Bundle; ein verlorenes Antwortpaket hinterließ dann einen Nutzer mit einem Zertifikat, das niemand besaß, und einen dauerhaft belegten Namen.
+
+Eine Registrierungssitzung darf außer `Ping` und `RenewRequest` nichts senden (sonst `PROTOCOL_VIOLATION`), höchstens 10 `RenewRequest` stellen und höchstens 120 s offen bleiben. Registrierungssitzungen sind auf 5/min pro IP und 20/min global begrenzt (`ENROLL_RATE_LIMITED`). Ein Registrierungszertifikat ist höchstens 7 Tage gültig (Default 24 h); ein nie quittiertes wird nach Ablauf samt Nutzer entfernt, sein Name ist dann wieder frei. Das gilt auch nach einer unquittierten Einlösung: wer das Zertifikat doch gespeichert, sich aber bis zum Ablauf des Bundles nie damit angemeldet hat, braucht eine neue Einladung.
 
 **Wer wird Admin:** das erste Registrierungszertifikat, das gegen einen leeren Bestand ausgestellt wird. Den ersten Admin erzeugt man also mit `icu-server invite` auf dem Host, auch ohne laufenden Server.
 
@@ -137,7 +139,7 @@ Armor: `-----BEGIN ICU PASSPORT-----`, Base64 (Standard-Alphabet mit Padding) au
 
 Der Client exportiert Version 2, wenn sein Zertifikat die Adresse trägt, sonst Version 1 mit ausgeschriebener Adresse (ein Zertifikat von vor 2026-09-24, bis zum nächsten Renewal). Beim Import von Version 2 ohne Adresse im Zertifikat lehnt er ab.
 
-**Der Body ist Klartext.** Ein Passport ist bis zum Ablauf des Zertifikats oder bis zum Widerruf ein vollwertiger Identitätsnachweis: wer den Text liest, kann sich als dieser Nutzer anmelden. Der Client warnt entsprechend, schreibt die Datei mit Mode 0600 und zeigt den Text nie am Bildschirm. Er pinnt auch nichts — wer einen gefälschten Passport einspielt, landet auf fremdem Server mit fremder CA. Für ein Registrierungs-Bundle gilt dasselbe, bis es eingelöst oder abgelaufen ist.
+**Der Body ist Klartext.** Ein Passport ist bis zum Ablauf des Zertifikats oder bis zum Widerruf ein vollwertiger Identitätsnachweis: wer den Text liest, kann sich als dieser Nutzer anmelden. Der Client warnt entsprechend, schreibt die Datei mit Mode 0600 und zeigt den Text nie am Bildschirm. Er pinnt auch nichts — wer einen gefälschten Passport einspielt, landet auf fremdem Server mit fremder CA. Für ein Registrierungs-Bundle gilt dasselbe, bis es quittiert oder abgelaufen ist.
 
 Beide Geräte halten danach dasselbe Zertifikat. Der Server akzeptiert das (Identität ist der Fingerprint, mehrere Sitzungen je `user_id` sind erlaubt); benennt sich eines der Geräte um, zieht das andere beim nächsten Start über den Nachzügler-Pfad aus §2.2 Nr. 9 nach.
 
@@ -183,7 +185,7 @@ Incoming ─accept─▶ Handshaking ─ALPN icu/1, TLS ok─▶ Authenticating 
                                                                    │ unbekannt/revoked            │ Timeout
                                                                    │                              │ Registrierungszertifikat
                                                                    ▼                              ▼
-                                                                close(AUTH_*)                  Registering ─RenewResponse─▶ Closed
+                                                                close(AUTH_*)                  Registering ─RenewResponse, Close NO_ERROR─▶ Closed
 ```
 
 Client-Sicht: `Connecting → Handshaking → SendHello → AwaitWelcome → Active → Closed`. Reconnect bei jedem nicht-fatalen Close und bei Netzfehlern: Backoff 1, 2, 4, 8, 15 s, dann 15 s, unbegrenzt; lokaler Zustand (Mute, Deafen, Lautstärken) bleibt. Fatal (kein Reconnect, UI-Hinweis) sind genau die in §6 mit „ja“ markierten Codes: PROTOCOL_VIOLATION, VERSION_UNSUPPORTED, AUTH_*, KICKED, RATE_LIMITED_FATAL, ENROLL_*. Alle anderen → Reconnect mit Backoff.

@@ -100,10 +100,11 @@ fn run(cli: Cli) -> Result<(), String> {
             let client = format!("icu/{} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS);
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
             identity = rt
-                .block_on(register(&identity, &name, &client, cli.server_addr))
+                .block_on(register(&identity, &name, &client, cli.server_addr, &paths))
                 .map_err(|e| e.to_string())?;
+        } else {
+            identity.save(&paths).map_err(|e| e.to_string())?;
         }
-        identity.save(&paths).map_err(|e| e.to_string())?;
         eprintln!(
             "icu: registered as {} at {}:{}, identity stored in {}",
             identity.server.name,

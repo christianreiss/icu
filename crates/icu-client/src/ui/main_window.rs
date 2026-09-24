@@ -1204,10 +1204,11 @@ impl EnrollApp {
         let addr = self.server_addr;
         let name = self.name.trim().to_string();
         let client = format!("icu/{} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS);
+        let paths = self.paths.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("runtime");
             let r = rt
-                .block_on(register(&identity, &name, &client, addr))
+                .block_on(register(&identity, &name, &client, addr, &paths))
                 .map_err(|e| e.to_string());
             *slot.lock().unwrap() = Some(r);
         });

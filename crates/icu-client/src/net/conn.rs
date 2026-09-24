@@ -96,6 +96,10 @@ impl ServerCertVerifier for ReportingVerifier {
 /// [`CertFailure`] captures the specific TLS error (if any) from the next
 /// handshake attempt made with this config, for [`connect`] to inspect.
 pub fn client_config(identity: &Identity) -> Result<(quinn::ClientConfig, CertFailure), NetError> {
+    // The server would refuse an expired certificate with a bare TLS alert,
+    // which reads like a network error and would be retried forever. No
+    // reconnect can fix it, so say so before trying.
+    check_not_expired(&identity.leaf_der, unix_now())?;
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(CertificateDer::from(identity.ca_der.clone()))
@@ -144,6 +148,35 @@ pub fn client_config(identity: &Identity) -> Result<(quinn::ClientConfig, CertFa
     )));
     config.transport_config(Arc::new(transport));
     Ok((config, cert_failure))
+}
+
+/// Refuses a client certificate whose `notAfter` lies before `now` (Unix
+/// seconds). A leaf that does not parse is left to the handshake.
+fn check_not_expired(leaf_der: &[u8], now: i64) -> Result<(), NetError> {
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(leaf_der) else {
+        return Ok(());
+    };
+    let not_after = cert.validity().not_after.timestamp();
+    if not_after < now {
+        let what = if crate::net::register::is_registration(leaf_der) {
+            "Die Einladung ist abgelaufen — bitte eine neue anfordern"
+        } else {
+            "Das eigene Zertifikat ist abgelaufen — Passport eines anderen Geräts \
+             importieren oder eine neue Einladung anfordern"
+        };
+        return Err(NetError::Tls(format!(
+            "{what} (gültig bis {})",
+            cert.validity().not_after
+        )));
+    }
+    Ok(())
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Turns a certificate-verification failure into a clear, user-facing reason.
@@ -318,6 +351,21 @@ impl ConnectError {
                 code: u64::from(c.error_code) as u32,
                 reason: String::from_utf8_lossy(&c.reason).into_owned(),
             },
+            // A TLS alert from the server (QUIC crypto error 0x100–0x1ff): it
+            // refused our certificate — unknown CA after a server rebuild, or
+            // expired. The same certificate will be refused again.
+            quinn::ConnectionError::ConnectionClosed(c)
+                if (0x100..0x200).contains(&u64::from(c.error_code)) =>
+            {
+                ConnectError::Certificate {
+                    server_name: String::new(),
+                    detail: format!(
+                        "Server hat das Client-Zertifikat abgelehnt (TLS-Alert {}): {}",
+                        u64::from(c.error_code) - 0x100,
+                        String::from_utf8_lossy(&c.reason)
+                    ),
+                }
+            }
             other => ConnectError::Transport(other.to_string()),
         }
     }
@@ -349,6 +397,10 @@ impl std::fmt::Display for ConnectError {
             }
             ConnectError::Transport(s) => write!(f, "transport: {s}"),
             ConnectError::Protocol(s) => write!(f, "protocol: {s}"),
+            ConnectError::Certificate {
+                server_name,
+                detail,
+            } if server_name.is_empty() => f.write_str(detail),
             ConnectError::Certificate {
                 server_name,
                 detail,
@@ -396,5 +448,19 @@ mod tests {
             detail: "y".into(),
         }
         .is_fatal());
+    }
+
+    #[test]
+    fn an_expired_client_certificate_is_refused_locally() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+        let der = params.self_signed(&key).unwrap().der().to_vec();
+        let before = 1_893_456_000 - 86_400; // 2029-12-31
+        let after = 1_893_456_000 + 86_400; // 2030-01-02
+        assert!(check_not_expired(&der, before).is_ok());
+        let err = check_not_expired(&der, after).unwrap_err().to_string();
+        assert!(err.contains("abgelaufen"), "{err}");
+        assert!(check_not_expired(b"junk", after).is_ok());
     }
 }

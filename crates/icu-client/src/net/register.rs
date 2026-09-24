@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 
 use icu_proto::{ControlMsg, MAX_CONTROL_FRAME};
 
-use crate::config::{Identity, ServerInfo};
+use crate::config::{Identity, Paths, ServerInfo};
 
 use super::{conn, read_frame, resolve, server_name_for, NetError};
 
@@ -30,17 +30,21 @@ pub fn is_registration(leaf_der: &[u8]) -> bool {
     found
 }
 
-/// Connects with the registration certificate in `bundle` and returns the
-/// identity on a fresh key, carrying `name`.
+/// Connects with the registration certificate in `bundle`, stores the
+/// identity on a fresh key, carrying `name`, under `paths` and returns it.
 ///
-/// A bundle that is not a registration (a plain passport) comes back as it
-/// is, so a caller can hand either here. `addr_override` replaces the DNS
-/// lookup (tests bind ephemeral ports).
+/// Stored before the session closes, because the clean close is the receipt
+/// that makes the server revoke the bundle (`PROTOCOL.md` §2.3): when saving
+/// fails, the session ends with another code and the bundle stays usable for
+/// another attempt. A bundle that is not a registration (a plain passport)
+/// comes back as it is, so a caller can hand either here. `addr_override`
+/// replaces the DNS lookup (tests bind ephemeral ports).
 pub async fn register(
     bundle: &Identity,
     name: &str,
     client: &str,
     addr_override: Option<SocketAddr>,
+    paths: &Paths,
 ) -> Result<Identity, NetError> {
     icu_proto::validate_name(name).map_err(|e| NetError::BadLink(e.to_string()))?;
     let (config, cert_failure) = conn::client_config(bundle)?;
@@ -74,13 +78,33 @@ pub async fn register(
         welcome,
     } = session;
     let result = if welcome.registration {
-        complete(&mut send, &mut recv, bundle, name).await
+        complete(&mut send, &mut recv, bundle, name)
+            .await
+            .and_then(|identity| {
+                identity.save(paths).map_err(|e| {
+                    NetError::Other(format!(
+                        "Speichern fehlgeschlagen: {e} — die Einladung bleibt gültig, bitte erneut versuchen"
+                    ))
+                })?;
+                Ok(identity)
+            })
     } else {
         Ok(bundle.clone())
     };
-    connection.close(quinn::VarInt::from_u32(0), b"");
+    connection.close(receipt(result.is_ok()), b"");
     endpoint.wait_idle().await;
     result
+}
+
+/// The close code that ends a registration session: `NO_ERROR` only once the
+/// new identity is stored, which tells the server to revoke the bundle.
+/// Anything else keeps it valid (`PROTOCOL.md` §2.3).
+pub fn receipt(stored: bool) -> quinn::VarInt {
+    quinn::VarInt::from_u32(if stored {
+        icu_proto::error::NO_ERROR
+    } else {
+        icu_proto::error::SHUTDOWN
+    })
 }
 
 /// The registration step on an already welcomed session: fresh key, CSR for

@@ -279,3 +279,30 @@ async fn a_passport_import_recovers_from_a_fatal_state() {
     engine.shutdown();
     server.handle.shutdown().await;
 }
+
+/// The clean close after `RenewResponse` is the receipt that revokes the
+/// bundle, so it is sent only once the identity is on disk: a failed save
+/// leaves the bundle usable for another attempt (`PROTOCOL.md` §2.3).
+#[tokio::test]
+async fn a_failed_save_does_not_burn_the_bundle() {
+    use icu_client::net::register::register;
+    let server = TestServer::start().await;
+    let bundle = Identity::from_passport(&server.invite_bundle("").await).unwrap();
+
+    // `identity.new` is a file, so the new set cannot be written.
+    let broken = tempfile::tempdir().unwrap();
+    std::fs::write(broken.path().join("identity.new"), b"").unwrap();
+    let broken_paths = Paths::new(Some(broken.path().to_path_buf()));
+    let client = "icu-test/0.1.0 linux";
+    let err = register(&bundle, "dora", client, Some(server.addr()), &broken_paths)
+        .await
+        .expect_err("saving must fail");
+    assert!(err.to_string().contains("Speichern"), "{err}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(dir.path().to_path_buf()));
+    register(&bundle, "dora", client, Some(server.addr()), &paths)
+        .await
+        .expect("the bundle is still valid");
+    assert_eq!(leaf_cn(&paths), "dora");
+}

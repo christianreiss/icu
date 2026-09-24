@@ -77,12 +77,25 @@ impl TestServer {
     pub async fn enroll(&self, name: &str) -> (Identity, Paths, tempfile::TempDir) {
         let bundle = Identity::from_passport(&self.invite_bundle("").await).expect("bundle");
         assert!(bundle.is_registration());
-        let identity = register(&bundle, name, "icu-test/0.1.0 linux", Some(self.addr()))
-            .await
-            .expect("registration");
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = Paths::new(Some(dir.path().to_path_buf()));
-        identity.save(&paths).expect("identity saved");
+        let identity = register(
+            &bundle,
+            name,
+            "icu-test/0.1.0 linux",
+            Some(self.addr()),
+            &paths,
+        )
+        .await
+        .expect("registration");
+        assert_eq!(
+            Identity::load(&paths)
+                .expect("load")
+                .expect("stored")
+                .leaf_der,
+            identity.leaf_der,
+            "register stores the identity itself"
+        );
         (identity, paths, dir)
     }
 

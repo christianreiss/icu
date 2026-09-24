@@ -1589,7 +1589,10 @@ impl LocalState {
         self.renew_attempted = false;
         self.name = crate::conninfo::CertInfo::from_der(&self.identity.leaf_der).subject;
         let saved = self.identity.save(&self.paths);
-        let server = format!("{}:{}", self.identity.server.host, self.identity.server.port);
+        let server = format!(
+            "{}:{}",
+            self.identity.server.host, self.identity.server.port
+        );
         let server_name = self.identity.server.server_name.clone();
         shared.state.send_modify(|s| {
             s.server = server;
@@ -1756,14 +1759,35 @@ async fn run_session(
             r = crate::net::register::complete(&mut send, &mut recv, &bundle, &name) => r,
             end = drain_until_quit(cmd_rx, local, shared) => return end,
         };
-        connection.close(quinn::VarInt::from_u32(0), b"");
+        // Stored first, then closed: the clean close is the receipt that
+        // makes the server revoke the bundle (`PROTOCOL.md` §2.3).
         return match registered {
-            Ok(identity) => {
-                local.replace_identity(identity, shared);
+            // Saved before it is taken into use: an identity that only lives
+            // in memory would consume the bundle on the next login and be
+            // gone after a restart.
+            Ok(identity) => match identity.save(&local.paths) {
+                Ok(()) => {
+                    connection.close(crate::net::register::receipt(true), b"");
+                    local.replace_identity(identity, shared);
+                    shared.state.send_modify(|s| s.banner = None);
+                    SessionEnd::Retry("registriert".into())
+                }
+                Err(e) => {
+                    connection.close(crate::net::register::receipt(false), b"");
+                    shared.state.send_modify(|s| s.banner = None);
+                    SessionEnd::Fatal(format!(
+                        "Registrierung nicht gespeichert: {e} — die Einladung bleibt gültig"
+                    ))
+                }
+            },
+            // No answer: the bundle is still valid, so try again.
+            Err(e @ crate::net::NetError::Connect(_)) => {
+                connection.close(crate::net::register::receipt(false), b"");
                 shared.state.send_modify(|s| s.banner = None);
-                SessionEnd::Retry("registriert".into())
+                SessionEnd::Retry(format!("Registrierung unterbrochen: {e}"))
             }
             Err(e) => {
+                connection.close(crate::net::register::receipt(false), b"");
                 shared.state.send_modify(|s| s.banner = None);
                 SessionEnd::Fatal(format!("Registrierung fehlgeschlagen: {e}"))
             }

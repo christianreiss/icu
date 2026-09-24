@@ -85,7 +85,7 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
         .ok_or_else(|| Error::coded(ec::AUTH_REQUIRED, "empty certificate chain"))?;
     let fp = fingerprint(leaf);
 
-    let store = server.store.lock().await;
+    let mut store = server.store.lock().await;
     let (user_id, user, cert) = store
         .by_fingerprint(&fp)
         .ok_or_else(|| Error::coded(ec::AUTH_UNKNOWN_CERT, format!("unknown fingerprint {fp}")))?;
@@ -114,11 +114,17 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
             "stale cn, client will catch up"
         );
     }
+    let registration = cert.registration;
+    // The first login with a real certificate proves the client stored it,
+    // whether or not the registration session saw the clean close.
+    if !registration {
+        store.consume_registration(user_id)?;
+    }
     Ok(Identity {
         user_id,
         cert_fp: fp,
         cert_cn,
-        registration: cert.registration,
+        registration,
         cert_spki: ca::leaf_public_key(leaf),
     })
 }
@@ -414,9 +420,25 @@ async fn serve_registration(
                         Counters::inc(&server.counters.enroll_ok);
                         write_msg(&mut send, &ControlMsg::RenewResponse { leaf_der }).await?;
                         let _ = send.finish();
-                        // The client closes once it has the certificate; a
-                        // close from here could overtake the response.
-                        let _ = tokio::time::timeout(REGISTRATION_LINGER, conn.closed()).await;
+                        // The client closes with NO_ERROR once it has stored
+                        // the certificate; a close from here could overtake the
+                        // response. Anything else — another code, a timeout, a
+                        // dropped path — leaves the bundle valid, so a lost
+                        // answer or a failed save does not burn it. The first
+                        // login with the new certificate consumes it as well.
+                        let closed = tokio::time::timeout(REGISTRATION_LINGER, conn.closed()).await;
+                        if matches!(
+                            closed,
+                            Ok(quinn::ConnectionError::ApplicationClosed(ref c))
+                                if u64::from(c.error_code) == u64::from(ec::NO_ERROR)
+                        ) {
+                            server
+                                .store
+                                .lock()
+                                .await
+                                .consume_registration(identity.user_id)?;
+                            tracing::info!(user_id = identity.user_id, "registration confirmed");
+                        }
                         return Ok(());
                     }
                     Err(e) => {

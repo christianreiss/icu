@@ -223,12 +223,9 @@ async fn a_bundle_works_exactly_once() {
     let bundle = server.invite("").await;
     let bob = server.register(&bundle, "bob").await.expect("registers");
 
-    // The registration certificate was revoked when it was redeemed.
-    let reused = common::identity_from_bundle(&bundle);
-    let client = server.connect(&reused).await.expect("connect");
-    assert_eq!(client.closed_code().await, Some(ec::AUTH_REVOKED));
-
-    // The certificate on the client's own key is a normal one.
+    // The certificate on the client's own key is a normal one. Logging in
+    // with it proves the client stored it and consumes the bundle — the
+    // clean close after `RenewResponse` does the same, but asynchronously.
     let mut client = server.connect(&bob).await.expect("connect");
     match client.hello("bob").await {
         ControlMsg::Welcome {
@@ -236,6 +233,64 @@ async fn a_bundle_works_exactly_once() {
         } => {
             assert!(!registration);
             assert_eq!(you.name, "bob");
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+
+    let reused = common::identity_from_bundle(&bundle);
+    let client = server.connect(&reused).await.expect("connect");
+    assert_eq!(client.closed_code().await, Some(ec::AUTH_REVOKED));
+    server.shutdown().await;
+}
+
+/// A clean close after `RenewResponse` is the client's receipt: the bundle
+/// is dead from then on, even before the first login.
+#[tokio::test]
+async fn a_confirmed_registration_consumes_the_bundle() {
+    let server = TestServer::start().await;
+    let bundle = server.invite("").await;
+    server.register(&bundle, "bob").await.expect("registers");
+
+    // The server sees the close asynchronously; one pause instead of a poll,
+    // since every early attempt would spend the per-IP registration budget.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let reused = common::identity_from_bundle(&bundle);
+    let client = server.connect(&reused).await.expect("connect");
+    assert_eq!(
+        client.closed_code().await,
+        Some(ec::AUTH_REVOKED),
+        "the clean close must consume the bundle"
+    );
+    server.shutdown().await;
+}
+
+/// A client that got no answer, or could not store it, closes without
+/// `NO_ERROR`: the bundle stays valid, and redeeming it again replaces the
+/// certificate nobody holds (`PROTOCOL.md` §2.3).
+#[tokio::test]
+async fn an_unconfirmed_registration_can_be_repeated() {
+    let server = TestServer::start().await;
+    let bundle = server.invite("").await;
+    let lost = server
+        .register_unconfirmed(&bundle, "bob")
+        .await
+        .expect("registers");
+    let bob = server
+        .register(&bundle, "bob")
+        .await
+        .expect("the unconfirmed bundle redeems again");
+
+    let client = server.connect(&lost).await.expect("connect");
+    assert_eq!(
+        client.closed_code().await,
+        Some(ec::AUTH_REVOKED),
+        "the lost certificate is replaced"
+    );
+    let mut client = server.connect(&bob).await.expect("connect");
+    match client.hello("bob").await {
+        ControlMsg::Welcome { you, .. } => {
+            assert_eq!(you.name, "bob");
+            assert_eq!(you.user_id, 1, "same user, not a second one");
         }
         other => panic!("expected Welcome, got {other:?}"),
     }

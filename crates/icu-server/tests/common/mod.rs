@@ -8,7 +8,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use icu_proto::{
-    framing,
+    error as ec, framing,
     header::{VIDEO_HEADER_LEN, VIDEO_MAX_FRAME},
     AudioHeader, ControlMsg, Session, UserFlags, UserId, VideoHeader, MAX_CONTROL_FRAME,
 };
@@ -99,6 +99,28 @@ impl TestServer {
         key: rcgen::KeyPair,
         csr: Vec<u8>,
     ) -> Result<Identity, EnrollFail> {
+        self.register_closing(bundle, key, csr, ec::NO_ERROR).await
+    }
+
+    /// Registers like [`TestServer::register`] but ends the session with
+    /// `close_code` — anything but `NO_ERROR` is a client that did not
+    /// confirm it stored the certificate (`PROTOCOL.md` §2.3).
+    pub async fn register_unconfirmed(
+        &self,
+        bundle: &str,
+        name: &str,
+    ) -> Result<Identity, EnrollFail> {
+        let (key, csr) = csr_with_cn(name);
+        self.register_closing(bundle, key, csr, ec::SHUTDOWN).await
+    }
+
+    async fn register_closing(
+        &self,
+        bundle: &str,
+        key: rcgen::KeyPair,
+        csr: Vec<u8>,
+        close_code: u32,
+    ) -> Result<Identity, EnrollFail> {
         let registration = identity_from_bundle(bundle);
         let mut client = self
             .connect(&registration)
@@ -140,7 +162,7 @@ impl TestServer {
                 None => "no answer".into(),
             })),
         };
-        client.conn.close(quinn::VarInt::from_u32(0), b"");
+        client.conn.close(quinn::VarInt::from_u32(close_code), b"");
         result
     }
 

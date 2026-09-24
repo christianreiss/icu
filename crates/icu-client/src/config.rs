@@ -543,6 +543,12 @@ impl Identity {
 
     /// Loads the identity, `Ok(None)` if not enrolled yet.
     pub fn load(paths: &Paths) -> Result<Option<Identity>, ConfigError> {
+        // A save that crashed between its two renames left only the previous
+        // set behind (see `save`).
+        let previous = paths.identity_dir().with_extension("old");
+        if !paths.identity_dir().exists() && previous.join("server.toml").exists() {
+            fs::rename(&previous, paths.identity_dir())?;
+        }
         if !paths.server().exists() {
             return Ok(None);
         }
@@ -559,15 +565,43 @@ impl Identity {
         }))
     }
 
-    /// Writes all four files; the key with mode 0600.
+    /// Writes all four files as one set; the key with mode 0600.
+    ///
+    /// Into a fresh `identity.new/` first, then swapped in by renaming
+    /// directories, so a crash never leaves a key next to somebody else's
+    /// certificate. The swap takes two renames (a directory cannot replace a
+    /// non-empty one everywhere); `load` repairs a crash between them.
     pub fn save(&self, paths: &Paths) -> Result<(), ConfigError> {
-        fs::create_dir_all(paths.identity_dir())?;
-        write_atomic(&paths.key(), &self.key_der, true)?;
-        write_atomic(&paths.leaf(), &self.leaf_der, false)?;
-        write_atomic(&paths.ca(), &self.ca_der, false)?;
+        let dir = paths.identity_dir();
+        let fresh = dir.with_extension("new");
+        let previous = dir.with_extension("old");
+        remove_dir_if_present(&fresh)?;
+        fs::create_dir_all(&fresh)?;
+        write_atomic(&fresh.join("key.pk8"), &self.key_der, true)?;
+        write_atomic(&fresh.join("leaf.der"), &self.leaf_der, false)?;
+        write_atomic(&fresh.join("ca.der"), &self.ca_der, false)?;
         let text =
             toml::to_string_pretty(&self.server).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        write_atomic(&paths.server(), text.as_bytes(), false)
+        write_atomic(&fresh.join("server.toml"), text.as_bytes(), false)?;
+
+        remove_dir_if_present(&previous)?;
+        if dir.exists() {
+            fs::rename(&dir, &previous)?;
+        }
+        fs::rename(&fresh, &dir)?;
+        #[cfg(unix)]
+        if let Ok(parent) = fs::File::open(&paths.config_dir) {
+            let _ = parent.sync_all();
+        }
+        let _ = remove_dir_if_present(&previous);
+        Ok(())
+    }
+}
+
+fn remove_dir_if_present(dir: &Path) -> Result<(), ConfigError> {
+    match fs::remove_dir_all(dir) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
     }
 }
 
@@ -814,5 +848,22 @@ mod tests {
             let mode = fs::metadata(paths.key()).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+
+        // Replaced as a set, and a crash between the two renames of the swap
+        // falls back to the previous set.
+        let other = Identity {
+            key_der: vec![9],
+            leaf_der: vec![8],
+            ..id.clone()
+        };
+        other.save(&paths).unwrap();
+        assert_eq!(Identity::load(&paths).unwrap().unwrap(), other);
+        assert!(!paths.identity_dir().with_extension("old").exists());
+        fs::rename(
+            paths.identity_dir(),
+            paths.identity_dir().with_extension("old"),
+        )
+        .unwrap();
+        assert_eq!(Identity::load(&paths).unwrap().unwrap(), other);
     }
 }
