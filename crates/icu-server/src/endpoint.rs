@@ -9,7 +9,12 @@ use std::{
 
 use icu_proto::limits as pl;
 use quinn::{crypto::rustls::QuicServerConfig, Endpoint, VarInt};
-use rustls::{pki_types::CertificateRevocationListDer, RootCertStore};
+use rustls::{
+    client::danger::HandshakeSignatureValid,
+    pki_types::{CertificateDer, CertificateRevocationListDer, UnixTime},
+    server::danger::{ClientCertVerified, ClientCertVerifier},
+    CertificateError, DigitallySignedStruct, DistinguishedName, RootCertStore, SignatureScheme,
+};
 
 use crate::{
     ca::Ca,
@@ -50,6 +55,7 @@ pub fn server_config(
     .only_check_end_entity_revocation()
     .build()
     .context("cannot build the client certificate verifier")?;
+    let verifier = Arc::new(ExpiredClientCertVerifier(verifier));
 
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -84,6 +90,87 @@ pub fn server_config(
     quic.transport_config(Arc::new(transport));
 
     Ok(quic)
+}
+
+/// Lets an **expired** client certificate through the handshake, so its
+/// holder can renew it however long ago it expired (`PROTOCOL.md` §2.3).
+///
+/// Only expiry is forgiven: when the inner verifier's sole complaint is that
+/// the leaf has expired, the leaf is checked again as of one second before its
+/// notAfter — chain, signature, key usage and the CRL all still apply. Proof of
+/// the key is the TLS handshake itself, and the server is still checked
+/// against the CA by the client, so nothing here is trust on first use.
+/// Everything past the handshake is `session.rs`: the fingerprint has to be in
+/// the store, not revoked, the user not disabled, and an expired leaf only
+/// ever gets a renew-only session.
+#[derive(Debug)]
+struct ExpiredClientCertVerifier(Arc<dyn ClientCertVerifier>);
+
+impl ClientCertVerifier for ExpiredClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.0.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.0.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.0.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> std::result::Result<ClientCertVerified, rustls::Error> {
+        match self.0.verify_client_cert(end_entity, intermediates, now) {
+            Err(rustls::Error::InvalidCertificate(
+                CertificateError::Expired | CertificateError::ExpiredContext { .. },
+            )) => {
+                let Some(not_after) = not_after(end_entity) else {
+                    return Err(rustls::Error::InvalidCertificate(CertificateError::Expired));
+                };
+                let before = UnixTime::since_unix_epoch(Duration::from_secs(
+                    not_after.as_secs().saturating_sub(1),
+                ));
+                self.0.verify_client_cert(end_entity, intermediates, before)
+            }
+            other => other,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        self.0.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.supported_verify_schemes()
+    }
+}
+
+/// A leaf's notAfter, read from the certificate itself.
+fn not_after(der: &CertificateDer<'_>) -> Option<Duration> {
+    use x509_parser::prelude::FromDer;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+    u64::try_from(cert.validity().not_after.timestamp())
+        .ok()
+        .map(Duration::from_secs)
 }
 
 /// Signs a fresh CRL from the store under the next CRL number.

@@ -1358,6 +1358,7 @@ async fn net_task(
         backend,
         identity: cfg.identity.clone(),
         pending_renew: None,
+        renew_only: false,
         invite_pending: false,
         renew_attempted_at: None,
         window_visible: !cfg.settings.ui.start_minimized,
@@ -1504,6 +1505,8 @@ struct LocalState {
     identity: Identity,
     /// The renewal this client is waiting for, if any.
     pending_renew: Option<PendingRenew>,
+    /// The server said `RENEW_REQUIRED`: the next session renews first.
+    renew_only: bool,
     /// A `CreateInviteRequest` is waiting for its answer.
     invite_pending: bool,
     /// When the last automatic renewal was sent. The server allows one a
@@ -1590,15 +1593,17 @@ fn renewal_due(cert: &crate::conninfo::CertInfo, stored: &str) -> Option<RenewRe
     if cert.subject != stored {
         return Some(RenewReason::CatchUp);
     }
-    // `expires_in_days` is floored: 30 means up to 31 days left, which the
-    // server still refuses (`PROTOCOL.md` §2.2 Nr. 9).
-    if cert.expires_in_days < RENEW_BEFORE_EXPIRY_DAYS {
+    // In the last third of the lifetime, and at least the last 30 days,
+    // where the server opens the window (`PROTOCOL.md` §2.2 Nr. 9). Both day
+    // counts are floored, which keeps this a little inside the server's
+    // window rather than before it: 30 floored days are up to 31 left.
+    if cert.expires_in_days < (cert.valid_days / 3).max(RENEW_BEFORE_EXPIRY_DAYS) {
         return Some(RenewReason::Expiry);
     }
     None
 }
 
-/// Renew this many days before the certificate expires
+/// Renew at the latest this many days before the certificate expires
 /// (`Client/IMPLEMENTATION.md` §5).
 const RENEW_BEFORE_EXPIRY_DAYS: i64 = 30;
 
@@ -1608,7 +1613,7 @@ const AUTO_RENEW_RETRY: Duration = Duration::from_secs(24 * 3600);
 
 /// Sends the automatic renewal if one is due and none was tried within
 /// [`AUTO_RENEW_RETRY`]: catch-up after a rename on another device, or the
-/// last 30 days before expiry. `stored` is the name the server holds. Silent:
+/// last third of the certificate's lifetime. `stored` is the name the server holds. Silent:
 /// no banner, no `name_error`, and `rename_pending` stays false — this is not
 /// something the user asked for. `Err` only when the control stream broke.
 async fn maybe_auto_renew(
@@ -1830,6 +1835,7 @@ impl LocalState {
         self.identity = identity;
         self.pending_renew = None;
         self.renew_attempted_at = None;
+        self.renew_only = false;
         self.name = crate::conninfo::CertInfo::from_der(&self.identity.leaf_der).subject;
         let saved = self.identity.save(&self.paths);
         let server = format!(
@@ -2050,6 +2056,55 @@ async fn run_session(
                 let mut p = e.problem();
                 p.text = format!("Anmeldung fehlgeschlagen: {}", p.text);
                 SessionEnd::Fatal(p)
+            }
+        };
+    }
+
+    // An expired certificate still gets through the handshake, into a
+    // renew-only session (`PROTOCOL.md` §2.3): renew it under the stored name
+    // with the same key, store it, reconnect with it. `renew_only` covers a
+    // server whose clock already disagrees with ours.
+    let expired = conn::leaf_expired(&local.identity.leaf_der, conn::unix_now());
+    if expired || std::mem::take(&mut local.renew_only) {
+        shared.state.send_modify(|s| {
+            s.conn = ConnStatus::Connecting;
+            s.notice = Some("Zertifikat abgelaufen – wird erneuert …".into());
+        });
+        let name = welcome.you.name.clone();
+        let identity = local.identity.clone();
+        let renewed = tokio::select! {
+            r = crate::net::register::renew_expired(&mut send, &mut recv, &identity, &name) => r,
+            end = drain_until_quit(cmd_rx, local, shared) => return end,
+        };
+        shared.state.send_modify(|s| s.notice = None);
+        return match renewed {
+            Ok(identity) => match identity.save(&local.paths) {
+                Ok(()) => {
+                    tracing::info!(name = %name, "expired certificate renewed");
+                    connection.close(quinn::VarInt::from_u32(codes::NO_ERROR), b"");
+                    local.replace_identity(identity, shared);
+                    SessionEnd::Retry(Problem::plain("Zertifikat erneuert – verbinde neu …"))
+                }
+                Err(e) => {
+                    connection.close(quinn::VarInt::from_u32(codes::SHUTDOWN), b"");
+                    SessionEnd::Fatal(crate::problem::storage("Das neue Zertifikat", &e))
+                }
+            },
+            Err(crate::net::NetError::Rejected { code, detail }) if codes::is_fatal(code) => {
+                SessionEnd::Fatal(crate::problem::from_code(code, &detail))
+            }
+            Err(e) => {
+                if let Some(reason) = connection.close_reason() {
+                    return close_end(ConnectError::from_connection_error(reason));
+                }
+                connection.close(quinn::VarInt::from_u32(codes::SHUTDOWN), b"");
+                // Still expired: the next connect lands here again, after
+                // the backoff.
+                SessionEnd::Retry(Problem::new(
+                    "Das abgelaufene Zertifikat konnte noch nicht erneuert werden. ICU versucht \
+                     es gleich noch einmal.",
+                    e.to_string(),
+                ))
             }
         };
     }
@@ -2705,6 +2760,14 @@ async fn handle_control(
                 }
             });
         }
+        // The server considers our certificate expired although we do not:
+        // reconnect straight into the renewal.
+        ControlMsg::Error { code, .. } if code == codes::RENEW_REQUIRED => {
+            local.renew_only = true;
+            return Some(SessionEnd::Retry(Problem::plain(
+                "Zertifikat abgelaufen – wird erneuert …",
+            )));
+        }
         ControlMsg::Error { code, detail } => {
             tracing::warn!(code, %detail, "server error");
             let text = crate::problem::from_code(code, &detail).text;
@@ -3048,11 +3111,21 @@ mod tests {
         let cert = |days| crate::conninfo::CertInfo {
             subject: "alice".into(),
             expires_in_days: days,
+            valid_days: 365,
             ..Default::default()
         };
-        // 30 floored days are up to 31 left: the server would refuse.
-        assert_eq!(renewal_due(&cert(30), "alice"), None);
-        assert_eq!(renewal_due(&cert(29), "alice"), Some(RenewReason::Expiry));
+        // A third of 365 is 121 floored days, up to 122 left: the server opens
+        // its window at 121.67.
+        assert_eq!(renewal_due(&cert(121), "alice"), None);
+        assert_eq!(renewal_due(&cert(120), "alice"), Some(RenewReason::Expiry));
+        assert_eq!(renewal_due(&cert(-400), "alice"), Some(RenewReason::Expiry));
+        // Short lifetimes keep the 30-day floor.
+        let short = |days| crate::conninfo::CertInfo {
+            valid_days: 20,
+            ..cert(days)
+        };
+        assert_eq!(renewal_due(&short(30), "alice"), None);
+        assert_eq!(renewal_due(&short(19), "alice"), Some(RenewReason::Expiry));
         assert_eq!(renewal_due(&cert(200), "bob"), Some(RenewReason::CatchUp));
     }
 }

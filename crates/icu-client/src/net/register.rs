@@ -124,7 +124,41 @@ pub async fn complete(
     name: &str,
 ) -> Result<Identity, NetError> {
     let key = rcgen::KeyPair::generate().map_err(|e| NetError::Other(e.to_string()))?;
-    let csr_der = csr_for(name, &key)?;
+    exchange(send, recv, bundle, &key, name).await
+}
+
+/// Renews an **expired** certificate on a renew-only session
+/// (`PROTOCOL.md` §2.3): the same key, the stored `name`, a new leaf. The
+/// handshake with the expired leaf proved the key; the server was checked
+/// against the CA as always. The key is kept so passports exported from this
+/// device keep matching.
+pub async fn renew_expired(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    identity: &Identity,
+    name: &str,
+) -> Result<Identity, NetError> {
+    let key = rcgen::KeyPair::try_from(identity.key_der.as_slice()).map_err(|e| {
+        NetError::User(crate::problem::Problem::new(
+            "Die gespeicherten Zugangsdaten sind beschädigt. Bitte den Passport erneut \
+             importieren.",
+            e.to_string(),
+        ))
+    })?;
+    exchange(send, recv, identity, &key, name).await
+}
+
+/// `RenewRequest` for `name` on `key` and the answer, checked against both.
+/// `Error{RENEW_REQUIRED}` is the server's prompt for exactly this and is
+/// skipped; any other `Error` ends it.
+async fn exchange(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    bundle: &Identity,
+    key: &rcgen::KeyPair,
+    name: &str,
+) -> Result<Identity, NetError> {
+    let csr_der = csr_for(name, key)?;
     conn::write_msg(send, &ControlMsg::RenewRequest { csr_der }).await?;
     loop {
         let body = read_frame(recv, MAX_CONTROL_FRAME).await?;
@@ -163,6 +197,7 @@ pub async fn complete(
                     server,
                 });
             }
+            ControlMsg::Error { code, .. } if code == icu_proto::error::RENEW_REQUIRED => {}
             ControlMsg::Error { code, detail } => {
                 return Err(NetError::Rejected { code, detail });
             }

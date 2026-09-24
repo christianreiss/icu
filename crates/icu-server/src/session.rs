@@ -63,10 +63,14 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
     }
 
     // One live connection per certificate: this one wins (`PROTOCOL.md` §7).
-    let _live = LiveCert::claim(&server, &identity.cert_fp, &conn);
+    // Not for a renew-only session: it never joins the room, and must not
+    // kick a session still running on the same certificate.
+    let _live = (!identity.expired).then(|| LiveCert::claim(&server, &identity.cert_fp, &conn));
 
     let served = if identity.registration {
         serve_registration(&server, &conn, &identity).await
+    } else if identity.expired {
+        serve_recovery(&server, &conn, &identity).await
     } else {
         serve(&server, &conn, &identity).await
     };
@@ -155,6 +159,9 @@ struct Identity {
     /// SubjectPublicKeyInfo of the presented leaf. A registration has to
     /// bring a different key.
     cert_spki: Vec<u8>,
+    /// The presented leaf has expired: a renew-only session
+    /// (`PROTOCOL.md` §2.3).
+    expired: bool,
 }
 
 async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<Identity> {
@@ -201,11 +208,21 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
         );
     }
     let registration = cert.registration;
+    let expired = ca::leaf_expired(leaf);
+    // The handshake forgives expiry only for renewing a real certificate; a
+    // registration certificate that ran out is spent (`PROTOCOL.md` §2.3).
+    if registration && expired {
+        return Err(Error::coded(
+            ec::AUTH_UNKNOWN_CERT,
+            format!("registration certificate {fp} has expired"),
+        ));
+    }
     // The first login with a real certificate proves the client stored it,
     // whether or not the registration session saw the clean close. A failed
     // write must not cost the login: the bundle just stays valid a little
     // longer, as before the receipt, and the next login tries again.
     let consumed = !registration
+        && !expired
         && store.consume_registration(user_id).unwrap_or_else(|e| {
             tracing::warn!(user_id, error = %e, "cannot consume the registration");
             false
@@ -221,6 +238,7 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
         cert_cn,
         registration,
         cert_spki: spki,
+        expired,
     })
 }
 
@@ -448,6 +466,136 @@ async fn serve_registration(
     )
     .await
     .unwrap_or_else(|_| Err(Error::coded(ec::TIMEOUT, "registration took too long")))
+}
+
+/// A session authenticated with an **expired** certificate
+/// (`PROTOCOL.md` §2.3): renew-only. It never joins the room. After `Welcome`
+/// (with no users) comes `Error{RENEW_REQUIRED}`, and the only useful message
+/// is a `RenewRequest` under the stored name with the existing key; anything
+/// else is answered with `RENEW_REQUIRED` again. After `RenewResponse` the
+/// client stores the leaf, closes, and reconnects with it. Bounded in time and
+/// attempts like a registration session.
+async fn serve_recovery(
+    server: &Arc<Server>,
+    conn: &quinn::Connection,
+    identity: &Identity,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + REGISTRATION_SESSION;
+    tokio::time::timeout_at(
+        deadline + REGISTRATION_LINGER,
+        recovery_exchange(server, conn, identity, deadline),
+    )
+    .await
+    .unwrap_or_else(|_| Err(Error::coded(ec::TIMEOUT, "renewal took too long")))
+}
+
+/// Hello, `Welcome` and the `RenewRequest` loop of [`serve_recovery`].
+async fn recovery_exchange(
+    server: &Arc<Server>,
+    conn: &quinn::Connection,
+    identity: &Identity,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let Hello {
+        mut send,
+        mut recv,
+        minor,
+        client,
+        initial: _,
+    } = read_hello(server, conn).await?;
+    let (name, is_admin) = {
+        let store = server.store.lock().await;
+        let user = store
+            .user(identity.user_id)
+            .ok_or_else(|| Error::coded(ec::AUTH_UNKNOWN_CERT, "user vanished"))?;
+        (user.name.clone(), user.is_admin)
+    };
+    let welcome = ControlMsg::Welcome {
+        minor,
+        caps: icu_proto::CAPS,
+        you: UserInfo {
+            user_id: identity.user_id,
+            session: 0,
+            name,
+            flags: icu_proto::UserFlags::NONE,
+        },
+        audio: AudioParams::default(),
+        users: Vec::new(),
+        min_client: server.config.server.min_client.clone(),
+        is_admin,
+        registration: false,
+    };
+    write_msg(&mut send, &welcome).await?;
+    let required = ControlMsg::Error {
+        code: ec::RENEW_REQUIRED,
+        detail: "certificate expired, renew it".into(),
+    };
+    write_msg(&mut send, &required).await?;
+    tracing::info!(
+        user_id = identity.user_id,
+        remote = %conn.remote_address(),
+        client = %client,
+        "renew-only session, certificate expired"
+    );
+
+    let mut pings = TokenBucket::per_second(server.config.limits.control_msgs_per_s);
+    let mut attempts = 0u32;
+    loop {
+        let body = tokio::select! {
+            body = wire::read_frame(&mut recv, MAX_CONTROL_FRAME) => body,
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(Error::coded(ec::TIMEOUT, "renewal took too long"));
+            }
+            _ = server.shutdown_requested() => {
+                return Err(Error::coded(ec::SHUTDOWN, "server is shutting down"));
+            }
+        };
+        let body = match body {
+            Ok(body) => body,
+            Err(e) if e.code() == Some(ec::PROTOCOL_VIOLATION) => return Err(e),
+            Err(_) => return Ok(()),
+        };
+        let msg = ControlMsg::decode(&body)
+            .map_err(|e| Error::coded(ec::PROTOCOL_VIOLATION, e.to_string()))?;
+        match msg {
+            ControlMsg::Ping { nonce } => {
+                if pings.take_one() {
+                    let pong = ControlMsg::Pong {
+                        nonce,
+                        server_time_ms: unix_millis(),
+                    };
+                    write_msg(&mut send, &pong).await?;
+                }
+                continue;
+            }
+            ControlMsg::RenewRequest { csr_der } => match renew_leaf(server, identity, &csr_der)
+                .await
+            {
+                Ok(renewed) => {
+                    let response = ControlMsg::RenewResponse {
+                        leaf_der: renewed.leaf,
+                    };
+                    write_msg(&mut send, &response).await?;
+                    let _ = send.finish();
+                    // The client closes once it has stored the leaf; a close
+                    // from here could overtake the response.
+                    let _ = tokio::time::timeout(REGISTRATION_LINGER, conn.closed()).await;
+                    return Ok(());
+                }
+                Err((code, detail)) => {
+                    write_msg(&mut send, &ControlMsg::Error { code, detail }).await?;
+                }
+            },
+            _ => write_msg(&mut send, &required).await?,
+        }
+        attempts += 1;
+        if attempts >= REGISTRATION_ATTEMPTS {
+            return Err(Error::coded(
+                ec::RATE_LIMITED_FATAL,
+                "too many messages in a renew-only session",
+            ));
+        }
+    }
 }
 
 /// Registration sessions: 5/min per IP, 20/min global (`PROTOCOL.md` §7).
@@ -874,133 +1022,131 @@ fn rate_limited(
     violations.record()
 }
 
-/// A plain renewal is accepted from this many days before the presented
-/// certificate expires (`PROTOCOL.md` §2.2 Nr. 9; the client asks at the
-/// same threshold).
-const RENEW_WINDOW_DAYS: i64 = 30;
+/// A plain renewal is accepted once less than a third of the presented
+/// certificate's lifetime, and at least 30 days, is left (`PROTOCOL.md` §2.2
+/// Nr. 9; the client asks at the same point).
+fn renew_window(issued: &str, expires: &str) -> time::Duration {
+    let third = match (parse_rfc3339(issued), parse_rfc3339(expires)) {
+        (Ok(issued), Ok(expires)) if expires > issued => (expires - issued) / 3,
+        _ => time::Duration::ZERO,
+    };
+    third.max(time::Duration::days(30))
+}
+
+/// A certificate issued by [`renew_leaf`].
+struct Renewed {
+    leaf: Vec<u8>,
+    cn: String,
+    renamed: bool,
+}
 
 /// Certificate renewal, and the only way a name changes (`PROTOCOL.md` §2.2).
 ///
-/// The CSR's subject CN is the name the client asks for. Three cases, told
+/// The CSR's subject CN is the name the client asks for. Four cases, told
 /// apart by exact string comparison against the stored name — case-insensitive
 /// comparison would misfile a pure case change as a plain renewal:
 ///
-/// * CN == stored, presented certificate current: plain renewal, one per day.
+/// * CN == stored, presented certificate current: plain renewal, one per day,
+///   in the last third of its lifetime.
 /// * CN == stored, presented certificate stale: catch-up after a rename on
 ///   another device. Exempt from the daily limit, but bounded per certificate
 ///   so one stale session cannot mint certificates in a loop.
 /// * CN != stored: rename. Costs the daily budget and needs the name to be
 ///   free server-wide.
-async fn handle_renew(
+/// * Presented certificate expired (renew-only session): bounded per
+///   certificate (one an hour), so renewing on one device never locks
+///   another out of recovering; no rename.
+///
+/// `Err` carries the code and detail for `Error`.
+async fn renew_leaf(
     server: &Arc<Server>,
-    session: Session,
     identity: &Identity,
     csr_der: &[u8],
-) {
-    let reject = |code: u32, detail: String| ControlMsg::Error { code, detail };
+) -> std::result::Result<Renewed, (u32, String)> {
     let user_id = identity.user_id;
-
-    let requested = match ca::csr_common_name(csr_der) {
-        Ok(cn) => cn,
-        Err(e) => {
-            server
-                .room
-                .send_to(session, &reject(ec::RENEW_REJECTED, e.to_string()));
-            return;
-        }
-    };
+    let requested =
+        ca::csr_common_name(csr_der).map_err(|e| (ec::RENEW_REJECTED, e.to_string()))?;
 
     let mut store = server.store.lock().await;
     let Some(user) = store.user(user_id) else {
-        server
-            .room
-            .send_to(session, &reject(ec::RENEW_REJECTED, "unknown user".into()));
-        return;
+        return Err((ec::RENEW_REJECTED, "unknown user".into()));
     };
     let stored = user.name.clone();
     let rename = requested != stored;
+    if rename && identity.expired {
+        return Err((
+            ec::RENEW_REJECTED,
+            "an expired certificate renews under the stored name only".into(),
+        ));
+    }
     // A new name meets today's rules; the stored one is carried over as it
     // is, even if it predates them.
     if rename {
-        if let Err(e) = icu_proto::validate_name(&requested) {
-            server.room.send_to(
-                session,
-                &reject(ec::RENEW_REJECTED, format!("bad name: {e}")),
-            );
-            return;
-        }
+        icu_proto::validate_name(&requested)
+            .map_err(|e| (ec::RENEW_REJECTED, format!("bad name: {e}")))?;
     }
 
     // Uniqueness before the rate check, so a taken name reports NAME_TAKEN
     // instead of a confusing rate message.
     if rename && store.name_taken(&requested, Some(user_id)) {
-        server.room.send_to(
-            session,
-            &reject(ec::NAME_TAKEN, format!("name {requested:?} is already taken")),
-        );
-        return;
+        return Err((
+            ec::NAME_TAKEN,
+            format!("name {requested:?} is already taken"),
+        ));
     }
 
     let catch_up = !rename && identity.cert_cn != stored;
-    if catch_up {
+    // Bounded per presented certificate rather than per user.
+    let per_cert = catch_up || identity.expired;
+    if per_cert {
+        // An hour for an expired certificate: a renewal whose answer got lost
+        // must not strand its holder for a day.
+        let (bound, detail) = if identity.expired {
+            (time::Duration::hours(1), "this certificate was renewed within the hour")
+        } else {
+            (time::Duration::days(1), "this certificate already caught up today")
+        };
         if let Some(last) = store.cert_renewed(user_id, &identity.cert_fp) {
-            if now() - last < time::Duration::days(1) {
-                server.room.send_to(
-                    session,
-                    &reject(
-                        ec::RENEW_REJECTED,
-                        "this certificate already caught up today".into(),
-                    ),
-                );
-                return;
+            if now() - last < bound {
+                return Err((ec::RENEW_REJECTED, detail.into()));
             }
         }
     } else if let Some(last) = store.last_renew(user_id) {
         if now() - last < time::Duration::days(1) / pl::RENEW_PER_DAY {
-            server.room.send_to(
-                session,
-                &reject(ec::RENEW_REJECTED, "at most one renewal per day".into()),
-            );
-            return;
+            return Err((ec::RENEW_REJECTED, "at most one renewal per day".into()));
         }
     }
-    // A plain renewal only inside the last 30 days of the presented
-    // certificate (`PROTOCOL.md` §2.2 Nr. 9); otherwise one renewal a day
-    // would pile up a year's worth of live certificates.
-    if !rename && !catch_up {
-        let expires = store
+    // A plain renewal only inside the last third of the presented
+    // certificate's lifetime; otherwise one renewal a day would pile up a
+    // year's worth of live certificates.
+    if !rename && !per_cert {
+        let window = store
             .by_fingerprint(&identity.cert_fp)
-            .and_then(|(_, _, c)| parse_rfc3339(&c.expires).ok());
-        if let Some(expires) = expires {
-            if expires - now() > time::Duration::days(RENEW_WINDOW_DAYS) {
-                server.room.send_to(
-                    session,
-                    &reject(
-                        ec::RENEW_REJECTED,
-                        format!("renewal opens {RENEW_WINDOW_DAYS} days before expiry"),
+            .and_then(|(_, _, c)| {
+                let expires = parse_rfc3339(&c.expires).ok()?;
+                Some((expires, renew_window(&c.issued, &c.expires)))
+            });
+        if let Some((expires, window)) = window {
+            if expires - now() > window {
+                return Err((
+                    ec::RENEW_REJECTED,
+                    format!(
+                        "renewal opens {} days before expiry",
+                        window.whole_days()
                     ),
-                );
-                return;
+                ));
             }
         }
     }
 
-    let signed = {
+    let (leaf, cn) = {
         let ca = server.ca.read().await;
         ca.sign_client_csr(
             csr_der,
             server.config.tls.client_validity_days,
             &server.config.public_host(),
         )
-    };
-    let (leaf, cn) = match signed {
-        Ok(signed) => signed,
-        Err(e) => {
-            server
-                .room
-                .send_to(session, &reject(ec::RENEW_REJECTED, e.to_string()));
-            return;
-        }
+        .map_err(|e| (ec::RENEW_REJECTED, e.to_string()))?
     };
 
     let issued = now();
@@ -1016,32 +1162,58 @@ async fn handle_renew(
         registration: false,
         serial: Some(ca::leaf_serial(&leaf)),
     };
-    // Only a catch-up stamps the presented certificate: the same certificate
-    // may be on a second device (passport) that still has to catch up itself.
-    let supersedes = catch_up.then_some(identity.cert_fp.as_str());
-    let renamed = match store.add_cert(user_id, cert, supersedes, !catch_up) {
-        Ok(renamed) => renamed,
-        Err(e) => {
-            let code = e.code().unwrap_or(ec::RENEW_REJECTED);
-            server.room.send_to(session, &reject(code, e.to_string()));
+    // Only a per-certificate renewal stamps the presented certificate: the
+    // same certificate may be on a second device (passport) that still has
+    // to catch up or recover itself, and the stamp is what bounds it.
+    let supersedes = per_cert.then_some(identity.cert_fp.as_str());
+    let renamed = store
+        .add_cert(user_id, cert, supersedes, !per_cert)
+        .map_err(|e| (e.code().unwrap_or(ec::RENEW_REJECTED), e.to_string()))?;
+    drop(store);
+    tracing::info!(
+        user_id,
+        name = %cn,
+        renamed,
+        catch_up,
+        expired = identity.expired,
+        "certificate renewed"
+    );
+    Ok(Renewed {
+        leaf: leaf.to_vec(),
+        cn,
+        renamed,
+    })
+}
+
+/// `RenewRequest` in the room: [`renew_leaf`], the answer, and a rename
+/// pushed to every session of the user.
+async fn handle_renew(
+    server: &Arc<Server>,
+    session: Session,
+    identity: &Identity,
+    csr_der: &[u8],
+) {
+    let renewed = match renew_leaf(server, identity, csr_der).await {
+        Ok(renewed) => renewed,
+        Err((code, detail)) => {
+            server
+                .room
+                .send_to(session, &ControlMsg::Error { code, detail });
             return;
         }
     };
-    drop(store);
-
-    tracing::info!(session, user_id, name = %cn, renamed, catch_up, "certificate renewed");
     server.room.send_to(
         session,
         &ControlMsg::RenewResponse {
-            leaf_der: leaf.to_vec(),
+            leaf_der: renewed.leaf,
         },
     );
-    if renamed {
-        for s in server.room.sessions_of_user(user_id) {
-            server.room.rename(s, &cn);
+    if renewed.renamed {
+        for s in server.room.sessions_of_user(identity.user_id) {
+            server.room.rename(s, &renewed.cn);
             server.room.broadcast(&ControlMsg::UserRenamed {
                 session: s,
-                name: cn.clone(),
+                name: renewed.cn.clone(),
             });
         }
     }

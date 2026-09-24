@@ -171,29 +171,30 @@ pub fn client_config_with_crl(
     Ok((config, cert_failure))
 }
 
-/// Refuses a client certificate whose `notAfter` lies before `now` (Unix
-/// seconds). A leaf that does not parse is left to the handshake.
+/// Refuses a registration certificate whose `notAfter` lies before `now`
+/// (Unix seconds): an expired invitation is spent. An expired certificate of
+/// our own is let through: the server admits it to a renew-only session
+/// (`PROTOCOL.md` §2.3). A leaf that does not parse is left to the handshake.
 fn check_not_expired(leaf_der: &[u8], now: i64) -> Result<(), NetError> {
-    let Ok((_, cert)) = x509_parser::parse_x509_certificate(leaf_der) else {
+    if !crate::net::register::is_registration(leaf_der) || !leaf_expired(leaf_der, now) {
         return Ok(());
-    };
-    let not_after = cert.validity().not_after.timestamp();
-    if not_after < now {
-        let what = if crate::net::register::is_registration(leaf_der) {
-            "Die Einladung ist abgelaufen — bitte eine neue anfordern"
-        } else {
-            "Das eigene Zertifikat ist abgelaufen — Passport eines anderen Geräts \
-             importieren oder eine neue Einladung anfordern"
-        };
-        return Err(NetError::Expired(format!(
-            "{what} (gültig bis {})",
-            cert.validity().not_after
-        )));
     }
-    Ok(())
+    let until = x509_parser::parse_x509_certificate(leaf_der)
+        .map(|(_, cert)| cert.validity().not_after.to_string())
+        .unwrap_or_default();
+    Err(NetError::Expired(format!(
+        "Die Einladung ist abgelaufen — bitte eine neue anfordern (gültig bis {until})"
+    )))
 }
 
-fn unix_now() -> i64 {
+/// Whether a certificate's `notAfter` lies before `now` (Unix seconds).
+/// `false` when it does not parse.
+pub fn leaf_expired(leaf_der: &[u8], now: i64) -> bool {
+    x509_parser::parse_x509_certificate(leaf_der)
+        .is_ok_and(|(_, cert)| cert.validity().not_after.timestamp() < now)
+}
+
+pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -601,16 +602,29 @@ mod tests {
     }
 
     #[test]
-    fn an_expired_client_certificate_is_refused_locally() {
-        let key = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::default();
-        params.not_after = rcgen::date_time_ymd(2030, 1, 1);
-        let der = params.self_signed(&key).unwrap().der().to_vec();
+    fn only_an_expired_invitation_is_refused_locally() {
+        let leaf = |ou: Option<&str>| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::default();
+            params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+            if let Some(ou) = ou {
+                params
+                    .distinguished_name
+                    .push(rcgen::DnType::OrganizationalUnitName, ou);
+            }
+            params.self_signed(&key).unwrap().der().to_vec()
+        };
         let before = 1_893_456_000 - 86_400; // 2029-12-31
         let after = 1_893_456_000 + 86_400; // 2030-01-02
-        assert!(check_not_expired(&der, before).is_ok());
-        let err = check_not_expired(&der, after).unwrap_err().to_string();
+        let invite = leaf(Some(crate::net::register::REGISTRATION_OU));
+        assert!(check_not_expired(&invite, before).is_ok());
+        let err = check_not_expired(&invite, after).unwrap_err().to_string();
         assert!(err.contains("abgelaufen"), "{err}");
+        // Our own certificate goes to the server, which renews it.
+        let own = leaf(None);
+        assert!(check_not_expired(&own, after).is_ok());
+        assert!(leaf_expired(&own, after));
+        assert!(!leaf_expired(&own, before));
         assert!(check_not_expired(b"junk", after).is_ok());
     }
 }

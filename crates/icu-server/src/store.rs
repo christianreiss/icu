@@ -435,10 +435,8 @@ impl Store {
                     old.renewed = Some(stamp.clone());
                 }
             }
-            // Expired certificates can no longer authenticate (rustls checks
-            // validity first), so their records are dead weight in every
-            // fingerprint lookup. Revoked ones stay: they are what makes a
-            // revoke visible, and what `is_revoked` counts.
+            // Only spent registration certificates are dropped; see
+            // `keep_cert`.
             record.certs.retain(|c| keep_cert(c, now));
             record.certs.push(cert);
             if renewal {
@@ -668,8 +666,8 @@ impl Store {
     }
 
     /// Serials for the CRL: every revoked certificate that has a recorded
-    /// serial and has not expired yet — client leaves, consumed registration
-    /// certificates and replaced server leaves.
+    /// serial — client leaves for good, consumed registration certificates
+    /// and replaced server leaves until they expire.
     pub fn crl_serials(&self) -> Vec<String> {
         let now = now();
         let clients = self
@@ -677,7 +675,10 @@ impl Store {
             .users
             .values()
             .flat_map(|u| &u.certs)
-            .filter(|c| c.revoked && !c.expired(now))
+            // Expired ones too: an expired client certificate still gets
+            // through the handshake for a renewal, so its revocation has to
+            // outlive it. Spent registrations are the exception.
+            .filter(|c| c.revoked && !(c.registration && c.expired(now)))
             .filter_map(|c| c.serial.clone());
         let servers = self
             .users
@@ -743,16 +744,18 @@ impl Store {
     }
 }
 
-/// Whether a certificate record is still worth keeping. Expired certificates
-/// can no longer authenticate (rustls checks validity first), so their records
-/// are dead weight in every fingerprint lookup. Revoked ones stay: they are
-/// what makes a revoke visible, and what `is_revoked` counts — except a
-/// consumed registration certificate, whose revocation only ever meant "used".
+/// Whether a certificate record is still worth keeping. An expired client
+/// certificate still authenticates a renew-only session, so its holder can
+/// renew after missing the window (`PROTOCOL.md` §2.3); the record is what
+/// admits it, with no time limit. Revoked ones stay too: they are what makes a
+/// revoke visible, and what `is_revoked` counts. Only a consumed registration
+/// certificate goes once expired, its revocation only ever meant "used". At
+/// most one record per user and day accrues (renewals are rate-limited).
 fn keep_cert(c: &CertRecord, now: OffsetDateTime) -> bool {
     if c.registration && c.revoked {
         return !c.expired(now);
     }
-    c.revoked || !c.expired(now)
+    true
 }
 
 /// Looks a user up by id for mutation. The `BTreeMap` key is the decimal
