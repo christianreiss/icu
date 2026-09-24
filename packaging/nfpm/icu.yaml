@@ -1,0 +1,42 @@
+# nfpm config for the ICU client. The binary is distro-specific (dynamic
+# pipewire, libstdc++ and system abseil with its distro soname), so
+# packaging/build.sh renders this once per distro (${VERSION}, ${RELEASE},
+# ${CLIENT_BIN}, ${LICENSES_FILE}). nfpm does not derive soname dependencies: build.sh appends
+# a `depends:` list per distro (linked libraries from ldd, plus the libraries
+# winit/wgpu dlopen), and the smoke test checks it in a clean container.
+name: icu
+arch: amd64
+platform: linux
+version: ${VERSION}
+release: ${RELEASE}
+section: sound
+priority: optional
+maintainer: Christian Reiß <email@christian-reiss.de>
+vendor: ICU
+homepage: https://github.com/christianreiss/icu
+license: Apache-2.0
+description: |-
+  ICU voice client.
+  Low-latency Opus voice over QUIC with mutual TLS, push-to-talk and voice
+  activation, optional camera overlay.
+
+contents:
+  - src: ${CLIENT_BIN}
+    dst: /usr/bin/icu
+    file_info: {mode: 0755}
+  - src: packaging/files/icu.desktop
+    dst: /usr/share/applications/icu.desktop
+    file_info: {mode: 0644}
+  - src: packaging/files/icu.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/icu.svg
+    file_info: {mode: 0644}
+  - src: LICENSE
+    dst: /usr/share/licenses/icu/LICENSE
+    file_info: {mode: 0644}
+  - src: ${LICENSES_FILE}
+    dst: /usr/share/licenses/icu/THIRD-PARTY-LICENSES
+    file_info: {mode: 0644}
+
+recommends:
+  - xdg-desktop-portal
+  - xdg-utils

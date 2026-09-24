@@ -7,6 +7,12 @@
 pub fn register() -> Result<std::path::PathBuf, String> {
     use std::io::Write;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // Installed from the rpm/deb: the package ships the handler, and a user
+    // copy under ~/.local would shadow it.
+    let packaged = std::path::Path::new("/usr/share/applications/icu.desktop");
+    if exe == std::path::Path::new("/usr/bin/icu") && packaged.exists() {
+        return Ok(packaged.to_path_buf());
+    }
     let apps = directories::BaseDirs::new()
         .ok_or("no home directory")?
         .data_local_dir()

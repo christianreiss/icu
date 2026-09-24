@@ -1,0 +1,19 @@
+THIRD-PARTY LICENSES
+====================
+
+ICU is licensed under Apache-2.0 (see LICENSE). The binaries in this package
+also contain the following third-party code.
+{{#each overview}}
+- {{{name}}} ({{count}} use{{#if (gt count 1)}}s{{/if}})
+{{/each}}
+{{#each licenses}}
+
+------------------------------------------------------------------------------
+{{{name}}} ({{id}})
+Used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+{{/each}}

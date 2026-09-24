@@ -7,6 +7,31 @@ Der Server ist ein einziges Binary ohne Laufzeitabhängigkeiten: kein libc,
 kein CA-Bundle (er ist seine eigene CA), kein Codec, keine Datenbank außer zwei
 TOML-Dateien.
 
+## 0. Pakete (rpm/deb)
+
+Fertige Pakete liegen unter https://github.com/christianreiss/icu/releases:
+`icu-server` (ein statisches Binary, dasselbe für Fedora und Debian) und der
+Client `icu` je Distro (Fedora 42, Fedora 43, Debian 13).
+
+```bash
+sudo dnf install ./icu-server-<ver>-1.x86_64.rpm        # Fedora
+sudo apt install ./icu-server_<ver>-1_amd64.deb          # Debian
+sudoedit /etc/icu/server.toml                            # server_name, public_host
+sudo systemctl enable --now icu-server
+sudo firewall-cmd --permanent --add-service=icu && sudo firewall-cmd --reload
+```
+
+Das Paket legt die Gruppe `icu` an (`/usr/lib/sysusers.d/icu-server.conf`),
+installiert die Unit nach `/usr/lib/systemd/system/`, eine Beispielkonfiguration
+nach `/etc/icu/server.toml` (bleibt bei Updates erhalten), den firewalld-Dienst
+`icu` und den Checkmk-Check nach `/usr/share/icu-server/checkmk/`. Der Dienst
+wird **nicht** automatisch gestartet, weil `server_name` gesetzt sein muss.
+Deinstallieren lässt den State (`/var/lib/private/icu/`, darin `ca.key`) liegen.
+
+Bauen aller Pakete (nur podman nötig): `packaging/build.sh`, Ergebnis unter
+`dist/<ver>/`; Veröffentlichen: `packaging/release.sh`. Details in den
+Kommentaren der beiden Skripte.
+
 ## 1. Bauen
 
 ### Host-Build (Entwicklung, Tests)
@@ -59,11 +84,11 @@ ldd    target/musl/x86_64-unknown-linux-musl/release/icu-server   # statically l
        target/musl/x86_64-unknown-linux-musl/release/icu-server --version
 ```
 
-## 2. Installieren (systemd)
+## 2. Installieren von Hand (systemd)
 
 ```bash
 sudo install -m0755 target/musl/x86_64-unknown-linux-musl/release/icu-server \
-  /usr/local/bin/icu-server
+  /usr/bin/icu-server
 sudo install -m0644 deploy/icu-server.service /etc/systemd/system/
 sudo groupadd --system icu            # Gruppe für den Admin-Socket
 sudo install -d -m0755 /etc/icu

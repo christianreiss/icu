@@ -4,6 +4,8 @@ description = "ICU voice server — QUIC/mTLS relay, own CA, admin CLI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 default-run = "icu-server"
 
 [lib]

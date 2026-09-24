@@ -243,7 +243,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/icu-server run --config /etc/icu/server.toml
+ExecStart=/usr/bin/icu-server run --config /etc/icu/server.toml
 DynamicUser=yes
 StateDirectory=icu
 RuntimeDirectory=icu
@@ -292,7 +292,7 @@ Kein libopus, kein Codec, keine GUI auf dem Server.
 
 Lizenz-Allowlist: **eine** `deny.toml` im Workspace-Root, gültig für Server und Client — MIT, Apache-2.0, ISC, BSD-2-Clause, BSD-3-Clause, Zlib, Unicode-3.0; `IJG` ausschließlich hinter dem Client-Feature `mjpeg`. Alles andere bricht den Build.
 
-Lizenz von ICU selbst: **TBD** (Empfehlung Apache-2.0, siehe `Research/packaging-licensing.md`). Bis zur Entscheidung trägt der Workspace kein `license`-Feld.
+Lizenz von ICU selbst: **Apache-2.0** (entschieden 2026-09-24 mit der Veröffentlichung auf GitHub, Empfehlung aus `Research/packaging-licensing.md`); `license` steht in `[workspace.package]`, Text in `LICENSE`.
 
 ## 10. Tests
 

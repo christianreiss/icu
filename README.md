@@ -13,6 +13,12 @@ Minimales Voice-System für eine feste Gruppe. Ein Server, ein Raum, keine Chann
 - Eigenes Protokoll
 - Nur die Features, die wirklich gebraucht werden. Die sind dafür perfekt.
 
+## Installation
+
+Pakete für Fedora 42/43 (`.rpm`) und Debian 13 (`.deb`) unter
+https://github.com/christianreiss/icu/releases — `icu` ist der Client,
+`icu-server` der Server (Einrichtung: `deploy/README.md` §0).
+
 ## Nicht-Ziele
 
 - Channels, Rechteverwaltung, Rollen, Server-Browser
@@ -31,6 +37,7 @@ Minimales Voice-System für eine feste Gruppe. Ein Server, ein Raum, keine Chann
 | `PROTOCOL.md` | Normatives Wire-Protokoll v1 |
 | `Server/IMPLEMENTATION.md` | Server-Spezifikation, später Implementierung |
 | `Client/IMPLEMENTATION.md` | Client-Spezifikation, später Implementierung |
+| `packaging/` | rpm/deb-Bau (nfpm, podman) und GitHub-Release |
 
 ## Status
 
@@ -39,3 +46,7 @@ Phase: Implementierung. Research und Spezifikation abgeschlossen (2026-09-20); S
 Stack (belegt in `Research/`, verifiziert in `Research/verification.md`): Rust; QUIC (quinn + rustls/ring) mit Datagrams für Audio; mutual TLS mit server-eigener CA und Invite-Link-Enrollment; Opus 48 kHz mono 20 ms; Server als reiner Relay; Client mit PipeWire (Linux) bzw. WASAPI IAudioClient3 (Windows), RNNoise, adaptivem Jitter-Buffer, egui-UI, Portal/evdev bzw. Raw-Input-Hotkeys, Layer-Shell bzw. Layered-Window-Overlay, H.264 über openh264.
 
 Offen bis zur Implementierung: echte Windows-Hardware (WASAPI, Raw Input, Overlay, SmartScreen), interaktiver Portal-Hotkey-Test auf KDE, Kamera-Bitrate bei 15 fps.
+
+## Lizenz
+
+Apache-2.0, siehe `LICENSE`. Die Pakete enthalten `THIRD-PARTY-LICENSES` für gebündelten Fremdcode. Der Client baut OpenH264 aus dem Quellcode ein; die Patentlizenz, die Cisco für seine eigenen Binaries übernimmt, gilt dafür nicht (`Research/packaging-licensing.md`, H.264-Patentlage).

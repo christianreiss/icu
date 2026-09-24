@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ICU
+Comment=ICU voice client
+Exec=icu %u
+Icon=icu
+Terminal=false
+Categories=Network;Audio;
+MimeType=x-scheme-handler/icu;

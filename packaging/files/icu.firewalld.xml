@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>ICU</short>
+  <description>ICU voice server (QUIC over UDP). Enable with: firewall-cmd --permanent --add-service=icu</description>
+  <port protocol="udp" port="4711"/>
+</service>

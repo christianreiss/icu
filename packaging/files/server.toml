@@ -1,0 +1,17 @@
+# ICU server configuration. Adjust server_name and public_host, then:
+#   sudo systemctl enable --now icu-server
+# Reference: /usr/share/doc/icu-server/README.md
+
+[server]
+listen = ["0.0.0.0:4711", "[::]:4711"]
+# DNS name (or IP) clients connect to; baked into every certificate.
+server_name = "icu.example.org"
+# host:port written into registration bundles.
+public_host = "icu.example.org:4711"
+max_users = 16
+min_client = "0.1.0"
+admin_socket_group = "icu"
+
+[log]
+level = "info"
+format = "text"

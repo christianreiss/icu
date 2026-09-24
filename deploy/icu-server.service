@@ -4,7 +4,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/icu-server run --config /etc/icu/server.toml
+ExecStart=/usr/bin/icu-server run --config /etc/icu/server.toml
 DynamicUser=yes
 # The admin socket is chgrp'ed to `server.admin_socket_group`. Changing only
 # the group of a file one owns needs no capability as long as the process is a

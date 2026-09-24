@@ -1,0 +1,3 @@
+# Group for the ICU admin socket (server.admin_socket_group); the service
+# itself runs as a DynamicUser and is a supplementary member.
+g icu -

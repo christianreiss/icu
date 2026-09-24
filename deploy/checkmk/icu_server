@@ -8,7 +8,7 @@
 # Output format: <status> <item> <metrics> <text>
 # 0 = OK, 1 = WARN, 2 = CRIT, 3 = UNKNOWN.
 
-BIN=${ICU_SERVER_BIN:-/usr/local/bin/icu-server}
+BIN=${ICU_SERVER_BIN:-/usr/bin/icu-server}
 CONFIG=${ICU_SERVER_CONFIG:-/etc/icu/server.toml}
 SOCKET=${ICU_ADMIN_SOCKET:-/run/icu/admin.sock}
 

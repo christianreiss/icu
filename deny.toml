@@ -42,6 +42,12 @@ confidence-threshold = 0.9
 name = "jpeg-encoder"
 allow = ["IJG"]
 
+# target-lexicon ist reine Build-Abhaengigkeit (system-deps -> cfg-expr) und
+# landet nicht im Binary; LLVM-exception erweitert Apache-2.0 nur.
+[[licenses.exceptions]]
+name = "target-lexicon"
+allow = ["Apache-2.0 WITH LLVM-exception"]
+
 # nokhwa (Default-Feature `decoding`) dekodiert MJPEG ueber mozjpeg; IJG ist
 # die libjpeg-Lizenz und gilt nur fuer diese beiden Crates (Client, Feature
 # `camera`).

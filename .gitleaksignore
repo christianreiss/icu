@@ -1,0 +1,6 @@
+# Test fixture token "k3nP8sQ2…" in unit tests of the removed invite-token flow; not a secret.
+9a6d0d445249c599abd7c4d0550c3ffca766b69b:crates/icu-client/src/net/enroll.rs:generic-api-key:475
+9a6d0d445249c599abd7c4d0550c3ffca766b69b:crates/icu-server/src/invite_key.rs:generic-api-key:121
+8cfc33f74ff5d201fbf24882d8ecd77df8a0abb6:crates/icu-proto/src/control.rs:generic-api-key:341
+8cfc33f74ff5d201fbf24882d8ecd77df8a0abb6:crates/icu-proto/src/control.rs:generic-api-key:368
+92da96c80ccd7163faf50e1ace2eb25a69f1bb17:crates/icu-client/src/net/enroll.rs:generic-api-key:334
