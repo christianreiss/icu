@@ -58,9 +58,9 @@ impl Paths {
 #[serde(rename_all = "lowercase")]
 pub enum ModeSetting {
     /// Push-to-talk.
-    #[default]
     Ptt,
     /// Voice activation.
+    #[default]
     Vad,
 }
 
@@ -106,14 +106,14 @@ impl Default for AudioSettings {
         AudioSettings {
             input_device: None,
             output_device: None,
-            mode: ModeSetting::Ptt,
+            mode: ModeSetting::Vad,
             vad_threshold: 0.5,
-            vad_auto: false,
+            vad_auto: true,
             gain_db: 0.0,
             denoise: true,
             aec: true,
             release_ms: 150,
-            hangover_ms: 200,
+            hangover_ms: 1000,
             frame_ms: 20,
             cue_join: true,
             cue_tx: false,
@@ -763,9 +763,10 @@ mod tests {
         assert_eq!(Settings::load(&paths).unwrap(), Settings::default());
 
         let mut s = Settings::default();
-        s.audio.mode = ModeSetting::Vad;
+        s.audio.mode = ModeSetting::Ptt;
         s.audio.vad_threshold = 0.7;
-        s.audio.vad_auto = true;
+        s.audio.vad_auto = false;
+        s.audio.hangover_ms = 1500;
         s.audio.input_device = Some("alsa_input.foo".into());
         s.hotkeys.ptt.key = "BTN_SIDE".into();
         s.overlay.corner = Corner::BottomLeft;
@@ -790,7 +791,7 @@ mod tests {
         assert_eq!(back.overlay.frame_color, [0x10, 0x20, 0x30]);
 
         let text = fs::read_to_string(paths.settings()).unwrap();
-        assert!(text.contains("mode = \"vad\""));
+        assert!(text.contains("mode = \"ptt\""));
         assert!(text.contains("corner = \"bottom-left\""));
         assert!(text.contains("[volumes]"));
     }
@@ -800,6 +801,8 @@ mod tests {
         let s: Settings = toml::from_str("[audio]\nmode = \"vad\"\n[future]\nx = 1\n").unwrap();
         assert_eq!(s.audio.mode, ModeSetting::Vad);
         assert_eq!(s.audio.release_ms, 150);
+        assert_eq!(s.audio.hangover_ms, 1000);
+        assert!(s.audio.vad_auto);
         assert!(s.overlay.dim_non_speaking, "old settings.toml default on");
     }
 

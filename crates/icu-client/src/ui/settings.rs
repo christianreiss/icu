@@ -323,7 +323,7 @@ impl SettingsView {
                 self.draft.audio.release_ms = release as u32;
             }
             let mut hangover = self.draft.audio.hangover_ms as f32;
-            if widgets::slider_row(ui, true, "VAD-Nachlauf", &mut hangover, 0.0..=1000.0, " ms")
+            if widgets::slider_row(ui, true, "VAD-Nachlauf", &mut hangover, 0.0..=3000.0, " ms")
                 .changed()
             {
                 self.draft.audio.hangover_ms = hangover as u32;
