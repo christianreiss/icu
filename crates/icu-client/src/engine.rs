@@ -1214,6 +1214,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
         {
             let mut speakers = shared.speakers.lock().unwrap_or_else(|e| e.into_inner());
             for sp in speakers.values_mut() {
+                let before = sp.jitter.stats();
                 while sp.pending.len() < BLOCK {
                     match sp.jitter.pop(now) {
                         Pop::Packet(p) => {
@@ -1251,6 +1252,9 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                         }
                     }
                 }
+                let after = sp.jitter.stats();
+                DebugStats::add(&stats.jitter_underruns, after.underruns - before.underruns);
+                DebugStats::add(&stats.jitter_skipped, after.skipped - before.skipped);
                 let mut buf = vec![0.0f32; BLOCK];
                 for s in buf.iter_mut() {
                     *s = sp.pending.pop_front().unwrap_or(0.0);
@@ -2441,6 +2445,10 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                     }
                 };
                 sp.last_packet = Some(now);
+                // The TOC byte gives the peer's frame length (no decode).
+                let samples = sp.decoder.nb_samples(payload);
+                sp.jitter.set_frame_samples(samples as u32);
+                let late = sp.jitter.stats().late;
                 sp.jitter.push(
                     Packet {
                         seq: header.seq,
@@ -2450,6 +2458,7 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                     },
                     now,
                 );
+                DebugStats::add(&shared.stats.jitter_late, sp.jitter.stats().late - late);
             }
             Err(_) => DebugStats::inc(&shared.stats.datagrams_bad),
         }

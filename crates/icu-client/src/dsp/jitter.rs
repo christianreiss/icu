@@ -118,9 +118,6 @@ pub struct JitterBuffer {
     last_ts: Option<u32>,
     last_end: bool,
     last_delay: Option<Duration>,
-    /// A `ts` step seen on a gapless pair that differs from the configured
-    /// frame length; adopted once it repeats (the peer picks its frame).
-    frame_candidate: Option<u32>,
     /// Frames inserted by underruns this spurt and not yet shed again.
     grown: u32,
 }
@@ -144,7 +141,6 @@ impl JitterBuffer {
             last_ts: None,
             last_end: false,
             last_delay: None,
-            frame_candidate: None,
             grown: 0,
         }
     }
@@ -161,6 +157,14 @@ impl JitterBuffer {
     /// Frame length in samples this stream is played with.
     pub fn frame_samples(&self) -> u32 {
         self.cfg.frame_samples
+    }
+
+    /// Sets the frame length from a packet's own duration: the peer picks
+    /// it, and pause detection compares `ts` steps against it.
+    pub fn set_frame_samples(&mut self, samples: u32) {
+        if samples > 0 {
+            self.cfg.frame_samples = samples;
+        }
     }
 
     /// Current target delay.
@@ -213,14 +217,8 @@ impl JitterBuffer {
             let gapless = seq_diff(packet.seq, last_seq) == 1;
             let step = ts_diff(packet.ts, last_ts);
             if gapless && step > 0 && step != self.cfg.frame_samples as i32 {
-                if self.learn_frame(step as u32) {
-                    // The peer's frame length differs from ours; not a pause.
-                } else {
-                    // A pause: the spurt ended without us seeing END (or with it).
-                    self.end_spurt();
-                }
-            } else if gapless {
-                self.frame_candidate = None;
+                // A pause: the spurt ended without us seeing END (or with it).
+                self.end_spurt();
             }
         }
         let u = self.unwrap_seq(packet.seq);
@@ -255,23 +253,6 @@ impl JitterBuffer {
         }
         self.last_end = packet.end;
         self.queue.insert(u, (packet, now));
-    }
-
-    /// Adopts `step` as the stream's frame length once two gapless pairs in
-    /// a row show it. Only Opus frame lengths qualify (2.5–120 ms at 48 kHz).
-    fn learn_frame(&mut self, step: u32) -> bool {
-        const OPUS_FRAMES: [u32; 6] = [120, 240, 480, 960, 1920, 2880];
-        if !OPUS_FRAMES.contains(&step) {
-            self.frame_candidate = None;
-            return false;
-        }
-        if self.frame_candidate == Some(step) {
-            self.cfg.frame_samples = step;
-            self.frame_candidate = None;
-            return true;
-        }
-        self.frame_candidate = Some(step);
-        false
     }
 
     fn observe(&mut self, delay: Duration) {
@@ -600,9 +581,9 @@ mod tests {
         let t0 = Instant::now();
         let mut jb = buffer();
         for i in 0..20u64 {
+            jb.set_frame_samples(480);
             jb.push(pkt(i as u16, i as u32 * 480, false), t0 + ms(10 * i));
         }
-        assert_eq!(jb.frame_samples(), 480);
         assert!(jb.stats().spurts <= 1);
         for i in 0..20u64 {
             let _ = jb.pop(t0 + ms(200 + 10 * i));
