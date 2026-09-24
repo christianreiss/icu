@@ -1145,41 +1145,56 @@ fn participant_row(
                             {
                                 *open = if expanded { None } else { Some(p.user_id) };
                             }
+                        } else {
+                            // Own row has no volume handle; keep its column so
+                            // ping and icons line up with every other row.
+                            ui.add_space(28.0);
                         }
                         // Server-measured RTT (`PROTOCOL.md` §2.2 `UserRtt`), not
                         // a client self-report: every viewer sees the same number
                         // for a given peer. Plain text in a fixed box, so a
                         // changing number never shoves the icons around.
-                        if let Some(ms) = p.rtt_ms {
-                            let color = if ms > SLOW_RTT_MS {
-                                tok.connecting
-                            } else {
-                                tok.dim_text
-                            };
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(44.0, 20.0),
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(44.0, 20.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if let Some(ms) = p.rtt_ms {
+                                    let color = if ms > SLOW_RTT_MS {
+                                        tok.connecting
+                                    } else {
+                                        tok.dim_text
+                                    };
                                     ui.label(
                                         RichText::new(format!("{ms} ms"))
                                             .monospace()
                                             .size(11.0)
                                             .color(color),
-                                    )
-                                },
-                            );
-                        }
+                                    );
+                                }
+                            },
+                        );
+                        // One fixed slot per glyph, so glyph widths don't jitter
+                        // the columns between rows.
+                        let slot = |ui: &mut egui::Ui, text: RichText| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(18.0, 20.0),
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| ui.label(text),
+                            )
+                            .inner
+                        };
                         for (on, color, glyph) in [
                             (p.deafened, tok.error, icon::SPEAKER_SLASH),
                             (p.muted, tok.error, icon::MICROPHONE_SLASH),
                             (p.camera, tok.dim_text, icon::VIDEO_CAMERA),
                         ] {
                             if on {
-                                ui.label(RichText::new(glyph).size(15.0).color(color));
+                                slot(ui, RichText::new(glyph).size(15.0).color(color));
                             }
                         }
                         if p.is_admin {
-                            ui.label(
+                            slot(
+                                ui,
                                 RichText::new(icon::SHIELD_STAR)
                                     .size(14.0)
                                     .color(tok.dim_text),
