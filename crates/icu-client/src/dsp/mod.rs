@@ -7,6 +7,7 @@ pub mod jitter;
 pub mod meter;
 pub mod mixer;
 pub mod opus;
+pub mod refalign;
 pub mod testsignal;
 pub mod vad;
 pub mod vad_auto;

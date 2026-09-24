@@ -100,7 +100,7 @@ icu stats: sent=498 recv=500 bad=0 decoded=499 fec=0 plc=0 played=480960 dsp_blo
 | `decoded` / `fec` / `plc` | Frames aus echten Paketen / aus FEC / per PLC | im LAN `fec=plc=0` |
 | `played` | Samples an die Wiedergabe (48 000/s) | wächst um ~96 000 je 2 s |
 | `dsp_blocks` | 10-ms-Blöcke der Capture-Kette | ~200 je 2 s |
-| `ref_underruns` | AEC-Referenz kam nicht rechtzeitig | einzelne beim Start ok, sonst 0 |
+| `ref_underruns` | AEC-Referenz kam 5 ms nach dem Capture-Block noch nicht | 0 (Stream-Wechsel ausgenommen); im Einstellungs-Audio-Tab sollte `Delay` auf Lautsprechern deutlich über 0 ms liegen |
 | `loss_perc` | `PACKET_LOSS_PERC` aus `LossHint` | 0 im LAN |
 | `rtt` | Ping/Pong | < 1 ms Loopback |
 | `dsp block` | Zeit je 10-ms-Block (AEC + RNNoise + Opus) | Debug ≈ 1,2 ms, Release ≈ 0,15 ms |

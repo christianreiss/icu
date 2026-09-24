@@ -14,8 +14,11 @@ pub struct AecStats {
     pub erl_db: Option<f64>,
     /// Echo return loss enhancement in dB.
     pub erle_db: Option<f64>,
-    /// Estimated delay in ms.
+    /// Estimated delay in ms. Near 0 on speakers means the reference
+    /// arrives late (`dsp::refalign`).
     pub delay_ms: Option<u32>,
+    /// Likelihood (0–1) that residual echo is left in the output.
+    pub residual_echo_likelihood: Option<f64>,
 }
 
 #[cfg(feature = "aec")]
@@ -68,7 +71,6 @@ mod real {
             self.apm.reinitialize();
         }
 
-        /// Tells the APM the output is muted (mute/deafen).
         /// Current statistics.
         pub fn stats(&self) -> AecStats {
             let s = self.apm.get_stats();
@@ -76,6 +78,7 @@ mod real {
                 erl_db: s.echo_return_loss,
                 erle_db: s.echo_return_loss_enhancement,
                 delay_ms: s.delay_ms,
+                residual_echo_likelihood: s.residual_echo_likelihood,
             }
         }
     }
@@ -97,7 +100,6 @@ mod real {
         pub fn process(&mut self, _reference: &[f32], _capture: &mut [f32]) {}
         /// No-op.
         pub fn reinitialize(&mut self) {}
-        /// No-op.
         /// Empty.
         pub fn stats(&self) -> AecStats {
             AecStats::default()
@@ -172,6 +174,27 @@ mod tests {
             out[a..a + FRAME].copy_from_slice(&cap);
         }
         out
+    }
+
+    /// Runs the scene with the reference shifted by `shift` samples:
+    /// positive = reference arrives late, negative = early.
+    fn run_shifted(scene: &Scene, shift: i64) -> Vec<f32> {
+        let reference: Vec<f32> = (0..N as i64)
+            .map(|i| {
+                let j = i - shift;
+                if (0..N as i64).contains(&j) {
+                    scene.far[j as usize]
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let shifted = Scene {
+            far: reference,
+            mic: scene.mic.clone(),
+            near: scene.near.clone(),
+        };
+        run(&shifted)
     }
 
     fn win(x: &[f32], from_s: f64, to_s: f64) -> &[f32] {
@@ -274,5 +297,26 @@ mod tests {
         let out = run(&scene);
         let erle = erle_db(win(&scene.mic, 8.0, 10.0), win(&out, 8.0, 10.0));
         assert!(erle < 20.0, "ERLE with missing game audio = {erle:.1} dB");
+    }
+
+    /// (f) A reference that arrives later than its echo cannot be
+    /// cancelled; one that arrives early can. This is why `dsp::refalign`
+    /// never lets the reference lag the capture.
+    #[test]
+    fn late_reference_breaks_cancellation_early_does_not() {
+        // Short acoustic path, as on a laptop: 5 ms.
+        let scene = build_scene(5.0, false);
+        let erle = |out: &[f32]| erle_db(win(&scene.mic, 8.0, 10.0), win(out, 8.0, 10.0));
+        let aligned = erle(&run_shifted(&scene, 0));
+        let early = erle(&run_shifted(&scene, -(SR as i64) / 50));
+        let late10 = erle(&run_shifted(&scene, (SR as i64) / 100));
+        let late20 = erle(&run_shifted(&scene, (SR as i64) / 50));
+        eprintln!(
+            "ERLE aligned {aligned:.1} early {early:.1} late10 {late10:.1} late20 {late20:.1}"
+        );
+        assert!(aligned >= 30.0, "aligned {aligned:.1} dB");
+        assert!(early >= 30.0, "20 ms early {early:.1} dB");
+        assert!(late10 < aligned - 10.0, "10 ms late {late10:.1} dB");
+        assert!(late20 < aligned - 15.0, "20 ms late {late20:.1} dB");
     }
 }

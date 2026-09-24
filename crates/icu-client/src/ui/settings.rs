@@ -363,14 +363,34 @@ impl SettingsView {
                             .small()
                             .color(tok.dim_text),
                     );
+                } else if self.draft.audio.aec && !state.aec_reference {
+                    ui.label(
+                        RichText::new(
+                            "Keine Referenz vom Audio-Backend — Echo-Unterdrückung inaktiv",
+                        )
+                        .small()
+                        .color(tok.dim_text),
+                    );
                 } else if let (Some(erl), Some(erle)) =
                     (state.aec_stats.erl_db, state.aec_stats.erle_db)
                 {
+                    let delay = state
+                        .aec_stats
+                        .delay_ms
+                        .map_or(String::new(), |d| format!(" · Delay {d} ms"));
                     ui.label(
-                        RichText::new(format!("ERL {erl:.0} dB · ERLE {erle:.0} dB"))
+                        RichText::new(format!("ERL {erl:.0} dB · ERLE {erle:.0} dB{delay}"))
                             .monospace()
                             .small(),
                     );
+                    if state.aec_suspect {
+                        ui.label(
+                            RichText::new(
+                                "Echo erkannt, wird aber nicht entfernt — Referenzgerät prüfen",
+                            )
+                            .small(),
+                        );
+                    }
                 }
             });
         });

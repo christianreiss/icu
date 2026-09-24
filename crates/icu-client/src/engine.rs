@@ -38,7 +38,9 @@ use crate::{
         gate::{Decision, Gate, Mode},
         jitter::{JitterBuffer, JitterConfig, Packet, Pop},
         meter::{self, Level},
-        mixer, opus, vad, vad_auto,
+        mixer, opus,
+        refalign::{self, CycleClock},
+        vad, vad_auto,
     },
     net::{
         conn::{self, ConnectError},
@@ -195,6 +197,11 @@ pub struct AppState {
     pub aec_available: bool,
     /// AEC statistics.
     pub aec_stats: AecStats,
+    /// The AEC reference stream is open (false on backends without one).
+    pub aec_reference: bool,
+    /// Echo is audible in the far-end signal but the AEC removes almost
+    /// none of it for 10 s: the reference is probably the wrong device.
+    pub aec_suspect: bool,
     /// Camera state.
     pub camera_on: bool,
     /// Overlay state.
@@ -415,6 +422,11 @@ struct Shared {
     cues: Mutex<VecDeque<f32>>,
     cue_settings: Mutex<(bool, bool, bool)>,
     playback_open: Arc<AtomicBool>,
+    /// The AEC reference stream is open.
+    reference_open: AtomicBool,
+    /// Push times of the capture and reference callbacks, so the DSP thread
+    /// pairs blocks from the same graph cycle (`dsp::refalign`).
+    cycle: Arc<CycleClock>,
     /// Requests an IDR from the camera thread.
     keyframe_request: AtomicBool,
     /// Video frames received, keyed by session (M4).
@@ -516,6 +528,8 @@ impl Engine {
             backend: backend_name,
             aec_available: false,
             aec_stats: AecStats::default(),
+            aec_reference: false,
+            aec_suspect: false,
             camera_on: false,
             overlay_on: settings.overlay.enabled,
             hotkey_backend: String::new(),
@@ -551,6 +565,8 @@ impl Engine {
                 settings.audio.cue_mute,
             )),
             playback_open: Arc::new(AtomicBool::new(false)),
+            reference_open: AtomicBool::new(false),
+            cycle: Arc::new(CycleClock::default()),
             keyframe_request: AtomicBool::new(false),
             video: Mutex::new(crate::video::Receivers::default()),
             video_tx: Mutex::new(None),
@@ -722,6 +738,7 @@ impl Drop for Engine {
 fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Arc<Shared>) {
     let stats = shared.stats.clone();
     let cap_prod = shared.cap_prod.clone();
+    let cycle = shared.cycle.clone();
     if let Err(e) = backend.open_capture(
         settings.audio.input_device.as_deref(),
         Box::new(move |block| {
@@ -731,6 +748,7 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
                     DebugStats::inc(&stats.capture_overruns);
                 }
             }
+            cycle.capture_pushed(block.len());
         }),
     ) {
         tracing::warn!(error = %e, "cannot open capture");
@@ -738,19 +756,29 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
             .state
             .send_modify(|s| s.banner = Some(format!("Mikrofon: {e}")));
     }
+    let mut reference_open = false;
     if settings.audio.aec {
         let ref_prod = shared.ref_prod.clone();
-        if let Err(e) = backend.open_reference(
+        let cycle = shared.cycle.clone();
+        match backend.open_reference(
             settings.audio.output_device.as_deref(),
             Box::new(move |block| {
                 if let Ok(mut p) = ref_prod.try_lock() {
                     let _ = p.push_slice(block);
                 }
+                cycle.reference_pushed();
             }),
         ) {
-            tracing::warn!(error = %e, "cannot open AEC reference");
+            Ok(()) => reference_open = true,
+            Err(e) => tracing::warn!(error = %e, "cannot open AEC reference"),
         }
     }
+    shared
+        .reference_open
+        .store(reference_open, Ordering::Relaxed);
+    shared
+        .state
+        .send_modify(|s| s.aec_reference = reference_open);
     let play_cons = shared.play_cons.clone();
     match backend.open_playback(
         settings.audio.output_device.as_deref(),
@@ -830,6 +858,11 @@ fn dsp_thread(
     let mut window_start = Instant::now();
     let mut last_state_push = Instant::now();
     let mut last_aec_stats = Instant::now();
+    // Reference energy since the last stats push, and how many pushes in a
+    // row looked like "echo present, not removed".
+    let mut ref_energy = 0.0f64;
+    let mut ref_samples = 0usize;
+    let mut suspect_streak = 0u32;
     let mut loss_applied = 0u32;
     let start = Instant::now();
     let mut tone_ticks: u64 = 0;
@@ -855,64 +888,111 @@ fn dsp_thread(
             while cap.occupied_len() >= BLOCK {
                 cap.pop_slice(&mut sink);
             }
+            reference.clear();
+            ref_block.fill(0.0);
         } else {
+            // Pair the capture block with the reference block of the same
+            // graph cycle (`dsp::refalign`).
+            if ctl.reinit_aec.swap(false, Ordering::Relaxed) {
+                // Streams were reopened: restart both rings together so
+                // their occupancy difference is the reference lag again.
+                cap.clear();
+                reference.clear();
+                if let Some(a) = aec.as_mut() {
+                    a.reinitialize();
+                }
+            }
             let mut waited = 0u32;
-            while cap.occupied_len() < BLOCK {
+            let mut ready_since: Option<Instant> = None;
+            loop {
                 if ctl.stop.load(Ordering::Relaxed) {
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(1));
-                waited += 1;
-                if waited > 2000 {
-                    // No capture for 2 s: keep the pipeline alive with silence
-                    // so the AEC reference timeline does not stall.
-                    break;
+                let ref_open = shared.reference_open.load(Ordering::Relaxed);
+                let step = refalign::step(
+                    cap.occupied_len(),
+                    reference.occupied_len(),
+                    BLOCK,
+                    ref_open,
+                    shared.cycle.cycle_complete(),
+                    ready_since.map_or(Duration::ZERO, |t| t.elapsed()),
+                );
+                match step {
+                    refalign::Step::Wait => {
+                        if cap.occupied_len() >= BLOCK {
+                            ready_since.get_or_insert_with(Instant::now);
+                            std::thread::sleep(Duration::from_micros(200));
+                            continue;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        waited += 1;
+                        if waited > 2000 {
+                            // No capture for 2 s: keep the pipeline alive
+                            // with silence.
+                            block.fill(0.0);
+                            ref_block.fill(0.0);
+                            break;
+                        }
+                    }
+                    refalign::Step::Pair { drop_ref } => {
+                        reference.skip(drop_ref);
+                        cap.pop_slice(&mut block);
+                        reference.pop_slice(&mut ref_block);
+                        break;
+                    }
+                    refalign::Step::Silent { underrun } => {
+                        cap.pop_slice(&mut block);
+                        ref_block.fill(0.0);
+                        if underrun {
+                            DebugStats::inc(&stats.reference_underruns);
+                            ref_underruns_window += 1;
+                        }
+                        break;
+                    }
                 }
-            }
-            if cap.occupied_len() >= BLOCK {
-                cap.pop_slice(&mut block);
-            } else {
-                block.fill(0.0);
             }
         }
         let t_block = Instant::now();
         DebugStats::inc(&stats.dsp_blocks);
 
-        // 2. Reference block for the AEC (zeros on underrun).
-        let have_ref = reference.occupied_len() >= BLOCK;
-        if have_ref {
-            reference.pop_slice(&mut ref_block);
-            // Bound the backlog: the reference must not run ahead of the mic.
-            let mut sink = [0.0f32; BLOCK];
-            while reference.occupied_len() > 4 * BLOCK {
-                reference.pop_slice(&mut sink);
-            }
-        } else {
-            ref_block.fill(0.0);
-        }
-        let aec_on = ctl.aec.load(Ordering::Relaxed);
+        // 2. AEC: reference first, then capture.
+        let aec_on =
+            ctl.aec.load(Ordering::Relaxed) && shared.reference_open.load(Ordering::Relaxed);
         if let Some(a) = aec.as_mut() {
             if aec_on {
-                if !have_ref && shared.playback_open.load(Ordering::Relaxed) {
-                    DebugStats::inc(&stats.reference_underruns);
-                    ref_underruns_window += 1;
-                }
                 if window_start.elapsed() > Duration::from_secs(10) {
                     if ref_underruns_window > 5 {
                         tracing::info!("AEC reference dropped out, reinitializing");
+                        cap.clear();
+                        reference.clear();
                         a.reinitialize();
                     }
                     ref_underruns_window = 0;
                     window_start = Instant::now();
                 }
-                if ctl.reinit_aec.swap(false, Ordering::Relaxed) {
-                    a.reinitialize();
-                }
+                ref_energy += ref_block
+                    .iter()
+                    .map(|&x| (x as f64) * (x as f64))
+                    .sum::<f64>();
+                ref_samples += BLOCK;
                 a.process(&ref_block, &mut block);
                 if last_aec_stats.elapsed() > Duration::from_secs(2) {
                     last_aec_stats = Instant::now();
                     let st = a.stats();
-                    shared.state.send_modify(|s| s.aec_stats = st);
+                    let ref_db = 10.0 * (ref_energy / ref_samples.max(1) as f64 + 1e-12).log10();
+                    ref_energy = 0.0;
+                    ref_samples = 0;
+                    // Self-diagnosis (`Research/aec.md`): the far end plays,
+                    // the mic hears it loudly (low ERL), yet ERLE stays
+                    // below 6 dB for 10 s.
+                    let suspect = ref_db > -50.0
+                        && matches!((st.erl_db, st.erle_db), (Some(erl), Some(erle)) if erl < 15.0 && erle < 6.0);
+                    suspect_streak = if suspect { suspect_streak + 1 } else { 0 };
+                    let flag = suspect_streak >= 5;
+                    shared.state.send_modify(|s| {
+                        s.aec_stats = st;
+                        s.aec_suspect = flag;
+                    });
                 }
             }
         }
@@ -1736,6 +1816,7 @@ impl LocalState {
 
     fn reopen_streams(&mut self, shared: &Arc<Shared>) {
         let mut backend = self.backend.lock().unwrap_or_else(|e| e.into_inner());
+        shared.reference_open.store(false, Ordering::Relaxed);
         backend.close(StreamKind::Capture);
         backend.close(StreamKind::Reference);
         backend.close(StreamKind::Playback);

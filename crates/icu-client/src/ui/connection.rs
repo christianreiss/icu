@@ -1148,10 +1148,20 @@ fn aec_text(state: &AppState) -> String {
     if !state.aec_available {
         return "eingeschaltet, aber nicht verfügbar".to_string();
     }
-    match state.aec_stats.erle_db {
-        Some(erle) => format!("AEC3, an · ERLE {erle:.1} dB"),
-        None => "AEC3, an".to_string(),
+    if !state.aec_reference {
+        return "eingeschaltet, aber keine Referenz (Backend)".to_string();
     }
+    let mut text = "AEC3, an".to_string();
+    if let Some(erle) = state.aec_stats.erle_db {
+        text += &format!(" · ERLE {erle:.1} dB");
+    }
+    if let Some(delay) = state.aec_stats.delay_ms {
+        text += &format!(" · Delay {delay} ms");
+    }
+    if state.aec_suspect {
+        text += " · Echo wird nicht entfernt, Referenzgerät prüfen";
+    }
+    text
 }
 
 /// The human-readable name of the selected device, or „Standard“.
