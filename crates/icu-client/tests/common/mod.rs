@@ -4,7 +4,12 @@
 
 #![allow(dead_code)]
 
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use icu_client::{
     audio::AudioBackend,
@@ -122,6 +127,26 @@ impl TestServer {
         self.engine_from(identity, paths.clone(), backend, test_tone)
             .map(|engine| (engine, paths, dir))
             .expect("engine starts")
+    }
+
+    /// Like [`TestServer::engine`], but connecting through `via` (a
+    /// [`JitterProxy`] in front of this server).
+    pub async fn engine_via(
+        &self,
+        name: &str,
+        backend: Box<dyn AudioBackend>,
+        test_tone: bool,
+        via: SocketAddr,
+    ) -> (Engine, tempfile::TempDir) {
+        let (identity, paths, dir) = self.enroll(name).await;
+        let mut settings = Settings::default();
+        settings.audio.aec = false;
+        settings.audio.denoise = false;
+        settings.ui.register_uri_handler = false;
+        let mut cfg = EngineConfig::new(identity, settings, paths);
+        cfg.server_addr = Some(via);
+        cfg.test_tone = test_tone;
+        (Engine::start(cfg, backend).expect("engine starts"), dir)
     }
 
     /// An engine on an identity the caller already has (passport import, a
@@ -268,4 +293,103 @@ pub async fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bo
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     pred()
+}
+
+/// A UDP relay that delays packets like a busy Wi-Fi link: a few ms of
+/// jitter on every packet, and now and then a stall that holds everything
+/// back and then releases it in one burst. Seeded, so runs compare.
+pub struct JitterProxy {
+    pub addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Delay model of a [`JitterProxy`].
+#[derive(Debug, Clone, Copy)]
+pub struct Jitter {
+    /// Uniform per-packet delay, 0..=`spread`.
+    pub spread: Duration,
+    /// Chance per packet that a stall starts.
+    pub stall_chance: f32,
+    /// Stall length range.
+    pub stall: (Duration, Duration),
+}
+
+struct Delay {
+    rng: icu_client::dsp::testsignal::Rng,
+    hold_until: tokio::time::Instant,
+    model: Jitter,
+}
+
+impl Delay {
+    fn deliver_at(&mut self) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        let u = |r: &mut icu_client::dsp::testsignal::Rng| (r.uniform() + 1.0) / 2.0;
+        if u(&mut self.rng) < self.model.stall_chance && self.hold_until <= now {
+            let (lo, hi) = self.model.stall;
+            self.hold_until = now + lo + (hi - lo).mul_f32(u(&mut self.rng));
+        }
+        let own = now + self.model.spread.mul_f32(u(&mut self.rng));
+        own.max(self.hold_until)
+    }
+}
+
+impl JitterProxy {
+    /// Relays to `upstream`, delaying the downstream direction (server →
+    /// client) by `model`; upstream packets pass straight through.
+    pub async fn start(upstream: SocketAddr, model: Jitter, seed: u64) -> JitterProxy {
+        let front = Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("proxy bind"),
+        );
+        let addr = front.local_addr().unwrap();
+        let delay = Arc::new(Mutex::new(Delay {
+            rng: icu_client::dsp::testsignal::Rng::new(seed),
+            hold_until: tokio::time::Instant::now(),
+            model,
+        }));
+        let task = tokio::spawn(async move {
+            let mut clients: HashMap<SocketAddr, Arc<tokio::net::UdpSocket>> = HashMap::new();
+            let mut buf = vec![0u8; 65_536];
+            loop {
+                let Ok((n, from)) = front.recv_from(&mut buf).await else {
+                    return;
+                };
+                let up = match clients.get(&from) {
+                    Some(up) => up.clone(),
+                    None => {
+                        let bind = if upstream.is_ipv4() {
+                            "127.0.0.1:0"
+                        } else {
+                            "[::1]:0"
+                        };
+                        let up = Arc::new(tokio::net::UdpSocket::bind(bind).await.unwrap());
+                        up.connect(upstream).await.unwrap();
+                        clients.insert(from, up.clone());
+                        let (up2, front2, delay) = (up.clone(), front.clone(), delay.clone());
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65_536];
+                            while let Ok(n) = up2.recv(&mut buf).await {
+                                let at = delay.lock().unwrap().deliver_at();
+                                let (front, pkt) = (front2.clone(), buf[..n].to_vec());
+                                tokio::spawn(async move {
+                                    tokio::time::sleep_until(at).await;
+                                    let _ = front.send_to(&pkt, from).await;
+                                });
+                            }
+                        });
+                        up
+                    }
+                };
+                let _ = up.send(&buf[..n]).await;
+            }
+        });
+        JitterProxy { addr, task }
+    }
+}
+
+impl Drop for JitterProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
