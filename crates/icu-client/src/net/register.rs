@@ -47,7 +47,7 @@ pub async fn register(
     paths: &Paths,
 ) -> Result<Identity, NetError> {
     let name = &icu_proto::normalize_name(name);
-    icu_proto::validate_name(name).map_err(|e| NetError::BadLink(e.to_string()))?;
+    icu_proto::validate_name(name).map_err(NetError::Name)?;
     let (config, cert_failure) = conn::client_config(bundle)?;
     let addr = match addr_override {
         Some(a) => a,
@@ -68,9 +68,12 @@ pub async fn register(
     .map_err(|e| match e.code() {
         Some(code) => NetError::Rejected {
             code,
-            detail: e.to_string(),
+            detail: match &e {
+                conn::ConnectError::Closed { reason, .. } => reason.clone(),
+                other => other.to_string(),
+            },
         },
-        None => NetError::Connect(e.to_string()),
+        None => NetError::Handshake(e),
     })?;
     let conn::Session {
         conn: connection,
@@ -83,9 +86,10 @@ pub async fn register(
             .await
             .and_then(|identity| {
                 identity.save(paths).map_err(|e| {
-                    NetError::Other(format!(
-                        "Speichern fehlgeschlagen: {e} — die Einladung bleibt gültig, bitte erneut versuchen"
-                    ))
+                    let mut p = crate::problem::storage("Die Anmeldung", &e);
+                    p.text
+                        .push_str(" Die Einladung bleibt gültig – bitte erneut versuchen.");
+                    NetError::User(p)
                 })?;
                 Ok(identity)
             })
@@ -129,14 +133,21 @@ pub async fn complete(
                 let key_der = key.serialize_der();
                 let cn = crate::conninfo::CertInfo::from_der(&leaf_der).subject;
                 if cn != name {
-                    return Err(NetError::Other(format!(
-                        "Server hat ein Zertifikat für {cn:?} ausgestellt, erwartet war {name:?}"
+                    return Err(NetError::User(crate::problem::Problem::new(
+                        "Der Server hat die Anmeldung falsch beantwortet. Bitte noch einmal \
+                         versuchen.",
+                        format!(
+                            "Server hat ein Zertifikat für {cn:?} ausgestellt, erwartet war \
+                             {name:?}"
+                        ),
                     )));
                 }
                 if !crate::conninfo::leaf_matches_key(&leaf_der, &key_der) {
-                    return Err(NetError::Other(
-                        "Neues Zertifikat passt nicht zum eigenen Schlüssel".into(),
-                    ));
+                    return Err(NetError::User(crate::problem::Problem::new(
+                        "Der Server hat die Anmeldung falsch beantwortet. Bitte noch einmal \
+                         versuchen.",
+                        "Neues Zertifikat passt nicht zum eigenen Schlüssel",
+                    )));
                 }
                 let server =
                     ServerInfo::from_certs(&leaf_der, &bundle.ca_der).unwrap_or_else(|| {

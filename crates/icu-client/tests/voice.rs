@@ -115,7 +115,13 @@ async fn reconnect_after_server_restart() {
     })
     .await;
     if let ConnStatus::Disconnected { reason, .. } = &disconnected.conn {
-        assert!(reason.contains("SHUTDOWN"), "reason {reason}");
+        let technical = reason.technical.as_deref().unwrap_or_default();
+        assert!(technical.contains("SHUTDOWN"), "technical {technical}");
+        assert!(
+            reason.text.contains("neu gestartet"),
+            "text {}",
+            reason.text
+        );
     }
     let again = wait_for(&engine, Duration::from_secs(20), |s| {
         s.conn == ConnStatus::Connected

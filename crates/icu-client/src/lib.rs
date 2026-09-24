@@ -15,6 +15,7 @@ pub mod net;
 pub mod netcond;
 #[cfg(feature = "overlay")]
 pub mod overlay;
+pub mod problem;
 pub mod quality;
 pub mod stats;
 #[cfg(feature = "tray")]

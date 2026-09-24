@@ -297,7 +297,7 @@ async fn a_failed_save_does_not_burn_the_bundle() {
     let err = register(&bundle, "dora", client, Some(server.addr()), &broken_paths)
         .await
         .expect_err("saving must fail");
-    assert!(err.to_string().contains("Speichern"), "{err}");
+    assert!(err.problem().text.contains("gespeichert"), "{err}");
 
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::new(Some(dir.path().to_path_buf()));

@@ -434,12 +434,43 @@ impl eframe::App for App {
                         None::<fn()>,
                     );
                 }
+                // Non-techies do not hover: a connection that will not come
+                // back on its own says why right here, not only in the
+                // pill's tooltip.
+                match &state.conn {
+                    ConnStatus::Fatal(problem) => widgets::banner(
+                        ui,
+                        widgets::BannerKind::Error,
+                        "Keine Verbindung",
+                        &problem.text,
+                        None::<fn()>,
+                    ),
+                    ConnStatus::Disconnected { reason, attempt } if *attempt >= 2 => {
+                        widgets::banner(
+                            ui,
+                            widgets::BannerKind::Warning,
+                            "Verbindung unterbrochen",
+                            &reason.text,
+                            None::<fn()>,
+                        )
+                    }
+                    _ => {}
+                }
+                if let Some(notice) = &state.notice {
+                    widgets::banner(
+                        ui,
+                        widgets::BannerKind::Warning,
+                        "Bitte warten",
+                        notice,
+                        None::<fn()>,
+                    );
+                }
                 if let Some(banner) = &state.banner {
                     widgets::banner(
                         ui,
                         widgets::BannerKind::Error,
                         "Fehler",
-                        banner,
+                        &banner.text,
                         Some(|| send(Command::DismissBanner)),
                     );
                 }
@@ -798,9 +829,9 @@ fn conn_status(state: &AppState, tok: &theme::Tokens) -> (Color32, String, Strin
         ConnStatus::Disconnected { reason, attempt } => (
             tok.connecting,
             "getrennt".to_string(),
-            format!("{reason} — Versuch {attempt}"),
+            format!("{} (Versuch {attempt})", reason.text),
         ),
-        ConnStatus::Fatal(reason) => (tok.error, "Fehler".to_string(), reason.clone()),
+        ConnStatus::Fatal(reason) => (tok.error, "Fehler".to_string(), reason.text.clone()),
     }
 }
 
@@ -1324,7 +1355,10 @@ impl EnrollApp {
             let rt = tokio::runtime::Runtime::new().expect("runtime");
             let r = rt
                 .block_on(register(&identity, &name, &client, addr, &paths))
-                .map_err(|e| e.to_string());
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "registration failed");
+                    e.problem().text
+                });
             *slot.lock().unwrap() = Some(r);
         });
     }
@@ -1350,9 +1384,9 @@ impl eframe::App for EnrollApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     Err(e) => {
-                        self.status = Some(EnrollStatus::Failed(format!(
-                            "Speichern fehlgeschlagen: {e}"
-                        )))
+                        self.status = Some(EnrollStatus::Failed(
+                            crate::problem::storage("Die Anmeldung", &e).text,
+                        ))
                     }
                 },
                 Err(e) => self.status = Some(EnrollStatus::Failed(e)),
