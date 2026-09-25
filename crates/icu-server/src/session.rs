@@ -213,8 +213,24 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
             tracing::warn!(user_id, error = %e, "cannot consume the registration");
             false
         });
+    // Likewise for a renewal: the first login with the new certificate
+    // proves it was stored, and everything it replaced is revoked
+    // (`PROTOCOL.md` §2.2 Nr. 10). Not on a renew-only session, which proves
+    // nothing about a successor. A failed write is retried on the next login.
+    let retired = if registration || expired {
+        Vec::new()
+    } else {
+        store.retire_predecessors(user_id, &fp).unwrap_or_else(|e| {
+            tracing::warn!(user_id, error = %e, "cannot revoke the replaced certificates");
+            Vec::new()
+        })
+    };
     drop(store);
-    if consumed {
+    if !retired.is_empty() {
+        tracing::info!(user_id, count = retired.len(), "replaced certificates revoked");
+        close_retired(server, &retired);
+    }
+    if consumed || !retired.is_empty() {
         crate::endpoint::reload_tls_logged(server).await;
     }
     Ok(Identity {
@@ -226,6 +242,21 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
         expired,
         cert_validity: info.validity,
     })
+}
+
+/// Closes live connections still running on certificates that were just
+/// revoked by their successor's login — a second device holding a copy, or
+/// a connection this client already left.
+fn close_retired(server: &Arc<Server>, fingerprints: &[String]) {
+    let live: Vec<quinn::Connection> = {
+        let live = lock(&server.live_certs);
+        fingerprints.iter().filter_map(|fp| live.get(fp).cloned()).collect()
+    };
+    for conn in live {
+        if !server.room.close_connection(conn.stable_id(), ec::AUTH_REVOKED) {
+            wire::close(&conn, ec::AUTH_REVOKED);
+        }
+    }
 }
 
 /// The store's admission of a presented certificate: known, not revoked, its
