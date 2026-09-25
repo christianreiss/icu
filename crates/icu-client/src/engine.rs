@@ -481,8 +481,9 @@ struct Shared {
     keyframe_request: AtomicBool,
     /// Video frames received, keyed by session (M4).
     video: Mutex<crate::video::Receivers>,
-    /// Video sender (M4).
-    video_tx: Mutex<Option<crate::video::Sender>>,
+    /// Video sender (M4). Taken out of the lock for each frame, so the
+    /// camera thread never holds it across a send.
+    video_tx: Mutex<Option<Arc<crate::video::Sender>>>,
     /// Ring buffer ends the backend callbacks write/read. Behind a mutex so
     /// streams can be reopened with a fresh closure; the callbacks only
     /// `try_lock`, which is uncontended in practice.
@@ -2342,7 +2343,7 @@ async fn run_session(
         connection.clone(),
         shared.clone(),
     ));
-    *shared.video_tx.lock().unwrap() = Some(crate::video::Sender::new(connection.clone()));
+    *lock(&shared.video_tx) = Some(Arc::new(crate::video::Sender::new(connection.clone())));
 
     // Flags may have changed while the handshake was in flight (a command
     // handled during `connect`); the server only knows `Hello.initial`.
@@ -2637,7 +2638,13 @@ impl crate::video::VideoSink for Arc<Shared> {
             &self.stats.video_bytes_received,
             (icu_proto::header::VIDEO_HEADER_LEN + frame.data.len()) as u64,
         );
-        self.video.lock().unwrap().push(session, frame);
+        // The decode runs between the two locks: the windows take this one
+        // on every repaint, and an H.264 decode is milliseconds.
+        let Some(mut decoder) = lock(&self.video).accept(session, &frame) else {
+            return;
+        };
+        let picture = crate::video::decode(&mut decoder, &frame.data);
+        lock(&self.video).finish(session, decoder, picture);
     }
 
     fn overflow(&self) {
@@ -3110,8 +3117,7 @@ impl CameraLink {
     /// Sends one encoded frame on the live connection; `Err` when not
     /// connected or when flow control dropped it.
     pub fn send_frame(&self, keyframe: bool, ts: u32, data: &[u8]) -> Result<(), String> {
-        let mut guard = lock(&self.shared.video_tx);
-        let Some(sender) = guard.as_mut() else {
+        let Some(sender) = lock(&self.shared.video_tx).clone() else {
             return Err("not connected".into());
         };
         let r = self.runtime.block_on(sender.send(keyframe, ts, data));

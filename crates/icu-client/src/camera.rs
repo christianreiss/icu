@@ -52,15 +52,16 @@ pub struct RgbFrame {
 /// same bytes again.
 #[derive(Default)]
 pub struct PreviewSlot {
-    /// The picture itself, `None` until the camera delivers one.
-    pub frame: Mutex<Option<RgbFrame>>,
+    /// The picture itself, `None` until the camera delivers one. Shared
+    /// with the encoder's copy: publishing it costs no copy.
+    pub frame: Mutex<Option<Arc<RgbFrame>>>,
     /// Incremented once per captured picture.
     pub seq: AtomicU64,
 }
 
 impl PreviewSlot {
     /// Publishes a picture to whoever is watching.
-    pub fn put(&self, frame: RgbFrame) {
+    pub fn put(&self, frame: Arc<RgbFrame>) {
         *self.frame.lock().unwrap() = Some(frame);
         self.seq.fetch_add(1, Ordering::Release);
     }
@@ -214,16 +215,21 @@ pub fn run_sender(
     stop: Arc<AtomicBool>,
     preview: Arc<PreviewSlot>,
 ) {
+    // No encoder while paused: `run_sender` stops encoding rather than
+    // building one with a zero bitrate.
+    let build = |tier: VideoTier| -> Result<Option<Encoder>, String> {
+        if tier.paused() {
+            Ok(None)
+        } else {
+            encoder(tier).map(Some)
+        }
+    };
     let mut tier = link.send_tier();
-    let mut enc = if tier.paused() {
-        None
-    } else {
-        match encoder(tier) {
-            Ok(e) => Some(e),
-            Err(e) => {
-                tracing::error!(%e, "openh264 encoder");
-                return;
-            }
+    let mut enc = match build(tier) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!(%e, "openh264 encoder");
+            return;
         }
     };
     let start = Instant::now();
@@ -232,7 +238,7 @@ pub fn run_sender(
     let mut frame_index: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         let frame = match source.next_frame() {
-            Ok(f) => f,
+            Ok(f) => Arc::new(f),
             Err(e) => {
                 tracing::warn!(%e, "camera frame");
                 std::thread::sleep(Duration::from_millis(200));
@@ -244,17 +250,10 @@ pub fn run_sender(
         let new_tier = link.send_tier();
         if new_tier != tier {
             tier = new_tier;
-            enc = if tier.paused() {
+            enc = build(tier).unwrap_or_else(|e| {
+                tracing::error!(%e, "openh264 encoder rebuild");
                 None
-            } else {
-                match encoder(tier) {
-                    Ok(e) => Some(e),
-                    Err(e) => {
-                        tracing::error!(%e, "openh264 encoder rebuild");
-                        None
-                    }
-                }
-            };
+            });
             last_idr = Instant::now() - IDR_INTERVAL;
             frame_index = 0;
         }
@@ -429,7 +428,10 @@ impl CameraPreview {
         let seq = self.slot.seq.load(Ordering::Acquire);
         if seq != self.shown {
             self.shown = seq;
-            match self.slot.frame.lock().unwrap().as_ref() {
+            // The capture thread only waits for the pointer copy, not for
+            // the conversion below.
+            let frame = self.slot.frame.lock().unwrap().clone();
+            match frame {
                 Some(frame) => {
                     let image = egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
                     match &mut self.texture {

@@ -181,6 +181,32 @@ impl Drop for LiveStream {
     }
 }
 
+/// Main loop, context, core and registry, each step naming itself in the
+/// error. The context stays alive as long as the core; the caller keeps it.
+type Connected = (
+    pw::main_loop::MainLoopRc,
+    pw::context::ContextRc,
+    pw::core::CoreRc,
+    pw::registry::RegistryRc,
+);
+
+fn connect() -> Result<Connected, BackendError> {
+    let mainloop = pw::main_loop::MainLoopRc::new(None)
+        .map_err(|e| BackendError(format!("main loop: {e}")))?;
+    let context = pw::context::ContextRc::new(&mainloop, None)
+        .map_err(|e| BackendError(format!("context: {e}")))?;
+    // module-rt, loaded by the client context, is what can lift the engine's
+    // audio threads to real-time priority (`super::rt`).
+    super::rt::register_context(context.as_raw_ptr() as *mut std::ffi::c_void);
+    let core = context
+        .connect_rc(None)
+        .map_err(|e| BackendError(format!("connect: {e}")))?;
+    let registry = core
+        .get_registry_rc()
+        .map_err(|e| BackendError(format!("registry: {e}")))?;
+    Ok((mainloop, context, core, registry))
+}
+
 fn pw_thread(
     rx: pw::channel::Receiver<Cmd>,
     events: Sender<BackendEvent>,
@@ -188,34 +214,10 @@ fn pw_thread(
     ready: Sender<Result<(), BackendError>>,
 ) {
     pw::init();
-    let mainloop = match pw::main_loop::MainLoopRc::new(None) {
-        Ok(l) => l,
+    let (mainloop, _context, core, registry) = match connect() {
+        Ok(x) => x,
         Err(e) => {
-            let _ = ready.send(Err(BackendError(format!("main loop: {e}"))));
-            return;
-        }
-    };
-    let context = match pw::context::ContextRc::new(&mainloop, None) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = ready.send(Err(BackendError(format!("context: {e}"))));
-            return;
-        }
-    };
-    // module-rt, loaded by the client context, is what can lift the engine's
-    // audio threads to real-time priority (`super::rt`).
-    super::rt::register_context(context.as_raw_ptr() as *mut std::ffi::c_void);
-    let core = match context.connect_rc(None) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = ready.send(Err(BackendError(format!("connect: {e}"))));
-            return;
-        }
-    };
-    let registry = match core.get_registry_rc() {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = ready.send(Err(BackendError(format!("registry: {e}"))));
+            let _ = ready.send(Err(e));
             return;
         }
     };

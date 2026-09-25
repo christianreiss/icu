@@ -3,6 +3,10 @@
 
 use std::{
     collections::HashMap,
+    sync::{
+        atomic::{AtomicU16, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -125,7 +129,8 @@ pub struct EncodedFrame {
     pub data: Vec<u8>,
 }
 
-/// A decoded RGBA picture.
+/// A decoded RGBA picture. Cloned by every viewer on every repaint, so the
+/// pixels are shared: a clone is a reference count, not a copy.
 #[derive(Debug, Clone)]
 pub struct Frame {
     /// Width in pixels.
@@ -133,9 +138,42 @@ pub struct Frame {
     /// Height in pixels.
     pub height: usize,
     /// RGBA8, row major.
-    pub rgba: Vec<u8>,
+    pub rgba: Arc<Vec<u8>>,
     /// When it was decoded.
     pub at: Instant,
+}
+
+/// The per-speaker H.264 decoder.
+#[cfg(feature = "camera")]
+pub use openh264::decoder::Decoder;
+
+/// Stands in for the decoder in a build without `camera`: nothing is ever
+/// decoded, the frames are only counted.
+#[cfg(not(feature = "camera"))]
+#[derive(Debug)]
+pub struct Decoder;
+
+/// Decodes one access unit to a picture, `None` when the decoder has
+/// nothing to show yet or cannot read it.
+#[cfg(feature = "camera")]
+pub fn decode(decoder: &mut Decoder, data: &[u8]) -> Option<Frame> {
+    use openh264::formats::YUVSource;
+    let yuv = decoder.decode(data).ok()??;
+    let (w, h) = yuv.dimensions();
+    let mut rgba = vec![0u8; w * h * 4];
+    yuv.write_rgba8(&mut rgba);
+    Some(Frame {
+        width: w,
+        height: h,
+        rgba: Arc::new(rgba),
+        at: Instant::now(),
+    })
+}
+
+/// See the `camera` version; without the feature there is no picture.
+#[cfg(not(feature = "camera"))]
+pub fn decode(_decoder: &mut Decoder, _data: &[u8]) -> Option<Frame> {
+    None
 }
 
 /// Where received frames go.
@@ -181,17 +219,16 @@ pub async fn accept_loop<S: VideoSink>(conn: quinn::Connection, sink: S) {
         let tx = tx.clone();
         let sink = sink.clone();
         tokio::spawn(async move {
-            let bytes = match recv.read_to_end(VIDEO_HEADER_LEN + VIDEO_MAX_FRAME).await {
+            let mut data = match recv.read_to_end(VIDEO_HEADER_LEN + VIDEO_MAX_FRAME).await {
                 Ok(b) => b,
                 Err(_) => return,
             };
-            let Ok(header) = VideoHeader::decode(&bytes) else {
+            let Ok(header) = VideoHeader::decode(&data) else {
                 return;
             };
-            let frame = EncodedFrame {
-                header,
-                data: bytes[VIDEO_HEADER_LEN..].to_vec(),
-            };
+            // The header is dropped in place; the frame body is not copied.
+            data.drain(..VIDEO_HEADER_LEN);
+            let frame = EncodedFrame { header, data };
             if tx.try_send((header.speaker, frame)).is_err() {
                 sink.overflow();
             }
@@ -200,20 +237,24 @@ pub async fn accept_loop<S: VideoSink>(conn: quinn::Connection, sink: S) {
 }
 
 /// Sends frames, one uni stream each. Drops the frame when flow control
-/// blocks (`Client/IMPLEMENTATION.md` §8).
+/// blocks (`Client/IMPLEMENTATION.md` §8). Shared by reference: the camera
+/// thread sends on it while the session task may be taking it down.
 pub struct Sender {
     conn: quinn::Connection,
-    seq: u16,
+    seq: AtomicU16,
 }
 
 impl Sender {
     /// For `conn`.
     pub fn new(conn: quinn::Connection) -> Sender {
-        Sender { conn, seq: 0 }
+        Sender {
+            conn,
+            seq: AtomicU16::new(0),
+        }
     }
 
     /// Sends one H.264 access unit.
-    pub async fn send(&mut self, keyframe: bool, ts: u32, data: &[u8]) -> Result<(), String> {
+    pub async fn send(&self, keyframe: bool, ts: u32, data: &[u8]) -> Result<(), String> {
         let header = VideoHeader {
             flags: if keyframe {
                 icu_proto::header::VIDEO_FLAG_KEYFRAME
@@ -221,11 +262,10 @@ impl Sender {
                 0
             },
             speaker: 0,
-            seq: self.seq,
+            seq: self.seq.fetch_add(1, Ordering::Relaxed),
             ts,
             codec: VIDEO_CODEC_H264,
         };
-        self.seq = self.seq.wrapping_add(1);
         let mut send =
             match tokio::time::timeout(Duration::from_millis(50), self.conn.open_uni()).await {
                 Ok(Ok(s)) => s,
@@ -233,10 +273,12 @@ impl Sender {
                 Err(_) => return Err("flow control: frame dropped".into()),
             };
         let _ = send.set_priority(-1);
-        let mut buf = Vec::with_capacity(VIDEO_HEADER_LEN + data.len());
-        buf.extend_from_slice(&header.encode());
-        buf.extend_from_slice(data);
-        send.write_all(&buf).await.map_err(|e| e.to_string())?;
+        // Header and body as two writes on the stream: no copy of the frame
+        // into a joined buffer.
+        send.write_all(&header.encode())
+            .await
+            .map_err(|e| e.to_string())?;
+        send.write_all(data).await.map_err(|e| e.to_string())?;
         send.finish().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -244,8 +286,9 @@ impl Sender {
 
 /// Per speaker decoding state.
 struct Receiver {
-    #[cfg(feature = "camera")]
-    decoder: Option<openh264::decoder::Decoder>,
+    /// `None` while [`Receivers::accept`] has lent it to the decode thread,
+    /// or when no decoder could be created.
+    decoder: Option<Decoder>,
     latest: Option<Frame>,
     /// Counts decoded pictures, mirroring `crate::camera::PreviewSlot::seq`:
     /// a viewer that already uploaded `seq` knows the pixels have not changed
@@ -261,7 +304,9 @@ impl Receiver {
     fn new() -> Receiver {
         Receiver {
             #[cfg(feature = "camera")]
-            decoder: openh264::decoder::Decoder::new().ok(),
+            decoder: Decoder::new().ok(),
+            #[cfg(not(feature = "camera"))]
+            decoder: Some(Decoder),
             latest: None,
             seq: 0,
             got_keyframe: false,
@@ -286,9 +331,20 @@ pub struct Receivers {
 }
 
 impl Receivers {
-    /// Stores and decodes a frame. Frames before the first IDR are dropped
-    /// and a `KeyframeRequest` is queued.
+    /// Stores and decodes a frame in one go (tests). The engine splits it
+    /// into [`Receivers::accept`], [`decode`] and [`Receivers::finish`], so
+    /// the decode runs outside the lock the windows take for every repaint.
     pub fn push(&mut self, session: Session, frame: EncodedFrame) {
+        if let Some(mut decoder) = self.accept(session, &frame) {
+            let picture = decode(&mut decoder, &frame.data);
+            self.finish(session, decoder, picture);
+        }
+    }
+
+    /// Books a frame for `session` and, when it is decodable — H.264, after
+    /// the first IDR — lends out the session's decoder. Frames before the
+    /// first IDR are dropped and a `KeyframeRequest` is queued.
+    pub fn accept(&mut self, session: Session, frame: &EncodedFrame) -> Option<Decoder> {
         let r = self.map.entry(session).or_insert_with(Receiver::new);
         r.frames += 1;
         r.last_frame = Some(Instant::now());
@@ -296,25 +352,25 @@ impl Receivers {
             r.got_keyframe = true;
         }
         if !r.got_keyframe || frame.header.codec != VIDEO_CODEC_H264 {
+            return None;
+        }
+        r.decoder.take()
+    }
+
+    /// Returns the decoder [`Receivers::accept`] lent out, with the picture
+    /// it made of the frame. A session removed or reset in the meantime has
+    /// a fresh decoder waiting for its IDR; the old one is dropped with it.
+    pub fn finish(&mut self, session: Session, decoder: Decoder, picture: Option<Frame>) {
+        let Some(r) = self.map.get_mut(&session) else {
+            return;
+        };
+        if r.decoder.is_some() {
             return;
         }
-        #[cfg(not(feature = "camera"))]
-        let _ = frame;
-        #[cfg(feature = "camera")]
-        if let Some(dec) = r.decoder.as_mut() {
-            use openh264::formats::YUVSource;
-            if let Ok(Some(yuv)) = dec.decode(&frame.data) {
-                let (w, h) = yuv.dimensions();
-                let mut rgba = vec![0u8; w * h * 4];
-                yuv.write_rgba8(&mut rgba);
-                r.latest = Some(Frame {
-                    width: w,
-                    height: h,
-                    rgba,
-                    at: Instant::now(),
-                });
-                r.seq += 1;
-            }
+        r.decoder = Some(decoder);
+        if let Some(picture) = picture {
+            r.latest = Some(picture);
+            r.seq += 1;
         }
     }
 
