@@ -442,6 +442,13 @@ impl SettingsView {
             widgets::setting_row(
                 ui,
                 true,
+                "Lautstärke angleichen",
+                Some("Bringt alle anderen auf eine ähnliche Lautstärke, leise wie laute."),
+                |ui| widgets::toggle(ui, &mut self.draft.audio.normalize_incoming),
+            );
+            widgets::setting_row(
+                ui,
+                true,
                 "Stimmoptimierung",
                 Some("Gleicht leise und laute Stellen aus, damit du gleichmäßig klingst."),
                 |ui| widgets::toggle(ui, &mut self.draft.audio.voice_opt),

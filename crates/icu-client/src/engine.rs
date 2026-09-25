@@ -38,7 +38,9 @@ use crate::{
         gate::{Decision, Gate, Mode},
         jitter::{JitterBuffer, JitterConfig, Packet, Pop},
         meter::{self, Level},
-        mixer, opus,
+        mixer,
+        normalize::Normalizer,
+        opus,
         refalign::{self, CycleClock},
         vad, vad_auto,
         voice::{VoiceChain, VoiceStrength},
@@ -436,6 +438,8 @@ struct Speaker {
     pending: VecDeque<f32>,
     last_packet: Option<Instant>,
     volume: f32,
+    /// Loudness normalization, ahead of `volume`.
+    norm: Normalizer,
     /// Loss accounting for `LossReport`: (played, lost) at the last report.
     report_base: (u64, u64),
     last_reported_permille: u16,
@@ -454,6 +458,7 @@ impl Speaker {
             pending: VecDeque::with_capacity(4 * BLOCK),
             last_packet: None,
             volume,
+            norm: Normalizer::new(),
             report_base: (0, 0),
             last_reported_permille: 0,
             loss_hinted: false,
@@ -471,6 +476,8 @@ struct Shared {
     conn: Mutex<Option<quinn::Connection>>,
     deafened: AtomicBool,
     output_gain: AtomicF32,
+    /// `audio.normalize_incoming`, read by the mixer.
+    normalize_incoming: AtomicBool,
     cues: Mutex<VecDeque<f32>>,
     /// The AEC reference stream is open.
     reference_open: AtomicBool,
@@ -599,6 +606,7 @@ impl Engine {
             conn: Mutex::new(None),
             deafened: AtomicBool::new(false),
             output_gain: AtomicF32::new(mixer::volume_gain(settings.audio.output_volume)),
+            normalize_incoming: AtomicBool::new(settings.audio.normalize_incoming),
             cues: Mutex::new(VecDeque::new()),
             reference_open: AtomicBool::new(false),
             cycle: Arc::new(CycleClock::default()),
@@ -1362,6 +1370,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
         let now = Instant::now();
         let deafened = shared.deafened.load(Ordering::Relaxed);
         let master = shared.output_gain.load();
+        let normalize = shared.normalize_incoming.load(Ordering::Relaxed);
         let mut n_inputs = 0;
         {
             let mut speakers = lock(&shared.speakers);
@@ -1411,6 +1420,11 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                     *dst = src;
                 }
                 buf[have..].fill(0.0);
+                if normalize {
+                    sp.norm.process(buf);
+                } else {
+                    sp.norm.reset();
+                }
                 *gain = if deafened {
                     0.0
                 } else {
@@ -2014,6 +2028,9 @@ impl LocalState {
         shared
             .output_gain
             .store(mixer::volume_gain(self.settings.audio.output_volume));
+        shared
+            .normalize_incoming
+            .store(self.settings.audio.normalize_incoming, Ordering::Relaxed);
         if reopen {
             self.reopen_streams(shared);
         }

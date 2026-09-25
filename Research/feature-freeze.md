@@ -109,6 +109,7 @@ Tabelle „Feature | v1 | Grund". „Perfekt" = das Kriterium in der Grund-Spalt
 | Sende-Cue (Ton bei PTT-Start/Ende) | ja, Default aus | Trivial, von Mumble-Nutzern erwartet, Default aus, weil es den Sprecher stört. |
 | Automatische Mikrofon-Verstärkung (AGC, TeamSpeak „automatic microphone volume adjustment") | nein | Manuelle Verstärkung („Max Amplification"-Regler) plus sichtbarer Pegel reicht; AGC pumpt und verstärkt Rauschen. Prüfen in v2, falls Pegelbeschwerden auftreten. |
 | Stimmoptimierung (Hochpass, Kompressor, Limiter) | ja, Default aus (2026-09-24) | Kein AGC: feste Kennlinie ohne Adaption, also kein Pumpen und kein Hochziehen von Rauschen in Pausen (VAD und Gate sehen das Signal vor der Kette). Der Nutzer entscheidet sich bewusst gegen „unverfälscht“, der Default bleibt glasklar. |
+| Lautstärke angleichen (empfangsseitig, je Sprecher) | ja, Default an (2026-09-25) | Auftraggeber-Wunsch: Teilnehmer kommen sehr unterschiedlich laut an. Keine Mikrofon-AGC (die bleibt „nein“, s. o.): es wird nur das **empfangene** Signal jedes Sprechers vor seinem Lautstärkeregler auf eine gemeinsame Hüllkurve (−22 dBFS RMS, ±12 dB) gebracht. Die Schätzung bewegt sich nur auf Blöcken ≥ 10 dB über dem eigenen Rauschboden des Sprechers (Minimum der letzten 1,5–3 s) und mindestens −50 dBFS; in Pausen hält die Verstärkung, konstantes Rauschen zählt nie als Sprache — also kein Pumpen und kein Hochziehen von Rauschen. Schnell runter (80 ms), langsam rauf (2 s). Abschaltbar unter Audio → Klang. |
 
 ## Verworfen, mit Grund
 
