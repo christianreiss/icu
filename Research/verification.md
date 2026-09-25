@@ -325,7 +325,7 @@ Algorithmische Verzögerung: **0 Samples = 0,00 ms**.
 | Rust-Binding gepflegt | ja (2026-05) | nein (2018/2022) |
 | Cross nach Windows-gnu | nein (struktureller Crate-Mangel) | ungetestet |
 
-**Spike 6: PASS.** `webrtc-audio-processing` 2.1.0 baut nativ auf Fedora 43 (mit objcopy-Workaround), erreicht 34–39 dB ERLE bei 0,47 % eines Kerns und 8,96 ms algorithmischer Verzögerung, ist gegen falsche Delay-Angaben, wechselnde Echopfade und langsamen Clock-Drift (100 ppm über 10 min: −0,4 dB) unempfindlich, und schlägt Speex in jeder gemessenen Qualitätsdimension bei halbem CPU-Verbrauch. Zwei Einschränkungen: der Windows-Cross-Build funktioniert nicht, und ohne Systemmix-Referenz fällt die ERLE von 38,8 auf 7,7 dB.
+**Spike 6: PASS.** *(Korrektur 2026-09-25: die ERLE-Zahlen dieses Absatzes stammen aus einem Rauschgenerator mit DC-Offset und sind rund 10 dB zu hoch; korrigierte Werte 27–29 dB Single-Talk, siehe `Research/aec.md`, Abschnitt „Korrektur 2026-09-25".)* `webrtc-audio-processing` 2.1.0 baut nativ auf Fedora 43 (mit objcopy-Workaround), erreicht 34–39 dB ERLE bei 0,47 % eines Kerns und 8,96 ms algorithmischer Verzögerung, ist gegen falsche Delay-Angaben, wechselnde Echopfade und langsamen Clock-Drift (100 ppm über 10 min: −0,4 dB) unempfindlich, und schlägt Speex in jeder gemessenen Qualitätsdimension bei halbem CPU-Verbrauch. Zwei Einschränkungen: der Windows-Cross-Build funktioniert nicht, und ohne Systemmix-Referenz fällt die ERLE von 38,8 auf 7,7 dB.
 
 Entscheidung und Design in `Research/aec.md`. Offene Punkte dort unter A1–A12; A1 (Windows-Build) ist blockierend.
 

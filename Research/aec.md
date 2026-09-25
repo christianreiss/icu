@@ -285,6 +285,34 @@ Diese Datei ändert nur sich selbst und `verification.md`. Nachzuziehen sind:
 | A11 | **Lizenz-Weitergabe** | Die gebündelten WebRTC-Quellen stehen unter BSD-3-Clause (Google). Prüfen, dass der Lizenztext den Binary-Distributionen beiliegt („Redistributions in binary form must reproduce the above copyright notice"), und in `packaging-licensing.md` eintragen. |
 | A12 | **Vergleich APM 1.3 (PipeWire-Backend) vs. 2.1 (unser Crate)** | Nur nötig, falls der PipeWire-Fallback jemals Produktweg werden soll: gleiche Signale durch beide, ERLE vergleichen. Aktuell unbelegt. |
 
+## Korrektur 2026-09-25: Spike-6-Zahlen mit fehlerhaftem Rauschgenerator gemessen
+
+`Rng::uniform` in `Research/spikes/spike-aec/src/signal.rs` (und der davon abgeleitete `crates/icu-client/src/dsp/testsignal.rs`) lieferte nicht [−1, 1), sondern [−1, 3): 53 Zufallsbits wurden durch 2⁵² statt 2⁵³ geteilt. Folgen für jede Messung oben: das „sprachähnliche" Far-End trug einen Gleichanteil von 1,0 im Tiefpass-Term und war damit vor allem ein mit der Silbenrate modulierter Sub-20-Hz-Puls; die Nachhall-Taps waren positiv verschoben (Echo-RMS −8,3 statt der beabsichtigten ≈ −26 dBFS bei ERL 6 dB, also ERL ≈ −12 dB); das Mikrofonrauschen hatte einen DC-Offset von −45 dBFS. Das APM filtert die Capture-Seite intern hoch (`enforce_high_pass_filtering`, Default an), entfernte also den DC- und Sub-20-Hz-Anteil des Echos aus dem Ausgang — die ERLE-Metrik hat das als Echokompensation gezählt. **Die absoluten ERLE-Werte oben (34–39 dB) sind deshalb zu hoch**; die relativen Befunde (Delay-Angabe wirkungslos, Referenz darf nicht spät kommen, Systemmix-Referenz nötig, Driftrate statt Schlupf entscheidend) bleiben qualitativ bestehen.
+
+Spike 6 mit korrigiertem Generator neu gelaufen (gleicher Host, 2026-09-25; `cargo run --release` in `Research/spikes/spike-aec/`):
+
+| Messung | alt (fehlerhaft) | neu |
+| --- | --- | --- |
+| Szene | Echo-RMS −8,3 dBFS, Near −9,4 dBFS | Echo-RMS **−25,1 dBFS**, Near −25,9 dBFS, Far −20 dBFS (ERL ≈ 5 dB, wie beabsichtigt) |
+| Algorithmische Verzögerung | 430 Samples | 430 Samples (unverändert) |
+| ERLE Single-Talk 2–4 s / 8–10 s, linear | 39,3 / 36,8 dB | **28,9 / 27,4 dB** |
+| Double-Talk, Near-End-Pausen | 31,7 dB | **25,6 dB** |
+| Double-Talk, Near-End aktiv (SI-SDR vs. Baseline / Korr) | 0,6 dB / 0,536 | 2,9 dB / 0,812 |
+| Lautsprecher drive 5 / 10, ERLE 8–10 s | 34,3 / 31,1 dB | 24,4 / 21,0 dB |
+| `stream_delay_ms` 0 … 200 (AEC3) | identisch ±0,3 dB | identisch ±0,3 dB (28,9–29,2 / 27,4–27,5) |
+| AECM, falsches Delay 110 / 200 ms | 24,3 / 23,6 dB | 3,9 / 2,0 dB (2–4 s) |
+| Wahres Delay 40 … 400 ms | 37–39,5 dB | 27,8–29,1 dB, flach |
+| Delay-Sprung 80 → 140 ms bei 5 s | 1 s Rekonvergenz | 6 s 16,3 · 7 s 25,1 · 8 s 32,3 → rund 2 s |
+| Drift 100 ppm / 1 000 ppm, ERLE 8–10 s | 36,9 / 35,9 dB | 27,5 / **4,6 dB** |
+| Drift 100 ppm über 600 s, letzte 10 s | 33,8 dB | 23,2 dB (0 ppm: 25,1) |
+| AEC allein vs. AEC+HPF+NS (drive 5), 8–10 s | 34,3 → 41,0 dB | 24,4 → **36,2 dB** |
+| Referenz nur eigener Voice-Playback / Systemmix | 7,7 / 38,8 dB | **5,2 / 26,9 dB** |
+| CPU je 10 ms | 47 µs | 50 µs |
+
+**Neuer Messvorbehalt**: Mit Echo −25 dBFS und Grundrauschen −50 dBFS deckelt der Rauschteppich die messbare ERLE bei ≈ 25 dB; die 27–29 dB entstehen, weil der AEC3-Suppressor in Single-Talk auch das Rauschen dämpft. Die Szene misst also „Restecho am Rauschteppich", nicht die algorithmische Grenze — dafür müsste das Grundrauschen auf ≈ −70 dBFS. Die Zielwerte „≥ 30 dB Single-Talk / ≥ 25 dB Double-Talk-Pausen" in der Entscheidungstabelle sind mit dieser Szene nicht belegbar und waren es nie; die Unit-Tests in `dsp/aec.rs` prüfen jetzt ≥ 25 dB (Single-Talk, gemessen 28,9/27,4), ≥ 24 dB (ausgerichtete Referenz, 26,5) und ≥ 22 dB (Double-Talk-Pausen, 25,6) als Regressionsschwellen. Die WebRTC-NS als „Residual-Echo-Reserve" ist mit +12 dB ERLE (statt +6,7) gewichtiger als angenommen. Die Speex-Vergleichszahlen (6b) sind ebenfalls mit dem fehlerhaften Generator entstanden und **nicht** neu gemessen (libspeexdsp nicht installiert); die Rangfolge AEC3 > Speex bleibt unbelegt, bis 6b wiederholt ist.
+
+Zusätzlich geprüft (Test `residual_echo_does_not_read_as_voice`): Far-End = harmonischer Testton (das einzige synthetische Signal, das RNNoise als Sprache liest), Echo über die 80-ms-Raum-IR, kein Near-End. Ohne AEC meldet RNNoise auf 38,5 % der aktiven Blöcke Sprache (≥ 0,5), nach AEC3 auf 0,7 % — das Restecho öffnet das VAD-Gate im eingeschwungenen Zustand nicht. Die Konvergenzphase (erste 1–2 s nach Start oder Delay-Sprung) ist davon ausgenommen.
+
 ## Verified against
 
 - [x] Step 3 am 2026-09-20 — empirisch belegt durch **Spike 6** (`Research/spikes/spike-aec/`, Details auch in `verification.md`). Host: Fedora 43, Linux 7.2.5, rustc 1.98.1, Release-Build mit Debug-Info.
