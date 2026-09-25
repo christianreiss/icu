@@ -54,7 +54,7 @@ pub async fn simple(config: &Config, request: AdminRequest, done: &str) -> Resul
 }
 
 /// Runs an admin command that also reports how many live connections it
-/// closed (`disable`, `revoke`).
+/// closed (`disable`, `kick`, `revoke`).
 pub async fn with_closed(config: &Config, request: AdminRequest, verb: &str) -> Result<()> {
     let value = dispatch(config, request).await?;
     require_ok(&value)?;

@@ -235,7 +235,7 @@ pub enum ControlMsg {
         /// One row per registered user.
         users: Vec<UserSummary>,
     },
-    /// 28, S→C. Rejection of variant 19/22/24/26. `user_id` is `0` for a
+    /// 28, S→C. Rejection of variant 19/22/24/26/31/33. `user_id` is `0` for a
     /// `UserListRequest` failure, since it names no single target.
     AdminActionError {
         /// The targeted user, or `0`.
@@ -263,6 +263,50 @@ pub enum ControlMsg {
     CrlUpdate {
         /// The CRL, DER.
         crl_der: Vec<u8>,
+    },
+    /// 31, C→S. Closes every live session of `user_id` with `KICKED`
+    /// without touching the store: the user may connect again. Admin only;
+    /// same rejection shape as `AdminSetRole`.
+    AdminKick {
+        /// The affected user.
+        user_id: UserId,
+    },
+    /// 32, S→C. Ack to the acting admin.
+    AdminKickOk {
+        /// The affected user.
+        user_id: UserId,
+        /// How many live connections were closed.
+        closed: u32,
+    },
+    /// 33, C→S. Server-enforced mute and deafen of `user_id`, absolute and
+    /// persisted: while set, bit0/bit1 of the user's `UserFlags` stay set
+    /// whatever the client sends. Admin only; same rejection shape as
+    /// `AdminSetRole`.
+    AdminSetRestriction {
+        /// The affected user.
+        user_id: UserId,
+        /// Enforced mute.
+        muted: bool,
+        /// Enforced deafen.
+        deafened: bool,
+    },
+    /// 34, S→C. Ack to the acting admin.
+    AdminSetRestrictionOk {
+        /// The affected user.
+        user_id: UserId,
+        /// Enforced mute.
+        muted: bool,
+        /// Enforced deafen.
+        deafened: bool,
+    },
+    /// 35, S→C. Unicast to every session of the affected user, on change and
+    /// right after `Welcome` while any restriction is set: which of their
+    /// own mute/deafen an admin enforces.
+    UserRestrictionChanged {
+        /// Enforced mute.
+        muted: bool,
+        /// Enforced deafen.
+        deafened: bool,
     },
 }
 
@@ -316,6 +360,11 @@ impl ControlMsg {
             ControlMsg::AdminActionError { .. } => "AdminActionError",
             ControlMsg::UserRtt { .. } => "UserRtt",
             ControlMsg::CrlUpdate { .. } => "CrlUpdate",
+            ControlMsg::AdminKick { .. } => "AdminKick",
+            ControlMsg::AdminKickOk { .. } => "AdminKickOk",
+            ControlMsg::AdminSetRestriction { .. } => "AdminSetRestriction",
+            ControlMsg::AdminSetRestrictionOk { .. } => "AdminSetRestrictionOk",
+            ControlMsg::UserRestrictionChanged { .. } => "UserRestrictionChanged",
         }
     }
 
@@ -334,6 +383,8 @@ impl ControlMsg {
                 | ControlMsg::AdminSetDisabled { .. }
                 | ControlMsg::AdminRevokeUser { .. }
                 | ControlMsg::UserListRequest
+                | ControlMsg::AdminKick { .. }
+                | ControlMsg::AdminSetRestriction { .. }
         )
     }
 }
@@ -455,6 +506,8 @@ mod tests {
                     revoked: false,
                     online: true,
                     pending: false,
+                    muted: true,
+                    deafened: false,
                 }],
             },
             ControlMsg::AdminActionError {
@@ -468,6 +521,25 @@ mod tests {
             ControlMsg::CrlUpdate {
                 crl_der: vec![0x30, 0x03, 0x02, 0x01, 0x01],
             },
+            ControlMsg::AdminKick { user_id: 5 },
+            ControlMsg::AdminKickOk {
+                user_id: 5,
+                closed: 1,
+            },
+            ControlMsg::AdminSetRestriction {
+                user_id: 5,
+                muted: true,
+                deafened: false,
+            },
+            ControlMsg::AdminSetRestrictionOk {
+                user_id: 5,
+                muted: true,
+                deafened: false,
+            },
+            ControlMsg::UserRestrictionChanged {
+                muted: true,
+                deafened: true,
+            },
         ]
     }
 
@@ -475,7 +547,7 @@ mod tests {
     #[test]
     fn roundtrip_all_control_variants() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 31, "v1 has exactly 31 control variants");
+        assert_eq!(variants.len(), 36, "v1 has exactly 36 control variants");
         for msg in variants {
             let frame = msg.encode().unwrap();
             let body = framing::split_frame(&frame, MAX_CONTROL_FRAME)
@@ -504,8 +576,8 @@ mod tests {
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
     #[test]
     fn unknown_variant_is_an_error() {
-        // Discriminant 31 does not exist yet.
-        let body = [31u8, 0, 0];
+        // Discriminant 36 does not exist yet.
+        let body = [36u8, 0, 0];
         let err = ControlMsg::decode(&body).unwrap_err();
         assert!(
             matches!(err, ProtoError::UnknownVariant),
@@ -558,6 +630,18 @@ mod tests {
         .is_client_to_server());
         assert!(ControlMsg::AdminRevokeUser { user_id: 1 }.is_client_to_server());
         assert!(ControlMsg::UserListRequest.is_client_to_server());
+        assert!(ControlMsg::AdminKick { user_id: 1 }.is_client_to_server());
+        assert!(ControlMsg::AdminSetRestriction {
+            user_id: 1,
+            muted: true,
+            deafened: true
+        }
+        .is_client_to_server());
+        assert!(!ControlMsg::UserRestrictionChanged {
+            muted: true,
+            deafened: false
+        }
+        .is_client_to_server());
         assert!(!ControlMsg::UserAdminChanged { is_admin: true }.is_client_to_server());
         assert!(!ControlMsg::UserListResponse { users: vec![] }.is_client_to_server());
         assert!(!ControlMsg::UserRtt { rtts: vec![] }.is_client_to_server());

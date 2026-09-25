@@ -64,6 +64,31 @@ pub enum AdminRequest {
         /// `user_id`, name or fingerprint.
         user: String,
     },
+    /// Close a user's live connections; they may connect again.
+    Kick {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Enforce mute: the user's microphone stays off until `unmute`.
+    Mute {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Lift an enforced mute.
+    Unmute {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Enforce deafen: the user receives no audio until `undeafen`.
+    Deafen {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Lift an enforced deafen.
+    Undeafen {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
     /// Uptime, online count and relay counters.
     Status,
     /// Issue a fresh server leaf from the same CA.
@@ -99,6 +124,13 @@ pub enum AdminResponse {
     },
     /// `promote`, `demote`, `enable`, `rotate-server-cert`
     Ok,
+    /// `kick`
+    Kick {
+        /// The affected user.
+        user_id: UserId,
+        /// How many live connections were closed.
+        closed: usize,
+    },
     /// `disable`
     Disable {
         /// The affected user.
@@ -141,6 +173,12 @@ pub struct AdminUser {
     /// Invited, registration not confirmed yet.
     #[serde(default)]
     pub pending: bool,
+    /// Mute enforced by an admin.
+    #[serde(default)]
+    pub muted: bool,
+    /// Deafen enforced by an admin.
+    #[serde(default)]
+    pub deafened: bool,
 }
 
 impl AdminResponse {
@@ -166,7 +204,7 @@ impl AdminResponse {
                 json!({"ok": true, "user_id": user_id, "closed": closed})
             }
             AdminResponse::Ok => json!({"ok": true}),
-            AdminResponse::Disable { user_id, closed } => {
+            AdminResponse::Disable { user_id, closed } | AdminResponse::Kick { user_id, closed } => {
                 json!({"ok": true, "user_id": user_id, "closed": closed})
             }
             AdminResponse::Status(value) => {
@@ -230,6 +268,8 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     is_admin: record.is_admin,
                     disabled: record.disabled,
                     pending: record.is_pending(),
+                    muted: record.server_muted,
+                    deafened: record.server_deafened,
                 });
             }
             AdminResponse::Users(users)
@@ -262,6 +302,32 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                 Err(response) => response,
             }
         }
+        AdminRequest::Kick { user } => match resolve(server, user).await {
+            Ok(user_id) => match kick(server, None, user_id).await {
+                Ok(closed) => AdminResponse::Kick { user_id, closed },
+                Err(e) => store_err(e, "KICK_FAILED"),
+            },
+            Err(response) => response,
+        },
+        AdminRequest::Mute { user }
+        | AdminRequest::Unmute { user }
+        | AdminRequest::Deafen { user }
+        | AdminRequest::Undeafen { user } => match resolve(server, user).await {
+            Ok(user_id) => {
+                let (mut muted, mut deafened) = server.store.lock().await.restriction(user_id);
+                match request {
+                    AdminRequest::Mute { .. } => muted = true,
+                    AdminRequest::Unmute { .. } => muted = false,
+                    AdminRequest::Deafen { .. } => deafened = true,
+                    _ => deafened = false,
+                }
+                match set_restriction(server, None, user_id, muted, deafened).await {
+                    Ok(()) => AdminResponse::Ok,
+                    Err(e) => store_err(e, "RESTRICT_FAILED"),
+                }
+            }
+            Err(response) => response,
+        },
         AdminRequest::Status => AdminResponse::Status(status(server)),
         AdminRequest::RotateServerCert => match rotate_server_cert(server).await {
             Ok(()) => AdminResponse::Ok,
@@ -408,6 +474,46 @@ pub async fn set_disabled(
     };
     tracing::info!(actor, target, disabled, closed, "disabled state changed");
     Ok(closed)
+}
+
+/// Closes the target's live connections with `KICKED` and changes nothing
+/// else: they may connect again. Returns how many were closed. Behind
+/// `kick` and `AdminKick`.
+pub async fn kick(server: &Arc<Server>, actor: Option<UserId>, target: UserId) -> Result<usize> {
+    change(server, actor, target, |_| Ok(false)).await?;
+    let closed = kick_user(server, target, ec::KICKED);
+    tracing::info!(actor, target, closed, "kicked");
+    Ok(closed)
+}
+
+/// Enforces or lifts mute and deafen, persisted and live: the target's own
+/// sessions get `UserRestrictionChanged`, and every session whose flags
+/// changed a `UserState` broadcast. Behind `mute`/`unmute`/`deafen`/
+/// `undeafen` and `AdminSetRestriction`.
+pub async fn set_restriction(
+    server: &Arc<Server>,
+    actor: Option<UserId>,
+    target: UserId,
+    muted: bool,
+    deafened: bool,
+) -> Result<()> {
+    change(server, actor, target, |store| {
+        store.set_restriction(target, muted, deafened)
+    })
+    .await?;
+    for s in server.room.sessions_of_user(target) {
+        server
+            .room
+            .send_to(s, &ControlMsg::UserRestrictionChanged { muted, deafened });
+    }
+    let forced = crate::session::restriction_flags(muted, deafened);
+    for (session, flags) in server.room.set_forced(target, forced) {
+        server
+            .room
+            .broadcast(&ControlMsg::UserState { session, flags });
+    }
+    tracing::info!(actor, target, muted, deafened, "restriction changed");
+    Ok(())
 }
 
 /// Closes every connection of a user with `code`, through the room so that

@@ -65,6 +65,31 @@ enum Command {
         /// `user_id`, name or fingerprint.
         user: String,
     },
+    /// Close a user's live connections; they may connect again.
+    Kick {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Enforce mute: the user's microphone stays off until `unmute`.
+    Mute {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Lift an enforced mute.
+    Unmute {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Enforce deafen: the user receives no audio until `undeafen`.
+    Deafen {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
+    /// Lift an enforced deafen.
+    Undeafen {
+        /// `user_id`, name or fingerprint.
+        user: String,
+    },
     /// Show uptime, online users and relay counters.
     Status {
         /// Print raw JSON, for a Checkmk local check.
@@ -130,6 +155,25 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Enable { user } => {
             let done = format!("enabled {user}");
             cli::simple(&config, AdminRequest::Enable { user }, &done).await
+        }
+        Command::Kick { user } => {
+            cli::with_closed(&config, AdminRequest::Kick { user }, "kicked").await
+        }
+        Command::Mute { user } => {
+            let done = format!("muted {user}");
+            cli::simple(&config, AdminRequest::Mute { user }, &done).await
+        }
+        Command::Unmute { user } => {
+            let done = format!("unmuted {user}");
+            cli::simple(&config, AdminRequest::Unmute { user }, &done).await
+        }
+        Command::Deafen { user } => {
+            let done = format!("deafened {user}");
+            cli::simple(&config, AdminRequest::Deafen { user }, &done).await
+        }
+        Command::Undeafen { user } => {
+            let done = format!("undeafened {user}");
+            cli::simple(&config, AdminRequest::Undeafen { user }, &done).await
         }
         Command::Status { json } => cli::status::run(&config, json).await,
         Command::RotateServerCert => {

@@ -303,3 +303,164 @@ async fn a_lone_participant_never_receives_user_rtt() {
     );
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn admin_kick_closes_with_kicked_and_the_user_may_come_back() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await; // sole bootstrap admin
+    let identity = server.enroll("bob").await;
+    let mut bob = server.connect(&identity).await.expect("connect");
+    bob.hello("bob").await;
+
+    alice
+        .send_msg(&ControlMsg::AdminKick {
+            user_id: bob.user_id,
+        })
+        .await;
+    let ok = alice
+        .recv_matching(|m| matches!(m, ControlMsg::AdminKickOk { .. }))
+        .await;
+    assert!(
+        matches!(ok, Some(ControlMsg::AdminKickOk { closed: 1, .. })),
+        "{ok:?}"
+    );
+    assert_eq!(bob.closed_code().await, Some(ec::KICKED));
+
+    // Nothing in the store changed: the same certificate gets back in.
+    let mut again = server.connect(&identity).await.expect("reconnect");
+    assert!(matches!(again.hello("bob").await, ControlMsg::Welcome { .. }));
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_kick_from_a_non_admin_is_rejected() {
+    let server = TestServer::start().await;
+    let alice = server.client("alice").await; // sole bootstrap admin
+    let mut bob = server.client("bob").await;
+
+    bob.send_msg(&ControlMsg::AdminKick {
+        user_id: alice.user_id,
+    })
+    .await;
+    let err = bob
+        .recv_matching(|m| matches!(m, ControlMsg::AdminActionError { .. }))
+        .await;
+    assert!(
+        matches!(
+            err,
+            Some(ControlMsg::AdminActionError {
+                code: ec::NOT_ADMIN,
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn admin_restriction_is_enforced_persisted_and_lifted() {
+    use icu_proto::UserFlags;
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await; // sole bootstrap admin
+    let identity = server.enroll("bob").await;
+    let mut bob = server.connect(&identity).await.expect("connect");
+    bob.hello("bob").await;
+    let bob_id = bob.user_id;
+
+    alice
+        .send_msg(&ControlMsg::AdminSetRestriction {
+            user_id: bob_id,
+            muted: true,
+            deafened: true,
+        })
+        .await;
+    // The `UserState` broadcast goes out before the ack.
+    let seen = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob.session))
+        .await;
+    let Some(ControlMsg::UserState { flags, .. }) = seen else {
+        panic!("{seen:?}")
+    };
+    assert!(flags.muted() && flags.deafened());
+    let ok = alice
+        .recv_matching(|m| matches!(m, ControlMsg::AdminSetRestrictionOk { .. }))
+        .await;
+    assert!(ok.is_some(), "{ok:?}");
+    let pushed = bob
+        .recv_matching(|m| matches!(m, ControlMsg::UserRestrictionChanged { .. }))
+        .await;
+    assert_eq!(
+        pushed,
+        Some(ControlMsg::UserRestrictionChanged {
+            muted: true,
+            deafened: true
+        })
+    );
+
+    // The client cannot clear it.
+    bob.send_msg(&ControlMsg::SetState {
+        flags: UserFlags::NONE,
+    })
+    .await;
+    alice.expect_silence().await;
+
+    // Muted: nothing relayed to alice.
+    bob.send_audio(1, 960, &[0xF8, 1, 2, 3]);
+    assert!(alice.recv_audio(std::time::Duration::from_millis(300)).await.is_none());
+
+    // Survives a reconnect, announced right after `Welcome`.
+    bob.conn.close(0u32.into(), b"");
+    drop(bob);
+    let mut bob = server.connect(&identity).await.expect("reconnect");
+    let ControlMsg::Welcome { you, .. } = bob.hello("bob").await else {
+        panic!("no Welcome")
+    };
+    assert!(you.flags.muted() && you.flags.deafened());
+    let pushed = bob
+        .recv_matching(|m| matches!(m, ControlMsg::UserRestrictionChanged { .. }))
+        .await;
+    assert!(pushed.is_some());
+
+    // Listed for admins.
+    alice.send_msg(&ControlMsg::UserListRequest).await;
+    let Some(ControlMsg::UserListResponse { users }) = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserListResponse { .. }))
+        .await
+    else {
+        panic!("no UserListResponse")
+    };
+    let row = users.iter().find(|u| u.user_id == bob_id).unwrap();
+    assert!(row.muted && row.deafened);
+
+    // Lifted: the client may unmute again.
+    alice
+        .send_msg(&ControlMsg::AdminSetRestriction {
+            user_id: bob_id,
+            muted: false,
+            deafened: false,
+        })
+        .await;
+    let pushed = bob
+        .recv_matching(|m| matches!(m, ControlMsg::UserRestrictionChanged { .. }))
+        .await;
+    assert_eq!(
+        pushed,
+        Some(ControlMsg::UserRestrictionChanged {
+            muted: false,
+            deafened: false
+        })
+    );
+    bob.send_msg(&ControlMsg::SetState {
+        flags: UserFlags::NONE,
+    })
+    .await;
+    let state = bob
+        .recv_matching(|m| matches!(m, ControlMsg::UserState { .. }))
+        .await;
+    let Some(ControlMsg::UserState { flags, .. }) = state else {
+        panic!("{state:?}")
+    };
+    assert!(!flags.muted() && !flags.deafened());
+    server.shutdown().await;
+}

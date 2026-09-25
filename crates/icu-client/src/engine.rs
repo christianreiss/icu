@@ -217,6 +217,11 @@ pub struct AppState {
     /// disable/enable/revoke) — kept separate from `invite_error` so the two
     /// admin features never clobber each other's error slot.
     pub user_action_error: Option<String>,
+    /// An admin enforces our mute (`UserRestrictionChanged`): unmuting is
+    /// refused until it is lifted. Cleared with the session.
+    pub restricted_muted: bool,
+    /// An admin enforces our deafen, like `restricted_muted`.
+    pub restricted_deafened: bool,
     /// Devices.
     pub devices: Vec<DeviceInfo>,
     /// Backend name.
@@ -293,6 +298,23 @@ pub enum Command {
     },
     /// Refresh the full user list for the Nutzer tab. Admin only.
     RequestUserList,
+    /// Close another user's connections; they may come back. Admin only.
+    KickUser {
+        /// The affected user.
+        user_id: UserId,
+    },
+    /// Enforce or lift another user's mute and deafen. Admin only.
+    SetUserRestriction {
+        /// The affected user.
+        user_id: UserId,
+        /// Enforced mute.
+        muted: bool,
+        /// Enforced deafen.
+        deafened: bool,
+    },
+    /// Connect again right away: after a fatal close (a kick), or to skip
+    /// the backoff wait.
+    Reconnect,
     /// Replace the settings (device change, thresholds, …); effective at once.
     UpdateSettings(Box<Settings>),
     /// Camera on/off.
@@ -591,6 +613,8 @@ impl Engine {
             invite_error: None,
             user_list: Vec::new(),
             user_action_error: None,
+            restricted_muted: false,
+            restricted_deafened: false,
             devices: backend.devices(),
             backend: backend_name,
             aec_available: false,
@@ -1705,6 +1729,8 @@ fn end_session(shared: &Arc<Shared>) {
         s.server_rtt_ms = None;
         s.clock_offset_ms = None;
         s.notice = None;
+        s.restricted_muted = false;
+        s.restricted_deafened = false;
     });
 }
 
@@ -1936,6 +1962,8 @@ impl LocalState {
     fn handle_local(&mut self, cmd: Command, shared: &Arc<Shared>) -> bool {
         let mut set_state = false;
         match cmd {
+            Command::SetMuted(false) if shared.state.borrow().restricted_muted => {}
+            Command::SetDeafened(false) if shared.state.borrow().restricted_deafened => {}
             Command::SetMuted(m) => {
                 self.flags = self.flags.with_bit(UserFlags::MUTED, m);
                 shared.dsp.muted.store(m, Ordering::Relaxed);
@@ -2056,6 +2084,9 @@ impl LocalState {
             | Command::SetUserDisabled { .. }
             | Command::RevokeUser { .. }
             | Command::RequestUserList
+            | Command::KickUser { .. }
+            | Command::SetUserRestriction { .. }
+            | Command::Reconnect
             | Command::Quit => {}
         }
         set_state
@@ -2554,6 +2585,17 @@ async fn run_session(
                             break send_failed();
                         }
                     }
+                    Command::KickUser { user_id } => {
+                        if conn::write_msg(&mut send, &ControlMsg::AdminKick { user_id }).await.is_err() {
+                            break send_failed();
+                        }
+                    }
+                    Command::SetUserRestriction { user_id, muted, deafened } => {
+                        let msg = ControlMsg::AdminSetRestriction { user_id, muted, deafened };
+                        if conn::write_msg(&mut send, &msg).await.is_err() {
+                            break send_failed();
+                        }
+                    }
                     cmd => {
                         let send_state = local.handle_local(cmd, shared);
                         if send_state && set_state_budget.take() {
@@ -2751,6 +2793,9 @@ async fn drain_until_quit(
     loop {
         match cmd_rx.recv().await {
             None | Some(Command::Quit) => return SessionEnd::Quit,
+            Some(Command::Reconnect) => {
+                return SessionEnd::Retry(Problem::plain("Verbinde neu …"));
+            }
             Some(cmd) => {
                 let replaced = matches!(cmd, Command::ReplaceIdentity(_));
                 local.handle_local(cmd, shared);
@@ -3084,7 +3129,9 @@ async fn handle_control(
         }
         ControlMsg::AdminSetRoleOk { .. }
         | ControlMsg::AdminSetDisabledOk { .. }
-        | ControlMsg::AdminRevokeUserOk { .. } => {
+        | ControlMsg::AdminRevokeUserOk { .. }
+        | ControlMsg::AdminKickOk { .. }
+        | ControlMsg::AdminSetRestrictionOk { .. } => {
             // Acks don't carry the full row; the Nutzer tab re-issues
             // RequestUserList right after sending an action, so this just
             // confirms no error banner is needed while that refresh lands.
@@ -3109,6 +3156,20 @@ async fn handle_control(
                 }
             });
         }
+        ControlMsg::UserRestrictionChanged { muted, deafened } => {
+            shared.state.send_modify(|s| {
+                s.restricted_muted = muted;
+                s.restricted_deafened = deafened;
+            });
+            // The server already holds the bits; this brings the local
+            // pipeline and buttons in line, so no `SetState` is needed.
+            if deafened && !local.flags.deafened() {
+                local.handle_local(Command::SetDeafened(true), shared);
+            }
+            if muted && !local.flags.muted() {
+                local.handle_local(Command::SetMuted(true), shared);
+            }
+        }
         ControlMsg::Welcome { .. } => {
             return Some(SessionEnd::Fatal(Problem::new(
                 crate::problem::UPDATE_NEEDED,
@@ -3125,7 +3186,9 @@ async fn handle_control(
         | ControlMsg::AdminSetRole { .. }
         | ControlMsg::AdminSetDisabled { .. }
         | ControlMsg::AdminRevokeUser { .. }
-        | ControlMsg::UserListRequest => {
+        | ControlMsg::UserListRequest
+        | ControlMsg::AdminKick { .. }
+        | ControlMsg::AdminSetRestriction { .. } => {
             return Some(SessionEnd::Fatal(Problem::new(
                 crate::problem::UPDATE_NEEDED,
                 format!("server sent client message {}", msg.variant()),

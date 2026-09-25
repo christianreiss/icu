@@ -79,7 +79,7 @@ pub fn code_text(code: u32) -> String {
              Irrtum ist."
         }
         codes::SERVER_FULL => "Der Server ist voll. ICU versucht es gleich noch einmal.",
-        codes::KICKED => "Ein Admin hat dich vom Server entfernt.",
+        codes::KICKED => "Ein Admin hat dich vom Server geworfen.",
         codes::HELLO_TIMEOUT | codes::TIMEOUT => {
             "Die Verbindung ist eingeschlafen. ICU verbindet sich neu."
         }

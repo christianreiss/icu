@@ -16,7 +16,7 @@ pub const AUTH_UNKNOWN_CERT: u32 = 0x03;
 pub const AUTH_REVOKED: u32 = 0x04;
 /// `max_users` reached. Not fatal, the client reconnects with backoff.
 pub const SERVER_FULL: u32 = 0x05;
-/// Admin action (revoke with immediate close). Fatal.
+/// Admin action: kick, or revoke with immediate close. Fatal.
 pub const KICKED: u32 = 0x06;
 /// No `Hello` within 5 s. Not fatal.
 pub const HELLO_TIMEOUT: u32 = 0x07;
