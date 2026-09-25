@@ -2173,19 +2173,26 @@ impl LocalState {
 
         // A server that moved says so in the certificates it issues; the next
         // reconnect goes to the new address.
-        self.identity
-            .server
-            .update_from_certs(&leaf_der, &self.identity.ca_der);
-        self.identity.leaf_der = leaf_der;
-        self.identity.server.name = pending.cn.clone();
-        let saved = self.identity.save(&self.paths);
+        let mut renewed = self.identity.clone();
+        renewed.server.update_from_certs(&leaf_der, &renewed.ca_der);
+        renewed.leaf_der = leaf_der;
+        renewed.server.name = pending.cn.clone();
+        // Adopted only once stored: its first login revokes the old one
+        // (`PROTOCOL.md` §2.2 Nr. 10), so reconnecting with a leaf that is
+        // not on disk would leave the next start with a revoked certificate.
+        // The old one stays valid until then; the next renewal tries again.
+        if let Err(e) = renewed.save(&self.paths) {
+            tracing::warn!(error = %e, "cannot store the renewed certificate, keeping the old one");
+            shared.state.send_modify(|s| {
+                s.banner = Some(crate::problem::storage("Das neue Zertifikat", &e));
+            });
+            return;
+        }
+        self.identity = renewed;
         self.name = pending.cn.clone();
         tracing::info!(name = %pending.cn, reason = ?pending.reason, "certificate renewed");
         shared.state.send_modify(|s| {
             s.name_error = None;
-            if let Err(e) = &saved {
-                s.banner = Some(crate::problem::storage("Das neue Zertifikat", e));
-            }
             // Otherwise the Verbindung window keeps showing the old subject
             // and fingerprint for the rest of the session.
             if let Some(old) = s.conn_info.as_ref() {
