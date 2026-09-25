@@ -689,6 +689,14 @@ impl eframe::App for App {
                 .count();
         let watches =
             |viewing: bool, own_camera: bool| viewing && cameras > usize::from(own_camera);
+        let own = state
+            .me
+            .as_ref()
+            .map(|_| [state.deafened, state.muted, state.camera_on, state.is_admin]);
+        let columns = badge_columns(own.into_iter().chain(state.peers.iter().map(|p| {
+            let f = p.info.flags;
+            [f.deafened(), f.muted(), f.camera_on(), f.is_admin()]
+        })));
         let list = egui::CentralPanel::default().show(root, |ui| {
             // The people get a card of their own, the same surface as the
             // control dock below, so the window reads as two calm blocks.
@@ -724,6 +732,7 @@ impl eframe::App for App {
                                         session: me.session,
                                         video: self_video,
                                     },
+                                    &columns,
                                     expanded,
                                     &send,
                                 );
@@ -761,6 +770,7 @@ impl eframe::App for App {
                                             .then(|| videos.get(p.info.session))
                                             .flatten(),
                                     },
+                                    &columns,
                                     expanded,
                                     &send,
                                 );
@@ -1192,9 +1202,42 @@ fn rtt_bars(ms: u16) -> u8 {
     }
 }
 
+/// A status icon that only some people show. Order = `BADGES` order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Badge {
+    Deafened,
+    Muted,
+    Camera,
+    Admin,
+}
+
+const BADGES: [Badge; 4] = [Badge::Deafened, Badge::Muted, Badge::Camera, Badge::Admin];
+
+/// The badge columns of the list, right to left: the badges someone in the
+/// room shows right now, the most common one rightmost next to the columns
+/// every row has, the rare ones further left. Ties keep `BADGES` order. Every
+/// row draws the same columns, so the grid holds while it reorders.
+fn badge_columns(rows: impl Iterator<Item = [bool; 4]>) -> Vec<Badge> {
+    let mut counts = [0usize; 4];
+    for row in rows {
+        for (count, on) in counts.iter_mut().zip(row) {
+            *count += usize::from(on);
+        }
+    }
+    let mut columns: Vec<(usize, Badge)> = counts
+        .into_iter()
+        .zip(BADGES)
+        .filter(|&(count, _)| count > 0)
+        .collect();
+    // Stable: equal counts keep `BADGES` order.
+    columns.sort_by_key(|&(count, _)| std::cmp::Reverse(count));
+    columns.into_iter().map(|(_, badge)| badge).collect()
+}
+
 fn participant_row(
     ui: &mut egui::Ui,
     p: Participant<'_>,
+    columns: &[Badge],
     open: &mut Option<icu_proto::UserId>,
     send: &impl Fn(Command),
 ) {
@@ -1323,12 +1366,21 @@ fn participant_row(
                         };
                         slot(ui, Some(RichText::new(mode_glyph).size(15.0).color(tok.dim_text)))
                             .on_hover_text(mode_hint);
-                        for (on, color, glyph, hint) in [
-                            (p.deafened, tok.error, icon::SPEAKER_SLASH, "hört nicht zu"),
-                            (p.muted, tok.error, icon::MICROPHONE_SLASH, "stummgeschaltet"),
-                            (p.camera, tok.dim_text, icon::VIDEO_CAMERA, "Kamera an"),
-                            (p.is_admin, tok.dim_text, icon::SHIELD_STAR, "Admin"),
-                        ] {
+                        for &badge in columns {
+                            let (on, color, glyph, hint) = match badge {
+                                Badge::Deafened => {
+                                    (p.deafened, tok.error, icon::SPEAKER_SLASH, "hört nicht zu")
+                                }
+                                Badge::Muted => {
+                                    (p.muted, tok.error, icon::MICROPHONE_SLASH, "stummgeschaltet")
+                                }
+                                Badge::Camera => {
+                                    (p.camera, tok.dim_text, icon::VIDEO_CAMERA, "Kamera an")
+                                }
+                                Badge::Admin => {
+                                    (p.is_admin, tok.dim_text, icon::SHIELD_STAR, "Admin")
+                                }
+                            };
                             let glyph = RichText::new(glyph).size(15.0).color(color);
                             let r = slot(ui, on.then_some(glyph));
                             if on {
@@ -2051,6 +2103,24 @@ mod tests {
             },
             100.0,
         )
+    }
+
+    #[test]
+    fn badge_columns_put_the_common_ones_right() {
+        use super::{badge_columns, Badge};
+        //       deafened muted  camera admin
+        let rows = [
+            [false, true, false, true],
+            [false, true, true, false],
+            [false, true, false, false],
+        ];
+        // Right to left: muted (3), then camera and admin tied (1) in
+        // `BADGES` order; deafened nobody shows, so no column.
+        assert_eq!(
+            badge_columns(rows.into_iter()),
+            [Badge::Muted, Badge::Camera, Badge::Admin]
+        );
+        assert!(badge_columns(std::iter::empty()).is_empty());
     }
 
     #[test]
