@@ -282,7 +282,8 @@ pub fn run_sender(
         if want_idr {
             enc.force_intra_frame();
         }
-        let ts = (start.elapsed().as_secs_f64() * 48_000.0) as u64 as u32;
+        let ts =
+            (start.elapsed().as_secs_f64() * f64::from(crate::audio::SAMPLE_RATE)) as u64 as u32;
         match enc.encode(buf) {
             Ok(bs) => {
                 let keyframe = matches!(bs.frame_type(), FrameType::IDR | FrameType::I);

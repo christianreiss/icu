@@ -240,7 +240,6 @@ Tray: tray-icon 0.25 (Linux `default-features = false, features = ["ksni"]`), Ic
 | pipewire | 0.10.1 (Linux) | MIT | Audio Linux. Build braucht PipeWire-Header + clang (pkg-config/bindgen), linkt `libpipewire-0.3` hart; **noch nie gebaut**, Nachweis in M0. |
 | windows | 0.62.2 (Features `Win32_Media_Audio`, `Win32_UI_Input`, `Win32_UI_WindowsAndMessaging`, `Win32_Graphics_Gdi`, `Win32_Security_Cryptography`) | MIT/Apache-2.0 | WASAPI, Raw Input, Layered Window, DPAPI. `UpdateLayeredWindow` liegt in `Win32::UI::WindowsAndMessaging`, ist aber `#[cfg(feature = "Win32_Graphics_Gdi")]` — beide Features nötig. `RegisterRawInputDevices` liegt in `Win32::UI::Input` (nicht `…::KeyboardAndMouse`). DPAPI-Blob heißt `CRYPT_INTEGER_BLOB`, nicht `DATA_BLOB`. |
 | cpal | 0.18.2 | Apache-2.0 | Fallback-Host (Feature) |
-| rubato | 5.0.0 | MIT/Apache-2.0 | Resampling nur bei Bedarf |
 | ringbuf | 0.5 | MIT/Apache-2.0 | Audio-Ringpuffer (0.4.8 wäre eine Major-Version zurück, 0.4.9 ist yanked) |
 | eframe / egui | 0.36.2 | MIT/Apache-2.0 | UI |
 | tray-icon | 0.25.1 (Linux `ksni`) | MIT/Apache-2.0 | Tray |

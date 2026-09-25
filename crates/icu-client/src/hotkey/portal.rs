@@ -10,7 +10,7 @@ use ashpd::desktop::{
 use futures_util::StreamExt;
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::Action;
+use super::{Action, Dispatch};
 use crate::{config::HotkeySettings, engine::Command};
 
 /// Keeps the portal session alive.
@@ -29,37 +29,16 @@ pub async fn start(
     settings: &HotkeySettings,
     cmd: UnboundedSender<Command>,
 ) -> Result<Guard, String> {
-    let wanted: Vec<(&str, &str, Option<String>, Action)> = vec![
-        (
-            "ptt",
-            "ICU Push-to-Talk",
-            settings.ptt.trigger.clone(),
-            Action::Ptt,
-        ),
-        (
-            "mute",
-            "ICU Mute",
-            settings.mute.trigger.clone(),
-            Action::Mute,
-        ),
-        (
-            "deafen",
-            "ICU Deafen",
-            settings.deafen.trigger.clone(),
-            Action::Deafen,
-        ),
-        (
-            "toggle_mode",
-            "ICU PTT/VAD",
-            settings.toggle_mode.trigger.clone(),
-            Action::ToggleMode,
-        ),
-    ];
+    // Only a binding with a trigger is bound; the others could never fire.
+    let wanted: Vec<(Action, String)> = super::bindings(settings)
+        .into_iter()
+        .filter_map(|(binding, action)| binding.trigger.clone().map(|t| (action, t)))
+        .collect();
     let shortcuts: Vec<NewShortcut> = wanted
         .iter()
-        .filter_map(|(id, desc, trigger, _)| {
-            let t = trigger.as_ref()?;
-            Some(NewShortcut::new(*id, *desc).preferred_trigger(t.as_str()))
+        .map(|(action, trigger)| {
+            NewShortcut::new(action.portal_id(), action.description())
+                .preferred_trigger(trigger.as_str())
         })
         .collect();
     if shortcuts.is_empty() {
@@ -102,35 +81,22 @@ pub async fn start(
         .receive_deactivated()
         .await
         .map_err(|e| e.to_string())?;
-    let actions: Vec<(String, Action)> = wanted
-        .iter()
-        .map(|(id, _, _, a)| (id.to_string(), *a))
-        .collect();
+    let actions: Vec<Action> = wanted.iter().map(|(action, _)| *action).collect();
     let task = tokio::spawn(async move {
         let _session = session;
         let _portal = portal;
-        // A stream that ends mid-press must not leave the mic open.
-        let mut ptt_held = false;
+        // Dropped when the streams end: a PTT key held then is released.
+        let mut dispatch = Dispatch::new(cmd);
         loop {
             let (id, pressed) = tokio::select! {
                 Some(a) = activated.next() => (a.shortcut_id().to_string(), true),
                 Some(d) = deactivated.next() => (d.shortcut_id().to_string(), false),
-                else => {
-                    if ptt_held {
-                        let _ = cmd.send(Command::Ptt(false));
-                    }
-                    return;
-                }
+                else => return,
             };
             tracing::debug!(id, pressed, "portal shortcut event");
-            for (bound, action) in &actions {
-                if *bound == id {
-                    if *action == Action::Ptt {
-                        ptt_held = pressed;
-                    }
-                    if let Some(c) = action.command(pressed) {
-                        let _ = cmd.send(c);
-                    }
+            for action in &actions {
+                if action.portal_id() == id {
+                    dispatch.key(*action, pressed);
                 }
             }
         }

@@ -209,17 +209,10 @@ impl HistCache {
         }
         self.refreshed = Some(now);
         let h = lock(&stats.jitter_delay);
-        let fmt = |v: f64| {
-            if v.is_infinite() {
-                ">1000 ms".to_string()
-            } else {
-                format!("{v:.1} ms")
-            }
-        };
         self.jitter = if h.count() == 0 {
             NONE.to_string()
         } else {
-            format!("{} / {}", fmt(h.quantile_ms(0.5)), fmt(h.quantile_ms(0.95)))
+            h.p50_p95()
         };
         &self.jitter
     }

@@ -4,7 +4,7 @@
 use icu_proto::limits::LOSS_HINT_MAX_PERCENT;
 
 /// Sample rate.
-pub const RATE: u32 = 48_000;
+pub const RATE: u32 = crate::audio::SAMPLE_RATE;
 /// Largest packet the protocol allows.
 pub const MAX_PACKET: usize = icu_proto::header::AUDIO_MAX_PAYLOAD;
 

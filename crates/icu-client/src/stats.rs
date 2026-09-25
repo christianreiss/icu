@@ -82,6 +82,15 @@ impl Histogram {
         self.max_ms
     }
 
+    /// `p50 / p95`, the way the windows show a latency histogram.
+    pub fn p50_p95(&self) -> String {
+        format!(
+            "{} / {}",
+            fmt_ms(self.quantile_ms(0.5)),
+            fmt_ms(self.quantile_ms(0.95))
+        )
+    }
+
     /// One line summary.
     pub fn summary(&self) -> String {
         format!(
@@ -93,6 +102,16 @@ impl Histogram {
             self.mean_ms(),
             self.max_ms
         )
+    }
+}
+
+/// A histogram figure in ms for the windows; the open-ended last bucket
+/// reads `>1000 ms`.
+pub fn fmt_ms(v: f64) -> String {
+    if v.is_infinite() {
+        ">1000 ms".to_string()
+    } else {
+        format!("{v:.1} ms")
     }
 }
 

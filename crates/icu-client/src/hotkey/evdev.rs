@@ -16,7 +16,7 @@ use std::{
 use evdev::{Device, EventSummary, KeyCode};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::Action;
+use super::{Action, Dispatch};
 use crate::{config::HotkeySettings, engine::Command};
 
 /// Parses `KEY_F12`, `BTN_SIDE` or `code:<n>`.
@@ -72,41 +72,50 @@ impl Drop for Guard {
 
 /// Starts readers for every device that has one of the bound keys. Must be
 /// called from within a tokio runtime.
-pub fn start(
+pub async fn start(
     settings: &HotkeySettings,
     cmd: UnboundedSender<Command>,
 ) -> Result<(Guard, usize), String> {
-    let bindings: Vec<(KeyCode, Action)> = [
-        (&settings.ptt, Action::Ptt),
-        (&settings.mute, Action::Mute),
-        (&settings.deafen, Action::Deafen),
-        (&settings.toggle_mode, Action::ToggleMode),
-    ]
-    .into_iter()
-    .filter_map(|(b, a)| parse_key(&b.key).map(|k| (k, a)))
-    .collect();
+    let bindings: Vec<(KeyCode, Action)> = super::bindings(settings)
+        .into_iter()
+        .filter_map(|(b, a)| parse_key(&b.key).map(|k| (k, a)))
+        .collect();
     if bindings.is_empty() {
         return Err("no evdev key bound".into());
     }
     let stop = Arc::new(AtomicBool::new(false));
     let opened = Arc::new(std::sync::Mutex::new(HashSet::<PathBuf>::new()));
-    let n = scan(&bindings, &cmd, &stop, &opened);
+    let n = scan_blocking(&bindings, &cmd, &stop, &opened).await;
     if n == 0 {
         return Err("no readable input device has the bound keys".into());
     }
     // Hot-plug: rescan periodically.
     {
         let stop = stop.clone();
-        let bindings = bindings.clone();
-        let cmd = cmd.clone();
         tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                scan(&bindings, &cmd, &stop, &opened);
+                scan_blocking(&bindings, &cmd, &stop, &opened).await;
             }
         });
     }
     Ok((Guard { stop }, n))
+}
+
+/// [`scan`] on the blocking pool: it opens and queries every input device,
+/// which must not stall the runtime's workers — they read the audio
+/// datagrams and time their arrival.
+async fn scan_blocking(
+    bindings: &[(KeyCode, Action)],
+    cmd: &UnboundedSender<Command>,
+    stop: &Arc<AtomicBool>,
+    opened: &Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+) -> usize {
+    let (bindings, cmd, stop, opened) =
+        (bindings.to_vec(), cmd.clone(), stop.clone(), opened.clone());
+    tokio::task::spawn_blocking(move || scan(&bindings, &cmd, &stop, &opened))
+        .await
+        .unwrap_or(0)
 }
 
 fn scan(
@@ -162,17 +171,11 @@ fn spawn_reader(
                 return;
             }
         };
-        // Whether this device last reported a bound PTT key down: a reader
-        // that exits mid-press must release it, or the mic stays open.
-        let mut ptt_held = false;
-        let release = |held: bool| {
-            if held {
-                let _ = cmd.send(Command::Ptt(false));
-            }
-        };
+        // Dropped on every way out: a PTT key held then is released, or the
+        // mic would stay open.
+        let mut dispatch = Dispatch::new(cmd);
         loop {
             if stop.load(Ordering::Relaxed) {
-                release(ptt_held);
                 return;
             }
             let ev = tokio::select! {
@@ -184,7 +187,6 @@ fn spawn_reader(
                 Err(_) => {
                     // Device gone; let the rescan pick it up again.
                     opened.lock().unwrap().remove(&path);
-                    release(ptt_held);
                     return;
                 }
             };
@@ -196,12 +198,7 @@ fn spawn_reader(
                 };
                 for (k, action) in &bindings {
                     if *k == code {
-                        if *action == Action::Ptt {
-                            ptt_held = pressed;
-                        }
-                        if let Some(c) = action.command(pressed) {
-                            let _ = cmd.send(c);
-                        }
+                        dispatch.key(*action, pressed);
                     }
                 }
             }

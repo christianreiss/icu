@@ -1719,21 +1719,8 @@ impl SettingsView {
             return;
         }
         self.diagnose.refreshed = Some(now);
-        let fmt_ms = |v: f64| {
-            if v.is_infinite() {
-                ">1000 ms".to_string()
-            } else {
-                format!("{v:.1} ms")
-            }
-        };
-        {
-            let h = self.stats.jitter_delay.lock().unwrap();
-            self.diagnose.jitter = format!(
-                "{} / {}",
-                fmt_ms(h.quantile_ms(0.5)),
-                fmt_ms(h.quantile_ms(0.95))
-            );
-        }
+        let fmt_ms = crate::stats::fmt_ms;
+        self.diagnose.jitter = self.stats.jitter_delay.lock().unwrap().p50_p95();
         {
             let h = self.stats.capture_to_send.lock().unwrap();
             self.diagnose.capture_send =
