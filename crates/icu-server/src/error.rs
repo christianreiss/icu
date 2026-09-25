@@ -86,13 +86,19 @@ from_display!(
     quinn::ConnectError,
     quinn::crypto::rustls::NoInitialCipherSuite,
     rustls::server::VerifierBuilderError,
-    icu_proto::ProtoError,
     icu_proto::NameError,
     icu_proto::VersionError,
     time::error::Format,
     time::error::Parse,
     rustix::io::Errno,
 );
+
+/// A wire error is the peer's fault: it carries `PROTOCOL_VIOLATION`.
+impl From<icu_proto::ProtoError> for Error {
+    fn from(e: icu_proto::ProtoError) -> Error {
+        Error::coded(e.error_code(), e)
+    }
+}
 
 /// Adds context to a `Result`.
 pub trait Context<T> {

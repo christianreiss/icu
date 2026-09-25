@@ -74,8 +74,6 @@ pub struct Server {
     pub ip_limits: std::sync::Mutex<IpLimits>,
     /// `LossReport` aggregation per speaker.
     pub loss: std::sync::Mutex<LossTracker>,
-    /// Last forwarded `KeyframeRequest` per speaker.
-    pub keyframes: std::sync::Mutex<std::collections::HashMap<icu_proto::Session, Instant>>,
     /// Connection tasks alive right now, handshaking or established, over
     /// all endpoints (`limits.max_connections`).
     pub open_connections: std::sync::atomic::AtomicUsize,
@@ -117,23 +115,40 @@ impl Server {
             &config.tls,
             &config.server.server_name,
         )?;
+        Ok(Arc::new(Server::new(
+            config,
+            store,
+            ca,
+            Vec::new(),
+            Vec::new(),
+        )))
+    }
+
+    /// The shared state around already opened store, CA and endpoints, with
+    /// an empty room and fresh counters.
+    fn new(
+        config: Config,
+        store: Store,
+        ca: Ca,
+        endpoints: Vec<quinn::Endpoint>,
+        crl: Vec<u8>,
+    ) -> Server {
         let (shutdown, _) = watch::channel(false);
-        Ok(Arc::new(Server {
+        Server {
             room: Room::new(config.server.max_users),
             ip_limits: std::sync::Mutex::new(IpLimits::new(&config.limits)),
             loss: std::sync::Mutex::new(LossTracker::default()),
-            keyframes: std::sync::Mutex::new(std::collections::HashMap::new()),
             open_connections: std::sync::atomic::AtomicUsize::new(0),
             live_certs: std::sync::Mutex::new(std::collections::HashMap::new()),
-            endpoints: Vec::new(),
-            crl: std::sync::RwLock::new(Vec::new()),
+            endpoints,
+            crl: std::sync::RwLock::new(crl),
             counters: Counters::default(),
             ca: tokio::sync::RwLock::new(ca),
             store: tokio::sync::Mutex::new(store),
             started: Instant::now(),
             shutdown,
             config,
-        }))
+        }
     }
 
     /// Resolves when shutdown is requested.
@@ -151,7 +166,6 @@ impl Server {
 pub struct Handle {
     server: Arc<Server>,
     addrs: Vec<SocketAddr>,
-    endpoints: Vec<quinn::Endpoint>,
     tasks: Vec<JoinHandle<()>>,
     admin_socket: Option<std::path::PathBuf>,
 }
@@ -192,20 +206,12 @@ impl Handle {
     /// releases the state lock (§6.1.8).
     pub async fn shutdown(self) {
         let _ = self.server.shutdown.send(true);
-        self.server
-            .room
-            .mark_all_closing(icu_proto::error::SHUTDOWN);
-        for conn in self.server.room.connections() {
-            conn.close(
-                quinn::VarInt::from_u32(icu_proto::error::SHUTDOWN),
-                b"shutdown",
-            );
-        }
+        self.server.room.close_all(icu_proto::error::SHUTDOWN);
         tokio::time::sleep(Duration::from_millis(
             self.server.config.timing.shutdown_grace_ms,
         ))
         .await;
-        for endpoint in &self.endpoints {
+        for endpoint in &self.server.endpoints {
             endpoint.close(
                 quinn::VarInt::from_u32(icu_proto::error::SHUTDOWN),
                 b"shutdown",
@@ -219,7 +225,7 @@ impl Handle {
         }
         // Dropping the Arc releases the Store and with it `flock(state.lock)`,
         // but only once every task holding a clone is gone.
-        for endpoint in &self.endpoints {
+        for endpoint in &self.server.endpoints {
             endpoint.wait_idle().await;
         }
     }
@@ -258,26 +264,10 @@ pub async fn run(config: Config) -> Result<Handle> {
         endpoints.push(endpoint);
     }
 
-    let (shutdown, _) = watch::channel(false);
-    let server = Arc::new(Server {
-        room: Room::new(config.server.max_users),
-        ip_limits: std::sync::Mutex::new(IpLimits::new(&config.limits)),
-        loss: std::sync::Mutex::new(LossTracker::default()),
-        keyframes: std::sync::Mutex::new(std::collections::HashMap::new()),
-        open_connections: std::sync::atomic::AtomicUsize::new(0),
-        live_certs: std::sync::Mutex::new(std::collections::HashMap::new()),
-        endpoints: endpoints.clone(),
-        crl: std::sync::RwLock::new(crl.to_vec()),
-        counters: Counters::default(),
-        ca: tokio::sync::RwLock::new(ca),
-        store: tokio::sync::Mutex::new(store),
-        started: Instant::now(),
-        shutdown,
-        config,
-    });
+    let server = Arc::new(Server::new(config, store, ca, endpoints, crl.to_vec()));
 
     let mut tasks = Vec::new();
-    for endpoint in &endpoints {
+    for endpoint in &server.endpoints {
         tasks.push(tokio::spawn(endpoint::accept_loop(
             server.clone(),
             endpoint.clone(),
@@ -307,7 +297,6 @@ pub async fn run(config: Config) -> Result<Handle> {
     Ok(Handle {
         server,
         addrs,
-        endpoints,
         tasks,
         admin_socket,
     })
@@ -335,10 +324,7 @@ async fn housekeeping(server: Arc<Server>) {
 
         // The expiry of a report is a change: the speaker must learn that it
         // can stop paying for FEC (`PROTOCOL.md` §2.2).
-        let hints = {
-            let mut loss = server.loss.lock().unwrap_or_else(|e| e.into_inner());
-            loss.expire(ttl)
-        };
+        let hints = lock(&server.loss).expire(ttl);
         for (speaker, loss_permille) in hints {
             server
                 .room
@@ -366,11 +352,7 @@ async fn housekeeping(server: Arc<Server>) {
         }
 
         if prune_counter.is_multiple_of(600) {
-            server
-                .ip_limits
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .prune();
+            lock(&server.ip_limits).prune();
         }
     }
 }
@@ -389,18 +371,14 @@ async fn check_cert_expiry(server: Arc<Server>) {
             ca::leaf_days_left_checked(ca.ca_der()),
         )
     };
-    let ca_threshold = CA_RENEW_DAYS
-        .min(i64::from(server.config.tls.ca_validity_days) / 3)
-        .max(1);
-    if ca_left.is_none_or(|left| left < ca_threshold) {
+    if renewal_due(ca_left, server.config.tls.ca_validity_days, CA_RENEW_DAYS) {
         tracing::warn!(days_left = ?ca_left, "the CA certificate expires soon, renewing");
         match admin::renew_ca(&server).await {
             Ok(()) => tracing::info!("CA certificate renewed under the same key"),
             Err(e) => tracing::error!(error = %e, "automatic CA certificate renewal failed"),
         }
     }
-    let threshold = WARN_DAYS.min(i64::from(server.config.tls.server_validity_days) / 3).max(1);
-    if leaf_left.is_none_or(|left| left < threshold) {
+    if renewal_due(leaf_left, server.config.tls.server_validity_days, WARN_DAYS) {
         tracing::warn!(
             days_left = ?leaf_left,
             "server certificate expires soon, rotating"
@@ -410,6 +388,20 @@ async fn check_cert_expiry(server: Arc<Server>) {
             Err(e) => tracing::error!(error = %e, "automatic server certificate rotation failed"),
         }
     }
+}
+
+/// Whether a certificate with `days_left` (`None`: unreadable) is due for
+/// renewal: fewer than `min(cap, validity / 3)` days, at least one, remain.
+fn renewal_due(days_left: Option<i64>, validity_days: u32, cap_days: i64) -> bool {
+    let threshold = cap_days.min(i64::from(validity_days) / 3).max(1);
+    days_left.is_none_or(|left| left < threshold)
+}
+
+/// Locks a `std` mutex, recovering from poisoning: the state behind every
+/// lock in this crate is a plain map or counter that stays consistent when a
+/// holder panics, so nothing is gained by propagating the panic.
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Installs the `tracing` subscriber from the configuration.

@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use icu_proto::{
     error as ec, limits as pl, name_key, AudioParams, ControlMsg, Session, UserId, UserInfo,
     MAX_CONTROL_FRAME,
@@ -14,12 +15,13 @@ use rustls::pki_types::CertificateDer;
 use tokio::sync::mpsc;
 
 use crate::{
-    ca,
-    error::{Error, Result},
+    admin, ca,
+    error::{Context, Error, Result},
     limits::{TokenBucket, ViolationCounter},
+    lock,
     relay::{self, VideoSender},
     room::{Counters, JoinError},
-    store::{fingerprint, now, parse_rfc3339, rfc3339, unix_millis, CertRecord, Store},
+    store::{fingerprint, now, parse_rfc3339, rfc3339, unix_millis, CertRecord, Store, UserRecord},
     wire, Server,
 };
 
@@ -46,7 +48,7 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
             } else {
                 tracing::info!(%remote, error = %e, "rejected");
             }
-            conn.close(quinn::VarInt::from_u32(code), ec::name(code).as_bytes());
+            wire::close(&conn, code);
             return Err(e);
         }
     };
@@ -57,7 +59,7 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
         if let Err(e) = enroll_budget(&server, &conn) {
             tracing::info!(%remote, user_id = identity.user_id, error = %e, "rejected");
             let code = ec::ENROLL_RATE_LIMITED;
-            conn.close(quinn::VarInt::from_u32(code), ec::name(code).as_bytes());
+            wire::close(&conn, code);
             return Err(e);
         }
     }
@@ -68,9 +70,11 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
     let _live = (!identity.expired).then(|| LiveCert::claim(&server, &identity.cert_fp, &conn));
 
     let served = if identity.registration {
-        serve_registration(&server, &conn, &identity).await
+        let exchange = |deadline| registration_exchange(&server, &conn, &identity, deadline);
+        renew_only(exchange, "registration took too long").await
     } else if identity.expired {
-        serve_recovery(&server, &conn, &identity).await
+        let exchange = |deadline| recovery_exchange(&server, &conn, &identity, deadline);
+        renew_only(exchange, "renewal took too long").await
     } else {
         serve(&server, &conn, &identity).await
     };
@@ -79,7 +83,7 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
         Err(e) => {
             let code = e.code().unwrap_or(ec::PROTOCOL_VIOLATION);
             tracing::info!(%remote, user_id = identity.user_id, error = %e, "closing");
-            conn.close(quinn::VarInt::from_u32(code), ec::name(code).as_bytes());
+            wire::close(&conn, code);
             Err(e)
         }
     }
@@ -98,22 +102,17 @@ struct LiveCert {
 
 impl LiveCert {
     fn claim(server: &Arc<Server>, fp: &str, conn: &quinn::Connection) -> LiveCert {
-        let old = server
-            .live_certs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(fp.to_string(), conn.clone());
+        let old = lock(&server.live_certs).insert(fp.to_string(), conn.clone());
         if let Some(old) = old.filter(|old| old.stable_id() != conn.stable_id()) {
-            // Mark before closing, like `kick_user`, so `UserLeft` carries the
+            // Through the room when it is in there, so `UserLeft` carries the
             // code. An old session still before `room.join` sees its closed
             // connection right after joining and leaves again.
-            if let Some(session) = server.room.session_of_connection(old.stable_id()) {
-                server.room.mark_closing(session, ec::SESSION_REPLACED);
+            if !server
+                .room
+                .close_connection(old.stable_id(), ec::SESSION_REPLACED)
+            {
+                wire::close(&old, ec::SESSION_REPLACED);
             }
-            old.close(
-                quinn::VarInt::from_u32(ec::SESSION_REPLACED),
-                ec::name(ec::SESSION_REPLACED).as_bytes(),
-            );
             tracing::info!(
                 fingerprint = fp,
                 old = %old.remote_address(),
@@ -131,11 +130,7 @@ impl LiveCert {
 
 impl Drop for LiveCert {
     fn drop(&mut self) {
-        let mut live = self
-            .server
-            .live_certs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut live = lock(&self.server.live_certs);
         // Only our own entry: a replacement already sits there otherwise.
         if live.get(&self.fp).is_some_and(|c| c.stable_id() == self.id) {
             live.remove(&self.fp);
@@ -177,41 +172,29 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
         .first()
         .ok_or_else(|| Error::coded(ec::AUTH_REQUIRED, "empty certificate chain"))?;
     let fp = fingerprint(leaf);
+    let info = ca::leaf_info(leaf);
 
     // This lookup is the admission, not a second line behind the CRL: on a
     // TLS 1.3 resumption rustls does not run the client verifier again, so
     // the CRL is not checked there. Never drop it as redundant.
     let mut store = server.store.lock().await;
-    let (user_id, user, cert) = store
-        .by_fingerprint(&fp)
-        .ok_or_else(|| Error::coded(ec::AUTH_UNKNOWN_CERT, format!("unknown fingerprint {fp}")))?;
-    if cert.revoked {
-        return Err(Error::coded(
-            ec::AUTH_REVOKED,
-            format!("certificate {fp} is revoked"),
-        ));
-    }
-    if user.disabled {
-        return Err(Error::coded(
-            ec::AUTH_DISABLED,
-            format!("user_id {user_id} is disabled"),
-        ));
-    }
-    let cert_cn = ca::leaf_common_name(leaf);
-    if name_key(&cert_cn) != name_key(&user.name) {
+    let (user_id, user, cert) = admit(&store, &fp)?;
+    if name_key(&info.cn) != name_key(&user.name) {
         // Not a reason to reject: the store keeps fingerprints, not DER, so
         // certificates issued before the name moved into the certificate have
         // no recorded CN at all. The client notices the same mismatch and
         // renews itself (`PROTOCOL.md` §2.2).
         tracing::debug!(
             user_id,
-            cert_cn = %cert_cn,
+            cert_cn = %info.cn,
             stored = %user.name,
             "stale cn, client will catch up"
         );
     }
     let registration = cert.registration;
-    let expired = ca::leaf_expired(leaf);
+    let expired = info
+        .validity
+        .is_some_and(|(_, not_after)| not_after <= now());
     // The handshake forgives expiry only for renewing a real certificate; a
     // registration certificate that ran out is spent (`PROTOCOL.md` §2.3).
     if registration && expired {
@@ -230,7 +213,6 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
             tracing::warn!(user_id, error = %e, "cannot consume the registration");
             false
         });
-    let spki = ca::leaf_public_key(leaf);
     drop(store);
     if consumed {
         crate::endpoint::reload_tls_logged(server).await;
@@ -238,12 +220,33 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
     Ok(Identity {
         user_id,
         cert_fp: fp,
-        cert_cn,
+        cert_cn: info.cn,
         registration,
-        cert_spki: spki,
+        cert_spki: info.spki,
         expired,
-        cert_validity: ca::leaf_validity(leaf),
+        cert_validity: info.validity,
     })
+}
+
+/// The store's admission of a presented certificate: known, not revoked, its
+/// user not disabled. Run once in [`authenticate`] and again in [`serve`].
+fn admit<'a>(store: &'a Store, fp: &str) -> Result<(UserId, &'a UserRecord, &'a CertRecord)> {
+    let (user_id, user, cert) = store
+        .by_fingerprint(fp)
+        .ok_or_else(|| Error::coded(ec::AUTH_UNKNOWN_CERT, format!("unknown fingerprint {fp}")))?;
+    if cert.revoked {
+        return Err(Error::coded(
+            ec::AUTH_REVOKED,
+            format!("certificate {fp} is revoked"),
+        ));
+    }
+    if user.disabled {
+        return Err(Error::coded(
+            ec::AUTH_DISABLED,
+            format!("user_id {user_id} is disabled"),
+        ));
+    }
+    Ok((user_id, user, cert))
 }
 
 /// What `Hello` said, plus the control stream it arrived on.
@@ -271,8 +274,7 @@ async fn read_hello(server: &Arc<Server>, conn: &quinn::Connection) -> Result<He
         .await
         .map_err(|_| Error::coded(ec::HELLO_TIMEOUT, "no Hello within the timeout"))??;
 
-    let hello = ControlMsg::decode(&body)
-        .map_err(|e| Error::coded(ec::PROTOCOL_VIOLATION, format!("bad Hello: {e}")))?;
+    let hello = ControlMsg::decode(&body).context("bad Hello")?;
     let ControlMsg::Hello {
         minor,
         caps: _,
@@ -328,38 +330,20 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     // releasing it, so either this check sees the change or the kick sees
     // the session.
     let store = server.store.lock().await;
-    let (_, user, cert) = store.by_fingerprint(&identity.cert_fp).ok_or_else(|| {
-        Error::coded(
-            ec::AUTH_UNKNOWN_CERT,
-            format!("unknown user_id {}", identity.user_id),
-        )
-    })?;
-    if cert.revoked {
-        return Err(Error::coded(ec::AUTH_REVOKED, "certificate revoked"));
-    }
-    if user.disabled {
-        return Err(Error::coded(ec::AUTH_DISABLED, "user disabled"));
-    }
+    let (_, user, _) = admit(&store, &identity.cert_fp)?;
     let stored_name = user.name.clone();
     let is_admin = user.is_admin;
 
     // 3. Join, `Welcome`, `UserJoined`.
-    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>(crate::limits::CONTROL_QUEUE_FRAMES);
-    let min_client = server.config.server.min_client.clone();
-    let welcome = |session, flags, users| ControlMsg::Welcome {
-        minor,
-        caps: icu_proto::CAPS,
-        you: UserInfo {
+    let (out_tx, out_rx) = mpsc::channel(crate::limits::CONTROL_QUEUE_FRAMES);
+    let welcome = |session, flags, users| {
+        let you = UserInfo {
             user_id: identity.user_id,
             session,
             name: stored_name.clone(),
             flags,
-        },
-        audio: AudioParams::default(),
-        users,
-        min_client,
-        is_admin,
-        registration: false,
+        };
+        welcome(server, minor, you, users, is_admin, false)
     };
     let session = match server.room.join(
         identity.user_id,
@@ -406,21 +390,11 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     uni.abort();
     writer.abort();
     let member = server.room.leave(session);
-    let hints = server
-        .loss
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .forget(session);
-    for (speaker, loss_permille) in hints {
+    for (speaker, loss_permille) in lock(&server.loss).forget(session) {
         server
             .room
             .send_to(speaker, &ControlMsg::LossHint { loss_permille });
     }
-    server
-        .keyframes
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&session);
 
     // `UserLeft.reason` (§6.4.6): the code the server closed with if it was the
     // server, otherwise the peer's application close code, otherwise TIMEOUT
@@ -450,59 +424,36 @@ const REGISTRATION_LINGER: Duration = Duration::from_secs(5);
 /// `RenewRequest`s one registration session may send before it is closed.
 const REGISTRATION_ATTEMPTS: u32 = 10;
 
-/// A session authenticated with a registration certificate
-/// (`PROTOCOL.md` §2.3). It never joins the room: after `Welcome` with
-/// `registration = true` the only useful message is a `RenewRequest` with a
-/// fresh key. On success the answer is `RenewResponse`, the registration
-/// certificate is revoked, and the client reconnects with its own.
-async fn serve_registration(
-    server: &Arc<Server>,
-    conn: &quinn::Connection,
-    identity: &Identity,
-) -> Result<()> {
-    // The cap covers the whole session, writes included: a client that stops
-    // reading stalls a write on flow control, where no `select!` around a
-    // read could end it.
+/// Runs a renew-only exchange — registration or recovery — under the session
+/// cap. The cap covers the whole session, writes included: a client that
+/// stops reading stalls a write on flow control, where no `select!` around a
+/// read could end it.
+async fn renew_only<F>(
+    exchange: impl FnOnce(tokio::time::Instant) -> F,
+    timed_out: &'static str,
+) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
     let deadline = tokio::time::Instant::now() + REGISTRATION_SESSION;
-    tokio::time::timeout_at(
-        deadline + REGISTRATION_LINGER,
-        registration_exchange(server, conn, identity, deadline),
-    )
-    .await
-    .unwrap_or_else(|_| Err(Error::coded(ec::TIMEOUT, "registration took too long")))
+    tokio::time::timeout_at(deadline + REGISTRATION_LINGER, exchange(deadline))
+        .await
+        .unwrap_or_else(|_| Err(Error::coded(ec::TIMEOUT, timed_out)))
 }
 
-/// A session authenticated with an **expired** certificate
-/// (`PROTOCOL.md` §2.3): renew-only. It never joins the room. After `Welcome`
-/// (with no users) comes `Error{RENEW_REQUIRED}`, and the only useful message
-/// is a `RenewRequest` under the stored name with the existing key; anything
-/// else is answered with `RENEW_REQUIRED` again. After `RenewResponse` the
-/// client stores the leaf, closes, and reconnects with it. Bounded in time and
-/// attempts like a registration session.
-async fn serve_recovery(
+/// The start of a renew-only session: `Hello`, then a `Welcome` with no
+/// session and no user list, written straight onto the stream (there is no
+/// room queue). Returns the control stream.
+async fn roomless_welcome(
     server: &Arc<Server>,
     conn: &quinn::Connection,
     identity: &Identity,
-) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + REGISTRATION_SESSION;
-    tokio::time::timeout_at(
-        deadline + REGISTRATION_LINGER,
-        recovery_exchange(server, conn, identity, deadline),
-    )
-    .await
-    .unwrap_or_else(|_| Err(Error::coded(ec::TIMEOUT, "renewal took too long")))
-}
-
-/// Hello, `Welcome` and the `RenewRequest` loop of [`serve_recovery`].
-async fn recovery_exchange(
-    server: &Arc<Server>,
-    conn: &quinn::Connection,
-    identity: &Identity,
-    deadline: tokio::time::Instant,
-) -> Result<()> {
+    registration: bool,
+    what: &str,
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
     let Hello {
         mut send,
-        mut recv,
+        recv,
         minor,
         client,
         initial: _,
@@ -514,61 +465,85 @@ async fn recovery_exchange(
             .ok_or_else(|| Error::coded(ec::AUTH_UNKNOWN_CERT, "user vanished"))?;
         (user.name.clone(), user.is_admin)
     };
-    let welcome = ControlMsg::Welcome {
-        minor,
-        caps: icu_proto::CAPS,
-        you: UserInfo {
-            user_id: identity.user_id,
-            session: 0,
-            name,
-            flags: icu_proto::UserFlags::NONE,
-        },
-        audio: AudioParams::default(),
-        users: Vec::new(),
-        min_client: server.config.server.min_client.clone(),
-        is_admin,
-        registration: false,
+    let you = UserInfo {
+        user_id: identity.user_id,
+        session: 0,
+        name,
+        flags: icu_proto::UserFlags::NONE,
     };
+    let welcome = welcome(server, minor, you, Vec::new(), is_admin, registration);
     write_msg(&mut send, &welcome).await?;
+    tracing::info!(
+        user_id = identity.user_id,
+        remote = %conn.remote_address(),
+        client = %client,
+        "{what}"
+    );
+    Ok((send, recv))
+}
+
+/// One frame of a renew-only session. `None` once the client ended the
+/// stream; an error past `deadline`, on shutdown, or for a bad frame.
+async fn read_bounded(
+    server: &Arc<Server>,
+    recv: &mut quinn::RecvStream,
+    deadline: tokio::time::Instant,
+    timed_out: &'static str,
+) -> Result<Option<Vec<u8>>> {
+    let body = tokio::select! {
+        body = wire::read_frame(recv, MAX_CONTROL_FRAME) => body,
+        _ = tokio::time::sleep_until(deadline) => {
+            return Err(Error::coded(ec::TIMEOUT, timed_out));
+        }
+        _ = server.shutdown_requested() => {
+            return Err(Error::coded(ec::SHUTDOWN, "server is shutting down"));
+        }
+    };
+    stream_end(body)
+}
+
+/// A closed or reset control stream is a normal end of connection (`None`);
+/// only a bad frame, `PROTOCOL_VIOLATION`, is the client's fault.
+fn stream_end(read: Result<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+    match read {
+        Ok(body) => Ok(Some(body)),
+        Err(e) if e.code() == Some(ec::PROTOCOL_VIOLATION) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+/// A session authenticated with an **expired** certificate
+/// (`PROTOCOL.md` §2.3): renew-only. It never joins the room. After `Welcome`
+/// (with no users) comes `Error{RENEW_REQUIRED}`, and the only useful message
+/// is a `RenewRequest` under the stored name with the existing key; anything
+/// else is answered with `RENEW_REQUIRED` again. After `RenewResponse` the
+/// client stores the leaf, closes, and reconnects with it. Bounded in time and
+/// attempts like a registration session.
+async fn recovery_exchange(
+    server: &Arc<Server>,
+    conn: &quinn::Connection,
+    identity: &Identity,
+    deadline: tokio::time::Instant,
+) -> Result<()> {
+    let what = "renew-only session, certificate expired";
+    let (mut send, mut recv) = roomless_welcome(server, conn, identity, false, what).await?;
     let required = ControlMsg::Error {
         code: ec::RENEW_REQUIRED,
         detail: "certificate expired, renew it".into(),
     };
     write_msg(&mut send, &required).await?;
-    tracing::info!(
-        user_id = identity.user_id,
-        remote = %conn.remote_address(),
-        client = %client,
-        "renew-only session, certificate expired"
-    );
 
     let mut pings = TokenBucket::per_second(server.config.limits.control_msgs_per_s);
     let mut attempts = 0u32;
     loop {
-        let body = tokio::select! {
-            body = wire::read_frame(&mut recv, MAX_CONTROL_FRAME) => body,
-            _ = tokio::time::sleep_until(deadline) => {
-                return Err(Error::coded(ec::TIMEOUT, "renewal took too long"));
-            }
-            _ = server.shutdown_requested() => {
-                return Err(Error::coded(ec::SHUTDOWN, "server is shutting down"));
-            }
+        let Some(body) = read_bounded(server, &mut recv, deadline, "renewal took too long").await?
+        else {
+            return Ok(());
         };
-        let body = match body {
-            Ok(body) => body,
-            Err(e) if e.code() == Some(ec::PROTOCOL_VIOLATION) => return Err(e),
-            Err(_) => return Ok(()),
-        };
-        let msg = ControlMsg::decode(&body)
-            .map_err(|e| Error::coded(ec::PROTOCOL_VIOLATION, e.to_string()))?;
-        match msg {
+        match ControlMsg::decode(&body)? {
             ControlMsg::Ping { nonce } => {
                 if pings.take_one() {
-                    let pong = ControlMsg::Pong {
-                        nonce,
-                        server_time_ms: unix_millis(),
-                    };
-                    write_msg(&mut send, &pong).await?;
+                    write_msg(&mut send, &pong(nonce)).await?;
                 }
                 continue;
             }
@@ -604,11 +579,7 @@ async fn recovery_exchange(
 
 /// Registration sessions: 5/min per IP, 20/min global (`PROTOCOL.md` §7).
 fn enroll_budget(server: &Arc<Server>, conn: &quinn::Connection) -> Result<()> {
-    let allowed = server
-        .ip_limits
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .allow_enroll(conn.remote_address().ip());
+    let allowed = lock(&server.ip_limits).allow_enroll(conn.remote_address().ip());
     Counters::inc(&server.counters.enroll_attempts);
     if !allowed {
         Counters::inc(&server.counters.enroll_failed);
@@ -620,78 +591,33 @@ fn enroll_budget(server: &Arc<Server>, conn: &quinn::Connection) -> Result<()> {
     Ok(())
 }
 
-/// Hello, `Welcome` and the `RenewRequest` loop of [`serve_registration`].
+/// A session authenticated with a registration certificate
+/// (`PROTOCOL.md` §2.3). It never joins the room: after `Welcome` with
+/// `registration = true` the only useful message is a `RenewRequest` with a
+/// fresh key. On success the answer is `RenewResponse`, the registration
+/// certificate is revoked, and the client reconnects with its own.
 async fn registration_exchange(
     server: &Arc<Server>,
     conn: &quinn::Connection,
     identity: &Identity,
     deadline: tokio::time::Instant,
 ) -> Result<()> {
-    let Hello {
-        mut send,
-        mut recv,
-        minor,
-        client,
-        initial: _,
-    } = read_hello(server, conn).await?;
-    let (name, is_admin) = {
-        let store = server.store.lock().await;
-        let user = store.user(identity.user_id).ok_or_else(|| {
-            Error::coded(ec::AUTH_UNKNOWN_CERT, "registration user vanished")
-        })?;
-        (user.name.clone(), user.is_admin)
-    };
-    let welcome = ControlMsg::Welcome {
-        minor,
-        caps: icu_proto::CAPS,
-        you: UserInfo {
-            user_id: identity.user_id,
-            session: 0,
-            name,
-            flags: icu_proto::UserFlags::NONE,
-        },
-        audio: AudioParams::default(),
-        users: Vec::new(),
-        min_client: server.config.server.min_client.clone(),
-        is_admin,
-        registration: true,
-    };
-    write_msg(&mut send, &welcome).await?;
-    tracing::info!(
-        user_id = identity.user_id,
-        remote = %conn.remote_address(),
-        client = %client,
-        "registration session"
-    );
+    let (mut send, mut recv) =
+        roomless_welcome(server, conn, identity, true, "registration session").await?;
 
     // Nothing else bounds `Ping` here; past the rate it goes unanswered.
     let mut pings = TokenBucket::per_second(server.config.limits.control_msgs_per_s);
     let mut attempts = 0u32;
     loop {
-        let body = tokio::select! {
-            body = wire::read_frame(&mut recv, MAX_CONTROL_FRAME) => body,
-            _ = tokio::time::sleep_until(deadline) => {
-                return Err(Error::coded(ec::TIMEOUT, "registration took too long"));
-            }
-            _ = server.shutdown_requested() => {
-                return Err(Error::coded(ec::SHUTDOWN, "server is shutting down"));
-            }
+        let Some(body) =
+            read_bounded(server, &mut recv, deadline, "registration took too long").await?
+        else {
+            return Ok(());
         };
-        let body = match body {
-            Ok(body) => body,
-            Err(e) if e.code() == Some(ec::PROTOCOL_VIOLATION) => return Err(e),
-            Err(_) => return Ok(()),
-        };
-        let msg = ControlMsg::decode(&body)
-            .map_err(|e| Error::coded(ec::PROTOCOL_VIOLATION, e.to_string()))?;
-        match msg {
+        match ControlMsg::decode(&body)? {
             ControlMsg::Ping { nonce } => {
                 if pings.take_one() {
-                    let pong = ControlMsg::Pong {
-                        nonce,
-                        server_time_ms: unix_millis(),
-                    };
-                    write_msg(&mut send, &pong).await?;
+                    write_msg(&mut send, &pong(nonce)).await?;
                 }
             }
             ControlMsg::RenewRequest { csr_der } => {
@@ -762,8 +688,6 @@ async fn registration_exchange(
 async fn redeem(server: &Arc<Server>, identity: &Identity, csr_der: &[u8]) -> Result<Vec<u8>> {
     let requested = ca::csr_common_name(csr_der)
         .map_err(|e| Error::coded(ec::RENEW_REJECTED, e.to_string()))?;
-    icu_proto::validate_name(&requested)
-        .map_err(|e| Error::coded(ec::RENEW_REJECTED, format!("bad name: {e}")))?;
     if ca::csr_public_key(csr_der)? == identity.cert_spki {
         return Err(Error::coded(
             ec::RENEW_REJECTED,
@@ -783,12 +707,7 @@ async fn redeem(server: &Arc<Server>, identity: &Identity, csr_der: &[u8]) -> Re
             "registration expired during the session",
         ));
     }
-    if store.name_taken(&requested, Some(identity.user_id)) {
-        return Err(Error::coded(
-            ec::NAME_TAKEN,
-            format!("name {requested:?} is already taken"),
-        ));
-    }
+    store.claim_name(&requested, Some(identity.user_id))?;
     let (leaf, cn) = {
         let ca = server.ca.read().await;
         ca.sign_client_csr(
@@ -798,19 +717,7 @@ async fn redeem(server: &Arc<Server>, identity: &Identity, csr_der: &[u8]) -> Re
         )
         .map_err(|e| Error::coded(ec::RENEW_REJECTED, e.to_string()))?
     };
-    let issued = now();
-    let cert = CertRecord {
-        fingerprint: fingerprint(&leaf),
-        cn: cn.clone(),
-        issued: rfc3339(issued),
-        expires: rfc3339(
-            issued + Duration::from_secs(u64::from(server.config.tls.client_validity_days) * 86400),
-        ),
-        revoked: false,
-        renewed: None,
-        registration: false,
-        serial: Some(ca::leaf_serial(&leaf)),
-    };
+    let cert = CertRecord::issued(&leaf, cn.clone(), rfc3339(now()), false);
     store.redeem_registration(identity.user_id, &identity.cert_fp, cert)?;
     drop(store);
     // A repeated redeem revoked the certificates of earlier ones.
@@ -820,18 +727,46 @@ async fn redeem(server: &Arc<Server>, identity: &Identity, csr_der: &[u8]) -> Re
 }
 
 /// Encodes and writes one control message straight onto the stream, for the
-/// registration session, which has no room queue.
+/// renew-only sessions, which have no room queue.
 async fn write_msg(send: &mut quinn::SendStream, msg: &ControlMsg) -> Result<()> {
-    let frame = msg
-        .encode()
-        .map_err(|e| Error::coded(ec::PROTOCOL_VIOLATION, e.to_string()))?;
-    wire::write_frame(send, &frame).await
+    wire::write_frame(send, &msg.encode()?).await
 }
 
-/// Drains the outgoing control queue onto the control stream.
-async fn writer_task(mut send: quinn::SendStream, mut rx: mpsc::Receiver<Vec<u8>>) {
+/// This server's `Welcome`: protocol constants and `min_client` filled in.
+fn welcome(
+    server: &Server,
+    minor: u16,
+    you: UserInfo,
+    users: Vec<UserInfo>,
+    is_admin: bool,
+    registration: bool,
+) -> ControlMsg {
+    ControlMsg::Welcome {
+        minor,
+        caps: icu_proto::CAPS,
+        you,
+        audio: AudioParams::default(),
+        users,
+        min_client: server.config.server.min_client.clone(),
+        is_admin,
+        registration,
+    }
+}
+
+/// The answer to a `Ping`.
+fn pong(nonce: u64) -> ControlMsg {
+    ControlMsg::Pong {
+        nonce,
+        server_time_ms: unix_millis(),
+    }
+}
+
+/// Drains the outgoing control queue onto the control stream. The frames are
+/// shared with every other recipient, so they are handed to quinn as chunks
+/// rather than copied.
+async fn writer_task(mut send: quinn::SendStream, mut rx: mpsc::Receiver<Bytes>) {
     while let Some(frame) = rx.recv().await {
-        if send.write_all(&frame).await.is_err() {
+        if send.write_chunk(frame).await.is_err() {
             return;
         }
     }
@@ -885,34 +820,31 @@ async fn control_loop(
         server.config.timing.rate_violation_window(),
     );
 
+    // Built once: `closed()` takes the connection lock and
+    // `shutdown_requested()` subscribes, neither per frame.
+    let closed = conn.closed();
+    let shutdown = server.shutdown_requested();
+    tokio::pin!(closed, shutdown);
+
     loop {
         let body = tokio::select! {
             body = wire::read_frame(recv, MAX_CONTROL_FRAME) => body,
-            _ = conn.closed() => return Ok(()),
-            _ = server.shutdown_requested() => {
+            _ = &mut closed => return Ok(()),
+            _ = &mut shutdown => {
                 return Err(Error::coded(ec::SHUTDOWN, "server is shutting down"));
             }
         };
-        let body = match body {
-            Ok(body) => body,
-            Err(e) if e.code() == Some(ec::PROTOCOL_VIOLATION) => return Err(e),
-            // A closed or reset stream is a normal end of connection.
-            Err(_) => return Ok(()),
+        let Some(body) = stream_end(body)? else {
+            return Ok(());
         };
 
         Counters::inc(&server.counters.control_in);
         if !control.take_one() {
-            if rate_limited(server, session, &mut violations, "control rate exceeded") {
-                return Err(Error::coded(
-                    ec::RATE_LIMITED_FATAL,
-                    "third rate limit violation within the window",
-                ));
-            }
+            rate_limited(server, session, &mut violations, "control rate exceeded")?;
             continue;
         }
 
-        let msg = ControlMsg::decode(&body)
-            .map_err(|e| Error::coded(ec::PROTOCOL_VIOLATION, e.to_string()))?;
+        let msg = ControlMsg::decode(&body)?;
         if !msg.is_client_to_server() {
             return Err(Error::coded(
                 ec::PROTOCOL_VIOLATION,
@@ -926,12 +858,7 @@ async fn control_loop(
             }
             ControlMsg::SetState { flags } => {
                 if !set_state.take_one() {
-                    if rate_limited(server, session, &mut violations, "SetState rate exceeded") {
-                        return Err(Error::coded(
-                            ec::RATE_LIMITED_FATAL,
-                            "third rate limit violation within the window",
-                        ));
-                    }
+                    rate_limited(server, session, &mut violations, "SetState rate exceeded")?;
                     continue;
                 }
                 if let Some(flags) = server.room.apply_client_state(session, flags) {
@@ -941,13 +868,7 @@ async fn control_loop(
                 }
             }
             ControlMsg::Ping { nonce } => {
-                server.room.send_to(
-                    session,
-                    &ControlMsg::Pong {
-                        nonce,
-                        server_time_ms: unix_millis(),
-                    },
-                );
+                server.room.send_to(session, &pong(nonce));
             }
             // Both name a speaker, and both key server state by it: only a
             // peer that is in the room right now counts, or a client could
@@ -959,11 +880,7 @@ async fn control_loop(
                 loss_permille,
             } => {
                 let ttl = server.config.timing.loss_report_ttl();
-                let hint = server
-                    .loss
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .report(speaker, session, loss_permille, ttl);
+                let hint = lock(&server.loss).report(speaker, session, loss_permille, ttl);
                 if let Some(loss_permille) = hint {
                     server
                         .room
@@ -971,7 +888,9 @@ async fn control_loop(
                 }
             }
             ControlMsg::KeyframeRequest { speaker } => {
-                relay::keyframe_request(server, speaker);
+                server
+                    .room
+                    .keyframe_request(speaker, server.config.timing.keyframe_min_interval());
             }
             ControlMsg::RenewRequest { csr_der } => {
                 handle_renew(server, session, identity, &csr_der).await;
@@ -983,16 +902,31 @@ async fn control_loop(
                 user_id: target,
                 is_admin,
             } => {
-                handle_admin_set_role(server, session, user_id, target, is_admin).await;
+                let done = admin::set_role(server, Some(user_id), target, is_admin).await;
+                let answer = admin_answer(target, done, |()| ControlMsg::AdminSetRoleOk {
+                    user_id: target,
+                    is_admin,
+                });
+                server.room.send_to(session, &answer);
             }
             ControlMsg::AdminSetDisabled {
                 user_id: target,
                 disabled,
             } => {
-                handle_admin_set_disabled(server, session, user_id, target, disabled).await;
+                let done = admin::set_disabled(server, Some(user_id), target, disabled).await;
+                let answer = admin_answer(target, done, |_| ControlMsg::AdminSetDisabledOk {
+                    user_id: target,
+                    disabled,
+                });
+                server.room.send_to(session, &answer);
             }
             ControlMsg::AdminRevokeUser { user_id: target } => {
-                handle_admin_revoke_user(server, session, user_id, target).await;
+                let done = admin::revoke_user(server, Some(user_id), target).await;
+                let answer = admin_answer(target, done, |closed| ControlMsg::AdminRevokeUserOk {
+                    user_id: target,
+                    closed: closed as u32,
+                });
+                server.room.send_to(session, &answer);
             }
             ControlMsg::UserListRequest => {
                 handle_user_list_request(server, session, user_id).await;
@@ -1007,14 +941,14 @@ async fn control_loop(
     }
 }
 
-/// Sends `Error(RATE_LIMITED)` and reports whether this was the fatal third
-/// violation (§6.6).
+/// Sends `Error(RATE_LIMITED)`; the fatal third violation within the window
+/// is the `Err` (§6.6).
 fn rate_limited(
     server: &Arc<Server>,
     session: Session,
     violations: &mut ViolationCounter,
     detail: &str,
-) -> bool {
+) -> Result<()> {
     Counters::inc(&server.counters.control_rate_limited);
     server.room.send_to(
         session,
@@ -1023,7 +957,13 @@ fn rate_limited(
             detail: detail.to_string(),
         },
     );
-    violations.record()
+    if violations.record() {
+        return Err(Error::coded(
+            ec::RATE_LIMITED_FATAL,
+            "third rate limit violation within the window",
+        ));
+    }
+    Ok(())
 }
 
 /// A plain renewal is accepted once less than a third of the presented
@@ -1070,6 +1010,8 @@ async fn renew_leaf(
     let user_id = identity.user_id;
     let requested =
         ca::csr_common_name(csr_der).map_err(|e| (ec::RENEW_REJECTED, e.to_string()))?;
+    // A store refusal keeps its own code (`NAME_TAKEN`, `AUTH_REVOKED`, …).
+    let store_err = |e: Error| (e.code().unwrap_or(ec::RENEW_REJECTED), e.to_string());
 
     let mut store = server.store.lock().await;
     let Some(user) = store.user(user_id) else {
@@ -1084,19 +1026,12 @@ async fn renew_leaf(
         ));
     }
     // A new name meets today's rules; the stored one is carried over as it
-    // is, even if it predates them.
+    // is, even if it predates them. Uniqueness before the rate check, so a
+    // taken name reports NAME_TAKEN instead of a confusing rate message.
     if rename {
-        icu_proto::validate_name(&requested)
-            .map_err(|e| (ec::RENEW_REJECTED, format!("bad name: {e}")))?;
-    }
-
-    // Uniqueness before the rate check, so a taken name reports NAME_TAKEN
-    // instead of a confusing rate message.
-    if rename && store.name_taken(&requested, Some(user_id)) {
-        return Err((
-            ec::NAME_TAKEN,
-            format!("name {requested:?} is already taken"),
-        ));
+        store
+            .claim_name(&requested, Some(user_id))
+            .map_err(store_err)?;
     }
 
     let catch_up = !rename && identity.cert_cn != stored;
@@ -1142,56 +1077,34 @@ async fn renew_leaf(
             format!("renewal opens {days} days before expiry"),
         ));
     }
-    let keep = match (in_window, identity.cert_validity, &presented) {
-        (false, Some((not_before, not_after)), Some(record)) => {
-            Some((not_before, not_after, record.clone()))
-        }
-        _ => None,
+    // A kept lifetime keeps its `issued` too, so the renewal window computed
+    // from the record stays the presented certificate's.
+    let (lifetime, issued) = match (in_window, identity.cert_validity, presented) {
+        (false, Some((not_before, not_after)), Some((issued, _))) => (
+            ca::Lifetime::Keep {
+                not_before,
+                not_after,
+            },
+            issued,
+        ),
+        _ => (
+            ca::Lifetime::Days(server.config.tls.client_validity_days),
+            rfc3339(now()),
+        ),
     };
-
     let (leaf, cn) = {
         let ca = server.ca.read().await;
-        let lifetime = match &keep {
-            Some((not_before, not_after, _)) => ca::Lifetime::Keep {
-                not_before: *not_before,
-                not_after: *not_after,
-            },
-            None => ca::Lifetime::Days(server.config.tls.client_validity_days),
-        };
         ca.sign_client_csr(csr_der, lifetime, &server.config.public_host())
             .map_err(|e| (ec::RENEW_REJECTED, e.to_string()))?
     };
-
-    let issued = now();
-    let (issued, expires) = match keep {
-        Some((_, _, record)) => record,
-        None => (
-            rfc3339(issued),
-            rfc3339(
-                issued
-                    + Duration::from_secs(
-                        u64::from(server.config.tls.client_validity_days) * 86400,
-                    ),
-            ),
-        ),
-    };
-    let cert = CertRecord {
-        fingerprint: fingerprint(&leaf),
-        cn: cn.clone(),
-        issued,
-        expires,
-        revoked: false,
-        renewed: None,
-        registration: false,
-        serial: Some(ca::leaf_serial(&leaf)),
-    };
+    let cert = CertRecord::issued(&leaf, cn.clone(), issued, false);
     // Only a per-certificate renewal stamps the presented certificate: the
     // same certificate may be on a second device (passport) that still has
     // to catch up or recover itself, and the stamp is what bounds it.
     let supersedes = per_cert.then_some(identity.cert_fp.as_str());
     let renamed = store
         .add_cert(user_id, cert, supersedes, !per_cert)
-        .map_err(|e| (e.code().unwrap_or(ec::RENEW_REJECTED), e.to_string()))?;
+        .map_err(store_err)?;
     drop(store);
     tracing::info!(
         user_id,
@@ -1282,147 +1195,20 @@ async fn handle_create_invite(
     }
 }
 
-/// Shared body of the in-band admin actions (`PROTOCOL.md` §2.2).
-///
-/// All three have the same shape: under the store lock, check that the actor
-/// is still an admin and that the target exists, then apply `change`. Only on
-/// success does `done` run, and it runs **outside** the lock, because it kicks
-/// connections and sends control frames. Any failure answers with
-/// `AdminActionError` and changes nothing.
-async fn admin_action(
-    server: &Arc<Server>,
-    session: Session,
-    actor: UserId,
+/// The in-band answer to an admin action: `ok` on success, else
+/// `AdminActionError` with the code the store gave (`PROTOCOL.md` §2.2).
+fn admin_answer<T>(
     target: UserId,
-    change: impl FnOnce(&mut Store) -> Result<bool>,
-    done: impl FnOnce() -> ControlMsg,
-) -> bool {
-    let outcome = {
-        let mut store = server.store.lock().await;
-        if !store.is_admin(actor) {
-            Err(Error::coded(ec::NOT_ADMIN, "not an admin"))
-        } else if store.user(target).is_none() {
-            Err(Error::coded(ec::NO_SUCH_USER, "unknown user"))
-        } else {
-            change(&mut store)
-        }
-    };
-    let applied = outcome.is_ok();
-    let answer = match outcome {
-        Ok(_) => done(),
+    done: Result<T>,
+    ok: impl FnOnce(T) -> ControlMsg,
+) -> ControlMsg {
+    match done {
+        Ok(value) => ok(value),
         Err(e) => ControlMsg::AdminActionError {
             user_id: target,
             code: e.code().unwrap_or(ec::LAST_ADMIN),
             detail: e.to_string(),
         },
-    };
-    server.room.send_to(session, &answer);
-    applied
-}
-
-/// `AdminSetRole`: `UserAdminChanged` goes to every one of the target's own
-/// sessions, so their cached `is_admin` updates without a reconnect; the
-/// `UserState` broadcast that follows is what puts the admin badge live on
-/// everybody else's roster.
-async fn handle_admin_set_role(
-    server: &Arc<Server>,
-    session: Session,
-    actor: UserId,
-    target: UserId,
-    is_admin: bool,
-) {
-    admin_action(
-        server,
-        session,
-        actor,
-        target,
-        |store| store.set_admin(target, is_admin),
-        || {
-            announce_admin_change(server, target, is_admin);
-            tracing::info!(actor, target, is_admin, "admin role changed");
-            ControlMsg::AdminSetRoleOk {
-                user_id: target,
-                is_admin,
-            }
-        },
-    )
-    .await;
-}
-
-/// Puts a role change live without a reconnect: `UserAdminChanged` to every
-/// one of the target's own sessions, then a `UserState` broadcast per session
-/// whose `ADMIN` bit flipped, which is what moves the badge on everybody
-/// else's roster. Shared by the in-band handler and the admin socket.
-pub fn announce_admin_change(server: &Arc<Server>, target: UserId, is_admin: bool) {
-    for s in server.room.sessions_of_user(target) {
-        server
-            .room
-            .send_to(s, &ControlMsg::UserAdminChanged { is_admin });
-    }
-    for s in server.room.set_admin_flag(target, is_admin) {
-        if let Some(flags) = server.room.flags(s) {
-            server
-                .room
-                .broadcast(&ControlMsg::UserState { session: s, flags });
-        }
-    }
-}
-
-/// `AdminSetDisabled`: disabling an online user kicks it immediately with
-/// `AUTH_DISABLED` — the close itself is the notification, no separate push.
-async fn handle_admin_set_disabled(
-    server: &Arc<Server>,
-    session: Session,
-    actor: UserId,
-    target: UserId,
-    disabled: bool,
-) {
-    admin_action(
-        server,
-        session,
-        actor,
-        target,
-        |store| store.set_disabled(target, disabled),
-        || {
-            if disabled {
-                kick_user(server, target, ec::AUTH_DISABLED);
-            }
-            tracing::info!(actor, target, disabled, "admin disabled state changed");
-            ControlMsg::AdminSetDisabledOk {
-                user_id: target,
-                disabled,
-            }
-        },
-    )
-    .await;
-}
-
-/// `AdminRevokeUser`: revokes every certificate of `target` and kicks any live
-/// connection with `KICKED`.
-async fn handle_admin_revoke_user(
-    server: &Arc<Server>,
-    session: Session,
-    actor: UserId,
-    target: UserId,
-) {
-    let revoked = admin_action(
-        server,
-        session,
-        actor,
-        target,
-        |store| store.revoke(target),
-        || {
-            let closed = kick_user(server, target, ec::KICKED) as u32;
-            tracing::info!(actor, target, closed, "admin revoked user");
-            ControlMsg::AdminRevokeUserOk {
-                user_id: target,
-                closed,
-            }
-        },
-    )
-    .await;
-    if revoked {
-        crate::endpoint::reload_tls_logged(server).await;
     }
 }
 
@@ -1443,6 +1229,7 @@ async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor:
         );
         return;
     }
+    let online = server.room.online_users();
     let users = store
         .users()
         .map(|(id, u)| icu_proto::UserSummary {
@@ -1452,7 +1239,7 @@ async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor:
             is_admin: u.is_admin,
             disabled: u.disabled,
             revoked: u.is_revoked(),
-            online: !server.room.sessions_of_user(id).is_empty(),
+            online: online.contains(&id),
             pending: u.is_pending(),
         })
         .collect();
@@ -1478,22 +1265,4 @@ fn peer_close_code(conn: &quinn::Connection) -> u32 {
         }
         _ => ec::TIMEOUT,
     }
-}
-
-/// Closes every connection of a user with `code` (`revoke`/`disable`, §5).
-pub fn kick_user(server: &Arc<Server>, user_id: UserId, code: u32) -> usize {
-    let sessions = server.room.sessions_of_user(user_id);
-    let mut closed = 0;
-    for session in sessions {
-        if let Some(member) = server.room.member(session) {
-            // Mark before closing, so the `UserLeft` broadcast says the same
-            // code and not "the peer went away".
-            server.room.mark_closing(session, code);
-            member
-                .conn
-                .close(quinn::VarInt::from_u32(code), ec::name(code).as_bytes());
-            closed += 1;
-        }
-    }
-    closed
 }

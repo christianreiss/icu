@@ -10,12 +10,12 @@
 
 use std::{sync::Arc, time::Duration};
 
-use icu_proto::{error as ec, limits as pl, passport::PassportV2, validate_name, UserId};
+use icu_proto::{error as ec, limits as pl, passport::PassportV2, UserId};
 use rand::RngCore;
 
 use crate::{
     error::{Error, Result},
-    store::{encode_hex, fingerprint, now, rfc3339, CertRecord, Store},
+    store::{encode_hex, now, rfc3339, CertRecord, Store},
     Server,
 };
 
@@ -51,13 +51,7 @@ pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issu
     let name = if label.is_empty() {
         placeholder(&store)?
     } else {
-        validate_name(label)?;
-        if store.name_taken(label, None) {
-            return Err(Error::coded(
-                ec::NAME_TAKEN,
-                format!("name {label:?} is already taken"),
-            ));
-        }
+        store.claim_name(label, None)?;
         label.to_string()
     };
     let (leaf, key_der, ca_der) = {
@@ -65,17 +59,7 @@ pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issu
         let (leaf, key_der) = ca.issue_registration(&name, ttl, &public_host)?;
         (leaf, key_der, ca.ca_der().to_vec())
     };
-    let issued = now();
-    let cert = CertRecord {
-        fingerprint: fingerprint(&leaf),
-        cn: name.clone(),
-        issued: rfc3339(issued),
-        expires: rfc3339(issued + ttl),
-        revoked: false,
-        renewed: None,
-        registration: true,
-        serial: Some(crate::ca::leaf_serial(&leaf)),
-    };
+    let cert = CertRecord::issued(&leaf, name.clone(), rfc3339(now()), true);
     let expires = cert.expires.clone();
     let (user_id, is_admin) = store.add_registration(cert)?;
     drop(store);

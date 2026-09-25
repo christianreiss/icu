@@ -127,6 +127,22 @@ pub struct CertRecord {
 }
 
 impl CertRecord {
+    /// The record of a leaf just issued for `cn`, unrevoked; `expires` and
+    /// the serial are read from the DER. `issued` is passed in rather than
+    /// read as notBefore, which the CA backdates by an hour of clock slack.
+    pub fn issued(leaf: &[u8], cn: String, issued: String, registration: bool) -> CertRecord {
+        CertRecord {
+            fingerprint: fingerprint(leaf),
+            cn,
+            issued,
+            expires: crate::ca::leaf_not_after(leaf),
+            revoked: false,
+            renewed: None,
+            registration,
+            serial: Some(crate::ca::leaf_serial(leaf)),
+        }
+    }
+
     fn expired(&self, now: OffsetDateTime) -> bool {
         parse_rfc3339(&self.expires)
             .map(|e| e <= now)
@@ -207,6 +223,15 @@ pub struct RevokedServerCert {
     pub serial: String,
     /// When it expires, RFC 3339 UTC; afterwards it leaves the CRL.
     pub expires: String,
+}
+
+impl RevokedServerCert {
+    /// Whether the leaf still has to be listed; an unreadable expiry keeps it.
+    fn live(&self, now: OffsetDateTime) -> bool {
+        parse_rfc3339(&self.expires)
+            .map(|e| e > now)
+            .unwrap_or(true)
+    }
 }
 
 impl Default for UsersFile {
@@ -347,21 +372,23 @@ impl Store {
             .any(|(id, u)| Some(id) != except && name_key(&u.name) == key)
     }
 
-    /// The id the next [`Store::add_user`] will hand out.
-    pub fn peek_next_user_id(&self) -> UserId {
-        self.users.next_user_id
+    /// Whether `name` may be issued to `except` (or a new user): it meets
+    /// today's rules and nobody else holds it, else `NAME_TAKEN`.
+    pub fn claim_name(&self, name: &str, except: Option<UserId>) -> Result<()> {
+        validate_name(name).context("bad name")?;
+        if self.name_taken(name, except) {
+            return Err(Error::coded(
+                ec::NAME_TAKEN,
+                format!("name {name:?} is already taken"),
+            ));
+        }
+        Ok(())
     }
 
     /// Adds a new user with its first certificate. The display name is the
     /// certificate's CN. Returns the new `user_id`.
     pub fn add_user(&mut self, cert: CertRecord, is_admin: bool) -> Result<UserId> {
-        validate_name(&cert.cn)?;
-        if self.name_taken(&cert.cn, None) {
-            return Err(Error::coded(
-                ec::NAME_TAKEN,
-                format!("name {:?} taken", cert.cn),
-            ));
-        }
+        self.claim_name(&cert.cn, None)?;
         self.update_users(|users| {
             let id = users.next_user_id;
             users.next_user_id = id
@@ -408,13 +435,7 @@ impl Store {
         // able to renew.
         let keeps_name = self.user(id).is_some_and(|u| u.name == cert.cn);
         if !keeps_name {
-            validate_name(&cert.cn)?;
-            if self.name_taken(&cert.cn, Some(id)) {
-                return Err(Error::coded(
-                    ec::NAME_TAKEN,
-                    format!("name {:?} taken", cert.cn),
-                ));
-            }
+            self.claim_name(&cert.cn, Some(id))?;
         }
         let now = now();
         let stamp = rfc3339(now);
@@ -523,19 +544,13 @@ impl Store {
     /// Grants or revokes admin rights. Guarded against demoting the last
     /// remaining functional admin. Returns whether anything changed.
     pub fn set_admin(&mut self, id: UserId, is_admin: bool) -> Result<bool> {
-        if !is_admin {
-            self.guard_last_admin(id)?;
-        }
-        let current = self
-            .user(id)
-            .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
-        if current.is_admin == is_admin {
-            return Ok(false);
-        }
-        self.update_users(|users| {
-            user_entry(users, id)?.is_admin = is_admin;
-            Ok(true)
-        })
+        self.set_flag(
+            id,
+            is_admin,
+            !is_admin,
+            |u| u.is_admin,
+            |u, v| u.is_admin = v,
+        )
     }
 
     /// Blocks or restores login without touching certificates. Guarded
@@ -544,17 +559,36 @@ impl Store {
     /// again immediately, no re-enrollment needed. Returns whether anything
     /// changed.
     pub fn set_disabled(&mut self, id: UserId, disabled: bool) -> Result<bool> {
-        if disabled {
+        self.set_flag(
+            id,
+            disabled,
+            disabled,
+            |u| u.disabled,
+            |u, v| u.disabled = v,
+        )
+    }
+
+    /// Sets one user flag to `want`, writing only when it changes; `guarded`
+    /// says whether this direction may not take the last admin away.
+    fn set_flag(
+        &mut self,
+        id: UserId,
+        want: bool,
+        guarded: bool,
+        get: fn(&UserRecord) -> bool,
+        set: fn(&mut UserRecord, bool),
+    ) -> Result<bool> {
+        if guarded {
             self.guard_last_admin(id)?;
         }
         let current = self
             .user(id)
             .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))?;
-        if current.disabled == disabled {
+        if get(current) == want {
             return Ok(false);
         }
         self.update_users(|users| {
-            user_entry(users, id)?.disabled = disabled;
+            set(user_entry(users, id)?, want);
             Ok(true)
         })
     }
@@ -592,13 +626,7 @@ impl Store {
         registration_fp: &str,
         cert: CertRecord,
     ) -> Result<()> {
-        validate_name(&cert.cn)?;
-        if self.name_taken(&cert.cn, Some(id)) {
-            return Err(Error::coded(
-                ec::NAME_TAKEN,
-                format!("name {:?} taken", cert.cn),
-            ));
-        }
+        self.claim_name(&cert.cn, Some(id))?;
         let promote = !self.has_enrolled_admin(id);
         self.update_users(|users| {
             let record = user_entry(users, id)?;
@@ -684,7 +712,7 @@ impl Store {
             .users
             .revoked_server
             .iter()
-            .filter(|s| parse_rfc3339(&s.expires).map(|e| e > now).unwrap_or(true))
+            .filter(|s| s.live(now))
             .map(|s| s.serial.clone());
         clients.chain(servers).collect()
     }
@@ -699,9 +727,7 @@ impl Store {
             // only take a higher one, would ignore every CRL until it caught
             // up (`deploy/README.md`, restore).
             users.crl_number = (users.crl_number + 1).max(now.unix_timestamp().max(0) as u64);
-            users
-                .revoked_server
-                .retain(|s| parse_rfc3339(&s.expires).map(|e| e > now).unwrap_or(true));
+            users.revoked_server.retain(|s| s.live(now));
             Ok(users.crl_number)
         })
     }

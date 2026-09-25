@@ -21,23 +21,17 @@ use crate::error::{Context, Error, Result};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Listen addresses, room size, names.
-    #[serde(default)]
     pub server: ServerSection,
     /// Rate limits, defaults from `PROTOCOL.md` §7.
-    #[serde(default)]
     pub limits: LimitsSection,
     /// Certificate validity periods.
-    #[serde(default)]
     pub tls: TlsSection,
     /// Logging.
-    #[serde(default)]
     pub log: LogSection,
     /// State and runtime paths. Not in the spec; needed to run out of tree.
-    #[serde(default)]
     pub paths: PathsSection,
     /// Timeouts the spec fixes. Not in the spec; the defaults are the spec
     /// values, tests shorten them.
-    #[serde(default)]
     pub timing: TimingSection,
 }
 
@@ -58,7 +52,6 @@ pub struct ServerSection {
     /// Lowest allowed client version, SemVer.
     pub min_client: String,
     /// Group that owns the admin socket. `None` leaves the group alone.
-    #[serde(default)]
     pub admin_socket_group: Option<String>,
 }
 
@@ -172,7 +165,6 @@ pub struct PathsSection {
     /// Directory holding `admin.sock`.
     pub runtime_dir: PathBuf,
     /// Explicit admin socket path. Defaults to `runtime_dir/admin.sock`.
-    #[serde(default)]
     pub admin_socket: Option<PathBuf>,
 }
 
