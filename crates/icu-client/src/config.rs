@@ -101,6 +101,9 @@ pub struct AudioSettings {
     pub vad_auto: bool,
     /// Microphone gain in dB.
     pub gain_db: f32,
+    /// Mic auto leveling (`dsp::normalize::Profile::MIC_LEVEL`) after
+    /// `gain_db`, ahead of denoise and VAD. Requires `denoise`.
+    pub auto_level: bool,
     /// RNNoise on.
     pub denoise: bool,
     /// AEC3 on.
@@ -126,6 +129,9 @@ pub struct AudioSettings {
     /// Bring every incoming voice to a common loudness
     /// (`dsp::normalize`), before the per-user volume.
     pub normalize_incoming: bool,
+    /// Bring the own voice to a common loudness right before the encoder
+    /// (`dsp::normalize::Profile::OUTBOUND` plus a peak limiter).
+    pub normalize_outgoing: bool,
 }
 
 impl Default for AudioSettings {
@@ -137,6 +143,7 @@ impl Default for AudioSettings {
             vad_threshold: 0.5,
             vad_auto: true,
             gain_db: 0.0,
+            auto_level: true,
             denoise: true,
             aec: true,
             voice_opt: false,
@@ -149,6 +156,7 @@ impl Default for AudioSettings {
             cue_mute: true,
             output_volume: 100.0,
             normalize_incoming: true,
+            normalize_outgoing: true,
         }
     }
 }
@@ -822,6 +830,8 @@ mod tests {
         s.audio.voice_opt = true;
         s.audio.voice_strength = VoiceStrength::Strong;
         s.audio.normalize_incoming = false;
+        s.audio.auto_level = false;
+        s.audio.normalize_outgoing = false;
         s.audio.input_device = Some("alsa_input.foo".into());
         s.hotkeys.ptt.key = "BTN_SIDE".into();
         s.overlay.corner = Corner::BottomLeft;
@@ -853,6 +863,15 @@ mod tests {
     }
 
     #[test]
+    fn fresh_install_sends_by_voice_with_auto_threshold() {
+        let a = AudioSettings::default();
+        assert_eq!(a.mode, ModeSetting::Vad);
+        assert!(a.vad_auto);
+        assert!(a.auto_level);
+        assert!(a.normalize_outgoing);
+    }
+
+    #[test]
     fn unknown_keys_and_missing_sections_are_tolerated() {
         let s: Settings = toml::from_str("[audio]\nmode = \"vad\"\n[future]\nx = 1\n").unwrap();
         assert_eq!(s.audio.mode, ModeSetting::Vad);
@@ -861,6 +880,8 @@ mod tests {
         assert!(s.audio.vad_auto);
         assert!(!s.audio.voice_opt);
         assert!(s.audio.normalize_incoming);
+        assert!(s.audio.auto_level);
+        assert!(s.audio.normalize_outgoing);
         assert_eq!(s.audio.voice_strength, VoiceStrength::Medium);
         assert!(s.overlay.dim_non_speaking, "old settings.toml default on");
     }

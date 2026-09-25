@@ -39,11 +39,11 @@ use crate::{
         jitter::{JitterBuffer, JitterConfig, Packet, Pop},
         meter::{self, Level},
         mixer,
-        normalize::Normalizer,
+        normalize::{Normalizer, Profile},
         opus,
         refalign::{self, CycleClock},
         vad, vad_auto,
-        voice::{VoiceChain, VoiceStrength},
+        voice::{Limiter, VoiceChain, VoiceStrength},
     },
     net::{
         conn::{self, ConnectError},
@@ -346,6 +346,10 @@ pub struct DspControl {
     aec: AtomicBool,
     voice_opt: AtomicBool,
     voice_strength: AtomicU32,
+    /// Mic auto leveling; only with denoise (the energy VAD would open on
+    /// boosted room noise).
+    auto_level: AtomicBool,
+    normalize_outgoing: AtomicBool,
     vad_threshold: AtomicF32,
     vad_auto: AtomicBool,
     vad_effective_threshold: AtomicF32,
@@ -377,6 +381,8 @@ impl DspControl {
             aec: AtomicBool::new(false),
             voice_opt: AtomicBool::new(false),
             voice_strength: AtomicU32::new(0),
+            auto_level: AtomicBool::new(false),
+            normalize_outgoing: AtomicBool::new(false),
             vad_threshold: AtomicF32::new(0.0),
             vad_auto: AtomicBool::new(false),
             vad_effective_threshold: AtomicF32::new(0.0),
@@ -409,6 +415,12 @@ impl DspControl {
             .store(s.audio.voice_opt && !test_tone, Ordering::Relaxed);
         self.voice_strength
             .store(s.audio.voice_strength.to_u32(), Ordering::Relaxed);
+        self.auto_level.store(
+            s.audio.auto_level && s.audio.denoise && !test_tone,
+            Ordering::Relaxed,
+        );
+        self.normalize_outgoing
+            .store(s.audio.normalize_outgoing && !test_tone, Ordering::Relaxed);
         self.vad_threshold.store(s.audio.vad_threshold);
         self.vad_auto.store(s.audio.vad_auto, Ordering::Relaxed);
         self.gain.store(meter::from_db(s.audio.gain_db));
@@ -933,6 +945,14 @@ fn dsp_thread(
     let mut voice_strength = VoiceStrength::from_u32(ctl.voice_strength.load(Ordering::Relaxed));
     let mut voice_chain = VoiceChain::new(voice_strength);
     let mut voice_on = false;
+    let mut leveler = Normalizer::with(Profile::MIC_LEVEL);
+    let mut level_on = false;
+    // The previous block's VAD decision steers the leveler, which runs
+    // ahead of the VAD.
+    let mut prev_voice = false;
+    let mut out_norm = Normalizer::with(Profile::OUTBOUND);
+    let mut out_limiter = Limiter::new();
+    let mut out_norm_on = false;
     let mut encoder = match opus::Encoder::new() {
         Ok(e) => e,
         Err(e) => {
@@ -1121,12 +1141,20 @@ fn dsp_thread(
             }
         }
 
-        // 3. Gain, denoise, VAD.
+        // 3. Gain, auto level, denoise, VAD.
         let gain = ctl.gain.load();
         if gain != 1.0 {
             for s in block.iter_mut() {
                 *s *= gain;
             }
+        }
+        let on = ctl.auto_level.load(Ordering::Relaxed);
+        if on && !level_on {
+            leveler.reset();
+        }
+        level_on = on;
+        if on {
+            leveler.process_hinted(&mut block, Some(prev_voice));
         }
         let prob = if ctl.denoise.load(Ordering::Relaxed) {
             Some(denoiser.process(&mut block))
@@ -1147,6 +1175,7 @@ fn dsp_thread(
         };
         ctl.vad_effective_threshold.store(threshold);
         let voice = vad::is_voice(threshold, prob, level);
+        prev_voice = voice;
         voice_in_frame |= voice;
 
         // Voice optimizer: nonlinear, so after AEC; after the meter and VAD,
@@ -1163,6 +1192,21 @@ fn dsp_thread(
         voice_on = on;
         if on {
             voice_chain.process(&mut block);
+        }
+
+        // Outbound normalization, last before the encoder so it also
+        // evens out the optimizer's makeup; its limiter catches the boost.
+        let on = ctl.normalize_outgoing.load(Ordering::Relaxed);
+        if on && !out_norm_on {
+            out_norm.reset();
+            out_limiter.reset();
+        }
+        out_norm_on = on;
+        if on {
+            out_norm.process_hinted(&mut block, Some(voice));
+            for s in block.iter_mut() {
+                *s = out_limiter.process(*s);
+            }
         }
 
         // 4. Accumulate to an Opus frame.

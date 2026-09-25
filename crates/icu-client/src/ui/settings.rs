@@ -399,6 +399,16 @@ impl SettingsView {
                     );
                 }
             }
+            ui.add_enabled_ui(self.draft.audio.denoise, |ui| {
+                widgets::setting_row(
+                    ui,
+                    true,
+                    "Pegel automatisch",
+                    Some("Regelt dein Mikrofon selbst nach, wenn du zu leise oder zu laut bist. Braucht die Rauschunterdrückung."),
+                    |ui| widgets::toggle(ui, &mut self.draft.audio.auto_level),
+                )
+            });
+            let auto_level = self.draft.audio.auto_level && self.draft.audio.denoise;
             if adv {
                 widgets::advanced_caption(ui);
                 let mut first = true;
@@ -408,14 +418,16 @@ impl SettingsView {
                         widgets::chip(ui, &format!("{:.2}", state.vad_threshold), 0.0)
                     });
                 }
-                widgets::slider_row(
-                    ui,
-                    divider(),
-                    "Verstärkung",
-                    &mut self.draft.audio.gain_db,
-                    -20.0..=20.0,
-                    " dB",
-                );
+                if !auto_level {
+                    widgets::slider_row(
+                        ui,
+                        divider(),
+                        "Verstärkung",
+                        &mut self.draft.audio.gain_db,
+                        -20.0..=20.0,
+                        " dB",
+                    );
+                }
                 let mut release = self.draft.audio.release_ms as f32;
                 if widgets::slider_row(ui, divider(), "PTT-Nachlauf", &mut release, 0.0..=1000.0, " ms")
                     .changed()
@@ -445,6 +457,13 @@ impl SettingsView {
                 "Lautstärke angleichen",
                 Some("Bringt alle anderen auf eine ähnliche Lautstärke, leise wie laute."),
                 |ui| widgets::toggle(ui, &mut self.draft.audio.normalize_incoming),
+            );
+            widgets::setting_row(
+                ui,
+                true,
+                "Eigene Lautstärke angleichen",
+                Some("Du kommst bei den anderen immer gleich laut an."),
+                |ui| widgets::toggle(ui, &mut self.draft.audio.normalize_outgoing),
             );
             widgets::setting_row(
                 ui,
