@@ -580,7 +580,7 @@ async fn certificates_carry_the_server_address() {
 }
 
 #[tokio::test]
-async fn renewal_issues_a_second_certificate_and_both_connect() {
+async fn renewal_revokes_the_old_certificate_once_the_new_one_logs_in() {
     // Short-lived certificates, so the fresh one is already inside the
     // 30-day renewal window (`PROTOCOL.md` §2.2 Nr. 9).
     let server = TestServer::start_with(|c| c.tls.client_validity_days = 20).await;
@@ -608,10 +608,19 @@ async fn renewal_issues_a_second_certificate_and_both_connect() {
         ca: server.ca(),
     };
 
+    // Until the new certificate logs in, the old one still does: the
+    // response may have been lost. Connecting it again replaces the first
+    // connection that used it (one per certificate).
+    let mut with_old = server.connect(&old).await.expect("connect old");
+    assert!(matches!(
+        with_old.hello("alice").await,
+        ControlMsg::Welcome { .. }
+    ));
+    assert_eq!(client.closed_code().await, Some(ec::SESSION_REPLACED));
+
     // The new certificate connects...
     let mut with_new = server.connect(&renewed).await.expect("connect new");
-    let welcome = with_new.hello("alice").await;
-    match &welcome {
+    match &with_new.hello("alice").await {
         ControlMsg::Welcome { you, .. } => {
             assert_eq!(you.user_id, 1, "the user_id survives the renewal");
             assert_eq!(you.name, "alice");
@@ -619,24 +628,21 @@ async fn renewal_issues_a_second_certificate_and_both_connect() {
         other => panic!("expected Welcome, got {other:?}"),
     }
 
-    // ...and the old one still does, until it expires. Connecting it again
-    // replaces the first connection that used it (one per certificate).
-    let mut with_old = server.connect(&old).await.expect("connect old");
-    let welcome = with_old.hello("alice").await;
-    assert!(matches!(welcome, ControlMsg::Welcome { .. }));
-    assert_eq!(client.closed_code().await, Some(ec::SESSION_REPLACED));
-
-    // A second renewal on the same day is rejected.
-    with_old
-        .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
-        .await;
-    let answer = with_old
-        .recv_matching(|m| matches!(m, ControlMsg::Error { .. }))
-        .await;
+    // ...which revokes the old one: its live session is closed, and it
+    // cannot come back.
+    assert_eq!(with_old.closed_code().await, Some(ec::AUTH_REVOKED));
+    let code = server.rejection(&old).await;
     assert!(
-        matches!(answer, Some(ControlMsg::Error { code, .. }) if code == ec::RENEW_REJECTED),
-        "{answer:?}"
+        code == Some(common::TLS_CERTIFICATE_REVOKED) || code == Some(ec::AUTH_REVOKED),
+        "got {code:?}"
     );
+
+    // The new session is untouched, and the user is not revoked.
+    with_new.send_msg(&ControlMsg::Ping { nonce: 7 }).await;
+    assert!(with_new
+        .recv_matching(|m| matches!(m, ControlMsg::Pong { .. }))
+        .await
+        .is_some());
     server.shutdown().await;
 }
 

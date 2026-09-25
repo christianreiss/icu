@@ -118,6 +118,11 @@ pub struct CertRecord {
     /// ([`Store::consume_registration`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub registration: bool,
+    /// Revoked because a later certificate of the same user logged in
+    /// ([`Store::retire_predecessors`]), not by an admin. Once expired, such a
+    /// record goes and leaves the CRL: its fingerprint is then simply unknown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub superseded: bool,
     /// Serial number, lowercase hex of the DER integer's content octets —
     /// what the CRL lists (`PROTOCOL.md` §1). `None` for records written
     /// before the CRL existed; those stay covered by the fingerprint check
@@ -139,6 +144,7 @@ impl CertRecord {
             revoked: false,
             renewed: None,
             registration,
+            superseded: false,
             serial: Some(crate::ca::leaf_serial(leaf)),
         }
     }
@@ -727,9 +733,40 @@ impl Store {
         })
     }
 
+    /// Revokes every certificate of the user issued before `fingerprint`,
+    /// once that one logs in: its first login proves the client stored it,
+    /// so whatever it replaced — on this device or on any other holding a
+    /// copy — is invalid from then on, expired or not (`PROTOCOL.md` §2.2
+    /// Nr. 10). Registration certificates are left to
+    /// [`Store::consume_registration`]. Returns the fingerprints revoked.
+    pub fn retire_predecessors(&mut self, id: UserId, fingerprint: &str) -> Result<Vec<String>> {
+        let Some(user) = self.user(id) else {
+            return Ok(Vec::new());
+        };
+        // `certs` is in issue order: `add_user`, `redeem_registration` and
+        // `add_cert` only ever push.
+        let Some(position) = user.certs.iter().position(|c| c.fingerprint == fingerprint) else {
+            return Ok(Vec::new());
+        };
+        let retire = |c: &CertRecord| !c.revoked && !c.registration;
+        if !user.certs[..position].iter().any(retire) {
+            return Ok(Vec::new());
+        }
+        self.update_users(|users| {
+            let record = user_entry(users, id)?;
+            let mut retired = Vec::new();
+            for cert in record.certs[..position].iter_mut().filter(|c| retire(c)) {
+                cert.revoked = true;
+                cert.superseded = true;
+                retired.push(cert.fingerprint.clone());
+            }
+            Ok(retired)
+        })
+    }
+
     /// Serials for the CRL: every revoked certificate that has a recorded
-    /// serial — client leaves for good, consumed registration certificates
-    /// and replaced server leaves until they expire.
+    /// serial — client leaves for good, consumed registration certificates,
+    /// superseded client leaves and replaced server leaves until they expire.
     pub fn crl_serials(&self) -> Vec<String> {
         let now = now();
         let clients = self
@@ -739,8 +776,10 @@ impl Store {
             .flat_map(|u| &u.certs)
             // Expired ones too: an expired client certificate still gets
             // through the handshake for a renewal, so its revocation has to
-            // outlive it. Spent registrations are the exception.
-            .filter(|c| c.revoked && !(c.registration && c.expired(now)))
+            // outlive it. Spent registrations and superseded leaves are the
+            // exception: once expired, their records go (`keep_cert`), and an
+            // unknown fingerprint is refused anyway.
+            .filter(|c| c.revoked && !((c.registration || c.superseded) && c.expired(now)))
             .filter_map(|c| c.serial.clone());
         let servers = self
             .users
@@ -810,9 +849,11 @@ impl Store {
 /// admits it, with no time limit. Revoked ones stay too: they are what makes a
 /// revoke visible, and what `is_revoked` counts. Only a consumed registration
 /// certificate goes once expired, its revocation only ever meant "used". At
-/// most one record per user and day accrues (renewals are rate-limited).
+/// most one record per user and day accrues (renewals are rate-limited). A
+/// superseded certificate goes once expired as well: it was revoked because
+/// its successor logged in, and the successor's record admits that user.
 fn keep_cert(c: &CertRecord, now: OffsetDateTime) -> bool {
-    if c.registration && c.revoked {
+    if (c.registration || c.superseded) && c.revoked {
         return !c.expired(now);
     }
     true
@@ -907,6 +948,7 @@ mod tests {
             revoked: false,
             renewed: None,
             registration: false,
+            superseded: false,
             serial: None,
         }
     }
@@ -1150,6 +1192,35 @@ mod tests {
             .unwrap());
         assert_eq!(s.user(alice).unwrap().name, "carol");
         assert_eq!(s.user(alice).unwrap().certs.len(), 4, "old certs stay");
+    }
+
+    #[test]
+    fn a_login_retires_every_earlier_certificate_and_they_leave_once_expired() {
+        let (_dir, mut s) = store();
+        let alice = s.add_user(named_cert("aa", "alice"), false).unwrap();
+        s.add_cert(alice, named_cert("bb", "alice"), None, true).unwrap();
+        s.add_cert(alice, named_cert("cc", "alice"), None, true).unwrap();
+
+        // The middle one logging in retires only what came before it.
+        assert_eq!(s.retire_predecessors(alice, "bb").unwrap(), ["aa"]);
+        assert!(s.retire_predecessors(alice, "bb").unwrap().is_empty());
+        assert_eq!(s.retire_predecessors(alice, "cc").unwrap(), ["bb"]);
+        let user = s.user(alice).unwrap();
+        assert!(user.certs[..2].iter().all(|c| c.revoked && c.superseded));
+        assert!(!user.certs[2].revoked);
+        assert!(!user.is_revoked());
+
+        // An expired superseded record leaves the store with the next write.
+        let past = rfc3339(now() - Duration::from_secs(60));
+        s.update_users(|users| {
+            user_entry(users, alice)?.certs[0].expires = past.clone();
+            Ok(())
+        })
+        .unwrap();
+        s.add_cert(alice, named_cert("dd", "alice"), None, true).unwrap();
+        let user = s.user(alice).unwrap();
+        let fps: Vec<_> = user.certs.iter().map(|c| c.fingerprint.as_str()).collect();
+        assert_eq!(fps, ["bb", "cc", "dd"]);
     }
 
     #[test]

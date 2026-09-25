@@ -79,7 +79,7 @@ async fn an_expired_certificate_renews_and_the_new_one_logs_in() {
 
     let renewed = Identity {
         cert: CertificateDer::from(leaf_der),
-        ..alice
+        ..alice.clone()
     };
     let mut client = server.connect(&renewed).await.expect("connect");
     let welcome = client.hello("alice").await;
@@ -90,6 +90,13 @@ async fn an_expired_certificate_renews_and_the_new_one_logs_in() {
             .await
             .is_none_or(|m| !matches!(m, ControlMsg::Error { .. })),
         "a normal session"
+    );
+
+    // The expired certificate is spent: no second renewal, however late.
+    let code = server.rejection(&alice).await;
+    assert!(
+        code == Some(common::TLS_CERTIFICATE_REVOKED) || code == Some(ec::AUTH_REVOKED),
+        "got {code:?}"
     );
     server.shutdown().await;
 }
