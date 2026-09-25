@@ -24,7 +24,11 @@ impl Rng {
     }
     /// Uniform in [-1, 1).
     pub fn uniform(&mut self) -> f32 {
-        (self.next_u64() >> 11) as f32 / (1u64 << 52) as f32 * 2.0 - 1.0
+        // 53 random bits over 2^53 → [0, 1). (Until 2026-09-25 this divided
+        // by 2^52 and returned [-1, 3): every noise signal carried a DC
+        // offset of 1.0 and every `(uniform() + 1) / 2` probability ran at
+        // half its nominal rate.)
+        ((self.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32
     }
 }
 
@@ -278,6 +282,22 @@ pub fn harmonic_voice(n: usize, rms_target: f32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uniform_covers_minus_one_to_one_with_zero_mean() {
+        let mut rng = Rng::new(42);
+        let (mut lo, mut hi, mut sum) = (f32::MAX, f32::MIN, 0.0f64);
+        let n = 200_000;
+        for _ in 0..n {
+            let u = rng.uniform();
+            lo = lo.min(u);
+            hi = hi.max(u);
+            sum += u as f64;
+        }
+        assert!((-1.0..-0.99).contains(&lo), "min {lo}");
+        assert!(hi < 1.0 && hi > 0.99, "max {hi}");
+        assert!((sum / n as f64).abs() < 0.01, "mean {}", sum / n as f64);
+    }
 
     fn window_at(source: &[f32], pos: usize) -> Vec<f32> {
         (0..960).map(|i| source[(pos + i) % source.len()]).collect()

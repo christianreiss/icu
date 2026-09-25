@@ -7,7 +7,12 @@
 //! estimate. A short cooldown after an open→closed transition skips
 //! RNNoise's own trailing probability tail. A starvation watchdog nudges
 //! the floor up even while nominally open, so a threshold that started too
-//! low (gate never closes) cannot deadlock the tracker forever.
+//! low (gate never closes) cannot deadlock the tracker forever. It feeds on
+//! the *lowest* probability of the last one to two seconds, not the current
+//! one: speech dips towards zero between words and syllables, steady noise
+//! that holds the gate open does not. Before 2026-09-25 the watchdog
+//! absorbed the current probability, so a monologue longer than four
+//! seconds drove the threshold up to 0.9 and clipped the next onset.
 
 use std::time::{Duration, Instant};
 
@@ -21,9 +26,12 @@ const ALPHA_UP: f32 = 0.03;
 /// Skip samples this long after an open→closed transition (RNNoise's own
 /// smoothing leaves a short probability tail after speech ends).
 const CLOSE_COOLDOWN: Duration = Duration::from_millis(150);
-/// If no trusted sample has landed in this long, absorb the current
-/// sample anyway (breaks a stuck-open gate in a noisy room).
+/// If no trusted sample has landed in this long, absorb the recent minimum
+/// anyway (breaks a stuck-open gate in a noisy room).
 const STARVATION: Duration = Duration::from_secs(4);
+/// Length of one minimum-tracking window; the watchdog sees the lower of the
+/// current and the previous window, so 1–2 s of history.
+const MIN_WINDOW: Duration = Duration::from_secs(1);
 
 /// Tracks the noise floor and derives the live VAD threshold. One instance
 /// per `dsp_thread`; not thread-safe, owned entirely by that thread.
@@ -33,6 +41,10 @@ pub struct AutoThreshold {
     closed_at: Option<Instant>,
     prev_gate_open: bool,
     last_trusted: Instant,
+    /// Lowest probability in the current and the previous [`MIN_WINDOW`].
+    win_min: f32,
+    prev_win_min: f32,
+    win_start: Instant,
 }
 
 impl AutoThreshold {
@@ -44,6 +56,9 @@ impl AutoThreshold {
             closed_at: None,
             prev_gate_open: false,
             last_trusted: now,
+            win_min: 1.0,
+            prev_win_min: 1.0,
+            win_start: now,
         }
     }
 
@@ -55,6 +70,13 @@ impl AutoThreshold {
             self.closed_at = Some(now);
         }
         self.prev_gate_open = gate_open;
+        if now.duration_since(self.win_start) >= MIN_WINDOW {
+            self.prev_win_min = self.win_min;
+            self.win_min = prob;
+            self.win_start = now;
+        } else {
+            self.win_min = self.win_min.min(prob);
+        }
 
         let cooled = self
             .closed_at
@@ -71,7 +93,8 @@ impl AutoThreshold {
             self.floor += alpha * (prob - self.floor);
             self.last_trusted = now;
         } else if starved {
-            self.floor += ALPHA_UP * (prob - self.floor);
+            let recent_min = self.win_min.min(self.prev_win_min);
+            self.floor += ALPHA_UP * (recent_min - self.floor);
         }
     }
 
@@ -166,6 +189,32 @@ mod tests {
             "a genuine pause should pull the floor back down quickly, {} -> {}",
             nudged,
             a.floor
+        );
+    }
+
+    /// A long monologue: RNNoise reports ~0.95 on syllables and dips to
+    /// ~0.1 between them, the gate (with its hangover) stays open for
+    /// 20 s. The watchdog must not ratchet the threshold up towards the
+    /// speech probability — that clipped the first word after the next
+    /// pause.
+    #[test]
+    fn long_speech_does_not_raise_the_threshold() {
+        let t0 = Instant::now();
+        let mut a = AutoThreshold::new(t0);
+        let mut t = t0;
+        let mut worst = 0.0f32;
+        let mut i = 0u64;
+        while t.duration_since(t0) < Duration::from_secs(20) {
+            t += ms(10);
+            // 250 ms syllable, 50 ms dip.
+            let prob = if i % 30 < 25 { 0.95 } else { 0.1 };
+            a.update(t, true, prob);
+            worst = worst.max(a.threshold());
+            i += 1;
+        }
+        assert!(
+            worst < 0.45,
+            "threshold climbed to {worst} during continuous speech"
         );
     }
 

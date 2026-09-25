@@ -92,7 +92,17 @@ impl Default for JitterConfig {
 
 const BUCKET_MS: f64 = 5.0;
 const BUCKETS: usize = 64; // 0..320 ms
-const FORGET: f64 = 0.983;
+/// How much earlier than the anchor predicts a packet may arrive and still
+/// move the anchor: the histogram's range.
+const MAX_EARLY: Duration = Duration::from_millis((BUCKETS as f64 * BUCKET_MS) as u64);
+/// Per-observation forgetting: 1/(1 − FORGET) ≈ 330 packets, 6–7 s of
+/// speech at 20 ms, so a spike seen a few spurts ago still counts. The old
+/// 0.983 (60 packets) was NetEQ's 2015 inter-arrival factor; NetEQ has
+/// since moved to 0.9993 on relative arrival delay — the quantity measured
+/// here. With 60 packets of memory a 10 % spike share dropped below the
+/// 95 % quantile at a third of all spurt ends and the target collapsed
+/// (`spurt_target_does_not_depend_on_the_anchor_packet`).
+const FORGET: f64 = 0.997;
 /// Consecutive pops with more than target + 1 frame queued before one
 /// packet is skipped to shed the excess: half a second at 20 ms frames.
 const EXCESS_POPS: u32 = 25;
@@ -242,12 +252,33 @@ impl JitterBuffer {
         }
         // Arrival delay relative to the spurt anchor feeds the histogram —
         // late packets too, they are exactly the jitter the target must cover.
-        if let Some((anchor_arrival, anchor_ts)) = self.anchor {
-            let expected = anchor_arrival
+        // The anchor is the earliest arrival seen this spurt, not the first:
+        // a first packet that was itself delayed would make everything after
+        // it look punctual, and the histogram would learn no jitter at all
+        // from a spurt full of it. A packet that arrives earlier than the
+        // anchor predicts therefore becomes the anchor (delay 0), and the
+        // remaining packets are measured against it.
+        if let Some((anchor_arrival, anchor_ts)) = self.anchor.as_mut() {
+            let expected = *anchor_arrival
                 + Duration::from_micros(
-                    ts_diff(packet.ts, anchor_ts).max(0) as u64 * 1_000_000 / 48_000,
+                    ts_diff(packet.ts, *anchor_ts).max(0) as u64 * 1_000_000 / 48_000,
                 );
-            let delay = now.saturating_duration_since(expected);
+            let delay = if now >= expected {
+                now - expected
+            } else {
+                // Only as early as a stalled anchor can explain (the
+                // histogram's range). Anything earlier is a `ts` that
+                // jumped ahead, not jitter: leave the anchor alone. The
+                // subtraction is checked because `Instant` panics below
+                // its epoch, and a peer's `ts` is not to be trusted.
+                let early = expected - now;
+                if early <= MAX_EARLY {
+                    if let Some(a) = anchor_arrival.checked_sub(early) {
+                        *anchor_arrival = a;
+                    }
+                }
+                Duration::ZERO
+            };
             self.observe(delay);
             // Mid-spurt the target only grows; it shrinks in pauses.
             let before = self.target;
@@ -794,5 +825,104 @@ mod tests {
             "backlog stays as latency: {delay_after:?} (dropped {dropped})"
         );
         assert!((10..=20).contains(&dropped), "dropped {dropped}");
+    }
+
+    /// A `ts` that jumps hours ahead mid-spurt (seq gap, so it is not a
+    /// pause) predicts an arrival far in the future; the packet is then
+    /// "early" by hours. That must neither panic (`Instant` below its
+    /// epoch) nor move the anchor or the target.
+    #[test]
+    fn ts_far_ahead_does_not_panic_or_move_the_anchor() {
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        jb.push(pkt(0, 0, false), t0);
+        jb.push(pkt(1, 960, false), t0 + ms(20));
+        assert!(matches!(jb.pop(t0 + ms(20)), Pop::Packet(_)));
+        let target = jb.target();
+        jb.push(pkt(3, 1 << 30, false), t0 + ms(60));
+        jb.push(pkt(4, 4 * 960, false), t0 + ms(80));
+        assert_eq!(jb.target(), target);
+        // The stream goes on; the next punctual packet reads as delay 0.
+        let _ = jb.pop(t0 + ms(80));
+        let _ = jb.pop(t0 + ms(100));
+        assert!(jb.stats().played >= 1);
+    }
+
+    /// Many short talk spurts over a link with occasional delay spikes:
+    /// the target must not depend on how late the *first* packet of a
+    /// spurt happened to arrive.
+    #[test]
+    fn spurt_target_does_not_depend_on_the_anchor_packet() {
+        use crate::dsp::testsignal::Rng;
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        let mut rng = Rng::new(0x5EED);
+        let u = |r: &mut Rng| (r.uniform() + 1.0) / 2.0;
+        // (arrival ms, packet)
+        let mut events: Vec<(u64, Packet)> = Vec::new();
+        let spurts = 30u64;
+        let per_spurt = 100u64;
+        let gap = 1000u64;
+        let mut seq = 0u16;
+        let mut spikes = vec![0u32; spurts as usize];
+        for s in 0..spurts {
+            let start = s * (per_spurt * 20 + gap);
+            for i in 0..per_spurt {
+                let sent = start + i * 20;
+                let delay = if u(&mut rng) < 0.1 {
+                    spikes[s as usize] += 1;
+                    60.0 + 60.0 * u(&mut rng)
+                } else {
+                    10.0 * u(&mut rng)
+                };
+                let ts = ((s * (per_spurt + gap / 20) + i) * 960) as u32;
+                events.push((sent + delay as u64, pkt(seq, ts, i == per_spurt - 1)));
+                seq = seq.wrapping_add(1);
+            }
+        }
+        events.sort_by_key(|(t, _)| *t);
+        let end = events.last().unwrap().0 + 500;
+        let mut ei = 0;
+        let mut t = 10u64;
+        let mut per_spurt_underruns = Vec::new();
+        let mut per_spurt_targets = Vec::new();
+        let mut last = jb.stats();
+        let mut spurt_seen = 0u64;
+        while t < end {
+            while ei < events.len() && events[ei].0 <= t {
+                jb.push(events[ei].1.clone(), t0 + ms(events[ei].0));
+                ei += 1;
+            }
+            let _ = jb.pop(t0 + ms(t));
+            let st = jb.stats();
+            if st.spurts > spurt_seen {
+                spurt_seen = st.spurts;
+                per_spurt_underruns.push(st.underruns - last.underruns);
+                per_spurt_targets.push(jb.target());
+                last = st;
+            }
+            t += 20;
+        }
+        per_spurt_underruns.push(jb.stats().underruns - last.underruns);
+        eprintln!("spikes per spurt: {spikes:?}");
+        eprintln!("underruns per spurt: {per_spurt_underruns:?}");
+        eprintln!("target at spurt start: {per_spurt_targets:?}");
+        let underruns: u64 = per_spurt_underruns[5..].iter().sum();
+        let min_target = per_spurt_targets[5..].iter().min().unwrap();
+        let st = jb.stats();
+        eprintln!("underruns after warm-up: {underruns}, min target {min_target:?}, {st:?}");
+        // 10 % of the packets are delayed by 60–120 ms: the 95 % quantile
+        // sits in the middle of that range, so the target settles around
+        // 100–120 ms and the top of the spike range (about 1 % of all
+        // packets) is written off by design. Before the anchor followed the
+        // earliest arrival and the histogram remembered ~60 packets, the
+        // target fell to 25–40 ms at a third of the spurt starts, with 16
+        // underruns and 4 % of the packets lost after warm-up.
+        assert!(*min_target >= ms(80), "target collapsed to {min_target:?}");
+        assert!(underruns <= 3, "{underruns} underruns after warm-up");
+        assert!(
+            st.lost <= st.played / 50,
+            "more than 2 % of the packets written off: {st:?}"
+        );
     }
 }

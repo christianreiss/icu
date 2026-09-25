@@ -21,7 +21,7 @@ impl Rng {
     }
     /// Gleichverteilt in [-1, 1).
     pub fn uniform(&mut self) -> f32 {
-        (self.next_u64() >> 11) as f32 / (1u64 << 52) as f32 * 2.0 - 1.0
+        ((self.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0) as f32
     }
 }
 
