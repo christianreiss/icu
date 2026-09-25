@@ -139,14 +139,8 @@ impl TestServer {
         via: SocketAddr,
     ) -> (Engine, tempfile::TempDir) {
         let (identity, paths, dir) = self.enroll(name).await;
-        let mut settings = Settings::default();
-        settings.audio.aec = false;
-        settings.audio.denoise = false;
-        settings.ui.register_uri_handler = false;
-        let mut cfg = EngineConfig::new(identity, settings, paths);
-        cfg.server_addr = Some(via);
-        cfg.test_tone = test_tone;
-        (Engine::start(cfg, backend).expect("engine starts"), dir)
+        let engine = engine_at(identity, paths, backend, test_tone, via).expect("engine starts");
+        (engine, dir)
     }
 
     /// An engine on an identity the caller already has (passport import, a
@@ -158,14 +152,7 @@ impl TestServer {
         backend: Box<dyn AudioBackend>,
         test_tone: bool,
     ) -> Result<Engine, String> {
-        let mut settings = Settings::default();
-        settings.audio.aec = false;
-        settings.audio.denoise = false;
-        settings.ui.register_uri_handler = false;
-        let mut cfg = EngineConfig::new(identity, settings, paths);
-        cfg.server_addr = Some(self.addr());
-        cfg.test_tone = test_tone;
-        Engine::start(cfg, backend).map_err(|e| e.to_string())
+        engine_at(identity, paths, backend, test_tone, self.addr())
     }
 
     /// A raw control client (no engine) that has said `Hello`.
@@ -193,6 +180,31 @@ impl TestServer {
             _dir,
         }
     }
+}
+
+/// The settings every test engine runs with: no AEC and no denoiser (a fake
+/// backend has nothing to cancel, and RNNoise would eat the test tone), and
+/// no URI handler touching the desktop.
+pub fn test_settings() -> Settings {
+    let mut settings = Settings::default();
+    settings.audio.aec = false;
+    settings.audio.denoise = false;
+    settings.ui.register_uri_handler = false;
+    settings
+}
+
+/// An engine on `identity` dialing `addr` instead of the identity's host.
+pub fn engine_at(
+    identity: Identity,
+    paths: Paths,
+    backend: Box<dyn AudioBackend>,
+    test_tone: bool,
+    addr: SocketAddr,
+) -> Result<Engine, String> {
+    let mut cfg = EngineConfig::new(identity, test_settings(), paths);
+    cfg.server_addr = Some(addr);
+    cfg.test_tone = test_tone;
+    Engine::start(cfg, backend).map_err(|e| e.to_string())
 }
 
 /// A raw client for driving the server from "the other side".

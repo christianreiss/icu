@@ -27,11 +27,11 @@ pub fn render(cue: Cue) -> Vec<f32> {
         Cue::Mute => (&[600.0, 400.0], 60),
         Cue::Unmute => (&[400.0, 600.0], 60),
     };
-    let n = (48_000 * dur_ms / 1000) as usize;
+    let n = (crate::audio::SAMPLE_RATE * dur_ms / 1000) as usize;
     let mut out = Vec::with_capacity(n * notes.len());
     for f in notes {
         for i in 0..n {
-            let t = i as f32 / 48_000.0;
+            let t = i as f32 / crate::audio::SAMPLE_RATE as f32;
             let env = (i as f32 / n as f32 * std::f32::consts::PI).sin();
             out.push((t * f * std::f32::consts::TAU).sin() * 0.125 * env);
         }

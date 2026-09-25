@@ -138,13 +138,7 @@ pub async fn renew_expired(
     identity: &Identity,
     name: &str,
 ) -> Result<Identity, NetError> {
-    let key = rcgen::KeyPair::try_from(identity.key_der.as_slice()).map_err(|e| {
-        NetError::User(crate::problem::Problem::new(
-            "Die gespeicherten Zugangsdaten sind beschädigt. Bitte den Passport erneut \
-             importieren.",
-            e.to_string(),
-        ))
-    })?;
+    let key = identity.key_pair().map_err(NetError::User)?;
     exchange(send, recv, identity, &key, name).await
 }
 
@@ -165,22 +159,11 @@ async fn exchange(
         match ControlMsg::decode(&body).map_err(|e| NetError::Other(e.to_string()))? {
             ControlMsg::RenewResponse { leaf_der } => {
                 let key_der = key.serialize_der();
-                let cn = crate::conninfo::CertInfo::from_der(&leaf_der).subject;
-                if cn != name {
+                if let Err(detail) = crate::conninfo::check_issued_leaf(&leaf_der, name, &key_der) {
                     return Err(NetError::User(crate::problem::Problem::new(
                         "Der Server hat die Anmeldung falsch beantwortet. Bitte noch einmal \
                          versuchen.",
-                        format!(
-                            "Server hat ein Zertifikat für {cn:?} ausgestellt, erwartet war \
-                             {name:?}"
-                        ),
-                    )));
-                }
-                if !crate::conninfo::leaf_matches_key(&leaf_der, &key_der) {
-                    return Err(NetError::User(crate::problem::Problem::new(
-                        "Der Server hat die Anmeldung falsch beantwortet. Bitte noch einmal \
-                         versuchen.",
-                        "Neues Zertifikat passt nicht zum eigenen Schlüssel",
+                        detail,
                     )));
                 }
                 let server =

@@ -133,10 +133,15 @@ fn run(cli: Cli) -> Result<(), String> {
                 .name
                 .clone()
                 .ok_or("a registration bundle needs --name <display name>")?;
-            let client = format!("icu/{} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS);
             let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
             identity = rt
-                .block_on(register(&identity, &name, &client, cli.server_addr, &paths))
+                .block_on(register(
+                    &identity,
+                    &name,
+                    &icu_client::engine::client_string(),
+                    cli.server_addr,
+                    &paths,
+                ))
                 .map_err(|e| e.to_string())?;
         } else {
             identity.save(&paths).map_err(|e| e.to_string())?;
@@ -261,13 +266,16 @@ fn run_headless(engine: Engine, debug_stats: bool) -> Result<(), String> {
     let mut last_conn = None;
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(100));
-        let s = state.borrow_and_update().clone();
-        if Some(s.conn.clone()) != last_conn {
-            eprintln!("icu: connection {:?}, {} peers", s.conn, s.peers.len());
-            last_conn = Some(s.conn.clone());
+        if state.has_changed().unwrap_or(true) {
+            let s = state.borrow_and_update();
+            if last_conn.as_ref() != Some(&s.conn) {
+                eprintln!("icu: connection {:?}, {} peers", s.conn, s.peers.len());
+                last_conn = Some(s.conn.clone());
+            }
         }
         if debug_stats && last_report.elapsed() >= Duration::from_secs(2) {
             last_report = std::time::Instant::now();
+            let s = state.borrow();
             let peers: Vec<String> = s
                 .peers
                 .iter()

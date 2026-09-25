@@ -4,11 +4,7 @@
 mod common;
 
 use common::*;
-use icu_client::{
-    audio::fake::FakeBackend,
-    config::Settings,
-    engine::{ConnStatus, Engine, EngineConfig},
-};
+use icu_client::{audio::fake::FakeBackend, engine::ConnStatus};
 
 /// A stored identity whose `server_name` no longer matches the leaf cert
 /// (e.g. hand-edited, or the server rotated to a different FQDN) must fail
@@ -24,13 +20,9 @@ async fn wrong_server_name_is_a_fatal_certificate_error() {
     identity.save(&paths).expect("identity re-saved");
 
     let (backend, _probe) = FakeBackend::silent();
-    let mut settings = Settings::default();
-    settings.audio.aec = false;
-    settings.audio.denoise = false;
-    settings.ui.register_uri_handler = false;
-    let mut cfg = EngineConfig::new(identity, settings, paths);
-    cfg.server_addr = Some(server.addr());
-    let engine = Engine::start(cfg, Box::new(backend)).expect("engine starts");
+    let engine = server
+        .engine_from(identity, paths, Box::new(backend), false)
+        .expect("engine starts");
 
     let state = wait_for(&engine, SOON, |s| matches!(&s.conn, ConnStatus::Fatal(_))).await;
     let ConnStatus::Fatal(reason) = &state.conn else {
@@ -62,13 +54,9 @@ async fn credentials_from_another_ca_read_as_a_plain_request_for_an_invite() {
     let new_server = TestServer::start().await;
 
     let (backend, _probe) = FakeBackend::silent();
-    let mut settings = Settings::default();
-    settings.audio.aec = false;
-    settings.audio.denoise = false;
-    settings.ui.register_uri_handler = false;
-    let mut cfg = EngineConfig::new(identity, settings, paths);
-    cfg.server_addr = Some(new_server.addr());
-    let engine = Engine::start(cfg, Box::new(backend)).expect("engine starts");
+    let engine = new_server
+        .engine_from(identity, paths, Box::new(backend), false)
+        .expect("engine starts");
 
     let state = wait_for(&engine, SOON, |s| matches!(&s.conn, ConnStatus::Fatal(_))).await;
     let ConnStatus::Fatal(problem) = &state.conn else {

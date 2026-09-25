@@ -66,6 +66,24 @@ pub enum ModeSetting {
     Vad,
 }
 
+impl From<ModeSetting> for crate::dsp::gate::Mode {
+    fn from(m: ModeSetting) -> Self {
+        match m {
+            ModeSetting::Ptt => Self::Ptt,
+            ModeSetting::Vad => Self::Vad,
+        }
+    }
+}
+
+impl From<crate::dsp::gate::Mode> for ModeSetting {
+    fn from(m: crate::dsp::gate::Mode) -> Self {
+        match m {
+            crate::dsp::gate::Mode::Ptt => ModeSetting::Ptt,
+            crate::dsp::gate::Mode::Vad => ModeSetting::Vad,
+        }
+    }
+}
+
 /// `[audio]`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -402,13 +420,7 @@ impl ServerInfo {
                 _ => None,
             })?;
         let (host, port) = crate::net::split_host_port(authority.trim_end_matches('/')).ok()?;
-        let name = leaf
-            .subject()
-            .iter_common_name()
-            .next()
-            .and_then(|cn| cn.as_str().ok())
-            .unwrap_or_default()
-            .to_string();
+        let name = crate::conninfo::cn(leaf.subject()).unwrap_or_default();
         let server_name = ca_server_name(ca_der).unwrap_or_else(|| host.clone());
         Some(ServerInfo {
             host,
@@ -436,12 +448,7 @@ impl ServerInfo {
 /// The SNI a CA announces in its CN `ICU CA <server_name>`, if it does.
 fn ca_server_name(ca_der: &[u8]) -> Option<String> {
     let (_, ca) = x509_parser::parse_x509_certificate(ca_der).ok()?;
-    let name = ca
-        .subject()
-        .iter_common_name()
-        .next()?
-        .as_str()
-        .ok()?
+    let name = crate::conninfo::cn(ca.subject())?
         .strip_prefix("ICU CA ")?
         .trim()
         .to_string();
@@ -515,7 +522,7 @@ impl Identity {
                 }
             }
         };
-        if rcgen::KeyPair::try_from(identity.key_der.as_slice()).is_err() {
+        if identity.key_pair().is_err() {
             return Err(
                 "Dieser Passport ist beschädigt (kein gültiger Schlüssel). Bitte auf \
                         dem anderen Gerät neu exportieren."
@@ -555,6 +562,20 @@ impl Identity {
             }
             .encode()
         }
+    }
+
+    /// The private key as rcgen reads it, for CSRs. One that does not parse
+    /// is worded for the user here, the same way at every caller: the stored
+    /// credentials are broken, and a passport from another device is the way
+    /// back.
+    pub fn key_pair(&self) -> Result<rcgen::KeyPair, crate::problem::Problem> {
+        rcgen::KeyPair::try_from(self.key_der.as_slice()).map_err(|e| {
+            crate::problem::Problem::new(
+                "Die gespeicherten Zugangsdaten sind beschädigt. Bitte den Passport erneut \
+                 importieren.",
+                e.to_string(),
+            )
+        })
     }
 
     /// Whether this is a registration bundle that still has to be swapped for
@@ -735,12 +756,7 @@ pub fn save_invite(paths: &Paths, bundle: &str) -> Result<PathBuf, ConfigError> 
     };
     let name: String = x509_parser::parse_x509_certificate(&leaf_der)
         .ok()
-        .and_then(|(_, leaf)| {
-            leaf.subject()
-                .iter_common_name()
-                .next()
-                .and_then(|cn| cn.as_str().ok().map(str::to_string))
-        })
+        .and_then(|(_, leaf)| crate::conninfo::cn(leaf.subject()))
         .unwrap_or_default()
         .chars()
         .map(|c| {

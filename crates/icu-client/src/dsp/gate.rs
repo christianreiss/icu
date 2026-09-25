@@ -83,11 +83,6 @@ impl Gate {
         self.ptt_down = down;
     }
 
-    /// Whether the PTT key is held.
-    pub fn ptt_down(&self) -> bool {
-        self.ptt_down
-    }
-
     /// Mute closes the gate regardless of mode.
     pub fn set_muted(&mut self, muted: bool) {
         self.muted = muted;

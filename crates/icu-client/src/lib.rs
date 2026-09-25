@@ -18,6 +18,7 @@ pub mod overlay;
 pub mod problem;
 pub mod quality;
 pub mod stats;
+pub mod sync;
 #[cfg(feature = "tray")]
 pub mod tray;
 #[cfg(feature = "gui")]

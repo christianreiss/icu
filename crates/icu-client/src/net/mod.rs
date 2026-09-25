@@ -121,11 +121,11 @@ pub fn bind_endpoint(remote: SocketAddr) -> Result<quinn::Endpoint, NetError> {
 
 /// Reads one length prefixed frame (`PROTOCOL.md` §2).
 pub async fn read_frame(recv: &mut quinn::RecvStream, max: usize) -> Result<Vec<u8>, NetError> {
-    let mut prefix = [0u8; 2];
+    let mut prefix = [0u8; icu_proto::framing::LEN_PREFIX];
     recv.read_exact(&mut prefix)
         .await
         .map_err(|e| NetError::Connect(e.to_string()))?;
-    let len = u16::from_le_bytes(prefix) as usize;
+    let len = icu_proto::framing::frame_len(prefix);
     icu_proto::framing::check_len(len, max).map_err(|e| NetError::Other(e.to_string()))?;
     let mut body = vec![0u8; len];
     recv.read_exact(&mut body)

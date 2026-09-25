@@ -15,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use icu_proto::Session;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_registry,
@@ -45,7 +46,7 @@ use wayland_client::{
 };
 
 use crate::{
-    config::{Corner, Expand, TileSize},
+    config::{Corner, Expand, OverlaySettings, TileSize},
     engine::{AppState, VideoFrames},
 };
 
@@ -95,7 +96,7 @@ impl Drop for OverlayHandle {
 }
 
 struct Tile {
-    rgba: Option<(usize, usize, Vec<u8>)>,
+    rgba: Option<(usize, usize, Arc<Vec<u8>>)>,
     speaking: bool,
     dim: bool,
 }
@@ -111,12 +112,8 @@ struct App {
     configured: bool,
     width: u32,
     height: u32,
-    corner: Corner,
-    offset: [u32; 2],
-    size: TileSize,
-    expand: Expand,
-    speaking_frame: bool,
-    frame_color: [u8; 3],
+    /// The overlay settings as of the last tick.
+    settings: OverlaySettings,
     tiles: Vec<Tile>,
     state: watch::Receiver<AppState>,
     frames: VideoFrames,
@@ -129,94 +126,12 @@ fn overlay_thread(
     stop: Arc<AtomicBool>,
     ready: std::sync::mpsc::Sender<Result<(), String>>,
 ) {
-    let conn = match Connection::connect_to_env() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = ready.send(Err(format!("wayland: {e}")));
-            return;
-        }
-    };
-    let (globals, event_queue) = match registry_queue_init::<App>(&conn) {
+    let (conn, mut event_loop, mut app) = match setup(state, frames) {
         Ok(x) => x,
         Err(e) => {
-            let _ = ready.send(Err(format!("registry: {e}")));
+            let _ = ready.send(Err(e));
             return;
         }
-    };
-    let qh = event_queue.handle();
-    let compositor = match CompositorState::bind(&globals, &qh) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = ready.send(Err(format!("compositor: {e}")));
-            return;
-        }
-    };
-    let layer_shell = match LayerShell::bind(&globals, &qh) {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = ready.send(Err(format!("kein zwlr_layer_shell_v1 (GNOME?): {e}")));
-            return;
-        }
-    };
-    let shm = match Shm::bind(&globals, &qh) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = ready.send(Err(format!("shm: {e}")));
-            return;
-        }
-    };
-    let pool = match SlotPool::new(320 * 240 * 4 * 4, &shm) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = ready.send(Err(format!("pool: {e}")));
-            return;
-        }
-    };
-    let mut event_loop: EventLoop<App> = match EventLoop::try_new() {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = ready.send(Err(format!("calloop: {e}")));
-            return;
-        }
-    };
-    if let Err(e) = WaylandSource::new(conn.clone(), event_queue).insert(event_loop.handle()) {
-        let _ = ready.send(Err(format!("wayland source: {e}")));
-        return;
-    }
-    let tick = Duration::from_millis(1000 / 15);
-    if let Err(e) =
-        event_loop
-            .handle()
-            .insert_source(Timer::from_duration(tick), move |_, _, app| {
-                app.tick();
-                TimeoutAction::ToDuration(tick)
-            })
-    {
-        let _ = ready.send(Err(format!("timer: {e}")));
-        return;
-    }
-    let settings = state.borrow().settings.overlay.clone();
-    let mut app = App {
-        registry: RegistryState::new(&globals),
-        outputs: OutputState::new(&globals, &qh),
-        compositor,
-        layer_shell,
-        shm,
-        pool,
-        surface: None,
-        configured: false,
-        width: 0,
-        height: 0,
-        corner: settings.corner,
-        offset: settings.offset,
-        size: settings.size,
-        expand: settings.expand,
-        speaking_frame: settings.speaking_frame,
-        frame_color: settings.frame_color,
-        tiles: Vec::new(),
-        state,
-        frames,
-        qh: qh.clone(),
     };
     let _ = ready.send(Ok(()));
     while !stop.load(Ordering::Relaxed) {
@@ -229,9 +144,65 @@ fn overlay_thread(
     let _ = conn.flush();
 }
 
+/// Connects to the compositor, binds the globals and builds the event loop
+/// with its 15 fps timer. Each step names itself in the error the window
+/// shows as "nicht verfügbar".
+fn setup(
+    state: watch::Receiver<AppState>,
+    frames: VideoFrames,
+) -> Result<(Connection, EventLoop<'static, App>, App), String> {
+    let conn = Connection::connect_to_env().map_err(|e| format!("wayland: {e}"))?;
+    let (globals, event_queue) =
+        registry_queue_init::<App>(&conn).map_err(|e| format!("registry: {e}"))?;
+    let qh = event_queue.handle();
+    let compositor =
+        CompositorState::bind(&globals, &qh).map_err(|e| format!("compositor: {e}"))?;
+    let layer_shell = LayerShell::bind(&globals, &qh)
+        .map_err(|e| format!("kein zwlr_layer_shell_v1 (GNOME?): {e}"))?;
+    let shm = Shm::bind(&globals, &qh).map_err(|e| format!("shm: {e}"))?;
+    let pool = SlotPool::new(320 * 240 * 4 * 4, &shm).map_err(|e| format!("pool: {e}"))?;
+    let event_loop: EventLoop<App> = EventLoop::try_new().map_err(|e| format!("calloop: {e}"))?;
+    WaylandSource::new(conn.clone(), event_queue)
+        .insert(event_loop.handle())
+        .map_err(|e| format!("wayland source: {e}"))?;
+    let tick = Duration::from_millis(1000 / 15);
+    event_loop
+        .handle()
+        .insert_source(Timer::from_duration(tick), move |_, _, app| {
+            app.tick();
+            TimeoutAction::ToDuration(tick)
+        })
+        .map_err(|e| format!("timer: {e}"))?;
+    let settings = state.borrow().settings.overlay.clone();
+    let app = App {
+        registry: RegistryState::new(&globals),
+        outputs: OutputState::new(&globals, &qh),
+        compositor,
+        layer_shell,
+        shm,
+        pool,
+        surface: None,
+        configured: false,
+        width: 0,
+        height: 0,
+        settings,
+        tiles: Vec::new(),
+        state,
+        frames,
+        qh: qh.clone(),
+    };
+    Ok((conn, event_loop, app))
+}
+
+/// What decides the layer surface's anchor, margin and size: a change here
+/// needs the surface created anew.
+fn layout(s: &OverlaySettings) -> (Corner, [u32; 2], TileSize, Expand) {
+    (s.corner, s.offset, s.size, s.expand)
+}
+
 impl App {
     fn tile_dims(&self) -> (u32, u32) {
-        match self.size {
+        match self.settings.size {
             TileSize::Small => (160, 120),
             TileSize::Medium => (320, 240),
             TileSize::Large => (480, 360),
@@ -241,47 +212,45 @@ impl App {
     /// `Top`/`Bottom` are always laid out horizontally (and centered by the
     /// compositor); other positions follow the configured expand direction.
     fn effective_expand(&self) -> Expand {
-        match self.corner {
+        match self.settings.corner {
             Corner::Top | Corner::Bottom => Expand::Horizontal,
-            _ => self.expand,
+            _ => self.settings.expand,
         }
     }
 
     fn tick(&mut self) {
-        let state = self.state.borrow().clone();
-        let settings = &state.settings.overlay;
-        let layout_changed = settings.corner != self.corner
-            || settings.offset != self.offset
-            || settings.size != self.size
-            || settings.expand != self.expand;
-        self.corner = settings.corner;
-        self.offset = settings.offset;
-        self.size = settings.size;
-        self.expand = settings.expand;
-        self.speaking_frame = settings.speaking_frame;
-        self.frame_color = settings.frame_color;
+        // Only what a tile needs leaves the state: the whole `AppState`
+        // (device list, user list, invite text) is not worth cloning at
+        // 15 Hz.
+        let (settings, mut peers) = {
+            let state = self.state.borrow();
+            let peers: Vec<(Session, String, bool)> = state
+                .peers
+                .iter()
+                .filter(|p| p.info.flags.camera_on())
+                .map(|p| (p.info.session, p.info.name.clone(), p.speaking))
+                .collect();
+            (state.settings.overlay.clone(), peers)
+        };
+        let layout_changed = layout(&settings) != layout(&self.settings);
+        self.settings = settings;
 
         // Tiles: every peer with the camera on, in name order.
         let frames = self.frames.latest();
-        let mut peers: Vec<_> = state
-            .peers
-            .iter()
-            .filter(|p| p.info.flags.camera_on())
-            .collect();
-        peers.sort_by(|a, b| a.info.name.cmp(&b.info.name));
+        peers.sort_by(|a, b| a.1.cmp(&b.1));
         self.tiles = peers
             .iter()
-            .map(|p| Tile {
+            .map(|(session, _, speaking)| Tile {
                 rgba: frames
                     .iter()
-                    .find(|(s, _)| *s == p.info.session)
+                    .find(|(s, _)| s == session)
                     .map(|(_, f)| (f.width, f.height, f.rgba.clone())),
-                speaking: p.speaking,
-                dim: settings.dim_non_speaking && !p.speaking,
+                speaking: *speaking,
+                dim: self.settings.dim_non_speaking && !speaking,
             })
             .collect();
 
-        let want = state.overlay_on && !self.tiles.is_empty();
+        let want = self.settings.enabled && !self.tiles.is_empty();
         if !want {
             if self.surface.take().is_some() {
                 self.configured = false;
@@ -308,7 +277,7 @@ impl App {
                 Some("icu-overlay"),
                 None,
             );
-            let anchor = match self.corner {
+            let anchor = match self.settings.corner {
                 Corner::TopLeft => Anchor::TOP | Anchor::LEFT,
                 Corner::TopRight => Anchor::TOP | Anchor::RIGHT,
                 Corner::BottomLeft => Anchor::BOTTOM | Anchor::LEFT,
@@ -319,7 +288,10 @@ impl App {
                 Corner::Bottom => Anchor::BOTTOM,
             };
             layer.set_anchor(anchor);
-            let (ox, oy) = (self.offset[0] as i32, self.offset[1] as i32);
+            let (ox, oy) = (
+                self.settings.offset[0] as i32,
+                self.settings.offset[1] as i32,
+            );
             layer.set_margin(oy, ox, oy, ox);
             layer.set_size(width, height);
             layer.set_keyboard_interactivity(KeyboardInteractivity::None);
@@ -362,8 +334,8 @@ impl App {
         let mut x0 = 0u32;
         let mut y0 = 0u32;
         for tile in &self.tiles {
-            let border = if tile.speaking && self.speaking_frame {
-                let [r, g, b] = self.frame_color;
+            let border = if tile.speaking && self.settings.speaking_frame {
+                let [r, g, b] = self.settings.frame_color;
                 [b, g, r, 0xff] // B G R A premultiplied
             } else {
                 [0x30, 0x30, 0x30, 0xc0]

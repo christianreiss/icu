@@ -11,13 +11,18 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
 use icu_proto::AudioParams;
 use sha2::{Digest, Sha256};
+use x509_parser::x509::X509Name;
 
-use crate::{config::Identity, net::conn::Welcome, netcond::NetworkCondition};
+use crate::{
+    config::Identity,
+    net::conn::{unix_now, Welcome},
+    netcond::NetworkCondition,
+};
 
 /// Placeholder for any field a malformed certificate does not yield. A
 /// cosmetic window must never be able to fail a connection, so every parse
@@ -107,13 +112,36 @@ pub fn leaf_matches_key(leaf_der: &[u8], key_der: &[u8]) -> bool {
     cert.public_key().subject_public_key.data.as_ref() == key.public_key_raw()
 }
 
-/// The certificate's common name, or the whole RDN sequence when it has none.
-fn common_name(name: &x509_parser::x509::X509Name<'_>) -> String {
+/// Checks a leaf the server issued in answer to a CSR: its CN must be the
+/// `cn` asked for and its public key the one of `key_der` (PKCS#8). `Err`
+/// carries the technical detail; the caller words it for the user. The one
+/// check for registration and renewal, so the two cannot drift apart in
+/// what they accept.
+pub fn check_issued_leaf(leaf_der: &[u8], cn: &str, key_der: &[u8]) -> Result<CertInfo, String> {
+    let info = CertInfo::from_der(leaf_der);
+    if info.subject != cn {
+        return Err(format!(
+            "Server hat ein Zertifikat für {:?} ausgestellt, erwartet war {cn:?}",
+            info.subject
+        ));
+    }
+    if !leaf_matches_key(leaf_der, key_der) {
+        return Err("Neues Zertifikat passt nicht zum eigenen Schlüssel".to_string());
+    }
+    Ok(info)
+}
+
+/// The common name of a certificate subject or issuer, if it has one.
+pub fn cn(name: &X509Name<'_>) -> Option<String> {
     name.iter_common_name()
         .next()
         .and_then(|cn| cn.as_str().ok())
         .map(str::to_string)
-        .unwrap_or_else(|| name.to_string())
+}
+
+/// The certificate's common name, or the whole RDN sequence when it has none.
+fn common_name(name: &X509Name<'_>) -> String {
+    cn(name).unwrap_or_else(|| name.to_string())
 }
 
 /// `YYYY-MM-DD` from a Unix timestamp; [`UNKNOWN`] if it is not a real date.
@@ -122,14 +150,6 @@ fn fmt_date(unix_s: i64) -> String {
         Ok(t) => format!("{:04}-{:02}-{:02}", t.year(), u8::from(t.month()), t.day()),
         Err(_) => UNKNOWN.to_string(),
     }
-}
-
-/// Seconds since the epoch, 0 if the clock is before it.
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// SHA-256 over `der`, as 32 colon-separated uppercase hex pairs — the form

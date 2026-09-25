@@ -17,6 +17,7 @@ use rustls::{
 use crate::{
     config::Identity,
     problem::{self, Problem},
+    sync::lock,
 };
 
 use super::{read_frame, NetError};
@@ -40,12 +41,12 @@ pub struct CertFailure(Arc<Mutex<Option<rustls::Error>>>);
 
 impl CertFailure {
     fn record(&self, e: &rustls::Error) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.clone());
+        *lock(&self.0) = Some(e.clone());
     }
 
     /// Takes and clears the last recorded verification failure, if any.
     fn take(&self) -> Option<rustls::Error> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+        lock(&self.0).take()
     }
 }
 
@@ -194,6 +195,7 @@ pub fn leaf_expired(leaf_der: &[u8], now: i64) -> bool {
         .is_ok_and(|(_, cert)| cert.validity().not_after.timestamp() < now)
 }
 
+/// Seconds since the epoch, 0 if the clock is before it.
 pub fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -318,20 +320,14 @@ pub async fn connect(
     // its code decides whether to retry, as on the read below.
     write_msg(&mut send, &hello)
         .await
-        .map_err(|e| match conn.close_reason() {
-            Some(reason) => ConnectError::from_connection_error(reason),
-            None => ConnectError::Transport(e.to_string()),
-        })?;
+        .map_err(|e| ConnectError::on(&conn, e))?;
     let body = tokio::time::timeout(
         Duration::from_secs(pl::HELLO_TIMEOUT_S + 5),
         read_frame(&mut recv, MAX_CONTROL_FRAME),
     )
     .await
     .map_err(|_| ConnectError::Transport("no Welcome".into()))?
-    .map_err(|e| match conn.close_reason() {
-        Some(reason) => ConnectError::from_connection_error(reason),
-        None => ConnectError::Transport(e.to_string()),
-    })?;
+    .map_err(|e| ConnectError::on(&conn, e))?;
     match ControlMsg::decode(&body).map_err(|e| ConnectError::Protocol(e.to_string()))? {
         ControlMsg::Welcome {
             minor,
@@ -414,6 +410,15 @@ pub enum CertIssue {
 }
 
 impl ConnectError {
+    /// Why a read or write on `conn` failed: the server's close code when
+    /// it closed the connection, otherwise the transport error `e`.
+    pub fn on(conn: &quinn::Connection, e: impl std::fmt::Display) -> ConnectError {
+        match conn.close_reason() {
+            Some(reason) => ConnectError::from_connection_error(reason),
+            None => ConnectError::Transport(e.to_string()),
+        }
+    }
+
     /// Maps a quinn error.
     pub fn from_connection_error(e: quinn::ConnectionError) -> ConnectError {
         match e {

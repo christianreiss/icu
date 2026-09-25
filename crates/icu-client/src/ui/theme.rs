@@ -37,8 +37,6 @@ pub struct Tokens {
     pub warning_tint: Color32,
     /// Level meter fill.
     pub level: Color32,
-    /// Level meter near/at 0 dBFS (top segments) — same value as [`Self::error`].
-    pub level_clip: Color32,
     /// Muted/secondary text, still body-sized (e.g. server host, help text).
     pub muted_text: Color32,
     /// Dim/tertiary text (min/max labels, chip captions).
@@ -76,7 +74,6 @@ pub fn tokens(visuals: &Visuals) -> Tokens {
             error_tint: Color32::from_rgb(0x22, 0x12, 0x14),
             warning_tint: Color32::from_rgb(0x20, 0x19, 0x0d),
             level: Color32::from_rgb(0x58, 0xc0, 0x89),
-            level_clip: Color32::from_rgb(0xe5, 0x56, 0x5b),
             muted_text: Color32::from_rgb(0xa2, 0xa9, 0xb8),
             dim_text: Color32::from_rgb(0x76, 0x7e, 0x8f),
             hover_overlay: Color32::from_white_alpha(14),
@@ -94,7 +91,6 @@ pub fn tokens(visuals: &Visuals) -> Tokens {
             error_tint: Color32::from_rgb(0xfb, 0xec, 0xeb),
             warning_tint: Color32::from_rgb(0xfb, 0xf1, 0xdf),
             level: Color32::from_rgb(0x2c, 0x9a, 0x63),
-            level_clip: Color32::from_rgb(0xc0, 0x34, 0x2f),
             muted_text: Color32::from_rgb(0x4e, 0x57, 0x66),
             dim_text: Color32::from_rgb(0x6e, 0x77, 0x86),
             hover_overlay: Color32::from_black_alpha(12),
