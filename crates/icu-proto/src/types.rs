@@ -286,6 +286,10 @@ pub struct UserSummary {
     /// Invited, but the registration has not been confirmed yet
     /// (`PROTOCOL.md` §2.3).
     pub pending: bool,
+    /// Mute enforced by an admin (`AdminSetRestriction`).
+    pub muted: bool,
+    /// Deafen enforced by an admin (`AdminSetRestriction`).
+    pub deafened: bool,
 }
 
 /// Audio parameters announced in `Welcome` (`PROTOCOL.md` §2.1).

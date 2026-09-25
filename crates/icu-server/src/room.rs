@@ -82,6 +82,9 @@ pub struct Member {
     pub name: String,
     /// Current state bits.
     pub flags: UserFlags,
+    /// `MUTED`/`DEAFENED` enforced by an admin (`AdminSetRestriction`): kept
+    /// set in `flags` whatever the client requests.
+    pub forced: UserFlags,
     /// The QUIC connection, for datagrams and for closing.
     pub conn: quinn::Connection,
     /// Outgoing control frames, each shared with every other recipient of a
@@ -215,6 +218,7 @@ impl Room {
         name: String,
         flags: UserFlags,
         is_admin: bool,
+        forced: UserFlags,
         conn: quinn::Connection,
         out: mpsc::Sender<Bytes>,
         welcome: impl FnOnce(Session, UserFlags, Vec<UserInfo>) -> ControlMsg,
@@ -228,12 +232,13 @@ impl Room {
         // A client cannot announce itself as speaking or admin; the admin
         // bit comes from the store, looked up by the caller before join.
         let mut initial = UserFlags::NONE.apply_client_request(flags);
-        initial = initial.with_bit(UserFlags::ADMIN, is_admin);
+        initial = UserFlags(initial.with_bit(UserFlags::ADMIN, is_admin).0 | forced.0);
         let mut member = Member {
             session,
             user_id,
             name,
             flags: initial,
+            forced,
             conn,
             out,
             speak: Speaking::default(),
@@ -379,7 +384,7 @@ impl Room {
     pub fn apply_client_state(&self, session: Session, requested: UserFlags) -> Option<UserFlags> {
         let mut state = self.lock();
         let member = state.members.get_mut(&session)?;
-        let new = member.flags.apply_client_request(requested);
+        let new = UserFlags(member.flags.apply_client_request(requested).0 | member.forced.0);
         if new == member.flags {
             return None;
         }
@@ -415,6 +420,27 @@ impl Room {
             if new != member.flags {
                 member.flags = new;
                 changed.push(member.session);
+            }
+        }
+        changed
+    }
+
+    /// Sets the admin-enforced `MUTED`/`DEAFENED` bits on every live session
+    /// of `user_id`. Enforcing sets the bits at once; lifting leaves them as
+    /// they are, the user unmutes themself. Returns each session whose flags
+    /// changed with its new flags, for the `UserState` broadcast.
+    pub fn set_forced(&self, user_id: UserId, forced: UserFlags) -> Vec<(Session, UserFlags)> {
+        let mut state = self.lock();
+        let mut changed = Vec::new();
+        for member in state.members.values_mut() {
+            if member.user_id != user_id {
+                continue;
+            }
+            member.forced = forced;
+            let new = UserFlags(member.flags.0 | forced.0);
+            if new != member.flags {
+                member.flags = new;
+                changed.push((member.session, new));
             }
         }
         changed

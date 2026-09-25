@@ -176,6 +176,14 @@ pub struct UserRecord {
     /// re-enrollment.
     #[serde(default)]
     pub disabled: bool,
+    /// Mute enforced by an admin (`AdminSetRestriction`): bit0 of the user's
+    /// `UserFlags` stays set whatever the client sends. Survives reconnects
+    /// and restarts, or it would be undone by reconnecting.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub server_muted: bool,
+    /// Deafen enforced by an admin, like `server_muted` for bit1.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub server_deafened: bool,
 }
 
 impl UserRecord {
@@ -403,6 +411,8 @@ impl Store {
                     certs: vec![cert],
                     is_admin,
                     disabled: false,
+                    server_muted: false,
+                    server_deafened: false,
                 },
             );
             Ok(id)
@@ -566,6 +576,30 @@ impl Store {
             |u| u.disabled,
             |u, v| u.disabled = v,
         )
+    }
+
+    /// Sets the admin-enforced mute and deafen. Not guarded: it takes no
+    /// admin rights away. Returns whether anything changed.
+    pub fn set_restriction(&mut self, id: UserId, muted: bool, deafened: bool) -> Result<bool> {
+        let current = self
+            .user(id)
+            .ok_or_else(|| Error::coded(ec::NO_SUCH_USER, format!("unknown user_id {id}")))?;
+        if (current.server_muted, current.server_deafened) == (muted, deafened) {
+            return Ok(false);
+        }
+        self.update_users(|users| {
+            let user = user_entry(users, id)?;
+            user.server_muted = muted;
+            user.server_deafened = deafened;
+            Ok(true)
+        })
+    }
+
+    /// The admin-enforced `(muted, deafened)` of a user; both false for an
+    /// unknown one.
+    pub fn restriction(&self, id: UserId) -> (bool, bool) {
+        self.user(id)
+            .map_or((false, false), |u| (u.server_muted, u.server_deafened))
     }
 
     /// Sets one user flag to `want`, writing only when it changes; `guarded`
@@ -1079,6 +1113,8 @@ mod tests {
                 certs: vec![named_cert("bb", "\u{0421}\u{04BB}ris")],
                 is_admin: false,
                 disabled: false,
+                server_muted: false,
+                server_deafened: false,
             },
         );
         assert_eq!(s.resolve("Chris"), Some(latin));

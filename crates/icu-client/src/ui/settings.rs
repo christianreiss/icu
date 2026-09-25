@@ -1158,8 +1158,10 @@ impl SettingsView {
 
         let me = state.me.as_ref().map(|m| m.user_id);
         let (removed, rest): (Vec<_>, Vec<_>) = state.user_list.iter().partition(|u| u.revoked);
-        let (mut pending, mut members): (Vec<_>, Vec<_>) =
-            rest.into_iter().partition(|u| u.pending);
+        let (mut pending, rest): (Vec<_>, Vec<_>) = rest.into_iter().partition(|u| u.pending);
+        // The ban list: blocked, but not removed for good.
+        let (mut banned, mut members): (Vec<_>, Vec<_>) = rest.into_iter().partition(|u| u.disabled);
+        banned.sort_by_cached_key(|u| u.name.to_lowercase());
         // You first, then admins, then everyone else, each by name.
         members.sort_by_cached_key(|u| (Some(u.user_id) != me, !u.is_admin, u.name.to_lowercase()));
         pending.sort_by(|a, b| b.created.cmp(&a.created));
@@ -1237,6 +1239,14 @@ impl SettingsView {
                 );
             }
         });
+
+        if !banned.is_empty() {
+            widgets::group_card(ui, &format!("Gesperrt · {}", banned.len()), |ui| {
+                for (i, user) in banned.iter().enumerate() {
+                    self.member_row(ui, i > 0, user, false, cmds);
+                }
+            });
+        }
 
         if !pending.is_empty() {
             widgets::group_card(ui, &format!("Offene Einladungen · {}", pending.len()), |ui| {
@@ -1349,6 +1359,14 @@ impl SettingsView {
                                 widgets::badge(ui, "Gesperrt", widgets::BadgeKind::Danger)
                                     .on_hover_text("Kann sich nicht verbinden, bis jemand entsperrt");
                             }
+                            if user.muted {
+                                widgets::badge(ui, "Stumm", widgets::BadgeKind::Danger)
+                                    .on_hover_text("Von einem Admin stummgeschaltet");
+                            }
+                            if user.deafened {
+                                widgets::badge(ui, "Taub", widgets::BadgeKind::Danger)
+                                    .on_hover_text("Von einem Admin taubgeschaltet");
+                            }
                         });
                         let since = short_date(&user.created);
                         let status = if user.pending {
@@ -1432,6 +1450,41 @@ impl SettingsView {
                                     cmds.push(Command::SetUserDisabled {
                                         user_id: user.user_id,
                                         disabled: !user.disabled,
+                                    });
+                                    cmds.push(Command::RequestUserList);
+                                }
+                                let (glyph, label) = if user.muted {
+                                    (icon::MICROPHONE, "Stummschaltung aufheben")
+                                } else {
+                                    (icon::MICROPHONE_SLASH, "Stummschalten")
+                                };
+                                if widgets::menu_item(ui, glyph, label, false).clicked() {
+                                    cmds.push(Command::SetUserRestriction {
+                                        user_id: user.user_id,
+                                        muted: !user.muted,
+                                        deafened: user.deafened,
+                                    });
+                                    cmds.push(Command::RequestUserList);
+                                }
+                                let (glyph, label) = if user.deafened {
+                                    (icon::SPEAKER_HIGH, "Taubschaltung aufheben")
+                                } else {
+                                    (icon::SPEAKER_SLASH, "Taubschalten")
+                                };
+                                if widgets::menu_item(ui, glyph, label, false).clicked() {
+                                    cmds.push(Command::SetUserRestriction {
+                                        user_id: user.user_id,
+                                        muted: user.muted,
+                                        deafened: !user.deafened,
+                                    });
+                                    cmds.push(Command::RequestUserList);
+                                }
+                                if user.online
+                                    && widgets::menu_item(ui, icon::SIGN_OUT, "Rauswerfen", false)
+                                        .clicked()
+                                {
+                                    cmds.push(Command::KickUser {
+                                        user_id: user.user_id,
                                     });
                                     cmds.push(Command::RequestUserList);
                                 }

@@ -529,14 +529,30 @@ impl eframe::App for App {
                 // Non-techies do not hover: a connection that will not come
                 // back on its own says why right here, not only in the
                 // pill's tooltip.
-                match &state.conn {
-                    ConnStatus::Fatal(problem) => widgets::banner(
+                let reconnect = |ui: &mut egui::Ui| {
+                    ui.add_space(4.0);
+                    if widgets::button(
                         ui,
-                        widgets::BannerKind::Error,
-                        "Keine Verbindung",
-                        &problem.text,
-                        None::<fn()>,
-                    ),
+                        widgets::ButtonKind::Neutral,
+                        icon::ARROW_CLOCKWISE,
+                        "Neu verbinden",
+                    )
+                    .clicked()
+                    {
+                        send(Command::Reconnect);
+                    }
+                };
+                match &state.conn {
+                    ConnStatus::Fatal(problem) => {
+                        widgets::banner(
+                            ui,
+                            widgets::BannerKind::Error,
+                            "Keine Verbindung",
+                            &problem.text,
+                            None::<fn()>,
+                        );
+                        reconnect(ui);
+                    }
                     ConnStatus::Disconnected { reason, attempt } if *attempt >= 2 => {
                         widgets::banner(
                             ui,
@@ -544,7 +560,8 @@ impl eframe::App for App {
                             "Verbindung unterbrochen",
                             &reason.text,
                             None::<fn()>,
-                        )
+                        );
+                        reconnect(ui);
                     }
                     _ => {}
                 }
@@ -591,7 +608,9 @@ impl eframe::App for App {
                         state.muted,
                         widgets::Role::Danger,
                         widgets::RecDot::Off,
-                        None,
+                        state
+                            .restricted_muted
+                            .then(|| "Ein Admin hat dich stummgeschaltet.".to_string()),
                         Some(Command::SetMuted(!state.muted)),
                     ),
                     (
@@ -600,7 +619,9 @@ impl eframe::App for App {
                         state.deafened,
                         widgets::Role::Danger,
                         widgets::RecDot::Off,
-                        None,
+                        state
+                            .restricted_deafened
+                            .then(|| "Ein Admin hat dich taubgeschaltet.".to_string()),
                         Some(Command::SetDeafened(!state.deafened)),
                     ),
                     (
@@ -731,6 +752,7 @@ impl eframe::App for App {
                                         loss_permille: None,
                                         session: me.session,
                                         video: self_video,
+                                        moderation: None,
                                     },
                                     &columns,
                                     expanded,
@@ -759,6 +781,16 @@ impl eframe::App for App {
                                         client_rtt_ms: None,
                                         loss_permille: p.recv_loss_permille,
                                         session: p.info.session,
+                                        moderation: state.is_admin.then(|| {
+                                            let row = state
+                                                .user_list
+                                                .iter()
+                                                .find(|u| u.user_id == p.info.user_id);
+                                            Moderation {
+                                                muted: row.is_some_and(|u| u.muted),
+                                                deafened: row.is_some_and(|u| u.deafened),
+                                            }
+                                        }),
                                         // The flag arrives with `UserState`, so the
                                         // picture goes the moment somebody switches
                                         // off — not three seconds later when the
@@ -1166,6 +1198,17 @@ struct Participant<'a> {
     /// This person's live picture, `None` when there is none to show. Goes
     /// into the avatar's circle in place of the initials.
     video: Option<egui::load::SizedTexture>,
+    /// `Some` when the viewer is an admin and this is somebody else: what
+    /// an admin currently enforces on them, for the moderation menu.
+    moderation: Option<Moderation>,
+}
+
+/// What an admin enforces on a participant (`AdminSetRestriction`), as the
+/// last `UserListResponse` says.
+#[derive(Clone, Copy)]
+struct Moderation {
+    muted: bool,
+    deafened: bool,
 }
 
 impl Participant<'_> {
@@ -1400,6 +1443,16 @@ fn participant_row(
     }
     if row.response.clicked() {
         *open = if expanded { None } else { Some(p.user_id) };
+        if !expanded && p.moderation.is_some() {
+            send(Command::RequestUserList);
+        }
+    }
+    if let Some(m) = p.moderation {
+        if row.response.secondary_clicked() {
+            send(Command::RequestUserList);
+        }
+        row.response
+            .context_menu(|ui| moderation_menu(ui, p.user_id, m, send));
     }
     ui.data_mut(|d| d.insert_temp(rect_id, r));
 }
@@ -1478,7 +1531,81 @@ fn details(ui: &mut egui::Ui, p: &Participant<'_>, tok: &theme::Tokens, send: &i
             });
         });
     }
+    if let Some(m) = p.moderation {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(40.0);
+            ui.label(RichText::new("Moderation").size(12.0).color(tok.dim_text));
+            widgets::rtl(ui, 30.0, |ui| {
+                let menu = widgets::more_button(ui).on_hover_text("Admin-Aktionen");
+                egui::Popup::menu(&menu)
+                    .align(egui::RectAlign::BOTTOM_END)
+                    .gap(4.0)
+                    .show(|ui| moderation_menu(ui, p.user_id, m, send));
+            });
+        });
+    }
     ui.add_space(4.0);
+}
+
+/// An admin's actions on somebody else: enforce or lift mute and deafen,
+/// kick, kick and ban. Every one of them is undone in one click (a kicked
+/// person reconnects, a ban is lifted under Einstellungen → Nutzer), so
+/// none asks for confirmation.
+fn moderation_menu(
+    ui: &mut egui::Ui,
+    user_id: icu_proto::UserId,
+    m: Moderation,
+    send: &impl Fn(Command),
+) {
+    ui.set_min_width(220.0);
+    let restrict = |muted: bool, deafened: bool| {
+        send(Command::SetUserRestriction {
+            user_id,
+            muted,
+            deafened,
+        });
+        send(Command::RequestUserList);
+    };
+    let (glyph, label) = if m.muted {
+        (icon::MICROPHONE, "Stummschaltung aufheben")
+    } else {
+        (icon::MICROPHONE_SLASH, "Stummschalten")
+    };
+    if widgets::menu_item(ui, glyph, label, false)
+        .on_hover_text("Gilt, bis ein Admin es aufhebt – auch nach Neuverbinden")
+        .clicked()
+    {
+        restrict(!m.muted, m.deafened);
+    }
+    let (glyph, label) = if m.deafened {
+        (icon::SPEAKER_HIGH, "Taubschaltung aufheben")
+    } else {
+        (icon::SPEAKER_SLASH, "Taubschalten")
+    };
+    if widgets::menu_item(ui, glyph, label, false)
+        .on_hover_text("Hört niemanden, bis ein Admin es aufhebt")
+        .clicked()
+    {
+        restrict(m.muted, !m.deafened);
+    }
+    ui.separator();
+    if widgets::menu_item(ui, icon::SIGN_OUT, "Rauswerfen", true)
+        .on_hover_text("Trennt die Verbindung; die Person kann sich neu verbinden")
+        .clicked()
+    {
+        send(Command::KickUser { user_id });
+    }
+    if widgets::menu_item(ui, icon::PROHIBIT, "Rauswerfen & sperren", true)
+        .on_hover_text("Trennt und sperrt den Zugang, bis jemand entsperrt")
+        .clicked()
+    {
+        send(Command::SetUserDisabled {
+            user_id,
+            disabled: true,
+        });
+        send(Command::RequestUserList);
+    }
 }
 
 /// The empty state: connected, but the only person here is you.
