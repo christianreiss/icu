@@ -97,10 +97,6 @@ pub struct SettingsView {
     invite_status: Option<String>,
     /// The invite last seen in `AppState`, to notice a new one.
     seen_invite: Option<String>,
-    /// Hotkey backend in use, for display.
-    pub hotkey_backend: String,
-    /// Portal hint shown once.
-    pub show_portal_hint: bool,
     /// Active tab.
     tab: Tab,
     /// Which hotkey rows currently show their editable fields.
@@ -125,13 +121,18 @@ pub struct SettingsView {
     users_requested: Option<Instant>,
     /// Logging out is destructive too: same two-click window as revoke.
     confirm_logout: Option<Instant>,
-    /// Set once the user confirmed logging out. `App` closes the window;
-    /// the identity is deleted after the engine is down (`main_window::run`).
-    pub logout_requested: bool,
-    /// Debug window open state, mirrored in/out by `main_window.rs` each
-    /// frame (the window itself is owned by `App`, not this view — moved
-    /// here from a top-bar button so it doesn't compete for header space).
-    pub debug_window_open: bool,
+    /// Set once the user confirmed logging out; handed back to `App` as
+    /// [`SettingsOutput::logout`], which closes the window and deletes the
+    /// identity after the engine is down (`main_window::run`).
+    logout_requested: bool,
+    /// Whether the debug window is open — `App` owns the window and says so
+    /// on every call of [`SettingsView::ui`]; the About tab's button flips
+    /// it, and the frame's [`SettingsOutput`] carries the answer back.
+    debug_window_open: bool,
+    /// The draft as last handed out in `Command::UpdateSettings`, so a
+    /// change is noticed by comparison instead of by cloning the whole
+    /// draft on every frame.
+    applied: Settings,
     /// Live picture for the Kamera tab, fed by the running capture thread.
     #[cfg(feature = "camera")]
     preview: Option<crate::camera::CameraPreview>,
@@ -146,26 +147,30 @@ pub struct SettingsView {
     cameras_stale: bool,
 }
 
+/// What one frame of the settings window asks the main window to do.
+#[derive(Default)]
+pub struct SettingsOutput {
+    /// Commands for the engine.
+    pub cmds: Vec<Command>,
+    /// Whether the debug window should be open after this frame.
+    pub debug_window_open: bool,
+    /// The user confirmed logging out.
+    pub logout: bool,
+}
+
 impl SettingsView {
     /// From the engine's current settings.
-    pub fn new(
-        state: &AppState,
-        hotkey_backend: String,
-        stats: Arc<DebugStats>,
-        paths: Paths,
-    ) -> SettingsView {
+    pub fn new(state: &AppState, stats: Arc<DebugStats>, paths: Paths) -> SettingsView {
+        let name = state
+            .me
+            .as_ref()
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
         SettingsView {
             draft: state.settings.clone(),
-            name: state
-                .me
-                .as_ref()
-                .map(|m| m.name.clone())
-                .unwrap_or_default(),
-            name_synced: state
-                .me
-                .as_ref()
-                .map(|m| m.name.clone())
-                .unwrap_or_default(),
+            applied: state.settings.clone(),
+            name: name.clone(),
+            name_synced: name,
             passport_import: String::new(),
             passport_status: None,
             import_preview: None,
@@ -173,8 +178,6 @@ impl SettingsView {
             invite_ttl_s: icu_proto::limits::INVITE_TTL_S,
             invite_status: None,
             seen_invite: None,
-            hotkey_backend,
-            show_portal_hint: true,
             tab: Tab::General,
             expanded_bindings: std::collections::HashSet::new(),
             stats,
@@ -206,10 +209,18 @@ impl SettingsView {
         self
     }
 
-    /// Draws the panel content. Returns commands to send.
-    pub fn ui(&mut self, ui: &mut Ui, state: &AppState) -> Vec<Command> {
+    /// The header's theme button flipped the theme outside this window:
+    /// the draft follows, and nothing is re-sent for it.
+    pub fn set_theme(&mut self, theme: &str) {
+        self.draft.ui.theme = theme.to_string();
+        self.applied.ui.theme = theme.to_string();
+    }
+
+    /// Draws the panel content. `debug_window_open` is what `App` knows;
+    /// the answer comes back in the output.
+    pub fn ui(&mut self, ui: &mut Ui, state: &AppState, debug_window_open: bool) -> SettingsOutput {
         let mut cmds = Vec::new();
-        let before = self.draft.clone();
+        self.debug_window_open = debug_window_open;
 
         // A live demote can orphan the tab: it is only in the rail while
         // `state.is_admin`, so bounce back to Allgemein instead of rendering
@@ -289,7 +300,7 @@ impl SettingsView {
                         ui.set_max_width(ui.available_width().min(CONTENT_MAX_W));
                         match self.tab {
                             Tab::Audio => self.audio_tab(ui, state),
-                            Tab::Hotkeys => self.hotkeys_tab(ui),
+                            Tab::Hotkeys => self.hotkeys_tab(ui, state),
                             Tab::Camera => self.camera_tab(ui, state),
                             Tab::General => self.general_tab(ui, state, &mut cmds),
                             Tab::Users => self.users_tab(ui, state, &mut cmds),
@@ -298,10 +309,15 @@ impl SettingsView {
                     });
             });
 
-        if self.draft != before {
+        if self.draft != self.applied {
+            self.applied.clone_from(&self.draft);
             cmds.push(Command::UpdateSettings(Box::new(self.draft.clone())));
         }
-        cmds
+        SettingsOutput {
+            cmds,
+            debug_window_open: self.debug_window_open,
+            logout: std::mem::take(&mut self.logout_requested),
+        }
     }
 
     fn audio_tab(&mut self, ui: &mut Ui, state: &AppState) {
@@ -669,13 +685,7 @@ impl SettingsView {
     /// The outcome of the last passport copy, save or import, if any.
     fn passport_status_note(&self, ui: &mut Ui) {
         if let Some(status) = &self.passport_status {
-            widgets::card_note(ui, |ui| {
-                ui.label(
-                    RichText::new(status)
-                        .size(11.5)
-                        .color(theme::tokens(ui.visuals()).dim_text),
-                );
-            });
+            widgets::help_note(ui, status);
         }
     }
 
@@ -706,16 +716,11 @@ impl SettingsView {
                     }
                 });
             });
-            widgets::card_note(ui, |ui| {
-                ui.label(
-                    RichText::new(
-                        "Löscht Schlüssel und Zertifikat auf diesem Gerät. Zurück nur mit \
-                         deinem Passport oder einer neuen Einladung — sichere ihn vorher oben.",
-                    )
-                    .size(11.5)
-                    .color(theme::tokens(ui.visuals()).dim_text),
-                );
-            });
+            widgets::help_note(
+                ui,
+                "Löscht Schlüssel und Zertifikat auf diesem Gerät. Zurück nur mit deinem \
+                 Passport oder einer neuen Einladung — sichere ihn vorher oben.",
+            );
         });
     }
 
@@ -758,7 +763,7 @@ impl SettingsView {
         }
     }
 
-    fn hotkeys_tab(&mut self, ui: &mut Ui) {
+    fn hotkeys_tab(&mut self, ui: &mut Ui, state: &AppState) {
         let adv = self.draft.ui.show_advanced;
         widgets::page_header(
             ui,
@@ -769,29 +774,24 @@ impl SettingsView {
         // `crate::hotkey::start` reports "portal", "evdev (n devices)" or
         // "none"; the empty string means it was never started
         // (`--no-hotkeys`).
-        match self.hotkey_backend.as_str() {
-            "" => {
-                widgets::banner(
-                    ui,
-                    widgets::BannerKind::Warning,
-                    "Tastenkürzel sind abgeschaltet",
-                    "ICU wurde ohne Tastenkürzel gestartet. Bedienen geht weiter über das Hauptfenster.",
-                    None::<fn()>,
-                );
-                ui.add_space(14.0);
-            }
-            "none" => {
-                widgets::banner(
-                    ui,
-                    widgets::BannerKind::Error,
-                    "Tastenkürzel funktionieren gerade nicht",
-                    "Das System hat keinen Weg angeboten, Tasten im Hintergrund zu lesen. \
-                     Unter „Erweitert“ lässt sich ein anderer Weg wählen.",
-                    None::<fn()>,
-                );
-                ui.add_space(14.0);
-            }
-            _ => {}
+        let backend = state.hotkey_backend.as_str();
+        let banner = match backend {
+            "" => Some((
+                widgets::BannerKind::Warning,
+                "Tastenkürzel sind abgeschaltet",
+                "ICU wurde ohne Tastenkürzel gestartet. Bedienen geht weiter über das Hauptfenster.",
+            )),
+            "none" => Some((
+                widgets::BannerKind::Error,
+                "Tastenkürzel funktionieren gerade nicht",
+                "Das System hat keinen Weg angeboten, Tasten im Hintergrund zu lesen. \
+                 Unter „Erweitert“ lässt sich ein anderer Weg wählen.",
+            )),
+            _ => None,
+        };
+        if let Some((kind, title, body)) = banner {
+            widgets::banner(ui, kind, title, body, None::<fn()>);
+            ui.add_space(14.0);
         }
 
         widgets::group_card(ui, "Belegung", |ui| {
@@ -823,13 +823,7 @@ impl SettingsView {
                 "Modus wechseln",
                 &mut self.draft.hotkeys.toggle_mode,
             );
-            widgets::card_note(ui, |ui| {
-                ui.label(
-                    RichText::new("Änderungen gelten ab dem nächsten Start von ICU.")
-                        .size(11.5)
-                        .color(theme::tokens(ui.visuals()).dim_text),
-                );
-            });
+            widgets::help_note(ui, "Änderungen gelten ab dem nächsten Start von ICU.");
         });
 
         if adv {
@@ -847,23 +841,18 @@ impl SettingsView {
                 });
                 widgets::setting_row(ui, true, "Aktiv", None, |ui| {
                     let tok = theme::tokens(ui.visuals());
-                    let (color, text) = match self.hotkey_backend.as_str() {
+                    let (color, text) = match backend {
                         "" => (tok.connecting, "abgeschaltet"),
                         "none" => (tok.error, "keiner"),
                         backend => (tok.connected, backend),
                     };
                     widgets::status_pill(ui, color, text)
                 });
-                widgets::card_note(ui, |ui| {
-                    ui.label(
-                        RichText::new(
-                            "Tastennamen: evdev wie KEY_RIGHTCTRL, BTN_SIDE oder code:97; \
-                             Portal-Trigger wie CTRL+SHIFT+F12.",
-                        )
-                        .size(11.5)
-                        .color(theme::tokens(ui.visuals()).dim_text),
-                    );
-                });
+                widgets::help_note(
+                    ui,
+                    "Tastennamen: evdev wie KEY_RIGHTCTRL, BTN_SIDE oder code:97; \
+                     Portal-Trigger wie CTRL+SHIFT+F12.",
+                );
             });
         }
         if adv || self.draft.hotkeys.backend == HotkeyBackend::Evdev {
@@ -1050,16 +1039,11 @@ impl SettingsView {
             }
             if adv {
                 widgets::advanced_caption(ui);
-                widgets::card_note(ui, |ui| {
-                    ui.label(
-                        RichText::new(
-                            "Der Name steht im Zertifikat. Eine Änderung stellt ein neues aus; \
-                             das alte bleibt bis zum Ablauf gültig.",
-                        )
-                        .size(11.5)
-                        .color(theme::tokens(ui.visuals()).dim_text),
-                    );
-                });
+                widgets::help_note(
+                    ui,
+                    "Der Name steht im Zertifikat. Eine Änderung stellt ein neues aus; das \
+                     alte bleibt bis zum Ablauf gültig.",
+                );
                 widgets::setting_row(ui, true, "Server", None, |ui| {
                     widgets::chip(ui, &state.server, 0.0)
                 });
@@ -1151,8 +1135,8 @@ impl SettingsView {
         let (mut pending, mut members): (Vec<_>, Vec<_>) =
             rest.into_iter().partition(|u| u.pending);
         // You first, then admins, then everyone else, each by name.
-        members.sort_by_key(|u| (Some(u.user_id) != me, !u.is_admin, u.name.to_lowercase()));
-        pending.sort_by_key(|u| std::cmp::Reverse(u.created.clone()));
+        members.sort_by_cached_key(|u| (Some(u.user_id) != me, !u.is_admin, u.name.to_lowercase()));
+        pending.sort_by(|a, b| b.created.cmp(&a.created));
 
         widgets::page_header(
             ui,
@@ -1221,15 +1205,10 @@ impl SettingsView {
             }
             if members.len() == 1 && pending.is_empty() {
                 ui.separator();
-                widgets::card_note(ui, |ui| {
-                    ui.label(
-                        RichText::new(
-                            "Noch bist du allein hier. Über „Einladen“ holst du jemanden dazu.",
-                        )
-                        .size(11.5)
-                        .color(theme::tokens(ui.visuals()).dim_text),
-                    );
-                });
+                widgets::help_note(
+                    ui,
+                    "Noch bist du allein hier. Über „Einladen“ holst du jemanden dazu.",
+                );
             }
         });
 
@@ -1794,18 +1773,8 @@ fn preview_placeholder(ui: &mut Ui, width: f32, camera_on: bool) {
     let tok = theme::tokens(ui.visuals());
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(width, width * 3.0 / 4.0), egui::Sense::hover());
+    widgets::paint_well(ui, rect, theme::R_CHIP);
     let painter = ui.painter();
-    painter.rect_filled(
-        rect,
-        egui::CornerRadius::same(theme::R_CHIP),
-        ui.visuals().extreme_bg_color,
-    );
-    painter.rect_stroke(
-        rect,
-        egui::CornerRadius::same(theme::R_CHIP),
-        egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
-        egui::StrokeKind::Inside,
-    );
     painter.text(
         rect.center() - egui::vec2(0.0, 10.0),
         egui::Align2::CENTER_CENTER,
@@ -1836,24 +1805,14 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
             let selected = *corner == value;
             let (rect, resp) = ui.allocate_exact_size(swatch, egui::Sense::click());
             if ui.is_rect_visible(rect) {
-                let painter = ui.painter();
-                painter.rect_filled(
-                    rect,
-                    egui::CornerRadius::same(theme::R_CTRL),
-                    ui.visuals().extreme_bg_color,
-                );
-                painter.rect_stroke(
-                    rect,
-                    egui::CornerRadius::same(theme::R_CTRL),
-                    egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
-                    egui::StrokeKind::Inside,
-                );
+                widgets::paint_well(ui, rect, theme::R_CTRL);
                 let tile_color = if selected {
                     tok.accent
                 } else {
                     ui.visuals().widgets.inactive.bg_stroke.color
                 };
-                painter.rect_filled(tile_rect_fn(rect), 2.0, tile_color);
+                ui.painter()
+                    .rect_filled(tile_rect_fn(rect), 2.0, tile_color);
             }
             if resp.clicked() {
                 *corner = value;
@@ -1991,17 +1950,7 @@ fn binding_row(
         .inner_margin(egui::Margin::symmetric(12, 11))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // A full-height, left-aligned label column: it sets the row
-                // height before the chips arrive, so they center on it too.
-                let (col, _) =
-                    ui.allocate_exact_size(egui::vec2(BINDING_LABEL_W, 30.0), egui::Sense::hover());
-                ui.painter().text(
-                    col.left_center(),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    egui::FontId::new(13.5, egui::FontFamily::Proportional),
-                    ui.visuals().text_color(),
-                );
+                widgets::label_column(ui, BINDING_LABEL_W, 30.0, label);
                 // An unset binding shows one dash, not two empty boxes.
                 let key = if binding.key.is_empty() {
                     "—"

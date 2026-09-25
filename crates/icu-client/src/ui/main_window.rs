@@ -13,7 +13,12 @@ use std::{
 use egui::{Color32, RichText};
 use egui_phosphor::regular as icon;
 
-use super::{connection::ConnectionView, fonts, settings::SettingsView, theme, widgets};
+use super::{
+    connection::{opt, wrap_fingerprint, ConnectionView, NONE},
+    fonts,
+    settings::SettingsView,
+    theme, widgets,
+};
 use crate::{
     config::{Identity, Paths},
     dsp::gate::Mode,
@@ -79,8 +84,7 @@ pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String
         "ICU",
         options,
         Box::new(move |cc| {
-            let mut app = App::new(cc, engine_for_app, debug_stats);
-            app.logged_out = logged_out_app;
+            let mut app = App::new(cc, engine_for_app, debug_stats, logged_out_app);
             // `window_visible` keeps the engine's view, so `logic` reports
             // the difference.
             app.hidden = start_minimized;
@@ -198,57 +202,49 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         engine: Arc<Mutex<Option<Engine>>>,
         debug_stats: bool,
+        logged_out: Arc<AtomicBool>,
     ) -> App {
-        let (state_rx, cmd, stats, theme_name, start_minimized) = {
-            let guard = engine.lock().unwrap();
-            let e = guard.as_ref().expect("engine");
-            let snapshot = e.snapshot();
-            (
-                e.state(),
-                e.command_sender(),
-                e.stats(),
-                snapshot.settings.ui.theme.clone(),
-                snapshot.settings.ui.start_minimized,
-            )
-        };
+        // Everything the window needs from the engine, taken under one
+        // lock; the threads started below get their own handles.
+        let guard = engine.lock().unwrap();
+        let e = guard.as_ref().expect("engine");
+        let state_rx = e.state();
+        let cmd = e.command_sender();
+        let stats = e.stats();
+        let frames = e.video_frames_source();
+        #[cfg(feature = "camera")]
+        let camera_link = e.camera_link();
+        drop(guard);
+        let mut state = state_rx.borrow().clone();
+        sort_peers(&mut state);
+        let theme_name = state.settings.ui.theme.clone();
+        let start_minimized = state.settings.ui.start_minimized;
+
         fonts::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, &theme_name);
         #[cfg(feature = "tray")]
         let tray = crate::tray::Tray::start(cmd.clone(), cc.egui_ctx.clone()).ok();
         #[cfg(feature = "overlay")]
-        let overlay = {
-            let guard = engine.lock().unwrap();
-            let e = guard.as_ref().expect("engine");
-            match crate::overlay::OverlayHandle::start(e.state(), e.video_frames_source()) {
-                Ok(h) => {
-                    tracing::info!("overlay thread started (layer shell available)");
-                    Some(h)
-                }
-                Err(err) => {
-                    tracing::warn!(%err, "overlay unavailable");
-                    None
-                }
+        let overlay = match crate::overlay::OverlayHandle::start(state_rx.clone(), frames.clone()) {
+            Ok(h) => {
+                tracing::info!("overlay thread started (layer shell available)");
+                Some(h)
+            }
+            Err(err) => {
+                tracing::warn!(%err, "overlay unavailable");
+                None
             }
         };
         #[cfg(feature = "camera")]
         let (camera, self_video) = {
-            let guard = engine.lock().unwrap();
-            let e = guard.as_ref().expect("engine");
-            let snapshot = e.snapshot();
-            let handle = crate::camera::CameraHandle::new(e.camera_link());
+            let handle = crate::camera::CameraHandle::new(camera_link);
             let preview = crate::camera::CameraPreview::new(handle.preview_source());
-            if snapshot.settings.camera.enabled {
+            if state.settings.camera.enabled {
                 let _ = cmd.send(Command::SetCamera(true));
             }
             (Some(handle), Some(preview))
         };
-        let videos = {
-            let guard = engine.lock().unwrap();
-            let e = guard.as_ref().expect("engine");
-            crate::video::VideoTextures::new(e.video_frames_source())
-        };
-        let mut state = state_rx.borrow().clone();
-        sort_peers(&mut state);
+        let videos = crate::video::VideoTextures::new(frames);
         App {
             engine,
             state,
@@ -279,7 +275,7 @@ impl App {
             fitted: false,
             rows_seen: 0,
             quit_requested: false,
-            logged_out: Arc::new(AtomicBool::new(false)),
+            logged_out,
         }
     }
 }
@@ -307,7 +303,7 @@ impl eframe::App for App {
         let state = &self.state;
 
         #[cfg(feature = "tray")]
-        if let Some(tray) = &self.tray {
+        if let Some(tray) = &mut self.tray {
             match tray.poll() {
                 Some(crate::tray::TrayEvent::ShowWindow) => {
                     self.hidden = false;
@@ -427,13 +423,14 @@ impl eframe::App for App {
                         // Clickable in every state, not just Connected: a failed
                         // or retrying connection is exactly when the details are
                         // worth a window instead of a one-line tooltip.
-                        let hint = if detail.is_empty() {
-                            format!("{short}\n\nKlicken für Verbindungsdetails")
-                        } else {
-                            format!("{short} — {detail}\n\nKlicken für Verbindungsdetails")
-                        };
                         if widgets::status_link(ui, color, &short)
-                            .on_hover_text(hint)
+                            .on_hover_ui(|ui| {
+                                ui.label(if detail.is_empty() {
+                                    format!("{short}\n\nKlicken für Verbindungsdetails")
+                                } else {
+                                    format!("{short} — {detail}\n\nKlicken für Verbindungsdetails")
+                                });
+                            })
                             .clicked()
                         {
                             self.connection = match self.connection.take() {
@@ -488,12 +485,8 @@ impl eframe::App for App {
                                             .map(|e| e.paths())
                                             .unwrap_or_else(|| Paths::new(None));
                                         #[cfg_attr(not(feature = "camera"), allow(unused_mut))]
-                                        let mut view = SettingsView::new(
-                                            state,
-                                            state.hotkey_backend.clone(),
-                                            self.stats.clone(),
-                                            paths,
-                                        );
+                                        let mut view =
+                                            SettingsView::new(state, self.stats.clone(), paths);
                                         #[cfg(feature = "camera")]
                                         if let Some(camera) = &self.camera {
                                             view = view.with_preview(camera.preview_source());
@@ -788,7 +781,7 @@ impl eframe::App for App {
             let mut settings = self.state.settings.clone();
             settings.ui.theme = next.to_string();
             if let Some(view) = &mut self.settings {
-                view.draft.ui.theme = next.to_string();
+                view.set_theme(next);
             }
             send(Command::UpdateSettings(Box::new(settings)));
         }
@@ -824,25 +817,19 @@ impl App {
         if !self.debug_window_open {
             return;
         }
-        let mut still_open = true;
         let stats_text = &self.stats_text;
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("icu-debug"),
-            egui::ViewportBuilder::default()
-                .with_title("ICU — Debug")
-                .with_inner_size([540.0, 440.0]),
-            |ctx, _class| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.label(RichText::new(stats_text).monospace().small());
-                    });
+        self.debug_window_open = immediate_window(
+            ctx,
+            "icu-debug",
+            "ICU — Debug",
+            [540.0, 440.0],
+            None,
+            |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.label(RichText::new(stats_text).monospace().small());
                 });
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    still_open = false;
-                }
             },
         );
-        self.debug_window_open = still_open;
     }
 
     /// The Verbindung window, drawn into its own immediate viewport.
@@ -852,27 +839,18 @@ impl App {
         if self.connection.is_none() {
             return;
         }
-        let mut still_open = true;
         // Plain locals, not `self` fields — the closure would otherwise
         // capture the whole of `self` and collide `&self.state` against
         // `&mut self.connection` (see `settings_window`).
         let state = &self.state;
         let view = &mut self.connection;
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("icu-connection"),
-            egui::ViewportBuilder::default()
-                .with_title("ICU — Verbindung")
-                .with_inner_size([700.0, 560.0])
-                .with_min_inner_size([560.0, 380.0])
-                .with_resizable(true),
-            |vctx, _class| {
-                egui::CentralPanel::default().show(vctx, |ui| {
-                    view.as_mut().expect("checked above").ui(ui, state);
-                });
-                if vctx.input(|i| i.viewport().close_requested()) {
-                    still_open = false;
-                }
-            },
+        let still_open = immediate_window(
+            ctx,
+            "icu-connection",
+            "ICU — Verbindung",
+            [700.0, 560.0],
+            Some([560.0, 380.0]),
+            |ui| view.as_mut().expect("checked above").ui(ui, state),
         );
         if !still_open {
             self.connection = None;
@@ -884,33 +862,31 @@ impl App {
         if self.settings.is_none() {
             return;
         }
-        let mut still_open = true;
-        let mut cmds = Vec::new();
         // Plain locals, not `self` fields — read/write freely inside the
         // closure with no borrow conflict against `self.settings`.
-        let mut debug_open = self.debug_window_open;
+        let debug_open = self.debug_window_open;
         let state = &self.state;
         let settings = &mut self.settings;
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("icu-settings"),
-            egui::ViewportBuilder::default()
-                .with_title("ICU — Einstellungen")
-                .with_inner_size([820.0, 640.0])
-                .with_min_inner_size([640.0, 480.0])
-                .with_resizable(true),
-            |vctx, _class| {
-                egui::CentralPanel::default().show(vctx, |ui| {
-                    let view = settings.as_mut().expect("checked above");
-                    view.debug_window_open = debug_open;
-                    cmds = view.ui(ui, state);
-                    debug_open = view.debug_window_open;
-                });
-                if vctx.input(|i| i.viewport().close_requested()) {
-                    still_open = false;
-                }
+        let mut out = None;
+        let still_open = immediate_window(
+            ctx,
+            "icu-settings",
+            "ICU — Einstellungen",
+            [820.0, 640.0],
+            Some([640.0, 480.0]),
+            |ui| {
+                out = Some(
+                    settings
+                        .as_mut()
+                        .expect("checked above")
+                        .ui(ui, state, debug_open),
+                );
             },
         );
-        for c in cmds {
+        let Some(out) = out else {
+            return;
+        };
+        for c in out.cmds {
             if let Command::UpdateSettings(s) = &c {
                 // A slider drag emits this every frame it moves; only a real
                 // theme change is worth rebuilding all styles for.
@@ -921,7 +897,7 @@ impl App {
             }
             let _ = self.cmd.send(c);
         }
-        if self.settings.as_ref().is_some_and(|v| v.logout_requested) {
+        if out.logout {
             self.logged_out.store(true, Ordering::Relaxed);
             self.settings = None;
             self.quit_requested = true;
@@ -929,14 +905,49 @@ impl App {
         } else if !still_open {
             self.settings = None;
         }
-        if debug_open != self.debug_window_open {
-            self.debug_window_open = debug_open;
+        if out.debug_window_open != self.debug_window_open {
+            self.debug_window_open = out.debug_window_open;
             if self.debug_window_open {
                 self.stats_text = self.stats.report();
                 self.last_stats = Instant::now();
             }
         }
     }
+}
+
+/// One of the app's secondary windows, drawn into its own immediate
+/// viewport with `body` as its central panel. `min_size` makes it
+/// resizable. Returns `false` once the user closed it.
+fn immediate_window(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    size: [f32; 2],
+    min_size: Option<[f32; 2]>,
+    body: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut builder = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_inner_size(size);
+    if let Some(min) = min_size {
+        builder = builder.with_min_inner_size(min).with_resizable(true);
+    }
+    let mut still_open = true;
+    // The viewport callback is `FnMut`; `body` runs once per call.
+    let mut body = Some(body);
+    ctx.show_viewport_immediate(
+        egui::ViewportId::from_hash_of(id),
+        builder,
+        |vctx, _class| {
+            if let Some(body) = body.take() {
+                egui::CentralPanel::default().show(vctx, body);
+            }
+            if vctx.input(|i| i.viewport().close_requested()) {
+                still_open = false;
+            }
+        },
+    );
+    still_open
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,32 +1024,35 @@ fn speak_row(
         threshold: (!ptt).then_some(state.vad_threshold),
         key: ptt.then_some(key.as_str()),
     };
-    let tooltip = if offline {
-        format!(
-            "Nicht verbunden — es wird nichts gesendet\nPegel {:.0} dBFS",
-            state.level.rms_db
-        )
-    } else if ptt {
-        format!(
-            "Push-to-Talk — halten zum Sprechen\nPegel {:.0} dBFS",
-            state.level.rms_db
-        )
-    } else {
-        format!(
-            "Sprachaktivierung\nStimme {:.2}, Schwelle {:.2}{}\nPegel {:.0} dBFS",
-            state.vad_prob,
-            state.vad_threshold,
-            if state.settings.audio.vad_auto {
-                " (automatisch)"
-            } else {
-                ""
-            },
-            state.level.rms_db
-        )
+    // Built only while hovered: three floats formatted per frame otherwise.
+    let tooltip = |ui: &mut egui::Ui| {
+        ui.label(if offline {
+            format!(
+                "Nicht verbunden — es wird nichts gesendet\nPegel {:.0} dBFS",
+                state.level.rms_db
+            )
+        } else if ptt {
+            format!(
+                "Push-to-Talk — halten zum Sprechen\nPegel {:.0} dBFS",
+                state.level.rms_db
+            )
+        } else {
+            format!(
+                "Sprachaktivierung\nStimme {:.2}, Schwelle {:.2}{}\nPegel {:.0} dBFS",
+                state.vad_prob,
+                state.vad_threshold,
+                if state.settings.audio.vad_auto {
+                    " (automatisch)"
+                } else {
+                    ""
+                },
+                state.level.rms_db
+            )
+        });
     };
 
     let size = egui::vec2(ui.available_width() - tile_w - DOCK_GAP, SPEAK_H);
-    let response = widgets::speak_surface(ui, &speak, size).on_hover_text(tooltip);
+    let response = widgets::speak_surface(ui, &speak, size).on_hover_ui(tooltip);
     let (glyph, label, next) = if ptt {
         (icon::HAND_TAP, "PTT", "Umschalten auf Sprachaktivierung")
     } else {
@@ -1256,14 +1270,18 @@ fn participant_row(
                                 ui.id().with(("rtt", p.user_id)),
                                 egui::Sense::hover(),
                             )
-                            .on_hover_text(format!("Ping {ms} ms"));
+                            .on_hover_ui(|ui| {
+                                ui.label(format!("Ping {ms} ms"));
+                            });
                         }
                         // Always the same glyph: the crossed-out speaker is the
                         // badge for "this person hears nothing", and a volume
                         // handle wearing it would read as that.
                         if let Some(vol) = p.volume {
                             if widgets::icon_button(ui, icon::SPEAKER_HIGH, 28.0, expanded)
-                                .on_hover_text(format!("Lautstärke {vol:.0} %"))
+                                .on_hover_ui(|ui| {
+                                    ui.label(format!("Lautstärke {vol:.0} %"));
+                                })
                                 .clicked()
                             {
                                 *open = if expanded { None } else { Some(p.user_id) };
@@ -1321,8 +1339,7 @@ fn participant_row(
 /// The unfolded part of a participant row: what the client knows about this
 /// person, and for everyone but oneself the playback volume.
 fn details(ui: &mut egui::Ui, p: &Participant<'_>, tok: &theme::Tokens, send: &impl Fn(Command)) {
-    const NONE: &str = "—";
-    let ms = |v: Option<u16>| v.map_or_else(|| NONE.to_string(), |v| format!("{v} ms"));
+    let ms = |v: Option<u16>| opt(v.map(|v| format!("{v} ms")));
     let mut status = Vec::new();
     for (on, word) in [
         (p.speaking, "spricht"),
@@ -1360,11 +1377,7 @@ fn details(ui: &mut egui::Ui, p: &Participant<'_>, tok: &theme::Tokens, send: &i
             ));
             rows.push(("Ping (eigen)", ms(p.client_rtt_ms)));
         }
-        None => rows.push((
-            "Verlust",
-            p.loss_permille
-                .map_or_else(|| NONE.to_string(), |l| format!("{l} ‰")),
-        )),
+        None => rows.push(("Verlust", opt(p.loss_permille.map(|l| format!("{l} ‰"))))),
     }
     rows.push((
         "Nutzer · Sitzung",
@@ -1752,13 +1765,6 @@ impl eframe::App for EnrollApp {
                             }
                             if let Some(ca) = &ca {
                                 ui.add_space(12.0);
-                                // 32 pairs on two lines, so it reads in halves.
-                                let pairs: Vec<&str> = ca.fingerprint.split(':').collect();
-                                let fingerprint = pairs
-                                    .chunks(16)
-                                    .map(|c| c.join(":"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
                                 let until = if ca.expires_in_days < 0 {
                                     format!("{} (abgelaufen)", ca.not_after)
                                 } else {
@@ -1766,7 +1772,8 @@ impl eframe::App for EnrollApp {
                                 };
                                 let rows = [
                                     ("Name", ca.subject.clone()),
-                                    ("SHA-256", fingerprint),
+                                    // 32 pairs on two lines, so it reads in halves.
+                                    ("SHA-256", wrap_fingerprint(&ca.fingerprint)),
                                     ("Gültig ab", ca.not_before.clone()),
                                     ("Gültig bis", until),
                                     ("Signatur", ca.sig_alg.clone()),
@@ -2019,18 +2026,15 @@ mod tests {
     use widgets::RecDot;
 
     fn peer(session: u16, name: &str, flags: u8) -> Peer {
-        Peer {
-            info: UserInfo {
+        Peer::new(
+            UserInfo {
                 user_id: u32::from(session),
                 session,
                 name: name.into(),
                 flags: UserFlags(flags),
             },
-            speaking: false,
-            volume: 100.0,
-            rtt_ms: None,
-            recv_loss_permille: None,
-        }
+            100.0,
+        )
     }
 
     #[test]

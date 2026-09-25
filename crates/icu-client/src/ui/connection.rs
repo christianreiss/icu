@@ -13,6 +13,7 @@
 //! every row gets the same label/value/tone treatment for free.
 
 use std::{
+    borrow::Cow,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
@@ -32,7 +33,7 @@ use crate::{
 
 /// Placeholder for a value that does not exist right now — a reading taken
 /// before the first tick, or anything the platform declines to report.
-const NONE: &str = "—";
+pub(crate) const NONE: &str = "—";
 
 /// How long „Kopiert" stays under a fingerprint after the copy button.
 const COPY_FEEDBACK: Duration = Duration::from_secs(2);
@@ -59,7 +60,9 @@ enum Tone {
 /// One label/value line inside a [`Section`].
 #[derive(Debug, Clone)]
 struct Row {
-    label: String,
+    /// Almost always a literal; borrowed then, so building the page does
+    /// not allocate a label per row per frame.
+    label: Cow<'static, str>,
     value: String,
     tone: Tone,
     /// Render the value in a monospace chip — numbers and identifiers, so
@@ -76,7 +79,7 @@ struct Row {
 }
 
 impl Row {
-    fn new(label: impl Into<String>, value: impl Into<String>) -> Row {
+    fn new(label: impl Into<Cow<'static, str>>, value: impl Into<String>) -> Row {
         Row {
             label: label.into(),
             value: value.into(),
@@ -88,7 +91,7 @@ impl Row {
     }
 
     /// A numeric or identifier row.
-    fn mono(label: impl Into<String>, value: impl Into<String>) -> Row {
+    fn mono(label: impl Into<Cow<'static, str>>, value: impl Into<String>) -> Row {
         Row {
             mono: true,
             ..Row::new(label, value)
@@ -392,7 +395,7 @@ impl ConnectionView {
                 // non-shrinking `ScrollArea` that is the whole viewport, and
                 // the card balloons to fill it.
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&row.label).size(12.5));
+                    ui.label(RichText::new(row.label.as_ref()).size(12.5));
                     if row.copy {
                         widgets::rtl(ui, 22.0, |ui| {
                             if widgets::icon_button(ui, icon::COPY, 22.0, false)
@@ -400,7 +403,7 @@ impl ConnectionView {
                                 .clicked()
                             {
                                 ui.ctx().copy_text(row.value.replace('\n', ""));
-                                self.copied = Some((row.label.clone(), Instant::now()));
+                                self.copied = Some((row.label.to_string(), Instant::now()));
                             }
                             if self.copied.as_ref().is_some_and(|(l, t)| {
                                 *l == row.label && t.elapsed() < COPY_FEEDBACK
@@ -485,7 +488,7 @@ fn plain_row(ui: &mut Ui, row: &Row) {
             // line up; a row that only prints a value should not reserve it.
             ui.spacing_mut().interact_size.y = 18.0;
             ui.horizontal(|ui| {
-                ui.label(RichText::new(&row.label).size(12.5));
+                ui.label(RichText::new(row.label.as_ref()).size(12.5));
                 widgets::rtl(ui, 18.0, |ui| value_label(ui, row, &tok));
             });
         });
@@ -602,12 +605,8 @@ fn hero(ui: &mut Ui, state: &AppState) {
                 });
 
                 widgets::rtl(ui, 26.0, |ui| {
-                    widgets::chip(
-                        ui,
-                        &state.rtt_ms.map(fmt_ms).unwrap_or_else(|| NONE.to_string()),
-                        62.0,
-                    )
-                    .on_hover_text("Rundlaufzeit, von diesem Client gemessen");
+                    widgets::chip(ui, &opt(state.rtt_ms.map(fmt_ms)), 62.0)
+                        .on_hover_text("Rundlaufzeit, von diesem Client gemessen");
                 });
             });
         });
@@ -1112,25 +1111,18 @@ fn participants_section(state: &AppState) -> Section {
             format!("{} (ich)", me.name),
             format!(
                 "{} · {}",
-                state
-                    .server_rtt_ms
-                    .map(|r| format!("{r} ms"))
-                    .unwrap_or_else(|| NONE.to_string()),
+                opt(state.server_rtt_ms.map(|r| format!("{r} ms"))),
                 badges(me.flags, state.is_admin)
             ),
         ));
     }
     for p in &state.peers {
         s = s.row(Row::new(
-            &p.info.name,
+            p.info.name.clone(),
             format!(
                 "{} · Verlust {} · {}",
-                p.rtt_ms
-                    .map(|r| format!("{r} ms"))
-                    .unwrap_or_else(|| NONE.to_string()),
-                p.recv_loss_permille
-                    .map(|l| format!("{l} ‰"))
-                    .unwrap_or_else(|| NONE.to_string()),
+                opt(p.rtt_ms.map(|r| format!("{r} ms"))),
+                opt(p.recv_loss_permille.map(|l| format!("{l} ‰"))),
                 badges(p.info.flags, p.info.flags.is_admin())
             ),
         ));
@@ -1256,7 +1248,7 @@ fn fmt_ms(ms: f32) -> String {
 }
 
 /// A value or [`NONE`].
-fn opt(v: Option<String>) -> String {
+pub(crate) fn opt(v: Option<String>) -> String {
     v.unwrap_or_else(|| NONE.to_string())
 }
 
@@ -1305,7 +1297,7 @@ fn fmt_uptime(d: Duration) -> String {
 
 /// Breaks a 32-pair fingerprint into two lines, so it fits a card without
 /// shrinking the font to unreadable.
-fn wrap_fingerprint(fp: &str) -> String {
+pub(crate) fn wrap_fingerprint(fp: &str) -> String {
     let pairs: Vec<&str> = fp.split(':').collect();
     if pairs.len() < 32 {
         return fp.to_string();

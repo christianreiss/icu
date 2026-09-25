@@ -1,7 +1,7 @@
 //! Tray icon (tray-icon 0.25, ksni on Linux): status icon, menu with
 //! Mute/Deafen/Fenster/Beenden.
 
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
 
 use tokio::sync::mpsc::UnboundedSender;
 use tray_icon::{
@@ -30,7 +30,9 @@ pub struct Tray {
     cmd: UnboundedSender<Command>,
     menu_rx: mpsc::Receiver<MenuId>,
     tray_rx: mpsc::Receiver<TrayIconEvent>,
-    last: Arc<Mutex<Option<(bool, bool, bool)>>>,
+    /// `(connected, muted, deafened)` the icon and menu were last drawn
+    /// for; anything else in the state is not shown here.
+    last: Option<(bool, bool, bool)>,
 }
 
 impl Tray {
@@ -78,7 +80,7 @@ impl Tray {
             cmd,
             menu_rx,
             tray_rx,
-            last: Arc::new(Mutex::new(None)),
+            last: None,
         })
     }
 
@@ -107,17 +109,16 @@ impl Tray {
     }
 
     /// Updates icon and check marks from the state.
-    pub fn update(&self, state: &AppState) {
+    pub fn update(&mut self, state: &AppState) {
         let key = (
             state.conn == ConnStatus::Connected,
             state.muted,
             state.deafened,
         );
-        let mut last = self.last.lock().unwrap();
-        if *last == Some(key) {
+        if self.last == Some(key) {
             return;
         }
-        *last = Some(key);
+        self.last = Some(key);
         self.mute.set_checked(state.muted);
         self.deafen.set_checked(state.deafened);
         let color = if !key.0 {

@@ -104,6 +104,50 @@ pub fn card_note<R>(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
         .inner
 }
 
+/// One quiet line of help under a card's rows, as a [`card_note`]: the
+/// shape every "what this means" blurb in the settings takes.
+pub fn help_note(ui: &mut Ui, text: &str) {
+    card_note(ui, |ui| {
+        ui.label(
+            RichText::new(text)
+                .size(11.5)
+                .color(theme::tokens(ui.visuals()).dim_text),
+        );
+    });
+}
+
+/// The recessed surface a value sits in — a chip, a preview, a picker
+/// swatch: the sunken fill with a hairline border.
+pub fn paint_well(ui: &Ui, rect: egui::Rect, radius: u8) {
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(radius),
+        ui.visuals().extreme_bg_color,
+    );
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(radius),
+        Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+        StrokeKind::Inside,
+    );
+}
+
+/// A fixed-width, left-aligned label column. An exact allocation, not
+/// `allocate_ui_with_layout`: that one hands back only the space its content
+/// used, so every control after it would start at a different x. It also
+/// sets the row height before the controls arrive, so they center on it.
+pub fn label_column(ui: &mut Ui, width: f32, height: f32, label: &str) {
+    let (col, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    ui.painter().text(
+        col.left_center(),
+        egui::Align2::LEFT_CENTER,
+        label,
+        FontId::new(13.5, egui::FontFamily::Proportional),
+        ui.visuals().text_color(),
+    );
+}
+
 fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(
         egui::lerp(a.r() as f32..=b.r() as f32, t).round() as u8,
@@ -502,7 +546,7 @@ fn seg_font() -> FontId {
 }
 
 /// The width [`segmented`] will take for these options.
-pub fn segmented_width(ui: &Ui, labels: &[&str]) -> f32 {
+fn segmented_width(ui: &Ui, labels: &[&str]) -> f32 {
     let options: f32 = labels
         .iter()
         .map(|l| text_width(ui, l, seg_font()) + SEG_PAD * 2.0)
@@ -807,26 +851,16 @@ pub fn chip(ui: &mut Ui, text: &str, min_width: f32) -> egui::Response {
     );
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        painter.rect_filled(
-            rect,
-            CornerRadius::same(R_CHIP),
-            ui.visuals().extreme_bg_color,
-        );
-        painter.rect_stroke(
-            rect,
-            CornerRadius::same(R_CHIP),
-            Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
-            StrokeKind::Inside,
-        );
-        painter.galley(rect.center() - galley.size() / 2.0, galley, tok.dim_text);
+        paint_well(ui, rect, R_CHIP);
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, tok.dim_text);
     }
     response
 }
 
 /// The width [`chip`] will take for the widest of `samples`, so a row can
 /// reserve it up front.
-pub fn chip_width(ui: &Ui, samples: &[String]) -> f32 {
+fn chip_width(ui: &Ui, samples: &[String]) -> f32 {
     let font = FontId::new(11.0, egui::FontFamily::Monospace);
     samples
         .iter()
@@ -850,18 +884,6 @@ const PILL_GAP: f32 = 5.0;
 /// A rounded status pill: a colored dot plus one short word. Anything longer
 /// than a word belongs in the caller's `on_hover_text`, not in here.
 pub fn status_pill(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
-    let (rect, response, galley) = pill_shape(ui, text, Sense::hover());
-    paint_pill(ui, rect, color, galley, false);
-    response
-}
-
-/// Lays out the word and allocates the pill's rect. Shared so the inert and
-/// the clickable pill can never drift apart in size.
-fn pill_shape(
-    ui: &mut Ui,
-    text: &str,
-    sense: Sense,
-) -> (egui::Rect, egui::Response, std::sync::Arc<egui::Galley>) {
     let font = FontId::new(11.5, egui::FontFamily::Proportional);
     let galley = ui
         .painter()
@@ -870,29 +892,16 @@ fn pill_shape(
         PILL_PAD * 2.0 + PILL_DOT + PILL_GAP + galley.size().x,
         galley.size().y.max(PILL_DOT) + 7.0,
     );
-    let (rect, response) = ui.allocate_exact_size(size, sense);
-    (rect, response, galley)
-}
-
-/// Paints one pill. `hovered` lifts the fill and border the way
-/// [`icon_button`] does, so a clickable pill reads as clickable.
-fn paint_pill(
-    ui: &Ui,
-    rect: egui::Rect,
-    color: Color32,
-    galley: std::sync::Arc<egui::Galley>,
-    hovered: bool,
-) {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     if !ui.is_rect_visible(rect) {
-        return;
+        return response;
     }
-    let (fill, stroke) = if hovered { (0.26, 0.45) } else { (0.16, 0.27) };
     let painter = ui.painter();
-    painter.rect_filled(rect, rect.height() / 2.0, color.gamma_multiply(fill));
+    painter.rect_filled(rect, rect.height() / 2.0, color.gamma_multiply(0.16));
     painter.rect_stroke(
         rect,
         rect.height() / 2.0,
-        Stroke::new(1.0, color.gamma_multiply(stroke)),
+        Stroke::new(1.0, color.gamma_multiply(0.27)),
         StrokeKind::Inside,
     );
     painter.circle_filled(
@@ -906,6 +915,7 @@ fn paint_pill(
         galley,
         ui.visuals().text_color(),
     );
+    response
 }
 
 /// Non-modal banner kind, driving the tint/border/icon color.
@@ -1228,8 +1238,7 @@ pub fn presence_dot(ui: &Ui, avatar_rect: egui::Rect, color: Color32) {
 pub fn group_card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
     ui.label(theme::caps_text(title));
     ui.add_space(4.0);
-    let mut result = None;
-    Frame::new()
+    let result = Frame::new()
         .fill(ui.visuals().faint_bg_color)
         .stroke(Stroke::new(
             1.0,
@@ -1241,10 +1250,11 @@ pub fn group_card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui
             // would pad only the bottom of each row (between it and the next
             // divider), leaving every label above its row's center.
             ui.spacing_mut().item_spacing.y = 0.0;
-            result = Some(add_contents(ui));
-        });
+            add_contents(ui)
+        })
+        .inner;
     ui.add_space(14.0);
-    result.expect("add_contents always runs")
+    result
 }
 
 /// How wide a [`setting_row`] label column is, so labels and the controls
@@ -1263,7 +1273,6 @@ pub fn setting_row<R>(
         ui.separator();
     }
     let tok = theme::tokens(ui.visuals());
-    let mut result = None;
     Frame::new()
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
@@ -1271,16 +1280,19 @@ pub fn setting_row<R>(
             // it on the control; the help text runs underneath at full width
             // rather than beside the label, where it would wrap under the
             // control.
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(label).size(13.5));
-                result = Some(rtl(ui, 30.0, control));
-            });
+            let result = ui
+                .horizontal(|ui| {
+                    ui.label(RichText::new(label).size(13.5));
+                    rtl(ui, 30.0, control)
+                })
+                .inner;
             if let Some(h) = help {
                 ui.add_space(3.0);
                 ui.label(RichText::new(h).size(11.5).color(tok.dim_text));
             }
-        });
-    result.expect("control closure always runs")
+            result
+        })
+        .inner
 }
 
 /// A label + slider + value-chip row on a single line, used inside
@@ -1309,17 +1321,7 @@ pub fn slider_row(
         .inner_margin(egui::Margin::symmetric(12, 9))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                // An exact allocation, not `allocate_ui_with_layout`: that
-                // one hands back only the space its content used, so every
-                // slider would start at a different x.
-                let (col, _) = ui.allocate_exact_size(egui::vec2(LABEL_W, 22.0), Sense::hover());
-                ui.painter().text(
-                    col.left_center(),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    FontId::new(13.5, egui::FontFamily::Proportional),
-                    ui.visuals().text_color(),
-                );
+                label_column(ui, LABEL_W, 22.0, label);
                 rtl(ui, 22.0, |ui| {
                     chip(ui, &format(*value), reserve);
                     slider(ui, value, range)
