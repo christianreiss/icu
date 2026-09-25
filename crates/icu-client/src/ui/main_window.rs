@@ -1293,8 +1293,10 @@ fn participant_row(
                             }
                         } else {
                             // Own row has no volume handle; keep its column so
-                            // ping and icons line up with every other row.
-                            ui.add_space(28.0);
+                            // ping and icons line up with every other row. An
+                            // allocation, not `add_space`: only an allocation
+                            // gets the item spacing the button gets.
+                            ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
                         }
                         // A fixed grid: every row reserves every slot, lit or
                         // not, so each icon sits in the same column in every
