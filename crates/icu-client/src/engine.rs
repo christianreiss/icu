@@ -1837,13 +1837,18 @@ async fn maybe_auto_renew(
 }
 
 impl LocalState {
-    /// Recomputes `UserFlags::VIEWING`: overlay on or main window visible.
-    /// Returns `true` when the bit changed and `SetState` is due.
+    /// Recomputes `UserFlags::VIEWING` (overlay on or main window visible)
+    /// and `UserFlags::PTT` (the talk mode). Returns `true` when a bit
+    /// changed and `SetState` is due.
     fn update_viewing(&mut self) -> bool {
         let viewing = self.settings.overlay.enabled || self.window_visible;
-        let changed = self.flags.viewing() != viewing;
-        self.flags = self.flags.with_bit(UserFlags::VIEWING, viewing);
-        changed
+        let ptt = Mode::from(self.settings.audio.mode) == Mode::Ptt;
+        let before = self.flags;
+        self.flags = self
+            .flags
+            .with_bit(UserFlags::VIEWING, viewing)
+            .with_bit(UserFlags::PTT, ptt);
+        self.flags != before
     }
 
     /// The one writer of `pending_renew`. The window's "rename in progress"

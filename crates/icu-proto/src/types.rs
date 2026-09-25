@@ -178,11 +178,15 @@ impl UserFlags {
     /// window visible). The server relays video only to viewers, and a
     /// sender pauses its camera while no peer has this bit set.
     pub const VIEWING: u8 = 1 << 5;
-    /// bit6–7 — reserved, sender writes 0.
-    pub const RESERVED: u8 = 0xC0;
+    /// bit6 — the user talks by Push-to-Talk; cleared means voice
+    /// activation. Display only, so peers can show the mode.
+    pub const PTT: u8 = 1 << 6;
+    /// bit7 — reserved, sender writes 0.
+    pub const RESERVED: u8 = 0x80;
     /// Bits a client may set through `SetState`: everything but `SPEAKING`,
     /// `ADMIN` and the reserved range.
-    pub const CLIENT_SETTABLE: u8 = Self::MUTED | Self::DEAFENED | Self::CAMERA_ON | Self::VIEWING;
+    pub const CLIENT_SETTABLE: u8 =
+        Self::MUTED | Self::DEAFENED | Self::CAMERA_ON | Self::VIEWING | Self::PTT;
     /// Bits the server keeps regardless of what a client requests.
     const SERVER_AUTHORITATIVE: u8 = Self::SPEAKING | Self::ADMIN;
 
@@ -212,6 +216,10 @@ impl UserFlags {
     /// Whether the user is looking at video right now.
     pub fn viewing(self) -> bool {
         self.0 & Self::VIEWING != 0
+    }
+    /// Whether the user talks by Push-to-Talk rather than voice activation.
+    pub fn ptt(self) -> bool {
+        self.0 & Self::PTT != 0
     }
 
     /// Returns a copy with `SPEAKING` set or cleared.
@@ -442,7 +450,7 @@ mod tests {
         let out = current.apply_client_request(requested);
         assert_eq!(out.0 & UserFlags::RESERVED, 0);
         assert!(out.speaking(), "server authoritative bit is kept");
-        assert!(out.muted() && out.deafened() && out.camera_on() && out.viewing());
+        assert!(out.muted() && out.deafened() && out.camera_on() && out.viewing() && out.ptt());
 
         // A client clearing everything does not clear SPEAKING.
         let out = current.apply_client_request(UserFlags::NONE);

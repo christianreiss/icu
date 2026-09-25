@@ -714,6 +714,7 @@ impl eframe::App for App {
                                         deafened: state.deafened,
                                         camera: state.camera_on,
                                         mode: Some(state.settings.audio.mode.into()),
+                                        ptt: Mode::from(state.settings.audio.mode) == Mode::Ptt,
                                         volume: None,
                                         is_admin: state.is_admin,
                                         viewing: watches(me.flags.viewing(), state.camera_on),
@@ -738,6 +739,7 @@ impl eframe::App for App {
                                         deafened: p.info.flags.deafened(),
                                         camera: p.info.flags.camera_on(),
                                         mode: None,
+                                        ptt: p.info.flags.ptt(),
                                         volume: Some(p.volume),
                                         is_admin: p.info.flags.is_admin(),
                                         viewing: watches(
@@ -1133,7 +1135,10 @@ struct Participant<'a> {
     muted: bool,
     deafened: bool,
     camera: bool,
+    /// `Some` only for the local user.
     mode: Option<Mode>,
+    /// Talks by Push-to-Talk (`UserFlags::PTT`), voice activation otherwise.
+    ptt: bool,
     volume: Option<f32>,
     is_admin: bool,
     /// Looking at video right now: `UserFlags::VIEWING` while somebody
@@ -1291,33 +1296,42 @@ fn participant_row(
                             // ping and icons line up with every other row.
                             ui.add_space(28.0);
                         }
-                        // One fixed slot per glyph, so glyph widths don't jitter
-                        // the columns between rows.
-                        let slot = |ui: &mut egui::Ui, text: RichText| {
+                        // A fixed grid: every row reserves every slot, lit or
+                        // not, so each icon sits in the same column in every
+                        // row and a missing one leaves a gap instead of
+                        // shifting its neighbours.
+                        let slot = |ui: &mut egui::Ui, text: Option<RichText>| {
                             ui.allocate_ui_with_layout(
                                 egui::vec2(18.0, 20.0),
                                 egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                                |ui| ui.label(text),
+                                |ui| match text {
+                                    Some(text) => ui.label(text),
+                                    None => ui.allocate_response(
+                                        ui.available_size(),
+                                        egui::Sense::hover(),
+                                    ),
+                                },
                             )
                             .inner
                         };
-                        for (on, color, glyph) in [
-                            (p.deafened, tok.error, icon::SPEAKER_SLASH),
-                            (p.muted, tok.error, icon::MICROPHONE_SLASH),
-                            (p.camera, tok.dim_text, icon::VIDEO_CAMERA),
+                        let (mode_glyph, mode_hint) = if p.ptt {
+                            (icon::HAND_TAP, "Push-to-Talk")
+                        } else {
+                            (icon::WAVEFORM, "Sprachaktivierung")
+                        };
+                        slot(ui, Some(RichText::new(mode_glyph).size(15.0).color(tok.dim_text)))
+                            .on_hover_text(mode_hint);
+                        for (on, color, glyph, hint) in [
+                            (p.deafened, tok.error, icon::SPEAKER_SLASH, "hört nicht zu"),
+                            (p.muted, tok.error, icon::MICROPHONE_SLASH, "stummgeschaltet"),
+                            (p.camera, tok.dim_text, icon::VIDEO_CAMERA, "Kamera an"),
+                            (p.is_admin, tok.dim_text, icon::SHIELD_STAR, "Admin"),
                         ] {
+                            let glyph = RichText::new(glyph).size(15.0).color(color);
+                            let r = slot(ui, on.then_some(glyph));
                             if on {
-                                slot(ui, RichText::new(glyph).size(15.0).color(color));
+                                r.on_hover_text(hint);
                             }
-                        }
-                        if p.is_admin {
-                            slot(
-                                ui,
-                                RichText::new(icon::SHIELD_STAR)
-                                    .size(14.0)
-                                    .color(tok.dim_text),
-                            )
-                            .on_hover_text("Admin");
                         }
                     });
                 });
