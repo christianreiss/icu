@@ -27,6 +27,7 @@ use rustls::pki_types::{
     pem::PemObject, CertificateDer, CertificateSigningRequestDer, PrivateKeyDer, PrivatePkcs8KeyDer,
 };
 use time::OffsetDateTime;
+use x509_parser::certificate::X509Certificate;
 
 use crate::{
     config::TlsSection,
@@ -54,8 +55,10 @@ pub struct Ca {
     dir: PathBuf,
     ca_der: CertificateDer<'static>,
     ca_key_pem: String,
+    /// The CA, ready to sign: parsed once, not per leaf or CRL.
+    issuer: Issuer<'static, KeyPair>,
     server_der: CertificateDer<'static>,
-    server_key_pem: String,
+    server_key: PrivateKeyDer<'static>,
 }
 
 impl std::fmt::Debug for Ca {
@@ -82,10 +85,11 @@ impl Ca {
 
         let mut ca = Ca {
             dir: dir.to_path_buf(),
+            issuer: issuer(&ca_der, &ca_key_pem)?,
             ca_der,
             ca_key_pem,
             server_der: CertificateDer::from(Vec::new()),
-            server_key_pem: String::new(),
+            server_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(Vec::new())),
         };
 
         match (
@@ -94,7 +98,7 @@ impl Ca {
         ) {
             (Ok(crt), Ok(key)) => {
                 ca.server_der = read_cert_pem(&crt)?;
-                ca.server_key_pem = key;
+                ca.server_key = pkcs8(&KeyPair::from_pem(&key).context("cannot load server.key")?);
             }
             _ => ca.rotate_server_cert(tls, server_name)?,
         }
@@ -104,7 +108,6 @@ impl Ca {
     /// Issues a fresh server leaf from the same CA. Clients need no change
     /// (`Server/IMPLEMENTATION.md` §5, `rotate-server-cert`).
     pub fn rotate_server_cert(&mut self, tls: &TlsSection, server_name: &str) -> Result<()> {
-        let issuer = self.issuer()?;
         let key = KeyPair::generate()?;
         let mut params = CertificateParams::default();
         params.distinguished_name = DistinguishedName::new();
@@ -127,11 +130,11 @@ impl Ca {
 
         // rcgen 0.14: the direct form takes the public key AND the issuer
         // (A10); only the CSR form takes the issuer alone.
-        let cert = params.signed_by(&key, &issuer)?;
-        self.server_der = cert.der().clone();
-        self.server_key_pem = key.serialize_pem();
+        let cert = params.signed_by(&key, &self.issuer)?;
         store::write_atomic(&self.dir.join(SERVER_CRT), &cert.pem())?;
-        store::write_private(&self.dir.join(SERVER_KEY), &self.server_key_pem)?;
+        store::write_private(&self.dir.join(SERVER_KEY), &key.serialize_pem())?;
+        self.server_der = cert.der().clone();
+        self.server_key = pkcs8(&key);
         Ok(())
     }
 
@@ -142,16 +145,16 @@ impl Ca {
     /// holding the old `ca.der` keeps verifying. It keeps tooling that does
     /// look at the dates (openssl, Checkmk) quiet, and new bundles carry it.
     pub fn renew_ca_cert(&mut self, tls: &TlsSection) -> Result<()> {
-        let key = KeyPair::from_pem(&self.ca_key_pem).context("cannot load ca.key")?;
         // The subject is rebuilt exactly as `create_ca` built it, a lone CN;
         // `ca_renewal_keeps_subject_and_key` pins the bytes.
         let cn = leaf_common_name(&self.ca_der);
         if cn.is_empty() {
             return Err(Error::msg("ca.crt has no readable CN"));
         }
-        let cert = ca_params(&cn, tls.ca_validity_days).self_signed(&key)?;
+        let cert = ca_params(&cn, tls.ca_validity_days).self_signed(self.issuer.key())?;
         store::write_atomic(&self.dir.join(CA_CRT), &cert.pem())?;
         self.ca_der = cert.der().clone();
+        self.issuer = issuer(&self.ca_der, &self.ca_key_pem)?;
         Ok(())
     }
 
@@ -206,8 +209,7 @@ impl Ca {
         }
         csr.params.serial_number = Some(random_serial());
 
-        let issuer = self.issuer()?;
-        let cert = csr.signed_by(&issuer).map_err(|e| {
+        let cert = csr.signed_by(&self.issuer).map_err(|e| {
             Error::coded(
                 icu_proto::error::ENROLL_BAD_CSR,
                 format!("cannot sign csr: {e}"),
@@ -238,11 +240,11 @@ impl Ca {
         params.subject_alt_names = vec![server_uri(public_host)?];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         params.use_authority_key_identifier_extension = true;
-        let now = OffsetDateTime::from(std::time::SystemTime::now());
+        let now = store::now();
         params.not_before = now - time::Duration::hours(1);
         params.not_after = now + ttl;
         params.serial_number = Some(random_serial());
-        let cert = params.signed_by(&key, &self.issuer()?)?;
+        let cert = params.signed_by(&key, &self.issuer)?;
         Ok((cert.der().clone(), key.serialize_der()))
     }
 
@@ -255,7 +257,7 @@ impl Ca {
         number: u64,
         serials: &[String],
     ) -> Result<rustls::pki_types::CertificateRevocationListDer<'static>> {
-        let now = OffsetDateTime::from(std::time::SystemTime::now());
+        let now = store::now();
         let revoked_certs = serials
             .iter()
             .filter_map(|hex| store::decode_hex(hex))
@@ -276,7 +278,7 @@ impl Ca {
             key_identifier_method: rcgen::KeyIdMethod::Sha256,
         };
         let crl = params
-            .signed_by(&self.issuer()?)
+            .signed_by(&self.issuer)
             .map_err(|e| Error::msg(format!("cannot sign the CRL: {e}")))?;
         Ok(crl.der().clone())
     }
@@ -297,22 +299,25 @@ impl Ca {
     }
 
     /// The server's private key.
-    pub fn server_key(&self) -> Result<PrivateKeyDer<'static>> {
-        let key = KeyPair::from_pem(&self.server_key_pem)?;
-        Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            key.serialize_der(),
-        )))
+    pub fn server_key(&self) -> PrivateKeyDer<'static> {
+        self.server_key.clone_key()
     }
 
     /// SHA-256 of the CA DER, lowercase hex.
     pub fn ca_fingerprint(&self) -> String {
         store::fingerprint(&self.ca_der)
     }
+}
 
-    fn issuer(&self) -> Result<Issuer<'static, KeyPair>> {
-        let key = KeyPair::from_pem(&self.ca_key_pem).context("cannot load ca.key")?;
-        Issuer::from_ca_cert_der(&self.ca_der, key).context("cannot load ca.crt as issuer")
-    }
+/// The CA as a signer, from its certificate and PEM key.
+fn issuer(ca_der: &CertificateDer<'static>, key_pem: &str) -> Result<Issuer<'static, KeyPair>> {
+    let key = KeyPair::from_pem(key_pem).context("cannot load ca.key")?;
+    Issuer::from_ca_cert_der(ca_der, key).context("cannot load ca.crt as issuer")
+}
+
+/// A key pair as rustls wants it.
+fn pkcs8(key: &KeyPair) -> PrivateKeyDer<'static> {
+    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()))
 }
 
 /// The display name a CSR asks for: exactly one subject CN, readable as UTF-8,
@@ -381,31 +386,72 @@ pub fn csr_public_key(csr_der: &[u8]) -> Result<Vec<u8>> {
     Ok(csr.certification_request_info.subject_pki.raw.to_vec())
 }
 
+/// Runs `f` on a parsed certificate, `None` when the DER does not parse.
+/// Every `leaf_*` reader goes through here.
+fn with_leaf<R>(der: &[u8], f: impl FnOnce(&X509Certificate<'_>) -> R) -> Option<R> {
+    use x509_parser::prelude::FromDer;
+    X509Certificate::from_der(der)
+        .ok()
+        .map(|(_, cert)| f(&cert))
+}
+
+/// What a session needs to know about a presented leaf, from one parse.
+/// Each field degrades on its own when the DER does not parse, like the
+/// `leaf_*` readers: authentication is the fingerprint, never these.
+#[derive(Debug, Clone, Default)]
+pub struct LeafInfo {
+    /// Subject CN, `""` when unreadable.
+    pub cn: String,
+    /// Raw SubjectPublicKeyInfo, empty when unreadable.
+    pub spki: Vec<u8>,
+    /// notBefore and notAfter, `None` when unreadable.
+    pub validity: Option<(OffsetDateTime, OffsetDateTime)>,
+}
+
+/// Reads [`LeafInfo`] from a certificate.
+pub fn leaf_info(der: &[u8]) -> LeafInfo {
+    with_leaf(der, |cert| LeafInfo {
+        cn: common_name(cert),
+        spki: cert.public_key().raw.to_vec(),
+        validity: Some(validity(cert)),
+    })
+    .unwrap_or_default()
+}
+
+fn common_name(cert: &X509Certificate<'_>) -> String {
+    cert.subject()
+        .iter_common_name()
+        .next()
+        .and_then(|a| a.as_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn validity(cert: &X509Certificate<'_>) -> (OffsetDateTime, OffsetDateTime) {
+    let validity = cert.validity();
+    (
+        validity.not_before.to_datetime(),
+        validity.not_after.to_datetime(),
+    )
+}
+
 /// The raw SubjectPublicKeyInfo of a leaf, empty when it does not parse.
 pub fn leaf_public_key(der: &[u8]) -> Vec<u8> {
-    use x509_parser::prelude::FromDer;
-    x509_parser::certificate::X509Certificate::from_der(der)
-        .map(|(_, cert)| cert.public_key().raw.to_vec())
-        .unwrap_or_default()
+    with_leaf(der, |cert| cert.public_key().raw.to_vec()).unwrap_or_default()
 }
 
 /// Serial number of a certificate as lowercase hex of the DER integer's
 /// content octets, the form the store keeps for the CRL. Empty when it does
 /// not parse.
 pub fn leaf_serial(der: &[u8]) -> String {
-    use x509_parser::prelude::FromDer;
-    x509_parser::certificate::X509Certificate::from_der(der)
-        .map(|(_, cert)| store::encode_hex(cert.raw_serial()))
-        .unwrap_or_default()
+    with_leaf(der, |cert| store::encode_hex(cert.raw_serial())).unwrap_or_default()
 }
 
 /// A certificate's notAfter as RFC 3339 UTC; far future when it does not
 /// parse, so an unreadable entry stays on the CRL rather than drop off.
 pub fn leaf_not_after(der: &[u8]) -> String {
-    use x509_parser::prelude::FromDer;
-    x509_parser::certificate::X509Certificate::from_der(der)
-        .ok()
-        .map(|(_, cert)| store::rfc3339(cert.validity().not_after.to_datetime()))
+    leaf_validity(der)
+        .map(|(_, not_after)| store::rfc3339(not_after))
         .unwrap_or_else(|| "9999-12-31T23:59:59Z".to_string())
 }
 
@@ -431,21 +477,13 @@ impl From<u32> for Lifetime {
 
 /// A certificate's notBefore and notAfter, `None` when it does not parse.
 pub fn leaf_validity(der: &[u8]) -> Option<(OffsetDateTime, OffsetDateTime)> {
-    use x509_parser::prelude::FromDer;
-    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
-    Some((
-        cert.validity().not_before.to_datetime(),
-        cert.validity().not_after.to_datetime(),
-    ))
+    with_leaf(der, validity)
 }
 
 /// Whole days until a certificate's notAfter, negative once it has passed.
 /// `None` when it does not parse.
 pub fn leaf_days_left_checked(der: &[u8]) -> Option<i64> {
-    use x509_parser::prelude::FromDer;
-    x509_parser::certificate::X509Certificate::from_der(der)
-        .ok()
-        .map(|(_, cert)| (cert.validity().not_after.to_datetime() - store::now()).whole_days())
+    leaf_validity(der).map(|(_, not_after)| (not_after - store::now()).whole_days())
 }
 
 /// [`leaf_days_left_checked`] for reporting: `i64::MAX` when it does not
@@ -457,10 +495,7 @@ pub fn leaf_days_left(der: &[u8]) -> i64 {
 /// Whether a certificate's notAfter has passed. `false` when it does not
 /// parse: such a leaf never got through the handshake anyway.
 pub fn leaf_expired(der: &[u8]) -> bool {
-    use x509_parser::prelude::FromDer;
-    x509_parser::certificate::X509Certificate::from_der(der)
-        .map(|(_, cert)| cert.validity().not_after.to_datetime() <= store::now())
-        .unwrap_or(false)
+    leaf_validity(der).is_some_and(|(_, not_after)| not_after <= store::now())
 }
 
 /// How long a CRL claims to be current. Nobody enforces it (rustls does not
@@ -480,18 +515,7 @@ fn server_uri(public_host: &str) -> Result<SanType> {
 /// not parse. Never fails: an unreadable CN must not cost a client its
 /// connection, it only means the client has to catch up (`PROTOCOL.md` §2.2).
 pub fn leaf_common_name(der: &[u8]) -> String {
-    use x509_parser::prelude::FromDer;
-
-    x509_parser::certificate::X509Certificate::from_der(der)
-        .ok()
-        .and_then(|(_, cert)| {
-            cert.subject()
-                .iter_common_name()
-                .next()
-                .and_then(|a| a.as_str().ok())
-                .map(str::to_string)
-        })
-        .unwrap_or_default()
+    with_leaf(der, common_name).unwrap_or_default()
 }
 
 fn create_ca(
@@ -524,7 +548,7 @@ fn ca_params(common_name: &str, days: u32) -> CertificateParams {
 }
 
 fn set_validity(params: &mut CertificateParams, days: u32) {
-    let now = OffsetDateTime::from(std::time::SystemTime::now());
+    let now = store::now();
     params.not_before = now - time::Duration::hours(1);
     params.not_after = now + time::Duration::days(i64::from(days));
 }
@@ -620,7 +644,7 @@ mod tests {
         drop(ca);
         let again = Ca::load_or_create(dir.path(), &tls(), "icu.example.org").unwrap();
         assert_eq!(again.ca_fingerprint(), fp, "same CA after reload");
-        assert!(again.server_key().is_ok());
+        assert!(!again.server_key().secret_der().is_empty());
     }
 
     #[test]
@@ -890,7 +914,7 @@ mod tests {
         ca.rotate_server_cert(&tls(), "localhost").unwrap();
         assert_eq!(ca.ca_fingerprint(), ca_fp);
         assert_ne!(store::fingerprint(ca.server_der()), old);
-        assert!(ca.server_key().is_ok());
+        assert!(!ca.server_key().secret_der().is_empty());
     }
 
     #[test]

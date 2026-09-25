@@ -20,6 +20,7 @@ use crate::{
     ca::Ca,
     config::Config,
     error::{Context, Error, Result},
+    lock,
     store::Store,
     Server,
 };
@@ -63,7 +64,7 @@ pub fn server_config(
     .with_protocol_versions(&[&rustls::version::TLS13])
     .context("TLS 1.3 is not available in this provider")?
     .with_client_cert_verifier(verifier)
-    .with_single_cert(ca.server_chain(), ca.server_key()?)
+    .with_single_cert(ca.server_chain(), ca.server_key())
     .context("cannot install the server certificate")?;
 
     tls.alpn_protocols = vec![pl::ALPN_MAIN.to_vec()];
@@ -129,12 +130,13 @@ impl ClientCertVerifier for ExpiredClientCertVerifier {
             Err(rustls::Error::InvalidCertificate(
                 CertificateError::Expired | CertificateError::ExpiredContext { .. },
             )) => {
-                let Some(not_after) = not_after(end_entity) else {
+                let Some(not_after) = crate::ca::leaf_validity(end_entity)
+                    .and_then(|(_, not_after)| u64::try_from(not_after.unix_timestamp()).ok())
+                else {
                     return Err(rustls::Error::InvalidCertificate(CertificateError::Expired));
                 };
-                let before = UnixTime::since_unix_epoch(Duration::from_secs(
-                    not_after.as_secs().saturating_sub(1),
-                ));
+                let before =
+                    UnixTime::since_unix_epoch(Duration::from_secs(not_after.saturating_sub(1)));
                 self.0.verify_client_cert(end_entity, intermediates, before)
             }
             other => other,
@@ -164,15 +166,6 @@ impl ClientCertVerifier for ExpiredClientCertVerifier {
     }
 }
 
-/// A leaf's notAfter, read from the certificate itself.
-fn not_after(der: &CertificateDer<'_>) -> Option<Duration> {
-    use x509_parser::prelude::FromDer;
-    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
-    u64::try_from(cert.validity().not_after.timestamp())
-        .ok()
-        .map(Duration::from_secs)
-}
-
 /// Signs a fresh CRL from the store under the next CRL number.
 pub fn build_crl(store: &mut Store, ca: &Ca) -> Result<CertificateRevocationListDer<'static>> {
     let number = store.next_crl_number()?;
@@ -198,11 +191,12 @@ pub async fn reload_tls(server: &Arc<Server>) -> Result<()> {
         }
         crl
     };
-    *server.crl.write().unwrap_or_else(|e| e.into_inner()) = crl.to_vec();
-    server.room.broadcast(&icu_proto::ControlMsg::CrlUpdate {
-        crl_der: crl.to_vec(),
-    });
-    tracing::info!(bytes = crl.len(), "CRL and TLS config reloaded");
+    let crl_der = crl.to_vec();
+    tracing::info!(bytes = crl_der.len(), "CRL and TLS config reloaded");
+    *server.crl.write().unwrap_or_else(|e| e.into_inner()) = crl_der.clone();
+    server
+        .room
+        .broadcast(&icu_proto::ControlMsg::CrlUpdate { crl_der });
     Ok(())
 }
 
@@ -275,23 +269,13 @@ pub async fn accept_loop(server: Arc<Server>, endpoint: Endpoint) {
         } else {
             incoming
         };
-        let allowed = server
-            .ip_limits
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .allow_handshake(remote.ip());
-        match allowed {
+        match lock(&server.ip_limits).allow_handshake(remote.ip()) {
             Some(true) => {}
             // The table is full of addresses nobody validated: a validated
             // one passes on the server wide budget alone, anything else has
             // to prove its address.
             None if incoming.remote_address_validated() => {
-                let ok = server
-                    .ip_limits
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .allow_untracked_handshake();
-                if !ok {
+                if !lock(&server.ip_limits).allow_untracked_handshake() {
                     tracing::debug!(%remote, "global handshake rate limit, refusing");
                     incoming.refuse();
                     continue;
@@ -367,10 +351,7 @@ async fn dispatch(server: Arc<Server>, incoming: quinn::Incoming) -> Result<()> 
             // rustls refuses an unknown ALPN during the handshake, so this is
             // only reachable when no ALPN was offered at all.
             tracing::debug!(%remote, alpn = ?other, "no usable ALPN");
-            conn.close(
-                VarInt::from_u32(icu_proto::error::PROTOCOL_VIOLATION),
-                b"alpn",
-            );
+            crate::wire::close(&conn, icu_proto::error::PROTOCOL_VIOLATION);
             Ok(())
         }
     }

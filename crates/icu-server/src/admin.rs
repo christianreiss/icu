@@ -7,7 +7,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use icu_proto::{error as ec, UserId};
+use icu_proto::{error as ec, ControlMsg, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
@@ -19,8 +19,7 @@ use tokio::{
 use crate::{
     error::{Context, Error, Result},
     room::Counters,
-    session,
-    store::{parse_rfc3339, unix_millis},
+    store::{parse_rfc3339, unix_millis, Store},
     Server,
 };
 
@@ -145,11 +144,6 @@ pub struct AdminUser {
 }
 
 impl AdminResponse {
-    /// Whether the command succeeded.
-    pub fn is_ok(&self) -> bool {
-        !matches!(self, AdminResponse::Error { .. })
-    }
-
     /// The wire form: `{"ok":true,…}` or `{"ok":false,"error":…}` (§5).
     pub fn to_json(&self) -> serde_json::Value {
         match self {
@@ -200,10 +194,10 @@ impl AdminResponse {
 
 /// Runs one admin command. Used by the socket and by [`crate::Handle::admin`].
 pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminResponse {
-    match request {
+    match &request {
         AdminRequest::Invite { name, ttl_s } => {
-            let ttl_s = ttl_s.unwrap_or(icu_proto::limits::INVITE_TTL_S).max(1);
-            match crate::registration::issue(server, &name, ttl_s).await {
+            // `issue` owns the default and the clamp; absent or 0 means default.
+            match crate::registration::issue(server, name, ttl_s.unwrap_or(0)).await {
                 Ok(issued) => AdminResponse::Invite {
                     bundle: issued.bundle,
                     expires: issued.expires,
@@ -216,6 +210,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
         }
         AdminRequest::Users => {
             let store = server.store.lock().await;
+            let online = server.room.online_users();
             let mut users = Vec::new();
             for (user_id, record) in store.users() {
                 let newest = record
@@ -231,7 +226,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     issued: newest.map(|c| c.issued.clone()).unwrap_or_default(),
                     expires: newest.map(|c| c.expires.clone()).unwrap_or_default(),
                     revoked: record.is_revoked(),
-                    online: !server.room.sessions_of_user(user_id).is_empty(),
+                    online: online.contains(&user_id),
                     is_admin: record.is_admin,
                     disabled: record.disabled,
                     pending: record.is_pending(),
@@ -239,27 +234,34 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
             }
             AdminResponse::Users(users)
         }
-        AdminRequest::Revoke { user } => {
-            let mut store = server.store.lock().await;
-            let Some(user_id) = store.resolve(&user) else {
-                return AdminResponse::err("NO_SUCH_USER", format!("no user {user:?}"));
-            };
-            match store.revoke(user_id) {
-                Ok(_) => {
-                    drop(store);
-                    // A revoke takes effect immediately (§5).
-                    let closed = session::kick_user(server, user_id, ec::KICKED);
-                    tracing::info!(user_id, closed, "revoked");
-                    crate::endpoint::reload_tls_logged(server).await;
-                    AdminResponse::Revoke { user_id, closed }
-                }
+        AdminRequest::Revoke { user } => match resolve(server, user).await {
+            Ok(user_id) => match revoke_user(server, None, user_id).await {
+                Ok(closed) => AdminResponse::Revoke { user_id, closed },
                 Err(e) => store_err(e, "REVOKE_FAILED"),
+            },
+            Err(response) => response,
+        },
+        AdminRequest::Promote { user } | AdminRequest::Demote { user } => {
+            let is_admin = matches!(request, AdminRequest::Promote { .. });
+            match resolve(server, user).await {
+                Ok(user_id) => match set_role(server, None, user_id, is_admin).await {
+                    Ok(()) => AdminResponse::Ok,
+                    Err(e) => store_err(e, "PROMOTE_FAILED"),
+                },
+                Err(response) => response,
             }
         }
-        AdminRequest::Promote { user } => set_role(server, &user, true).await,
-        AdminRequest::Demote { user } => set_role(server, &user, false).await,
-        AdminRequest::Enable { user } => set_disabled(server, &user, false).await,
-        AdminRequest::Disable { user } => set_disabled(server, &user, true).await,
+        AdminRequest::Enable { user } | AdminRequest::Disable { user } => {
+            let disabled = matches!(request, AdminRequest::Disable { .. });
+            match resolve(server, user).await {
+                Ok(user_id) => match set_disabled(server, None, user_id, disabled).await {
+                    Ok(closed) if disabled => AdminResponse::Disable { user_id, closed },
+                    Ok(_) => AdminResponse::Ok,
+                    Err(e) => store_err(e, "DISABLE_FAILED"),
+                },
+                Err(response) => response,
+            }
+        }
         AdminRequest::Status => AdminResponse::Status(status(server)),
         AdminRequest::RotateServerCert => match rotate_server_cert(server).await {
             Ok(()) => AdminResponse::Ok,
@@ -305,48 +307,118 @@ pub async fn renew_ca(server: &Arc<Server>) -> Result<()> {
     crate::endpoint::reload_tls(server).await
 }
 
-/// Shared resolve→mutate→map-error body of `Promote`/`Demote`. On success,
-/// pushes `UserAdminChanged` live to every one of the target's own online
-/// sessions (same live-propagation shape as a renewal's `UserRenamed`), so
-/// their own cached `is_admin` updates without a reconnect, regardless of
-/// whether the action came from the socket or in-band.
-async fn set_role(server: &Arc<Server>, user: &str, is_admin: bool) -> AdminResponse {
-    let mut store = server.store.lock().await;
-    let Some(user_id) = store.resolve(user) else {
-        return AdminResponse::err("NO_SUCH_USER", format!("no user {user:?}"));
-    };
-    match store.set_admin(user_id, is_admin) {
-        Ok(_) => {
-            drop(store);
-            session::announce_admin_change(server, user_id, is_admin);
-            tracing::info!(user_id, is_admin, "admin role changed");
-            AdminResponse::Ok
-        }
-        Err(e) => store_err(e, "PROMOTE_FAILED"),
-    }
+/// Resolves a CLI selector; an unknown one comes back as the response to
+/// send.
+async fn resolve(server: &Arc<Server>, user: &str) -> std::result::Result<UserId, AdminResponse> {
+    server
+        .store
+        .lock()
+        .await
+        .resolve(user)
+        .ok_or_else(|| AdminResponse::err("NO_SUCH_USER", format!("no user {user:?}")))
 }
 
-/// Shared resolve→mutate→map-error body of `Enable`/`Disable`. Disabling
-/// takes effect immediately, so it also closes the target's live sessions and
-/// reports how many; enabling has nothing to close.
-async fn set_disabled(server: &Arc<Server>, user: &str, disabled: bool) -> AdminResponse {
+/// Under one store lock: an in-band `actor` must still be an admin and
+/// `target` must exist (the socket passes `None`, its authentication is the
+/// file permissions), then `change` runs. The lock is released before this
+/// returns, so the callers' side effects — kicks, control frames, the CRL
+/// reload — never run under it.
+async fn change(
+    server: &Arc<Server>,
+    actor: Option<UserId>,
+    target: UserId,
+    change: impl FnOnce(&mut Store) -> Result<bool>,
+) -> Result<bool> {
     let mut store = server.store.lock().await;
-    let Some(user_id) = store.resolve(user) else {
-        return AdminResponse::err("NO_SUCH_USER", format!("no user {user:?}"));
-    };
-    match store.set_disabled(user_id, disabled) {
-        Ok(_) => {
-            drop(store);
-            if !disabled {
-                tracing::info!(user_id, "enabled");
-                return AdminResponse::Ok;
-            }
-            let closed = session::kick_user(server, user_id, ec::AUTH_DISABLED);
-            tracing::info!(user_id, closed, "disabled");
-            AdminResponse::Disable { user_id, closed }
+    if let Some(actor) = actor {
+        if !store.is_admin(actor) {
+            return Err(Error::coded(ec::NOT_ADMIN, "not an admin"));
         }
-        Err(e) => store_err(e, "DISABLE_FAILED"),
+        if store.user(target).is_none() {
+            return Err(Error::coded(ec::NO_SUCH_USER, "unknown user"));
+        }
     }
+    change(&mut store)
+}
+
+/// Revokes every certificate of `target` and kicks its live connections with
+/// `KICKED`; the CRL goes live at once (§5). Returns how many were closed.
+/// Behind `revoke` and `AdminRevokeUser`.
+pub async fn revoke_user(
+    server: &Arc<Server>,
+    actor: Option<UserId>,
+    target: UserId,
+) -> Result<usize> {
+    change(server, actor, target, |store| store.revoke(target)).await?;
+    let closed = kick_user(server, target, ec::KICKED);
+    tracing::info!(actor, target, closed, "revoked");
+    crate::endpoint::reload_tls_logged(server).await;
+    Ok(closed)
+}
+
+/// Grants or revokes admin rights, live: `UserAdminChanged` to every one of
+/// the target's own sessions, so their cached `is_admin` updates without a
+/// reconnect, then a `UserState` broadcast per session whose `ADMIN` bit
+/// flipped, which is what moves the badge on everybody else's roster. Behind
+/// `promote`/`demote` and `AdminSetRole`.
+pub async fn set_role(
+    server: &Arc<Server>,
+    actor: Option<UserId>,
+    target: UserId,
+    is_admin: bool,
+) -> Result<()> {
+    change(server, actor, target, |store| {
+        store.set_admin(target, is_admin)
+    })
+    .await?;
+    for s in server.room.sessions_of_user(target) {
+        server
+            .room
+            .send_to(s, &ControlMsg::UserAdminChanged { is_admin });
+    }
+    for s in server.room.set_admin_flag(target, is_admin) {
+        if let Some(flags) = server.room.flags(s) {
+            server
+                .room
+                .broadcast(&ControlMsg::UserState { session: s, flags });
+        }
+    }
+    tracing::info!(actor, target, is_admin, "admin role changed");
+    Ok(())
+}
+
+/// Blocks or restores login. Disabling takes effect immediately: the
+/// target's live sessions are closed with `AUTH_DISABLED` — the close itself
+/// is the notification — and how many is returned; enabling closes nothing.
+/// Behind `disable`/`enable` and `AdminSetDisabled`.
+pub async fn set_disabled(
+    server: &Arc<Server>,
+    actor: Option<UserId>,
+    target: UserId,
+    disabled: bool,
+) -> Result<usize> {
+    change(server, actor, target, |store| {
+        store.set_disabled(target, disabled)
+    })
+    .await?;
+    let closed = if disabled {
+        kick_user(server, target, ec::AUTH_DISABLED)
+    } else {
+        0
+    };
+    tracing::info!(actor, target, disabled, closed, "disabled state changed");
+    Ok(closed)
+}
+
+/// Closes every connection of a user with `code`, through the room so that
+/// `UserLeft` carries it.
+fn kick_user(server: &Arc<Server>, user_id: UserId, code: u32) -> usize {
+    server
+        .room
+        .sessions_of_user(user_id)
+        .into_iter()
+        .filter(|session| server.room.close(*session, code))
+        .count()
 }
 
 /// Maps a store failure onto a response. A coded error reports under its own
@@ -492,11 +564,20 @@ async fn serve_one(server: Arc<Server>, stream: UnixStream) -> Result<()> {
             Ok(request) => handle(&server, request).await,
             Err(e) => AdminResponse::err("BAD_REQUEST", e),
         };
-        let mut body = serde_json::to_vec(&response.to_json())?;
-        body.push(b'\n');
-        write.write_all(&body).await?;
-        write.flush().await?;
+        write_line(&mut write, &response.to_json()).await?;
     }
+    Ok(())
+}
+
+/// One JSON document as one line, flushed.
+async fn write_line(
+    write: &mut (impl AsyncWriteExt + Unpin),
+    value: &impl Serialize,
+) -> Result<()> {
+    let mut body = serde_json::to_vec(value)?;
+    body.push(b'\n');
+    write.write_all(&body).await?;
+    write.flush().await?;
     Ok(())
 }
 
@@ -509,10 +590,7 @@ pub async fn request(
         .await
         .context(format!("cannot connect to {}", socket.display()))?;
     let (read, mut write) = stream.into_split();
-    let mut body = serde_json::to_vec(request)?;
-    body.push(b'\n');
-    write.write_all(&body).await?;
-    write.flush().await?;
+    write_line(&mut write, request).await?;
     let mut lines = BufReader::new(read).lines();
     let line = lines
         .next_line()

@@ -2,7 +2,7 @@
 //! (`Server/IMPLEMENTATION.md` §6.4).
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex,
@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
 use icu_proto::{ControlMsg, Session, UserFlags, UserId, UserInfo};
 use tokio::sync::mpsc;
 
@@ -71,7 +72,7 @@ impl Speaking {
 }
 
 /// One connected participant.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Member {
     /// Connection scoped id.
     pub session: Session,
@@ -83,12 +84,16 @@ pub struct Member {
     pub flags: UserFlags,
     /// The QUIC connection, for datagrams and for closing.
     pub conn: quinn::Connection,
-    /// Outgoing control frames. The writer task drains this. Bounded by
+    /// Outgoing control frames, each shared with every other recipient of a
+    /// broadcast. The writer task drains this. Bounded by
     /// [`crate::limits::CONTROL_QUEUE_FRAMES`]: a client that stops reading
     /// is closed rather than buffered for.
-    pub out: mpsc::Sender<Vec<u8>>,
+    pub out: mpsc::Sender<Bytes>,
     /// Talk spurt tracking.
     pub speak: Speaking,
+    /// When the last `KeyframeRequest` was forwarded to this member as a
+    /// speaker (`Room::keyframe_request`).
+    pub last_keyframe: Option<Instant>,
     /// Set just before the server closes this connection itself, so that
     /// `UserLeft.reason` carries the code the server closed with
     /// (`Server/IMPLEMENTATION.md` §6.4.6).
@@ -98,26 +103,27 @@ pub struct Member {
 impl Member {
     /// Queues one control frame. A full queue means the client has stopped
     /// reading its control stream; it is closed with `TIMEOUT` instead of
-    /// letting its backlog grow in server memory. `quinn::Connection::close`
-    /// is synchronous and never calls back into the room, so this is safe
-    /// under the room lock.
-    fn push(&mut self, frame: Vec<u8>) -> bool {
+    /// letting its backlog grow in server memory.
+    fn push(&mut self, frame: Bytes) -> bool {
         match self.out.try_send(frame) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 if self.close_code.is_none() {
                     tracing::info!(session = self.session, "control queue full, closing");
-                    self.close_code = Some(icu_proto::error::TIMEOUT);
-                    let code = icu_proto::error::TIMEOUT;
-                    self.conn.close(
-                        quinn::VarInt::from_u32(code),
-                        icu_proto::error::name(code).as_bytes(),
-                    );
+                    self.close(icu_proto::error::TIMEOUT);
                 }
                 false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         }
+    }
+
+    /// Closes the connection with `code`, recorded first so that `UserLeft`
+    /// carries it. `quinn::Connection::close` is synchronous and never calls
+    /// back into the room, so this is safe under the room lock.
+    fn close(&mut self, code: u32) {
+        self.close_code = Some(code);
+        crate::wire::close(&self.conn, code);
     }
 
     /// This member as it appears on the wire.
@@ -210,7 +216,7 @@ impl Room {
         flags: UserFlags,
         is_admin: bool,
         conn: quinn::Connection,
-        out: mpsc::Sender<Vec<u8>>,
+        out: mpsc::Sender<Bytes>,
         welcome: impl FnOnce(Session, UserFlags, Vec<UserInfo>) -> ControlMsg,
     ) -> Result<Session, JoinError> {
         let mut state = self.lock();
@@ -231,42 +237,58 @@ impl Room {
             conn,
             out,
             speak: Speaking::default(),
+            last_keyframe: None,
             close_code: None,
         };
         let users = state.members.values().map(Member::info).collect();
-        let welcome = welcome(session, initial, users);
-        match welcome.encode() {
-            Ok(frame) => {
-                member.push(frame);
-            }
-            Err(_) => tracing::error!(msg = welcome.variant(), "cannot encode control message"),
+        if let Some(frame) = encode(&welcome(session, initial, users)) {
+            member.push(frame);
         }
         let joined = ControlMsg::UserJoined {
             user: member.info(),
         };
-        match joined.encode() {
-            Ok(frame) => {
-                for other in state.members.values_mut() {
-                    other.push(frame.clone());
-                }
+        if let Some(frame) = encode(&joined) {
+            for other in state.members.values_mut() {
+                other.push(frame.clone());
             }
-            Err(_) => tracing::error!("cannot encode UserJoined"),
         }
         state.members.insert(session, member);
         Ok(session)
     }
 
-    /// Records the code the server is about to close this connection with.
-    pub fn mark_closing(&self, session: Session, code: u32) {
-        if let Some(member) = self.lock().members.get_mut(&session) {
-            member.close_code = Some(code);
+    /// Closes a participant's connection with `code` (`kick_user`). Returns
+    /// whether it was in the room.
+    pub fn close(&self, session: Session, code: u32) -> bool {
+        match self.lock().members.get_mut(&session) {
+            Some(member) => {
+                member.close(code);
+                true
+            }
+            None => false,
         }
     }
 
-    /// Records the close code for every participant, for shutdown.
-    pub fn mark_all_closing(&self, code: u32) {
+    /// Closes the connection with this `stable_id` if it is in the room, so
+    /// that its `UserLeft` carries `code`. Returns whether it was.
+    pub fn close_connection(&self, stable_id: usize, code: u32) -> bool {
+        match self
+            .lock()
+            .members
+            .values_mut()
+            .find(|m| m.conn.stable_id() == stable_id)
+        {
+            Some(member) => {
+                member.close(code);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Closes every connection with `code`, for shutdown.
+    pub fn close_all(&self, code: u32) {
         for member in self.lock().members.values_mut() {
-            member.close_code = Some(code);
+            member.close(code);
         }
     }
 
@@ -281,31 +303,6 @@ impl Room {
         member
     }
 
-    /// The session riding on the connection with this `stable_id`, if it is
-    /// in the room.
-    pub fn session_of_connection(&self, stable_id: usize) -> Option<Session> {
-        self.lock()
-            .members
-            .values()
-            .find(|m| m.conn.stable_id() == stable_id)
-            .map(|m| m.session)
-    }
-
-    /// One participant, cloned.
-    pub fn member(&self, session: Session) -> Option<Member> {
-        self.lock().members.get(&session).cloned()
-    }
-
-    /// All participants except `session`.
-    pub fn users_except(&self, session: Session) -> Vec<UserInfo> {
-        self.lock()
-            .members
-            .values()
-            .filter(|m| m.session != session)
-            .map(Member::info)
-            .collect()
-    }
-
     /// All sessions belonging to a `user_id` (a user can hold only one
     /// connection in practice, but nothing enforces it).
     pub fn sessions_of_user(&self, user_id: UserId) -> Vec<Session> {
@@ -317,31 +314,53 @@ impl Room {
             .collect()
     }
 
+    /// The `user_id` of everybody in the room, for the user lists.
+    pub fn online_users(&self) -> BTreeSet<UserId> {
+        self.lock().members.values().map(|m| m.user_id).collect()
+    }
+
     /// Everything the audio relay needs from the room, in **one** lock: the
     /// sender's flags, and — unless it is muted — the connections to fan the
     /// datagram out to, which is everybody else who is not deafened
-    /// (`PROTOCOL.md` §3). Returns `None` when the sender has already left.
+    /// (`PROTOCOL.md` §3), plus the talk spurt bookkeeping (`PROTOCOL.md`
+    /// §2.1, `Server/IMPLEMENTATION.md` §6.5): `end` closes the spurt, any
+    /// other datagram is noted. The second value is the new flags when
+    /// `speaking` flipped, for the `UserState` broadcast. Returns `None` when
+    /// the sender has already left.
     ///
     /// `out` is owned by the caller and reused across datagrams, so this, the
     /// only truly hot path in the server, allocates nothing.
     pub fn audio_fanout(
         &self,
         sender: Session,
+        end: bool,
+        silence: Duration,
         out: &mut Vec<(Session, quinn::Connection)>,
-    ) -> Option<UserFlags> {
+    ) -> Option<(UserFlags, Option<UserFlags>)> {
         out.clear();
-        let state = self.lock();
+        let mut state = self.lock();
         let flags = state.members.get(&sender)?.flags;
-        if !flags.muted() {
-            out.extend(
-                state
-                    .members
-                    .values()
-                    .filter(|m| m.session != sender && !m.flags.deafened())
-                    .map(|m| (m.session, m.conn.clone())),
-            );
+        if flags.muted() {
+            return Some((flags, None));
         }
-        Some(flags)
+        out.extend(
+            state
+                .members
+                .values()
+                .filter(|m| m.session != sender && !m.flags.deafened())
+                .map(|m| (m.session, m.conn.clone())),
+        );
+        let member = state.members.get_mut(&sender)?;
+        let flipped = if end {
+            member.speak.end()
+        } else {
+            member.speak.note_audio(Instant::now(), silence)
+        };
+        let flipped = flipped.then(|| {
+            member.flags = member.flags.with_speaking(!end);
+            member.flags
+        });
+        Some((flags, flipped))
     }
 
     /// Connections to hand a video frame to: everybody else. Deafened only
@@ -420,33 +439,6 @@ impl Room {
             .collect()
     }
 
-    /// Records an incoming audio datagram and derives the `speaking` bit
-    /// (`PROTOCOL.md` §2.1, `Server/IMPLEMENTATION.md` §6.5).
-    ///
-    /// Returns the new flags when `speaking` flipped to 1.
-    pub fn note_audio(&self, session: Session, silence: Duration) -> Option<UserFlags> {
-        let now = Instant::now();
-        let mut state = self.lock();
-        let member = state.members.get_mut(&session)?;
-        if !member.speak.note_audio(now, silence) {
-            return None;
-        }
-        member.flags = member.flags.with_speaking(true);
-        Some(member.flags)
-    }
-
-    /// Ends a talk spurt explicitly (the `END` flag). Returns the new flags
-    /// when `speaking` flipped to 0.
-    pub fn end_talk_spurt(&self, session: Session) -> Option<UserFlags> {
-        let mut state = self.lock();
-        let member = state.members.get_mut(&session)?;
-        if !member.speak.end() {
-            return None;
-        }
-        member.flags = member.flags.with_speaking(false);
-        Some(member.flags)
-    }
-
     /// Clears `speaking` for everybody silent for longer than `silence`.
     pub fn expire_speaking(&self, silence: Duration) -> Vec<(Session, UserFlags)> {
         let now = Instant::now();
@@ -461,10 +453,28 @@ impl Room {
         changed
     }
 
+    /// Forwards a `KeyframeRequest` to `speaker`, at most once per
+    /// `min_interval` (§6.5). The speaker learns "someone needs a keyframe",
+    /// not who asked.
+    pub fn keyframe_request(&self, speaker: Session, min_interval: Duration) -> bool {
+        let now = Instant::now();
+        let mut state = self.lock();
+        let Some(member) = state.members.get_mut(&speaker) else {
+            return false;
+        };
+        if member
+            .last_keyframe
+            .is_some_and(|last| now.saturating_duration_since(last) < min_interval)
+        {
+            return false;
+        }
+        member.last_keyframe = Some(now);
+        encode(&ControlMsg::KeyframeRequest { speaker: 0 }).is_some_and(|frame| member.push(frame))
+    }
+
     /// Sends a control message to one participant.
     pub fn send_to(&self, session: Session, msg: &ControlMsg) -> bool {
-        let Ok(frame) = msg.encode() else {
-            tracing::error!(msg = msg.variant(), "cannot encode control message");
+        let Some(frame) = encode(msg) else {
             return false;
         };
         let mut state = self.lock();
@@ -474,37 +484,27 @@ impl Room {
         }
     }
 
-    /// Sends a control message to everybody, including the originator.
+    /// Sends a control message to everybody, including the originator. One
+    /// encoding, shared by refcount with every queue.
     pub fn broadcast(&self, msg: &ControlMsg) {
-        self.broadcast_inner(msg, None)
-    }
-
-    /// Sends a control message to everybody but `except`.
-    pub fn broadcast_except(&self, except: Session, msg: &ControlMsg) {
-        self.broadcast_inner(msg, Some(except))
-    }
-
-    fn broadcast_inner(&self, msg: &ControlMsg, except: Option<Session>) {
-        let Ok(frame) = msg.encode() else {
-            tracing::error!(msg = msg.variant(), "cannot encode control message");
+        let Some(frame) = encode(msg) else {
             return;
         };
         let mut state = self.lock();
         for member in state.members.values_mut() {
-            if Some(member.session) == except {
-                continue;
-            }
             member.push(frame.clone());
         }
     }
+}
 
-    /// All connections, for shutdown.
-    pub fn connections(&self) -> Vec<quinn::Connection> {
-        self.lock()
-            .members
-            .values()
-            .map(|m| m.conn.clone())
-            .collect()
+/// One control frame, logged and `None` when it cannot be encoded.
+fn encode(msg: &ControlMsg) -> Option<Bytes> {
+    match msg.encode() {
+        Ok(frame) => Some(Bytes::from(frame)),
+        Err(_) => {
+            tracing::error!(msg = msg.variant(), "cannot encode control message");
+            None
+        }
     }
 }
 
@@ -561,6 +561,14 @@ impl Counters {
     /// Increments a counter by one.
     pub fn inc(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Adds `n` to a counter; nothing is touched for 0, so a fan-out can
+    /// count locally and settle each counter once.
+    pub fn add(counter: &AtomicU64, n: u64) {
+        if n > 0 {
+            counter.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     /// Reads a counter.

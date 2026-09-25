@@ -21,7 +21,7 @@ use icu_proto::{
 };
 use quinn::SendDatagramError;
 
-use crate::{limits::TokenBucket, room::Counters, Server};
+use crate::{limits::TokenBucket, lock, room::Counters, Server};
 
 /// Relays one audio datagram (`PROTOCOL.md` §3).
 ///
@@ -34,9 +34,9 @@ use crate::{limits::TokenBucket, room::Counters, Server};
 ///
 /// This is the one hot path in the server — 16 clients at 50 packets/s mean
 /// 800 calls a second, each fanning out to 15 peers. It therefore takes the
-/// room lock exactly twice (the fan-out, then the talk spurt bookkeeping) and
-/// reuses the caller's `receivers` buffer instead of allocating one per
-/// datagram.
+/// room lock exactly once (fan-out and talk spurt bookkeeping together),
+/// touches each counter once, and reuses the caller's `receivers` buffer
+/// instead of allocating one per datagram.
 pub fn audio(
     server: &Arc<Server>,
     sender: Session,
@@ -44,23 +44,30 @@ pub fn audio(
     bucket: &mut TokenBucket,
     receivers: &mut Vec<(Session, quinn::Connection)>,
 ) {
-    Counters::inc(&server.counters.datagrams_in);
+    let c = &server.counters;
+    Counters::inc(&c.datagrams_in);
 
     let Ok((audio_header, _)) = AudioHeader::decode(&datagram) else {
-        Counters::inc(&server.counters.dropped_malformed);
+        Counters::inc(&c.dropped_malformed);
         return;
     };
 
     if !bucket.take_one() {
-        Counters::inc(&server.counters.dropped_rate);
+        Counters::inc(&c.dropped_rate);
         return;
     }
-    let Some(flags) = server.room.audio_fanout(sender, receivers) else {
-        Counters::inc(&server.counters.dropped_malformed);
+    // Derive `speaking` from the flow (§6.5), in the same lock as the fan-out.
+    let silence = server.config.timing.speaking_silence();
+    let Some((flags, flipped)) =
+        server
+            .room
+            .audio_fanout(sender, audio_header.end(), silence, receivers)
+    else {
+        Counters::inc(&c.dropped_malformed);
         return;
     };
     if flags.muted() {
-        Counters::inc(&server.counters.dropped_muted);
+        Counters::inc(&c.dropped_muted);
         return;
     }
 
@@ -72,39 +79,34 @@ pub fn audio(
         Err(shared) => BytesMut::from(&shared[..]),
     };
     if header::set_speaker_in_place(&mut buf, sender).is_err() {
-        Counters::inc(&server.counters.dropped_malformed);
+        Counters::inc(&c.dropped_malformed);
         return;
     }
     let out = buf.freeze();
 
+    let (mut sent, mut too_large, mut unsupported, mut disabled, mut lost) = (0, 0, 0, 0, 0);
     for (session, conn) in receivers.iter() {
         // One refcount bump per receiver, no copy.
         match conn.send_datagram(out.clone()) {
-            Ok(()) => Counters::inc(&server.counters.datagrams_out),
+            Ok(()) => sent += 1,
             // `quinn::SendDatagramError` has exactly these four variants; the
             // `Blocked` from `quinn_proto` does not exist here (A1).
-            Err(SendDatagramError::TooLarge) => Counters::inc(&server.counters.send_too_large),
-            Err(SendDatagramError::UnsupportedByPeer) => {
-                Counters::inc(&server.counters.send_unsupported)
-            }
-            Err(SendDatagramError::Disabled) => Counters::inc(&server.counters.send_disabled),
+            Err(SendDatagramError::TooLarge) => too_large += 1,
+            Err(SendDatagramError::UnsupportedByPeer) => unsupported += 1,
+            Err(SendDatagramError::Disabled) => disabled += 1,
             Err(SendDatagramError::ConnectionLost(_)) => {
-                Counters::inc(&server.counters.send_connection_lost);
+                lost += 1;
                 tracing::debug!(session, "datagram receiver gone");
             }
         }
     }
+    Counters::add(&c.datagrams_out, sent);
+    Counters::add(&c.send_too_large, too_large);
+    Counters::add(&c.send_unsupported, unsupported);
+    Counters::add(&c.send_disabled, disabled);
+    Counters::add(&c.send_connection_lost, lost);
 
-    // Derive `speaking` from the flow (§6.5).
-    let silence = server.config.timing.speaking_silence();
-    if audio_header.end() {
-        if let Some(flags) = server.room.end_talk_spurt(sender) {
-            server.room.broadcast(&ControlMsg::UserState {
-                session: sender,
-                flags,
-            });
-        }
-    } else if let Some(flags) = server.room.note_audio(sender, silence) {
+    if let Some(flags) = flipped {
         server.room.broadcast(&ControlMsg::UserState {
             session: sender,
             flags,
@@ -236,24 +238,20 @@ impl Slot {
     /// Offers a frame. Returns `true` when it displaced an older waiting one,
     /// which is then dropped.
     fn offer(&self, frame: Bytes) -> bool {
-        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
-        let displaced = waiting.replace(frame).is_some();
+        let displaced = lock(&self.waiting).replace(frame).is_some();
         self.notify.notify_one();
         displaced
     }
 
     fn take(&self) -> Option<Bytes> {
-        self.waiting
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        lock(&self.waiting).take()
     }
 
     /// Retires the slot: drops whatever is still waiting and wakes the
     /// forwarder so it can end.
     fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        *self.waiting.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *lock(&self.waiting) = None;
         self.notify.notify_one();
     }
 
@@ -299,12 +297,7 @@ pub async fn video(
         refuse(&mut recv);
         return;
     }
-    let frame_ok = state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .frames
-        .take_one();
-    if !frame_ok {
+    if !lock(&state).frames.take_one() {
         Counters::inc(&server.counters.video_dropped_rate);
         refuse(&mut recv);
         return;
@@ -320,12 +313,10 @@ pub async fn video(
     // The byte budget can only be charged once the size is known. It runs
     // into debt rather than refusing outright, so a frame larger than the
     // 2 s burst — a big IDR — still passes when the budget is not spent.
-    let bytes_ok = state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    if !lock(&state)
         .bitrate
-        .take_debt((VIDEO_HEADER_LEN + payload.len()) as f64);
-    if !bytes_ok {
+        .take_debt((VIDEO_HEADER_LEN + payload.len()) as f64)
+    {
         Counters::inc(&server.counters.video_dropped_rate);
         return;
     }
@@ -353,7 +344,7 @@ pub async fn video(
     let now = Instant::now();
     let mut hint = None;
     {
-        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = lock(&state);
         // Receivers that left take their slot with them, and so does an id
         // that now belongs to a different connection. Without this the map —
         // and a held-back frame in each entry — would grow for as long as the
@@ -408,6 +399,9 @@ async fn forward_frames(
     slot: Arc<Slot>,
     session: Session,
 ) {
+    let closed = conn.closed();
+    let shutdown = server.shutdown_requested();
+    tokio::pin!(closed, shutdown);
     loop {
         let frame = match slot.take() {
             Some(frame) => frame,
@@ -415,8 +409,8 @@ async fn forward_frames(
             None => {
                 tokio::select! {
                     _ = slot.notify.notified() => continue,
-                    _ = conn.closed() => return,
-                    _ = server.shutdown_requested() => return,
+                    _ = &mut closed => return,
+                    _ = &mut shutdown => return,
                 }
             }
         };
@@ -427,9 +421,11 @@ async fn forward_frames(
                 return;
             }
         };
-        // Video is the lowest priority stream (`PROTOCOL.md` §4).
+        // Video is the lowest priority stream (`PROTOCOL.md` §4). The frame
+        // is shared with every other receiver; handing it over as a chunk
+        // spares quinn a copy.
         let _ = send.set_priority(-1);
-        if send.write_all(&frame).await.is_err() {
+        if send.write_chunk(frame).await.is_err() {
             Counters::inc(&server.counters.video_dropped_slow_receiver);
             let _ = send.reset(quinn::VarInt::from_u32(icu_proto::error::RATE_LIMITED));
             continue;
@@ -438,26 +434,6 @@ async fn forward_frames(
         let _ = send.finish();
         Counters::inc(&server.counters.video_frames_out);
     }
-}
-
-/// Forwards a `KeyframeRequest` to the speaker, at most once per second
-/// (§6.5).
-pub fn keyframe_request(server: &Arc<Server>, speaker: Session) -> bool {
-    let min_interval = server.config.timing.keyframe_min_interval();
-    let now = Instant::now();
-    {
-        let mut last = server.keyframes.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(previous) = last.get(&speaker) {
-            if now.saturating_duration_since(*previous) < min_interval {
-                return false;
-            }
-        }
-        last.insert(speaker, now);
-    }
-    // The speaker learns "someone needs a keyframe", not who asked.
-    server
-        .room
-        .send_to(speaker, &ControlMsg::KeyframeRequest { speaker: 0 })
 }
 
 #[cfg(test)]

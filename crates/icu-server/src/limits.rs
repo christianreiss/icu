@@ -66,15 +66,20 @@ impl TokenBucket {
 
     /// [`TokenBucket::take`] with an explicit clock, for tests.
     pub fn take_at(&mut self, n: f64, now: Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
-        self.last = now;
-        self.tokens = (self.tokens + elapsed * self.rate_per_s).min(self.capacity);
+        self.refill(now);
         if self.tokens >= n {
             self.tokens -= n;
             true
         } else {
             false
         }
+    }
+
+    /// Credits the tokens earned since the last call, up to the capacity.
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.last = now;
+        self.tokens = (self.tokens + elapsed * self.rate_per_s).min(self.capacity);
     }
 
     /// Takes one token.
@@ -93,9 +98,7 @@ impl TokenBucket {
 
     /// [`TokenBucket::take_debt`] with an explicit clock, for tests.
     pub fn take_debt_at(&mut self, n: f64, now: Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
-        self.last = now;
-        self.tokens = (self.tokens + elapsed * self.rate_per_s).min(self.capacity);
+        self.refill(now);
         if self.tokens > 0.0 {
             self.tokens -= n;
             true
