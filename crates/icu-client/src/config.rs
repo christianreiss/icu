@@ -123,6 +123,9 @@ pub struct AudioSettings {
     pub cue_mute: bool,
     /// Master playback volume in percent.
     pub output_volume: f32,
+    /// Bring every incoming voice to a common loudness
+    /// (`dsp::normalize`), before the per-user volume.
+    pub normalize_incoming: bool,
 }
 
 impl Default for AudioSettings {
@@ -145,6 +148,7 @@ impl Default for AudioSettings {
             cue_tx: false,
             cue_mute: true,
             output_volume: 100.0,
+            normalize_incoming: true,
         }
     }
 }
@@ -817,6 +821,7 @@ mod tests {
         s.audio.hangover_ms = 1500;
         s.audio.voice_opt = true;
         s.audio.voice_strength = VoiceStrength::Strong;
+        s.audio.normalize_incoming = false;
         s.audio.input_device = Some("alsa_input.foo".into());
         s.hotkeys.ptt.key = "BTN_SIDE".into();
         s.overlay.corner = Corner::BottomLeft;
@@ -855,6 +860,7 @@ mod tests {
         assert_eq!(s.audio.hangover_ms, 1000);
         assert!(s.audio.vad_auto);
         assert!(!s.audio.voice_opt);
+        assert!(s.audio.normalize_incoming);
         assert_eq!(s.audio.voice_strength, VoiceStrength::Medium);
         assert!(s.overlay.dim_non_speaking, "old settings.toml default on");
     }
