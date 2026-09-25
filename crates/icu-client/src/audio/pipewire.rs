@@ -34,6 +34,7 @@ use super::backend::{
     AudioBackend, BackendError, BackendEvent, CaptureCallback, DeviceInfo, DeviceKind,
     PlaybackCallback, StreamKind, BLOCK_SAMPLES, SAMPLE_RATE,
 };
+use crate::sync::lock;
 
 /// What the engine thread asks the PipeWire thread to do.
 enum Cmd {
@@ -129,7 +130,7 @@ impl AudioBackend for PipeWireBackend {
     }
 
     fn devices(&self) -> Vec<DeviceInfo> {
-        let map = self.devices.lock().unwrap_or_else(|e| e.into_inner());
+        let map = lock(&self.devices);
         let mut list: Vec<DeviceInfo> = map.values().cloned().collect();
         list.sort_by(|a, b| a.kind.cmp(&b.kind).then(a.description.cmp(&b.description)));
         list
@@ -250,7 +251,7 @@ fn pw_thread(
                 kind,
             };
             let list = {
-                let mut map = dev_add.lock().unwrap_or_else(|e| e.into_inner());
+                let mut map = lock(&dev_add);
                 map.insert(obj.id, info);
                 map.values().cloned().collect()
             };
@@ -258,7 +259,7 @@ fn pw_thread(
         })
         .global_remove(move |id| {
             let removed = {
-                let mut map = dev_rm.lock().unwrap_or_else(|e| e.into_inner());
+                let mut map = lock(&dev_rm);
                 map.remove(&id).map(|_| map.values().cloned().collect())
             };
             if let Some(list) = removed {

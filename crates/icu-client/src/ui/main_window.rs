@@ -622,11 +622,12 @@ impl eframe::App for App {
                     (
                         icon::SQUARES_FOUR,
                         "Overlay",
-                        state.overlay_on,
+                        state.settings.overlay.enabled,
                         widgets::Role::Accent,
                         widgets::RecDot::Off,
                         None,
-                        cfg!(feature = "overlay").then(|| Command::SetOverlay(!state.overlay_on)),
+                        cfg!(feature = "overlay")
+                            .then(|| Command::SetOverlay(!state.settings.overlay.enabled)),
                     ),
                 ];
                 let toggles: Vec<_> = toggles.into_iter().filter(|t| t.6.is_some()).collect();
@@ -719,7 +720,7 @@ impl eframe::App for App {
                                         muted: state.muted,
                                         deafened: state.deafened,
                                         camera: state.camera_on,
-                                        mode: Some(state.mode),
+                                        mode: Some(state.settings.audio.mode.into()),
                                         volume: None,
                                         is_admin: state.is_admin,
                                         viewing: watches(me.flags.viewing(), state.camera_on),
@@ -995,7 +996,7 @@ fn speak_row(
     send: &impl Fn(Command),
     tile_w: f32,
 ) -> Option<egui::Response> {
-    let ptt = state.mode == Mode::Ptt;
+    let ptt = Mode::from(state.settings.audio.mode) == Mode::Ptt;
     let offline = state.conn != ConnStatus::Connected;
     let open = !offline && if ptt { state.ptt_down } else { state.sending };
     let key = hotkey_label(state);
@@ -1532,7 +1533,7 @@ impl EnrollApp {
         self.pending = Some(slot.clone());
         let addr = self.server_addr;
         let name = icu_proto::normalize_name(&self.name);
-        let client = format!("icu/{} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS);
+        let client = crate::engine::client_string();
         let paths = self.paths.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("runtime");

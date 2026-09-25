@@ -26,6 +26,7 @@ use crate::{
     conninfo::CertInfo,
     engine::{AppState, ConnStatus},
     stats::DebugStats,
+    sync::lock,
     video::VideoTier,
 };
 
@@ -207,7 +208,7 @@ impl HistCache {
             return &self.jitter;
         }
         self.refreshed = Some(now);
-        let h = stats.jitter_delay.lock().unwrap_or_else(|e| e.into_inner());
+        let h = lock(&stats.jitter_delay);
         let fmt = |v: f64| {
             if v.is_infinite() {
                 ">1000 ms".to_string()

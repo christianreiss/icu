@@ -13,7 +13,7 @@ use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::{
     audio::{AudioBackend, BackendEvent, DeviceInfo, StreamKind},
-    config::{Identity, ModeSetting, Paths, Settings},
+    config::{Identity, Paths, Settings},
     dsp::{
         aec::{Aec, AecStats},
         denoise::Denoiser,
@@ -51,6 +51,7 @@ use crate::{
     problem::Problem,
     quality::QualityController,
     stats::DebugStats,
+    sync::lock,
     video::VideoTier,
 };
 
@@ -88,9 +89,14 @@ impl EngineConfig {
             paths,
             server_addr: None,
             test_tone: false,
-            client_string: format!("icu/{} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
+            client_string: client_string(),
         }
     }
+}
+
+/// What this build sends as `Hello.client`: `icu/<version> <os>`.
+pub fn client_string() -> String {
+    format!("icu/{} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS)
 }
 
 /// Connection status for the UI.
@@ -129,6 +135,20 @@ pub struct Peer {
     pub recv_loss_permille: Option<u16>,
 }
 
+impl Peer {
+    /// A peer as `Welcome` or `UserJoined` announces it: nothing measured
+    /// yet, speaking as the server flag says.
+    pub fn new(info: UserInfo, volume: f32) -> Peer {
+        Peer {
+            speaking: info.flags.speaking(),
+            info,
+            volume,
+            rtt_ms: None,
+            recv_loss_permille: None,
+        }
+    }
+}
+
 /// Everything the UI renders.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppState {
@@ -147,8 +167,6 @@ pub struct AppState {
     pub muted: bool,
     /// Local deafen.
     pub deafened: bool,
-    /// PTT or VAD.
-    pub mode: Mode,
     /// PTT key held.
     pub ptt_down: bool,
     /// Gate open (audio is going out).
@@ -212,8 +230,6 @@ pub struct AppState {
     pub aec_suspect: bool,
     /// Camera state.
     pub camera_on: bool,
-    /// Overlay state.
-    pub overlay_on: bool,
     /// Hotkey backend in use.
     pub hotkey_backend: String,
     /// Settings as the engine holds them.
@@ -297,6 +313,24 @@ pub enum Command {
     Quit,
 }
 
+/// An `f32` the audio threads read every block without a lock.
+#[derive(Debug)]
+struct AtomicF32(AtomicU32);
+
+impl AtomicF32 {
+    fn new(v: f32) -> AtomicF32 {
+        AtomicF32(AtomicU32::new(v.to_bits()))
+    }
+
+    fn load(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+
+    fn store(&self, v: f32) {
+        self.0.store(v.to_bits(), Ordering::Relaxed);
+    }
+}
+
 /// Atomics the DSP thread reads every block.
 #[derive(Debug)]
 pub struct DspControl {
@@ -310,17 +344,17 @@ pub struct DspControl {
     aec: AtomicBool,
     voice_opt: AtomicBool,
     voice_strength: AtomicU32,
-    vad_threshold_bits: AtomicU32,
+    vad_threshold: AtomicF32,
     vad_auto: AtomicBool,
-    vad_effective_threshold_bits: AtomicU32,
-    gain_bits: AtomicU32,
+    vad_effective_threshold: AtomicF32,
+    gain: AtomicF32,
     release_ms: AtomicU32,
     hangover_ms: AtomicU32,
     frame_samples: AtomicU32,
     loss_permille: AtomicU32,
-    level_peak_bits: AtomicU32,
-    level_rms_bits: AtomicU32,
-    vad_prob_bits: AtomicU32,
+    level_peak: AtomicF32,
+    level_rms: AtomicF32,
+    vad_prob: AtomicF32,
     sending: AtomicBool,
     aec_available: AtomicBool,
     reinit_aec: AtomicBool,
@@ -341,17 +375,17 @@ impl DspControl {
             aec: AtomicBool::new(false),
             voice_opt: AtomicBool::new(false),
             voice_strength: AtomicU32::new(0),
-            vad_threshold_bits: AtomicU32::new(0),
+            vad_threshold: AtomicF32::new(0.0),
             vad_auto: AtomicBool::new(false),
-            vad_effective_threshold_bits: AtomicU32::new(0),
-            gain_bits: AtomicU32::new(0),
+            vad_effective_threshold: AtomicF32::new(0.0),
+            gain: AtomicF32::new(0.0),
             release_ms: AtomicU32::new(0),
             hangover_ms: AtomicU32::new(0),
             frame_samples: AtomicU32::new(0),
             loss_permille: AtomicU32::new(0),
-            level_peak_bits: AtomicU32::new((-100.0f32).to_bits()),
-            level_rms_bits: AtomicU32::new((-100.0f32).to_bits()),
-            vad_prob_bits: AtomicU32::new(0),
+            level_peak: AtomicF32::new(-100.0),
+            level_rms: AtomicF32::new(-100.0),
+            vad_prob: AtomicF32::new(0.0),
             sending: AtomicBool::new(false),
             aec_available: AtomicBool::new(false),
             reinit_aec: AtomicBool::new(false),
@@ -365,7 +399,7 @@ impl DspControl {
     fn apply_settings(&self, s: &Settings) {
         let test_tone = self.test_tone.load(Ordering::Relaxed);
         self.vad_mode
-            .store(s.audio.mode == ModeSetting::Vad, Ordering::Relaxed);
+            .store(Mode::from(s.audio.mode) == Mode::Vad, Ordering::Relaxed);
         self.denoise
             .store(s.audio.denoise && !test_tone, Ordering::Relaxed);
         self.aec.store(s.audio.aec && !test_tone, Ordering::Relaxed);
@@ -373,11 +407,9 @@ impl DspControl {
             .store(s.audio.voice_opt && !test_tone, Ordering::Relaxed);
         self.voice_strength
             .store(s.audio.voice_strength.to_u32(), Ordering::Relaxed);
-        self.vad_threshold_bits
-            .store(s.audio.vad_threshold.to_bits(), Ordering::Relaxed);
+        self.vad_threshold.store(s.audio.vad_threshold);
         self.vad_auto.store(s.audio.vad_auto, Ordering::Relaxed);
-        self.gain_bits
-            .store(meter::from_db(s.audio.gain_db).to_bits(), Ordering::Relaxed);
+        self.gain.store(meter::from_db(s.audio.gain_db));
         self.release_ms.store(s.audio.release_ms, Ordering::Relaxed);
         self.hangover_ms
             .store(s.audio.hangover_ms, Ordering::Relaxed);
@@ -390,8 +422,8 @@ impl DspControl {
     /// Current level.
     pub fn level(&self) -> Level {
         Level {
-            peak_db: f32::from_bits(self.level_peak_bits.load(Ordering::Relaxed)),
-            rms_db: f32::from_bits(self.level_rms_bits.load(Ordering::Relaxed)),
+            peak_db: self.level_peak.load(),
+            rms_db: self.level_rms.load(),
         }
     }
 }
@@ -437,13 +469,9 @@ struct Shared {
     speakers: Mutex<HashMap<Session, Speaker>>,
     /// The live connection for `send_datagram` from the DSP thread.
     conn: Mutex<Option<quinn::Connection>>,
-    /// Session → user_id map for volumes and video.
-    volumes: Mutex<HashMap<UserId, f32>>,
     deafened: AtomicBool,
-    output_gain_bits: AtomicU32,
+    output_gain: AtomicF32,
     cues: Mutex<VecDeque<f32>>,
-    cue_settings: Mutex<(bool, bool, bool)>,
-    playback_open: Arc<AtomicBool>,
     /// The AEC reference stream is open.
     reference_open: AtomicBool,
     /// Push times of the capture and reference callbacks, so the DSP thread
@@ -464,8 +492,6 @@ struct Shared {
     /// Largest block the playback callback has asked for; the mixer keeps
     /// at least that much plus a block queued, whatever the graph quantum.
     play_request: Arc<AtomicUsize>,
-    /// Encoder loss percent mirrored for the tests.
-    loss_perc: AtomicI64,
     /// Detected network condition (RTT, loss, congestion pressure); folded
     /// from quinn's own connection stats plus `LossHint`/
     /// `VideoCongestionHint` (`crate::netcond`).
@@ -525,11 +551,6 @@ impl Engine {
             peers: Vec::new(),
             muted: false,
             deafened: false,
-            mode: if settings.audio.mode == ModeSetting::Vad {
-                Mode::Vad
-            } else {
-                Mode::Ptt
-            },
             ptt_down: false,
             sending: false,
             level: Level::default(),
@@ -557,17 +578,10 @@ impl Engine {
             aec_reference: false,
             aec_suspect: false,
             camera_on: false,
-            overlay_on: settings.overlay.enabled,
             hotkey_backend: String::new(),
             settings: settings.clone(),
         };
         let (state_tx, state_rx) = watch::channel(initial);
-        let mut volumes = HashMap::new();
-        for (k, v) in &settings.volumes {
-            if let Ok(id) = k.parse::<UserId>() {
-                volumes.insert(id, *v);
-            }
-        }
         // Ring buffers between backend callbacks and the DSP/mixer threads.
         let (cap_prod, cap_cons) = HeapRb::<f32>::new(48_000).split();
         let (ref_prod, ref_cons) = HeapRb::<f32>::new(48_000).split();
@@ -582,18 +596,9 @@ impl Engine {
             stats: stats.clone(),
             speakers: Mutex::new(HashMap::new()),
             conn: Mutex::new(None),
-            volumes: Mutex::new(volumes),
             deafened: AtomicBool::new(false),
-            output_gain_bits: AtomicU32::new(
-                mixer::volume_gain(settings.audio.output_volume).to_bits(),
-            ),
+            output_gain: AtomicF32::new(mixer::volume_gain(settings.audio.output_volume)),
             cues: Mutex::new(VecDeque::new()),
-            cue_settings: Mutex::new((
-                settings.audio.cue_join,
-                settings.audio.cue_tx,
-                settings.audio.cue_mute,
-            )),
-            playback_open: Arc::new(AtomicBool::new(false)),
             reference_open: AtomicBool::new(false),
             cycle: Arc::new(CycleClock::default()),
             keyframe_request: AtomicBool::new(false),
@@ -603,7 +608,6 @@ impl Engine {
             ref_prod: Arc::new(Mutex::new(ref_prod)),
             play_cons: Arc::new(Mutex::new(play_cons)),
             play_request: Arc::new(AtomicUsize::new(0)),
-            loss_perc: AtomicI64::new(0),
             net: Mutex::new(NetworkTracker::new()),
             video_tier: AtomicU8::new(VideoTier::T0.as_u8()),
         });
@@ -762,7 +766,7 @@ impl Engine {
 
     /// `PACKET_LOSS_PERC` currently applied to the encoder.
     pub fn packet_loss_perc(&self) -> i64 {
-        self.shared.loss_perc.load(Ordering::Relaxed)
+        self.shared.stats.packet_loss_perc.load(Ordering::Relaxed)
     }
 
     /// The runtime handle, for spawning hotkey/camera tasks.
@@ -882,9 +886,8 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
             out[n..].fill(0.0);
         }),
     ) {
-        Ok(()) => shared.playback_open.store(true, Ordering::Relaxed),
+        Ok(()) => {}
         Err(e) => {
-            shared.playback_open.store(false, Ordering::Relaxed);
             tracing::warn!(error = %e, "cannot open playback");
             shared
                 .state
@@ -930,11 +933,7 @@ fn dsp_thread(
     };
     let mut auto_threshold = vad_auto::AutoThreshold::new(Instant::now());
     let mut gate = Gate::new(
-        if ctl.vad_mode.load(Ordering::Relaxed) {
-            Mode::Vad
-        } else {
-            Mode::Ptt
-        },
+        mode_of(ctl.vad_mode.load(Ordering::Relaxed)),
         Duration::from_millis(ctl.release_ms.load(Ordering::Relaxed) as u64),
         Duration::from_millis(ctl.hangover_ms.load(Ordering::Relaxed) as u64),
     );
@@ -1114,7 +1113,7 @@ fn dsp_thread(
         }
 
         // 3. Gain, denoise, VAD.
-        let gain = f32::from_bits(ctl.gain_bits.load(Ordering::Relaxed));
+        let gain = ctl.gain.load();
         if gain != 1.0 {
             for s in block.iter_mut() {
                 *s *= gain;
@@ -1126,23 +1125,19 @@ fn dsp_thread(
             None
         };
         let level = meter::measure(&block);
-        ctl.level_peak_bits
-            .store(level.peak_db.to_bits(), Ordering::Relaxed);
-        ctl.level_rms_bits
-            .store(level.rms_db.to_bits(), Ordering::Relaxed);
-        ctl.vad_prob_bits
-            .store(prob.unwrap_or(0.0).to_bits(), Ordering::Relaxed);
+        ctl.level_peak.store(level.peak_db);
+        ctl.level_rms.store(level.rms_db);
+        ctl.vad_prob.store(prob.unwrap_or(0.0));
         let threshold = if ctl.vad_auto.load(Ordering::Relaxed) {
             if let Some(p) = prob {
                 auto_threshold.update(t_block, gate.is_open(), p);
             }
             auto_threshold.threshold()
         } else {
-            f32::from_bits(ctl.vad_threshold_bits.load(Ordering::Relaxed))
+            ctl.vad_threshold.load()
         };
-        ctl.vad_effective_threshold_bits
-            .store(threshold.to_bits(), Ordering::Relaxed);
-        let voice = vad::is_voice(vad::VadSource::Rnnoise { threshold }, prob, level);
+        ctl.vad_effective_threshold.store(threshold);
+        let voice = vad::is_voice(threshold, prob, level);
         voice_in_frame |= voice;
 
         // Voice optimizer: nonlinear, so after AEC; after the meter and VAD,
@@ -1166,11 +1161,7 @@ fn dsp_thread(
         let frame_samples = ctl.frame_samples.load(Ordering::Relaxed) as usize;
         if frame_acc.len() >= frame_samples {
             let now = Instant::now();
-            gate.set_mode(if ctl.vad_mode.load(Ordering::Relaxed) {
-                Mode::Vad
-            } else {
-                Mode::Ptt
-            });
+            gate.set_mode(mode_of(ctl.vad_mode.load(Ordering::Relaxed)));
             gate.set_release(Duration::from_millis(
                 ctl.release_ms.load(Ordering::Relaxed) as u64,
             ));
@@ -1190,9 +1181,6 @@ fn dsp_thread(
             if permille != loss_applied {
                 loss_applied = permille;
                 let _ = encoder.set_loss_permille(permille as u16);
-                shared
-                    .loss_perc
-                    .store(encoder.loss_perc() as i64, Ordering::Relaxed);
                 stats
                     .packet_loss_perc
                     .store(encoder.loss_perc() as i64, Ordering::Relaxed);
@@ -1254,9 +1242,8 @@ fn dsp_thread(
             last_state_push = Instant::now();
             let sending = ctl.sending.load(Ordering::Relaxed);
             let ptt = ctl.ptt_down.load(Ordering::Relaxed);
-            let p = f32::from_bits(ctl.vad_prob_bits.load(Ordering::Relaxed));
-            let vad_threshold =
-                f32::from_bits(ctl.vad_effective_threshold_bits.load(Ordering::Relaxed));
+            let p = ctl.vad_prob.load();
+            let vad_threshold = ctl.vad_effective_threshold.load();
             shared.state.send_modify(|s| {
                 s.level = level;
                 s.vad_prob = p;
@@ -1265,6 +1252,15 @@ fn dsp_thread(
                 s.ptt_down = ptt;
             });
         }
+    }
+}
+
+/// The gate mode the `vad_mode` atomic encodes.
+fn mode_of(vad: bool) -> Mode {
+    if vad {
+        Mode::Vad
+    } else {
+        Mode::Ptt
     }
 }
 
@@ -1302,7 +1298,7 @@ fn send_audio(
     };
     // `into()` moves the buffer, so take its length first.
     let wire_bytes = datagram.len() as u64;
-    let conn = shared.conn.lock().unwrap_or_else(|e| e.into_inner());
+    let conn = lock(&shared.conn);
     if let Some(c) = conn.as_ref() {
         if c.send_datagram(datagram.into()).is_ok() {
             DebugStats::inc(&stats.datagrams_sent);
@@ -1324,7 +1320,10 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
     crate::audio::rt::promote_current_thread("icu-mixer");
     let stats = shared.stats.clone();
     let mut out = vec![0.0f32; BLOCK];
+    // One block per speaker, kept across iterations: nothing is allocated on
+    // this thread once every speaker has its buffer.
     let mut inputs: Vec<(Vec<f32>, f32)> = Vec::new();
+    let mut cue_buf = vec![0.0f32; BLOCK];
     let mut last_indicator = Instant::now();
     let mut stalled_since: Option<Instant> = None;
     // 120 ms, the longest frame Opus allows: a peer picks its frame length.
@@ -1360,9 +1359,11 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
         }
 
         let now = Instant::now();
-        inputs.clear();
+        let deafened = shared.deafened.load(Ordering::Relaxed);
+        let master = shared.output_gain.load();
+        let mut n_inputs = 0;
         {
-            let mut speakers = shared.speakers.lock().unwrap_or_else(|e| e.into_inner());
+            let mut speakers = lock(&shared.speakers);
             for sp in speakers.values_mut() {
                 let before = sp.jitter.stats();
                 while sp.pending.len() < BLOCK {
@@ -1373,14 +1374,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                             }
                             let n = sp.decoder.decode(&p.payload, &mut fec_scratch).unwrap_or(0);
                             DebugStats::inc(&stats.frames_decoded);
-                            if n == 0 {
-                                // Undecodable: keep the speaker's timeline by
-                                // filling its frame length, not a block.
-                                sp.pending
-                                    .extend(std::iter::repeat_n(0.0, sp.jitter.frame_samples() as usize));
-                            } else {
-                                sp.pending.extend(fec_scratch[..n].iter().copied());
-                            }
+                            queue_decoded(sp, n, &fec_scratch);
                         }
                         Pop::Lost { fec_source, .. } => {
                             let n = match fec_source {
@@ -1395,12 +1389,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                                     sp.decoder.conceal(&mut fec_scratch).unwrap_or(0)
                                 }
                             };
-                            if n == 0 {
-                                sp.pending
-                                    .extend(std::iter::repeat_n(0.0, sp.jitter.frame_samples() as usize));
-                            } else {
-                                sp.pending.extend(fec_scratch[..n].iter().copied());
-                            }
+                            queue_decoded(sp, n, &fec_scratch);
                         }
                         Pop::Silence => {
                             sp.pending.extend(std::iter::repeat_n(0.0, BLOCK));
@@ -1411,31 +1400,42 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                 DebugStats::add(&stats.jitter_underruns, after.underruns - before.underruns);
                 DebugStats::add(&stats.jitter_skipped, after.skipped - before.skipped);
                 DebugStats::add(&stats.jitter_dropped, after.dropped - before.dropped);
-                let mut buf = vec![0.0f32; BLOCK];
-                for s in buf.iter_mut() {
-                    *s = sp.pending.pop_front().unwrap_or(0.0);
+                if inputs.len() <= n_inputs {
+                    inputs.push((vec![0.0f32; BLOCK], 0.0));
                 }
-                inputs.push((buf, mixer::volume_gain(sp.volume)));
+                let (buf, gain) = &mut inputs[n_inputs];
+                n_inputs += 1;
+                let have = sp.pending.len().min(BLOCK);
+                for (dst, src) in buf.iter_mut().zip(sp.pending.drain(..have)) {
+                    *dst = src;
+                }
+                buf[have..].fill(0.0);
+                *gain = if deafened {
+                    0.0
+                } else {
+                    mixer::volume_gain(sp.volume) * master
+                };
             }
         }
-        let deafened = shared.deafened.load(Ordering::Relaxed);
-        let master = f32::from_bits(shared.output_gain_bits.load(Ordering::Relaxed));
-        let mut refs: Vec<(&[f32], f32)> = inputs
-            .iter()
-            .map(|(b, g)| (b.as_slice(), if deafened { 0.0 } else { g * master }))
-            .collect();
         // Cues are heard even when deafened.
-        let mut cue_buf = vec![0.0f32; BLOCK];
-        {
+        let cue = {
             let mut cues = shared.cues.lock().unwrap();
-            if !cues.is_empty() {
+            if cues.is_empty() {
+                None
+            } else {
                 for s in cue_buf.iter_mut() {
                     *s = cues.pop_front().unwrap_or(0.0);
                 }
-                refs.push((cue_buf.as_slice(), 1.0));
+                Some((cue_buf.as_slice(), 1.0))
             }
-        }
-        mixer::mix(&refs, &mut out);
+        };
+        mixer::mix(
+            inputs[..n_inputs]
+                .iter()
+                .map(|(b, g)| (b.as_slice(), *g))
+                .chain(cue),
+            &mut out,
+        );
         if play.occupied_len() < lead {
             let n = play.push_slice(&out);
             DebugStats::add(&stats.samples_played, n as u64);
@@ -1445,7 +1445,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
         if last_indicator.elapsed() > Duration::from_millis(100) {
             last_indicator = Instant::now();
             let speaking: Vec<(Session, bool)> = {
-                let speakers = shared.speakers.lock().unwrap_or_else(|e| e.into_inner());
+                let speakers = lock(&shared.speakers);
                 speakers
                     .iter()
                     .map(|(s, sp)| {
@@ -1475,6 +1475,18 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                 changed
             });
         }
+    }
+}
+
+/// Queues `n` decoded samples from `scratch` for playout — or, when the
+/// decoder produced nothing, the speaker's frame length of silence, so its
+/// timeline keeps its shape rather than gaining a block.
+fn queue_decoded(sp: &mut Speaker, n: usize, scratch: &[f32]) {
+    if n == 0 {
+        sp.pending
+            .extend(std::iter::repeat_n(0.0, sp.jitter.frame_samples() as usize));
+    } else {
+        sp.pending.extend(scratch[..n].iter().copied());
     }
 }
 
@@ -1538,73 +1550,36 @@ async fn net_task(
         if was_connected {
             attempt = 0;
         }
-        *shared.conn.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        shared.dsp.online.store(false, Ordering::Relaxed);
-        shared
-            .speakers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        shared.video.lock().unwrap().clear();
         // Here, not at the end of `run_session`: that function returns early
         // from half a dozen places, and a stale `conn_info` outliving the
-        // connection it describes is exactly the lie this window must not
-        // tell.
-        shared.state.send_modify(|s| {
-            s.conn_info = None;
-            s.conn_stats = None;
-            s.server_rtt_ms = None;
-            s.clock_offset_ms = None;
-        });
+        // connection it describes is exactly the lie the Verbindung window
+        // must not tell.
+        end_session(&shared);
         match outcome {
             SessionEnd::Quit => return,
             SessionEnd::Fatal(reason) => {
-                shared.state.send_modify(|s| {
-                    s.conn = ConnStatus::Fatal(reason.clone());
-                    s.peers.clear();
-                });
+                shared
+                    .state
+                    .send_modify(|s| s.conn = ConnStatus::Fatal(reason));
                 // Keep serving local commands (mute etc.) until Quit. A new
                 // identity (passport import) is the way out: reconnect with it.
-                loop {
-                    match cmd_rx.recv().await {
-                        None | Some(Command::Quit) => return,
-                        Some(cmd) => {
-                            let replaced = matches!(cmd, Command::ReplaceIdentity(_));
-                            local.handle_local(cmd, &shared, None).await;
-                            if replaced {
-                                attempt = 0;
-                                break;
-                            }
-                        }
-                    }
+                match drain_until_quit(&mut cmd_rx, &mut local, &shared).await {
+                    SessionEnd::Quit => return,
+                    _ => attempt = 0,
                 }
             }
             SessionEnd::Retry(reason) => {
                 let wait = conn::backoff(attempt);
                 attempt += 1;
                 shared.state.send_modify(|s| {
-                    s.conn = ConnStatus::Disconnected {
-                        reason: reason.clone(),
-                        attempt,
-                    };
-                    s.peers.clear();
+                    s.conn = ConnStatus::Disconnected { reason, attempt };
                 });
-                let deadline = tokio::time::Instant::now() + wait;
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep_until(deadline) => break,
-                        cmd = cmd_rx.recv() => match cmd {
-                            Some(Command::Quit) | None => return,
-                            Some(cmd) => {
-                                // A new identity is worth trying right away.
-                                let replaced = matches!(cmd, Command::ReplaceIdentity(_));
-                                local.handle_local(cmd, &shared, None).await;
-                                if replaced {
-                                    attempt = 0;
-                                    break;
-                                }
-                            }
-                        }
+                // A new identity is worth trying right away.
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    end = drain_until_quit(&mut cmd_rx, &mut local, &shared) => match end {
+                        SessionEnd::Quit => return,
+                        _ => attempt = 0,
                     }
                 }
             }
@@ -1618,12 +1593,88 @@ enum SessionEnd {
     Retry(Problem),
 }
 
-/// A control-stream write failed: the connection is gone.
-fn send_failed() -> SessionEnd {
+impl From<ConnectError> for SessionEnd {
+    /// Fatal codes end the reconnect loop (`PROTOCOL.md` §5); everything
+    /// else is retried.
+    fn from(e: ConnectError) -> SessionEnd {
+        if e.is_fatal() {
+            SessionEnd::Fatal(e.problem())
+        } else {
+            SessionEnd::Retry(e.problem())
+        }
+    }
+}
+
+impl From<quinn::ConnectionError> for SessionEnd {
+    fn from(reason: quinn::ConnectionError) -> SessionEnd {
+        ConnectError::from_connection_error(reason).into()
+    }
+}
+
+/// Why `connection` ended, as a session end — `None` while it is still open.
+fn closed_end(connection: &quinn::Connection) -> Option<SessionEnd> {
+    connection.close_reason().map(SessionEnd::from)
+}
+
+/// The connection went away under a running session, `technical` saying
+/// how that was noticed; retried like any other transport failure.
+fn connection_lost(technical: &str) -> SessionEnd {
     SessionEnd::Retry(Problem::new(
         "Die Verbindung zum Server ist abgebrochen. ICU verbindet sich neu.",
-        "send failed",
+        technical,
     ))
+}
+
+/// A control-stream write failed: the connection is gone.
+fn send_failed() -> SessionEnd {
+    connection_lost("send failed")
+}
+
+/// Forgets everything scoped to one session: the connection the DSP thread
+/// sends on, the speakers, the received video, and what the window shows
+/// about the connection and the people on it.
+fn end_session(shared: &Arc<Shared>) {
+    *lock(&shared.video_tx) = None;
+    *lock(&shared.conn) = None;
+    shared.dsp.online.store(false, Ordering::Relaxed);
+    lock(&shared.speakers).clear();
+    shared.video.lock().unwrap().clear();
+    shared.state.send_modify(|s| {
+        s.peers.clear();
+        s.conn_info = None;
+        s.conn_stats = None;
+        s.server_rtt_ms = None;
+        s.clock_offset_ms = None;
+        s.notice = None;
+    });
+}
+
+/// Stores an identity the server just issued on `connection` and takes it
+/// into use: written first, then the session closed with `ok` — for a
+/// registration that close is the receipt which spends the bundle — so the
+/// next connect runs under the new leaf. When the write fails the session
+/// closes with `fail` and the identity in force stays; the problem names
+/// `what` could not be stored.
+fn adopt_issued(
+    local: &mut LocalState,
+    shared: &Arc<Shared>,
+    connection: &quinn::Connection,
+    identity: Identity,
+    ok: quinn::VarInt,
+    fail: quinn::VarInt,
+    what: &str,
+) -> Result<(), Problem> {
+    match identity.save(&local.paths) {
+        Ok(()) => {
+            connection.close(ok, b"");
+            local.replace_identity(identity, shared);
+            Ok(())
+        }
+        Err(e) => {
+            connection.close(fail, b"");
+            Err(crate::problem::storage(what, &e))
+        }
+    }
 }
 
 /// Deliberate reconnect with new credentials; not a failure.
@@ -1691,6 +1742,7 @@ enum RenewSendError {
 async fn send_renew(
     send: &mut quinn::SendStream,
     local: &mut LocalState,
+    shared: &Arc<Shared>,
     cn: &str,
     reason: RenewReason,
 ) -> Result<(), RenewSendError> {
@@ -1701,13 +1753,9 @@ async fn send_renew(
         RenewReason::CatchUp | RenewReason::Expiry => icu_proto::validate_stored_name(cn),
     };
     checked.map_err(|e| RenewSendError::Local(crate::problem::name_error_text(&e)))?;
-    let key = rcgen::KeyPair::try_from(local.identity.key_der.as_slice()).map_err(|e| {
-        tracing::warn!(%e, "own key unreadable");
-        RenewSendError::Local(
-            "Die gespeicherten Zugangsdaten sind beschädigt. Bitte den Passport erneut \
-             importieren."
-                .into(),
-        )
+    let key = local.identity.key_pair().map_err(|p| {
+        tracing::warn!(error = ?p.technical, "own key unreadable");
+        RenewSendError::Local(p.text)
     })?;
     let csr_der = crate::net::register::csr_for(cn, &key)
         .map_err(|e| RenewSendError::Local(e.problem().text))?;
@@ -1717,10 +1765,13 @@ async fn send_renew(
     {
         return Err(RenewSendError::Transport);
     }
-    local.pending_renew = Some(PendingRenew {
-        cn: cn.to_string(),
-        reason,
-    });
+    local.set_pending_renew(
+        Some(PendingRenew {
+            cn: cn.to_string(),
+            reason,
+        }),
+        shared,
+    );
     Ok(())
 }
 
@@ -1759,6 +1810,7 @@ const AUTO_RENEW_RETRY: Duration = Duration::from_secs(24 * 3600);
 async fn maybe_auto_renew(
     send: &mut quinn::SendStream,
     local: &mut LocalState,
+    shared: &Arc<Shared>,
     stored: &str,
 ) -> Result<(), ()> {
     if local.pending_renew.is_some()
@@ -1773,7 +1825,7 @@ async fn maybe_auto_renew(
         return Ok(());
     };
     local.renew_attempted_at = Some(Instant::now());
-    match send_renew(send, local, stored, reason).await {
+    match send_renew(send, local, shared, stored, reason).await {
         Ok(()) => Ok(()),
         Err(RenewSendError::Local(e)) => {
             tracing::warn!(error = %e, ?reason, "automatic renewal not possible");
@@ -1793,14 +1845,31 @@ impl LocalState {
         changed
     }
 
+    /// The one writer of `pending_renew`. The window's "rename in progress"
+    /// flag is derived from it here, so the two cannot disagree: it shows
+    /// for a rename the user asked for, never for a background renewal.
+    fn set_pending_renew(&mut self, pending: Option<PendingRenew>, shared: &Arc<Shared>) {
+        let user_rename = pending
+            .as_ref()
+            .is_some_and(|p| p.reason == RenewReason::UserRename);
+        self.pending_renew = pending;
+        shared
+            .state
+            .send_if_modified(|s| std::mem::replace(&mut s.rename_pending, user_rename) != user_rename);
+    }
+
+    /// Takes the renewal in flight, clearing the window's flag with it.
+    fn take_pending_renew(&mut self, shared: &Arc<Shared>) -> Option<PendingRenew> {
+        let pending = self.pending_renew.take();
+        shared
+            .state
+            .send_if_modified(|s| std::mem::replace(&mut s.rename_pending, false));
+        pending
+    }
+
     /// Commands that do not need a connection. Returns `true` if `SetState`
     /// should be sent.
-    async fn handle_local(
-        &mut self,
-        cmd: Command,
-        shared: &Arc<Shared>,
-        send: Option<&mut quinn::SendStream>,
-    ) -> bool {
+    fn handle_local(&mut self, cmd: Command, shared: &Arc<Shared>) -> bool {
         let mut set_state = false;
         match cmd {
             Command::SetMuted(m) => {
@@ -1812,7 +1881,7 @@ impl LocalState {
             }
             Command::ToggleMute => {
                 let m = !self.flags.muted();
-                return Box::pin(self.handle_local(Command::SetMuted(m), shared, send)).await;
+                return self.handle_local(Command::SetMuted(m), shared);
             }
             Command::SetDeafened(d) => {
                 self.flags = self.flags.with_bit(UserFlags::DEAFENED, d);
@@ -1832,31 +1901,18 @@ impl LocalState {
             }
             Command::ToggleDeafen => {
                 let d = !self.flags.deafened();
-                return Box::pin(self.handle_local(Command::SetDeafened(d), shared, send)).await;
+                return self.handle_local(Command::SetDeafened(d), shared);
             }
             Command::SetMode(mode) => {
-                shared
-                    .dsp
-                    .vad_mode
-                    .store(mode == Mode::Vad, Ordering::Relaxed);
-                self.settings.audio.mode = match mode {
-                    Mode::Vad => ModeSetting::Vad,
-                    Mode::Ptt => ModeSetting::Ptt,
-                };
-                let settings = self.settings.clone();
-                shared.state.send_modify(|s| {
-                    s.mode = mode;
-                    s.settings = settings;
-                });
-                let _ = self.settings.save(&self.paths);
+                self.settings.audio.mode = mode.into();
+                set_state = self.commit_settings(shared, false);
             }
             Command::ToggleMode => {
-                let mode = if shared.dsp.vad_mode.load(Ordering::Relaxed) {
-                    Mode::Ptt
-                } else {
-                    Mode::Vad
+                let mode = match Mode::from(self.settings.audio.mode) {
+                    Mode::Vad => Mode::Ptt,
+                    Mode::Ptt => Mode::Vad,
                 };
-                return Box::pin(self.handle_local(Command::SetMode(mode), shared, send)).await;
+                return self.handle_local(Command::SetMode(mode), shared);
             }
             Command::Ptt(down) => {
                 tracing::debug!(down, "ptt");
@@ -1865,55 +1921,29 @@ impl LocalState {
             }
             Command::SetVolume(user_id, percent) => {
                 let percent = self.settings.set_volume(user_id, percent);
-                shared.volumes.lock().unwrap().insert(user_id, percent);
-                for sp in shared.speakers.lock().unwrap().values_mut() {
+                for sp in lock(&shared.speakers).values_mut() {
                     if sp.user_id == user_id {
                         sp.volume = percent;
                     }
                 }
-                let settings = self.settings.clone();
                 shared.state.send_modify(|s| {
                     for p in s.peers.iter_mut() {
                         if p.info.user_id == user_id {
                             p.volume = percent;
                         }
                     }
-                    s.settings = settings;
                 });
-                let _ = self.settings.save(&self.paths);
+                set_state = self.commit_settings(shared, false);
             }
             Command::UpdateSettings(new) => {
-                let old = self.settings.clone();
+                // The streams are opened against the devices and the AEC
+                // switch; a change there needs them opened anew.
+                let old = &self.settings.audio;
+                let reopen = new.audio.input_device != old.input_device
+                    || new.audio.output_device != old.output_device
+                    || new.audio.aec != old.aec;
                 self.settings = *new;
-                shared.dsp.apply_settings(&self.settings);
-                shared.output_gain_bits.store(
-                    mixer::volume_gain(self.settings.audio.output_volume).to_bits(),
-                    Ordering::Relaxed,
-                );
-                *shared.cue_settings.lock().unwrap() = (
-                    self.settings.audio.cue_join,
-                    self.settings.audio.cue_tx,
-                    self.settings.audio.cue_mute,
-                );
-                if old.audio.input_device != self.settings.audio.input_device
-                    || old.audio.output_device != self.settings.audio.output_device
-                    || old.audio.aec != self.settings.audio.aec
-                {
-                    self.reopen_streams(shared);
-                }
-                let settings = self.settings.clone();
-                let mode = if settings.audio.mode == ModeSetting::Vad {
-                    Mode::Vad
-                } else {
-                    Mode::Ptt
-                };
-                shared.state.send_modify(|s| {
-                    s.settings = settings;
-                    s.mode = mode;
-                    s.overlay_on = s.settings.overlay.enabled;
-                });
-                let _ = self.settings.save(&self.paths);
-                set_state |= self.update_viewing();
+                set_state = self.commit_settings(shared, reopen);
             }
             Command::SetCamera(on) => {
                 self.flags = self.flags.with_bit(UserFlags::CAMERA_ON, on);
@@ -1922,13 +1952,7 @@ impl LocalState {
             }
             Command::SetOverlay(on) => {
                 self.settings.overlay.enabled = on;
-                let settings = self.settings.clone();
-                shared.state.send_modify(|s| {
-                    s.overlay_on = on;
-                    s.settings = settings;
-                });
-                let _ = self.settings.save(&self.paths);
-                set_state = self.update_viewing();
+                set_state = self.commit_settings(shared, false);
             }
             Command::SetWindowVisible(visible) => {
                 self.window_visible = visible;
@@ -1973,11 +1997,31 @@ impl LocalState {
         set_state
     }
 
+    /// Takes a changed `self.settings` into effect. Everything that follows
+    /// the settings — the DSP atomics, the master gain, the streams (when
+    /// `reopen` says a device or the AEC switch changed), the published
+    /// state and the file — is re-derived here, in one place, so none of
+    /// them can drift from the settings. Returns whether `SetState` is due:
+    /// the overlay switch is part of `VIEWING`.
+    fn commit_settings(&mut self, shared: &Arc<Shared>, reopen: bool) -> bool {
+        shared.dsp.apply_settings(&self.settings);
+        shared
+            .output_gain
+            .store(mixer::volume_gain(self.settings.audio.output_volume));
+        if reopen {
+            self.reopen_streams(shared);
+        }
+        let settings = self.settings.clone();
+        shared.state.send_modify(|s| s.settings = settings);
+        let _ = self.settings.save(&self.paths);
+        self.update_viewing()
+    }
+
     /// Takes over an imported identity: memory first, then disk, so a failed
     /// write cannot leave the two disagreeing about which leaf is in force.
     fn replace_identity(&mut self, identity: Identity, shared: &Arc<Shared>) {
         self.identity = identity;
-        self.pending_renew = None;
+        self.set_pending_renew(None, shared);
         self.renew_attempted_at = None;
         self.renew_only = false;
         self.name = crate::conninfo::CertInfo::from_der(&self.identity.leaf_der).subject;
@@ -1991,7 +2035,6 @@ impl LocalState {
             s.server = server;
             s.server_name = server_name;
             s.name_error = None;
-            s.rename_pending = false;
             if let Err(e) = &saved {
                 s.banner = Some(crate::problem::storage("Der Passport", e));
             }
@@ -2005,36 +2048,30 @@ impl LocalState {
     /// the local key would make the next `client_config` fail, and the only way
     /// back from that is a passport from another device.
     fn apply_renewed_leaf(&mut self, leaf_der: Vec<u8>, shared: &Arc<Shared>) {
-        let Some(pending) = self.pending_renew.take() else {
+        let Some(pending) = self.take_pending_renew(shared) else {
             tracing::warn!("unsolicited RenewResponse");
             return;
         };
-        let info = crate::conninfo::CertInfo::from_der(&leaf_der);
-        let mismatch = if info.subject != pending.cn {
-            Some(format!(
-                "Server hat ein Zertifikat für {:?} ausgestellt, erwartet war {:?}",
-                info.subject, pending.cn
-            ))
-        } else if !crate::conninfo::leaf_matches_key(&leaf_der, &self.identity.key_der) {
-            Some("Neues Zertifikat passt nicht zum eigenen Schlüssel".to_string())
-        } else {
-            None
-        };
-        if let Some(detail) = mismatch {
-            tracing::warn!(%detail, "renewal rejected locally, keeping the old certificate");
-            let user_asked = pending.reason == RenewReason::UserRename;
-            shared.state.send_modify(|s| {
-                s.rename_pending = false;
-                if user_asked {
-                    s.name_error = Some(
-                        "Der Server hat die Namensänderung falsch beantwortet. Der bisherige Name \
-                         bleibt."
-                            .into(),
-                    );
+        let info = match crate::conninfo::check_issued_leaf(
+            &leaf_der,
+            &pending.cn,
+            &self.identity.key_der,
+        ) {
+            Ok(info) => info,
+            Err(detail) => {
+                tracing::warn!(%detail, "renewal rejected locally, keeping the old certificate");
+                if pending.reason == RenewReason::UserRename {
+                    shared.state.send_modify(|s| {
+                        s.name_error = Some(
+                            "Der Server hat die Namensänderung falsch beantwortet. Der \
+                             bisherige Name bleibt."
+                                .into(),
+                        );
+                    });
                 }
-            });
-            return;
-        }
+                return;
+            }
+        };
 
         // A server that moved says so in the certificates it issues; the next
         // reconnect goes to the new address.
@@ -2047,7 +2084,6 @@ impl LocalState {
         self.name = pending.cn.clone();
         tracing::info!(name = %pending.cn, reason = ?pending.reason, "certificate renewed");
         shared.state.send_modify(|s| {
-            s.rename_pending = false;
             s.name_error = None;
             if let Err(e) = &saved {
                 s.banner = Some(crate::problem::storage("Das neue Zertifikat", e));
@@ -2063,7 +2099,7 @@ impl LocalState {
     }
 
     fn reopen_streams(&mut self, shared: &Arc<Shared>) {
-        let mut backend = self.backend.lock().unwrap_or_else(|e| e.into_inner());
+        let mut backend = lock(&self.backend);
         shared.reference_open.store(false, Ordering::Relaxed);
         backend.close(StreamKind::Capture);
         backend.close(StreamKind::Reference);
@@ -2075,11 +2111,11 @@ impl LocalState {
     }
 
     fn cue(&self, shared: &Arc<Shared>, cue: Cue) {
-        let (join, tx, mute) = *shared.cue_settings.lock().unwrap();
+        let audio = &self.settings.audio;
         let enabled = match cue {
-            Cue::Join | Cue::Leave => join,
-            Cue::TxStart | Cue::TxStop => tx,
-            Cue::Mute | Cue::Unmute => mute,
+            Cue::Join | Cue::Leave => audio.cue_join,
+            Cue::TxStart | Cue::TxStop => audio.cue_tx,
+            Cue::Mute | Cue::Unmute => audio.cue_mute,
         };
         if enabled {
             let samples = crate::cues::render(cue);
@@ -2129,13 +2165,7 @@ async fn run_session(
     };
     let session = match session {
         Ok(s) => s,
-        Err(e) => {
-            return if e.is_fatal() {
-                SessionEnd::Fatal(e.problem())
-            } else {
-                SessionEnd::Retry(e.problem())
-            };
-        }
+        Err(e) => return e.into(),
     };
     let conn::Session {
         conn: connection,
@@ -2165,17 +2195,19 @@ async fn run_session(
             // Saved before it is taken into use: an identity that only lives
             // in memory would consume the bundle on the next login and be
             // gone after a restart.
-            Ok(identity) => match identity.save(&local.paths) {
+            Ok(identity) => match adopt_issued(
+                local,
+                shared,
+                &connection,
+                identity,
+                crate::net::register::receipt(true),
+                crate::net::register::receipt(false),
+                "Die Anmeldung",
+            ) {
                 Ok(()) => {
-                    connection.close(crate::net::register::receipt(true), b"");
-                    local.replace_identity(identity, shared);
-                    shared.state.send_modify(|s| s.notice = None);
                     SessionEnd::Retry(Problem::plain("Anmeldung gespeichert – verbinde neu …"))
                 }
-                Err(e) => {
-                    connection.close(crate::net::register::receipt(false), b"");
-                    shared.state.send_modify(|s| s.notice = None);
-                    let mut p = crate::problem::storage("Die Anmeldung", &e);
+                Err(mut p) => {
                     p.text.push_str(" Die Einladung bleibt gültig.");
                     SessionEnd::Fatal(p)
                 }
@@ -2184,9 +2216,8 @@ async fn run_session(
             // server closed with a fatal code (replaced by another device,
             // revoked), where retrying would only burn the registration budget.
             Err(e @ crate::net::NetError::Connect(_)) => {
-                shared.state.send_modify(|s| s.notice = None);
-                if let Some(reason) = connection.close_reason() {
-                    return close_end(ConnectError::from_connection_error(reason));
+                if let Some(end) = closed_end(&connection) {
+                    return end;
                 }
                 connection.close(crate::net::register::receipt(false), b"");
                 SessionEnd::Retry(Problem::new(
@@ -2196,7 +2227,6 @@ async fn run_session(
             }
             Err(e) => {
                 connection.close(crate::net::register::receipt(false), b"");
-                shared.state.send_modify(|s| s.notice = None);
                 let mut p = e.problem();
                 p.text = format!("Anmeldung fehlgeschlagen: {}", p.text);
                 SessionEnd::Fatal(p)
@@ -2220,26 +2250,28 @@ async fn run_session(
             r = crate::net::register::renew_expired(&mut send, &mut recv, &identity, &name) => r,
             end = drain_until_quit(cmd_rx, local, shared) => return end,
         };
-        shared.state.send_modify(|s| s.notice = None);
         return match renewed {
-            Ok(identity) => match identity.save(&local.paths) {
+            Ok(identity) => match adopt_issued(
+                local,
+                shared,
+                &connection,
+                identity,
+                quinn::VarInt::from_u32(codes::NO_ERROR),
+                quinn::VarInt::from_u32(codes::SHUTDOWN),
+                "Das neue Zertifikat",
+            ) {
                 Ok(()) => {
                     tracing::info!(name = %name, "expired certificate renewed");
-                    connection.close(quinn::VarInt::from_u32(codes::NO_ERROR), b"");
-                    local.replace_identity(identity, shared);
                     SessionEnd::Retry(Problem::plain("Zertifikat erneuert – verbinde neu …"))
                 }
-                Err(e) => {
-                    connection.close(quinn::VarInt::from_u32(codes::SHUTDOWN), b"");
-                    SessionEnd::Fatal(crate::problem::storage("Das neue Zertifikat", &e))
-                }
+                Err(p) => SessionEnd::Fatal(p),
             },
             Err(crate::net::NetError::Rejected { code, detail }) if codes::is_fatal(code) => {
                 SessionEnd::Fatal(crate::problem::from_code(code, &detail))
             }
             Err(e) => {
-                if let Some(reason) = connection.close_reason() {
-                    return close_end(ConnectError::from_connection_error(reason));
+                if let Some(end) = closed_end(&connection) {
+                    return end;
                 }
                 connection.close(quinn::VarInt::from_u32(codes::SHUTDOWN), b"");
                 // Still expired: the next connect lands here again, after
@@ -2254,21 +2286,14 @@ async fn run_session(
     }
 
     // Connected: install the peer state, clear everything session scoped.
-    let frame_samples = shared.dsp.frame_samples.load(Ordering::Relaxed);
-    {
-        let volumes = shared.volumes.lock().unwrap();
-        let mut speakers = shared.speakers.lock().unwrap_or_else(|e| e.into_inner());
-        speakers.clear();
-        for u in &welcome.users {
-            if let Ok(sp) = Speaker::new(
-                u.user_id,
-                volumes.get(&u.user_id).copied().unwrap_or(100.0),
-                frame_samples,
-            ) {
-                speakers.insert(u.session, sp);
-            }
-        }
-    }
+    // The speakers are emptied here and not only at session end: the previous
+    // session's datagram reader may have been mid-insert when it was aborted.
+    lock(&shared.speakers).clear();
+    let peers: Vec<Peer> = welcome
+        .users
+        .iter()
+        .map(|u| admit(shared, &local.settings, u))
+        .collect();
     let update_required = match (
         icu_proto::Version::parse(&welcome.min_client),
         icu_proto::Version::parse(env!("CARGO_PKG_VERSION")),
@@ -2278,18 +2303,6 @@ async fn run_session(
     };
     local.name = welcome.you.name.clone();
     {
-        let volumes = shared.volumes.lock().unwrap();
-        let peers: Vec<Peer> = welcome
-            .users
-            .iter()
-            .map(|u| Peer {
-                info: u.clone(),
-                speaking: u.flags.speaking(),
-                volume: volumes.get(&u.user_id).copied().unwrap_or(100.0),
-                rtt_ms: None,
-                recv_loss_permille: None,
-            })
-            .collect();
         let me = welcome.you.clone();
         tracing::info!(peers = peers.len(), "welcome: initial peer list");
         // Parsed here, once: three X.509 certificates is far too much work
@@ -2312,7 +2325,7 @@ async fn run_session(
             s.conn_info = Some(info);
         });
     }
-    *shared.conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(connection.clone());
+    *lock(&shared.conn) = Some(connection.clone());
     shared.dsp.online.store(true, Ordering::Relaxed);
     *was_connected = true;
     tracing::info!(
@@ -2349,7 +2362,10 @@ async fn run_session(
     // Pick up a rename that happened on another device, or renew a
     // certificate that is about to expire (`PROTOCOL.md` §2.2); again every
     // hour, since a session can outlive the window.
-    if maybe_auto_renew(&mut send, local, &welcome.you.name).await.is_err() {
+    if maybe_auto_renew(&mut send, local, shared, &welcome.you.name)
+        .await
+        .is_err()
+    {
         return send_failed();
     }
     let mut renew_tick = tokio::time::interval_at(
@@ -2397,15 +2413,10 @@ async fn run_session(
         tokio::select! {
             msg = ctrl_rx.recv() => {
                 let Some(msg) = msg else {
-                    break match connection.close_reason() {
-                        Some(e) => close_end(ConnectError::from_connection_error(e)),
-                        None => SessionEnd::Retry(Problem::new(
-                            "Die Verbindung zum Server ist abgebrochen. ICU verbindet sich neu.",
-                            "control stream ended",
-                        )),
-                    };
+                    break closed_end(&connection)
+                        .unwrap_or_else(|| connection_lost("control stream ended"));
                 };
-                if let Some(end) = handle_control(msg, shared, local, &mut pings, &mut send).await {
+                if let Some(end) = handle_control(msg, shared, local, &mut pings).await {
                     break end;
                 }
             }
@@ -2423,11 +2434,8 @@ async fn run_session(
                                 )
                             });
                         } else {
-                            match send_renew(&mut send, local, &name, RenewReason::UserRename).await {
-                                Ok(()) => shared.state.send_modify(|s| {
-                                    s.rename_pending = true;
-                                    s.name_error = None;
-                                }),
+                            match send_renew(&mut send, local, shared, &name, RenewReason::UserRename).await {
+                                Ok(()) => shared.state.send_modify(|s| s.name_error = None),
                                 Err(RenewSendError::Local(e)) => {
                                     shared.state.send_modify(|s| s.name_error = Some(e));
                                 }
@@ -2480,7 +2488,7 @@ async fn run_session(
                         }
                     }
                     cmd => {
-                        let send_state = local.handle_local(cmd, shared, Some(&mut send)).await;
+                        let send_state = local.handle_local(cmd, shared);
                         if send_state && set_state_budget.take() {
                             let msg = ControlMsg::SetState { flags: local.flags.sanitized() };
                             if conn::write_msg(&mut send, &msg).await.is_err() {
@@ -2492,7 +2500,7 @@ async fn run_session(
             }
             _ = renew_tick.tick() => {
                 let stored = local.name.clone();
-                if maybe_auto_renew(&mut send, local, &stored).await.is_err() {
+                if maybe_auto_renew(&mut send, local, shared, &stored).await.is_err() {
                     break send_failed();
                 }
             }
@@ -2548,10 +2556,7 @@ async fn run_session(
                         .saturating_sub(connection.datagram_send_buffer_space())
                         as u64,
                 };
-                let cond = shared
-                    .net
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                let cond = lock(&shared.net)
                     .observe(sample, net_tick_period);
                 let conn_stats = {
                     let now = ByteMarks {
@@ -2604,7 +2609,7 @@ async fn run_session(
                 shared.stats.video_tier.store(tier.as_u8() as i64, Ordering::Relaxed);
             }
             reason = connection.closed() => {
-                break close_end(ConnectError::from_connection_error(reason));
+                break reason.into();
             }
         }
     };
@@ -2613,7 +2618,7 @@ async fn run_session(
     dg_reader.abort();
     video_reader.abort();
     *shared.video_tx.lock().unwrap() = None;
-    *shared.conn.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *lock(&shared.conn) = None;
     shared.dsp.online.store(false, Ordering::Relaxed);
     if matches!(end, SessionEnd::Quit) {
         connection.close(quinn::VarInt::from_u32(codes::NO_ERROR), b"bye");
@@ -2640,12 +2645,26 @@ impl crate::video::VideoSink for Arc<Shared> {
     }
 }
 
-fn close_end(e: ConnectError) -> SessionEnd {
-    if e.is_fatal() {
-        SessionEnd::Fatal(e.problem())
-    } else {
-        SessionEnd::Retry(e.problem())
+/// Admits `user` to the playout side — a fresh speaker under its session, or
+/// the one already there (a datagram may arrive before `UserJoined`) with the
+/// user's volume — and returns the entry the window shows for it. `Welcome`
+/// and `UserJoined` both land here.
+fn admit(shared: &Arc<Shared>, settings: &Settings, user: &UserInfo) -> Peer {
+    let volume = settings.volume(user.user_id);
+    let frame_samples = shared.dsp.frame_samples.load(Ordering::Relaxed);
+    let mut speakers = lock(&shared.speakers);
+    match speakers.get_mut(&user.session) {
+        Some(sp) => {
+            sp.user_id = user.user_id;
+            sp.volume = volume;
+        }
+        None => {
+            if let Ok(sp) = Speaker::new(user.user_id, volume, frame_samples) {
+                speakers.insert(user.session, sp);
+            }
+        }
     }
+    Peer::new(user.clone(), volume)
 }
 
 /// Handles commands while a connection is being established. Returns `Quit`
@@ -2661,7 +2680,7 @@ async fn drain_until_quit(
             None | Some(Command::Quit) => return SessionEnd::Quit,
             Some(cmd) => {
                 let replaced = matches!(cmd, Command::ReplaceIdentity(_));
-                local.handle_local(cmd, shared, None).await;
+                local.handle_local(cmd, shared);
                 if replaced {
                     return reconnect_with_new_identity();
                 }
@@ -2701,7 +2720,7 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
             Ok((header, payload)) => {
                 DebugStats::inc(&shared.stats.datagrams_received);
                 DebugStats::add(&shared.stats.audio_bytes_received, datagram.len() as u64);
-                let mut speakers = shared.speakers.lock().unwrap_or_else(|e| e.into_inner());
+                let mut speakers = lock(&shared.speakers);
                 let sp = match speakers.get_mut(&header.speaker) {
                     Some(sp) => sp,
                     None => {
@@ -2745,7 +2764,7 @@ fn prune_stray_speakers(shared: &Arc<Shared>) {
         .iter()
         .map(|p| p.info.session)
         .collect();
-    let mut speakers = shared.speakers.lock().unwrap_or_else(|e| e.into_inner());
+    let mut speakers = lock(&shared.speakers);
     speakers.retain(|session, sp| {
         known.contains(session)
             || sp
@@ -2766,7 +2785,7 @@ type LossPerSpeaker = Vec<(Session, u16)>;
 fn collect_loss_reports(shared: &Arc<Shared>) -> (LossPerSpeaker, LossPerSpeaker) {
     let mut report = Vec::new();
     let mut all = Vec::new();
-    let mut speakers = shared.speakers.lock().unwrap_or_else(|e| e.into_inner());
+    let mut speakers = lock(&shared.speakers);
     for (session, sp) in speakers.iter_mut() {
         let st = sp.jitter.stats();
         let played = st.played - sp.report_base.0;
@@ -2815,7 +2834,6 @@ async fn handle_control(
     shared: &Arc<Shared>,
     local: &mut LocalState,
     pings: &mut HashMap<u64, Instant>,
-    _send: &mut quinn::SendStream,
 ) -> Option<SessionEnd> {
     match msg {
         // Kept for the next connect; the current one already passed the
@@ -2828,46 +2846,16 @@ async fn handle_control(
             }
         }
         ControlMsg::UserJoined { user } => {
-            let frame_samples = shared.dsp.frame_samples.load(Ordering::Relaxed);
-            let volume = shared
-                .volumes
-                .lock()
-                .unwrap()
-                .get(&user.user_id)
-                .copied()
-                .unwrap_or(100.0);
-            {
-                let mut speakers = shared.speakers.lock().unwrap_or_else(|e| e.into_inner());
-                match speakers.get_mut(&user.session) {
-                    Some(sp) => {
-                        sp.user_id = user.user_id;
-                        sp.volume = volume;
-                    }
-                    None => {
-                        if let Ok(sp) = Speaker::new(user.user_id, volume, frame_samples) {
-                            speakers.insert(user.session, sp);
-                        }
-                    }
-                }
-            }
+            let peer = admit(shared, &local.settings, &user);
             local.cue(shared, Cue::Join);
             shared.state.send_modify(|s| {
                 s.peers.retain(|p| p.info.session != user.session);
-                s.peers.push(Peer {
-                    speaking: user.flags.speaking(),
-                    info: user,
-                    volume,
-                    rtt_ms: None,
-                    recv_loss_permille: None,
-                });
+                s.peers.push(peer);
                 tracing::info!(peers = s.peers.len(), "user joined: peer list updated");
             });
         }
         ControlMsg::UserLeft { session, .. } => {
-            shared
-                .speakers
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lock(&shared.speakers)
                 .remove(&session);
             shared.video.lock().unwrap().remove(session);
             local.cue(shared, Cue::Leave);
@@ -2885,10 +2873,7 @@ async fn handle_control(
                 for p in s.peers.iter_mut() {
                     if p.info.session == session {
                         p.info.flags = flags;
-                        p.speaking = p.speaking || flags.speaking();
-                        if !flags.speaking() {
-                            p.speaking = false;
-                        }
+                        p.speaking = flags.speaking();
                     }
                 }
             });
@@ -2960,17 +2945,13 @@ async fn handle_control(
             } else if code == codes::NAME_TAKEN || code == codes::RENEW_REJECTED {
                 // A background renewal must not paint a red error under the
                 // name field: only a rename the user asked for lands there.
-                let pending = local.pending_renew.take();
+                let pending = local.take_pending_renew(shared);
                 let asked_for_it = pending
                     .map(|p| p.reason == RenewReason::UserRename)
                     .unwrap_or(code == codes::NAME_TAKEN);
-                shared.state.send_modify(|s| {
-                    s.rename_pending = false;
-                    if asked_for_it {
-                        s.name_error = Some(text.clone());
-                    }
-                });
-                if !asked_for_it {
+                if asked_for_it {
+                    shared.state.send_modify(|s| s.name_error = Some(text));
+                } else {
                     tracing::warn!(code, %detail, "background renewal rejected");
                 }
             } else if code == codes::NOT_ADMIN {
@@ -2986,10 +2967,7 @@ async fn handle_control(
                 .dsp
                 .loss_permille
                 .store(loss_permille as u32, Ordering::Relaxed);
-            shared
-                .net
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lock(&shared.net)
                 .set_audio_loss_hint(loss_permille);
             // This hint is about *our* outgoing audio (the encoder above);
             // the incoming buffers' FEC floor follows what we reported for
@@ -2999,10 +2977,7 @@ async fn handle_control(
             shared.keyframe_request.store(true, Ordering::Relaxed);
         }
         ControlMsg::VideoCongestionHint { drop_permille } => {
-            shared
-                .net
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lock(&shared.net)
                 .set_video_drop_hint(drop_permille);
         }
         ControlMsg::UserRenamed { session, name } => {
@@ -3135,11 +3110,7 @@ impl CameraLink {
     /// Sends one encoded frame on the live connection; `Err` when not
     /// connected or when flow control dropped it.
     pub fn send_frame(&self, keyframe: bool, ts: u32, data: &[u8]) -> Result<(), String> {
-        let mut guard = self
-            .shared
-            .video_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut guard = lock(&self.shared.video_tx);
         let Some(sender) = guard.as_mut() else {
             return Err("not connected".into());
         };
@@ -3265,18 +3236,15 @@ mod tests {
     use super::*;
 
     fn peer(session: Session, flags: u8) -> Peer {
-        Peer {
-            info: UserInfo {
+        Peer::new(
+            UserInfo {
                 user_id: u32::from(session),
                 session,
                 name: format!("p{session}"),
                 flags: UserFlags(flags),
             },
-            speaking: false,
-            volume: 100.0,
-            rtt_ms: None,
-            recv_loss_permille: None,
-        }
+            100.0,
+        )
     }
 
     #[test]

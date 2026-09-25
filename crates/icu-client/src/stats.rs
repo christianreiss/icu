@@ -199,6 +199,11 @@ impl DebugStats {
         } else {
             format!("{:.2} ms", rtt as f64 / 1000.0)
         };
+        // Each summary takes its lock only for itself, not for the whole
+        // report: the audio threads record into these histograms.
+        let dsp_block = self.dsp_block.lock().unwrap().summary();
+        let jitter_delay = self.jitter_delay.lock().unwrap().summary();
+        let capture_to_send = self.capture_to_send.lock().unwrap().summary();
         format!(
             "icu stats: sent={} recv={} bad={} decoded={} fec={} plc={} played={} play_underruns={} jb_late={} jb_underruns={} jb_skipped={} jb_dropped={} dsp_blocks={} ref_underruns={} cap_overruns={} ref_overruns={} cap_backlog={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
             Self::get(&self.datagrams_sent),
@@ -227,9 +232,9 @@ impl DebugStats {
             self.video_tier.load(Ordering::Relaxed),
             Self::get(&self.video_tier_changes),
             Self::get(&self.video_open_uni_drops),
-            self.dsp_block.lock().unwrap().summary(),
-            self.jitter_delay.lock().unwrap().summary(),
-            self.capture_to_send.lock().unwrap().summary(),
+            dsp_block,
+            jitter_delay,
+            capture_to_send,
         )
     }
 }

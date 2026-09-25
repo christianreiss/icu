@@ -281,7 +281,7 @@ impl App {
             })
             .collect();
 
-        let want = state.overlay_on && !self.tiles.is_empty();
+        let want = state.settings.overlay.enabled && !self.tiles.is_empty();
         if !want {
             if self.surface.take().is_some() {
                 self.configured = false;
