@@ -1,29 +1,56 @@
-//! Receive-side loudness normalization: brings each remote speaker to a
-//! common level before their volume slider and the mix.
+//! Loudness normalization: brings a voice to a common level.
 //!
-//! Not the capture-side AGC `Research/feature-freeze.md` rejects: that one
-//! pumps and lifts room noise into pauses. Here the level estimate only moves
-//! on blocks clearly above the speaker's own noise floor (the minimum block
-//! level of the last 1.5–3 s, so steady hiss never counts as speech), and in
-//! pauses the gain holds. The estimate follows an upper envelope — fast up so
-//! a loud onset is caught before `mixer::limit` colours it, slow down so the
-//! gain does not breathe between words. One instance per speaker, 48 kHz,
-//! any block length, allocates nothing.
+//! Three uses, one per [`Profile`]: receive side (each remote speaker before
+//! their volume slider and the mix), mic auto leveling (a slow automatic
+//! input gain ahead of denoise and VAD) and outbound normalization (right
+//! before the encoder). The level estimate only moves on blocks clearly
+//! above the voice's own noise floor (the minimum block level of the last
+//! 1.5–3 s, so steady hiss never counts as speech) and, on the send side,
+//! only while the VAD hears voice; in pauses the gain holds, so nothing
+//! pumps or lifts room noise. The estimate follows an upper envelope — fast
+//! up so a loud onset is caught early, slow down so the gain does not
+//! breathe between words. 48 kHz, any block length, allocates nothing.
 
 use super::meter::{from_db, measure, to_db};
 
-/// Target level of the speech envelope in dBFS RMS.
-const TARGET_DB: f32 = -22.0;
-/// Gain bounds in dB.
-const MAX_BOOST_DB: f32 = 12.0;
-const MAX_CUT_DB: f32 = -12.0;
+/// Target, bounds and speed of one normalizer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Profile {
+    /// Target level of the speech envelope in dBFS RMS.
+    pub target_db: f32,
+    /// Gain bounds in dB.
+    pub max_boost_db: f32,
+    pub max_cut_db: f32,
+    /// Envelope time constants in seconds.
+    pub rise_s: f32,
+    pub fall_s: f32,
+}
+
+impl Profile {
+    /// Each remote speaker, in the mixer.
+    pub const RECEIVE: Profile = Profile {
+        target_db: -22.0,
+        max_boost_db: 12.0,
+        max_cut_db: -12.0,
+        rise_s: 0.08,
+        fall_s: 2.0,
+    };
+    /// Mic auto leveling: a slow hand on the input fader.
+    pub const MIC_LEVEL: Profile = Profile {
+        target_db: -22.0,
+        max_boost_db: 15.0,
+        max_cut_db: -10.0,
+        rise_s: 0.5,
+        fall_s: 4.0,
+    };
+    /// Own voice right before the encoder.
+    pub const OUTBOUND: Profile = Profile::RECEIVE;
+}
+
 /// A block counts as speech this far above the noise floor…
 const SPEECH_MARGIN_DB: f32 = 10.0;
 /// …and never below this absolute level.
 const SPEECH_MIN_DB: f32 = -50.0;
-/// Envelope time constants in seconds.
-const RISE_S: f32 = 0.08;
-const FALL_S: f32 = 2.0;
 /// Floor = minimum over the current and the previous window of this length.
 const FLOOR_WINDOW_S: f32 = 1.5;
 const SR: f32 = 48_000.0;
@@ -33,9 +60,10 @@ fn alpha(seconds: f32, samples: usize) -> f32 {
     1.0 - (-(samples as f32) / (seconds * SR)).exp()
 }
 
-/// Loudness normalizer for one speaker.
+/// Loudness normalizer for one voice.
 #[derive(Debug, Clone)]
 pub struct Normalizer {
+    profile: Profile,
     /// Speech envelope in dBFS; starts at the target (unity gain).
     level_db: f32,
     /// Linear gain applied at the end of the last block.
@@ -53,10 +81,16 @@ impl Default for Normalizer {
 }
 
 impl Normalizer {
-    /// Fresh state: unity gain until speech has been heard.
+    /// Receive-side normalizer ([`Profile::RECEIVE`]).
     pub fn new() -> Normalizer {
+        Normalizer::with(Profile::RECEIVE)
+    }
+
+    /// Fresh state: unity gain until speech has been heard.
+    pub fn with(profile: Profile) -> Normalizer {
         Normalizer {
-            level_db: TARGET_DB,
+            profile,
+            level_db: profile.target_db,
             gain: 1.0,
             win_min: f32::INFINITY,
             prev_win_min: f32::INFINITY,
@@ -66,7 +100,7 @@ impl Normalizer {
 
     /// Clears all state (when switched off, so re-enabling starts clean).
     pub fn reset(&mut self) {
-        *self = Normalizer::new();
+        *self = Normalizer::with(self.profile);
     }
 
     /// Current gain in dB (for tests and diagnostics).
@@ -76,6 +110,12 @@ impl Normalizer {
 
     /// Processes one block in place.
     pub fn process(&mut self, block: &mut [f32]) {
+        self.process_hinted(block, None);
+    }
+
+    /// Like [`Normalizer::process`]; `Some(false)` (the VAD hears no voice)
+    /// holds the level estimate. The noise floor keeps tracking either way.
+    pub fn process_hinted(&mut self, block: &mut [f32], voice: Option<bool>) {
         if block.is_empty() {
             return;
         }
@@ -99,16 +139,17 @@ impl Normalizer {
         }
         let floor = self.win_min.min(self.prev_win_min);
 
-        if rms_db > SPEECH_MIN_DB.max(floor + SPEECH_MARGIN_DB) {
+        let p = self.profile;
+        if voice != Some(false) && rms_db > SPEECH_MIN_DB.max(floor + SPEECH_MARGIN_DB) {
             let a = if rms_db > self.level_db {
-                alpha(RISE_S, block.len())
+                alpha(p.rise_s, block.len())
             } else {
-                alpha(FALL_S, block.len())
+                alpha(p.fall_s, block.len())
             };
             self.level_db += a * (rms_db - self.level_db);
         }
 
-        let target = from_db((TARGET_DB - self.level_db).clamp(MAX_CUT_DB, MAX_BOOST_DB));
+        let target = from_db((p.target_db - self.level_db).clamp(p.max_cut_db, p.max_boost_db));
         let start = self.gain;
         let step = (target - start) / block.len() as f32;
         for (i, s) in block.iter_mut().enumerate() {
@@ -181,10 +222,10 @@ mod tests {
     fn gain_is_bounded() {
         let mut n = Normalizer::new();
         run(&mut n, talk(-48.0, -90.0, 20.0));
-        assert!(n.gain_db() <= MAX_BOOST_DB + 0.01);
+        assert!(n.gain_db() <= Profile::RECEIVE.max_boost_db + 0.01);
         let mut n = Normalizer::new();
         run(&mut n, talk(0.0, -90.0, 5.0));
-        assert!(n.gain_db() >= MAX_CUT_DB - 0.01);
+        assert!(n.gain_db() >= Profile::RECEIVE.max_cut_db - 0.01);
     }
 
     #[test]
@@ -225,5 +266,45 @@ mod tests {
         run(&mut n, talk(-34.0, -70.0, 10.0));
         n.reset();
         assert_eq!(n.gain_db(), 0.0);
+    }
+
+    #[test]
+    fn mic_level_is_slow() {
+        let mut n = Normalizer::with(Profile::MIC_LEVEL);
+        run(&mut n, talk(-8.0, -70.0, 0.3));
+        assert!(n.gain_db() > -9.0, "gain {}", n.gain_db());
+        run(&mut n, talk(-8.0, -70.0, 10.0));
+        assert!(n.gain_db() < -9.5, "gain {}", n.gain_db());
+    }
+
+    #[test]
+    fn mic_level_boost_is_bounded() {
+        let mut n = Normalizer::with(Profile::MIC_LEVEL);
+        run(&mut n, talk(-48.0, -90.0, 30.0));
+        assert!(
+            n.gain_db() > 12.0 && n.gain_db() <= 15.01,
+            "gain {}",
+            n.gain_db()
+        );
+    }
+
+    #[test]
+    fn no_voice_hint_holds_gain() {
+        let mut n = Normalizer::new();
+        for mut b in talk(-34.0, -70.0, 10.0) {
+            n.process_hinted(&mut b, Some(false));
+        }
+        assert_eq!(n.gain_db(), 0.0);
+        for mut b in talk(-34.0, -70.0, 10.0) {
+            n.process_hinted(&mut b, Some(true));
+        }
+        assert!(n.gain_db() > 9.0, "gain {}", n.gain_db());
+    }
+
+    #[test]
+    fn reset_keeps_profile() {
+        let mut n = Normalizer::with(Profile::MIC_LEVEL);
+        n.reset();
+        assert_eq!(n.profile, Profile::MIC_LEVEL);
     }
 }

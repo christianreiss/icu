@@ -182,20 +182,20 @@ impl Compressor {
 /// Peak limiter without lookahead: instant attack, exponential release,
 /// hard clamp as a backstop.
 #[derive(Debug, Clone)]
-struct Limiter {
+pub(crate) struct Limiter {
     gain: f32,
     release: f32,
 }
 
 impl Limiter {
-    fn new() -> Limiter {
+    pub(crate) fn new() -> Limiter {
         Limiter {
             gain: 1.0,
             release: coef(LIMITER_RELEASE_S),
         }
     }
 
-    fn process(&mut self, s: f32) -> f32 {
+    pub(crate) fn process(&mut self, s: f32) -> f32 {
         let a = s.abs();
         let target = if a > CEILING { CEILING / a } else { 1.0 };
         if target < self.gain {
@@ -206,7 +206,7 @@ impl Limiter {
         (s * self.gain).clamp(-CEILING, CEILING)
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.gain = 1.0;
     }
 }
