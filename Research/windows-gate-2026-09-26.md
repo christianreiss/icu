@@ -39,7 +39,8 @@ were needed.
 | Main, setup, settings and invitation windows could extend below the taskbar. | Windows windows are fitted to the usable monitor rectangle, with title-bar margins and capped minimum sizes. Subsequent growth respects available space. |
 | A tray double-click also opened the native menu, and a restored window could remain behind other apps. | Windows reserves left double-click for restore and right-click for the menu. After restoring, activate the exact main/enrollment window once; native tests showed winit could report active focus while Explorer still owned the foreground. |
 | Native tray menu actions could wait until the main window received another event. | The menu callback posts a native repaint as well as waking egui. Hidden mute/deafen now update the orange/red icon immediately; Show and Quit also work without clicking the main window. |
-| Recreating the tray after logout left library-global handlers pointing at the dropped window. | Install the handlers once and route events to the current tray through a scoped registration. A regression covers replacement and teardown without retaining the old wake callback. |
+| Recreating the tray after logout left library-global handlers pointing at the dropped window. | Install the handlers once and route events to the current tray through a scoped registration. A regression covers replacement and teardown without retaining the old wake callback; Windows 11 GUI logout/rejoin and subsequent tray actions also pass. |
+| On first connection, the main window covered the setup wizard. | After eframe reveals the root following its first paint, focus the setup once. Native Windows 11 first-start verification shows the wizard in front. |
 | Close-to-tray kept rendering an invisible Win32 window. | Hidden Windows windows are also minimized so eframe skips rendering; restore explicitly removes minimization. Connected hidden CPU fell from about two cores to near idle in the VM. |
 | Minimized enrollment did not process handoff/completion; an idle invitation repainted continuously. | Handoff and enrollment completion run in `App::logic`, with wake callbacks. Only pending registration needs periodic polling. Idle invitation CPU fell from several cores to near idle. |
 | Attaching to a Windows parent console discarded inherited output redirection. | Preserve redirected stdin/stdout/stderr while attaching; CLI help, errors and pipes reach their intended destination. Native regression fails on the prior candidate and passes with the fix. |
@@ -113,8 +114,20 @@ The MMCSS cleanup follows the [Windows task-lifetime contract](https://learn.mic
   CPUs, 8 GiB RAM, HDA audio and Microsoft Basic Display Adapter, on the
   isolated libvirt NAT at `192.168.122.156`. Defender signatures were updated;
   real-time protection remains enabled. The same native library suite passed
-  **232 tests, 0 failed, 4 ignored** there. Package first-run and interactive
-  acceptance are still pending at this point.
+  **232 tests, 0 failed, 4 ignored** there. Both opt-in live WASAPI tests
+  passed too: 145,200 capture samples, 145,440 reference samples and
+  144,544 nonzero reference samples, followed by stopped-stream recovery.
+- Windows 11 first-run: Edge downloaded the release ZIP from the isolated
+  test host; its hash matched. Explorer extraction preserved `ZoneId=3`
+  on `icu.exe`. SmartScreen showed the expected unknown-publisher warning;
+  the documented More info / Run anyway flow opened enrollment without
+  missing DLLs or a console. Defender remained enabled. Opening an `.icu`
+  invitation through the registered file association handed it to the
+  existing process, enrollment connected and all four setup pages completed.
+  Passport export, logout, file handoff and rejoin retained the same PID.
+  Hidden tray mute/deafen immediately changed the icon, double-click restored
+  the foreground and tray Quit ended that process. A subsequent native
+  candidate verified the setup-focus correction above.
 - A native Windows join toast was visible on the desktop.
 - Follow-up on 2026-09-27: main/settings windows stayed inside the work area
   at 125% scaling, then scaling was restored to 100%. This was one monitor.
@@ -198,9 +211,11 @@ the original configuration was preserved. The LAN-only configuration is
 3. Global PTT and click-through/topmost overlay over an actual borderless
    game, including gaming mouse buttons; actual mixed-DPI/multi-monitor use.
    Elevated Notepad and single-monitor 100%/125% scaling are verified.
-4. Windows 11 and first-run installation/SmartScreen on a fresh normal
-   workstation. The portable executable remains unsigned. This session did
-   not publish a release or deploy to production.
+4. Target-workstation acceptance still needs the physical checks above.
+   Fresh Windows 11 VM download, extraction, SmartScreen and enrollment
+   passed; the portable executable remains unsigned, with the documented
+   first-run warning. This session did not publish a release or deploy to
+   production.
 
 Do not describe these remaining checks as passed on the strength of the VM
 or the synthetic AEC/video tests.

@@ -880,6 +880,16 @@ impl App {
         let Some(view) = &mut self.setup else {
             return false;
         };
+        // eframe shows the root after its first paint, which on Windows
+        // raises it above the setup created during that paint. Give the
+        // setup focus once the root has actually appeared.
+        #[cfg(windows)]
+        if ctx.cumulative_frame_nr() == 1 {
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::from_hash_of(SETUP_ID),
+                egui::ViewportCommand::Focus,
+            );
+        }
         let state = &self.state;
         let mut out = None;
         let still_open = immediate_window(
