@@ -126,8 +126,9 @@ The MMCSS cleanup follows the [Windows task-lifetime contract](https://learn.mic
   existing process, enrollment connected and all four setup pages completed.
   Passport export, logout, file handoff and rejoin retained the same PID.
   Hidden tray mute/deafen immediately changed the icon, double-click restored
-  the foreground and tray Quit ended that process. A subsequent native
-  candidate verified the setup-focus correction above.
+  the foreground and tray Quit ended that process. The final release
+  also verified the setup-focus correction above; nine layout tests and
+  strict Windows Clippy passed after that correction.
 - A native Windows join toast was visible on the desktop.
 - Follow-up on 2026-09-27: main/settings windows stayed inside the work area
   at 125% scaling, then scaling was restored to 100%. This was one monitor.
@@ -174,8 +175,19 @@ The portable package is
 executable:
 
 ```text
-7f7c95dfc23dfe7106dfdd80a368e2b1ac89dcb52d3b53f806fbbe21bbf7e04a
+16cf92b8d5f19cbc114dec05e8e8a703fc0cab31a98e6ca7e6df37f2ec6ac48d
 ```
+
+Built from signed commit `41d4b50` (including tray fixes `6644440`). ZIP
+SHA-256: `295b4a072030f3fa31bc29096da6d6db0f4ce18e9ecec5b44c40ba8cc94e20f6`.
+The same executable was verified on Windows 11. The browser/SmartScreen
+flow used the preceding `6644440` package; the final setup-only update was
+copied over it and launched successfully. The Windows 11 VM is retained,
+powered off, with install media ejected and its test app closed. Its
+installed package is under
+`C:\Users\icugate\Downloads\icu-0.1.0-windows-x86_64\icu-0.1.0-windows-x86_64`.
+Temporary download/enrollment services and VM-specific firewall rules were
+removed; test logs/screenshots are in `.scratch/windows11-gate`.
 
 The previous package is preserved at
 `C:\Users\Buffies\icu-gate\original-20260926`; its executable SHA-256 is
@@ -187,7 +199,7 @@ The normal VM profile retains its existing identity and server at
 `10.2.0.10:4712` (display name `localhost`); parity tests used the separate
 LAN profile above. The
 isolated server/peers and temporary `ICU-Gate*` scheduled tasks were stopped
-or removed after testing; Audiosrv is running. Large test executables and
+or removed after testing; Audiosrv is running. Temporary tray diagnostic executables and
 intermediate ZIPs were removed; logs, the candidate and rollback copy remain.
 
 For hands-on review, the existing VM backend was restarted as the transient
