@@ -53,6 +53,10 @@ impl Paths {
     pub fn server(&self) -> PathBuf {
         self.identity_dir().join("server.toml")
     }
+    /// `invites/`: registration bundles saved from the Nutzer tab.
+    pub fn invites_dir(&self) -> PathBuf {
+        self.config_dir.join("invites")
+    }
 }
 
 /// Transmission mode as written to the settings file.
@@ -367,6 +371,35 @@ impl Settings {
         }
     }
 
+    /// [`Settings::load`], except that a file that does not parse does not
+    /// stop the client — started from the desktop, a line on stderr is
+    /// all anybody would have seen. It is moved aside as
+    /// `settings.toml.broken-<unix time>`, the defaults apply, and the
+    /// returned problem is for the window to show.
+    pub fn load_or_recover(
+        paths: &Paths,
+    ) -> Result<(Settings, Option<crate::problem::Problem>), ConfigError> {
+        match Settings::load(paths) {
+            Ok(settings) => Ok((settings, None)),
+            Err(ConfigError::Parse(e)) => {
+                let name = format!("settings.toml.broken-{}", crate::net::conn::unix_now());
+                fs::rename(paths.settings(), paths.config_dir.join(&name))?;
+                tracing::warn!(error = %e, moved_to = %name, "settings.toml unreadable, using defaults");
+                Ok((
+                    Settings::default(),
+                    Some(crate::problem::Problem::new(
+                        format!(
+                            "Die Einstellungen ließen sich nicht lesen und stehen wieder auf \
+                             Standard. Die alte Datei liegt als „{name}“ im Einstellungsordner."
+                        ),
+                        e,
+                    )),
+                ))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Writes the file atomically.
     pub fn save(&self, paths: &Paths) -> Result<(), ConfigError> {
         let text = toml::to_string_pretty(self).map_err(|e| ConfigError::Parse(e.to_string()))?;
@@ -597,20 +630,26 @@ impl Identity {
     }
 
     /// Loads the identity, `Ok(None)` if not enrolled yet.
+    ///
+    /// Only reads, so the window may call it while the engine saves. A save
+    /// interrupted between its two renames left the previous complete set
+    /// in `identity.old/`; that one is read, and the next `save` sets the
+    /// directories right. (Until 2026-09-25 `load` repaired that by renaming,
+    /// and a load from the window between the renames of a running save
+    /// made the save fail with `ENOTEMPTY`.)
     pub fn load(paths: &Paths) -> Result<Option<Identity>, ConfigError> {
-        // A save that crashed between its two renames left only the previous
-        // set behind (see `save`).
-        let previous = paths.identity_dir().with_extension("old");
-        if !paths.identity_dir().exists() && previous.join("server.toml").exists() {
-            fs::rename(&previous, paths.identity_dir())?;
+        let _files = crate::sync::lock(&IDENTITY_FILES);
+        let mut dir = paths.identity_dir();
+        if !dir.join("server.toml").exists() {
+            dir = dir.with_extension("old");
+            if !dir.join("server.toml").exists() {
+                return Ok(None);
+            }
         }
-        if !paths.server().exists() {
-            return Ok(None);
-        }
-        let key_der = fs::read(paths.key())?;
-        let leaf_der = fs::read(paths.leaf())?;
-        let ca_der = fs::read(paths.ca())?;
-        let server: ServerInfo = toml::from_str(&fs::read_to_string(paths.server())?)
+        let key_der = fs::read(dir.join("key.pk8"))?;
+        let leaf_der = fs::read(dir.join("leaf.der"))?;
+        let ca_der = fs::read(dir.join("ca.der"))?;
+        let server: ServerInfo = toml::from_str(&fs::read_to_string(dir.join("server.toml"))?)
             .map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(Some(Identity {
             key_der,
@@ -625,8 +664,10 @@ impl Identity {
     /// Into a fresh `identity.new/` first, then swapped in by renaming
     /// directories, so a crash never leaves a key next to somebody else's
     /// certificate. The swap takes two renames (a directory cannot replace a
-    /// non-empty one everywhere); `load` repairs a crash between them.
+    /// non-empty one everywhere); after a crash between them `load` reads
+    /// `identity.old/`, which stays until the new set is in place.
     pub fn save(&self, paths: &Paths) -> Result<(), ConfigError> {
+        let _files = crate::sync::lock(&IDENTITY_FILES);
         let dir = paths.identity_dir();
         let fresh = dir.with_extension("new");
         let previous = dir.with_extension("old");
@@ -639,10 +680,13 @@ impl Identity {
             toml::to_string_pretty(&self.server).map_err(|e| ConfigError::Parse(e.to_string()))?;
         write_atomic(&fresh.join("server.toml"), text.as_bytes(), false)?;
 
-        remove_dir_if_present(&previous)?;
         if dir.exists() {
+            // A leftover `identity.old/` is older than `dir`.
+            remove_dir_if_present(&previous)?;
             fs::rename(&dir, &previous)?;
         }
+        // Without `dir`, `identity.old/` may be the only complete set (a
+        // swap interrupted between its renames): it goes only below.
         fs::rename(&fresh, &dir)?;
         #[cfg(unix)]
         if let Ok(parent) = fs::File::open(&paths.config_dir) {
@@ -653,15 +697,25 @@ impl Identity {
     }
 
     /// Deletes the identity from this device: logging out. The leftovers of
-    /// an interrupted `save` go first, or `load` would bring `identity.old/`
-    /// back. An exported `icu-passport.txt` stays: it is the way back in.
+    /// an interrupted `save` go first, or `load` would read `identity.old/`.
+    /// Saved invitations go too: each is a live registration key
+    /// (`save_invite`) of the account logging out. An exported
+    /// `icu-passport.txt` stays: it is the way back in.
     pub fn remove(paths: &Paths) -> Result<(), ConfigError> {
+        let _files = crate::sync::lock(&IDENTITY_FILES);
         let dir = paths.identity_dir();
         remove_dir_if_present(&dir.with_extension("new"))?;
         remove_dir_if_present(&dir.with_extension("old"))?;
-        remove_dir_if_present(&dir)
+        remove_dir_if_present(&dir)?;
+        remove_dir_if_present(&paths.invites_dir())
     }
 }
+
+/// Serializes `Identity::load`, `save` and `remove` within the process: the
+/// engine stores a renewed certificate while the window may be reading the
+/// identity for a passport export, and a load between the two renames of a
+/// save could otherwise pair a key with the other set's certificate.
+static IDENTITY_FILES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// What importing a passport or registration bundle would switch this client
 /// to, shown for the user to confirm before anything is replaced
@@ -784,7 +838,7 @@ pub fn save_invite(paths: &Paths, bundle: &str) -> Result<PathBuf, ConfigError> 
     } else {
         name
     };
-    let path = paths.config_dir.join("invites").join(format!("{name}.icu"));
+    let path = paths.invites_dir().join(format!("{name}.icu"));
     write_atomic(&path, bundle.as_bytes(), true)?;
     Ok(path)
 }
@@ -1114,6 +1168,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(Identity::load(&paths).unwrap().unwrap(), other);
+        assert!(!paths.identity_dir().exists(), "load only reads");
+        // The next save starts from there and keeps the old set until the new
+        // one is in place.
+        id.save(&paths).unwrap();
+        assert_eq!(Identity::load(&paths).unwrap().unwrap(), id);
+        assert!(!paths.identity_dir().with_extension("old").exists());
 
         // Logging out leaves nothing `load` could revive.
         other.save(&paths).unwrap();
@@ -1130,5 +1190,95 @@ mod tests {
         assert!(Identity::load(&paths).unwrap().is_none());
         assert!(!paths.identity_dir().with_extension("old").exists());
         Identity::remove(&paths).unwrap();
+    }
+
+    /// The window reads the identity (passport export) while the engine
+    /// saves a renewed one: every read sees one complete set, and no save
+    /// fails for it.
+    #[test]
+    fn loading_while_saving_sees_whole_sets() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf()));
+        let set = |n: u8| Identity {
+            key_der: vec![n; 32],
+            leaf_der: vec![n; 16],
+            ca_der: vec![9],
+            server: ServerInfo {
+                host: "icu.example.org".into(),
+                port: 4711,
+                server_name: "icu.example.org".into(),
+                name: format!("user{n}"),
+            },
+        };
+        set(1).save(&paths).unwrap();
+        let saver = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                for i in 0..200 {
+                    set(1 + (i % 2) as u8).save(&paths).expect("save");
+                }
+            })
+        };
+        while !saver.is_finished() {
+            let id = Identity::load(&paths).expect("load").expect("present");
+            assert_eq!(id.key_der[0], id.leaf_der[0], "key and leaf of one set");
+            assert_eq!(id.server.name, format!("user{}", id.key_der[0]));
+        }
+        saver.join().unwrap();
+    }
+
+    /// Logging out takes the saved invitations with it: each one is a live
+    /// registration key.
+    #[test]
+    fn logging_out_deletes_saved_invitations() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf()));
+        let (leaf, ca, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA x");
+        let bundle = icu_proto::passport::PassportV2 {
+            key_der: key,
+            leaf_der: leaf,
+            ca_der: ca,
+        }
+        .encode();
+        let saved = save_invite(&paths, &bundle).unwrap();
+        assert!(saved.exists());
+        Identity::remove(&paths).unwrap();
+        assert!(!paths.invites_dir().exists());
+    }
+
+    /// A settings file that does not parse is moved aside and the defaults
+    /// apply, with a readable problem for the window.
+    #[test]
+    fn an_unreadable_settings_file_is_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf()));
+        fs::write(paths.settings(), "[audio\nmode = ").unwrap();
+        assert!(matches!(Settings::load(&paths), Err(ConfigError::Parse(_))));
+        let (settings, problem) = Settings::load_or_recover(&paths).unwrap();
+        assert_eq!(settings, Settings::default());
+        let problem = problem.expect("a banner");
+        crate::problem::tests::assert_readable(&problem);
+        assert!(
+            problem.text.contains("settings.toml.broken-"),
+            "{}",
+            problem.text
+        );
+        assert!(!paths.settings().exists());
+        let aside: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.toml.broken-")
+            })
+            .collect();
+        assert_eq!(aside.len(), 1);
+        assert_eq!(
+            fs::read_to_string(aside[0].path()).unwrap(),
+            "[audio\nmode = "
+        );
+        // A good file, or none, reads as before, without a problem.
+        assert_eq!(Settings::load_or_recover(&paths).unwrap().1, None);
     }
 }

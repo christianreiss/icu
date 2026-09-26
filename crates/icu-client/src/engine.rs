@@ -80,6 +80,10 @@ pub struct EngineConfig {
     pub test_tone: bool,
     /// `Hello.client`.
     pub client_string: String,
+    /// A problem found before the engine started — a `settings.toml` that
+    /// did not parse (`Settings::load_or_recover`) — shown as the first
+    /// banner.
+    pub banner: Option<Problem>,
 }
 
 impl EngineConfig {
@@ -92,6 +96,7 @@ impl EngineConfig {
             server_addr: None,
             test_tone: false,
             client_string: client_string(),
+            banner: None,
         }
     }
 }
@@ -678,7 +683,7 @@ impl Engine {
             conn_info: None,
             conn_stats: None,
             update_required: None,
-            banner: None,
+            banner: cfg.banner.clone(),
             notice: None,
             name_error: None,
             rename_pending: false,
@@ -2534,8 +2539,16 @@ async fn run_session(
     let session = tokio::select! {
         r = connect => r,
         // Commands keep working while connecting; Quit aborts, and a new
-        // identity abandons the attempt made with the old one.
-        end = drain_until_quit(cmd_rx, local, shared) => return end,
+        // identity abandons the attempt made with the old one — with a
+        // close, or the server holds the half-open connection until its
+        // idle timeout.
+        end = drain_until_quit(cmd_rx, local, shared) => {
+            endpoint.close(quinn::VarInt::from_u32(codes::NO_ERROR), b"");
+            tokio::time::timeout(Duration::from_millis(100), endpoint.wait_idle())
+                .await
+                .ok();
+            return end;
+        }
     };
     let session = match session {
         Ok(s) => s,

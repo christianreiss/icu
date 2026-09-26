@@ -265,3 +265,23 @@ async fn logging_out_during_a_rename_leaves_no_identity_behind() {
     assert!(!paths.identity_dir().exists());
     server.handle.shutdown().await;
 }
+
+/// A problem found before the engine started (an unreadable settings.toml)
+/// is the first banner the window shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_startup_problem_is_the_first_banner() {
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let problem = icu_client::problem::Problem::plain("Die Einstellungen wurden zurückgesetzt.");
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, test_settings(), paths);
+    cfg.server_addr = Some(server.addr());
+    cfg.banner = Some(problem.clone());
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(FakeBackend::silent().0))
+        .expect("engine starts");
+    assert_eq!(engine.snapshot().banner, Some(problem.clone()));
+    // Still there once connected: nothing on the way clears it.
+    let state = wait_connected(&engine).await;
+    assert_eq!(state.banner, Some(problem));
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
