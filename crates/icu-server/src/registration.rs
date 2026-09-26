@@ -66,7 +66,12 @@ pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issu
             return Err(Error::msg(reserved));
         }
     }
-    let pending = store.users().filter(|(_, u)| u.is_pending()).count();
+    // A revoked invitation is no longer open: it stays in the store until it
+    // expires, but must not hold a place until then.
+    let pending = store
+        .users()
+        .filter(|(_, u)| u.is_pending() && !u.is_revoked())
+        .count();
     let cap = server.config.max_pending_invites();
     if pending >= cap {
         return Err(Error::coded(

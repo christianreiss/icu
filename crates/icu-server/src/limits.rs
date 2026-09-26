@@ -93,6 +93,12 @@ impl TokenBucket {
         self.take(1.0)
     }
 
+    /// Gives back a token taken for something that then did not happen, up
+    /// to the capacity.
+    pub fn refund_one(&mut self) {
+        self.tokens = (self.tokens + 1.0).min(self.capacity);
+    }
+
     /// Takes `n` tokens whenever the bucket is not in debt, even if that
     /// drives it below zero; the debt is then paid off by the refill before
     /// anything else passes. For byte budgets, where a single item (one

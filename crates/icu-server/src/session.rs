@@ -1458,8 +1458,16 @@ async fn handle_create_invite(
     }
     // `issue` codes its refusals (`NAME_TAKEN` for a malformed or taken
     // label, `RATE_LIMITED`); anything uncoded is the server's own trouble,
-    // a failed write, and must not read as a taken name.
-    match crate::registration::issue(server, name, ttl_s).await {
+    // a failed write, and must not read as a taken name. Refused, it minted
+    // nothing: the token goes back, or a taken name, a full server or a disk
+    // problem would use up the admin's hour.
+    let issued = crate::registration::issue(server, name, ttl_s).await;
+    if issued.is_err() {
+        if let Some(bucket) = lock(&server.invite_budget).get_mut(&user_id) {
+            bucket.refund_one();
+        }
+    }
+    match issued {
         Ok(issued) => {
             tracing::info!(
                 user_id,
