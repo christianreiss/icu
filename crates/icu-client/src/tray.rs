@@ -1,7 +1,9 @@
 //! Tray icon (tray-icon 0.25, ksni on Linux): status icon, menu with
 //! Fenster anzeigen/Stumm/Taub/Beenden, in the words the main window uses.
 
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 use tray_icon::{
@@ -33,6 +35,9 @@ pub struct Tray {
     /// `(connected, muted, deafened)` the icon and menu were last drawn
     /// for; anything else in the state is not shown here.
     last: Option<(bool, bool, bool)>,
+    /// A StatusNotifier host shows the icon (`host_present`), refreshed by
+    /// a watch thread: plasmashell restarts, a GNOME extension comes later.
+    host: Arc<AtomicBool>,
 }
 
 impl Tray {
@@ -71,6 +76,8 @@ impl Tray {
             let _ = tray_tx.send(ev);
             ctx_tray.request_repaint();
         }));
+        let host = Arc::new(AtomicBool::new(host_present()));
+        watch_host(host.clone(), ctx);
         Ok(Tray {
             icon,
             show_id: show.id().clone(),
@@ -81,7 +88,14 @@ impl Tray {
             menu_rx,
             tray_rx,
             last: None,
+            host,
         })
+    }
+
+    /// Whether a panel shows the icon right now; without one, hiding the
+    /// window would leave no way back to it.
+    pub fn host_available(&self) -> bool {
+        self.host.load(Ordering::Relaxed)
     }
 
     /// Drains pending events; menu actions are turned into commands here.
@@ -150,6 +164,90 @@ impl Tray {
             }
         )));
     }
+}
+
+/// Whether a StatusNotifier host (KDE's panel, GNOME's AppIndicator
+/// extension, …) is registered: without one the ksni icon exists but
+/// nobody draws it. Asks the session bus, at most ~300 ms; any error is
+/// „no“. Not Linux: the shell always has a notification area.
+pub fn host_present() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return false;
+        };
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_millis(300), async {
+                let conn = zbus::Connection::session().await.ok()?;
+                query_host(&conn).await
+            })
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    true
+}
+
+#[cfg(target_os = "linux")]
+async fn query_host(conn: &zbus::Connection) -> Option<bool> {
+    let proxy = zbus::Proxy::new(
+        conn,
+        "org.kde.StatusNotifierWatcher",
+        "/StatusNotifierWatcher",
+        "org.kde.StatusNotifierWatcher",
+    )
+    .await
+    .ok()?;
+    proxy
+        .get_property::<bool>("IsStatusNotifierHostRegistered")
+        .await
+        .ok()
+}
+
+/// Refreshes `host` every 5 s and wakes the window when it flips.
+fn watch_host(host: Arc<AtomicBool>, ctx: egui::Context) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::thread::Builder::new()
+            .name("icu-tray-host".into())
+            .spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(async {
+                    let mut conn = None;
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        if conn.is_none() {
+                            conn = zbus::Connection::session().await.ok();
+                        }
+                        let now = match &conn {
+                            Some(c) => tokio::time::timeout(Duration::from_secs(1), query_host(c))
+                                .await
+                                .ok()
+                                .flatten()
+                                .unwrap_or(false),
+                            None => false,
+                        };
+                        if host.swap(now, Ordering::Relaxed) != now {
+                            tracing::info!(host = now, "tray host changed");
+                            ctx.request_repaint();
+                        }
+                    }
+                });
+            });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (host, ctx);
 }
 
 /// A 32×32 filled circle, optionally with a diagonal bar.

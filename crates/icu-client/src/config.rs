@@ -335,6 +335,10 @@ pub struct UiSettings {
     pub register_uri_handler: bool,
     /// Theme: `system`, `light`, `dark`.
     pub theme: String,
+    /// What closing the main window does: `tray` (hide to the notification
+    /// area; minimizes where that is impossible — no tray host, Wayland),
+    /// `minimize` (to the task bar/dock), `quit`.
+    pub close_action: String,
     /// Settings window shows the technical knobs (codec frame, hangover
     /// times, hotkey backend, passport, diagnostics) next to the everyday
     /// ones. Off by default: most people never need them.
@@ -355,6 +359,7 @@ impl Default for UiSettings {
             start_minimized: false,
             register_uri_handler: true,
             theme: "system".into(),
+            close_action: "tray".into(),
             show_advanced: false,
             notify_join: false,
             setup_done: false,
@@ -917,6 +922,7 @@ mod tests {
         s.set_volume(9, 100.0);
         s.ui.name = Some("chris".into());
         s.ui.setup_done = true;
+        s.ui.close_action = "minimize".into();
         s.save(&paths).unwrap();
 
         let back = Settings::load(&paths).unwrap();
@@ -935,6 +941,7 @@ mod tests {
         assert!(text.contains("corner = \"bottom-left\""));
         assert!(text.contains("[volumes]"));
         assert!(text.contains("setup_done = true"));
+        assert!(text.contains("close_action = \"minimize\""));
     }
 
     #[test]
@@ -959,6 +966,7 @@ mod tests {
         assert!(s.audio.normalize_outgoing);
         assert_eq!(s.audio.voice_strength, VoiceStrength::Medium);
         assert!(s.overlay.dim_non_speaking, "old settings.toml default on");
+        assert_eq!(s.ui.close_action, "tray");
         assert!(
             !s.ui.setup_done,
             "a file from before the setup shows it once"
