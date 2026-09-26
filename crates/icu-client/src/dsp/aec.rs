@@ -74,7 +74,7 @@ impl Diagnosis {
                         0
                     };
                 }
-                (Some(_), _) => {
+                (Some(erl), _) if erl <= ERL_NO_PATH_DB => {
                     self.no_path += 1;
                     self.poor = 0;
                 }
