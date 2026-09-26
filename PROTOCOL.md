@@ -141,10 +141,17 @@ Eine Registrierungssitzung darf außer `Ping` und `RenewRequest` nichts senden (
 
 ### 2.3.1 Passport `-----BEGIN ICU PASSPORT-----`
 
-Die ganze Identität eines Clients in einem ASCII-armierten Block, damit ein Nutzer sie auf ein zweites Gerät mitnehmen kann. Dasselbe Format transportiert das Registrierungs-Bundle (§2.3) — das ist der einzige Fall, in dem der Server einen Passport erzeugt; er liest nie einen. Ein wieder eingespielter Passport verbindet sofort mit dem ursprünglichen Server: CA und Adresse reisen mit.
+Die ganze Identität eines Clients in einem ASCII-armierten Block, damit ein Nutzer sie auf ein zweites Gerät mitnehmen kann, seit 2026-09-26 samt seinen Einstellungen. Dasselbe Format transportiert das Registrierungs-Bundle (§2.3) — das ist der einzige Fall, in dem der Server einen Passport erzeugt, immer als Version 2; er liest nie einen. Ein wieder eingespielter Passport verbindet sofort mit dem ursprünglichen Server: CA und Adresse reisen mit.
 
 ```
-PassportV2 {                 // Version 2, aktuell geschrieben
+PassportV3 {                 // Version 3 (2026-09-26), nur vom Client geschrieben
+    key_der: Vec<u8>,    // wie Version 2
+    leaf_der: Vec<u8>,
+    ca_der: Vec<u8>,
+    settings: String,    // TOML: die übertragbaren Einstellungen des exportierenden Clients
+}
+
+PassportV2 {                 // Version 2: Registrierungs-Bundle, Identität ohne Einstellungen
     key_der: Vec<u8>,    // privater Schlüssel, PKCS#8 DER
     leaf_der: Vec<u8>,   // Client-Zertifikat, DER — trägt die Serveradresse als URI-SAN
     ca_der: Vec<u8>,     // CA des Servers, DER — trägt das SNI im CN
@@ -158,11 +165,13 @@ PassportV1 {                 // Version 1, nur noch gelesen
 
 Armor: `-----BEGIN ICU PASSPORT-----`, Base64 (Standard-Alphabet mit Padding) auf 64 Spalten umbrochen, `-----END ICU PASSPORT-----`. Body = `[Version-Byte] ++ postcard(PassportV<n>)`, ≤ 8192 Byte dekodiert. Das Versionsbyte steht **außerhalb** des postcard-Bodys, weil postcard nicht selbstbeschreibend ist: eine andere Version würde sonst als plausibler Müll durchgehen statt abgelehnt zu werden. Beim Dekodieren wird jeder Whitespace ignoriert, damit ein neu umbrochener oder eingerückter Block aus einem Chat-Client weiter lesbar ist.
 
-Der Client exportiert Version 2, wenn sein Zertifikat die Adresse trägt, sonst Version 1 mit ausgeschriebener Adresse (ein Zertifikat von vor 2026-09-24, bis zum nächsten Renewal). Beim Import von Version 2 ohne Adresse im Zertifikat lehnt er ab.
+Der Client exportiert Version 3, wenn sein Zertifikat die Adresse trägt, sonst Version 1 mit ausgeschriebener Adresse (ein Zertifikat von vor 2026-09-24, bis zum nächsten Renewal) — Version 1 hat keinen Platz für Einstellungen, der Export sagt dann „ohne Einstellungen“. Ebenso ohne Einstellungen (Version 2) geht er, falls sie die 8192 Byte sprengen würden. Beim Import von Version 2 oder 3 ohne Adresse im Zertifikat lehnt er ab.
+
+**Einstellungen** (2026-09-26): `settings` ist `settings.toml` des exportierenden Clients (Client/IMPLEMENTATION.md §11) als TOML-Text, für das Protokoll undurchsichtig. TOML statt postcard, weil ein neuerer Client Einstellungen hinzufügt und ein älterer welche nicht kennt: unbekannte Schlüssel werden ignoriert, fehlende nehmen ihren Standard. Mit reisen alle Einstellungen außer denen, die zum Rechner gehören: Mikrofon, Lautsprecher, `[camera]`, das Hotkey-Backend, die Dateizuordnung und ob die Einrichtung hier schon lief — der Export lässt sie auf dem Standard, der Import behält die eigenen. Die Lautstärken je `user_id` reisen mit; sie gelten auf dem Server des Passports. Übernommen werden die Einstellungen nur mit der Identität und nur nach der Bestätigung unten, abwählbar (Standard: übernehmen); Zahlen landen dabei in den Bereichen, die das Einstellungsfenster anbietet. Lassen sie sich nicht lesen, kommt die Identität allein.
 
 **Der Body ist Klartext.** Ein Passport ist bis zum Widerruf ein vollwertiger Identitätsnachweis — auch ein Renewal auf irgendeinem Gerät widerruft ihn, sobald sich das neue Zertifikat anmeldet (Nr. 10; ein zweites Gerät mit derselben Identität braucht danach einen neuen Passport): wer den Text liest, kann sich als dieser Nutzer anmelden. Der Client warnt entsprechend, schreibt die Datei mit Mode 0600 und zeigt den Text nie am Bildschirm. Für ein Registrierungs-Bundle gilt dasselbe, bis es quittiert oder abgelaufen ist.
 
-**Import nur nach Bestätigung** (2026-09-24). Ein Passport bringt CA und Adresse selbst mit; wer einen gefälschten einspielt, landet auf einem fremden Server mit fremder CA. Deshalb zeigt der Client vor jedem Import Server-Name (SNI), Adresse und den eigenen Namen aus dem Zertifikat (`ImportSummary`) und übernimmt erst nach Bestätigung: im Einstellungsfenster „Prüfen“ → „Übernehmen“, im Erststart-Fenster „Beitreten“ (auf derselben Seite wie Server, Adresse und CA-Fingerabdruck), auf der Kommandozeile eine Rückfrage `[j/N]` oder `--yes`. Vertraut die vorhandene Identität einer anderen CA, steht zusätzlich die Warnung „anderer Server als bisher“ dabei.
+**Import nur nach Bestätigung** (2026-09-24). Ein Passport bringt CA und Adresse selbst mit; wer einen gefälschten einspielt, landet auf einem fremden Server mit fremder CA. Deshalb zeigt der Client vor jedem Import Server-Name (SNI), Adresse und den eigenen Namen aus dem Zertifikat (`ImportSummary`) und übernimmt erst nach Bestätigung: im Einstellungsfenster „Prüfen“ → „Übernehmen“, im Erststart-Fenster „Beitreten“ (auf derselben Seite wie Server, Adresse und CA-Fingerabdruck), auf der Kommandozeile eine Rückfrage `[j/N]` oder `--yes`. Vertraut die vorhandene Identität einer anderen CA, steht zusätzlich die Warnung „anderer Server als bisher“ dabei. Trägt der Passport Einstellungen, steht auf derselben Seite der Schalter „Einstellungen übernehmen“ (an); auf der Kommandozeile lässt `--skip-settings` sie weg.
 
 Beide Geräte halten danach dasselbe Zertifikat. Der Server lässt davon **eine** Verbindung gleichzeitig zu (§7): verbindet sich das zweite Gerät, schließt der Server das erste mit `SESSION_REPLACED`. Benennt sich eines der Geräte um, zieht das andere beim nächsten Start über den Nachzügler-Pfad aus §2.2 Nr. 9 nach.
 

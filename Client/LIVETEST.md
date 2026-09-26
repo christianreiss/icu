@@ -64,6 +64,8 @@ Ohne Fenster: `icu ~/icu-live/chris1.icu --name chris1 --yes --config-dir ~/icu-
 
 Beim ersten Start fragt KDE (Portal GlobalShortcuts) nach den Kurzbefehlen. Wer den Dialog abbricht, bekommt **nicht** stillschweigend evdev: ⚙ → Tastenkürzel bietet „Erneut fragen“ oder, mit Warnung, das Lesen über evdev an.
 
+**Passport mit Einstellungen**: bei Client 1 ein paar Einstellungen ändern (Senden „Taste halten“, Farben „Dunkel“, die Lautstärke von Client 2), dann ⚙ → Allgemein → „Speichern“. `./target/release/icu ~/Downloads/icu-passport.icu --config-dir ~/icu-live/c3`: die Beitreten-Seite zeigt unter dem Passport „Einstellungen — Von dort übernehmen“ (an). Nach „Beitreten“ öffnet sich die Einrichtung (neuer Rechner), Sendemodus, PTT-Taste, Farben und die Lautstärke von Client 2 sind wie bei Client 1, Mikrofon und Lautsprecher stehen auf dem eigenen Standard. Dieselbe Identität verdrängt dabei Client 1 (`SESSION_REPLACED`); danach c3 schließen und bei Client 1 „Neu verbinden“. Mit dem Schalter aus, oder auf der Kommandozeile mit `--skip-settings`, bleibt c3 auf seinen Einstellungen.
+
 ### Was zu sehen sein soll
 
 - **Hauptfenster** (400 px breit, Höhe passt sich nach dem Verbinden der Liste an): Kopf mit Servername, „Admin“ bei Admins, Verbindung als Punkt + Wort (Klick öffnet das Verbindungsfenster), Hell/Dunkel-Schalter, Zahnrad.

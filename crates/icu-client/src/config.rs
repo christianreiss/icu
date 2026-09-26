@@ -449,6 +449,68 @@ impl Settings {
         }
         percent
     }
+
+    /// Copies from `from` what belongs to this machine rather than to the
+    /// person: microphone, speakers and camera, the hotkey backend (a matter
+    /// of the desktop), the file association, whether the first-run setup
+    /// ran here (it picks this machine's devices) and the legacy name. The
+    /// one list of what a passport leaves behind (`PROTOCOL.md` §2.3.1).
+    fn keep_machine_fields(&mut self, from: &Settings) {
+        self.audio.input_device.clone_from(&from.audio.input_device);
+        self.audio
+            .output_device
+            .clone_from(&from.audio.output_device);
+        self.hotkeys.backend = from.hotkeys.backend;
+        self.camera.clone_from(&from.camera);
+        self.ui.register_uri_handler = from.ui.register_uri_handler;
+        self.ui.setup_done = from.ui.setup_done;
+        self.ui.name.clone_from(&from.ui.name);
+    }
+
+    /// What a passport carries: everything but the machine-bound fields,
+    /// which read as their defaults.
+    pub fn portable(&self) -> Settings {
+        let mut portable = self.clone();
+        portable.keep_machine_fields(&Settings::default());
+        portable
+    }
+
+    /// Takes over the settings a passport brought: `incoming` replaces
+    /// everything but this machine's own fields. It comes from outside, so
+    /// every number is brought into the range the settings window offers,
+    /// and one that is no number at all falls back to its default.
+    pub fn take_portable(&mut self, incoming: Settings) {
+        let mut taken = incoming;
+        taken.keep_machine_fields(self);
+        taken.clamp_numbers();
+        *self = taken;
+    }
+
+    /// The ranges of the settings window's sliders and choices.
+    fn clamp_numbers(&mut self) {
+        let defaults = AudioSettings::default();
+        let audio = &mut self.audio;
+        audio.output_volume = clamped(audio.output_volume, 0.0, 200.0, defaults.output_volume);
+        audio.vad_threshold = clamped(audio.vad_threshold, 0.0, 1.0, defaults.vad_threshold);
+        audio.gain_db = clamped(audio.gain_db, -20.0, 20.0, defaults.gain_db);
+        audio.release_ms = audio.release_ms.min(1000);
+        audio.hangover_ms = audio.hangover_ms.min(3000);
+        if !matches!(audio.frame_ms, 10 | 20) {
+            audio.frame_ms = defaults.frame_ms;
+        }
+        for percent in self.volumes.values_mut() {
+            *percent = clamped(*percent, 0.0, 200.0, 100.0);
+        }
+    }
+}
+
+/// `value` within `min..=max`, or `default` when it is not a finite number.
+fn clamped(value: f32, min: f32, max: f32, default: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        default
+    }
 }
 
 /// `identity/server.toml`: where to connect.
@@ -556,39 +618,57 @@ impl std::fmt::Debug for Identity {
 impl Identity {
     /// Reads a pasted passport or registration bundle.
     ///
-    /// Version 2 carries no address of its own, so its certificates must say
-    /// where the server is; version 1 brings its fields. Either way the key
-    /// has to parse, since the codec only checks the wrapper.
+    /// Versions 2 and 3 carry no address of their own, so their certificates
+    /// must say where the server is; version 1 brings its fields. Either way
+    /// the key has to parse, since the codec only checks the wrapper.
     pub fn from_passport(armored: &str) -> Result<Identity, String> {
+        Identity::from_passport_with_settings(armored).map(|(identity, _)| identity)
+    }
+
+    /// [`Identity::from_passport`], plus the settings a version 3 passport
+    /// carries (`PROTOCOL.md` §2.3.1). Settings that do not read are left
+    /// behind with a log line: the identity is what a passport is for.
+    pub fn from_passport_with_settings(
+        armored: &str,
+    ) -> Result<(Identity, Option<Settings>), String> {
         use icu_proto::passport::Passport;
         let passport = Passport::decode(armored).map_err(|e| {
             tracing::info!(%e, "passport does not decode");
             crate::problem::passport_text(&e)
         })?;
-        let identity = match passport {
-            Passport::V1(p) => Identity {
-                key_der: p.key_der,
-                leaf_der: p.leaf_der,
-                ca_der: p.ca_der,
-                server: ServerInfo {
-                    host: p.host,
-                    port: p.port,
-                    server_name: p.server_name,
-                    name: p.name,
-                },
-            },
-            Passport::V2(p) => {
-                let server = ServerInfo::from_certs(&p.leaf_der, &p.ca_der).ok_or_else(|| {
-                    "Dieser Passport ist unvollständig (keine Serveradresse). Bitte auf dem \
-                     anderen Gerät neu exportieren."
-                        .to_string()
-                })?;
+        let (identity, settings) = match passport {
+            Passport::V1(p) => (
                 Identity {
                     key_der: p.key_der,
                     leaf_der: p.leaf_der,
                     ca_der: p.ca_der,
-                    server,
-                }
+                    server: ServerInfo {
+                        host: p.host,
+                        port: p.port,
+                        server_name: p.server_name,
+                        name: p.name,
+                    },
+                },
+                None,
+            ),
+            Passport::V2(p) => (
+                Identity::addressed_by_certs(p.key_der, p.leaf_der, p.ca_der)?,
+                None,
+            ),
+            Passport::V3(p) => {
+                let settings = if p.settings.trim().is_empty() {
+                    None
+                } else {
+                    toml::from_str::<Settings>(&p.settings)
+                        .inspect_err(|e| {
+                            tracing::info!(error = %e, "passport settings unreadable, taking the identity alone");
+                        })
+                        .ok()
+                };
+                (
+                    Identity::addressed_by_certs(p.key_der, p.leaf_der, p.ca_der)?,
+                    settings,
+                )
             }
         };
         if identity.key_pair().is_err() {
@@ -598,7 +678,27 @@ impl Identity {
                     .into(),
             );
         }
-        Ok(identity)
+        Ok((identity, settings))
+    }
+
+    /// An identity whose certificates say where the server is (passport
+    /// versions 2 and 3).
+    fn addressed_by_certs(
+        key_der: Vec<u8>,
+        leaf_der: Vec<u8>,
+        ca_der: Vec<u8>,
+    ) -> Result<Identity, String> {
+        let server = ServerInfo::from_certs(&leaf_der, &ca_der).ok_or_else(|| {
+            "Dieser Passport ist unvollständig (keine Serveradresse). Bitte auf dem \
+             anderen Gerät neu exportieren."
+                .to_string()
+        })?;
+        Ok(Identity {
+            key_der,
+            leaf_der,
+            ca_der,
+            server,
+        })
     }
 
     /// The armored passport for this identity. Version 2 when the
@@ -607,12 +707,7 @@ impl Identity {
     /// certificate or CA would send the other device somewhere else.
     pub fn to_passport(&self) -> String {
         use icu_proto::passport::{PassportV1, PassportV2};
-        let reproducible = ServerInfo::from_certs(&self.leaf_der, &self.ca_der).is_some_and(|d| {
-            d.host == self.server.host
-                && d.port == self.server.port
-                && d.server_name == self.server.server_name
-        });
-        if reproducible {
+        if self.reproducible() {
             PassportV2 {
                 key_der: self.key_der.clone(),
                 leaf_der: self.leaf_der.clone(),
@@ -631,6 +726,44 @@ impl Identity {
             }
             .encode()
         }
+    }
+
+    /// The armored passport with this device's settings, their portable part
+    /// ([`Settings::portable`]): version 3 when the certificates lead to this
+    /// identity's server. Otherwise, or when the settings would not fit, the
+    /// passport of [`Identity::to_passport`] without them. The flag says
+    /// whether they are in.
+    pub fn to_passport_with_settings(&self, settings: &Settings) -> (String, bool) {
+        if self.reproducible() {
+            match toml::to_string_pretty(&settings.portable()) {
+                Ok(text) => {
+                    let passport = icu_proto::passport::PassportV3 {
+                        key_der: self.key_der.clone(),
+                        leaf_der: self.leaf_der.clone(),
+                        ca_der: self.ca_der.clone(),
+                        settings: text,
+                    };
+                    if passport.fits() {
+                        return (passport.encode(), true);
+                    }
+                    tracing::warn!("settings too large for the passport, exporting without them");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "settings do not serialize, exporting without them")
+                }
+            }
+        }
+        (self.to_passport(), false)
+    }
+
+    /// Whether the certificates alone lead to the host, port and SNI this
+    /// identity uses, which passport versions 2 and 3 rely on.
+    fn reproducible(&self) -> bool {
+        ServerInfo::from_certs(&self.leaf_der, &self.ca_der).is_some_and(|d| {
+            d.host == self.server.host
+                && d.port == self.server.port
+                && d.server_name == self.server.server_name
+        })
     }
 
     /// The private key as rcgen reads it, for CSRs. One that does not parse
@@ -842,6 +975,7 @@ pub fn save_invite(paths: &Paths, bundle: &str) -> Result<PathBuf, ConfigError> 
     let leaf_der = match Passport::decode(bundle) {
         Ok(Passport::V1(p)) => p.leaf_der,
         Ok(Passport::V2(p)) => p.leaf_der,
+        Ok(Passport::V3(p)) => p.leaf_der,
         Err(e) => return Err(ConfigError::Parse(e.to_string())),
     };
     let name: String = x509_parser::parse_x509_certificate(&leaf_der)
@@ -865,6 +999,17 @@ pub fn save_invite(paths: &Paths, bundle: &str) -> Result<PathBuf, ConfigError> 
     let path = paths.invites_dir().join(format!("{name}.icu"));
     write_atomic(&path, bundle.as_bytes(), true)?;
     Ok(path)
+}
+
+/// Takes a passport's settings over into the `settings.toml` of an
+/// installation whose engine is not running yet (first-start window, `icu
+/// <file>` on the terminal): [`Settings::take_portable`] on what is stored,
+/// then saved. A running engine does the same itself
+/// (`Command::ReplaceIdentity`).
+pub fn import_settings(paths: &Paths, incoming: Settings) -> Result<(), ConfigError> {
+    let mut settings = Settings::load(paths)?;
+    settings.take_portable(incoming);
+    settings.save(paths)
 }
 
 /// Writes `data` to `path` via a temporary file and rename.
@@ -1317,5 +1462,183 @@ mod tests {
         );
         // A good file, or none, reads as before, without a problem.
         assert_eq!(Settings::load_or_recover(&paths).unwrap().1, None);
+    }
+
+    /// Settings on one machine, with devices, camera and the rest of what
+    /// stays behind set to something recognisable.
+    fn machine(tag: &str) -> Settings {
+        let mut s = Settings::default();
+        s.audio.input_device = Some(format!("mic-{tag}"));
+        s.audio.output_device = Some(format!("speaker-{tag}"));
+        s.hotkeys.backend = HotkeyBackend::Evdev;
+        s.camera.device = Some(format!("cam-{tag}"));
+        s.camera.enabled = true;
+        s.ui.register_uri_handler = false;
+        s.ui.setup_done = true;
+        s.ui.name = Some(tag.into());
+        s
+    }
+
+    /// A passport takes the person's settings along and leaves the
+    /// machine's behind, on both ends.
+    #[test]
+    fn a_passport_moves_the_person_not_the_machine() {
+        let mut exported = machine("a");
+        exported.audio.mode = ModeSetting::Ptt;
+        exported.audio.hangover_ms = 1500;
+        exported.hotkeys.ptt.key = "BTN_SIDE".into();
+        exported.overlay.corner = Corner::BottomLeft;
+        exported.ui.theme = "dark".into();
+        exported.ui.close_action = "quit".into();
+        exported.set_volume(7, 140.0);
+
+        let portable = exported.portable();
+        assert_eq!(portable.audio.input_device, None);
+        assert_eq!(portable.audio.output_device, None);
+        assert_eq!(portable.camera, CameraSettings::default());
+        assert_eq!(portable.hotkeys.backend, HotkeyBackend::Auto);
+        assert_eq!(portable.ui.name, None);
+        assert_eq!(portable.audio.mode, ModeSetting::Ptt);
+
+        let mut here = machine("b");
+        here.set_volume(9, 50.0);
+        here.take_portable(portable);
+        // The person's settings arrived …
+        assert_eq!(here.audio.mode, ModeSetting::Ptt);
+        assert_eq!(here.audio.hangover_ms, 1500);
+        assert_eq!(here.hotkeys.ptt.key, "BTN_SIDE");
+        assert_eq!(here.overlay.corner, Corner::BottomLeft);
+        assert_eq!(here.ui.theme, "dark");
+        assert_eq!(here.ui.close_action, "quit");
+        assert_eq!(here.volume(7), 140.0);
+        assert_eq!(here.volume(9), 100.0, "volumes come as a whole");
+        // … and this machine kept its own.
+        let b = machine("b");
+        assert_eq!(here.audio.input_device, b.audio.input_device);
+        assert_eq!(here.audio.output_device, b.audio.output_device);
+        assert_eq!(here.camera, b.camera);
+        assert_eq!(here.hotkeys.backend, HotkeyBackend::Evdev);
+        assert!(!here.ui.register_uri_handler);
+        assert!(here.ui.setup_done);
+        assert_eq!(here.ui.name.as_deref(), Some("b"));
+    }
+
+    /// Imported numbers land in the ranges the settings window offers.
+    #[test]
+    fn imported_numbers_are_clamped() {
+        let mut incoming = Settings::default();
+        incoming.audio.output_volume = 1e9;
+        incoming.audio.vad_threshold = -3.0;
+        incoming.audio.gain_db = f32::NAN;
+        incoming.audio.release_ms = 99_999;
+        incoming.audio.hangover_ms = 1_000_000;
+        incoming.audio.frame_ms = 7;
+        incoming.volumes.insert("5".into(), 1e9);
+        incoming.volumes.insert("6".into(), f32::INFINITY);
+        let mut here = Settings::default();
+        here.take_portable(incoming);
+        assert_eq!(here.audio.output_volume, 200.0);
+        assert_eq!(here.audio.vad_threshold, 0.0);
+        assert_eq!(here.audio.gain_db, 0.0);
+        assert_eq!(here.audio.release_ms, 1000);
+        assert_eq!(here.audio.hangover_ms, 3000);
+        assert_eq!(here.audio.frame_ms, 20);
+        assert_eq!(here.volume(5), 200.0);
+        assert_eq!(here.volume(6), 100.0);
+    }
+
+    /// Version 3 carries the settings and reads back to the same identity;
+    /// an identity that needs version 1 exports without them, as does one
+    /// whose settings would not fit.
+    #[test]
+    fn passport_export_carries_the_settings_where_it_can() {
+        let (leaf, ca, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA icu.example.org");
+        let server = ServerInfo::from_certs(&leaf, &ca).unwrap();
+        let identity = Identity {
+            key_der: key,
+            leaf_der: leaf,
+            ca_der: ca,
+            server,
+        };
+        let mut settings = machine("a");
+        settings.audio.mode = ModeSetting::Ptt;
+        settings.hotkeys.ptt.trigger = Some("CTRL+ALT+SHIFT+SUPER+F12".repeat(4));
+        // A server's worth of people, each with a volume of their own.
+        for user_id in 1..=64 {
+            settings.set_volume(1000 + user_id, 150.0);
+        }
+        let (text, included) = identity.to_passport_with_settings(&settings);
+        assert!(included, "a full settings file fits");
+        assert!(matches!(
+            icu_proto::passport::Passport::decode(&text).unwrap(),
+            icu_proto::passport::Passport::V3(_)
+        ));
+        let (back, carried) = Identity::from_passport_with_settings(&text).unwrap();
+        assert_eq!(back, identity);
+        assert_eq!(carried, Some(settings.portable()));
+        assert_eq!(Identity::from_passport(&text).unwrap(), identity);
+
+        let old = Identity {
+            server: ServerInfo {
+                server_name: "elsewhere.example.org".into(),
+                ..identity.server.clone()
+            },
+            ..identity.clone()
+        };
+        let (text, included) = old.to_passport_with_settings(&settings);
+        assert!(!included);
+        let (back, carried) = Identity::from_passport_with_settings(&text).unwrap();
+        assert_eq!(back, old);
+        assert_eq!(carried, None);
+
+        let mut huge = settings.clone();
+        huge.ui.theme = "x".repeat(icu_proto::passport::MAX_PASSPORT_BYTES);
+        let (text, included) = identity.to_passport_with_settings(&huge);
+        assert!(!included, "too large: the identity goes alone");
+        assert_eq!(Identity::from_passport(&text).unwrap(), identity);
+    }
+
+    /// Settings that do not read do not cost the identity.
+    #[test]
+    fn unreadable_passport_settings_leave_the_identity() {
+        let (leaf, ca, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA icu.example.org");
+        for settings in [
+            "[audio\nmode = ",
+            "[audio]\nframe_ms = \"zwanzig\"\n",
+            "  \n",
+        ] {
+            let text = icu_proto::passport::PassportV3 {
+                key_der: key.clone(),
+                leaf_der: leaf.clone(),
+                ca_der: ca.clone(),
+                settings: settings.into(),
+            }
+            .encode();
+            let (identity, carried) = Identity::from_passport_with_settings(&text).unwrap();
+            assert_eq!(identity.server.host, "icu.example.org");
+            assert_eq!(carried, None, "{settings:?}");
+        }
+    }
+
+    /// Without a running engine the settings go straight into the file,
+    /// around this machine's devices; a fresh install has no file yet.
+    #[test]
+    fn imported_settings_are_stored_around_this_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf()));
+        let mut incoming = machine("a").portable();
+        incoming.audio.mode = ModeSetting::Ptt;
+        import_settings(&paths, incoming.clone()).unwrap();
+        let fresh = Settings::load(&paths).unwrap();
+        assert_eq!(fresh.audio.mode, ModeSetting::Ptt);
+        assert_eq!(fresh.audio.input_device, None);
+        assert!(!fresh.ui.setup_done, "a new machine still runs the setup");
+
+        machine("b").save(&paths).unwrap();
+        import_settings(&paths, incoming).unwrap();
+        let kept = Settings::load(&paths).unwrap();
+        assert_eq!(kept.audio.mode, ModeSetting::Ptt);
+        assert_eq!(kept.audio.input_device.as_deref(), Some("mic-b"));
+        assert_eq!(kept.camera.device.as_deref(), Some("cam-b"));
     }
 }

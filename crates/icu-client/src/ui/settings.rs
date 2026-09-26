@@ -32,6 +32,8 @@ const INVITE_TTLS: [(u64, &str); 4] = [
     (3 * 24 * 60 * 60, "3 Tage"),
     (icu_proto::limits::MAX_INVITE_TTL_S, "7 Tage"),
 ];
+/// Height the passport paste field grows to before it scrolls.
+const PASTE_MAX_H: f32 = 120.0;
 /// Width of the camera preview beside the camera controls: enough to judge
 /// framing, small enough that the card stays a settings card.
 const PREVIEW_W: f32 = 176.0;
@@ -91,8 +93,12 @@ pub struct SettingsView {
     passport_status: Option<String>,
     /// A parsed passport waiting for confirmation: importing replaces the
     /// identity, and the passport brings its own server, so the user sees
-    /// which one first (`PROTOCOL.md` §2.3.1).
-    import_preview: Option<(Box<Identity>, config::ImportSummary)>,
+    /// which one first (`PROTOCOL.md` §2.3.1). With the settings it carries,
+    /// if any.
+    import_preview: Option<(Box<Identity>, Option<Box<Settings>>, config::ImportSummary)>,
+    /// The import option: take the passport's settings along. On for every
+    /// new preview.
+    import_settings: bool,
     /// The passport paste field is open.
     import_open: bool,
     /// Put the cursor into it on the next frame.
@@ -282,6 +288,7 @@ impl SettingsView {
             passport_import: String::new(),
             passport_status: None,
             import_preview: None,
+            import_settings: true,
             import_open: false,
             focus_import: false,
             invite_name: String::new(),
@@ -842,7 +849,8 @@ impl SettingsView {
         });
     }
 
-    /// Export and import of the whole identity (`PROTOCOL.md` §2.3.1).
+    /// Export and import of the whole identity, and of the settings that may
+    /// move with it (`PROTOCOL.md` §2.3.1).
     ///
     /// The armored text is never rendered: it carries the private key in the
     /// clear, and a settings window is exactly the thing people have open
@@ -856,30 +864,36 @@ impl SettingsView {
                 widgets::row_group(ui, width, |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if widgets::button(ui, widgets::ButtonKind::Neutral, icon::COPY, "Kopieren")
-                        .on_hover_text("Als Text in die Zwischenablage")
+                        .on_hover_text("Als Text in die Zwischenablage, mit deinen Einstellungen")
                         .clicked()
                     {
                         match self.passport_text() {
-                            Ok(text) => {
+                            Ok((text, with_settings)) => {
                                 ui.ctx().copy_text(text);
-                                self.passport_status =
-                                    Some("In die Zwischenablage kopiert.".into());
+                                self.passport_status = Some(format!(
+                                    "In die Zwischenablage kopiert.{}",
+                                    without_settings(with_settings)
+                                ));
                             }
                             Err(e) => self.passport_status = Some(e),
                         }
                     }
                     if widgets::button(ui, widgets::ButtonKind::Neutral, icon::EXPORT, "Speichern")
                         .on_hover_text(
-                            "Als .icu-Datei in den Download-Ordner, nur für dich lesbar — \
-                             auf dem anderen Gerät doppelklicken",
+                            "Als .icu-Datei samt Einstellungen in den Download-Ordner, nur für \
+                             dich lesbar — auf dem anderen Gerät doppelklicken",
                         )
                         .clicked()
                     {
                         self.passport_status = Some(match self.passport_text() {
-                            Ok(text) => {
+                            Ok((text, with_settings)) => {
                                 let path = passport_file();
                                 match crate::config::write_atomic(&path, text.as_bytes(), true) {
-                                    Ok(()) => format!("Gespeichert: {}", path.display()),
+                                    Ok(()) => format!(
+                                        "Gespeichert: {}{}",
+                                        path.display(),
+                                        without_settings(with_settings)
+                                    ),
                                     Err(e) => crate::problem::storage("Der Passport", &e).text,
                                 }
                             }
@@ -928,17 +942,24 @@ impl SettingsView {
     fn import_area(&mut self, ui: &mut Ui, cmds: &mut Vec<Command>) {
         let mut edited = false;
         widgets::card_note(ui, |ui| {
-            let field = ui.add(
-                egui::TextEdit::multiline(&mut self.passport_import)
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("Passport hier einfügen (Strg+V)")
-                    .font(egui::TextStyle::Monospace),
-            );
-            if std::mem::take(&mut self.focus_import) {
-                field.request_focus();
-            }
-            edited = field.changed();
+            // A passport with settings runs to some 50 lines: the field stops
+            // growing at a few, so the preview and „Übernehmen" stay in view.
+            egui::ScrollArea::vertical()
+                .id_salt("passport-paste")
+                .max_height(PASTE_MAX_H)
+                .show(ui, |ui| {
+                    let field = ui.add(
+                        egui::TextEdit::multiline(&mut self.passport_import)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("Passport hier einfügen (Strg+V)")
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if std::mem::take(&mut self.focus_import) {
+                        field.request_focus();
+                    }
+                    edited = field.changed();
+                });
         });
         // A confirmation belongs to the text it was made for.
         if edited {
@@ -947,11 +968,12 @@ impl SettingsView {
                 self.preview_passport();
             }
         }
-        let Some((_, summary)) = &self.import_preview else {
+        let Some((_, settings, summary)) = &self.import_preview else {
             return;
         };
         let lines = summary.lines();
         let warn = summary.ca_changed;
+        let carries_settings = settings.is_some();
         widgets::card_note(ui, |ui| {
             let tok = theme::tokens(ui.visuals());
             for (i, line) in lines.iter().enumerate() {
@@ -963,11 +985,27 @@ impl SettingsView {
                 }
             }
         });
+        // The import option: the passport's settings come along unless
+        // switched off here.
+        if carries_settings {
+            widgets::setting_row(
+                ui,
+                true,
+                "Einstellungen übernehmen",
+                Some(SETTINGS_HELP),
+                |ui| widgets::toggle(ui, &mut self.import_settings),
+            );
+        }
+        let replaces = if carries_settings && self.import_settings {
+            "Ersetzt Schlüssel, Zertifikat, Serverdaten und Einstellungen dieses Geräts"
+        } else {
+            "Ersetzt Schlüssel, Zertifikat und Serverdaten dieses Geräts"
+        };
         widgets::setting_row(ui, true, "Diesen Server übernehmen?", None, |ui| {
             let width = widgets::button_width(ui, icon::CHECK, "Übernehmen");
             widgets::row_group(ui, width, |ui| {
                 if widgets::button(ui, widgets::ButtonKind::Danger, icon::CHECK, "Übernehmen")
-                    .on_hover_text("Ersetzt Schlüssel, Zertifikat und Serverdaten dieses Geräts")
+                    .on_hover_text(replaces)
                     .clicked()
                 {
                     self.import_passport(cmds);
@@ -1014,10 +1052,11 @@ impl SettingsView {
 
     /// The armored passport for the identity on disk. Disk, not `AppState`:
     /// that one is cloned ten times a second and has no business carrying a
-    /// private key.
-    fn passport_text(&self) -> Result<String, String> {
+    /// private key. The settings come from the draft, which is ahead of the
+    /// debounced `settings.toml`; the flag says whether they fit in.
+    fn passport_text(&self) -> Result<(String, bool), String> {
         match Identity::load(&self.paths) {
-            Ok(Some(id)) => Ok(id.to_passport()),
+            Ok(Some(id)) => Ok(id.to_passport_with_settings(&self.draft)),
             Ok(None) => Err("Keine Identität gefunden.".into()),
             Err(e) => {
                 tracing::warn!(%e, "identity unreadable");
@@ -1031,25 +1070,32 @@ impl SettingsView {
         // `from_passport` also checks the key: a passport whose key does not
         // parse would brick the next connection. A registration bundle is
         // taken as well; the engine registers it under its placeholder name.
-        match Identity::from_passport(&self.passport_import) {
-            Ok(identity) => {
+        match Identity::from_passport_with_settings(&self.passport_import) {
+            Ok((identity, settings)) => {
                 let current = Identity::load(&self.paths).ok().flatten();
                 let summary = config::ImportSummary::of(&identity, current.as_ref());
-                self.import_preview = Some((Box::new(identity), summary));
+                self.import_preview = Some((Box::new(identity), settings.map(Box::new), summary));
+                self.import_settings = true;
                 self.passport_status = None;
             }
             Err(e) => self.passport_status = Some(e),
         }
     }
 
-    /// Takes the confirmed passport into use.
+    /// Takes the confirmed passport into use, with its settings unless the
+    /// import option says otherwise.
     fn import_passport(&mut self, cmds: &mut Vec<Command>) {
-        if let Some((identity, _)) = self.import_preview.take() {
-            cmds.push(Command::ReplaceIdentity(identity));
+        if let Some((identity, settings, _)) = self.import_preview.take() {
+            let settings = settings.filter(|_| self.import_settings);
+            self.passport_status = Some(if settings.is_some() {
+                "Wird samt Einstellungen übernommen, ICU verbindet neu …".into()
+            } else {
+                "Wird übernommen, ICU verbindet neu …".into()
+            });
+            cmds.push(Command::ReplaceIdentity(identity, settings));
             self.passport_import.clear();
             // The engine saves it first; a failed save keeps the old one
-            // and says so in the main window's banner.
-            self.passport_status = Some("Wird übernommen, ICU verbindet neu …".into());
+            // (settings included) and says so in the main window's banner.
         }
     }
 
@@ -2167,6 +2213,22 @@ impl SettingsView {
         );
         self.diagnose.ref_underruns = DebugStats::get(&self.stats.reference_underruns).to_string();
         self.diagnose.reconnects = DebugStats::get(&self.stats.reconnects).to_string();
+    }
+}
+
+/// What the import option takes along, next to its switch in the settings
+/// window and the first-start window (`Settings::take_portable`).
+pub(crate) const SETTINGS_HELP: &str =
+    "Audio, Klang, Tastenkürzel, Overlay, Lautstärken und Aussehen von dort; Geräte und \
+     Kamera bleiben, wie sie hier sind.";
+
+/// The export status' note when the settings could not come along (an old
+/// certificate needs passport version 1, which has no room for them).
+fn without_settings(with_settings: bool) -> &'static str {
+    if with_settings {
+        ""
+    } else {
+        " Ohne Einstellungen: dieser Passport kann sie nicht mitnehmen."
     }
 }
 

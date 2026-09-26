@@ -7,8 +7,10 @@
 //!
 //! Version 2 carries only the three DER blobs. Where to connect comes from the
 //! certificates themselves: the client leaf has a URI SAN `icu://host:port`,
-//! the CA's CN is `ICU CA <server_name>`. Version 1 still decodes; it carried
-//! the server coordinates as separate fields.
+//! the CA's CN is `ICU CA <server_name>`. Version 3 adds the exporting
+//! client's settings as TOML text, opaque to this crate; only clients write
+//! it, a registration bundle stays version 2. Version 1 still decodes; it
+//! carried the server coordinates as separate fields.
 //!
 //! The body is **not encrypted**. A passport is a bearer credential for the
 //! account until the certificate expires or an admin revokes it — whoever reads
@@ -22,25 +24,32 @@ pub const ARMOR_BEGIN: &str = "-----BEGIN ICU PASSPORT-----";
 /// Armor footer line.
 pub const ARMOR_END: &str = "-----END ICU PASSPORT-----";
 
-/// Format version this build writes, the first byte of the decoded body.
+/// The newest format version, the first byte of the decoded body: identity
+/// plus settings ([`PassportV3`]).
 ///
 /// It sits *outside* the postcard body on purpose: postcard is not
 /// self-describing, so a version with changed fields would otherwise decode as
 /// a plausible-looking older one instead of being rejected.
-pub const PASSPORT_VERSION: u8 = 2;
+pub const PASSPORT_VERSION: u8 = 3;
+
+/// The identity alone ([`PassportV2`]): every registration bundle, and a
+/// passport without settings.
+pub const PASSPORT_VERSION_V2: u8 = 2;
 
 /// The first format, with the server coordinates as separate fields. Still
 /// accepted on import.
 pub const PASSPORT_VERSION_V1: u8 = 1;
 
-/// Upper bound on the decoded body. A real bundle is 1–1.5 KiB; the headroom
-/// covers a longer key or CA without inviting a decode bomb.
+/// Upper bound on the decoded body. A real bundle is 1–1.5 KiB, with settings
+/// some 3 KiB; the headroom covers a longer key or CA without inviting a
+/// decode bomb.
 pub const MAX_PASSPORT_BYTES: usize = 8192;
 
 /// Base64 line width inside the armor.
 const ARMOR_COLUMNS: usize = 64;
 
-/// A whole ICU identity, portable to another device. Current format.
+/// A whole ICU identity, portable to another device: what the server writes
+/// for a registration bundle, and a client for an identity without settings.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PassportV2 {
     /// Private key, PKCS#8 DER.
@@ -65,13 +74,46 @@ impl std::fmt::Debug for PassportV2 {
     }
 }
 
+/// An identity together with the exporting client's settings. Written only by
+/// clients; the server neither writes nor reads it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassportV3 {
+    /// Private key, PKCS#8 DER.
+    pub key_der: Vec<u8>,
+    /// Client leaf certificate, DER. Carries the server address as URI SAN.
+    pub leaf_der: Vec<u8>,
+    /// The server's CA certificate, DER.
+    pub ca_der: Vec<u8>,
+    /// The settings that may move to another device, as TOML text. Opaque
+    /// here: TOML stays readable when a newer client adds a setting or an
+    /// older one lacks it, which postcard would not.
+    pub settings: String,
+}
+
+/// `key_der` is redacted: a passport must never end up in a log line.
+impl std::fmt::Debug for PassportV3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PassportV3")
+            .field(
+                "key_der",
+                &format_args!("<redacted, {} bytes>", self.key_der.len()),
+            )
+            .field("leaf_der", &format_args!("{} bytes", self.leaf_der.len()))
+            .field("ca_der", &format_args!("{} bytes", self.ca_der.len()))
+            .field("settings", &format_args!("{} bytes", self.settings.len()))
+            .finish()
+    }
+}
+
 /// Any passport this build can read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Passport {
     /// Old format with explicit server coordinates.
     V1(PassportV1),
-    /// Current format.
+    /// The identity alone.
     V2(PassportV2),
+    /// The identity and the exporting client's settings.
+    V3(PassportV3),
 }
 
 impl Passport {
@@ -87,8 +129,11 @@ impl Passport {
             PASSPORT_VERSION_V1 => postcard::from_bytes(rest)
                 .map(Passport::V1)
                 .map_err(|_| PassportError::Malformed),
-            PASSPORT_VERSION => postcard::from_bytes(rest)
+            PASSPORT_VERSION_V2 => postcard::from_bytes(rest)
                 .map(Passport::V2)
+                .map_err(|_| PassportError::Malformed),
+            PASSPORT_VERSION => postcard::from_bytes(rest)
+                .map(Passport::V3)
                 .map_err(|_| PassportError::Malformed),
             other => Err(PassportError::UnsupportedVersion(other)),
         }
@@ -109,6 +154,11 @@ impl Passport {
                 ca_der: p.ca_der,
             },
             Passport::V2(p) => p,
+            Passport::V3(p) => PassportV2 {
+                key_der: p.key_der,
+                leaf_der: p.leaf_der,
+                ca_der: p.ca_der,
+            },
         }
     }
 }
@@ -118,9 +168,27 @@ impl PassportV2 {
     /// newline so concatenating one into a file needs no fixup.
     pub fn encode(&self) -> String {
         armor(
+            PASSPORT_VERSION_V2,
+            &postcard::to_stdvec(self).unwrap_or_default(),
+        )
+    }
+}
+
+impl PassportV3 {
+    /// The full armored block, like [`PassportV2::encode`].
+    pub fn encode(&self) -> String {
+        armor(
             PASSPORT_VERSION,
             &postcard::to_stdvec(self).unwrap_or_default(),
         )
+    }
+
+    /// Whether the body stays within [`MAX_PASSPORT_BYTES`], so that
+    /// [`Passport::decode`] takes it. A writer checks before choosing this
+    /// version: settings with a very long volume list could outgrow it.
+    pub fn fits(&self) -> bool {
+        // The version byte comes on top of the postcard body.
+        postcard::to_stdvec(self).is_ok_and(|body| body.len() < MAX_PASSPORT_BYTES)
     }
 }
 
@@ -257,6 +325,16 @@ mod tests {
         }
     }
 
+    fn sample_v3() -> PassportV3 {
+        let p = sample();
+        PassportV3 {
+            key_der: p.key_der,
+            leaf_der: p.leaf_der,
+            ca_der: p.ca_der,
+            settings: "[audio]\nmode = \"ptt\"\n".into(),
+        }
+    }
+
     fn sample_v1() -> PassportV1 {
         PassportV1 {
             host: "icu.example.org".into(),
@@ -356,20 +434,20 @@ mod tests {
     fn wrong_version_is_rejected() {
         use base64::Engine;
         let mut body = vec![PASSPORT_VERSION];
-        body.extend_from_slice(&postcard::to_stdvec(&sample()).unwrap());
-        body[0] = 3;
+        body.extend_from_slice(&postcard::to_stdvec(&sample_v3()).unwrap());
+        body[0] = 4;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&body);
         let armored = format!("{ARMOR_BEGIN}\n{b64}\n{ARMOR_END}\n");
         assert!(matches!(
             Passport::decode(&armored),
-            Err(PassportError::UnsupportedVersion(3))
+            Err(PassportError::UnsupportedVersion(4))
         ));
     }
 
     #[test]
     fn truncated_or_empty_body_is_malformed() {
         use base64::Engine;
-        let mut body = vec![PASSPORT_VERSION];
+        let mut body = vec![PASSPORT_VERSION_V2];
         body.extend_from_slice(&postcard::to_stdvec(&sample()).unwrap());
         body.truncate(body.len() / 2);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&body);
@@ -393,6 +471,43 @@ mod tests {
         assert!(!shown.contains("197, 198, 199"));
         let shown = format!("{:?}", sample_v1());
         assert!(shown.contains("<redacted, 200 bytes>"));
+        let shown = format!("{:?}", sample_v3());
+        assert!(shown.contains("<redacted, 200 bytes>"));
+        assert!(!shown.contains("197, 198, 199"));
+    }
+
+    /// Version 3 carries the settings text next to the identity; a bundle
+    /// without them is still written, and read, as version 2.
+    #[test]
+    fn v3_carries_settings_and_v2_stays_v2() {
+        use base64::Engine;
+        let p = sample_v3();
+        assert!(p.fits());
+        let armored = p.encode();
+        assert_eq!(Passport::decode(&armored).unwrap(), Passport::V3(p.clone()));
+        let parts = Passport::decode(&armored).unwrap().into_parts();
+        assert_eq!(parts, sample(), "into_parts leaves the settings behind");
+
+        let v2 = sample().encode();
+        let b64: String = v2.lines().filter(|l| !l.starts_with("-----")).collect();
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .unwrap();
+        assert_eq!(body[0], PASSPORT_VERSION_V2);
+        assert_eq!(Passport::decode(&v2).unwrap(), Passport::V2(sample()));
+    }
+
+    /// Settings that would push the body past the cap are caught before
+    /// writing: a reader would refuse the whole passport.
+    #[test]
+    fn oversized_settings_do_not_fit() {
+        let mut p = sample_v3();
+        p.settings = "x".repeat(MAX_PASSPORT_BYTES);
+        assert!(!p.fits());
+        assert!(matches!(
+            Passport::decode(&p.encode()),
+            Err(PassportError::TooLarge)
+        ));
     }
 
     /// A passport exported by an older client still imports, and yields the
