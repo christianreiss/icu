@@ -339,24 +339,40 @@ pub async fn run(config: Config) -> Result<Handle> {
 /// Loads the CA for [`run`] and [`Server::offline`], creating one only for a
 /// state that has never been used ([`Store::is_fresh`]): with `ca.crt` and
 /// `ca.key` both gone but users on record — a partial restore, a migration
-/// that forgot them — a new CA would lock every one of them out.
+/// that forgot them — a new CA would lock every one of them out. Nor under a
+/// name reserved for examples, which a new CA carries for good
+/// ([`Config::reserved_names`]); an existing one keeps its names, with a
+/// warning.
 fn open_ca(config: &Config, store: &Store) -> Result<Ca> {
     let dir = &config.paths.state_dir;
-    Ca::load_or_create_if(dir, &config.tls, &config.server.server_name, || {
-        if store.is_fresh() {
-            return Ok(());
+    let ca = Ca::load_or_create_if(dir, &config.tls, &config.server.server_name, || {
+        if !store.is_fresh() {
+            return Err(Error::msg(format!(
+                "no CA in {}: ca.crt and ca.key are both missing, but {users} has \
+                 been in use (users or CRLs on record). Refusing to create a new CA, \
+                 it would lock out everyone registered so far. Restore ca.crt and \
+                 ca.key from the backup {users} comes from (runbook \"Backup und \
+                 Restore\" in /usr/share/doc/icu-server/README.md, deploy/README.md \
+                 in the sources); to start over with a new CA, move the state \
+                 directory aside",
+                dir.display(),
+                users = store::USERS_FILE,
+            )));
         }
-        Err(Error::msg(format!(
-            "no CA in {}: ca.crt and ca.key are both missing, but {users} has been \
-             in use (users or CRLs on record). Refusing to create a new CA, it would \
-             lock out everyone registered so far. Restore ca.crt and ca.key from the \
-             backup {users} comes from (runbook \"Backup und Restore\" in \
-             /usr/share/doc/icu-server/README.md, deploy/README.md in the sources); \
-             to start over with a new CA, move the state directory aside",
-            dir.display(),
-            users = store::USERS_FILE,
-        )))
-    })
+        match config.reserved_names().into_iter().next() {
+            Some(reserved) => Err(Error::msg(reserved)),
+            None => Ok(()),
+        }
+    })?;
+    for reserved in config.reserved_names() {
+        tracing::warn!(
+            problem = %reserved,
+            "a name reserved for examples is configured; the existing CA and \
+             certificates carry it and keep working, changing it means a new CA \
+             and every user registering again"
+        );
+    }
+    Ok(ca)
 }
 
 /// Periodic work: expiring talk spurts, expiring `LossReport`s, pruning IP

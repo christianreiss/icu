@@ -117,9 +117,11 @@ sudo systemctl enable --now icu-server
 
 `server_name` und `public_host` landen in der CA und in jedem Zertifikat;
 später ändern heißt neue CA und alle registrieren sich neu. Mit den Namen aus
-dem Beispiel (`example.org`, `.example`, `.invalid`, `.test`, RFC 2606) startet
-der Server deshalb nicht, und `icu-server invite` stellt nichts aus.
-`localhost` und IP-Adressen gehen.
+dem Beispiel (`example.org`, `.example`, `.invalid`, `.test`, RFC 2606) legt
+der Server deshalb keine CA an — der erste Start scheitert —, und die erste
+Einladung eines Servers ohne Nutzer stellt `icu-server invite` nicht aus.
+Eine bestehende Installation, deren CA einen solchen Namen schon trägt,
+startet weiter und warnt im Journal. `localhost` und IP-Adressen gehen.
 
 `StateDirectory=icu` legt `/var/lib/icu/` an; beim ersten Start entstehen dort
 `ca.key` (0600), `ca.crt`, `server.key` (0600), `server.crt`, `users.toml`

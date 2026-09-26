@@ -349,3 +349,86 @@ async fn invite_says_whether_an_admin_has_registered() {
     );
     server.shutdown().await;
 }
+
+/// A name reserved for examples (`icu.example.org`) is refused only where it
+/// would be baked in for the first time: a new CA, the first invitation. An
+/// install whose CA already carries one, from before the check, keeps
+/// starting and answering `status` and `users` — refusing it in the config,
+/// as before, took such a server down with the upgrade, and every CLI command
+/// with it.
+#[tokio::test]
+async fn reserved_example_names_are_refused_only_where_they_are_new() {
+    let example = |dir: &std::path::Path| {
+        let mut config = icu_server::Config::for_test(dir);
+        config.server.server_name = "icu.example.org".into();
+        config.server.public_host = "icu.example.org:4711".into();
+        config
+    };
+    let invite = || AdminRequest::Invite {
+        name: String::new(),
+        ttl_s: None,
+    };
+
+    // A fresh install: neither the server nor the offline CLI makes a CA.
+    let dir = tempfile::tempdir().unwrap();
+    let config = example(dir.path());
+    let started = icu_server::run(config.clone()).await.err();
+    let offline = icu_server::Server::offline(config.clone()).err();
+    for error in [started, offline] {
+        let error = error.expect("refused").to_string();
+        assert!(error.contains("server.server_name"), "{error}");
+    }
+    assert!(!dir.path().join("ca.crt").exists(), "no CA was created");
+
+    // An install from before the check: its CA carries the example name.
+    icu_server::ca::Ca::load_or_create(dir.path(), &config.tls, "icu.example.org").unwrap();
+    let handle = icu_server::run(config)
+        .await
+        .expect("an existing CA starts");
+    assert!(matches!(
+        handle.admin(AdminRequest::Status).await,
+        AdminResponse::Status(_)
+    ));
+    // Nobody holds a certificate yet, so the first invitation would be the
+    // first to carry the example `public_host`.
+    let first = handle.admin(invite()).await;
+    assert!(
+        matches!(&first, AdminResponse::Error { detail, .. } if detail.contains("server.public_host")),
+        "{first:?}"
+    );
+    handle.shutdown().await;
+
+    // With users on record, invitations go on: their certificates already
+    // carry the name.
+    let dir = tempfile::tempdir().unwrap();
+    let config = example(dir.path());
+    icu_server::ca::Ca::load_or_create(dir.path(), &config.tls, "icu.example.org").unwrap();
+    std::fs::write(
+        dir.path().join("users.toml"),
+        format!(
+            "schema = 1\nnext_user_id = 2\ncrl_number = 1790000000\n\n\
+             [user.1]\nname = \"alice\"\ncreated = \"2026-01-01T00:00:00Z\"\nis_admin = true\n\n\
+             [[user.1.cert]]\nfingerprint = \"{:064x}\"\nissued = \"2026-01-01T00:00:00Z\"\n\
+             expires = \"2099-01-01T00:00:00Z\"\nrevoked = false\n",
+            1
+        ),
+    )
+    .unwrap();
+    let handle = icu_server::run(config).await.expect("starts");
+    let later = handle.admin(invite()).await;
+    assert!(matches!(later, AdminResponse::Invite { .. }), "{later:?}");
+    let AdminResponse::Users(users) = handle.admin(AdminRequest::Users).await else {
+        panic!("users")
+    };
+    assert_eq!(users.len(), 2);
+    handle.shutdown().await;
+
+    // Every CLI command loads the configuration file first.
+    let file = dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        "[server]\nserver_name = \"icu.example.org\"\npublic_host = \"icu.example.org:4711\"\n",
+    )
+    .unwrap();
+    icu_server::Config::load(&file).expect("the configuration loads");
+}

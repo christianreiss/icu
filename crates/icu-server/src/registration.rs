@@ -47,7 +47,10 @@ pub struct Issued {
 /// Refused with `RATE_LIMITED` while `Config::max_pending_invites` are open:
 /// every invitation is a user in `users.toml` until it is confirmed or
 /// expires, and the whole file is rewritten under the store lock on every
-/// change. A malformed or taken label is `NAME_TAKEN`.
+/// change. A malformed or taken label is `NAME_TAKEN`. The first invitation
+/// of a server without users is refused while `public_host` is a name
+/// reserved for examples (`Config::reserved_names`): it would be the first
+/// certificate to carry it.
 pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issued> {
     let ttl_s = if ttl_s == 0 { pl::INVITE_TTL_S } else { ttl_s };
     let ttl = Duration::from_secs(ttl_s.min(pl::MAX_INVITE_TTL_S));
@@ -58,6 +61,11 @@ pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issu
     // would otherwise keep the store non-empty and cost the next one its
     // admin rights until a restart.
     store.purge_expired_registrations()?;
+    if store.is_empty() {
+        if let Some(reserved) = server.config.reserved_public_host() {
+            return Err(Error::msg(reserved));
+        }
+    }
     let pending = store.users().filter(|(_, u)| u.is_pending()).count();
     let cap = server.config.max_pending_invites();
     if pending >= cap {
