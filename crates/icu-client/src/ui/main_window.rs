@@ -390,8 +390,17 @@ impl eframe::App for App {
     /// `request_repaint`): tray events, camera state, close handling.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.state_rx.has_changed().unwrap_or(false) {
+            let theme_before = self.state.settings.ui.theme.clone();
             self.state = self.state_rx.borrow_and_update().clone();
             sort_peers(&mut self.state);
+            // The engine changed the theme on its own (a passport brought
+            // settings): paint it now. A change made here is installed
+            // already, and its echo leaves it alone.
+            let theme = &self.state.settings.ui.theme;
+            if *theme != theme_before && *theme != self.theme {
+                self.theme.clone_from(theme);
+                theme::apply(ctx, &self.theme);
+            }
         }
         #[cfg_attr(
             not(any(feature = "tray", feature = "camera")),
@@ -2078,6 +2087,12 @@ pub struct EnrollApp {
     /// The identity in force, if any: joining replaces it, and a different
     /// CA means a different server, which the join page says.
     current: Option<Identity>,
+    /// The import option: take a passport's settings along. On for every
+    /// new passport on the join page.
+    take_settings: bool,
+    /// The settings of the passport being joined, stored once its identity
+    /// is (`config::import_settings`).
+    pending_settings: Option<crate::config::Settings>,
     /// How much taller the last frame's content was than the window.
     overflow: f32,
 }
@@ -2104,6 +2119,8 @@ impl EnrollApp {
             was_valid: false,
             pending: None,
             result,
+            take_settings: true,
+            pending_settings: None,
             overflow: 0.0,
         }
     }
@@ -2123,8 +2140,8 @@ impl EnrollApp {
     /// Reads the pasted text and either takes it as it is (a passport) or
     /// starts the registration thread (a registration bundle).
     fn submit(&mut self) {
-        let identity = match Identity::from_passport(&self.link) {
-            Ok(identity) => identity,
+        let (identity, settings) = match Identity::from_passport_with_settings(&self.link) {
+            Ok(parsed) => parsed,
             Err(e) => {
                 self.status = Some(EnrollStatus::Failed(e));
                 return;
@@ -2135,6 +2152,7 @@ impl EnrollApp {
             // round trip to make. Through the same slot as a registration, so
             // the one place that saves and closes the window stays the only
             // one.
+            self.pending_settings = settings.filter(|_| self.take_settings);
             let slot: EnrollSlot = Arc::new(Mutex::new(Some(Ok(identity))));
             self.pending = Some(slot);
             return;
@@ -2208,9 +2226,18 @@ impl eframe::App for EnrollApp {
             .and_then(|slot| slot.lock().unwrap().take());
         if let Some(done) = done {
             self.pending = None;
+            // A passport's settings go in only together with its identity.
+            let settings = self.pending_settings.take();
             match done {
                 Ok(identity) => match identity.save(&self.paths) {
                     Ok(()) => {
+                        if let Some(settings) = settings {
+                            // The identity is what counts: without the
+                            // settings this device keeps its own.
+                            if let Err(e) = crate::config::import_settings(&self.paths, settings) {
+                                tracing::warn!(error = %e, "cannot store the passport's settings");
+                            }
+                        }
                         *self.result.lock().unwrap() = Some(identity);
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -2233,7 +2260,9 @@ impl eframe::App for EnrollApp {
         // A passport carries its own certificate; a registration bundle
         // needs a name, which the user types in: the placeholder is the
         // inviter's, not theirs.
-        let parsed = Identity::from_passport(&self.link).ok();
+        let parsed = Identity::from_passport_with_settings(&self.link).ok();
+        let carries_settings = parsed.as_ref().is_some_and(|(_, s)| s.is_some());
+        let parsed = parsed.map(|(identity, _)| identity);
         // Where the pasted text leads, shown before joining: it brings its
         // own CA and address (`PROTOCOL.md` §2.3.1).
         let summary = parsed
@@ -2253,6 +2282,7 @@ impl eframe::App for EnrollApp {
         } else if !self.was_valid && self.step == EnrollStep::Paste {
             self.step = EnrollStep::Join;
             self.focus_name = needs_name;
+            self.take_settings = true;
         }
         self.was_valid = valid;
         let name_ok = !icu_proto::normalize_name(&self.name).is_empty();
@@ -2426,8 +2456,28 @@ impl eframe::App for EnrollApp {
                                         .size(11.5)
                                         .color(tok.dim_text),
                                 );
-                            } else if join_ok && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                join = true;
+                            } else {
+                                // The import option, where the name field
+                                // stands for an invite.
+                                if carries_settings {
+                                    ui.label(theme::caps_text("Einstellungen"));
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Von dort übernehmen").size(13.5));
+                                        widgets::rtl(ui, 30.0, |ui| {
+                                            widgets::toggle(ui, &mut self.take_settings)
+                                        });
+                                    });
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        RichText::new(super::settings::SETTINGS_HELP)
+                                            .size(11.5)
+                                            .color(tok.dim_text),
+                                    );
+                                }
+                                if join_ok && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                    join = true;
+                                }
                             }
                             ui.add_space(10.0);
                             match &self.status {

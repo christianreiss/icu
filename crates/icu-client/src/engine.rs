@@ -294,8 +294,11 @@ pub enum Command {
     /// the name lives in the certificate (`PROTOCOL.md` §2.2).
     RequestRename(String),
     /// Replace the whole identity (passport import): persist it, then
-    /// reconnect with it.
-    ReplaceIdentity(Box<Identity>),
+    /// reconnect with it. The settings the passport carried come along when
+    /// the user took them: applied like [`Command::UpdateSettings`] once the
+    /// identity is stored, around this machine's devices
+    /// (`Settings::take_portable`).
+    ReplaceIdentity(Box<Identity>, Option<Box<Settings>>),
     /// Issue a registration bundle. Admin only (`AppState.is_admin`); a
     /// non-admin send is rejected by the server, non-fatally.
     CreateInvite {
@@ -2519,14 +2522,7 @@ impl LocalState {
                 set_state = self.commit_settings(shared, false);
             }
             Command::UpdateSettings(new) => {
-                // The streams are opened against the devices and the AEC
-                // switch; a change there needs them opened anew.
-                let old = &self.settings.audio;
-                let reopen = new.audio.input_device != old.input_device
-                    || new.audio.output_device != old.output_device
-                    || new.audio.aec != old.aec;
-                self.settings = *new;
-                set_state = self.commit_settings(shared, reopen);
+                set_state = self.replace_settings(*new, shared);
             }
             Command::SetMicTest(on) => {
                 shared.dsp.mic_test.store(on, Ordering::Relaxed);
@@ -2584,10 +2580,10 @@ impl LocalState {
                     )
                 });
             }
-            Command::ReplaceIdentity(identity) => {
+            Command::ReplaceIdentity(identity, settings) => {
                 // Taken into use at the next connect; the callers reconnect
                 // right away when it was stored.
-                self.replace_identity(*identity, shared);
+                self.replace_identity(*identity, settings.map(|s| *s), shared);
             }
             Command::CreateInvite { .. }
             | Command::SetUserAdmin { .. }
@@ -2656,13 +2652,32 @@ impl LocalState {
         self.update_viewing()
     }
 
+    /// Replaces the settings and takes them into effect. The streams are
+    /// opened against the devices and the AEC switch; a change there needs
+    /// them opened anew. Returns whether `SetState` is due.
+    fn replace_settings(&mut self, new: Settings, shared: &Arc<Shared>) -> bool {
+        let old = &self.settings.audio;
+        let reopen = new.audio.input_device != old.input_device
+            || new.audio.output_device != old.output_device
+            || new.audio.aec != old.aec;
+        self.settings = new;
+        self.commit_settings(shared, reopen)
+    }
+
     /// Takes over an imported identity (passport import): stored first and
     /// taken into use only once it is, like a renewed certificate
     /// (`apply_renewed_leaf`). Connecting with one that is not on disk would
     /// leave the next start on the old one — revoked, if the imported
     /// certificate's first login retired it. A failed write keeps the
-    /// identity in force and says so. Returns whether it was taken over.
-    fn replace_identity(&mut self, identity: Identity, shared: &Arc<Shared>) -> bool {
+    /// identity in force and says so, and leaves the settings alone too.
+    /// Settings that came with it replace this machine's portable ones
+    /// (`Settings::take_portable`). Returns whether it was taken over.
+    fn replace_identity(
+        &mut self,
+        identity: Identity,
+        settings: Option<Settings>,
+        shared: &Arc<Shared>,
+    ) -> bool {
         if let Err(e) = store_identity(&identity, &self.paths, shared) {
             tracing::warn!(error = %e, "cannot store the imported identity, keeping the old one");
             shared.state.send_modify(|s| {
@@ -2671,6 +2686,14 @@ impl LocalState {
             return false;
         }
         self.adopt(identity, shared);
+        if let Some(incoming) = settings {
+            let mut taken = self.settings.clone();
+            taken.take_portable(incoming);
+            // A `SetState` for a changed overlay switch is moot: the callers
+            // reconnect, and the new `Hello` carries the flags.
+            self.replace_settings(taken, shared);
+            tracing::info!("settings taken over from the passport");
+        }
         true
     }
 
@@ -3135,8 +3158,8 @@ async fn run_session(
                             }
                         }
                     }
-                    Command::ReplaceIdentity(identity) => {
-                        if local.replace_identity(*identity, shared) {
+                    Command::ReplaceIdentity(identity, settings) => {
+                        if local.replace_identity(*identity, settings.map(|s| *s), shared) {
                             break reconnect_with_new_identity();
                         }
                     }
@@ -3434,8 +3457,8 @@ async fn drain_until_quit(
             }
             // A new identity abandons the attempt made with the old one —
             // once it is stored.
-            Some(Command::ReplaceIdentity(identity)) => {
-                if local.replace_identity(*identity, shared) {
+            Some(Command::ReplaceIdentity(identity, settings)) => {
+                if local.replace_identity(*identity, settings.map(|s| *s), shared) {
                     return reconnect_with_new_identity();
                 }
             }

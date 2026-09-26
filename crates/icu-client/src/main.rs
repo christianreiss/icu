@@ -1,8 +1,8 @@
 //! `icu` — the ICU voice client.
 //!
 //! `icu` starts. `icu <file>` opens an invite or passport in the first-start
-//! window (with `--name`/`--yes`/`--headless` it is taken on the terminal),
-//! then starts. `--config-dir` allows two instances on one machine,
+//! window (with `--name`/`--yes`/`--skip-settings`/`--headless` it is taken
+//! on the terminal), then starts. `--config-dir` allows two instances on one machine,
 //! `--headless` runs without a window,
 //! `--debug-stats` prints latency histograms to stderr every 2 s,
 //! `--test-tone` replaces the microphone with a synthetic voice.
@@ -23,8 +23,8 @@ struct Cli {
     /// Invite (registration bundle) or passport to take over: an `.icu`
     /// file, or the armored text itself (`-----BEGIN ICU PASSPORT-----`). It
     /// opens in the first-start window, which shows where it leads and joins
-    /// on a click; with --yes, --name or --headless it is taken on the
-    /// terminal instead.
+    /// on a click; with --yes, --name, --skip-settings or --headless it is
+    /// taken on the terminal instead.
     bundle: Option<String>,
     /// The name to register with. It goes into the certificate, so it is what
     /// everyone sees. Needed for a registration bundle, ignored for a
@@ -35,6 +35,10 @@ struct Cli {
     /// address and name it leads to are shown and have to be confirmed.
     #[arg(long)]
     yes: bool,
+    /// Take only the identity from a passport. By default the settings it
+    /// carries replace this device's, except devices and camera.
+    #[arg(long)]
+    skip_settings: bool,
     /// Configuration directory (default `$XDG_CONFIG_HOME/icu`).
     #[arg(long)]
     config_dir: Option<PathBuf>,
@@ -117,21 +121,34 @@ fn read_bundle(arg: &str) -> Result<String, String> {
 }
 
 /// Whether `icu <file>` opens the first-start window: a desktop start has
-/// no terminal to confirm on, and the window asks for the name itself.
+/// no terminal to confirm on, and the window asks for the name itself. A
+/// flag for the import means the terminal.
 fn in_window(cli: &Cli) -> bool {
-    cfg!(feature = "gui") && !cli.headless && !cli.yes && cli.name.is_none()
+    cfg!(feature = "gui") && !cli.headless && !cli.yes && !cli.skip_settings && cli.name.is_none()
 }
 
 /// Takes an invite or passport on the terminal: shows where it leads,
-/// asks `[j/N]` (or `--yes`), registers under `--name` or stores it.
+/// asks `[j/N]` (or `--yes`), registers under `--name` or stores it, and a
+/// passport's settings with it unless `--skip-settings`.
 fn import_in_terminal(cli: &Cli, paths: &Paths, text: &str) -> Result<(), String> {
-    let mut identity = Identity::from_passport(text)?;
+    let (mut identity, settings) = Identity::from_passport_with_settings(text)?;
     // A passport brings its own CA and address: show where it leads
     // before anything is replaced (`PROTOCOL.md` §2.3.1).
     let current = Identity::load(paths).ok().flatten();
     let summary = icu_client::config::ImportSummary::of(&identity, current.as_ref());
     for line in summary.lines() {
         eprintln!("icu: {line}");
+    }
+    let settings = settings.filter(|_| !identity.is_registration());
+    if settings.is_some() {
+        eprintln!(
+            "icu: {}",
+            if cli.skip_settings {
+                "Einstellungen: bleiben, wie sie hier sind (--skip-settings)"
+            } else {
+                "Einstellungen: werden übernommen (Geräte und Kamera bleiben)"
+            }
+        );
     }
     if !cli.yes && !confirm_import()? {
         return Err("import cancelled".into());
@@ -153,6 +170,14 @@ fn import_in_terminal(cli: &Cli, paths: &Paths, text: &str) -> Result<(), String
             .map_err(|e| e.to_string())?;
     } else {
         identity.save(paths).map_err(|e| e.to_string())?;
+        if let Some(settings) = settings.filter(|_| !cli.skip_settings) {
+            // The identity is in; without the settings this device keeps
+            // its own.
+            match icu_client::config::import_settings(paths, settings) {
+                Ok(()) => eprintln!("icu: settings taken over from the passport"),
+                Err(e) => eprintln!("icu: settings not taken over: {e}"),
+            }
+        }
     }
     eprintln!(
         "icu: registered as {} at {}:{}, identity stored in {}",

@@ -474,7 +474,8 @@ fn connection_pages_fit() {
 }
 
 /// The first-start window: empty, with an invite (asks for the name) and
-/// with a passport (does not), each checked where it leads before joining.
+/// with a passport (does not, but offers to take its settings along), each
+/// checked where it leads before joining.
 #[test]
 fn enroll_window_fits() {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -482,7 +483,9 @@ fn enroll_window_fits() {
         let server = common::TestServer::start().await;
         let bundle = server.invite_bundle("neu-3fa2").await;
         let (identity, _paths, _dir) = server.enroll("Chris").await;
-        (bundle, identity.to_passport())
+        let (passport, with_settings) = identity.to_passport_with_settings(&Settings::default());
+        assert!(with_settings, "the join page shows the import option");
+        (bundle, passport)
     });
     let mut overflows = Overflows::default();
     for theme_name in THEMES {
@@ -577,6 +580,67 @@ fn settings_window_keeps_outside_changes() {
         "outside change written back"
     );
     assert!(sent.audio.cue_tx);
+}
+
+/// ⚙ → Allgemein: a pasted passport that carries settings offers to take
+/// them along, on by default; switched off, „Übernehmen“ sends the identity
+/// alone.
+#[test]
+fn settings_import_takes_the_settings_unless_switched_off() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let passport = rt.block_on(async {
+        let server = common::TestServer::start().await;
+        let (identity, _paths, _dir) = server.enroll("Chris").await;
+        let mut there = Settings::default();
+        there.audio.mode = ModeSetting::Ptt;
+        identity.to_passport_with_settings(&there).0
+    });
+    for take in [true, false] {
+        let s = state();
+        let dir = tempfile::tempdir().unwrap();
+        let mut view = SettingsView::new(
+            &s,
+            Arc::new(DebugStats::default()),
+            Paths::new(Some(dir.path().to_path_buf())),
+        );
+        view.import_text(passport.clone());
+        let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+        let cmds_out = cmds.clone();
+        let mut h = harness(SETTINGS, "light", true, move |ui| {
+            cmds_out.borrow_mut().extend(view.ui(ui, &s, false).cmds);
+        });
+        shot(&mut h, &format!("settings-import-{take}"));
+        // The switch sits in the row its label names.
+        let row = h.get_by_label("Einstellungen übernehmen").rect();
+        if !take {
+            h.query_all_by_role(egui::accesskit::Role::CheckBox)
+                .find(|n| (n.rect().center().y - row.center().y).abs() < 16.0)
+                .expect("the import option's switch")
+                .click_accesskit();
+            h.run();
+        }
+        h.get_by_role_and_label(
+            egui::accesskit::Role::Button,
+            &format!("{}  Übernehmen", egui_phosphor::regular::CHECK),
+        )
+        .click_accesskit();
+        h.run();
+        let settings = cmds
+            .borrow()
+            .iter()
+            .find_map(|c| match c {
+                Command::ReplaceIdentity(_, settings) => Some(settings.clone()),
+                _ => None,
+            })
+            .expect("a ReplaceIdentity");
+        match settings {
+            Some(settings) => {
+                assert!(take, "switched off, yet the settings came along");
+                assert_eq!(settings.audio.mode, ModeSetting::Ptt);
+            }
+            None => assert!(!take, "the settings were left behind"),
+        }
+    }
 }
 
 /// „Weiter“ in the setup's bottom bar.

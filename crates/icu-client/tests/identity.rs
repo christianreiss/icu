@@ -9,7 +9,7 @@ use std::time::Duration;
 use common::{wait_connected, wait_for, wait_until, TestServer, SOON};
 use icu_client::{
     audio::fake::FakeBackend,
-    config::{Identity, Paths},
+    config::{Identity, ModeSetting, Paths, Settings},
     conninfo::CertInfo,
     engine::Command,
 };
@@ -174,7 +174,7 @@ async fn replacing_the_identity_reconnects_as_the_other_user() {
     let state = wait_connected(&engine).await;
     assert_eq!(state.me.unwrap().name, "alice");
 
-    engine.command(Command::ReplaceIdentity(Box::new(bob)));
+    engine.command(Command::ReplaceIdentity(Box::new(bob), None));
     let state = wait_for(&engine, SOON, |s| {
         s.me.as_ref().map(|m| m.name.as_str()) == Some("bob")
     })
@@ -232,7 +232,7 @@ async fn an_imported_bundle_registers_itself() {
     wait_connected(&engine).await;
 
     let bundle = Identity::from_passport(&server.invite_bundle("carol").await).unwrap();
-    engine.command(Command::ReplaceIdentity(Box::new(bundle.clone())));
+    engine.command(Command::ReplaceIdentity(Box::new(bundle.clone()), None));
     let state = wait_for(&engine, SOON, |s| {
         s.me.as_ref().map(|m| m.name.as_str()) == Some("carol")
             && matches!(s.conn, icu_client::engine::ConnStatus::Connected)
@@ -268,7 +268,7 @@ async fn a_passport_import_recovers_from_a_fatal_state() {
     })
     .await;
 
-    engine.command(Command::ReplaceIdentity(Box::new(alice)));
+    engine.command(Command::ReplaceIdentity(Box::new(alice), None));
     let state = wait_for(&engine, SOON, |s| {
         s.me.as_ref().map(|m| m.name.as_str()) == Some("alice")
             && matches!(s.conn, icu_client::engine::ConnStatus::Connected)
@@ -384,7 +384,12 @@ async fn a_passport_that_cannot_be_stored_is_not_taken_over() {
 
     // `identity.new` is a file, so the new set cannot be written.
     std::fs::write(paths.identity_dir().with_extension("new"), b"").unwrap();
-    engine.command(Command::ReplaceIdentity(Box::new(bob)));
+    let mut settings = Settings::default();
+    settings.audio.mode = ModeSetting::Ptt;
+    engine.command(Command::ReplaceIdentity(
+        Box::new(bob),
+        Some(Box::new(settings)),
+    ));
     let state = wait_for(&engine, SOON, |s| s.banner.is_some()).await;
     assert!(
         state.banner.unwrap().text.contains("gespeichert"),
@@ -398,6 +403,73 @@ async fn a_passport_that_cannot_be_stored_is_not_taken_over() {
         icu_client::engine::ConnStatus::Connected
     ));
     assert_eq!(leaf_cn(&paths), "alice");
+    assert_eq!(
+        state.settings.audio.mode,
+        ModeSetting::Vad,
+        "the settings stay with the identity in force"
+    );
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// A passport with settings, taken into a running client: the person's
+/// settings arrive with the identity, this machine keeps its devices, and
+/// `settings.toml` follows.
+#[tokio::test]
+async fn a_passport_brings_the_settings_but_not_the_devices() {
+    let server = TestServer::start().await;
+    let (bob, _bob_paths, _bob_dir) = server.enroll("bob").await;
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+
+    // This machine's microphone.
+    let mut here = engine.snapshot().settings;
+    here.audio.input_device = Some("mic-here".into());
+    engine.command(Command::UpdateSettings(Box::new(here)));
+    wait_for(&engine, SOON, |s| {
+        s.settings.audio.input_device.as_deref() == Some("mic-here")
+    })
+    .await;
+
+    // Bob's other device: push to talk on a mouse button, dark, someone
+    // louder — and a microphone of its own.
+    let mut there = Settings::default();
+    there.audio.mode = ModeSetting::Ptt;
+    there.audio.input_device = Some("mic-there".into());
+    there.hotkeys.ptt.key = "BTN_SIDE".into();
+    there.ui.theme = "dark".into();
+    there.set_volume(42, 150.0);
+    let (passport, with_settings) = bob.to_passport_with_settings(&there);
+    assert!(with_settings);
+    let (identity, settings) = Identity::from_passport_with_settings(&passport).unwrap();
+    engine.command(Command::ReplaceIdentity(
+        Box::new(identity),
+        settings.map(Box::new),
+    ));
+
+    let state = wait_for(&engine, SOON, |s| {
+        s.me.as_ref().map(|m| m.name.as_str()) == Some("bob")
+    })
+    .await;
+    assert_eq!(state.settings.audio.mode, ModeSetting::Ptt);
+    assert_eq!(state.settings.hotkeys.ptt.key, "BTN_SIDE");
+    assert_eq!(state.settings.ui.theme, "dark");
+    assert_eq!(state.settings.volume(42), 150.0);
+    assert_eq!(
+        state.settings.audio.input_device.as_deref(),
+        Some("mic-here"),
+        "the device stays this machine's"
+    );
+    assert!(
+        wait_until(SOON, || Settings::load(&paths)
+            .is_ok_and(|s| s.audio.mode == ModeSetting::Ptt
+                && s.audio.input_device.as_deref() == Some("mic-here")))
+        .await,
+        "settings.toml follows"
+    );
 
     engine.shutdown();
     server.handle.shutdown().await;
