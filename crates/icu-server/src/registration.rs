@@ -51,12 +51,22 @@ pub struct Issued {
 /// of a server without users is refused while `public_host` is a name
 /// reserved for examples (`Config::reserved_names`): it would be the first
 /// certificate to carry it.
-pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issued> {
+pub async fn issue(
+    server: &Arc<Server>,
+    actor: Option<&crate::admin::Actor>,
+    label: &str,
+    ttl_s: u64,
+) -> Result<Issued> {
     let ttl_s = if ttl_s == 0 { pl::INVITE_TTL_S } else { ttl_s };
     let ttl = Duration::from_secs(ttl_s.min(pl::MAX_INVITE_TTL_S));
     let public_host = server.config.public_host();
 
     let mut store = server.store.lock().await;
+    // The in-band caller checked this before its rate limit, under another
+    // lock; the actor may have been demoted, disabled or revoked since.
+    if actor.is_some_and(|a| !a.is_admin(&store)) {
+        return Err(Error::coded(ec::NOT_ADMIN, "not an admin"));
+    }
     // Also at startup, but needed here too: an expired, unused first bundle
     // would otherwise keep the store non-empty and cost the next one its
     // admin rights until a restart.

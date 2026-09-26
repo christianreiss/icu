@@ -712,3 +712,119 @@ async fn a_user_list_too_long_for_a_frame_is_shortened() {
     );
     server.shutdown().await;
 }
+
+/// An admin action queued on the store lock is judged by the store as it
+/// is when the action gets the lock, not as it was when the message was
+/// read: here alice asks to re-enable herself while another admin's
+/// disable holds the lock. Without the check under the lock her request
+/// would undo the disable that kicks her.
+#[tokio::test]
+async fn a_queued_self_enable_fails_once_the_disable_commits() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await; // sole bootstrap admin
+    let bob = server.client("bob").await;
+    let store = &server.handle.server().store;
+    store.lock().await.set_admin(bob.user_id, true).unwrap();
+
+    let mut guard = store.lock().await;
+    alice
+        .send_msg(&ControlMsg::AdminSetDisabled {
+            user_id: alice.user_id,
+            disabled: false,
+        })
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    guard.set_disabled(alice.user_id, true).unwrap();
+    drop(guard);
+
+    let err = alice
+        .recv_matching(|m| matches!(m, ControlMsg::AdminActionError { .. }))
+        .await;
+    assert!(
+        matches!(
+            err,
+            Some(ControlMsg::AdminActionError {
+                code: ec::NOT_ADMIN,
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+    assert!(store.lock().await.user(alice.user_id).unwrap().disabled);
+    server.shutdown().await;
+}
+
+/// The same for a revoked actor: a role grant queued behind the revoke
+/// does not go through.
+#[tokio::test]
+async fn a_queued_role_grant_fails_once_the_actor_is_revoked() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await; // sole bootstrap admin
+    let bob = server.client("bob").await;
+    let carol = server.client("carol").await;
+    let store = &server.handle.server().store;
+    store.lock().await.set_admin(bob.user_id, true).unwrap();
+
+    let mut guard = store.lock().await;
+    alice
+        .send_msg(&ControlMsg::AdminSetRole {
+            user_id: carol.user_id,
+            is_admin: true,
+        })
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    guard.revoke(alice.user_id).unwrap();
+    drop(guard);
+
+    let err = alice
+        .recv_matching(|m| matches!(m, ControlMsg::AdminActionError { .. }))
+        .await;
+    assert!(
+        matches!(
+            err,
+            Some(ControlMsg::AdminActionError {
+                code: ec::NOT_ADMIN,
+                ..
+            })
+        ),
+        "{err:?}"
+    );
+    assert!(!store.lock().await.is_admin(carol.user_id));
+    server.shutdown().await;
+}
+
+/// `registration::issue` checks its actor under its own lock: the in-band
+/// caller's earlier check ran under another one, and a demotion in between
+/// must not leave the invitation authorized.
+#[tokio::test]
+async fn an_invitation_is_not_issued_for_a_demoted_actor() {
+    let server = TestServer::start().await;
+    let alice = server.client("alice").await; // sole bootstrap admin
+    let bob = server.client("bob").await;
+    let srv = server.handle.server();
+    let actor = {
+        let mut store = srv.store.lock().await;
+        store.set_admin(bob.user_id, true).unwrap();
+        let user = store.user(alice.user_id).unwrap();
+        // The session's leaf; the registration certificate is revoked.
+        let fp = user.certs.iter().find(|c| !c.revoked).unwrap().fingerprint.clone();
+        icu_server::admin::Actor {
+            user_id: alice.user_id,
+            cert_fp: fp,
+        }
+    };
+    let issued = icu_server::registration::issue(srv, Some(&actor), "", 0).await;
+    assert!(issued.is_ok(), "{:?}", issued.err());
+
+    srv.store
+        .lock()
+        .await
+        .set_admin(alice.user_id, false)
+        .unwrap();
+    let refused = icu_server::registration::issue(srv, Some(&actor), "", 0).await;
+    assert_eq!(refused.err().and_then(|e| e.code()), Some(ec::NOT_ADMIN));
+    assert!(icu_server::registration::issue(srv, None, "", 0)
+        .await
+        .is_ok(), "the socket has no actor");
+    server.shutdown().await;
+}

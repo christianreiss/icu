@@ -373,7 +373,7 @@ fn close_retired(server: &Arc<Server>, fingerprints: &[String]) {
 
 /// The store's admission of a presented certificate: known, not revoked, its
 /// user not disabled. Run once in [`authenticate`] and again in [`serve`].
-fn admit<'a>(store: &'a Store, fp: &str) -> Result<(UserId, &'a UserRecord, &'a CertRecord)> {
+pub(crate) fn admit<'a>(store: &'a Store, fp: &str) -> Result<(UserId, &'a UserRecord, &'a CertRecord)> {
     let (user_id, user, cert) = store
         .by_fingerprint(fp)
         .ok_or_else(|| Error::coded(ec::AUTH_UNKNOWN_CERT, format!("unknown fingerprint {fp}")))?;
@@ -1081,6 +1081,10 @@ async fn control_loop(
     recv: &mut quinn::RecvStream,
 ) -> Result<()> {
     let user_id = identity.user_id;
+    let actor = admin::Actor {
+        user_id,
+        cert_fp: identity.cert_fp.clone(),
+    };
     let mut control = TokenBucket::per_second(server.config.limits.control_msgs_per_s);
     let mut set_state = TokenBucket::per_second(server.config.limits.set_state_per_s);
     let mut violations = ViolationCounter::new(
@@ -1164,13 +1168,13 @@ async fn control_loop(
                 handle_renew(server, session, identity, &csr_der).await;
             }
             ControlMsg::CreateInviteRequest { name, ttl_s } => {
-                handle_create_invite(server, session, user_id, &name, ttl_s).await;
+                handle_create_invite(server, session, &actor, &name, ttl_s).await;
             }
             ControlMsg::AdminSetRole {
                 user_id: target,
                 is_admin,
             } => {
-                let done = admin::set_role(server, Some(user_id), target, is_admin).await;
+                let done = admin::set_role(server, Some(&actor), target, is_admin).await;
                 let answer = admin_answer(target, done, |()| ControlMsg::AdminSetRoleOk {
                     user_id: target,
                     is_admin,
@@ -1181,7 +1185,7 @@ async fn control_loop(
                 user_id: target,
                 disabled,
             } => {
-                let done = admin::set_disabled(server, Some(user_id), target, disabled).await;
+                let done = admin::set_disabled(server, Some(&actor), target, disabled).await;
                 let answer = admin_answer(target, done, |_| ControlMsg::AdminSetDisabledOk {
                     user_id: target,
                     disabled,
@@ -1189,7 +1193,7 @@ async fn control_loop(
                 server.room.send_to(session, &answer);
             }
             ControlMsg::AdminRevokeUser { user_id: target } => {
-                let done = admin::revoke_user(server, Some(user_id), target).await;
+                let done = admin::revoke_user(server, Some(&actor), target).await;
                 let answer = admin_answer(target, done, |closed| ControlMsg::AdminRevokeUserOk {
                     user_id: target,
                     closed: closed as u32,
@@ -1197,10 +1201,10 @@ async fn control_loop(
                 server.room.send_to(session, &answer);
             }
             ControlMsg::UserListRequest => {
-                handle_user_list_request(server, session, user_id).await;
+                handle_user_list_request(server, session, &actor).await;
             }
             ControlMsg::AdminKick { user_id: target } => {
-                let done = admin::kick(server, Some(user_id), target).await;
+                let done = admin::kick(server, Some(&actor), target).await;
                 let answer = admin_answer(target, done, |closed| ControlMsg::AdminKickOk {
                     user_id: target,
                     closed: closed as u32,
@@ -1213,7 +1217,7 @@ async fn control_loop(
                 deafened,
             } => {
                 let done =
-                    admin::set_restriction(server, Some(user_id), target, |_| (muted, deafened))
+                    admin::set_restriction(server, Some(&actor), target, |_| (muted, deafened))
                         .await;
                 let answer = admin_answer(target, done, |_| ControlMsg::AdminSetRestrictionOk {
                     user_id: target,
@@ -1457,13 +1461,14 @@ async fn handle_renew(server: &Arc<Server>, session: Session, identity: &Identit
 async fn handle_create_invite(
     server: &Arc<Server>,
     session: Session,
-    user_id: UserId,
+    actor: &admin::Actor,
     name: &str,
     ttl_s: u64,
 ) {
     let reject = |code: u32, detail: String| ControlMsg::Error { code, detail };
+    let user_id = actor.user_id;
 
-    if !server.store.lock().await.is_admin(user_id) {
+    if !actor.is_admin(&*server.store.lock().await) {
         server
             .room
             .send_to(session, &reject(ec::NOT_ADMIN, "not an admin".into()));
@@ -1492,7 +1497,7 @@ async fn handle_create_invite(
     // a failed write, and must not read as a taken name. Refused, it minted
     // nothing: the token goes back, or a taken name, a full server or a disk
     // problem would use up the admin's hour.
-    let issued = crate::registration::issue(server, name, ttl_s).await;
+    let issued = crate::registration::issue(server, Some(actor), name, ttl_s).await;
     if issued.is_err() {
         if let Some(bucket) = lock(&server.invite_budget).get_mut(&user_id) {
             bucket.refund_one();
@@ -1567,9 +1572,9 @@ fn admin_answer<T>(
 
 /// `UserListRequest` (`PROTOCOL.md` §2.2). Admin only; every registered user,
 /// online or not.
-async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor: UserId) {
+async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor: &admin::Actor) {
     let store = server.store.lock().await;
-    if !store.is_admin(actor) {
+    if !actor.is_admin(&store) {
         drop(store);
         // No target to name, so `user_id` stays 0.
         server.room.send_to(
