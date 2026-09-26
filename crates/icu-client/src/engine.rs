@@ -523,8 +523,9 @@ struct Shared {
     cycle: Arc<CycleClock>,
     /// Requests an IDR from the camera thread.
     keyframe_request: AtomicBool,
-    /// Video frames received, keyed by session (M4).
-    video: Mutex<crate::video::Receivers>,
+    /// Video frames received, keyed by session (M4), and the connection
+    /// they belong to.
+    video: Mutex<VideoIn>,
     /// Video sender (M4). Taken out of the lock for each frame, so the
     /// camera thread never holds it across a send.
     video_tx: Mutex<Option<Arc<crate::video::Sender>>>,
@@ -549,6 +550,69 @@ struct Shared {
     /// `crate::camera::run_sender`). Video absorbs all of the network
     /// adaptation; this atomic is the only channel for it.
     video_tier: AtomicU8,
+}
+
+/// Received video, tagged with the connection it belongs to. Session IDs
+/// are only valid within one connection (`PROTOCOL.md` §5): the decode
+/// thread of a connection that ended can still hold frames, and delivered
+/// after a reconnect they would appear under a session ID that now belongs
+/// to somebody else — a peer briefly showing another person's picture.
+#[derive(Default)]
+struct VideoIn {
+    receivers: crate::video::Receivers,
+    /// Bumped by every [`VideoIn::reset`], at `Welcome` and at session end.
+    generation: u64,
+}
+
+impl std::ops::Deref for VideoIn {
+    type Target = crate::video::Receivers;
+    fn deref(&self) -> &crate::video::Receivers {
+        &self.receivers
+    }
+}
+
+impl std::ops::DerefMut for VideoIn {
+    fn deref_mut(&mut self) -> &mut crate::video::Receivers {
+        &mut self.receivers
+    }
+}
+
+impl VideoIn {
+    /// Forgets all received video and starts a new generation: frames of an
+    /// earlier connection are dropped from now on.
+    fn reset(&mut self) -> u64 {
+        self.receivers.clear();
+        self.generation += 1;
+        self.generation
+    }
+
+    /// [`crate::video::Receivers::accept`] for a frame of connection
+    /// `generation`; `None` for a stale one, which creates nothing.
+    fn accept_for(
+        &mut self,
+        generation: u64,
+        session: Session,
+        frame: &crate::video::EncodedFrame,
+    ) -> Option<crate::video::Decoder> {
+        if generation != self.generation {
+            return None;
+        }
+        self.receivers.accept(session, frame)
+    }
+
+    /// [`crate::video::Receivers::finish`], unless the connection the
+    /// frame came from is gone by now.
+    fn finish_for(
+        &mut self,
+        generation: u64,
+        session: Session,
+        decoder: crate::video::Decoder,
+        picture: Option<crate::video::Frame>,
+    ) {
+        if generation == self.generation {
+            self.receivers.finish(session, decoder, picture);
+        }
+    }
 }
 
 /// A running engine.
@@ -657,7 +721,7 @@ impl Engine {
             reference_open: AtomicBool::new(false),
             cycle: Arc::new(CycleClock::default()),
             keyframe_request: AtomicBool::new(false),
-            video: Mutex::new(crate::video::Receivers::default()),
+            video: Mutex::new(VideoIn::default()),
             video_tx: Mutex::new(None),
             cap_prod: Arc::new(Mutex::new(cap_prod)),
             ref_prod: Arc::new(Mutex::new(ref_prod)),
@@ -1659,8 +1723,29 @@ async fn net_task(
             .send_modify(|s| s.conn = ConnStatus::Connecting);
         let addr = match cfg.server_addr {
             Some(a) => Ok(a),
+            // Commands keep working while the resolver stalls — mute and
+            // deafen must not wait for getaddrinfo's timeout — and the
+            // lookup itself is bounded. Quit ends it; a new identity starts
+            // over with its own host.
             None => {
-                crate::net::resolve(&local.identity.server.host, local.identity.server.port).await
+                let (host, port) = (
+                    local.identity.server.host.clone(),
+                    local.identity.server.port,
+                );
+                tokio::select! {
+                    r = tokio::time::timeout(RESOLVE_TIMEOUT, crate::net::resolve(&host, port)) => {
+                        r.unwrap_or_else(|_| Err(NetError::Resolve(format!(
+                            "{host}: no answer within {RESOLVE_TIMEOUT:?}"
+                        ))))
+                    }
+                    end = drain_until_quit(&mut cmd_rx, &mut local, &shared) => match end {
+                        SessionEnd::Quit => break,
+                        _ => {
+                            attempt = 0;
+                            continue;
+                        }
+                    }
+                }
             }
         };
         let mut was_connected = false;
@@ -1686,6 +1771,7 @@ async fn net_task(
         // connection it describes is exactly the lie the Verbindung window
         // must not tell.
         end_session(&shared);
+        local.forget_session(&shared);
         match outcome {
             SessionEnd::Quit => break,
             SessionEnd::Fatal(reason) => {
@@ -1727,6 +1813,10 @@ async fn net_task(
         tracing::warn!("settings not written within the shutdown wait");
     }
 }
+
+/// How long a name lookup of the server may take before it counts as
+/// failed and is retried with the backoff.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long changes must be quiet before `settings.toml` is written.
 const SETTINGS_QUIET: Duration = Duration::from_millis(500);
@@ -1812,7 +1902,7 @@ fn end_session(shared: &Arc<Shared>) {
     *lock(&shared.conn) = None;
     shared.dsp.online.store(false, Ordering::Relaxed);
     lock(&shared.speakers).clear();
-    shared.video.lock().unwrap().clear();
+    lock(&shared.video).reset();
     shared.state.send_modify(|s| {
         s.peers.clear();
         s.conn_info = None;
@@ -1990,6 +2080,15 @@ fn renewal_due(cert: &crate::conninfo::CertInfo, stored: &str) -> Option<RenewRe
     None
 }
 
+/// Whether an automatic renewal lost with its session (no answer) is tried
+/// again on the next connect rather than a day later: it may never have
+/// reached the server. A rename the user asked for is simply over — the
+/// field unlocks; if the server did apply it, the next `Welcome` reports the
+/// new name and the catch-up renewal picks it up.
+fn retry_lost_renewal_at_once(reason: RenewReason) -> bool {
+    reason != RenewReason::UserRename
+}
+
 /// Renew at the latest this many days before the certificate expires
 /// (`Client/IMPLEMENTATION.md` §5).
 const RENEW_BEFORE_EXPIRY_DAYS: i64 = 30;
@@ -2057,6 +2156,19 @@ impl LocalState {
         shared.state.send_if_modified(|s| {
             std::mem::replace(&mut s.rename_pending, user_rename) != user_rename
         });
+    }
+
+    /// Forgets the requests of a session that ended before their answers.
+    /// A pending renewal locked the name field until restart ("a change is
+    /// still running"), and a stale invite request routed the next
+    /// unrelated `Error` into `invite_error`.
+    fn forget_session(&mut self, shared: &Arc<Shared>) {
+        if let Some(lost) = self.take_pending_renew(shared) {
+            if retry_lost_renewal_at_once(lost.reason) {
+                self.renew_attempted_at = None;
+            }
+        }
+        self.invite_pending = false;
     }
 
     /// Takes the renewal in flight, clearing the window's flag with it.
@@ -2550,7 +2662,10 @@ async fn run_session(
     // Connected: install the peer state, clear everything session scoped.
     // The speakers are emptied here and not only at session end: the previous
     // session's datagram reader may have been mid-insert when it was aborted.
+    // Likewise the video: the previous connection's decode thread may still
+    // deliver queued frames, which the new generation drops.
     lock(&shared.speakers).clear();
+    let video_generation = lock(&shared.video).reset();
     let peers: Vec<Peer> = welcome
         .users
         .iter()
@@ -2596,14 +2711,22 @@ async fn run_session(
         "connected"
     );
 
-    // Reader tasks.
+    // Reader tasks, aborted with the endpoint closed however this returns.
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<Result<ControlMsg, String>>();
-    let reader = tokio::spawn(control_reader(recv, ctrl_tx));
-    let dg_reader = tokio::spawn(datagram_reader(connection.clone(), shared.clone()));
-    let video_reader = tokio::spawn(crate::video::accept_loop(
-        connection.clone(),
-        shared.clone(),
-    ));
+    let session_tasks = SessionTasks {
+        tasks: vec![
+            tokio::spawn(control_reader(recv, ctrl_tx)),
+            tokio::spawn(datagram_reader(connection.clone(), shared.clone())),
+            tokio::spawn(crate::video::accept_loop(
+                connection.clone(),
+                SessionVideo {
+                    shared: shared.clone(),
+                    generation: video_generation,
+                },
+            )),
+        ],
+        endpoint: endpoint.clone(),
+    };
     *lock(&shared.video_tx) = Some(Arc::new(crate::video::Sender::new(connection.clone())));
 
     // Flags may have changed while the handshake was in flight (a command
@@ -2909,40 +3032,68 @@ async fn run_session(
         }
     };
 
-    reader.abort();
-    dg_reader.abort();
-    video_reader.abort();
     *shared.video_tx.lock().unwrap() = None;
     *lock(&shared.conn) = None;
     shared.dsp.online.store(false, Ordering::Relaxed);
     if matches!(end, SessionEnd::Quit) {
         connection.close(quinn::VarInt::from_u32(codes::NO_ERROR), b"bye");
     }
-    endpoint.close(quinn::VarInt::from_u32(codes::NO_ERROR), b"");
+    drop(session_tasks);
     tokio::time::timeout(Duration::from_millis(500), endpoint.wait_idle())
         .await
         .ok();
     end
 }
 
-impl crate::video::VideoSink for Arc<Shared> {
+/// The reader tasks of a session and its endpoint: dropped — at the end of
+/// `run_session` or on any early return — the tasks are aborted and the
+/// endpoint closed. Two early returns used to skip that and left the old
+/// connection's readers running, the datagram reader filling the speakers
+/// of the next session, until the idle timeout.
+struct SessionTasks {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    endpoint: quinn::Endpoint,
+}
+
+impl Drop for SessionTasks {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        self.endpoint
+            .close(quinn::VarInt::from_u32(codes::NO_ERROR), b"");
+    }
+}
+
+/// Where one connection's video frames go: into [`Shared::video`], as long
+/// as that connection is the current one ([`VideoIn`]).
+#[derive(Clone)]
+struct SessionVideo {
+    shared: Arc<Shared>,
+    generation: u64,
+}
+
+impl crate::video::VideoSink for SessionVideo {
     fn deliver(&self, session: Session, frame: crate::video::EncodedFrame) {
-        DebugStats::inc(&self.stats.video_received);
+        let stats = &self.shared.stats;
+        DebugStats::inc(&stats.video_received);
         DebugStats::add(
-            &self.stats.video_bytes_received,
+            &stats.video_bytes_received,
             (icu_proto::header::VIDEO_HEADER_LEN + frame.data.len()) as u64,
         );
         // The decode runs between the two locks: the windows take this one
         // on every repaint, and an H.264 decode is milliseconds.
-        let Some(mut decoder) = lock(&self.video).accept(session, &frame) else {
+        let Some(mut decoder) =
+            lock(&self.shared.video).accept_for(self.generation, session, &frame)
+        else {
             return;
         };
         let picture = crate::video::decode(&mut decoder, &frame.data);
-        lock(&self.video).finish(session, decoder, picture);
+        lock(&self.shared.video).finish_for(self.generation, session, decoder, picture);
     }
 
     fn overflow(&self) {
-        DebugStats::inc(&self.stats.video_decode_dropped);
+        DebugStats::inc(&self.shared.stats.video_decode_dropped);
     }
 }
 
@@ -3692,6 +3843,57 @@ mod tests {
             inbound(Err(NetError::Connect("reset".into()))),
             Inbound::End
         ));
+    }
+
+    /// Whichever way `run_session` returns, its reader tasks end with it.
+    #[tokio::test]
+    async fn dropping_the_session_tasks_aborts_them() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let _tx = tx;
+            std::future::pending::<()>().await
+        });
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        drop(SessionTasks {
+            tasks: vec![task],
+            endpoint,
+        });
+        assert!(rx.await.is_err(), "the task was aborted");
+    }
+
+    /// Received video belongs to one connection: after a reset, frames
+    /// still queued from the previous one create nothing.
+    #[test]
+    fn video_of_an_earlier_connection_is_dropped() {
+        let frame = || crate::video::EncodedFrame {
+            header: icu_proto::VideoHeader {
+                flags: icu_proto::header::VIDEO_FLAG_KEYFRAME,
+                speaker: 3,
+                seq: 1,
+                ts: 0,
+                codec: icu_proto::header::VIDEO_CODEC_H264,
+            },
+            data: vec![0, 0, 0, 1],
+        };
+        let mut video = VideoIn::default();
+        let old = video.reset();
+        let _ = video.accept_for(old, 3, &frame());
+        assert_eq!(video.frames(3), 1);
+        let new = video.reset();
+        assert_eq!(video.frames(3), 0, "a reset forgets everything");
+        assert!(video.accept_for(old, 3, &frame()).is_none());
+        assert_eq!(video.frames(3), 0, "a stale frame creates no receiver");
+        let _ = video.accept_for(new, 3, &frame());
+        assert_eq!(video.frames(3), 1);
+    }
+
+    /// A lost automatic renewal is retried on the next connect; a lost
+    /// rename only unlocks the field.
+    #[test]
+    fn a_lost_renewal_is_retried_unless_the_user_asked_for_it() {
+        assert!(retry_lost_renewal_at_once(RenewReason::Expiry));
+        assert!(retry_lost_renewal_at_once(RenewReason::CatchUp));
+        assert!(!retry_lost_renewal_at_once(RenewReason::UserRename));
     }
 
     /// The client's `SetState` budget stays under the server's bucket (20
