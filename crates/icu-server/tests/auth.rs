@@ -53,11 +53,11 @@ async fn connect_without_a_certificate_is_auth_required() {
     server.shutdown().await;
 }
 
-/// `PROTOCOL.md` §7: past `max_connections` open connections — handshaking
-/// or established, `Hello` or not — the server refuses new ones outright
-/// instead of accumulating state.
+/// `PROTOCOL.md` §7: past `max_connections` established connections,
+/// `Hello` or not, a completed handshake is closed with the non-fatal
+/// `SERVER_FULL` instead of accumulating state.
 #[tokio::test]
-async fn connections_past_the_limit_are_refused() {
+async fn connections_past_the_limit_are_closed_with_server_full() {
     let server = TestServer::start_with(|config| {
         config.server.max_users = 1;
         config.limits.max_connections = 2;
@@ -87,9 +87,14 @@ async fn connections_past_the_limit_are_refused() {
     // replace the first instead of adding to it.
     let _a = server.connect(&alice).await.expect("first connection");
     let _b = server.connect(&bob).await.expect("second connection");
+    let third = server
+        .connect(&carol)
+        .await
+        .expect("the handshake itself completes");
+    assert_eq!(third.closed_code().await, Some(ec::SERVER_FULL));
     assert!(
-        server.connect(&carol).await.is_err(),
-        "the third is refused during the handshake"
+        !ec::is_fatal(ec::SERVER_FULL),
+        "the client tries again later"
     );
     server.shutdown().await;
 }
@@ -810,16 +815,92 @@ async fn a_registration_session_is_replaced_by_a_newer_one() {
     server.shutdown().await;
 }
 
-/// `PROTOCOL.md` §1/§2.2: the CRL follows `Welcome`, and a revoke puts the
-/// certificate on a new one that reaches everybody online at once.
+/// `PROTOCOL.md` §7: sessions outside the room — registration and
+/// renew-only — are capped server wide, since the room size does not bound
+/// them. A room session is not affected, and a freed slot is taken again.
 #[tokio::test]
-async fn a_revoke_updates_the_crl_live() {
+async fn sessions_outside_the_room_are_capped() {
+    use icu_proto::limits::MAX_ROOMLESS_SESSIONS;
+    let server = TestServer::start_with(|c| {
+        // Every session comes from 127.0.0.1 within a second.
+        c.limits.handshakes_per_ip_per_s = 1000;
+        c.limits.enroll_per_ip_per_min = 1000;
+        c.limits.enroll_global_per_min = 1000;
+    })
+    .await;
+    let admin = server.enroll("admin").await;
+    let registration = |bundle: &str| common::identity_from_bundle(bundle);
+
+    let mut open = Vec::new();
+    for _ in 0..MAX_ROOMLESS_SESSIONS {
+        let bundle = server.invite("").await;
+        let mut client = server
+            .connect(&registration(&bundle))
+            .await
+            .expect("connect");
+        assert!(matches!(
+            client.hello("").await,
+            ControlMsg::Welcome {
+                registration: true,
+                ..
+            }
+        ));
+        open.push(client);
+    }
+    let bundle = server.invite("").await;
+    let refused = server
+        .connect(&registration(&bundle))
+        .await
+        .expect("the handshake completes");
+    assert_eq!(refused.closed_code().await, Some(ec::SERVER_FULL));
+    assert!(
+        !ec::is_fatal(ec::SERVER_FULL),
+        "the client tries again later"
+    );
+
+    let mut member = server.connect(&admin).await.expect("connect");
+    assert!(
+        matches!(member.hello("admin").await, ControlMsg::Welcome { .. }),
+        "the room is not affected"
+    );
+
+    open.pop().expect("a session").conn.close(0u32.into(), b"");
+    let roomless = &server.handle.server().roomless;
+    for _ in 0..200 {
+        if roomless.lock().unwrap().len() < MAX_ROOMLESS_SESSIONS {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut again = server
+        .connect(&registration(&bundle))
+        .await
+        .expect("connect");
+    assert!(matches!(
+        again.hello("").await,
+        ControlMsg::Welcome {
+            registration: true,
+            ..
+        }
+    ));
+    server.shutdown().await;
+}
+
+/// `PROTOCOL.md` §1/§2.2: a revoke is in force in the handshake at once,
+/// without a restart. The CRL clients get follows `Welcome` and lists only
+/// replaced server leaves — a revoked client certificate is none of their
+/// business.
+#[tokio::test]
+async fn a_revoke_takes_effect_in_the_handshake_live() {
     let server = TestServer::start().await;
     let mut alice = server.client("alice").await;
     alice.expect_silence().await;
     let first = alice.crl.clone().expect("CrlUpdate after Welcome");
     let ca = server.ca();
-    crl_serials(&first, &ca); // signed by the CA
+    assert!(
+        crl_serials(&first, &ca).is_empty(),
+        "signed by the CA, empty"
+    );
 
     let bob = server.enroll("bob").await;
     server
@@ -827,15 +908,61 @@ async fn a_revoke_updates_the_crl_live() {
         .admin(AdminRequest::Revoke { user: "bob".into() })
         .await;
     alice.expect_silence().await;
-    let updated = alice.crl.clone().expect("a new CRL was broadcast");
-    assert_ne!(updated, first);
-    assert!(crl_serials(&updated, &ca).contains(&serial_of(&bob.cert)));
+    let updated = alice.crl.clone().expect("CrlUpdate");
+    assert!(
+        crl_serials(&updated, &ca).is_empty(),
+        "no client certificate in the clients' CRL"
+    );
 
     // Refused in the handshake, without a restart.
     assert_eq!(
         server.rejection(&bob).await,
         Some(common::TLS_CERTIFICATE_REVOKED)
     );
+    server.shutdown().await;
+}
+
+/// However many client certificates are revoked, the CRL clients get stays
+/// a replaced server leaf or two. It used to list every revoked certificate
+/// and stopped fitting a control frame past ~430 of them, and from then on
+/// clients silently stopped learning about a rotated server leaf.
+#[tokio::test]
+async fn the_crl_for_clients_stays_small_however_many_certificates_are_revoked() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let TestServer { dir, handle } = server;
+    handle.shutdown().await;
+    // 1000 revoked client certificates, as years of renames and revokes
+    // would leave them.
+    let users = dir.path().join("users.toml");
+    let mut text = std::fs::read_to_string(&users).unwrap();
+    for i in 0..1000u32 {
+        text.push_str(&format!(
+            "\n[user.{id}]\nname = \"gone-{i}\"\ncreated = \"2026-01-01T00:00:00Z\"\n\n\
+             [[user.{id}.cert]]\nfingerprint = \"{i:064x}\"\nissued = \"2026-01-01T00:00:00Z\"\n\
+             expires = \"2099-01-01T00:00:00Z\"\nrevoked = true\nserial = \"{serial:032x}\"\n",
+            id = 10_000 + i,
+            serial = 0x4000_0000_0000_0000_0000_0000_0000_0000u128 + u128::from(i),
+        ));
+    }
+    std::fs::write(&users, text).unwrap();
+    let config = icu_server::config::Config::for_test(dir.path());
+    let server = TestServer {
+        handle: icu_server::run(config).await.expect("restarts"),
+        dir,
+    };
+
+    let before = server_leaf(&server.connect(&alice).await.expect("connect").conn);
+    let response = server.handle.admin(AdminRequest::RotateServerCert).await;
+    assert!(matches!(response, AdminResponse::Ok), "{response:?}");
+    let mut client = server.connect(&alice).await.expect("connect");
+    client.hello("alice").await;
+    client.expect_silence().await;
+    let crl = client
+        .crl
+        .clone()
+        .expect("the CRL still reaches the client");
+    assert_eq!(crl_serials(&crl, &server.ca()), vec![serial_of(&before)]);
     server.shutdown().await;
 }
 
@@ -867,6 +994,87 @@ async fn rotating_the_server_certificate_revokes_the_old_one_live() {
     let serials = crl_serials(&crl, &server.ca());
     assert!(serials.contains(&serial_of(&old_leaf)));
     assert!(!serials.contains(&serial_of(&new_leaf)));
+    server.shutdown().await;
+}
+
+/// A rotation that fails — here the new certificate cannot be written —
+/// leaves the live leaf in use and off the CRL. Revoking it first, as
+/// before, locked every client out until a later rotation succeeded.
+#[tokio::test]
+async fn a_failed_rotation_leaves_the_live_server_certificate_alone() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let live = server_leaf(&server.connect(&alice).await.expect("connect").conn);
+
+    // A directory where the atomic writes put their temp files: whichever
+    // of the pair is written first, the write fails.
+    let dir = server.dir.path();
+    for tmp in [".server.crt.tmp", ".server.key.tmp"] {
+        std::fs::create_dir(dir.join(tmp)).expect("block the write");
+    }
+    let response = server.handle.admin(AdminRequest::RotateServerCert).await;
+    for tmp in [".server.crt.tmp", ".server.key.tmp"] {
+        std::fs::remove_dir(dir.join(tmp)).expect("unblock");
+    }
+    assert!(
+        matches!(response, AdminResponse::Error { .. }),
+        "{response:?}"
+    );
+    // Whatever rebuilds the CRL next — a revoke, a registration, a restart.
+    icu_server::endpoint::reload_tls(server.handle.server())
+        .await
+        .expect("reload");
+
+    let mut client = server.connect(&alice).await.expect("connect");
+    assert_eq!(server_leaf(&client.conn), live, "still the same leaf");
+    client.hello("alice").await;
+    client.expect_silence().await;
+    let serials = crl_serials(client.crl.as_ref().expect("CrlUpdate"), &server.ca());
+    assert!(
+        !serials.contains(&serial_of(&live)),
+        "the live leaf must not be on the CRL"
+    );
+
+    // Once writing works again, the rotation goes through.
+    let response = server.handle.admin(AdminRequest::RotateServerCert).await;
+    assert!(matches!(response, AdminResponse::Ok), "{response:?}");
+    server.shutdown().await;
+}
+
+/// A crash between the two writes of a rotation leaves a server key that
+/// does not match the certificate. The next start issues a new leaf instead
+/// of failing forever, and the one it found is on the CRL.
+#[tokio::test]
+async fn a_server_key_that_does_not_match_is_repaired_at_startup() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let old = server_leaf(&server.connect(&alice).await.expect("connect").conn);
+    let dir = server.dir.path().to_path_buf();
+    let TestServer { dir: tmp, handle } = server;
+    handle.shutdown().await;
+    icu_server::store::write_private(
+        &dir.join("server.key"),
+        &rcgen::KeyPair::generate().unwrap().serialize_pem(),
+    )
+    .unwrap();
+    let server = TestServer {
+        handle: icu_server::run(icu_server::config::Config::for_test(&dir))
+            .await
+            .expect("the server starts"),
+        dir: tmp,
+    };
+
+    let mut client = server.connect(&alice).await.expect("connect");
+    let new = server_leaf(&client.conn);
+    assert_ne!(new, old);
+    client.hello("alice").await;
+    client.expect_silence().await;
+    let serials = crl_serials(client.crl.as_ref().expect("CrlUpdate"), &server.ca());
+    assert!(
+        serials.contains(&serial_of(&old)),
+        "the replaced leaf is revoked"
+    );
+    assert!(!serials.contains(&serial_of(&new)));
     server.shutdown().await;
 }
 

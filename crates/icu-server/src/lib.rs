@@ -41,7 +41,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{sync::watch, task::AbortHandle};
 
 pub use crate::{
     admin::{AdminRequest, AdminResponse},
@@ -56,6 +56,10 @@ use crate::{
     room::{Counters, Room},
     store::Store,
 };
+
+/// Live connections by client certificate fingerprint, each with the user
+/// it belongs to.
+pub type CertSlots = std::collections::HashMap<String, (icu_proto::UserId, quinn::Connection)>;
 
 /// Everything the connection tasks share.
 pub struct Server {
@@ -74,16 +78,30 @@ pub struct Server {
     pub ip_limits: std::sync::Mutex<IpLimits>,
     /// `LossReport` aggregation per speaker.
     pub loss: std::sync::Mutex<LossTracker>,
-    /// Connection tasks alive right now, handshaking or established, over
-    /// all endpoints (`limits.max_connections`).
+    /// In-band invitations per admin (`limits.invites_per_admin_per_hour`).
+    pub invite_budget:
+        std::sync::Mutex<std::collections::HashMap<icu_proto::UserId, limits::TokenBucket>>,
+    /// Handshakes in flight right now, over all endpoints
+    /// (`limits.max_handshakes`).
+    pub handshakes: std::sync::atomic::AtomicUsize,
+    /// Established connections right now, over all endpoints
+    /// (`limits.max_connections`).
     pub open_connections: std::sync::atomic::AtomicUsize,
-    /// The one live connection per client certificate fingerprint; a newer
-    /// one replaces it (`PROTOCOL.md` §7).
-    pub live_certs: std::sync::Mutex<std::collections::HashMap<String, quinn::Connection>>,
+    /// The one live connection per client certificate fingerprint, with its
+    /// user; a newer one replaces it (`PROTOCOL.md` §7). Room sessions, and
+    /// those still waiting for `Hello`.
+    pub live_certs: std::sync::Mutex<CertSlots>,
+    /// The same for sessions outside the room — registration and renew-only
+    /// (`PROTOCOL.md` §2.3) — with a server wide cap
+    /// ([`icu_proto::limits::MAX_ROOMLESS_SESSIONS`]). Separate, so renewing
+    /// an expired certificate never replaces a room session that still runs
+    /// on it.
+    pub roomless: std::sync::Mutex<CertSlots>,
     /// The QUIC endpoints, so a new CRL or server leaf reaches the TLS
     /// config without a restart (`endpoint::reload_tls`). Empty offline.
     pub endpoints: Vec<quinn::Endpoint>,
-    /// The current CRL, DER, as last sent to clients (`CrlUpdate`).
+    /// The current CRL for clients — replaced server leaves only — DER, as
+    /// last sent to them (`CrlUpdate`).
     pub crl: std::sync::RwLock<Vec<u8>>,
     /// Flipped to `true` on shutdown.
     pub shutdown: watch::Sender<bool>,
@@ -109,12 +127,13 @@ impl Server {
     /// commands running while no server is up (§5).
     pub fn offline(config: Config) -> Result<Arc<Server>> {
         config.validate()?;
-        let store = Store::open(&config.paths.state_dir)?;
-        let ca = Ca::load_or_create(
+        let mut store = Store::open(&config.paths.state_dir)?;
+        let mut ca = Ca::load_or_create(
             &config.paths.state_dir,
             &config.tls,
             &config.server.server_name,
         )?;
+        admin::record_retired_leaves(&mut store, &mut ca)?;
         Ok(Arc::new(Server::new(
             config,
             store,
@@ -138,8 +157,11 @@ impl Server {
             room: Room::new(config.server.max_users),
             ip_limits: std::sync::Mutex::new(IpLimits::new(&config.limits)),
             loss: std::sync::Mutex::new(LossTracker::default()),
+            invite_budget: std::sync::Mutex::new(std::collections::HashMap::new()),
+            handshakes: std::sync::atomic::AtomicUsize::new(0),
             open_connections: std::sync::atomic::AtomicUsize::new(0),
-            live_certs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            live_certs: std::sync::Mutex::new(CertSlots::new()),
+            roomless: std::sync::Mutex::new(CertSlots::new()),
             endpoints,
             crl: std::sync::RwLock::new(crl),
             counters: Counters::default(),
@@ -162,11 +184,14 @@ impl Server {
     }
 }
 
+/// How long shutdown waits for closed connections to drain.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(3);
+
 /// A running server.
 pub struct Handle {
     server: Arc<Server>,
     addrs: Vec<SocketAddr>,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: Vec<AbortHandle>,
     admin_socket: Option<std::path::PathBuf>,
 }
 
@@ -224,9 +249,17 @@ impl Handle {
             let _ = std::fs::remove_file(path);
         }
         // Dropping the Arc releases the Store and with it `flock(state.lock)`,
-        // but only once every task holding a clone is gone.
-        for endpoint in &self.server.endpoints {
-            endpoint.wait_idle().await;
+        // but only once every task holding a clone is gone. The wait for the
+        // endpoints to drain is bounded: a closed connection whose peer never
+        // answers — a stalled handshake, a flood — lingers for three probe
+        // timeouts with their backoff, which held a stop up for a minute.
+        let drained = async {
+            for endpoint in &self.server.endpoints {
+                endpoint.wait_idle().await;
+            }
+        };
+        if tokio::time::timeout(SHUTDOWN_DRAIN, drained).await.is_err() {
+            tracing::info!("connections still draining, not waiting for them");
         }
     }
 }
@@ -244,18 +277,20 @@ pub async fn run(config: Config) -> Result<Handle> {
     if purged > 0 {
         tracing::info!(purged, "dropped expired registrations");
     }
-    let ca = Ca::load_or_create(
+    let mut ca = Ca::load_or_create(
         &config.paths.state_dir,
         &config.tls,
         &config.server.server_name,
     )?;
+    // A server leaf replaced while loading goes on the CRL built below.
+    admin::record_retired_leaves(&mut store, &mut ca)?;
 
     // 5–7: TLS, QUIC, one endpoint per listen address.
     // The CRL is rebuilt from the store on every start, so revocations made
     // offline (CLI without a running server) are in force from the first
     // handshake.
-    let crl = endpoint::build_crl(&mut store, &ca)?;
-    let quic_config = endpoint::server_config(&config, &ca, &crl)?;
+    let crls = endpoint::build_crls(&mut store, &ca)?;
+    let quic_config = endpoint::server_config(&config, &ca, &crls.handshake)?;
     let mut endpoints = Vec::new();
     let mut addrs = Vec::new();
     for addr in &config.server.listen {
@@ -264,16 +299,22 @@ pub async fn run(config: Config) -> Result<Handle> {
         endpoints.push(endpoint);
     }
 
-    let server = Arc::new(Server::new(config, store, ca, endpoints, crl.to_vec()));
+    let server = Arc::new(Server::new(
+        config,
+        store,
+        ca,
+        endpoints,
+        crls.clients.to_vec(),
+    ));
 
     let mut tasks = Vec::new();
     for endpoint in &server.endpoints {
-        tasks.push(tokio::spawn(endpoint::accept_loop(
-            server.clone(),
-            endpoint.clone(),
-        )));
+        tasks.push(spawn_logged(
+            "accept loop",
+            endpoint::accept_loop(server.clone(), endpoint.clone()),
+        ));
     }
-    tasks.push(tokio::spawn(housekeeping(server.clone())));
+    tasks.push(spawn_logged("housekeeping", housekeeping(server.clone())));
 
     // 8: admin socket. Not being able to create it is not fatal — the server
     // still serves; only the CLI is then unavailable (deviation, see report).
@@ -335,7 +376,7 @@ async fn housekeeping(server: Arc<Server>) {
         // leaf is renewed before it expires, because an expired leaf locks
         // every client out and only the server can fix it.
         if prune_counter.is_multiple_of(36_000) {
-            tokio::spawn(check_cert_expiry(server.clone()));
+            spawn_logged("certificate check", check_cert_expiry(server.clone()));
         }
 
         prune_counter += 1;
@@ -397,6 +438,33 @@ fn renewal_due(days_left: Option<i64>, validity_days: u32, cap_days: i64) -> boo
     days_left.is_none_or(|left| left < threshold)
 }
 
+/// Spawns `task` and watches its `JoinHandle` instead of dropping it, so a
+/// panic in it is logged with `what` rather than lost. With the server's
+/// `panic = "unwind"` (`[profile.release-server]`) a panic ends only this
+/// task; the process and every other connection keep running. Returns the
+/// handle to abort the task with.
+pub(crate) fn spawn_logged<F>(what: impl std::fmt::Display + Send + 'static, task: F) -> AbortHandle
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = tokio::spawn(task);
+    let abort = handle.abort_handle();
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                let payload = e.into_panic();
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                tracing::error!(task = %what, panic = %message, "task panicked, the server keeps running");
+            }
+        }
+    });
+    abort
+}
+
 /// Locks a `std` mutex, recovering from poisoning: the state behind every
 /// lock in this crate is a plain map or counter that stays consistent when a
 /// holder panics, so nothing is gained by propagating the panic.
@@ -416,4 +484,22 @@ pub fn init_tracing(log: &config::LogSection) {
         tracing::subscriber::set_global_default(builder.finish())
     };
     let _ = result;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic in a task spawned this way ends that task only: it is
+    /// reported, not propagated, and the runtime keeps serving.
+    #[tokio::test]
+    async fn a_panicking_task_is_contained() {
+        spawn_logged("test task", async { panic!("boom") });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        spawn_logged("next task", async move {
+            let _ = tx.send(42);
+        });
+        assert_eq!(rx.await.ok(), Some(42));
+        tokio::task::yield_now().await;
+    }
 }

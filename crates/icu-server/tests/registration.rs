@@ -192,3 +192,66 @@ async fn an_invited_user_is_pending_until_registered() {
     assert_eq!(pending(&users, "guest"), Some(false));
     server.shutdown().await;
 }
+
+/// Sends `CreateInviteRequest` and returns the `Error` code, `None` when a
+/// bundle came back.
+async fn invite_code(client: &mut common::Client) -> Option<u32> {
+    client
+        .send_msg(&ControlMsg::CreateInviteRequest {
+            name: String::new(),
+            ttl_s: 0,
+        })
+        .await;
+    match client
+        .recv_matching(|m| {
+            matches!(
+                m,
+                ControlMsg::CreateInviteResponse { .. } | ControlMsg::Error { .. }
+            )
+        })
+        .await
+    {
+        Some(ControlMsg::Error { code, .. }) => Some(code),
+        Some(_) => None,
+        None => panic!("no answer"),
+    }
+}
+
+/// Every open invitation is a user in `users.toml` until it is confirmed or
+/// expires: their number is capped, over every way in.
+#[tokio::test]
+async fn open_invitations_are_capped() {
+    let server = TestServer::start_with(|c| c.limits.max_pending_invites = Some(2)).await;
+    let mut admin = admin_client(&server).await;
+    assert_eq!(invite_code(&mut admin).await, None);
+    assert_eq!(invite_code(&mut admin).await, None);
+    assert_eq!(invite_code(&mut admin).await, Some(ec::RATE_LIMITED));
+    assert!(!ec::is_fatal(ec::RATE_LIMITED));
+
+    // The host's CLI is held to it as well.
+    let answer = server
+        .handle
+        .admin(icu_server::AdminRequest::Invite {
+            name: String::new(),
+            ttl_s: None,
+        })
+        .await;
+    assert!(
+        matches!(&answer, icu_server::AdminResponse::Error { error, .. } if error == "RATE_LIMITED"),
+        "{answer:?}"
+    );
+    server.shutdown().await;
+}
+
+/// An admin mints at most `limits.invites_per_admin_per_hour` bundles
+/// in-band; the host's CLI is not limited.
+#[tokio::test]
+async fn in_band_invitations_are_rate_limited_per_admin() {
+    let server = TestServer::start_with(|c| c.limits.invites_per_admin_per_hour = 2).await;
+    let mut admin = admin_client(&server).await;
+    assert_eq!(invite_code(&mut admin).await, None);
+    assert_eq!(invite_code(&mut admin).await, None);
+    assert_eq!(invite_code(&mut admin).await, Some(ec::RATE_LIMITED));
+    let _ = server.invite("").await;
+    server.shutdown().await;
+}

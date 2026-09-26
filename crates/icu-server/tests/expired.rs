@@ -205,6 +205,152 @@ async fn an_expired_certificate_from_another_ca_fails_the_handshake() {
     server.shutdown().await;
 }
 
+/// A renew-only session on `identity`, past its `Welcome` and the
+/// `RENEW_REQUIRED` that follows it.
+async fn renew_only_session(server: &TestServer, identity: &Identity) -> common::Client {
+    let mut client = server.connect(identity).await.expect("connect");
+    client.hello("alice").await;
+    assert!(matches!(
+        client.recv_msg().await,
+        ControlMsg::Error {
+            code: ec::RENEW_REQUIRED,
+            ..
+        }
+    ));
+    client
+}
+
+/// One renew-only session per certificate, the newest wins — like room
+/// sessions, but in a table of their own (`PROTOCOL.md` §7).
+#[tokio::test]
+async fn a_second_renew_only_session_replaces_the_first() {
+    let (server, alice) = expired_user("alice").await;
+    let first = renew_only_session(&server, &alice).await;
+    let _second = renew_only_session(&server, &alice).await;
+    assert_eq!(first.closed_code().await, Some(ec::SESSION_REPLACED));
+    server.shutdown().await;
+}
+
+/// Kick, disable and revoke reach a renew-only session too, although it is
+/// not in the room.
+#[tokio::test]
+async fn kick_disable_and_revoke_close_a_renew_only_session() {
+    let (server, alice) = expired_user("alice").await;
+    let user = || "alice".to_string();
+
+    let session = renew_only_session(&server, &alice).await;
+    let kicked = server
+        .handle
+        .admin(AdminRequest::Kick { user: user() })
+        .await;
+    assert!(
+        matches!(kicked, AdminResponse::Kick { closed: 1, .. }),
+        "{kicked:?}"
+    );
+    assert_eq!(session.closed_code().await, Some(ec::KICKED));
+
+    let session = renew_only_session(&server, &alice).await;
+    let disabled = server
+        .handle
+        .admin(AdminRequest::Disable { user: user() })
+        .await;
+    assert!(
+        matches!(disabled, AdminResponse::Disable { closed: 1, .. }),
+        "{disabled:?}"
+    );
+    assert_eq!(session.closed_code().await, Some(ec::AUTH_DISABLED));
+    server
+        .handle
+        .admin(AdminRequest::Enable { user: user() })
+        .await;
+
+    let session = renew_only_session(&server, &alice).await;
+    let revoked = server
+        .handle
+        .admin(AdminRequest::Revoke { user: user() })
+        .await;
+    assert!(
+        matches!(revoked, AdminResponse::Revoke { closed: 1, .. }),
+        "{revoked:?}"
+    );
+    assert_eq!(session.closed_code().await, Some(ec::KICKED));
+    server.shutdown().await;
+}
+
+/// A copy of an expired certificate whose renew-only session is still open
+/// when its owner's successor logs in is closed with it: the retirement
+/// reaches renew-only sessions as well (`PROTOCOL.md` §2.2 Nr. 10).
+#[tokio::test]
+async fn a_successor_login_closes_a_renew_only_session_on_the_old_certificate() {
+    let (server, alice) = expired_user("alice").await;
+    let mut owner = renew_only_session(&server, &alice).await;
+    owner
+        .send_msg(&ControlMsg::RenewRequest {
+            csr_der: renewal_csr(&alice, "alice"),
+        })
+        .await;
+    let ControlMsg::RenewResponse { leaf_der } = owner.recv_msg().await else {
+        panic!("expected RenewResponse");
+    };
+    owner.conn.close(0u32.into(), b"");
+    let renewed = Identity {
+        cert: CertificateDer::from(leaf_der),
+        ..alice.clone()
+    };
+
+    let copy = renew_only_session(&server, &alice).await;
+    let mut successor = server.connect(&renewed).await.expect("connect");
+    successor.hello("alice").await;
+    assert_eq!(copy.closed_code().await, Some(ec::AUTH_REVOKED));
+    server.shutdown().await;
+}
+
+/// A renew-only session is admitted again for its `RenewRequest`: when its
+/// certificate was retired after the session opened, it gets no successor
+/// and the session ends, whatever else would have closed it.
+#[tokio::test]
+async fn a_retired_certificate_does_not_renew_on_a_session_opened_before() {
+    use icu_server::store::{fingerprint, now, rfc3339, CertRecord};
+
+    let (server, alice) = expired_user("alice").await;
+    let mut copy = renew_only_session(&server, &alice).await;
+    {
+        // What a successor's first login does, minus closing connections.
+        let mut store = server.handle.server().store.lock().await;
+        let (user_id, _, _) = store
+            .by_fingerprint(&fingerprint(&alice.cert))
+            .expect("alice's certificate is known");
+        let successor = CertRecord {
+            fingerprint: "00".repeat(32),
+            cn: "alice".into(),
+            issued: rfc3339(now()),
+            expires: rfc3339(now() + std::time::Duration::from_secs(86_400)),
+            revoked: false,
+            renewed: None,
+            registration: false,
+            superseded: false,
+            serial: None,
+        };
+        store.add_cert(user_id, successor, None, false).unwrap();
+        let retired = store
+            .retire_predecessors(user_id, &"00".repeat(32))
+            .unwrap();
+        assert_eq!(retired, vec![fingerprint(&alice.cert)]);
+    }
+    copy.send_msg(&ControlMsg::RenewRequest {
+        csr_der: renewal_csr(&alice, "alice"),
+    })
+    .await;
+    assert!(
+        copy.recv_timeout(Duration::from_secs(2))
+            .await
+            .is_none_or(|m| !matches!(m, ControlMsg::RenewResponse { .. })),
+        "no certificate for a retired one"
+    );
+    assert_eq!(copy.closed_code().await, Some(ec::AUTH_REVOKED));
+    server.shutdown().await;
+}
+
 /// Renames `identity` to `name` on a fresh session and returns the new leaf.
 async fn rename(server: &TestServer, identity: &Identity, old: &str, name: &str) -> Vec<u8> {
     let mut client = server.connect(identity).await.expect("connect");

@@ -93,9 +93,19 @@ pub struct LimitsSection {
     pub handshakes_per_ip_per_s: u32,
     /// Handshakes per second, server wide.
     pub handshakes_global_per_s: u32,
-    /// Open connections, handshaking or established, before new ones are
-    /// refused.
+    /// Handshakes in flight, over all listen addresses, before new ones are
+    /// refused. Above `HANDSHAKES_IN_FLIGHT_RETRY` (32), or a flood of
+    /// unvalidated handshakes could take every slot before Retry sets in.
+    pub max_handshakes: u32,
+    /// Established connections before a completed handshake is closed with
+    /// `SERVER_FULL`; at least `2 x max_users`.
     pub max_connections: u32,
+    /// Invitations not yet confirmed, before a new one is refused with
+    /// `RATE_LIMITED`. Unset: `2 x max_users`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_pending_invites: Option<u32>,
+    /// Bundles one admin may mint per hour in-band (`CreateInviteRequest`).
+    pub invites_per_admin_per_hour: u32,
 }
 
 impl Default for LimitsSection {
@@ -110,7 +120,10 @@ impl Default for LimitsSection {
             enroll_global_per_min: pl::ENROLL_GLOBAL_PER_MIN,
             handshakes_per_ip_per_s: pl::HANDSHAKES_PER_IP_PER_S,
             handshakes_global_per_s: pl::HANDSHAKES_GLOBAL_PER_S,
+            max_handshakes: pl::MAX_HANDSHAKES,
             max_connections: pl::MAX_CONNECTIONS,
+            max_pending_invites: None,
+            invites_per_admin_per_hour: pl::INVITES_PER_ADMIN_PER_HOUR,
         }
     }
 }
@@ -198,6 +211,8 @@ pub struct TimingSection {
     pub max_idle_timeout_ms: u64,
     /// How long a QUIC handshake may take.
     pub handshake_timeout_ms: u64,
+    /// How long a video frame may take to arrive, header and payload.
+    pub video_frame_timeout_ms: u64,
 }
 
 impl Default for TimingSection {
@@ -211,6 +226,7 @@ impl Default for TimingSection {
             shutdown_grace_ms: 1000,
             max_idle_timeout_ms: pl::MAX_IDLE_TIMEOUT_S * 1000,
             handshake_timeout_ms: pl::HANDSHAKE_TIMEOUT_S * 1000,
+            video_frame_timeout_ms: pl::VIDEO_FRAME_TIMEOUT_S * 1000,
         }
     }
 }
@@ -223,6 +239,10 @@ impl TimingSection {
     /// `handshake_timeout_ms` as a `Duration`.
     pub fn handshake_timeout(&self) -> Duration {
         Duration::from_millis(self.handshake_timeout_ms)
+    }
+    /// `video_frame_timeout_ms` as a `Duration`.
+    pub fn video_frame_timeout(&self) -> Duration {
+        Duration::from_millis(self.video_frame_timeout_ms)
     }
     /// `speaking_silence_ms` as a `Duration`.
     pub fn speaking_silence(&self) -> Duration {
@@ -241,6 +261,28 @@ impl TimingSection {
         Duration::from_millis(self.rate_violation_window_ms)
     }
 }
+
+/// Whether `host` is reserved for documentation and testing (RFC 2606,
+/// RFC 6761): `example.com`, `.net`, `.org` and their subdomains, and the
+/// top-level domains `.example`, `.invalid` and `.test`. `localhost` stays
+/// allowed — tests and trial runs on one machine use it — as do IP
+/// addresses.
+fn reserved_name(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let tld = host.rsplit('.').next().unwrap_or_default();
+    matches!(tld, "example" | "invalid" | "test")
+        || ["example.com", "example.net", "example.org"]
+            .iter()
+            .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+}
+
+/// Longest certificate lifetime a configuration may ask for: 100 years. The
+/// date arithmetic behind a larger one overflows.
+pub const MAX_VALIDITY_DAYS: u32 = 36_500;
+
+/// Longest value any `[timing]` entry may have: an hour. Every one of them
+/// is added to a clock reading, which overflows for an absurd value.
+pub const MAX_TIMING_MS: u64 = 3_600_000;
 
 impl Config {
     /// Loads and validates a configuration file.
@@ -276,6 +318,44 @@ impl Config {
         if self.server.listen.is_empty() {
             return Err(Error::msg("server.listen is empty"));
         }
+        // Upper bounds, before anything computes with them: an absurd
+        // lifetime or timeout overflows date or clock arithmetic, which is a
+        // panic, not an error.
+        for (key, days) in [
+            ("tls.ca_validity_days", self.tls.ca_validity_days),
+            ("tls.client_validity_days", self.tls.client_validity_days),
+            ("tls.server_validity_days", self.tls.server_validity_days),
+        ] {
+            if days > MAX_VALIDITY_DAYS {
+                return Err(Error::msg(format!(
+                    "{key} must be at most {MAX_VALIDITY_DAYS}, got {days}"
+                )));
+            }
+        }
+        let t = &self.timing;
+        for (key, ms) in [
+            ("timing.hello_timeout_ms", t.hello_timeout_ms),
+            ("timing.speaking_silence_ms", t.speaking_silence_ms),
+            ("timing.loss_report_ttl_ms", t.loss_report_ttl_ms),
+            (
+                "timing.keyframe_min_interval_ms",
+                t.keyframe_min_interval_ms,
+            ),
+            (
+                "timing.rate_violation_window_ms",
+                t.rate_violation_window_ms,
+            ),
+            ("timing.shutdown_grace_ms", t.shutdown_grace_ms),
+            ("timing.max_idle_timeout_ms", t.max_idle_timeout_ms),
+            ("timing.handshake_timeout_ms", t.handshake_timeout_ms),
+            ("timing.video_frame_timeout_ms", t.video_frame_timeout_ms),
+        ] {
+            if ms > MAX_TIMING_MS {
+                return Err(Error::msg(format!(
+                    "{key} must be at most {MAX_TIMING_MS}, got {ms}"
+                )));
+            }
+        }
         let server_name = self.server.server_name.trim();
         if server_name.is_empty() {
             return Err(Error::msg("server.server_name must not be empty"));
@@ -289,6 +369,17 @@ impl Config {
         if rustls::pki_types::ServerName::try_from(server_name.to_string()).is_err() {
             return Err(Error::msg(format!(
                 "server.server_name {server_name:?} is not a valid DNS name or IP address"
+            )));
+        }
+        // The shipped example must not end up in the CA and every
+        // certificate: fixing that later means a new CA, and every user
+        // registering again.
+        if reserved_name(server_name) {
+            return Err(Error::msg(format!(
+                "server.server_name {server_name:?} is a name reserved for examples \
+                 (RFC 2606); set it to the DNS name or IP address clients connect to, \
+                 before the first start or invite: it goes into the CA and every \
+                 certificate"
             )));
         }
         if self.server.max_users < 1 || self.server.max_users > pl::MAX_MAX_USERS {
@@ -311,10 +402,34 @@ impl Config {
                 "server.public_host {public_host:?} must be ASCII host:port"
             )));
         }
+        let host = public_host
+            .rsplit_once(':')
+            .map_or(public_host.as_str(), |(host, _)| host);
+        if reserved_name(host.trim_start_matches('[').trim_end_matches(']')) {
+            return Err(Error::msg(format!(
+                "server.public_host {public_host:?} names a host reserved for examples \
+                 (RFC 2606); set it to the host:port clients dial, it goes into every \
+                 client certificate"
+            )));
+        }
         Version::parse(&self.server.min_client)
             .context("server.min_client is not a semver version")?;
-        // Room for everybody plus handshakes in flight, or a full server
-        // would turn away its own users.
+        // A ceiling at or below the Retry threshold would let unvalidated
+        // handshakes, which may come from spoofed addresses, take every slot.
+        if self.limits.max_handshakes as usize <= pl::HANDSHAKES_IN_FLIGHT_RETRY {
+            return Err(Error::msg(format!(
+                "limits.max_handshakes must be above {}, got {}",
+                pl::HANDSHAKES_IN_FLIGHT_RETRY,
+                self.limits.max_handshakes
+            )));
+        }
+        if self.limits.max_pending_invites == Some(0) {
+            return Err(Error::msg(
+                "limits.max_pending_invites must be at least 1 (unset: 2 x max_users)",
+            ));
+        }
+        // Room for everybody plus connections that have not said `Hello`
+        // yet, or a full server would turn away its own users.
         if self.limits.max_connections < u32::from(self.server.max_users) * 2 {
             return Err(Error::msg(format!(
                 "limits.max_connections must be at least 2 x max_users = {}, got {}",
@@ -356,6 +471,14 @@ impl Config {
         } else {
             format!("{host}:{port}")
         }
+    }
+
+    /// How many invitations may be open (issued, not confirmed) at once:
+    /// `limits.max_pending_invites`, else `2 x max_users`.
+    pub fn max_pending_invites(&self) -> usize {
+        self.limits
+            .max_pending_invites
+            .unwrap_or(2 * u32::from(self.server.max_users)) as usize
     }
 
     /// Path of the admin socket.
@@ -431,12 +554,53 @@ server_validity_days = 365
 level = "info"
 format = "text"
 "#;
-        let config: Config = toml::from_str(text).unwrap();
+        let mut config: Config = toml::from_str(text).unwrap();
+        // The example names are placeholders: taken as they are, they would
+        // end up in the CA and every certificate.
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("server.server_name"), "{err}");
+        config.server.server_name = "icu.home.arpa".into();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("server.public_host"), "{err}");
+        config.server.public_host = "icu.home.arpa:4711".into();
         config.validate().unwrap();
         assert_eq!(config.server.listen.len(), 2);
         assert_eq!(config.server.max_users, 16);
-        assert_eq!(config.public_host(), "icu.example.org:4711");
+        assert_eq!(config.public_host(), "icu.home.arpa:4711");
         assert_eq!(config.admin_socket(), Path::new("/run/icu/admin.sock"));
+    }
+
+    #[test]
+    fn reserved_example_names_are_refused() {
+        for (name, reserved) in [
+            ("icu.example.org", true),
+            ("example.com", true),
+            ("EXAMPLE.NET.", true),
+            ("chat.example", true),
+            ("host.invalid", true),
+            ("icu.test", true),
+            ("localhost", false),
+            ("127.0.0.1", false),
+            ("::1", false),
+            ("icu.home.arpa", false),
+            ("myexample.org", false),
+            ("example.org.de", false),
+            ("testing.net", false),
+        ] {
+            assert_eq!(reserved_name(name), reserved, "{name}");
+        }
+        let mut c = base();
+        c.server.server_name = "icu.example.org".into();
+        c.server.public_host = "localhost:4711".into();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("server.server_name"), "{err}");
+        let mut c = base();
+        c.server.public_host = "icu.test:4711".into();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("server.public_host"), "{err}");
+        let mut c = base();
+        c.server.public_host = String::new();
+        assert!(c.validate().is_ok(), "falls back to localhost");
     }
 
     #[test]
@@ -486,7 +650,34 @@ format = "text"
         assert!(c.validate().is_err(), "below 2 x max_users");
 
         let mut c = base();
+        c.limits.max_handshakes = 32;
+        assert!(c.validate().is_err(), "not above the Retry threshold");
+        c.limits.max_handshakes = 33;
+        assert!(c.validate().is_ok());
+
+        let mut c = base();
         c.log.format = "xml".into();
+        assert!(c.validate().is_err());
+
+        // Upper bounds: absurd values would overflow date or clock
+        // arithmetic, a panic rather than an error.
+        let mut c = base();
+        c.tls.client_validity_days = MAX_VALIDITY_DAYS;
+        assert!(c.validate().is_ok());
+        c.tls.client_validity_days = u32::MAX;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_validity_days"), "{err}");
+        let mut c = base();
+        c.tls.ca_validity_days = MAX_VALIDITY_DAYS + 1;
+        assert!(c.validate().is_err());
+        let mut c = base();
+        c.timing.handshake_timeout_ms = MAX_TIMING_MS;
+        assert!(c.validate().is_ok());
+        c.timing.handshake_timeout_ms = u64::MAX;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("timing.handshake_timeout_ms"), "{err}");
+        let mut c = base();
+        c.timing.hello_timeout_ms = MAX_TIMING_MS + 1;
         assert!(c.validate().is_err());
 
         // `public_host` goes into client certificates as `icu://host:port`.

@@ -64,10 +64,12 @@ if [ "${SKIP_TESTS:-0}" != 1 ]; then
 fi
 
 log "server: static musl binary"
+# Profile release-server: release with panic = "unwind", so a panic ends one
+# connection instead of the whole server (Cargo.toml).
 run -e CARGO_TARGET_DIR=/src/target/musl "$RUST_ALPINE" sh -euc '
     apk add --no-cache musl-dev >/dev/null
-    cargo build --release --locked -p icu-server --target x86_64-unknown-linux-musl'
-SERVER_BIN=target/musl/x86_64-unknown-linux-musl/release/icu-server
+    cargo build --profile release-server --locked -p icu-server --target x86_64-unknown-linux-musl'
+SERVER_BIN=target/musl/x86_64-unknown-linux-musl/release-server/icu-server
 file "$SERVER_BIN" | grep -q 'static-pie linked' \
     || { echo "$SERVER_BIN is not static-pie" >&2; exit 1; }
 

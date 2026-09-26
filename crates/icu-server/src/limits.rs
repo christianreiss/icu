@@ -52,6 +52,12 @@ impl TokenBucket {
         TokenBucket::new(per_min / 60.0, per_min)
     }
 
+    /// A bucket allowing `per_hour` events per hour, burst `per_hour`.
+    pub fn per_hour(per_hour: u32) -> TokenBucket {
+        let per_hour = f64::from(per_hour.max(1));
+        TokenBucket::new(per_hour / 3600.0, per_hour)
+    }
+
     /// A byte bucket for `kbit_s`, smoothed over `window`
     /// (`PROTOCOL.md` §7: video bitrate, sliding over 2 s).
     pub fn bitrate(kbit_s: u32, window: Duration) -> TokenBucket {
@@ -159,6 +165,18 @@ pub fn limit_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// The IPv6 /48 an address belongs to, `None` for IPv4 (and IPv4-mapped):
+/// one customer usually holds a whole /48, so its /64s share a ceiling.
+fn prefix_48(ip: IpAddr) -> Option<IpAddr> {
+    match limit_key(ip) {
+        IpAddr::V4(_) => None,
+        IpAddr::V6(v6) => {
+            let mask = u128::MAX << (128 - 48);
+            Some(IpAddr::V6((u128::from(v6) & mask).into()))
+        }
+    }
+}
+
 /// Per-IP buckets, shared across connections. Keyed by [`limit_key`].
 #[derive(Debug)]
 pub struct IpLimits {
@@ -168,6 +186,12 @@ pub struct IpLimits {
     global_handshakes: TokenBucket,
     handshakes_per_s: u32,
     enroll_per_min: u32,
+    /// Validated handshakes in flight per [`limit_key`]. Entries go when
+    /// their count drops to zero, so the map holds at most one entry per
+    /// handshake in flight.
+    in_flight: HashMap<IpAddr, u32>,
+    /// The same per IPv6 /48 ([`prefix_48`]).
+    in_flight_48: HashMap<IpAddr, u32>,
 }
 
 impl IpLimits {
@@ -180,6 +204,53 @@ impl IpLimits {
             global_handshakes: TokenBucket::per_second(limits.handshakes_global_per_s),
             handshakes_per_s: limits.handshakes_per_ip_per_s,
             enroll_per_min: limits.enroll_per_ip_per_min,
+            in_flight: HashMap::new(),
+            in_flight_48: HashMap::new(),
+        }
+    }
+
+    /// Whether a validated source may start one more handshake: fewer than
+    /// [`HANDSHAKES_IN_FLIGHT_PER_IP`](icu_proto::limits::HANDSHAKES_IN_FLIGHT_PER_IP)
+    /// of its own are in flight, and for IPv6 fewer than
+    /// [`HANDSHAKES_IN_FLIGHT_PER_48`](icu_proto::limits::HANDSHAKES_IN_FLIGHT_PER_48)
+    /// from its /48. The rate bucket alone lets a source that answers the
+    /// Retry and then stalls pile up handshakes for as long as each one may
+    /// take; this caps what it holds at any moment.
+    ///
+    /// Only for addresses that passed the Retry: an unvalidated one may be
+    /// spoofed, and counting it would let anybody use up a victim's slots.
+    pub fn handshake_slot_free(&self, ip: IpAddr) -> bool {
+        use icu_proto::limits::{HANDSHAKES_IN_FLIGHT_PER_48, HANDSHAKES_IN_FLIGHT_PER_IP};
+        let own = self.in_flight.get(&limit_key(ip)).copied().unwrap_or(0);
+        let wide = prefix_48(ip)
+            .and_then(|p| self.in_flight_48.get(&p).copied())
+            .unwrap_or(0);
+        own < HANDSHAKES_IN_FLIGHT_PER_IP && wide < HANDSHAKES_IN_FLIGHT_PER_48
+    }
+
+    /// Books a validated handshake from `ip` as in flight; pair with
+    /// [`IpLimits::end_handshake`].
+    pub fn start_handshake(&mut self, ip: IpAddr) {
+        *self.in_flight.entry(limit_key(ip)).or_default() += 1;
+        if let Some(p) = prefix_48(ip) {
+            *self.in_flight_48.entry(p).or_default() += 1;
+        }
+    }
+
+    /// A handshake booked by [`IpLimits::start_handshake`] is over, however
+    /// it ended.
+    pub fn end_handshake(&mut self, ip: IpAddr) {
+        fn release(map: &mut HashMap<IpAddr, u32>, key: IpAddr) {
+            if let Some(n) = map.get_mut(&key) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    map.remove(&key);
+                }
+            }
+        }
+        release(&mut self.in_flight, limit_key(ip));
+        if let Some(p) = prefix_48(ip) {
+            release(&mut self.in_flight_48, p);
         }
     }
 
@@ -383,6 +454,72 @@ mod tests {
         assert!(
             limits.allow_handshake(known).is_some(),
             "known IPs keep their budget"
+        );
+    }
+
+    #[test]
+    fn a_source_holds_four_handshakes_at_a_time() {
+        let mut limits = IpLimits::new(&crate::config::LimitsSection::default());
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        for _ in 0..4 {
+            assert!(limits.handshake_slot_free(a));
+            limits.start_handshake(a);
+        }
+        assert!(
+            !limits.handshake_slot_free(a),
+            "fifth from the same address"
+        );
+        assert!(
+            limits.handshake_slot_free(b),
+            "another address is not affected"
+        );
+        limits.end_handshake(a);
+        assert!(
+            limits.handshake_slot_free(a),
+            "a finished one frees its slot"
+        );
+        for _ in 0..3 {
+            limits.end_handshake(a);
+        }
+        assert!(
+            limits.in_flight.is_empty(),
+            "no entry outlives its handshakes"
+        );
+    }
+
+    #[test]
+    fn ipv6_handshakes_in_flight_count_per_64_and_per_48() {
+        let mut limits = IpLimits::new(&crate::config::LimitsSection::default());
+        let one_64 = |i: u16| -> IpAddr { format!("2001:db8:1:2::{i:x}").parse().unwrap() };
+        for i in 0..4 {
+            assert!(limits.handshake_slot_free(one_64(i)));
+            limits.start_handshake(one_64(i));
+        }
+        assert!(
+            !limits.handshake_slot_free(one_64(9)),
+            "the /64 is one source"
+        );
+        // Three more /64s of the same /48 fill it up to 16.
+        for net in 3..6u16 {
+            for i in 0..4u16 {
+                let ip: IpAddr = format!("2001:db8:1:{net:x}::{i:x}").parse().unwrap();
+                assert!(limits.handshake_slot_free(ip), "{ip}");
+                limits.start_handshake(ip);
+            }
+        }
+        let fresh_64: IpAddr = "2001:db8:1:ff::1".parse().unwrap();
+        assert!(!limits.handshake_slot_free(fresh_64), "the /48 is full");
+        let other_48: IpAddr = "2001:db8:2::1".parse().unwrap();
+        assert!(limits.handshake_slot_free(other_48));
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        limits.start_handshake(mapped);
+        assert_eq!(
+            limits
+                .in_flight
+                .get(&"192.0.2.1".parse::<IpAddr>().unwrap()),
+            Some(&1),
+            "a mapped address counts as IPv4, without a /48"
         );
     }
 

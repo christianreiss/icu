@@ -269,6 +269,11 @@ impl Slot {
 /// out, so that the per sender-receiver drop rule can be applied without
 /// holding a half written stream open. At the target profile a frame is
 /// around 1.2 KiB.
+///
+/// Header and payload together have `timing.video_frame_timeout_ms`: a
+/// sender that opens a stream and stops writing would otherwise hold this
+/// task, its buffer and one of its few stream slots (`session::uni_task`)
+/// for as long as the connection lives.
 pub async fn video(
     server: Arc<Server>,
     sender: Session,
@@ -279,11 +284,24 @@ pub async fn video(
     let refuse = |recv: &mut quinn::RecvStream| {
         let _ = recv.stop(quinn::VarInt::from_u32(icu_proto::error::RATE_LIMITED));
     };
+    let deadline = tokio::time::Instant::now() + server.config.timing.video_frame_timeout();
+    let stalled = |recv: &mut quinn::RecvStream| {
+        Counters::inc(&server.counters.video_dropped_stalled);
+        tracing::debug!(sender, "video frame stalled, stream stopped");
+        refuse(recv);
+    };
 
     let mut header = [0u8; VIDEO_HEADER_LEN];
-    if let Err(e) = recv.read_exact(&mut header).await {
-        tracing::debug!(sender, error = %e, "video header read failed");
-        return;
+    match tokio::time::timeout_at(deadline, recv.read_exact(&mut header)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::debug!(sender, error = %e, "video header read failed");
+            return;
+        }
+        Err(_) => {
+            stalled(&mut recv);
+            return;
+        }
     }
     if VideoHeader::decode(&header).is_err() {
         Counters::inc(&server.counters.video_dropped_rate);
@@ -303,10 +321,14 @@ pub async fn video(
         return;
     }
 
-    let payload = match recv.read_to_end(VIDEO_MAX_FRAME).await {
-        Ok(payload) => payload,
-        Err(e) => {
+    let payload = match tokio::time::timeout_at(deadline, recv.read_to_end(VIDEO_MAX_FRAME)).await {
+        Ok(Ok(payload)) => payload,
+        Ok(Err(e)) => {
             tracing::debug!(sender, error = %e, "video frame read failed");
+            return;
+        }
+        Err(_) => {
+            stalled(&mut recv);
             return;
         }
     };
@@ -364,12 +386,10 @@ pub async fn video(
                 .entry(*session)
                 .or_insert_with(|| {
                     let slot = Arc::new(Slot::new(conn.stable_id()));
-                    tokio::spawn(forward_frames(
-                        server.clone(),
-                        conn.clone(),
-                        slot.clone(),
-                        *session,
-                    ));
+                    crate::spawn_logged(
+                        "video forwarder",
+                        forward_frames(server.clone(), conn.clone(), slot.clone(), *session),
+                    );
                     slot
                 })
                 .clone();
