@@ -56,6 +56,32 @@ through real Opus/H.264 codecs and authenticated QUIC connections.
 | rpm/deb installation | Canonical `packaging/smoke.sh`, server-only on **Debian 12 and AlmaLinux 10**, passed: binary, group/config permissions, unit validation, local configuration survives reinstall, state survives uninstall. These review artifacts are not published. |
 | `FROM scratch` container | Built the repository Dockerfile; status, invitation creation and certificate rotation passed as uid 65532 with a fresh named state volume. Test container and volume removed. |
 
+### Full-room concurrent media follow-up — 27 September
+
+`crates/icu-server/tests/media_load.rs` adds two explicit 30-second soaks with
+16 mutually authenticated clients, each sending 50 maximum-size (400-byte)
+audio payloads/s and 15 3000-byte video payloads/s (360 kbit/s). This tests
+relay capacity and payload integrity; the payloads are opaque test patterns,
+so it complements the separate real-codec test rather than measuring decoded
+quality. Application send rates stay fixed; client quality adaptation is not
+modeled here. Only enrollment/handshake setup burst limits are increased;
+production media limits remain unchanged.
+
+- All receivers healthy: **360,000/360,000 audio packets and
+  108,000/108,000 video frames** arrived with intact payloads; audio p99 **4.916 ms**.
+- One authenticated viewer advertises zero video-stream credit: all
+  **360,000 audio packets** and all **101,250 video frames** addressed to healthy
+  receivers arrived intact; audio p99 **4.767 ms**. The refusal was counted as
+  slow-receiver drops without disconnecting the remaining clients.
+- Both tests passed. Strict server Clippy and formatting checks passed.
+- These are two additional opt-in tests; they do not change the 596-test
+  default-suite result recorded above. Logs: `target/gate/evidence/icu-server-gate-media-load.log`.
+
+```sh
+cargo test --locked -p icu-server --test media_load -- --ignored --nocapture --test-threads=1
+# For longer runs (10–600 seconds): prefix ICU_MEDIA_SECONDS=300
+```
+
 ### Service test on biest.eulie.de
 
 An isolated unit, `icu-server-gate-test.service`, used the shipped security
