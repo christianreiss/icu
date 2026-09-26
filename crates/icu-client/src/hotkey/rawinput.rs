@@ -282,6 +282,11 @@ fn transitions(input: &RAWINPUT) -> Vec<(u16, bool)> {
         let kb = unsafe { input.data.keyboard };
         let flags = u32::from(kb.Flags);
         let pressed = flags & RI_KEY_BREAK == 0;
+        // 0xFF: the second half of a multi-code key (Pause sends its E1 1D
+        // with VK_PAUSE, then 45 with no key) — not NumLock.
+        if kb.VKey == 0xff {
+            return Vec::new();
+        }
         let code = if kb.VKey == VK_PAUSE.0 || flags & RI_KEY_E1 != 0 {
             (kb.VKey == VK_PAUSE.0).then_some(keys::KEY_PAUSE)
         } else if kb.MakeCode == 0 {
