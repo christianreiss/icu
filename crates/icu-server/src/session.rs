@@ -373,7 +373,10 @@ fn close_retired(server: &Arc<Server>, fingerprints: &[String]) {
 
 /// The store's admission of a presented certificate: known, not revoked, its
 /// user not disabled. Run once in [`authenticate`] and again in [`serve`].
-pub(crate) fn admit<'a>(store: &'a Store, fp: &str) -> Result<(UserId, &'a UserRecord, &'a CertRecord)> {
+pub(crate) fn admit<'a>(
+    store: &'a Store,
+    fp: &str,
+) -> Result<(UserId, &'a UserRecord, &'a CertRecord)> {
     let (user_id, user, cert) = store
         .by_fingerprint(fp)
         .ok_or_else(|| Error::coded(ec::AUTH_UNKNOWN_CERT, format!("unknown fingerprint {fp}")))?;

@@ -217,7 +217,11 @@ impl Decoder {
         let mut v: i32 = 0;
         // SAFETY: GET_COMPLEXITY writes one opus_int32.
         check(unsafe {
-            ffi::opus_decoder_ctl(self.inner.0, ffi::OPUS_GET_COMPLEXITY_REQUEST, &mut v as *mut i32)
+            ffi::opus_decoder_ctl(
+                self.inner.0,
+                ffi::OPUS_GET_COMPLEXITY_REQUEST,
+                &mut v as *mut i32,
+            )
         })?;
         Ok(v)
     }
@@ -236,7 +240,8 @@ impl Decoder {
         let frame = packet_samples(next_packet)
             .unwrap_or(self.last_frame)
             .min(out.len());
-        self.inner.decode_float(next_packet, &mut out[..frame], true)
+        self.inner
+            .decode_float(next_packet, &mut out[..frame], true)
     }
 
     /// Packet loss concealment for one frame.
@@ -319,7 +324,10 @@ mod tests {
             let bw = unsafe { ffi::opus_packet_get_bandwidth(pkt.as_ptr()) };
             let config = pkt[0] >> 3;
             assert_eq!(bw, ffi::OPUS_BANDWIDTH_FULLBAND, "TOC config {config}");
-            assert!((14..=15).contains(&config), "not hybrid FB: config {config}");
+            assert!(
+                (14..=15).contains(&config),
+                "not hybrid FB: config {config}"
+            );
             voiced += 1;
         }
         assert!(voiced > 50);
@@ -386,7 +394,9 @@ mod tests {
         };
         let (plain, _) = size_at(0);
         let (with_fec, packets) = size_at(200);
-        eprintln!("mean packet {plain:.0} B at the FEC floor, {with_fec:.0} B with a 20 % loss hint");
+        eprintln!(
+            "mean packet {plain:.0} B at the FEC floor, {with_fec:.0} B with a 20 % loss hint"
+        );
         assert!(
             with_fec >= plain,
             "loss hint shrank packets: {plain:.0} → {with_fec:.0} B"
@@ -492,7 +502,10 @@ mod tests {
         let (fec, plc, n) = fec_vs_plc_at_default_hint();
         eprintln!("{n} frames at hint 0: FEC {fec:.2}, PLC {plc:.2}");
         assert!(n > 50);
-        assert!(fec > plc + 0.15, "FEC ({fec:.2}) hardly beats PLC ({plc:.2})");
+        assert!(
+            fec > plc + 0.15,
+            "FEC ({fec:.2}) hardly beats PLC ({plc:.2})"
+        );
     }
 
     /// Mean RMS of three consecutive concealed frames relative to the
@@ -570,8 +583,12 @@ mod tests {
         for c in [0, 5, 6, 7] {
             let mut dec = Decoder::with_complexity(c).unwrap();
             let mut out = vec![0.0f32; 960];
-            let (mut t_dec, mut t_plc, mut n_dec, mut n_plc) =
-                (std::time::Duration::ZERO, std::time::Duration::ZERO, 0u32, 0u32);
+            let (mut t_dec, mut t_plc, mut n_dec, mut n_plc) = (
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                0u32,
+                0u32,
+            );
             for (i, p) in packets.iter().enumerate() {
                 let t = std::time::Instant::now();
                 if i % 10 == 9 {

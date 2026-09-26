@@ -823,7 +823,10 @@ mod tests {
         let mut enc = crate::camera::encoder(VideoTier::T0).unwrap();
         let data = enc.encode(&yuv).unwrap().to_vec();
         assert!(data.len() <= VIDEO_MAX_FRAME);
-        assert!(matches!(h264::check(&data), Err(h264::Reject::TooLarge { .. })));
+        assert!(matches!(
+            h264::check(&data),
+            Err(h264::Reject::TooLarge { .. })
+        ));
 
         let mut decoder = Decoder::new().unwrap();
         assert!(decode(&mut decoder, &data).is_none());
