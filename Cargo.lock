@@ -2505,6 +2505,7 @@ dependencies = [
  "opusic-sys",
  "pipewire",
  "quinn",
+ "raw-window-handle",
  "rcgen",
  "ringbuf",
  "rustls",

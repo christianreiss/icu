@@ -2,14 +2,14 @@
 //! Fenster anzeigen/Stumm/Taub/Beenden, in the words the main window uses.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, Once};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem},
-    Icon, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 use crate::engine::{AppState, Command, ConnStatus};
@@ -23,6 +23,74 @@ pub enum TrayEvent {
     Quit,
 }
 
+// The native libraries install their global handlers only once. Route those
+// handlers to the current tray so logout/rejoin cannot leave them connected to
+// the dropped window's channels and wake callback.
+static ACTIVE_EVENTS: Mutex<Option<Arc<EventTargets>>> = Mutex::new(None);
+static INSTALL_HANDLERS: Once = Once::new();
+
+struct EventTargets {
+    menu: mpsc::Sender<MenuId>,
+    tray: mpsc::Sender<TrayIconEvent>,
+    wake: Box<dyn Fn() + Send + Sync>,
+}
+
+struct EventRegistration(Arc<EventTargets>);
+
+impl EventRegistration {
+    fn new(
+        menu: mpsc::Sender<MenuId>,
+        tray: mpsc::Sender<TrayIconEvent>,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let targets = Arc::new(EventTargets {
+            menu,
+            tray,
+            wake: Box::new(wake),
+        });
+        *ACTIVE_EVENTS.lock().unwrap() = Some(targets.clone());
+        INSTALL_HANDLERS.call_once(|| {
+            MenuEvent::set_event_handler(Some(dispatch_menu));
+            TrayIconEvent::set_event_handler(Some(dispatch_tray));
+        });
+        Self(targets)
+    }
+}
+
+impl Drop for EventRegistration {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_EVENTS.lock().unwrap();
+        if active.as_ref().is_some_and(|a| Arc::ptr_eq(a, &self.0)) {
+            *active = None;
+        }
+    }
+}
+
+fn dispatch_menu(event: MenuEvent) {
+    let active = ACTIVE_EVENTS.lock().unwrap().clone();
+    if let Some(active) = active {
+        let _ = active.menu.send(event.id);
+        (active.wake)();
+    }
+}
+
+fn dispatch_tray(event: TrayIconEvent) {
+    if !matches!(
+        event,
+        TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        }
+    ) {
+        return;
+    }
+    let active = ACTIVE_EVENTS.lock().unwrap().clone();
+    if let Some(active) = active {
+        let _ = active.tray.send(event);
+        (active.wake)();
+    }
+}
+
 /// The tray.
 pub struct Tray {
     icon: TrayIcon,
@@ -31,6 +99,7 @@ pub struct Tray {
     show_id: MenuId,
     quit_id: MenuId,
     cmd: UnboundedSender<Command>,
+    _events: EventRegistration,
     menu_rx: mpsc::Receiver<MenuId>,
     tray_rx: mpsc::Receiver<TrayIconEvent>,
     /// `(connected, muted, deafened)` the icon and menu were last drawn
@@ -43,7 +112,11 @@ pub struct Tray {
 
 impl Tray {
     /// Creates the tray icon with its menu.
-    pub fn start(cmd: UnboundedSender<Command>, ctx: egui::Context) -> Result<Tray, String> {
+    pub fn start(
+        cmd: UnboundedSender<Command>,
+        ctx: egui::Context,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Tray, String> {
         let menu = Menu::new();
         let show = MenuItem::new("Fenster anzeigen", true, None);
         let mute = CheckMenuItem::new("Stumm", true, false, None);
@@ -56,27 +129,17 @@ impl Tray {
         let icon = TrayIconBuilder::new()
             .with_id("icu")
             .with_menu(Box::new(menu))
+            // On Windows a left-click menu competes with double-click
+            // restore and can keep the restored window in the background.
+            .with_menu_on_left_click(!cfg!(windows))
             .with_tooltip("ICU")
             .with_title("ICU")
             .with_icon(render_icon([0x9e, 0x9e, 0x9e], false))
             .build()
             .map_err(|e| e.to_string())?;
-        // With a handler installed, muda/tray-icon deliver events to the
-        // handler *instead of* the global receiver; forward them into our
-        // own channel and wake the window so `poll` runs promptly (also
-        // while the window is hidden, via `App::logic`).
         let (menu_tx, menu_rx) = mpsc::channel();
-        let ctx_menu = ctx.clone();
-        MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
-            let _ = menu_tx.send(ev.id);
-            ctx_menu.request_repaint();
-        }));
         let (tray_tx, tray_rx) = mpsc::channel();
-        let ctx_tray = ctx.clone();
-        TrayIconEvent::set_event_handler(Some(move |ev: TrayIconEvent| {
-            let _ = tray_tx.send(ev);
-            ctx_tray.request_repaint();
-        }));
+        let events = EventRegistration::new(menu_tx, tray_tx, wake);
         let host = Arc::new(AtomicBool::new(host_present()));
         watch_host(host.clone(), ctx);
         Ok(Tray {
@@ -86,6 +149,7 @@ impl Tray {
             mute,
             deafen,
             cmd,
+            _events: events,
             menu_rx,
             tray_rx,
             last: None,
@@ -116,7 +180,11 @@ impl Tray {
             }
         }
         while let Ok(ev) = self.tray_rx.try_recv() {
-            if let TrayIconEvent::DoubleClick { .. } = ev {
+            if let TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } = ev
+            {
                 out = Some(TrayEvent::ShowWindow);
             }
         }
@@ -270,4 +338,48 @@ fn render_icon(rgb: [u8; 3], bar: bool) -> Icon {
         }
     }
     Icon::from_rgba(rgba, n as u32, n as u32).expect("icon")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn native_handlers_follow_the_replacement_tray() {
+        let (first_tx, first_rx) = mpsc::channel();
+        let (first_tray, _) = mpsc::channel();
+        let first = EventRegistration::new(first_tx, first_tray, || {});
+        dispatch_menu(MenuEvent {
+            id: MenuId::new("first"),
+        });
+        assert_eq!(first_rx.try_recv().unwrap(), "first");
+
+        let (next_tx, next_rx) = mpsc::channel();
+        let (next_tray, _) = mpsc::channel();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let count = wakes.clone();
+        let next = EventRegistration::new(next_tx, next_tray, move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        });
+        // Finishing destruction of an older window must not unregister
+        // the replacement's handlers.
+        drop(first);
+        dispatch_menu(MenuEvent {
+            id: MenuId::new("replacement"),
+        });
+        assert_eq!(next_rx.try_recv().unwrap(), "replacement");
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(first_rx.try_recv().is_err());
+
+        drop(next);
+        dispatch_menu(MenuEvent {
+            id: MenuId::new("closed"),
+        });
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            next_rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+    }
 }

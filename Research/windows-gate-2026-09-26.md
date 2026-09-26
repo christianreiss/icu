@@ -37,6 +37,9 @@ were needed.
 | Windows audio workers did not release their MMCSS registrations explicitly. | A non-transferable guard keeps each registration alive for its worker and calls `AvRevertMmThreadCharacteristics` on that same thread before exit. |
 | Toast workers did not balance COM initialization. | Every successful initialization, including `S_FALSE`, is paired with `CoUninitialize`. |
 | Main, setup, settings and invitation windows could extend below the taskbar. | Windows windows are fitted to the usable monitor rectangle, with title-bar margins and capped minimum sizes. Subsequent growth respects available space. |
+| A tray double-click also opened the native menu, and a restored window could remain behind other apps. | Windows reserves left double-click for restore and right-click for the menu. After restoring, activate the exact main/enrollment window once; native tests showed winit could report active focus while Explorer still owned the foreground. |
+| Native tray menu actions could wait until the main window received another event. | The menu callback posts a native repaint as well as waking egui. Hidden mute/deafen now update the orange/red icon immediately; Show and Quit also work without clicking the main window. |
+| Recreating the tray after logout left library-global handlers pointing at the dropped window. | Install the handlers once and route events to the current tray through a scoped registration. A regression covers replacement and teardown without retaining the old wake callback. |
 | Close-to-tray kept rendering an invisible Win32 window. | Hidden Windows windows are also minimized so eframe skips rendering; restore explicitly removes minimization. Connected hidden CPU fell from about two cores to near idle in the VM. |
 | Minimized enrollment did not process handoff/completion; an idle invitation repainted continuously. | Handoff and enrollment completion run in `App::logic`, with wake callbacks. Only pending registration needs periodic polling. Idle invitation CPU fell from several cores to near idle. |
 | Attaching to a Windows parent console discarded inherited output redirection. | Preserve redirected stdin/stdout/stderr while attaching; CLI help, errors and pipes reach their intended destination. Native regression fails on the prior candidate and passes with the fix. |
@@ -46,14 +49,14 @@ The MMCSS cleanup follows the [Windows task-lifetime contract](https://learn.mic
 
 ## Verification
 
-- Linux: `cargo test --workspace --locked` — **593 passed, 0 failed,
+- Linux: `cargo test --workspace --locked` — **594 passed, 0 failed,
   5 ignored**, across 27 suites in the final rerun. Two playout continuity tests failed during
   a concurrent release build; the complete rerun without build load passed.
   Their assertions and thresholds were not weakened. The final Windows-only
   main-window bounds change also passed all nine UI layout tests.
 - Windows: cross-built client library tests executed natively on the VM
-  with `--test-threads=2` — **231 passed, 0 failed, 4 ignored** after
-  the stall fix. The added opt-in stopped-stream test passed separately
+  with `--test-threads=2` — **232 passed, 0 failed, 4 ignored** after
+  the tray follow-up. The added opt-in stopped-stream test passed separately
   in the interactive session (12 seconds).
 - Strict Clippy: Linux workspace and Windows client, `--all-targets --
   -D warnings`, passed. The existing cross-linker COMDAT warnings from
@@ -93,6 +96,25 @@ The MMCSS cleanup follows the [Windows task-lifetime contract](https://learn.mic
   changed the actual client state. Close-to-tray and a separate second
   launch restored the same process without another connection. A minimized
   invitation accepted a passport handoff and restored its preview.
+- Follow-up tray checks on 2026-09-27: minimize-on-close left the native
+  window visible and iconic; taskbar restore reopened usable settings.
+  Quit-on-close ended the process. Tray hide made the window invisible and
+  iconic. Left double-click, menu Show and second-launch handoff restored
+  the foreground; hidden mute/deafen changed the icon without any further
+  main-window input, and menu Quit ended the hidden process. The original
+  close setting was restored. An apparent Settings input freeze was traced
+  to exact-coordinate pointer jumps in the automation: winit suppresses
+  an unchanged pointer position after re-entry. The test helper now moves
+  through an intermediate point, matching ordinary pointer movement.
+- A fresh Windows 11 Enterprise evaluation VM, `icu-win11-gate`, was built
+  from the official 25H2 EN-US ISO, whose SHA-256 matched Microsoft's list
+  (`a61adeab895ef5a4db436e0a7011c92a2ff17bb0357f58b13bbc4062e535e7b9`).
+  Build 26200.6584, Secure Boot and TPM 2.0 were verified. It has 6 virtual
+  CPUs, 8 GiB RAM, HDA audio and Microsoft Basic Display Adapter, on the
+  isolated libvirt NAT at `192.168.122.156`. Defender signatures were updated;
+  real-time protection remains enabled. The same native library suite passed
+  **232 tests, 0 failed, 4 ignored** there. Package first-run and interactive
+  acceptance are still pending at this point.
 - A native Windows join toast was visible on the desktop.
 - Follow-up on 2026-09-27: main/settings windows stayed inside the work area
   at 125% scaling, then scaling was restored to 100%. This was one monitor.
