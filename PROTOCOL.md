@@ -59,9 +59,10 @@ Name:      String  UTF-8, 1–32 Bytes, in NFC; keine Steuer-, Format- (Bidi, Ze
                    und danach ausschließlich dadurch geändert, dass ein neues Zertifikat ausgestellt wird (§2.2 Nr. 9).
                    `users.toml` spiegelt den CN des zuletzt ausgestellten Zertifikats; dieser Spiegel füllt alle
                    Roster-Felder. Identität bleibt der Fingerprint, nie der Name.
-                   Eindeutig ist ein Name zum Ausstellungszeitpunkt, nicht über die Zeit: alte Zertifikate bleiben bis
-                   zum Ablauf gültig, also kann nach einer Umbenennung ein altes Zertifikat denselben CN tragen wie ein
-                   neuer Nutzer. Der CN ist deshalb kein Schlüssel.
+                   Eindeutig ist ein Name zum Ausstellungszeitpunkt, nicht über die Zeit: ein altes Zertifikat gilt
+                   nach einer Umbenennung weiter, bis sich das neue zum ersten Mal anmeldet (§2.2 Nr. 10), und ein
+                   abgelaufenes kann noch erneuert werden (§2.3.3); so kann ein altes Zertifikat denselben CN tragen
+                   wie ein neuer Nutzer. Der CN ist deshalb kein Schlüssel.
 UserInfo { user_id: UserId, session: Session, name: Name, flags: UserFlags }
 AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64000 }
 ```
