@@ -1719,9 +1719,11 @@ fn connection_lost(technical: &str) -> SessionEnd {
     ))
 }
 
-/// A control-stream write failed: the connection is gone.
-fn send_failed() -> SessionEnd {
-    connection_lost("send failed")
+/// A control-stream write failed: the connection is gone. Its close code,
+/// when there is one, says why — a write racing the server's `SHUTDOWN`
+/// must not turn a restart into an anonymous abort.
+fn send_failed(connection: &quinn::Connection) -> SessionEnd {
+    closed_end(connection).unwrap_or_else(|| connection_lost("send failed"))
 }
 
 /// Forgets everything scoped to one session: the connection the DSP thread
@@ -2451,7 +2453,7 @@ async fn run_session(
     );
 
     // Reader tasks.
-    let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ControlMsg>();
+    let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<Result<ControlMsg, String>>();
     let reader = tokio::spawn(control_reader(recv, ctrl_tx));
     let dg_reader = tokio::spawn(datagram_reader(connection.clone(), shared.clone()));
     let video_reader = tokio::spawn(crate::video::accept_loop(
@@ -2471,7 +2473,7 @@ async fn run_session(
             flags: local.flags.sanitized(),
         };
         if conn::write_msg(&mut send, &msg).await.is_err() {
-            return send_failed();
+            return send_failed(&connection);
         }
     }
 
@@ -2482,7 +2484,7 @@ async fn run_session(
         .await
         .is_err()
     {
-        return send_failed();
+        return send_failed(&connection);
     }
     let mut renew_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(3600),
@@ -2528,9 +2530,13 @@ async fn run_session(
     let end = loop {
         tokio::select! {
             msg = ctrl_rx.recv() => {
-                let Some(msg) = msg else {
-                    break closed_end(&connection)
-                        .unwrap_or_else(|| connection_lost("control stream ended"));
+                let msg = match msg {
+                    Some(Ok(msg)) => msg,
+                    Some(Err(detail)) => break protocol_violation(&connection, detail),
+                    None => {
+                        break closed_end(&connection)
+                            .unwrap_or_else(|| connection_lost("control stream ended"))
+                    }
                 };
                 if let Some(end) = handle_control(msg, shared, local, &mut pings).await {
                     break end;
@@ -2556,7 +2562,7 @@ async fn run_session(
                                     shared.state.send_modify(|s| s.name_error = Some(e));
                                 }
                                 Err(RenewSendError::Transport) => {
-                                    break send_failed();
+                                    break send_failed(&connection);
                                 }
                             }
                         }
@@ -2578,40 +2584,40 @@ async fn run_session(
                                 s.invite_error = Some(crate::problem::name_error_text(&e))
                             });
                         } else if conn::write_msg(&mut send, &ControlMsg::CreateInviteRequest { name, ttl_s }).await.is_err() {
-                            break send_failed();
+                            break send_failed(&connection);
                         } else {
                             local.invite_pending = true;
                         }
                     }
                     Command::SetUserAdmin { user_id, is_admin } => {
                         if conn::write_msg(&mut send, &ControlMsg::AdminSetRole { user_id, is_admin }).await.is_err() {
-                            break send_failed();
+                            break send_failed(&connection);
                         }
                     }
                     Command::SetUserDisabled { user_id, disabled } => {
                         if conn::write_msg(&mut send, &ControlMsg::AdminSetDisabled { user_id, disabled }).await.is_err() {
-                            break send_failed();
+                            break send_failed(&connection);
                         }
                     }
                     Command::RevokeUser { user_id } => {
                         if conn::write_msg(&mut send, &ControlMsg::AdminRevokeUser { user_id }).await.is_err() {
-                            break send_failed();
+                            break send_failed(&connection);
                         }
                     }
                     Command::RequestUserList => {
                         if conn::write_msg(&mut send, &ControlMsg::UserListRequest).await.is_err() {
-                            break send_failed();
+                            break send_failed(&connection);
                         }
                     }
                     Command::KickUser { user_id } => {
                         if conn::write_msg(&mut send, &ControlMsg::AdminKick { user_id }).await.is_err() {
-                            break send_failed();
+                            break send_failed(&connection);
                         }
                     }
                     Command::SetUserRestriction { user_id, muted, deafened } => {
                         let msg = ControlMsg::AdminSetRestriction { user_id, muted, deafened };
                         if conn::write_msg(&mut send, &msg).await.is_err() {
-                            break send_failed();
+                            break send_failed(&connection);
                         }
                     }
                     cmd => {
@@ -2619,7 +2625,7 @@ async fn run_session(
                         if send_state && set_state_budget.take() {
                             let msg = ControlMsg::SetState { flags: local.flags.sanitized() };
                             if conn::write_msg(&mut send, &msg).await.is_err() {
-                                break send_failed();
+                                break send_failed(&connection);
                             }
                         }
                     }
@@ -2628,7 +2634,7 @@ async fn run_session(
             _ = renew_tick.tick() => {
                 let stored = local.name.clone();
                 if maybe_auto_renew(&mut send, local, shared, &stored).await.is_err() {
-                    break send_failed();
+                    break send_failed(&connection);
                 }
             }
             _ = ping.tick() => {
@@ -2637,7 +2643,7 @@ async fn run_session(
                 pings.insert(nonce, Instant::now());
                 pings.retain(|_, t| t.elapsed() < Duration::from_secs(30));
                 if conn::write_msg(&mut send, &ControlMsg::Ping { nonce }).await.is_err() {
-                    break send_failed();
+                    break send_failed(&connection);
                 }
             }
             _ = loss_tick.tick() => {
@@ -2825,23 +2831,62 @@ async fn drain_until_quit(
     }
 }
 
-async fn control_reader(mut recv: quinn::RecvStream, tx: mpsc::UnboundedSender<ControlMsg>) {
+/// One read from the control stream as the session sees it.
+#[derive(Debug)]
+enum Inbound {
+    /// A message.
+    Msg(ControlMsg),
+    /// The stream ended or broke: the connection is going away, and its
+    /// close code decides whether to retry.
+    End,
+    /// A frame that breaks the framing or does not decode
+    /// (`PROTOCOL.md` §2, §8): `PROTOCOL_VIOLATION`, fatal — the same
+    /// server would send it again after every reconnect.
+    Violation(String),
+}
+
+fn inbound(read: Result<Vec<u8>, NetError>) -> Inbound {
+    match read {
+        Ok(body) => match ControlMsg::decode(&body) {
+            Ok(msg) => Inbound::Msg(msg),
+            Err(e) => Inbound::Violation(format!("undecodable control message: {e}")),
+        },
+        Err(NetError::Protocol(e)) => Inbound::Violation(e),
+        Err(_) => Inbound::End,
+    }
+}
+
+/// Forwards control messages until the stream ends; a protocol violation
+/// is forwarded as the last item. The channel closing means the stream
+/// ended.
+async fn control_reader(
+    mut recv: quinn::RecvStream,
+    tx: mpsc::UnboundedSender<Result<ControlMsg, String>>,
+) {
     loop {
-        match crate::net::read_frame(&mut recv, icu_proto::MAX_CONTROL_FRAME).await {
-            Ok(body) => match ControlMsg::decode(&body) {
-                Ok(msg) => {
-                    if tx.send(msg).is_err() {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(%e, "control decode");
-                    return;
-                }
-            },
-            Err(_) => return,
+        let read = crate::net::read_frame(&mut recv, icu_proto::MAX_CONTROL_FRAME).await;
+        let item = match inbound(read) {
+            Inbound::Msg(msg) => Ok(msg),
+            Inbound::End => return,
+            Inbound::Violation(detail) => Err(detail),
+        };
+        let last = item.is_err();
+        if tx.send(item).is_err() || last {
+            return;
         }
     }
+}
+
+/// Ends a session on a protocol violation: the server is told
+/// `PROTOCOL_VIOLATION`, and the client stops instead of reconnecting into
+/// the same fault every second (`PROTOCOL.md` §5, §6).
+fn protocol_violation(connection: &quinn::Connection, detail: String) -> SessionEnd {
+    tracing::warn!(%detail, "protocol violation, not reconnecting");
+    connection.close(
+        quinn::VarInt::from_u32(codes::PROTOCOL_VIOLATION),
+        codes::name(codes::PROTOCOL_VIOLATION).as_bytes(),
+    );
+    SessionEnd::Fatal(Problem::new(crate::problem::UPDATE_NEEDED, detail))
 }
 
 async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
@@ -3404,6 +3449,30 @@ mod tests {
             },
             100.0,
         )
+    }
+
+    /// A frame that does not decode, or breaks the framing, is a protocol
+    /// violation and ends the client's attempts; a broken stream is just the
+    /// connection going away (`PROTOCOL.md` §5, §6).
+    #[test]
+    fn an_undecodable_control_message_is_a_violation() {
+        let ping = ControlMsg::Ping { nonce: 7 }.encode().unwrap();
+        let body = ping[icu_proto::framing::LEN_PREFIX..].to_vec();
+        assert!(matches!(
+            inbound(Ok(body)),
+            Inbound::Msg(ControlMsg::Ping { nonce: 7 })
+        ));
+        // Variant 200 exists in no version of the protocol.
+        assert!(matches!(inbound(Ok(vec![200, 1])), Inbound::Violation(_)));
+        assert!(matches!(inbound(Ok(Vec::new())), Inbound::Violation(_)));
+        assert!(matches!(
+            inbound(Err(NetError::Protocol("length 0".into()))),
+            Inbound::Violation(_)
+        ));
+        assert!(matches!(
+            inbound(Err(NetError::Connect("reset".into()))),
+            Inbound::End
+        ));
     }
 
     #[test]

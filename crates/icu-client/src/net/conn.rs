@@ -325,7 +325,10 @@ pub async fn connect(
     )
     .await
     .map_err(|_| ConnectError::Transport("no Welcome".into()))?
-    .map_err(|e| ConnectError::on(&conn, e))?;
+    .map_err(|e| match e {
+        NetError::Protocol(s) => ConnectError::Protocol(s),
+        e => ConnectError::on(&conn, e),
+    })?;
     match ControlMsg::decode(&body).map_err(|e| ConnectError::Protocol(e.to_string()))? {
         ControlMsg::Welcome {
             minor,
