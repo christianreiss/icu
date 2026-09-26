@@ -30,6 +30,8 @@ pub enum Action {
     Deafen,
     /// Toggle PTT/VAD on press.
     ToggleMode,
+    /// Toggle the camera on press.
+    Camera,
 }
 
 impl Action {
@@ -40,6 +42,7 @@ impl Action {
             (Action::Mute, true) => Some(Command::ToggleMute),
             (Action::Deafen, true) => Some(Command::ToggleDeafen),
             (Action::ToggleMode, true) => Some(Command::ToggleMode),
+            (Action::Camera, true) => Some(Command::ToggleCamera),
             _ => None,
         }
     }
@@ -51,6 +54,7 @@ impl Action {
             Action::Mute => "mute",
             Action::Deafen => "deafen",
             Action::ToggleMode => "toggle_mode",
+            Action::Camera => "camera",
         }
     }
 
@@ -61,18 +65,19 @@ impl Action {
             Action::Mute => "ICU Mute",
             Action::Deafen => "ICU Deafen",
             Action::ToggleMode => "ICU PTT/VAD",
+            Action::Camera => "ICU Kamera",
         }
     }
 }
 
-/// The four bindings and what each does, in the order the backends bind
-/// them.
-pub fn bindings(settings: &HotkeySettings) -> [(&KeyBinding, Action); 4] {
+/// The bindings and what each does, in the order the backends bind them.
+pub fn bindings(settings: &HotkeySettings) -> [(&KeyBinding, Action); 5] {
     [
         (&settings.ptt, Action::Ptt),
         (&settings.mute, Action::Mute),
         (&settings.deafen, Action::Deafen),
         (&settings.toggle_mode, Action::ToggleMode),
+        (&settings.camera, Action::Camera),
     ]
 }
 
@@ -476,6 +481,28 @@ mod tests {
         let _ = end.send(());
         assert_eq!(h.next_backend().await, "KEY_A");
         assert_eq!(h.log(), ["start KEY_A", "drop KEY_A", "start KEY_A"]);
+    }
+
+    /// A settings file from before the camera key has none bound; a key
+    /// bound to it toggles the camera on press only.
+    #[test]
+    fn the_camera_key_is_unset_by_default_and_toggles() {
+        let old: crate::config::Settings =
+            toml::from_str("[hotkeys]\nptt = { key = \"KEY_F12\" }\n").unwrap();
+        assert_eq!(old.hotkeys.camera, KeyBinding::default());
+        assert_eq!(old.hotkeys.ptt.key, "KEY_F12");
+        assert_eq!(HotkeySettings::default().camera, KeyBinding::default());
+        assert!(matches!(
+            Action::Camera.command(true),
+            Some(Command::ToggleCamera)
+        ));
+        assert!(Action::Camera.command(false).is_none());
+        assert_eq!(Action::Camera.portal_id(), "camera");
+        let mut settings = HotkeySettings::default();
+        settings.camera.trigger = Some("CTRL+SHIFT+F10".into());
+        assert!(bindings(&settings)
+            .iter()
+            .any(|(b, a)| *a == Action::Camera && b.trigger.as_deref() == Some("CTRL+SHIFT+F10")));
     }
 
     #[tokio::test]

@@ -345,6 +345,8 @@ pub enum Command {
     /// portal ask again after its dialog was turned down
     /// (`hotkey_backend == "portal-declined"`).
     RetryHotkeys,
+    /// Toggle the camera (hotkey).
+    ToggleCamera,
 }
 
 /// An `f32` the audio threads read every block without a lock.
@@ -2111,6 +2113,10 @@ impl LocalState {
                 shared
                     .state
                     .send_modify(|s| s.hotkey_retries = s.hotkey_retries.wrapping_add(1));
+            }
+            Command::ToggleCamera => {
+                let on = !self.flags.camera_on();
+                return self.handle_local(Command::SetCamera(on), shared);
             }
         }
         set_state
