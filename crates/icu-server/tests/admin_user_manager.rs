@@ -474,3 +474,106 @@ async fn admin_restriction_is_enforced_persisted_and_lifted() {
     assert!(!flags.muted() && !flags.deafened());
     server.shutdown().await;
 }
+
+/// An enforced deafen implies an enforced mute — who hears nobody must not
+/// talk into the room — and cuts video to that user as well
+/// (`PROTOCOL.md` §2.2 Nr. 33).
+#[tokio::test]
+async fn an_enforced_deafen_mutes_and_stops_video() {
+    use icu_proto::UserFlags;
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await; // sole bootstrap admin
+    let identity = server.enroll("bob").await;
+    let mut bob = server.connect(&identity).await.expect("connect");
+    bob.hello_with("bob", icu_proto::MINOR, UserFlags(UserFlags::VIEWING))
+        .await
+        .expect("Welcome");
+    let mut carol = server.client("carol").await;
+
+    alice
+        .send_msg(&ControlMsg::AdminSetRestriction {
+            user_id: bob.user_id,
+            muted: false,
+            deafened: true,
+        })
+        .await;
+    let pushed = bob
+        .recv_matching(|m| matches!(m, ControlMsg::UserRestrictionChanged { .. }))
+        .await;
+    assert_eq!(
+        pushed,
+        Some(ControlMsg::UserRestrictionChanged {
+            muted: true,
+            deafened: true
+        }),
+        "deafened includes muted"
+    );
+    let bob_session = bob.session;
+    let seen = alice
+        .recv_matching(
+            |m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob_session),
+        )
+        .await;
+    let Some(ControlMsg::UserState { flags, .. }) = seen else {
+        panic!("{seen:?}")
+    };
+    assert!(flags.muted() && flags.deafened());
+
+    // Bob's audio is not relayed.
+    bob.send_audio(1, 960, &[0xF8, 1, 2, 3]);
+    assert!(alice
+        .recv_audio(std::time::Duration::from_millis(300))
+        .await
+        .is_none());
+
+    // Carol's camera does not reach bob, although he is viewing.
+    carol
+        .send_msg(&ControlMsg::SetState {
+            flags: UserFlags(UserFlags::CAMERA_ON),
+        })
+        .await;
+    let carol_session = carol.session;
+    carol
+        .recv_matching(|m| matches!(m, ControlMsg::UserState { session, flags } if *session == carol_session && flags.camera_on()))
+        .await
+        .expect("camera on");
+    carol.send_video(1, 0, true, &[0x42; 64]).await;
+    assert!(bob
+        .recv_video(std::time::Duration::from_millis(300))
+        .await
+        .is_none());
+
+    // The restriction stored is what the admin set; the list says so.
+    alice.send_msg(&ControlMsg::UserListRequest).await;
+    let Some(ControlMsg::UserListResponse { users }) = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserListResponse { .. }))
+        .await
+    else {
+        panic!("no UserListResponse")
+    };
+    let row = users.iter().find(|u| u.name == "bob").unwrap();
+    assert!(!row.muted && row.deafened);
+
+    // Lifted, video flows again.
+    alice
+        .send_msg(&ControlMsg::AdminSetRestriction {
+            user_id: bob.user_id,
+            muted: false,
+            deafened: false,
+        })
+        .await;
+    bob.recv_matching(|m| {
+        matches!(
+            m,
+            ControlMsg::UserRestrictionChanged {
+                deafened: false,
+                ..
+            }
+        )
+    })
+    .await
+    .expect("lifted");
+    carol.send_video(2, 3200, true, &[0x43; 64]).await;
+    assert!(bob.recv_video(common::SOON).await.is_some());
+    server.shutdown().await;
+}

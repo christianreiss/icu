@@ -5,7 +5,7 @@ mod common;
 
 use common::TestServer;
 use icu_proto::ControlMsg;
-use icu_server::{admin, AdminRequest};
+use icu_server::{admin, AdminRequest, AdminResponse};
 
 /// §10: a registration bundle issued through the socket works right away,
 /// without a restart.
@@ -269,5 +269,44 @@ async fn the_offline_path_is_blocked_while_a_server_runs() {
     let config = icu_server::Config::for_test(server.dir.path());
     let error = icu_server::Server::offline(config).expect_err("the lock is held");
     assert!(error.to_string().contains("cannot lock"), "{error}");
+    server.shutdown().await;
+}
+
+/// `mute` and `deafen` each change one side of the pair and keep the other
+/// as it is at the moment of the write.
+#[tokio::test]
+async fn mute_and_deafen_over_the_socket_keep_each_other() {
+    let server = TestServer::start().await;
+    server.enroll("alice").await;
+    server.enroll("bob").await;
+    let bob = || "bob".to_string();
+    for request in [
+        AdminRequest::Mute { user: bob() },
+        AdminRequest::Deafen { user: bob() },
+    ] {
+        assert!(matches!(
+            server.handle.admin(request).await,
+            AdminResponse::Ok
+        ));
+    }
+    let restriction = |users: &[icu_server::admin::AdminUser]| {
+        let row = users.iter().find(|u| u.name == "bob").unwrap();
+        (row.muted, row.deafened)
+    };
+    let AdminResponse::Users(users) = server.handle.admin(AdminRequest::Users).await else {
+        panic!("users")
+    };
+    assert_eq!(restriction(&users), (true, true));
+    assert!(matches!(
+        server
+            .handle
+            .admin(AdminRequest::Unmute { user: bob() })
+            .await,
+        AdminResponse::Ok
+    ));
+    let AdminResponse::Users(users) = server.handle.admin(AdminRequest::Users).await else {
+        panic!("users")
+    };
+    assert_eq!(restriction(&users), (false, true));
     server.shutdown().await;
 }

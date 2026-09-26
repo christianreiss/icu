@@ -382,13 +382,14 @@ impl Room {
         Some((flags, flipped))
     }
 
-    /// Connections to hand a video frame to: everybody else. Deafened only
-    /// concerns audio.
+    /// Connections to hand a video frame to: everybody else who is viewing
+    /// (`PROTOCOL.md` §4). A user's own deafen only concerns audio; one an
+    /// admin enforces cuts video as well (`PROTOCOL.md` §2.2 Nr. 33).
     pub fn video_receivers(&self, sender: Session) -> Vec<(Session, quinn::Connection)> {
         self.lock()
             .members
             .values()
-            .filter(|m| m.session != sender && m.flags.viewing())
+            .filter(|m| m.session != sender && m.flags.viewing() && !m.forced.deafened())
             .map(|m| (m.session, m.conn.clone()))
             .collect()
     }

@@ -315,15 +315,17 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
         | AdminRequest::Deafen { user }
         | AdminRequest::Undeafen { user } => match resolve(server, user).await {
             Ok(user_id) => {
-                let (mut muted, mut deafened) = server.store.lock().await.restriction(user_id);
-                match request {
-                    AdminRequest::Mute { .. } => muted = true,
-                    AdminRequest::Unmute { .. } => muted = false,
-                    AdminRequest::Deafen { .. } => deafened = true,
-                    _ => deafened = false,
-                }
-                match set_restriction(server, None, user_id, muted, deafened).await {
-                    Ok(()) => AdminResponse::Ok,
+                // One side of the pair changes, the other stays as it is at
+                // the moment of the write: computed under the store lock, so
+                // a `mute` and a `deafen` at once cannot undo each other.
+                let update = |(muted, deafened): (bool, bool)| match request {
+                    AdminRequest::Mute { .. } => (true, deafened),
+                    AdminRequest::Unmute { .. } => (false, deafened),
+                    AdminRequest::Deafen { .. } => (muted, true),
+                    _ => (muted, false),
+                };
+                match set_restriction(server, None, user_id, update).await {
+                    Ok(_) => AdminResponse::Ok,
                     Err(e) => store_err(e, "RESTRICT_FAILED"),
                 }
             }
@@ -408,14 +410,14 @@ async fn resolve(server: &Arc<Server>, user: &str) -> std::result::Result<UserId
 /// Under one store lock: an in-band `actor` must still be an admin and
 /// `target` must exist (the socket passes `None`, its authentication is the
 /// file permissions), then `change` runs. The lock is released before this
-/// returns, so the callers' side effects — kicks, control frames, the CRL
-/// reload — never run under it.
-async fn change(
+/// returns, so the callers' asynchronous side effects — the CRL reload —
+/// never run under it.
+async fn change<T>(
     server: &Arc<Server>,
     actor: Option<UserId>,
     target: UserId,
-    change: impl FnOnce(&mut Store) -> Result<bool>,
-) -> Result<bool> {
+    change: impl FnOnce(&mut Store) -> Result<T>,
+) -> Result<T> {
     let mut store = server.store.lock().await;
     if let Some(actor) = actor {
         if !store.is_admin(actor) {
@@ -509,32 +511,40 @@ pub async fn kick(server: &Arc<Server>, actor: Option<UserId>, target: UserId) -
 
 /// Enforces or lifts mute and deafen, persisted and live: the target's own
 /// sessions get `UserRestrictionChanged`, and every session whose flags
-/// changed a `UserState` broadcast. Behind `mute`/`unmute`/`deafen`/
-/// `undeafen` and `AdminSetRestriction`.
+/// changed a `UserState` broadcast. `update` maps the current `(muted,
+/// deafened)` to the new pair, which is returned. Behind `mute`/`unmute`/
+/// `deafen`/`undeafen` and `AdminSetRestriction`.
+///
+/// Store write, room change and pushes happen under the store lock, all of
+/// it synchronous: two admins at once cannot leave the room enforcing one
+/// pair while the store holds the other, their pushes cannot arrive the
+/// wrong way round, and a session joining meanwhile, which reads the store
+/// under that lock too, sees either the old pair and gets the new one from
+/// here or sees the new one.
 pub async fn set_restriction(
     server: &Arc<Server>,
     actor: Option<UserId>,
     target: UserId,
-    muted: bool,
-    deafened: bool,
-) -> Result<()> {
-    change(server, actor, target, |store| {
-        store.set_restriction(target, muted, deafened)
+    update: impl FnOnce((bool, bool)) -> (bool, bool),
+) -> Result<(bool, bool)> {
+    let (muted, deafened) = change(server, actor, target, |store| {
+        let (muted, deafened) = update(store.restriction(target));
+        store.set_restriction(target, muted, deafened)?;
+        let pushed = crate::session::restriction_changed(muted, deafened);
+        for s in server.room.sessions_of_user(target) {
+            server.room.send_to(s, &pushed);
+        }
+        let forced = crate::session::restriction_flags(muted, deafened);
+        for (session, flags) in server.room.set_forced(target, forced) {
+            server
+                .room
+                .broadcast(&ControlMsg::UserState { session, flags });
+        }
+        Ok((muted, deafened))
     })
     .await?;
-    for s in server.room.sessions_of_user(target) {
-        server
-            .room
-            .send_to(s, &ControlMsg::UserRestrictionChanged { muted, deafened });
-    }
-    let forced = crate::session::restriction_flags(muted, deafened);
-    for (session, flags) in server.room.set_forced(target, forced) {
-        server
-            .room
-            .broadcast(&ControlMsg::UserState { session, flags });
-    }
     tracing::info!(actor, target, muted, deafened, "restriction changed");
-    Ok(())
+    Ok((muted, deafened))
 }
 
 /// Closes every connection of a user with `code`, room or not

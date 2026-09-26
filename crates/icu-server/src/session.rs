@@ -499,6 +499,14 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
             return Err(Error::coded(ec::SERVER_FULL, "room is full"));
         }
     };
+    // Still under the store lock, which every restriction change holds while
+    // it pushes: an admin lifting the restriction right now reaches this
+    // session after this push, not before it with a stale one following.
+    if forced_muted || forced_deafened {
+        server
+            .room
+            .send_to(session, &restriction_changed(forced_muted, forced_deafened));
+    }
     drop(store);
     // The client checks the server leaf against the newest CRL it holds;
     // this is how it gets one (`PROTOCOL.md` §2.2).
@@ -507,15 +515,6 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         server
             .room
             .send_to(session, &ControlMsg::CrlUpdate { crl_der });
-    }
-    if forced_muted || forced_deafened {
-        server.room.send_to(
-            session,
-            &ControlMsg::UserRestrictionChanged {
-                muted: forced_muted,
-                deafened: forced_deafened,
-            },
-        );
     }
 
     let writer = tokio::spawn(writer_task(send, out_rx));
@@ -1115,8 +1114,9 @@ async fn control_loop(
                 deafened,
             } => {
                 let done =
-                    admin::set_restriction(server, Some(user_id), target, muted, deafened).await;
-                let answer = admin_answer(target, done, |()| ControlMsg::AdminSetRestrictionOk {
+                    admin::set_restriction(server, Some(user_id), target, |_| (muted, deafened))
+                        .await;
+                let answer = admin_answer(target, done, |_| ControlMsg::AdminSetRestrictionOk {
                     user_id: target,
                     muted,
                     deafened,
@@ -1415,11 +1415,21 @@ async fn handle_create_invite(
     }
 }
 
-/// The `UserFlags` bits an admin restriction keeps set.
+/// The `UserFlags` bits an admin restriction keeps set. Deafened implies
+/// muted: a user who hears nobody must not talk into the room either.
 pub(crate) fn restriction_flags(muted: bool, deafened: bool) -> icu_proto::UserFlags {
     icu_proto::UserFlags::NONE
-        .with_bit(icu_proto::UserFlags::MUTED, muted)
+        .with_bit(icu_proto::UserFlags::MUTED, muted || deafened)
         .with_bit(icu_proto::UserFlags::DEAFENED, deafened)
+}
+
+/// `UserRestrictionChanged` for a restriction, as enforced: deafened
+/// includes muted ([`restriction_flags`]).
+pub(crate) fn restriction_changed(muted: bool, deafened: bool) -> ControlMsg {
+    ControlMsg::UserRestrictionChanged {
+        muted: muted || deafened,
+        deafened,
+    }
 }
 
 /// The in-band answer to an admin action: `ok` on success, else
