@@ -15,6 +15,9 @@ use icu_proto::{
     limits as pl, Session, VideoHeader,
 };
 
+#[cfg_attr(not(feature = "camera"), allow(dead_code))]
+mod h264;
+
 /// Minimum spacing between two `KeyframeRequest`s for the same speaker. The
 /// server forwards at most [`pl::KEYFRAME_REQUESTS_PER_S`] per second and
 /// speaker, so asking faster only burns control budget.
@@ -188,7 +191,15 @@ impl Decoder {
 /// nothing to show yet or cannot read it (then it remembers the failure).
 #[cfg(feature = "camera")]
 pub fn decode(decoder: &mut Decoder, data: &[u8]) -> Option<Frame> {
+    use icu_proto::header::{VIDEO_MAX_HEIGHT, VIDEO_MAX_WIDTH};
     use openh264::formats::YUVSource;
+    // The sender's encoder is not ours to trust: the size is checked
+    // before the decoder allocates for it (`h264`).
+    if let Err(e) = h264::check(data) {
+        tracing::debug!(?e, "h264 refused before decode");
+        decoder.failed = true;
+        return None;
+    }
     let yuv = match decoder.inner.decode(data) {
         Ok(yuv) => yuv?,
         Err(e) => {
@@ -198,6 +209,11 @@ pub fn decode(decoder: &mut Decoder, data: &[u8]) -> Option<Frame> {
         }
     };
     let (w, h) = yuv.dimensions();
+    if w > VIDEO_MAX_WIDTH || h > VIDEO_MAX_HEIGHT {
+        tracing::debug!(w, h, "h264 picture above the ceiling");
+        decoder.failed = true;
+        return None;
+    }
     let mut rgba = vec![0u8; w * h * 4];
     yuv.write_rgba8(&mut rgba);
     Some(Frame {
@@ -792,6 +808,29 @@ mod tests {
         assert_eq!(r.take_keyframe_requests(), vec![3]);
         r.push(3, frames[2].clone());
         assert_eq!(pictures(&r), 1, "dropped until the IDR");
+    }
+
+    /// A modified sender's 1280×720 IDR — a real one, well under the size
+    /// limit on the wire — is refused before the decoder allocates for it,
+    /// and counts as a failed decode: the receiver asks for a new IDR.
+    #[cfg(feature = "camera")]
+    #[test]
+    fn a_picture_above_the_ceiling_is_refused_before_decoding() {
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+        let (w, h) = (1280usize, 720usize);
+        let rgb: Vec<u8> = (0..w * h * 3).map(|i| (i % 251) as u8).collect();
+        let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(&rgb, (w, h)));
+        let mut enc = crate::camera::encoder(VideoTier::T0).unwrap();
+        let data = enc.encode(&yuv).unwrap().to_vec();
+        assert!(data.len() <= VIDEO_MAX_FRAME);
+        assert!(matches!(h264::check(&data), Err(h264::Reject::TooLarge { .. })));
+
+        let mut decoder = Decoder::new().unwrap();
+        assert!(decode(&mut decoder, &data).is_none());
+        assert!(decoder.take_failed());
+
+        let ok = encoded(1, &[]);
+        assert_eq!(h264::check(&ok[0].data), Ok(()), "the own encoder passes");
     }
 
     /// A session that delivered frames but nothing decodable is not offered
