@@ -545,3 +545,52 @@ async fn a_missing_device_falls_back_to_the_default_and_returns() {
     engine.shutdown();
     server.handle.shutdown().await;
 }
+
+/// „Mikrofontest“: while it is on, the microphone after the send chain plays
+/// locally; off, nothing does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_mic_test_plays_the_own_voice_while_it_is_on() {
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let (backend, probe) = FakeBackend::new(Box::new(|start, out| {
+        for (i, s) in out.iter_mut().enumerate() {
+            let t = (start + i as u64) as f32 / 48_000.0;
+            *s = 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+        }
+    }));
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, test_settings(), paths);
+    cfg.server_addr = Some(server.addr());
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).expect("engine starts");
+    wait_connected(&engine).await;
+    assert!(!engine.snapshot().mic_test, "off by default");
+
+    let listen = || async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        probe.clear();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        probe.played()
+    };
+    assert!(peak(&listen().await) < 1e-3, "silent while off");
+
+    engine.command(Command::SetMicTest(true));
+    wait_for(&engine, SOON, |s| s.mic_test).await;
+    let heard = listen().await;
+    assert!(peak(&heard) > 0.02, "the own voice, peak {}", peak(&heard));
+    assert!(
+        tone_power(&heard, 440.0) > 100.0 * tone_power(&heard, 1000.0),
+        "the microphone's tone"
+    );
+    let longest_gap = heard
+        .split(|v| v.abs() > 1e-6)
+        .map(<[f32]>::len)
+        .max()
+        .unwrap_or(0);
+    assert!(longest_gap < 48, "a dropout of {longest_gap} samples");
+
+    engine.command(Command::SetMicTest(false));
+    wait_for(&engine, SOON, |s| !s.mic_test).await;
+    assert!(peak(&listen().await) < 1e-3, "silent again");
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}

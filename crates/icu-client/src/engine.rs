@@ -250,6 +250,9 @@ pub struct AppState {
     /// Echo is audible in the far-end signal but the AEC removes almost
     /// none of it for 10 s: the reference is probably the wrong device.
     pub aec_suspect: bool,
+    /// The mic test is on (`Command::SetMicTest`): the own processed voice
+    /// plays locally. Never persisted; ends by itself after a minute.
+    pub mic_test: bool,
     /// Camera state.
     pub camera_on: bool,
     /// Hotkey backend in use.
@@ -332,6 +335,11 @@ pub enum Command {
     Reconnect,
     /// Replace the settings (device change, thresholds, …); effective at once.
     UpdateSettings(Box<Settings>),
+    /// Mic test („Mikrofontest“) on/off: the microphone after the whole
+    /// send chain — what the others would hear, before Opus — also plays
+    /// locally, at unity gain, whatever the gate, mute or deafen say. Off by
+    /// default, never persisted, ends by itself after [`MIC_TEST_MAX`].
+    SetMicTest(bool),
     /// Camera on/off.
     SetCamera(bool),
     /// Overlay on/off.
@@ -408,6 +416,8 @@ pub struct DspControl {
     test_tone: AtomicBool,
     /// `audio.cue_tx`: a cue when sending starts and ends.
     cue_tx: AtomicBool,
+    /// The mic test is on (`Command::SetMicTest`).
+    mic_test: AtomicBool,
 }
 
 impl DspControl {
@@ -442,6 +452,7 @@ impl DspControl {
             stop: AtomicBool::new(false),
             test_tone: AtomicBool::new(test_tone),
             cue_tx: AtomicBool::new(false),
+            mic_test: AtomicBool::new(false),
         };
         ctl.apply_settings(s);
         ctl
@@ -727,6 +738,7 @@ impl Engine {
             aec_stats: AecStats::default(),
             aec_reference: false,
             aec_suspect: false,
+            mic_test: false,
             camera_on: false,
             hotkey_backend: String::new(),
             settings: settings.clone(),
@@ -739,6 +751,9 @@ impl Engine {
         // quantum + 1 block); 1 s of capacity just makes sure `lead` is never
         // clamped below what a large quantum (Bluetooth, pro audio) asks for.
         let (play_prod, play_cons) = HeapRb::<f32>::new(48_000).split();
+        // The mic test's hand-off from the DSP thread to the mixer: lock
+        // free, allocated once here.
+        let (mic_prod, mic_cons) = HeapRb::<f32>::new(8 * BLOCK).split();
 
         let shared = Arc::new(Shared {
             state: state_tx,
@@ -781,7 +796,7 @@ impl Engine {
             threads.push(
                 std::thread::Builder::new()
                     .name("icu-dsp".into())
-                    .spawn(move || dsp_thread(shared, cap_cons, ref_cons, test_tone))
+                    .spawn(move || dsp_thread(shared, cap_cons, ref_cons, mic_prod, test_tone))
                     .map_err(|e| EngineError(e.to_string()))?,
             );
         }
@@ -791,7 +806,7 @@ impl Engine {
             threads.push(
                 std::thread::Builder::new()
                     .name("icu-mixer".into())
-                    .spawn(move || mixer_thread(shared, play_prod))
+                    .spawn(move || mixer_thread(shared, play_prod, mic_cons))
                     .map_err(|e| EngineError(e.to_string()))?,
             );
         }
@@ -1130,11 +1145,14 @@ fn dsp_thread(
     shared: Arc<Shared>,
     mut cap: HeapCons<f32>,
     mut reference: HeapCons<f32>,
+    mut mic_test: HeapProd<f32>,
     test_tone: bool,
 ) {
     crate::audio::rt::promote_current_thread("icu-dsp");
     let ctl = shared.dsp.clone();
     let stats = shared.stats.clone();
+    // Since when the mic test is on, for its time limit.
+    let mut mic_test_since: Option<Instant> = None;
     let mut aec = match Aec::new() {
         Ok(a) => {
             ctl.aec_available.store(true, Ordering::Relaxed);
@@ -1417,6 +1435,20 @@ fn dsp_thread(
             }
         }
 
+        // Mic test: this block, as the encoder gets it, also to the mixer.
+        if ctl.mic_test.load(Ordering::Relaxed) {
+            let since = *mic_test_since.get_or_insert(t_block);
+            if t_block.duration_since(since) >= MIC_TEST_MAX {
+                ctl.mic_test.store(false, Ordering::Relaxed);
+                mic_test_since = None;
+                shared.state.send_modify(|s| s.mic_test = false);
+            } else {
+                mic_test.push_slice(&block);
+            }
+        } else {
+            mic_test_since = None;
+        }
+
         // 4. Accumulate to an Opus frame.
         frame_acc.extend_from_slice(&block);
         let frame_samples = ctl.frame_samples.load(Ordering::Relaxed) as usize;
@@ -1546,6 +1578,10 @@ fn preroll_now(was_open: bool, prev_sent: bool, decision: Decision, mode: Mode) 
     !was_open && !prev_sent && decision != Decision::Silent && mode == Mode::Vad
 }
 
+/// How long the mic test (`Command::SetMicTest`) plays before it switches
+/// itself off.
+pub const MIC_TEST_MAX: Duration = Duration::from_secs(60);
+
 /// [`Shared::pending_tx_cue`]: sending started.
 const TX_CUE_START: u8 = 1;
 /// [`Shared::pending_tx_cue`]: sending ended.
@@ -1605,10 +1641,14 @@ fn send_audio(
 // Mixer thread
 // ---------------------------------------------------------------------------
 
-fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
+fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: HeapCons<f32>) {
     crate::audio::rt::promote_current_thread("icu-mixer");
     let stats = shared.stats.clone();
     let mut out = vec![0.0f32; BLOCK];
+    let mut mic_buf = vec![0.0f32; BLOCK];
+    // The mic test plays once two blocks are queued, and primes again after
+    // running dry: capture and playback callbacks do not tick in lockstep.
+    let mut mic_primed = false;
     // One block per speaker, kept across iterations: nothing is allocated on
     // this thread once every speaker has its buffer.
     let mut inputs: Vec<(Vec<f32>, f32)> = Vec::new();
@@ -1743,11 +1783,33 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                 Some((cue_buf.as_slice(), 1.0))
             }
         };
+        // The mic test, like the cues: unity gain, heard even when deafened.
+        let mic = if shared.dsp.mic_test.load(Ordering::Relaxed) {
+            let queued = mic_test.occupied_len();
+            if queued > 4 * BLOCK {
+                // Fell behind (a stall): back to two blocks of delay.
+                mic_test.skip(queued - 2 * BLOCK);
+            }
+            mic_primed |= mic_test.occupied_len() >= 2 * BLOCK;
+            if mic_primed {
+                let n = mic_test.pop_slice(&mut mic_buf);
+                mic_primed = n == BLOCK;
+                mic_buf[n..].fill(0.0);
+                Some((mic_buf.as_slice(), 1.0))
+            } else {
+                None
+            }
+        } else {
+            mic_primed = false;
+            mic_test.clear();
+            None
+        };
         mixer::mix(
             inputs[..n_inputs]
                 .iter()
                 .map(|(b, g)| (b.as_slice(), *g))
-                .chain(cue),
+                .chain(cue)
+                .chain(mic),
             &mut out,
         );
         if play.occupied_len() < lead {
@@ -2402,6 +2464,10 @@ impl LocalState {
                     || new.audio.aec != old.aec;
                 self.settings = *new;
                 set_state = self.commit_settings(shared, reopen);
+            }
+            Command::SetMicTest(on) => {
+                shared.dsp.mic_test.store(on, Ordering::Relaxed);
+                shared.state.send_modify(|s| s.mic_test = on);
             }
             Command::SetCamera(on) => {
                 self.flags = self.flags.with_bit(UserFlags::CAMERA_ON, on);
