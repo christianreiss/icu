@@ -1370,6 +1370,24 @@ async fn handle_create_invite(
             .send_to(session, &reject(ec::NOT_ADMIN, "not an admin".into()));
         return;
     }
+    // Each bundle is a user in `users.toml` until it is confirmed or
+    // expires; an admin certificate in the wrong hands must not be able to
+    // fill it.
+    let per_hour = server.config.limits.invites_per_admin_per_hour;
+    if !lock(&server.invite_budget)
+        .entry(user_id)
+        .or_insert_with(|| TokenBucket::per_hour(per_hour))
+        .take_one()
+    {
+        server.room.send_to(
+            session,
+            &reject(
+                ec::RATE_LIMITED,
+                format!("at most {per_hour} invitations per hour"),
+            ),
+        );
+        return;
+    }
     // The label is only a placeholder name, so the failures are a malformed
     // or taken one, or a failed write. `NAME_TAKEN` is the non-fatal code the
     // client already shows next to the invite field.

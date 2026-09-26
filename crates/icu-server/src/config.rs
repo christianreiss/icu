@@ -100,6 +100,12 @@ pub struct LimitsSection {
     /// Established connections before a completed handshake is closed with
     /// `SERVER_FULL`; at least `2 x max_users`.
     pub max_connections: u32,
+    /// Invitations not yet confirmed, before a new one is refused with
+    /// `RATE_LIMITED`. Unset: `2 x max_users`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_pending_invites: Option<u32>,
+    /// Bundles one admin may mint per hour in-band (`CreateInviteRequest`).
+    pub invites_per_admin_per_hour: u32,
 }
 
 impl Default for LimitsSection {
@@ -116,6 +122,8 @@ impl Default for LimitsSection {
             handshakes_global_per_s: pl::HANDSHAKES_GLOBAL_PER_S,
             max_handshakes: pl::MAX_HANDSHAKES,
             max_connections: pl::MAX_CONNECTIONS,
+            max_pending_invites: None,
+            invites_per_admin_per_hour: pl::INVITES_PER_ADMIN_PER_HOUR,
         }
     }
 }
@@ -334,6 +342,11 @@ impl Config {
                 self.limits.max_handshakes
             )));
         }
+        if self.limits.max_pending_invites == Some(0) {
+            return Err(Error::msg(
+                "limits.max_pending_invites must be at least 1 (unset: 2 x max_users)",
+            ));
+        }
         // Room for everybody plus connections that have not said `Hello`
         // yet, or a full server would turn away its own users.
         if self.limits.max_connections < u32::from(self.server.max_users) * 2 {
@@ -377,6 +390,14 @@ impl Config {
         } else {
             format!("{host}:{port}")
         }
+    }
+
+    /// How many invitations may be open (issued, not confirmed) at once:
+    /// `limits.max_pending_invites`, else `2 x max_users`.
+    pub fn max_pending_invites(&self) -> usize {
+        self.limits
+            .max_pending_invites
+            .unwrap_or(2 * u32::from(self.server.max_users)) as usize
     }
 
     /// Path of the admin socket.

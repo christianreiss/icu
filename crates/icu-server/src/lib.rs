@@ -78,6 +78,9 @@ pub struct Server {
     pub ip_limits: std::sync::Mutex<IpLimits>,
     /// `LossReport` aggregation per speaker.
     pub loss: std::sync::Mutex<LossTracker>,
+    /// In-band invitations per admin (`limits.invites_per_admin_per_hour`).
+    pub invite_budget:
+        std::sync::Mutex<std::collections::HashMap<icu_proto::UserId, limits::TokenBucket>>,
     /// Handshakes in flight right now, over all endpoints
     /// (`limits.max_handshakes`).
     pub handshakes: std::sync::atomic::AtomicUsize,
@@ -154,6 +157,7 @@ impl Server {
             room: Room::new(config.server.max_users),
             ip_limits: std::sync::Mutex::new(IpLimits::new(&config.limits)),
             loss: std::sync::Mutex::new(LossTracker::default()),
+            invite_budget: std::sync::Mutex::new(std::collections::HashMap::new()),
             handshakes: std::sync::atomic::AtomicUsize::new(0),
             open_connections: std::sync::atomic::AtomicUsize::new(0),
             live_certs: std::sync::Mutex::new(CertSlots::new()),

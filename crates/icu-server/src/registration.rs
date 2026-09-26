@@ -5,8 +5,10 @@
 //! freshly generated key, a short-lived certificate on it and the CA, armored
 //! as a passport. The invited client connects with it over plain `icu/1`,
 //! generates its own key and sends a `RenewRequest` carrying the name it wants;
-//! the server issues the real certificate and revokes the registration one in
-//! the same write. The session side lives in `session.rs`.
+//! the server issues the real certificate. The registration certificate stays
+//! valid until the client confirms it stored the new one — its close with
+//! `REGISTRATION_STORED`, or its first login with it — so a lost answer does
+//! not burn the bundle. The session side lives in `session.rs`.
 
 use std::{sync::Arc, time::Duration};
 
@@ -38,6 +40,11 @@ pub struct Issued {
 /// otherwise one is generated; either way the user picks their real name when
 /// they register. `ttl_s` of `0` means the default; anything above
 /// `limits::MAX_INVITE_TTL_S` is clamped to it.
+///
+/// Refused with `RATE_LIMITED` while `Config::max_pending_invites` are open:
+/// every invitation is a user in `users.toml` until it is confirmed or
+/// expires, and the whole file is rewritten under the store lock on every
+/// change. A malformed or taken label is `NAME_TAKEN`.
 pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issued> {
     let ttl_s = if ttl_s == 0 { pl::INVITE_TTL_S } else { ttl_s };
     let ttl = Duration::from_secs(ttl_s.min(pl::MAX_INVITE_TTL_S));
@@ -48,10 +55,24 @@ pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issu
     // would otherwise keep the store non-empty and cost the next one its
     // admin rights until a restart.
     store.purge_expired_registrations()?;
+    let pending = store.users().filter(|(_, u)| u.is_pending()).count();
+    let cap = server.config.max_pending_invites();
+    if pending >= cap {
+        return Err(Error::coded(
+            ec::RATE_LIMITED,
+            format!(
+                "{pending} invitations are open, at most {cap}: wait until one is \
+                 used or expires, or revoke one"
+            ),
+        ));
+    }
     let name = if label.is_empty() {
         placeholder(&store)?
     } else {
-        store.claim_name(label, None)?;
+        store.claim_name(label, None).map_err(|e| match e.code() {
+            Some(_) => e,
+            None => Error::coded(ec::NAME_TAKEN, e),
+        })?;
         label.to_string()
     };
     let (leaf, key_der, ca_der) = {

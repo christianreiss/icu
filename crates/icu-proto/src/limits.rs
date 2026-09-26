@@ -114,6 +114,9 @@ pub const RATE_VIOLATION_WINDOW_S: u64 = 60;
 
 /// Certificate renewals per day and `user_id`.
 pub const RENEW_PER_DAY: u32 = 1;
+/// Registration bundles one admin may mint per hour over the authenticated
+/// connection (`CreateInviteRequest`). The host's CLI is not limited.
+pub const INVITES_PER_ADMIN_PER_HOUR: u32 = 20;
 /// How long a registration certificate stays valid by default.
 pub const INVITE_TTL_S: u64 = 24 * 60 * 60;
 /// Organizational unit of a registration certificate (`PROTOCOL.md` §2.3).

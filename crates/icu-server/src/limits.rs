@@ -52,6 +52,12 @@ impl TokenBucket {
         TokenBucket::new(per_min / 60.0, per_min)
     }
 
+    /// A bucket allowing `per_hour` events per hour, burst `per_hour`.
+    pub fn per_hour(per_hour: u32) -> TokenBucket {
+        let per_hour = f64::from(per_hour.max(1));
+        TokenBucket::new(per_hour / 3600.0, per_hour)
+    }
+
     /// A byte bucket for `kbit_s`, smoothed over `window`
     /// (`PROTOCOL.md` §7: video bitrate, sliding over 2 s).
     pub fn bitrate(kbit_s: u32, window: Duration) -> TokenBucket {
