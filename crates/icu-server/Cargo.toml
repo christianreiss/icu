@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Shipped as rpm/deb and from GitHub releases, never to crates.io; also lets
+# cargo-deny accept the path dependencies between the three crates.
+publish = false
 default-run = "icu-server"
 
 [lib]

@@ -137,9 +137,11 @@ mod tests {
             ("Inter-Regular", INTER_REGULAR),
             ("Inter-SemiBold", INTER_SEMIBOLD),
         ] {
-            let face = ttf_parser::Face::parse(bytes, 0).expect("embedded font parses");
+            use skrifa::MetadataProvider;
+            let font = skrifa::FontRef::new(bytes).expect("embedded font parses");
+            let charmap = font.charmap();
             let mapped: Vec<u32> = (0xE000u32..=0xF8FF)
-                .filter(|&c| char::from_u32(c).is_some_and(|ch| face.glyph_index(ch).is_some()))
+                .filter(|&c| charmap.map(c).is_some())
                 .collect();
             assert!(
                 mapped.is_empty(),

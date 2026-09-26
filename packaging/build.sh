@@ -103,12 +103,12 @@ for d in $DISTS; do
         } > "/src/target/pkg/depends-$DIST.yaml"'
 done
 
-log "licenses: cargo deny + cargo about"
+log "supply chain: cargo deny (advisories, bans, licenses, sources) + cargo about"
 LICENSES_FILE=$WORK/THIRD-PARTY-LICENSES
 podman image exists "$(dist_image debian13)" || podman build -q \
     -f packaging/containers/client-debian.Containerfile -t "$(dist_image debian13)" packaging/containers >/dev/null
 run -e CARGO_TARGET_DIR=/src/target/pkg-debian13 "$(dist_image debian13)" bash -euc '
-    cargo deny check licenses
+    cargo deny --locked check
     cargo about generate --locked --fail packaging/about.hbs -o target/pkg/THIRD-PARTY-LICENSES'
 # Fonts embedded in the client binary are not crates; add their license.
 {

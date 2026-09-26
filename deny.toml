@@ -92,6 +92,18 @@ allow-wildcard-paths = true
 [advisories]
 version = 2
 yanked = "deny"
+# Unmaintained, no vulnerability and no safe upgrade; each checked
+# 2026-09-26 (cargo deny check, advisory DB of that day).
+ignore = [
+    # Proc macro, runs at compile time only; comes with nokhwa (camera).
+    { id = "RUSTSEC-2024-0436", reason = "paste: compile-time proc macro via nokhwa" },
+    # Proc macro, compile time only; Windows target graph.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: compile-time proc macro" },
+    # Parses only fonts embedded in the client binary (Inter, Phosphor, egui's
+    # defaults), never untrusted input; comes with winit's Wayland decorations
+    # (sctk-adwaita → ab_glyph) and the overlay's name rendering.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: only our own embedded fonts" },
+]
 
 [sources]
 unknown-registry = "deny"

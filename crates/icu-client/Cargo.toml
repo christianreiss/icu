@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Shipped as rpm/deb and from GitHub releases, never to crates.io; also lets
+# cargo-deny accept the path dependencies between the three crates.
+publish = false
 default-run = "icu"
 
 [lib]
@@ -104,8 +107,8 @@ tempfile.workspace = true
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Reads the embedded Inter files' cmap (`ui::fonts` test); already in the
-# tree through egui's font stack.
-ttf-parser = "0.25"
+# tree through egui's font stack (epaint).
+skrifa = "0.44"
 
 [[test]]
 name = "ui_layout"
