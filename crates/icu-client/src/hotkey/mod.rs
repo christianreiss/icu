@@ -110,15 +110,56 @@ impl Drop for Dispatch {
     }
 }
 
+/// `Hotkeys::backend` when no backend runs.
+pub const BACKEND_NONE: &str = "none";
+
+/// `Hotkeys::backend` when the user turned the portal down: cancelled its
+/// dialog, confirmed it without a key, or left it unanswered. Not `none`:
+/// the portal is there, and asking again may well work.
+pub const BACKEND_PORTAL_DECLINED: &str = "portal-declined";
+
 /// A running hotkey backend.
 pub struct Hotkeys {
-    /// Human readable backend description for the settings view.
+    /// Human readable backend description for the settings view:
+    /// `portal`, `evdev (<n> devices)`, [`BACKEND_PORTAL_DECLINED`] or
+    /// [`BACKEND_NONE`].
     pub backend: String,
     _guard: Option<Box<dyn std::any::Any + Send>>,
+    /// Resolves when the backend ended by itself and wants binding again
+    /// (the portal closed the session). `None` for backends that cannot.
+    ended: Option<tokio::sync::oneshot::Receiver<()>>,
+}
+
+impl Hotkeys {
+    /// No backend running, for the reason `backend` names.
+    fn idle(backend: &str) -> Hotkeys {
+        Hotkeys {
+            backend: backend.into(),
+            _guard: None,
+            ended: None,
+        }
+    }
+
+    /// Resolves once the backend ended by itself; never for one that cannot.
+    pub async fn ended(&mut self) {
+        match self.ended.as_mut() {
+            Some(ended) => {
+                let _ = ended.await;
+                self.ended = None;
+            }
+            None => std::future::pending().await,
+        }
+    }
 }
 
 /// Starts the configured backend. Never fails hard: without any backend the
 /// UI button still works.
+///
+/// With [`HotkeyBackend::Auto`] the portal comes first. evdev reads every
+/// keyboard, so it runs only when chosen (`Evdev`) or, under `Auto`, when
+/// the portal is missing or fails — never because the user turned the
+/// portal's dialog down: that is their answer, not a failure
+/// (`Client/IMPLEMENTATION.md` §7).
 pub async fn start(settings: &HotkeySettings, cmd: UnboundedSender<Command>) -> Hotkeys {
     #[cfg(target_os = "linux")]
     {
@@ -129,13 +170,20 @@ pub async fn start(settings: &HotkeySettings, cmd: UnboundedSender<Command>) -> 
         let want_evdev = matches!(settings.backend, HotkeyBackend::Auto | HotkeyBackend::Evdev);
         if want_portal {
             match portal::start(settings, cmd.clone()).await {
-                Ok(guard) => {
+                Ok((guard, ended)) => {
                     return Hotkeys {
                         backend: "portal".into(),
                         _guard: Some(Box::new(guard)),
+                        ended: Some(ended),
                     };
                 }
-                Err(e) => tracing::info!(%e, "portal hotkeys unavailable"),
+                Err(portal::Error::Declined(e)) => {
+                    tracing::info!(%e, "portal hotkeys declined; evdev only when chosen");
+                    return Hotkeys::idle(BACKEND_PORTAL_DECLINED);
+                }
+                Err(portal::Error::Unavailable(e)) => {
+                    tracing::info!(%e, "portal hotkeys unavailable")
+                }
             }
         }
         if want_evdev {
@@ -144,30 +192,22 @@ pub async fn start(settings: &HotkeySettings, cmd: UnboundedSender<Command>) -> 
                     return Hotkeys {
                         backend: format!("evdev ({n} devices)"),
                         _guard: Some(Box::new(guard)),
+                        ended: None,
                     };
                 }
                 Err(e) => tracing::warn!(%e, "evdev hotkeys unavailable"),
             }
         }
-        Hotkeys {
-            backend: "none".into(),
-            _guard: None,
-        }
+        Hotkeys::idle(BACKEND_NONE)
     }
     #[cfg(target_os = "windows")]
     {
         let _ = (settings, cmd);
-        Hotkeys {
-            backend: "Unsupported (M3)".into(),
-            _guard: None,
-        }
+        Hotkeys::idle("Unsupported (M3)")
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = (settings, cmd);
-        Hotkeys {
-            backend: "none".into(),
-            _guard: None,
-        }
+        Hotkeys::idle(BACKEND_NONE)
     }
 }

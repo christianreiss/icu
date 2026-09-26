@@ -1,6 +1,6 @@
-//! evdev hotkeys: read `/dev/input/event*` without grabbing (Spike 4a).
-//! Requires the user to be in group `input`. Devices are rescanned every
-//! few seconds for hot-plug.
+//! evdev hotkeys: read `/dev/input/event*` read-only and without grabbing
+//! (Spike 4a). Requires the user to be in group `input`. Devices are
+//! rescanned every few seconds for hot-plug.
 
 use std::{
     collections::HashSet,
@@ -44,9 +44,40 @@ pub struct InputDevice {
     pub mouse: bool,
 }
 
+/// `/dev/input/event*`.
+fn event_paths() -> Vec<PathBuf> {
+    let Ok(dir) = std::fs::read_dir("/dev/input") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("event"))
+        })
+        .collect()
+}
+
+/// Opens an input device **read-only**: hotkeys only ever read, and
+/// `evdev::enumerate`/`Device::open` try read-write first.
+fn open_read_only(path: &std::path::Path) -> Option<Device> {
+    let file = std::fs::File::open(path).ok()?;
+    Device::from_fd(std::os::fd::OwnedFd::from(file)).ok()
+}
+
+/// Every input device this user may read.
+fn open_all() -> Vec<(PathBuf, Device)> {
+    event_paths()
+        .into_iter()
+        .filter_map(|path| open_read_only(&path).map(|dev| (path, dev)))
+        .collect()
+}
+
 /// Lists devices that can be opened.
 pub fn list_devices() -> Vec<InputDevice> {
-    evdev::enumerate()
+    open_all()
+        .into_iter()
         .map(|(path, dev)| {
             let keys = dev.supported_keys();
             InputDevice {
@@ -125,10 +156,13 @@ fn scan(
     opened: &Arc<std::sync::Mutex<HashSet<PathBuf>>>,
 ) -> usize {
     let mut n = 0;
-    for (path, dev) in evdev::enumerate() {
+    for path in event_paths() {
         if opened.lock().unwrap().contains(&path) {
             continue;
         }
+        let Some(dev) = open_read_only(&path) else {
+            continue;
+        };
         let Some(keys) = dev.supported_keys() else {
             continue;
         };
