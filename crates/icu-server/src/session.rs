@@ -1476,7 +1476,7 @@ async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor:
         return;
     }
     let online = server.room.online_users();
-    let users = store
+    let mut rows: Vec<icu_proto::UserSummary> = store
         .users()
         .map(|(id, u)| icu_proto::UserSummary {
             user_id: id,
@@ -1492,9 +1492,68 @@ async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor:
         })
         .collect();
     drop(store);
+    // Most useful first, so a list too long for one frame loses the least
+    // useful rows: online, then admins, then everybody else, removed
+    // accounts last, the newest first within each.
+    rows.sort_by_key(|u| {
+        let rank = match () {
+            _ if u.online => 0,
+            _ if u.is_admin => 1,
+            _ if !u.revoked => 2,
+            _ => 3,
+        };
+        (rank, std::cmp::Reverse(u.user_id))
+    });
+    let users = fit_user_list(rows);
     server
         .room
         .send_to(session, &ControlMsg::UserListResponse { users });
+}
+
+/// `users` as they fit one `UserListResponse` (`PROTOCOL.md` §2.2 Nr. 27):
+/// all of them, or the longest head that fits together with a last row that
+/// stands for the rest — `user_id` 0, the number left out in `name`. Without
+/// this, a list past a control frame (~230 users) was not sent at all.
+fn fit_user_list(users: Vec<icu_proto::UserSummary>) -> Vec<icu_proto::UserSummary> {
+    let fits = |users: Vec<icu_proto::UserSummary>| {
+        ControlMsg::UserListResponse { users }.encode().is_ok()
+    };
+    if fits(users.clone()) {
+        return users;
+    }
+    let total = users.len();
+    let head = |k: usize| {
+        let mut head = users[..k].to_vec();
+        head.push(icu_proto::UserSummary {
+            user_id: 0,
+            name: format!("… und {} weitere", total - k),
+            created: String::new(),
+            is_admin: false,
+            disabled: false,
+            revoked: false,
+            online: false,
+            pending: false,
+            muted: false,
+            deafened: false,
+        });
+        head
+    };
+    // `head(lo)` fits (with `lo` 0, just the rest row), `head(hi)` does not.
+    let (mut lo, mut hi) = (0, total);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(head(mid)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    tracing::warn!(
+        total,
+        listed = lo,
+        "user list too long for one frame, shortened"
+    );
+    head(lo)
 }
 
 /// The code the peer closed with, reduced to the `UserLeft.reason` range.

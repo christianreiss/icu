@@ -641,3 +641,74 @@ async fn a_failed_write_is_a_server_error_not_a_refusal() {
         .is_some());
     server.shutdown().await;
 }
+
+/// A user list longer than one control frame is shortened, not dropped:
+/// online users and admins first, and a last row with `user_id` 0 saying
+/// how many are left out (`PROTOCOL.md` §2.2 Nr. 27).
+#[tokio::test]
+async fn a_user_list_too_long_for_a_frame_is_shortened() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await; // sole bootstrap admin
+    let bob = server.enroll("bob").await;
+    let common::TestServer { dir, handle } = server;
+    handle.shutdown().await;
+    // 600 accounts with long names: years of invitations, most removed.
+    let users = dir.path().join("users.toml");
+    let mut text = std::fs::read_to_string(&users).unwrap();
+    const EXTRA: u32 = 600;
+    for i in 0..EXTRA {
+        text.push_str(&format!(
+            "\n[user.{id}]\nname = \"old-account-with-a-long-name-{i:03}\"\n\
+             created = \"2026-01-01T00:00:00Z\"\n\n[[user.{id}.cert]]\n\
+             fingerprint = \"{i:064x}\"\nissued = \"2026-01-01T00:00:00Z\"\n\
+             expires = \"2099-01-01T00:00:00Z\"\nrevoked = {revoked}\n",
+            id = 10_000 + i,
+            revoked = i % 3 != 0,
+        ));
+    }
+    std::fs::write(&users, text).unwrap();
+    let server = TestServer {
+        handle: icu_server::run(icu_server::config::Config::for_test(dir.path()))
+            .await
+            .expect("restarts"),
+        dir,
+    };
+    let mut alice = server.connect(&alice).await.expect("connect");
+    alice.hello("alice").await;
+    let mut bob = server.connect(&bob).await.expect("connect");
+    bob.hello("bob").await;
+
+    alice.send_msg(&ControlMsg::UserListRequest).await;
+    let Some(ControlMsg::UserListResponse { users }) = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserListResponse { .. }))
+        .await
+    else {
+        panic!("no UserListResponse")
+    };
+    let rest = users.last().expect("rows");
+    assert_eq!(rest.user_id, 0, "the last row stands for the rest");
+    let left_out: usize = rest
+        .name
+        .split_whitespace()
+        .find_map(|w| w.parse().ok())
+        .expect("a count in the name");
+    assert_eq!(
+        users.len() - 1 + left_out,
+        EXTRA as usize + 2,
+        "{}",
+        rest.name
+    );
+    assert!(
+        users.len() > 100,
+        "a frame still carries a lot: {}",
+        users.len()
+    );
+    assert!(users[..2].iter().all(|u| u.online), "online users first");
+    assert!(
+        users[..users.len() - 1]
+            .windows(2)
+            .all(|w| w[0].revoked <= w[1].revoked),
+        "removed accounts last"
+    );
+    server.shutdown().await;
+}
