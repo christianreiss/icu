@@ -114,23 +114,8 @@ pub fn client_config_with_crl(
     // which reads like a network error and would be retried forever. No
     // reconnect can fix it, so say so before trying.
     check_not_expired(&identity.leaf_der, unix_now())?;
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(CertificateDer::from(identity.ca_der.clone()))
-        .map_err(|e| NetError::Tls(format!("ca: {e}")))?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut builder = rustls::client::WebPkiServerVerifier::builder_with_provider(
-        Arc::new(roots),
-        provider.clone(),
-    );
-    if let Some(crl) = crl {
-        builder = builder
-            .with_crls([rustls::pki_types::CertificateRevocationListDer::from(
-                crl.to_vec(),
-            )])
-            .only_check_end_entity_revocation();
-    }
-    let webpki_verifier = builder.build().map_err(|e| NetError::Tls(e.to_string()))?;
+    let webpki_verifier = server_verifier(&identity.ca_der, crl, provider.clone())?;
     let cert_failure = CertFailure::default();
     let verifier = Arc::new(ReportingVerifier {
         inner: webpki_verifier,
@@ -168,6 +153,31 @@ pub fn client_config_with_crl(
     )));
     config.transport_config(Arc::new(transport));
     Ok((config, cert_failure))
+}
+
+/// The check of the server's certificate: against our CA only and, with a
+/// CRL, against that for the leaf (`PROTOCOL.md` §1). Also how `crate::crl`
+/// finds out whether rustls takes a CRL at all, so the trial and the real
+/// build cannot drift apart.
+pub(crate) fn server_verifier(
+    ca_der: &[u8],
+    crl: Option<&[u8]>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<rustls::client::WebPkiServerVerifier>, NetError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca_der.to_vec()))
+        .map_err(|e| NetError::Tls(format!("ca: {e}")))?;
+    let mut builder =
+        rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider);
+    if let Some(crl) = crl {
+        builder = builder
+            .with_crls([rustls::pki_types::CertificateRevocationListDer::from(
+                crl.to_vec(),
+            )])
+            .only_check_end_entity_revocation();
+    }
+    builder.build().map_err(|e| NetError::Tls(e.to_string()))
 }
 
 /// Refuses a registration certificate whose `notAfter` lies before `now`
