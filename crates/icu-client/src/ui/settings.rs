@@ -137,19 +137,11 @@ pub struct SettingsView {
     /// on every call of [`SettingsView::ui`]; the About tab's button flips
     /// it, and the frame's [`SettingsOutput`] carries the answer back.
     debug_window_open: bool,
-    /// The draft as last handed out in `Command::UpdateSettings`, so a
-    /// change is noticed by comparison instead of by cloning the whole
-    /// draft on every frame.
-    applied: Settings,
-    /// The engine's settings as last seen. When they move to something
-    /// this window did not send (a hotkey switched the mode, the tray muted,
-    /// a volume changed in the main window), the draft takes them over —
-    /// otherwise the next change made here would write the old values back.
-    seen: Settings,
-    /// What this window sent and the engine may not have echoed yet: a
-    /// slider drag sends a new version every frame, and an echo of an older
-    /// one must not pull the slider back.
-    sent: std::collections::VecDeque<Settings>,
+    /// Keeps [`Self::draft`] in step with the engine.
+    sync: DraftSync,
+    /// „Assistent“ on the Audio page was clicked; handed back to `App` as
+    /// [`SettingsOutput::open_setup`].
+    open_setup: bool,
     /// Live picture for the Kamera tab, fed by the running capture thread.
     #[cfg(feature = "camera")]
     preview: Option<crate::camera::CameraPreview>,
@@ -196,6 +188,78 @@ pub struct SettingsOutput {
     /// How much taller the page is than the window shows (negative:
     /// shorter).
     pub overflow: f32,
+    /// „Assistent“ was clicked: open the setup (`super::setup`).
+    pub open_setup: bool,
+}
+
+/// Keeps a window's draft of the settings in step with the engine: the
+/// window's own changes go out as `Command::UpdateSettings`, and changes
+/// made elsewhere are taken over instead of being written back with the next
+/// edit. The settings window and the setup (`super::setup`) each hold one.
+pub(super) struct DraftSync {
+    /// The draft as last handed out in `Command::UpdateSettings`, so a
+    /// change is noticed by comparison instead of by cloning the whole
+    /// draft on every frame.
+    applied: Settings,
+    /// The engine's settings as last seen. When they move to something
+    /// this window did not send (a hotkey switched the mode, the tray muted,
+    /// a volume changed in the main window), the draft takes them over —
+    /// otherwise the next change made here would write the old values back.
+    seen: Settings,
+    /// What this window sent and the engine may not have echoed yet: a
+    /// slider drag sends a new version every frame, and an echo of an older
+    /// one must not pull the slider back.
+    sent: std::collections::VecDeque<Settings>,
+}
+
+impl DraftSync {
+    /// In step with `settings`, the draft's starting point.
+    pub(super) fn new(settings: &Settings) -> DraftSync {
+        DraftSync {
+            applied: settings.clone(),
+            seen: settings.clone(),
+            sent: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Takes over settings the engine changed on its own into `draft`. An
+    /// echo of one of our own `UpdateSettings` is left alone; anything else
+    /// came from elsewhere and wins.
+    pub(super) fn adopt(&mut self, draft: &mut Settings, engine: &Settings) {
+        if *engine == self.seen {
+            return;
+        }
+        self.seen.clone_from(engine);
+        if let Some(i) = self.sent.iter().position(|s| s == engine) {
+            // Our own, possibly an older one: everything sent before it has
+            // been superseded by it.
+            self.sent.drain(..=i);
+            return;
+        }
+        self.sent.clear();
+        draft.clone_from(engine);
+        self.applied.clone_from(engine);
+    }
+
+    /// The command that applies `draft`, if it changed since it last went
+    /// out.
+    pub(super) fn commit(&mut self, draft: &Settings) -> Option<Command> {
+        if *draft == self.applied {
+            return None;
+        }
+        self.applied.clone_from(draft);
+        if self.sent.len() == 32 {
+            self.sent.pop_front();
+        }
+        self.sent.push_back(draft.clone());
+        Some(Command::UpdateSettings(Box::new(draft.clone())))
+    }
+
+    /// The header's theme button changed the theme outside the window:
+    /// counts as sent, so it is not sent again.
+    pub(super) fn set_theme(&mut self, theme: &str) {
+        self.applied.ui.theme = theme.to_string();
+    }
 }
 
 impl SettingsView {
@@ -208,9 +272,8 @@ impl SettingsView {
             .unwrap_or_default();
         SettingsView {
             draft: state.settings.clone(),
-            applied: state.settings.clone(),
-            seen: state.settings.clone(),
-            sent: std::collections::VecDeque::new(),
+            sync: DraftSync::new(&state.settings),
+            open_setup: false,
             name: name.clone(),
             name_synced: name,
             passport_import: String::new(),
@@ -286,26 +349,7 @@ impl SettingsView {
     /// the draft follows, and nothing is re-sent for it.
     pub fn set_theme(&mut self, theme: &str) {
         self.draft.ui.theme = theme.to_string();
-        self.applied.ui.theme = theme.to_string();
-    }
-
-    /// Takes over settings the engine changed on its own. An echo of one of
-    /// our own `UpdateSettings` is left alone; anything else came from
-    /// elsewhere and wins.
-    fn adopt_outside_changes(&mut self, engine: &Settings) {
-        if *engine == self.seen {
-            return;
-        }
-        self.seen.clone_from(engine);
-        if let Some(i) = self.sent.iter().position(|s| s == engine) {
-            // Our own, possibly an older one: everything sent before it has
-            // been superseded by it.
-            self.sent.drain(..=i);
-            return;
-        }
-        self.sent.clear();
-        self.draft.clone_from(engine);
-        self.applied.clone_from(engine);
+        self.sync.set_theme(theme);
     }
 
     /// Draws the panel content. `debug_window_open` is what `App` knows;
@@ -313,7 +357,7 @@ impl SettingsView {
     pub fn ui(&mut self, ui: &mut Ui, state: &AppState, debug_window_open: bool) -> SettingsOutput {
         let mut cmds = Vec::new();
         self.debug_window_open = debug_window_open;
-        self.adopt_outside_changes(&state.settings);
+        self.sync.adopt(&mut self.draft, &state.settings);
 
         // A live demote can orphan the tab: it is only in the rail while
         // `state.is_admin`, so bounce back to Allgemein instead of rendering
@@ -405,14 +449,7 @@ impl SettingsView {
                     });
             });
 
-        if self.draft != self.applied {
-            self.applied.clone_from(&self.draft);
-            if self.sent.len() == 32 {
-                self.sent.pop_front();
-            }
-            self.sent.push_back(self.draft.clone());
-            cmds.push(Command::UpdateSettings(Box::new(self.draft.clone())));
-        }
+        cmds.extend(self.sync.commit(&self.draft));
         // A page taller than the window (expert rows, a long member list)
         // grows the window instead of hiding its end behind a scroll bar.
         let overflow = page.content_size.y - page.inner_rect.height();
@@ -424,6 +461,7 @@ impl SettingsView {
             camera_preview: self.tab == Tab::Camera && self.camera_preview,
             mic_test_page: self.tab == Tab::Audio,
             overflow,
+            open_setup: std::mem::take(&mut self.open_setup),
         }
     }
 
@@ -433,7 +471,21 @@ impl SettingsView {
             ui,
             "Audio",
             "Mikrofon, Lautsprecher und wann du zu hören bist.",
-            |_| {},
+            |ui| {
+                // The step-by-step way through the same choices, the one a
+                // new install opens with (`super::setup`).
+                if widgets::button(
+                    ui,
+                    widgets::ButtonKind::Neutral,
+                    icon::MAGIC_WAND,
+                    "Assistent",
+                )
+                .on_hover_text("Mikrofon, Sprechen und Klang Schritt für Schritt einrichten")
+                .clicked()
+                {
+                    self.open_setup = true;
+                }
+            },
         );
         let inputs: Vec<_> = state
             .devices
@@ -457,22 +509,7 @@ impl SettingsView {
                 "Mikrofon",
                 &mut self.draft.audio.input_device,
                 &inputs,
-                |ui| {
-                    let (kind, glyph, label) = if state.mic_test {
-                        (widgets::ButtonKind::Primary, icon::STOP, "Beenden")
-                    } else {
-                        (widgets::ButtonKind::Neutral, icon::HEADPHONES, "Testen")
-                    };
-                    if widgets::button(ui, kind, glyph, label)
-                        .on_hover_text(
-                            "Mikrofontest: du hörst dich so, wie die anderen dich hören. \
-                             Endet von selbst nach einer Minute.",
-                        )
-                        .clicked()
-                    {
-                        cmds.push(Command::SetMicTest(!state.mic_test));
-                    }
-                },
+                |ui| mic_test_button(ui, state.mic_test, cmds),
             );
             device_combo(
                 ui,
@@ -1015,72 +1052,8 @@ impl SettingsView {
              Änderungen gelten sofort.",
             |_| {},
         );
-        // `crate::hotkey` reports "portal", "evdev (n devices)",
-        // "portal-declined" or "none"; the empty string means it was never
-        // started (`--no-hotkeys`).
         let backend = state.hotkey_backend.as_str();
-        match backend {
-            "" => {
-                widgets::banner(
-                    ui,
-                    widgets::BannerKind::Warning,
-                    "Tastenkürzel sind abgeschaltet",
-                    "ICU wurde ohne Tastenkürzel gestartet. Bedienen geht weiter über das \
-                     Hauptfenster.",
-                    None::<fn()>,
-                );
-                ui.add_space(12.0);
-            }
-            crate::hotkey::BACKEND_PORTAL_DECLINED => {
-                widgets::banner(
-                    ui,
-                    widgets::BannerKind::Warning,
-                    "Tastenkürzel wurden abgelehnt",
-                    "Der Dialog der Arbeitsumgebung wurde abgebrochen oder ohne Taste bestätigt. \
-                     ICU kann erneut fragen oder die Tasten selbst lesen.",
-                    None::<fn()>,
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    if widgets::button(
-                        ui,
-                        widgets::ButtonKind::Primary,
-                        icon::ARROW_CLOCKWISE,
-                        "Erneut fragen",
-                    )
-                    .clicked()
-                    {
-                        cmds.push(Command::RetryHotkeys);
-                    }
-                    if widgets::button(
-                        ui,
-                        widgets::ButtonKind::Neutral,
-                        icon::COMMAND,
-                        "Tasten direkt lesen (evdev)",
-                    )
-                    .on_hover_text("Liest jeden Tastendruck mit; braucht die Gruppe input")
-                    .clicked()
-                    {
-                        self.draft.hotkeys.backend = HotkeyBackend::Evdev;
-                    }
-                });
-                ui.add_space(12.0);
-            }
-            crate::hotkey::BACKEND_NONE => {
-                widgets::banner(
-                    ui,
-                    widgets::BannerKind::Error,
-                    "Tastenkürzel funktionieren gerade nicht",
-                    "Das System bietet keinen Weg an, Tasten im Hintergrund zu lesen, und ICU \
-                     darf sie nicht selbst lesen (Gruppe input). Bedienen geht weiter über das \
-                     Hauptfenster.",
-                    None::<fn()>,
-                );
-                ui.add_space(12.0);
-            }
-            _ => {}
-        }
+        hotkey_notice(ui, backend, &mut self.draft.hotkeys.backend, cmds);
 
         let portal = backend == "portal";
         let capture = self.poll_capture(ui);
@@ -1154,6 +1127,7 @@ impl SettingsView {
                     let tok = theme::tokens(ui.visuals());
                     let (color, text) = match backend {
                         "" => (tok.connecting, "abgeschaltet"),
+                        crate::hotkey::BACKEND_STARTING => (tok.connecting, "wird eingerichtet"),
                         crate::hotkey::BACKEND_NONE => (tok.error, "keiner"),
                         crate::hotkey::BACKEND_PORTAL_DECLINED => (tok.connecting, "abgelehnt"),
                         backend => (tok.connected, backend),
@@ -1168,48 +1142,13 @@ impl SettingsView {
             });
         }
         if adv || self.draft.hotkeys.backend == HotkeyBackend::Evdev {
-            widgets::banner(
-                ui,
-                widgets::BannerKind::Warning,
-                "evdev liest alle Tasten",
-                "evdev braucht die Gruppe input und liest technisch jeden Tastendruck mit, \
-                 nicht nur die hier belegten.",
-                None::<fn()>,
-            );
+            evdev_notice(ui);
         }
     }
 
-    /// The running „Aufnehmen", if its answer is in: the key read straight
-    /// from the input devices (exact, also Right Ctrl or a mouse side
-    /// button), or — when ICU may not read them — a key pressed while this
-    /// window has the focus. Keeps the window repainting while it waits.
+    /// The running „Aufnehmen", if its answer is in ([`Capture::poll`]).
     fn poll_capture(&mut self, ui: &Ui) -> Option<Result<Captured, String>> {
-        let capture = self.capture.as_mut()?;
-        ui.ctx().request_repaint_after(Duration::from_millis(50));
-        let evdev = capture.slot.lock().ok().and_then(|mut s| s.take());
-        if let Some(Ok(key)) = evdev {
-            return Some(Ok(Captured::from_evdev(key)));
-        }
-        if let Some(Err(e)) = evdev {
-            capture.evdev_failed = Some(e);
-        }
-        if capture.window.is_none() {
-            capture.window = window_key(ui).map(|k| (k, Instant::now()));
-        }
-        // A key seen by the window waits a moment for the exact one from
-        // the devices, which knows left from right Ctrl.
-        if let Some((key, at)) = &capture.window {
-            if capture.evdev_failed.is_some() || at.elapsed() > Duration::from_millis(250) {
-                return Some(Ok(key.clone()));
-            }
-        }
-        if capture.started.elapsed() > Duration::from_secs(10) {
-            return Some(Err(capture
-                .evdev_failed
-                .clone()
-                .unwrap_or_else(|| "Keine Taste gedrückt.".to_string())));
-        }
-        None
+        self.capture.as_mut()?.poll(ui)
     }
 
     #[cfg_attr(not(feature = "camera"), allow(unused_variables))]
@@ -2335,8 +2274,127 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
     });
 }
 
+/// What the Tastenkürzel page and the setup say while the hotkeys do not
+/// work: still being set up, never started, the portal's dialog turned down
+/// (with the two ways on), or no way to read keys at all. Nothing while they
+/// work. `backend` is what `crate::hotkey` reports — "starting", "portal",
+/// "evdev (n devices)", "portal-declined" or "none"; the empty string means
+/// it was never started (`--no-hotkeys`). `choice` is the draft's backend
+/// setting.
+pub(super) fn hotkey_notice(
+    ui: &mut Ui,
+    backend: &str,
+    choice: &mut HotkeyBackend,
+    cmds: &mut Vec<Command>,
+) {
+    match backend {
+        crate::hotkey::BACKEND_STARTING => {
+            widgets::banner(
+                ui,
+                widgets::BannerKind::Warning,
+                "Tastenkürzel werden eingerichtet",
+                "Fragt die Arbeitsumgebung in einem eigenen Dialog nach, dort bestätigen — \
+                 danach wirken die Tasten.",
+                None::<fn()>,
+            );
+            ui.add_space(12.0);
+        }
+        "" => {
+            widgets::banner(
+                ui,
+                widgets::BannerKind::Warning,
+                "Tastenkürzel sind abgeschaltet",
+                "ICU wurde ohne Tastenkürzel gestartet. Bedienen geht weiter über das \
+                 Hauptfenster.",
+                None::<fn()>,
+            );
+            ui.add_space(12.0);
+        }
+        crate::hotkey::BACKEND_PORTAL_DECLINED => {
+            widgets::banner(
+                ui,
+                widgets::BannerKind::Warning,
+                "Tastenkürzel wurden abgelehnt",
+                "Der Dialog der Arbeitsumgebung wurde abgebrochen oder ohne Taste bestätigt. \
+                 ICU kann erneut fragen oder die Tasten selbst lesen.",
+                None::<fn()>,
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if widgets::button(
+                    ui,
+                    widgets::ButtonKind::Primary,
+                    icon::ARROW_CLOCKWISE,
+                    "Erneut fragen",
+                )
+                .clicked()
+                {
+                    cmds.push(Command::RetryHotkeys);
+                }
+                if widgets::button(
+                    ui,
+                    widgets::ButtonKind::Neutral,
+                    icon::COMMAND,
+                    "Tasten direkt lesen (evdev)",
+                )
+                .on_hover_text("Liest jeden Tastendruck mit; braucht die Gruppe input")
+                .clicked()
+                {
+                    *choice = HotkeyBackend::Evdev;
+                }
+            });
+            ui.add_space(12.0);
+        }
+        crate::hotkey::BACKEND_NONE => {
+            widgets::banner(
+                ui,
+                widgets::BannerKind::Error,
+                "Tastenkürzel funktionieren gerade nicht",
+                "Das System bietet keinen Weg an, Tasten im Hintergrund zu lesen, und ICU \
+                 darf sie nicht selbst lesen (Gruppe input). Bedienen geht weiter über das \
+                 Hauptfenster.",
+                None::<fn()>,
+            );
+            ui.add_space(12.0);
+        }
+        _ => {}
+    }
+}
+
+/// What choosing evdev costs, wherever it can be chosen.
+pub(super) fn evdev_notice(ui: &mut Ui) {
+    widgets::banner(
+        ui,
+        widgets::BannerKind::Warning,
+        "evdev liest alle Tasten",
+        "evdev braucht die Gruppe input und liest technisch jeden Tastendruck mit, \
+         nicht nur die hier belegten.",
+        None::<fn()>,
+    );
+}
+
+/// „Testen“, or „Beenden“ while `on`: the mic test, which plays the own
+/// voice the way the others get it, after the whole send chain.
+pub(super) fn mic_test_button(ui: &mut Ui, on: bool, cmds: &mut Vec<Command>) {
+    let (kind, glyph, label) = if on {
+        (widgets::ButtonKind::Primary, icon::STOP, "Beenden")
+    } else {
+        (widgets::ButtonKind::Neutral, icon::HEADPHONES, "Testen")
+    };
+    if widgets::button(ui, kind, glyph, label)
+        .on_hover_text(
+            "Mikrofontest: du hörst dich so, wie die anderen dich hören. \
+             Endet von selbst nach einer Minute.",
+        )
+        .clicked()
+    {
+        cmds.push(Command::SetMicTest(!on));
+    }
+}
+
 /// A device choice; `extra` goes left of the list, in the same row.
-fn device_combo(
+pub(super) fn device_combo(
     ui: &mut Ui,
     divider: bool,
     label: &str,
@@ -2389,9 +2447,9 @@ fn device_combo(
 }
 
 /// A running „Aufnehmen" for one binding row.
-struct Capture {
+pub(super) struct Capture {
     /// Which row (its label).
-    label: &'static str,
+    pub(super) label: &'static str,
     started: Instant,
     /// Where the device reader drops its answer
     /// (`crate::hotkey::evdev::capture_next_key`).
@@ -2406,7 +2464,7 @@ struct Capture {
 impl Capture {
     /// Starts reading the input devices on a thread of its own: the UI
     /// thread has no runtime, and opening `/dev/input/*` blocks.
-    fn start(label: &'static str) -> Capture {
+    pub(super) fn start(label: &'static str) -> Capture {
         let slot: Arc<std::sync::Mutex<Option<Result<String, String>>>> = Arc::default();
         let out = slot.clone();
         let spawned = std::thread::Builder::new()
@@ -2437,13 +2495,45 @@ impl Capture {
             window: None,
         }
     }
+
+    /// The answer, once it is in: the key read straight from the input
+    /// devices (exact, also Right Ctrl or a mouse side button), or — when
+    /// ICU may not read them — a key pressed while this window has the
+    /// focus. Keeps the window repainting while it waits.
+    pub(super) fn poll(&mut self, ui: &Ui) -> Option<Result<Captured, String>> {
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
+        let evdev = self.slot.lock().ok().and_then(|mut s| s.take());
+        if let Some(Ok(key)) = evdev {
+            return Some(Ok(Captured::from_evdev(key)));
+        }
+        if let Some(Err(e)) = evdev {
+            self.evdev_failed = Some(e);
+        }
+        if self.window.is_none() {
+            self.window = window_key(ui).map(|k| (k, Instant::now()));
+        }
+        // A key seen by the window waits a moment for the exact one from
+        // the devices, which knows left from right Ctrl.
+        if let Some((key, at)) = &self.window {
+            if self.evdev_failed.is_some() || at.elapsed() > Duration::from_millis(250) {
+                return Some(Ok(key.clone()));
+            }
+        }
+        if self.started.elapsed() > Duration::from_secs(10) {
+            return Some(Err(self
+                .evdev_failed
+                .clone()
+                .unwrap_or_else(|| "Keine Taste gedrückt.".to_string())));
+        }
+        None
+    }
 }
 
 /// A captured key: its evdev name, and the portal trigger when one can be
 /// written for it (`CTRL+SHIFT+F12`; a lone Right Ctrl or a mouse side
 /// button has none).
 #[derive(Debug, Clone, PartialEq)]
-struct Captured {
+pub(super) struct Captured {
     key: String,
     trigger: Option<String>,
 }
@@ -2461,9 +2551,15 @@ impl Captured {
         Captured { key, trigger }
     }
 
+    /// Whether the portal can be asked for this key: a lone modifier or a
+    /// mouse button has no trigger it would take.
+    pub(super) fn has_trigger(&self) -> bool {
+        self.trigger.is_some()
+    }
+
     /// Writes itself into `binding`. A trigger is only replaced when there
     /// is a new one: evdev and portal bindings live side by side.
-    fn apply(&self, binding: &mut crate::config::KeyBinding) {
+    pub(super) fn apply(&self, binding: &mut crate::config::KeyBinding) {
         binding.key.clone_from(&self.key);
         if let Some(t) = &self.trigger {
             binding.trigger = Some(t.clone());
@@ -2603,7 +2699,7 @@ fn egui_key_name(key: egui::Key) -> Option<&'static str> {
 }
 
 /// What a click in a [`binding_row`] asks for.
-enum BindingAction {
+pub(super) enum BindingAction {
     None,
     /// Start „Aufnehmen" for this row.
     Record,
@@ -2620,7 +2716,7 @@ const BINDING_LABEL_W: f32 = 124.0;
 /// reads the keys, else the evdev key), „Aufnehmen" to take the next key
 /// pressed, and for experts the raw text fields behind the pencil.
 #[allow(clippy::too_many_arguments)]
-fn binding_row(
+pub(super) fn binding_row(
     ui: &mut Ui,
     divider: bool,
     label: &'static str,

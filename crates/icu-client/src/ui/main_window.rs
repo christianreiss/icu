@@ -17,6 +17,7 @@ use super::{
     connection::{opt, wrap_fingerprint, ConnectionView, NONE},
     fonts,
     settings::SettingsView,
+    setup::SetupView,
     theme, widgets,
 };
 use crate::{
@@ -55,9 +56,12 @@ pub const SETTINGS_SIZE: [f32; 2] = [820.0, 680.0];
 /// What the Verbindung window opens with: its first page fits; the longer
 /// ones grow it.
 pub const CONNECTION_SIZE: [f32; 2] = [720.0, 780.0];
+/// What the setup window opens with: every step fits without a scroll bar;
+/// only a banner about the keys may make it grow (`tests/ui_layout.rs`).
+pub const SETUP_SIZE: [f32; 2] = [600.0, 720.0];
 
 /// A microphone peak at or above this reads as clipping.
-const CLIP_DB: f32 = -1.0;
+pub(super) const CLIP_DB: f32 = -1.0;
 
 /// Above this round-trip time a row's ping turns amber.
 const SLOW_RTT_MS: u16 = 150;
@@ -127,6 +131,9 @@ struct App {
     settings: Option<SettingsView>,
     /// The Verbindung window, opened from the status pill in the header.
     connection: Option<ConnectionView>,
+    /// The setup window: open on a new install until finished or skipped,
+    /// later from Einstellungen → Audio → „Assistent“.
+    setup: Option<SetupView>,
     /// The theme currently installed in the egui context, so a settings
     /// change that isn't a theme change doesn't rebuild every style. A
     /// slider drag emits `UpdateSettings` on every frame it moves.
@@ -264,6 +271,7 @@ impl App {
             (Some(handle), Some(preview))
         };
         let videos = crate::video::VideoTextures::new(frames);
+        let setup = (!state.settings.ui.setup_done).then(|| SetupView::new(&state));
         App {
             engine,
             state,
@@ -271,6 +279,7 @@ impl App {
             cmd,
             settings: None,
             connection: None,
+            setup,
             theme: theme_name,
             debug_stats,
             debug_window_open: debug_stats,
@@ -392,8 +401,9 @@ impl eframe::App for App {
             }
             camera.sync(state);
         }
-        // So does the mic test to the Audio page (`settings_window`).
-        if self.settings.is_none() && state.mic_test {
+        // So does the mic test to the Audio page and the setup
+        // (`ui`, after both windows are drawn).
+        if self.settings.is_none() && self.setup.is_none() && state.mic_test {
             let _ = self.cmd.send(Command::SetMicTest(false));
         }
 
@@ -433,8 +443,15 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(33));
 
         self.debug_window(&ctx);
-        self.settings_window(&ctx);
+        let settings_test = self.settings_window(&ctx);
+        let setup_test = self.setup_window(&ctx);
         self.connection_window(&ctx);
+        // The mic test belongs to the Audio page and to the setup's steps
+        // that offer it; off both, it stops. One check for both windows, or
+        // the one not showing it would stop the other's every frame.
+        if self.state.mic_test && !(settings_test || setup_test) {
+            let _ = self.cmd.send(Command::SetMicTest(false));
+        }
 
         // Here and not in `logic`: a window hidden to tray would upload
         // textures nobody is looking at. `ui` already asks for a repaint
@@ -491,6 +508,9 @@ impl eframe::App for App {
             let mut settings = self.state.settings.clone();
             settings.ui.theme = next.to_string();
             if let Some(view) = &mut self.settings {
+                view.set_theme(next);
+            }
+            if let Some(view) = &mut self.setup {
                 view.set_theme(next);
             }
             let _ = self.cmd.send(Command::UpdateSettings(Box::new(settings)));
@@ -597,10 +617,11 @@ impl App {
         }
     }
 
-    /// The settings window, drawn into its own immediate viewport.
-    fn settings_window(&mut self, ctx: &egui::Context) {
+    /// The settings window, drawn into its own immediate viewport. Returns
+    /// whether it shows the Audio page, the home of the mic test.
+    fn settings_window(&mut self, ctx: &egui::Context) -> bool {
         if self.settings.is_none() {
-            return;
+            return false;
         }
         // Plain locals, not `self` fields — read/write freely inside the
         // closure with no borrow conflict against `self.settings`.
@@ -624,7 +645,7 @@ impl App {
             },
         );
         let Some(out) = out else {
-            return;
+            return false;
         };
         for c in out.cmds {
             if let Command::UpdateSettings(s) = &c {
@@ -641,8 +662,14 @@ impl App {
         if let Some(camera) = &mut self.camera {
             camera.set_preview(out.camera_preview && still_open);
         }
-        if self.state.mic_test && !(out.mic_test_page && still_open) {
-            let _ = self.cmd.send(Command::SetMicTest(false));
+        if out.open_setup {
+            match self.setup {
+                Some(_) => ctx.send_viewport_cmd_to(
+                    egui::ViewportId::from_hash_of(SETUP_ID),
+                    egui::ViewportCommand::Focus,
+                ),
+                None => self.setup = Some(SetupView::new(&self.state)),
+            }
         }
         if out.logout {
             self.logged_out.store(true, Ordering::Relaxed);
@@ -659,8 +686,47 @@ impl App {
                 self.last_stats = Instant::now();
             }
         }
+        out.mic_test_page && still_open
+    }
+
+    /// The setup window, drawn into its own immediate viewport. „Fertig“,
+    /// „Überspringen“ and closing it all end it for good (`SetupView::close`).
+    /// Returns whether it shows a step with the mic test.
+    fn setup_window(&mut self, ctx: &egui::Context) -> bool {
+        let Some(view) = &mut self.setup else {
+            return false;
+        };
+        let state = &self.state;
+        let mut out = None;
+        let still_open = immediate_window(
+            ctx,
+            SETUP_ID,
+            "ICU — Einrichtung",
+            SETUP_SIZE,
+            Some([520.0, 520.0]),
+            |ui| out = Some(view.ui(ui, state)),
+        );
+        let (cmds, done, test) = match out {
+            Some(out) => (out.cmds, out.done, out.mic_test_page),
+            None => (Vec::new(), false, false),
+        };
+        for c in cmds {
+            let _ = self.cmd.send(c);
+        }
+        if done || !still_open {
+            if let Some(mut view) = self.setup.take() {
+                for c in view.close(&self.state) {
+                    let _ = self.cmd.send(c);
+                }
+            }
+            return false;
+        }
+        test
     }
 }
+
+/// The setup window's viewport.
+const SETUP_ID: &str = "icu-setup";
 
 /// One of the app's secondary windows, drawn into its own immediate
 /// viewport with `body` as its central panel. `min_size` makes it
