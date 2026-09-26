@@ -2869,7 +2869,10 @@ pub(super) fn binding_row(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 widgets::label_column(ui, BINDING_LABEL_W, 30.0, label);
-                let shown = match (portal, binding.trigger.as_deref()) {
+                let shown = match (
+                    portal || (cfg!(windows) && binding.key.trim().is_empty()),
+                    binding.trigger.as_deref(),
+                ) {
                     (true, Some(t)) => t.to_string(),
                     _ if binding.key.is_empty() => "—".to_string(),
                     _ => binding
@@ -2963,7 +2966,11 @@ pub(super) fn binding_row(
                         .add(
                             egui::TextEdit::singleline(&mut trigger)
                                 .desired_width(120.0)
-                                .hint_text("Portal"),
+                                .hint_text(if cfg!(windows) {
+                                    "Kombination (ohne Taste)"
+                                } else {
+                                    "Portal"
+                                }),
                         )
                         .changed()
                     {

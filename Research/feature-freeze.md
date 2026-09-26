@@ -126,7 +126,7 @@ Siehe Tabellen „Ausdrücklich abgelehnt" und „Grauzone": Channels, Rechte/Ro
 2. PTT-Latenz Tastendruck → erstes Datagramm auf dem Draht (≤ 20 ms) unter Windows (Raw Input, implementiert 2026-09-26) und Linux (evdev) messen; Portal-GlobalShortcuts-Latenz auf KDE vergleichen.
 3. Maustasten-Bindung: unter KDE Plasma Wayland mit „Listening for mouse buttons" über das Portal und alternativ über evdev; unter Windows Seitentasten über Raw Input bei fokussiertem Vollbildspiel (Borderless).
 4. Jitter-Puffer-Zielwert (≤ 40 ms Playout-Delay) mit realem WAN-Jitter testen; Opus-FEC/PLC-Verhalten bei 5 % Paketverlust hörbar bewerten.
-5. Overlay click-through und Always-on-top über einem Borderless-Windowed-Spiel: Windows (WS_EX_LAYERED/WS_EX_TRANSPARENT, implementiert 2026-09-26, auf echtem Windows unbelegt) und KDE layer-shell; GNOME als „nicht unterstützt" bestätigen.
+5. Overlay click-through und Always-on-top über einem Borderless-Windowed-Spiel: Windows (WS_EX_LAYERED/WS_EX_TRANSPARENT, implementiert 2026-09-26, auf dem Windows-VM-Desktop belegt; über einem Spiel offen) und KDE layer-shell; GNOME als „nicht unterstützt" bestätigen.
 6. Hot-Plug-Verhalten auf beiden Plattformen (Gerät ziehen während des Streams; Linux PipeWire-Registry, Windows `IMMNotificationClient` seit 2026-09-26).
 7. Kamera-Stream darf Voice nicht beeinflussen: Voice-Latenz und Paketverlust mit und ohne Kamera messen.
 8. Whisper/Priority-Speaker-Beschreibung gegen erreichbare Mumble-Doku nachziehen, falls die Seiten wieder verfügbar sind (aktuell Redirect auf Doku-Index).
@@ -137,7 +137,7 @@ Siehe Tabellen „Ausdrücklich abgelehnt" und „Grauzone": Channels, Rechte/Ro
 [x] Step 3 am 2026-09-20 (Details in `verification.md`):
 
 - Keine eigenen Spikes; Abgleich mit den Entscheidungen der anderen Dokumente (Korrekturen unten eingearbeitet): Invite-Link-Format aus `auth-enrollment.md`, PTT-Backends aus `hotkey-wayland.md` (Portal primär, evdev opt-in; Windows Raw Input), Speaking-Indicator kombiniert Audio-Ankunft mit dem `speaking`-Flag aus `protocol/wire.md` (Flag deckt deafened Clients ab), Reconnect-Backoff max. 15 s wird in `PROTOCOL.md` übernommen.
-- Offen: 1–9 (alle brauchen zwei Clients bzw. Windows).
+- VM-Nachprüfung Windows/Linux: `windows-gate-2026-09-26.md`; akustische Messungen und Spiel-/physische Geräteprüfungen bleiben offen.
 
 Mit WebFetch gelesen (Inhalt erhalten), 2026-09-20:
 

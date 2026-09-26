@@ -42,11 +42,11 @@ Fedora, AlmaLinux 10+ (`.rpm`) und Debian 12+ (`.deb`) (Einrichtung:
 
 ## Status
 
-Phase: Pre-Release-Gate 2026-09-26 (`Research/review-2026-09-26.md`). Research und Spezifikation abgeschlossen (2026-09-20); Server (`crates/icu-server`), Protokoll (`crates/icu-proto`) und Linux-Client (`crates/icu-client`) implementiert. Der Server ist fürs offene Internet gehärtet (`Research/review-2026-09-24.md`, `deploy/README.md` „Im offenen Internet“), der Linux-Client ist Release-Kandidat. Der Windows-Client ist implementiert und baut als portables ZIP (`packaging/windows/build.sh`, 2026-09-26), ist aber auf echtem Windows ungetestet und nicht veröffentlicht (`Client/LIVETEST.md` §7). Offene Review-Befunde: `Research/review-2026-09-23.md`, `Research/review-2026-09-24.md`.
+Phase: Pre-Release-Gate 2026-09-26 (`Research/review-2026-09-26.md`). Research und Spezifikation abgeschlossen (2026-09-20); Server (`crates/icu-server`), Protokoll (`crates/icu-proto`) und Linux-Client (`crates/icu-client`) implementiert. Der Server ist fürs offene Internet gehärtet (`Research/review-2026-09-24.md`, `deploy/README.md` „Im offenen Internet“), der Linux-Client ist Release-Kandidat. Der Windows-Client ist implementiert und baut als portables ZIP (`packaging/windows/build.sh`, 2026-09-26), ist auf Windows 10 Pro N (VM `10.2.0.201`) geprüft; der aktuelle Windows-Gate-Bericht steht in `Research/windows-gate-2026-09-26.md` (`Client/LIVETEST.md` §7), Veröffentlichung ausstehend. Offene Review-Befunde: `Research/review-2026-09-23.md`, `Research/review-2026-09-24.md`.
 
 Stack (belegt in `Research/`, verifiziert in `Research/verification.md`): Rust; QUIC (quinn + rustls/ring) mit Datagrams für Audio; mutual TLS mit server-eigener CA und Registrierung per Einladungs-Bundle (`.icu`-Datei); Opus 48 kHz mono 20 ms; Server als reiner Relay; Client mit PipeWire (Linux) bzw. WASAPI IAudioClient3 (Windows), WebRTC AEC3, RNNoise, adaptivem Jitter-Buffer, egui-UI, Portal/evdev bzw. Raw-Input-Hotkeys, Layer-Shell bzw. Layered-Window-Overlay, H.264 über openh264.
 
-Offen: Windows auf echter Hardware (WASAPI, Raw Input, Overlay, SmartScreen), interaktiver Portal-Hotkey-Test auf KDE, Kamera-Bitrate bei 15 fps; was der Live-Test noch nicht abdeckt, steht in `Client/LIVETEST.md` §6.
+Offen: Windows auf physischer Zielhardware (akustische AEC/Drift, Gaming-Maus/Spiel-Overlay, SmartScreen), interaktiver Portal-Hotkey-Test auf KDE, Kamera-Bitrate bei 15 fps; was der Live-Test noch nicht abdeckt, steht in `Client/LIVETEST.md` §6.
 
 ## Lizenz
 

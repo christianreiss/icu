@@ -137,30 +137,59 @@ icu stats: sent=498 recv=500 bad=0 decoded=499 fec=0 plc=0 played=480960 play_un
 
 ## 7. Windows
 
-Stand 2026-09-26: der Windows-Client ist gebaut (`packaging/windows/build.sh` → `dist/<ver>/icu-<ver>-windows-x86_64.zip`, Features `aec,gui,camera,tray,overlay`) unter Wine 11 getestet (Unit-Tests 216/217, der eine an Wines `WSAENOPROTOOPT` für quinn-Sockets) und am 2026-09-26 erstmals auf echtem Windows gelaufen: VM `win10-test` (Windows 10 21H1, QEMU mit HDA-Audio über SPICE, Autologon Buffies, gestartet per `schtasks /it` in der Desktop-Sitzung) gegen einen Server auf dem Linux-Host plus einen Linux-Client `--headless --test-tone`. „VM ✓“ = dort belegt; was echte Hardware braucht, ist „offen, Hardware“. Server wie §1, aber auf einer Adresse, die die VM erreicht.
+Stand 2026-09-26: der Windows-Client ist gebaut (`packaging/windows/build.sh` → `dist/<ver>/icu-<ver>-windows-x86_64.zip`, Features `aec,gui,camera,tray,overlay`) unter Wine 11 getestet (Unit-Tests 216/217, der eine an Wines `WSAENOPROTOOPT` für quinn-Sockets) und am 2026-09-26 erstmals auf echtem Windows gelaufen: VM `win10-test` (Windows 10 Pro N 22H2, Build 19045.6456, QEMU mit HDA-Audio über SPICE, Autologon Buffies, gestartet per `schtasks /it` in der Desktop-Sitzung) gegen einen Server auf dem Linux-Host plus einen Linux-Client `--headless --test-tone`. Der ergänzende native Gate-Lauf ergab 231 bestandene Tests, keine Fehler und drei ignorierte Tests (`Research/windows-gate-2026-09-26.md`). „VM ✓“ = dort belegt; was echte Hardware braucht, ist „offen, Hardware“. Server wie §1, aber auf einer Adresse, die die VM erreicht.
 
 - [x] **Start** (VM ✓, ohne SmartScreen: per SSH kopiert, kein Zone-Identifier): ZIP entpacken, `icu.exe` starten; kein Konsolenfenster; Log unter `%LOCALAPPDATA%\icu\data\icu.log`, aus `cmd` gestartet Log in der Konsole (`AttachConsole`).
 - [x] **Registrierung** (VM ✓ über `icu.exe <datei>.icu`, Name tippen, Beitreten; Dateizuordnung in HKCU geschrieben; Doppelklick im Explorer und Icon offen): Einladung per Doppelklick auf die `.icu`-Datei → Erststart-Fenster vorbelegt; Dateizuordnung unter `HKCU\Software\Classes\.icu`/`ICU.Invite` mit Icon im Explorer.
 - [x] **Eine Instanz** (VM ✓: zweiter Start übergibt genau einmal und endet; zunächst 30 Übergaben, weil `DisconnectNamedPipe` das `ok` verwarf — behoben): zweiter Start holt das Fenster nach vorn (auch aus dem Tray), Doppelklick auf eine `.icu`-Datei bei laufendem ICU landet im offenen Fenster.
-- [x] **DPAPI** (VM ✓ `ICU-DPAPI/1`; Passport und Altbestand offen): `identity\key.pk8` beginnt mit `ICU-DPAPI/1`; Passport-Export/-Import funktioniert; eine alte, unversiegelte `key.pk8` wird gelesen und beim nächsten Speichern versiegelt.
-- [x] **WASAPI** (VM ✓: Mikrofon „Line In“ und Loopback über `AUTOCONVERTPCM`, Wiedergabe `IAudioClient3` mit 256 Frames; Stimme des Linux-Clients kommt an, Sprechanzeige; Debug-Stats und echtes Gespräch offen): Geräteliste; Periode im Log (IAudioClient3 bei float32 @ 48 kHz: 240 Frames bzw. nächstes Vielfaches; sonst `AUTOCONVERTPCM` mit 20 ms, z. B. Gerät auf 44,1 kHz stellen); `--debug-stats` wie §5 (`play_underruns=0`, `cap_overruns=0`); zwei Clients sprechen miteinander.
-- [ ] **Hot-Plug** (offen): Standardgerät in den Windows-Einstellungen wechseln → „Standard“-Streams folgen; USB-Headset ziehen/stecken; fest gewähltes Gerät ziehen → Fehlermeldung statt Absturz.
+- [x] **DPAPI** (VM ✓ `ICU-DPAPI/1` und Passport mit Einstellungen exportiert/importiert; Altbestand offen): `identity\key.pk8` beginnt mit `ICU-DPAPI/1`; Passport-Export/-Import funktioniert; eine alte, unversiegelte `key.pk8` wird gelesen und beim nächsten Speichern versiegelt.
+- [x] **WASAPI** (VM ✓: Mikrofon „Line In“ und Loopback über `AUTOCONVERTPCM`, Wiedergabe `IAudioClient3` mit 256 Frames; Stimme des Linux-Clients kommt an, Sprechanzeige; Debug-Stats geprüft; echtes akustisches Gespräch offen): Geräteliste; Periode im Log (IAudioClient3 bei float32 @ 48 kHz: 240 Frames bzw. nächstes Vielfaches; sonst `AUTOCONVERTPCM` mit 20 ms, z. B. Gerät auf 44,1 kHz stellen); `--debug-stats` wie §5 (`play_underruns=0`, `cap_overruns=0`); zwei Clients sprechen miteinander.
+- [ ] **Hot-Plug** (Audio-Dienst-Neustart mit Stream-Wiederaufnahme und Banner-Rücksetzung VM ✓; physisches Geräteziehen/-wechseln offen): Standardgerät in den Windows-Einstellungen wechseln → „Standard“-Streams folgen; USB-Headset ziehen/stecken; fest gewähltes Gerät ziehen → Fehlermeldung statt Absturz.
 - [ ] **AEC-Referenz** (VM: Loopback liefert; in der VM stockt es bis ~35 ms und liefert dann gesammelt — ohne Toleranz „AEC reference dropped out“ alle 10 s, mit `reference_slack` 40 ms in 60 s keiner; Auslöschung selbst offen): Loopback des Ausgabegeräts liefert (`ref_underruns` nur beim Start); Spielton/Musik über Lautsprecher verschwindet aus dem gesendeten Signal; ERL/ERLE unter Erweitert plausibel.
 - [ ] **A6 Drift** Loopback ↔ Mikrofon über 10 min in ppm (offen, Hardware; `Research/aec.md` A6).
 - [ ] **MMCSS** (VM: `real-time priority acquired` für alle vier Threads; Stottern unter Last offen): Engine-Threads in der Aufgabe „Pro Audio“ (z. B. Process Explorer), kein Stottern unter CPU-Last.
-- [x] **Raw Input** (VM ✓: F12 als PTT bei fokussiertem Notepad sendet; winit nimmt Raw Input nach dem Fensterstart, die Rückholung nach 2 s greift; Pause/Maustasten offen): PTT/Mute/Deafen mit fokussiertem anderem Fenster; „Aufnehmen“ erkennt Tasten, Pause, Seitentasten der Maus (`BTN_SIDE`/`BTN_EXTRA`); kein Auto-Repeat; Tasten bleiben nach dem Öffnen weiterer Fenster wirksam (Neuregistrierung gegen winit).
+- [x] **Raw Input** (VM ✓: F12 als PTT bei fokussiertem Notepad sendet; winit nimmt Raw Input nach dem Fensterstart, die Rückholung nach 2 s greift; Pause-Press/Release und importiertes CTRL+SHIFT+F12 VM ✓; Maustasten offen): PTT/Mute/Deafen mit fokussiertem anderem Fenster; „Aufnehmen“ erkennt Tasten, Pause, Seitentasten der Maus (`BTN_SIDE`/`BTN_EXTRA`); kein Auto-Repeat; Tasten bleiben nach dem Öffnen weiterer Fenster wirksam (Neuregistrierung gegen winit).
 - [ ] **Raw Input im Spiel** mit Gaming-Maus bei fokussiertem Borderless-Spiel (offen, Hardware).
 - [ ] **UIPI** (offen, Hardware): Spiel als Administrator → Tasten kommen nicht an, Hinweis in ⚙ → Tastenkürzel stimmt; ICU als Administrator → Tasten kommen an.
 - [x] **Overlay** (VM ✓ auf dem Desktop: Namensschild oben rechts mit Sprechrahmen; Skalierung ≠ 100 % offen): klick-durchlässig, bleibt oben, Ecke/Offset im Arbeitsbereich des primären Monitors, auch bei Skalierung ≠ 100 %; über einem Borderless-Spiel (offen, Hardware).
-- [ ] **Toast** (VM: Info-Center zählt die Meldungen, kein Fehler im Log; Aussehen/Ersetzen offen): „Meldung bei Kommen und Gehen“ an → Toast mit Absender „ICU“, ein neuer ersetzt den vorigen, kein Systemton.
-- [ ] **Tray** (VM: Icon sichtbar; Menü und Schließen-Aktion offen): Icon-Varianten, Menü, Doppelklick, „Beim Schließen“ Infobereich/Minimieren/Beenden.
-- [ ] **Kamera** (offen): MediaFoundation-Kamera, Vorschau, Bild beim Gegenüber.
+- [ ] **Toast** (VM ✓ sichtbarer Join-Toast mit Absender ICU; Ersetzen offen): „Meldung bei Kommen und Gehen“ an → Toast mit Absender „ICU“, ein neuer ersetzt den vorigen, kein Systemton.
+- [ ] **Tray** (VM ✓ Menü/Stumm, Schließen in den Tray, minimierter Start und Wiederherstellen durch zweiten Start; Doppelklick und weitere Schließen-Modi offen): Icon-Varianten, Menü, Doppelklick, „Beim Schließen“ Infobereich/Minimieren/Beenden.
+- [ ] **Kamera** (synthetisches Video in beide Richtungen und Overlay VM ✓; physische Kamera offen): MediaFoundation-Kamera, Vorschau, Bild beim Gegenüber.
 - [x] **Beenden** (VM ✓ Abmelden: `session ends, quitting`, Server `left reason=NO_ERROR` 0,9 s später; Herunterfahren und Strg+C offen): Abmelden/Herunterfahren mit laufendem ICU → sauberes Ende (letzte Einstellung gespeichert), kein „Diese App verhindert das Herunterfahren“; Strg+C in der Konsole.
 
 Bekannte Abweichungen von Linux (Paritäts-Audit 2026-09-26), gezielt prüfen:
 
-- [ ] **AEC-Paarung** (offen, Hardware): `dsp::refalign` erwartet Mikrofon und Referenz im selben Graph-Zyklus (PipeWire `node.group`); unter WASAPI laufen Capture (Event) und Loopback (2-ms-Abfrage) unabhängig; das Backend schiebt das Mikrofon deshalb je Geräteperiode (≥ 480 Samples) und nennt 40 ms `reference_slack`. ERLE und Verzögerung messen, auch direkt nach einem Wechsel des Standardgeräts (der Stream öffnet sich im Backend neu, ohne dass die Engine den AEC neu startet).
-- [ ] **Loopback ohne Wiedergabe** (offen): schlägt nur der Lautsprecher beim Öffnen fehl und spielt sonst nichts, liefert Loopback nichts, und die DSP wartet pro Block auf die Referenz.
-- [ ] **Tastenkombinationen**: Windows bindet nur `key`, keine Portal-`trigger`; ein Linux-Passport mit reinem Portal-Trigger kommt ohne PTT-Taste an.
+- [ ] **AEC-Paarung** (offen, Hardware): `dsp::refalign` erwartet Mikrofon und Referenz im selben Graph-Zyklus (PipeWire `node.group`); unter WASAPI laufen Capture (Event) und Loopback (2-ms-Abfrage) unabhängig; das Backend schiebt das Mikrofon deshalb je Geräteperiode (≥ 480 Samples) und nennt 40 ms `reference_slack`. ERLE und Verzögerung messen, auch direkt nach einem Wechsel des Standardgeräts (Gerätewechsel öffnen jetzt die gesamte Stream-Gruppe mit AEC-Neustart über die Engine neu; Regressionstest vorhanden).
+- [x] **Loopback ohne Wiedergabe**: bei fehlgeschlagener WASAPI-Wiedergabe wird die Referenz geschlossen und die DSP wartet nicht auf einen stillstehenden Loopback; das Öffnen wird mit Backoff wiederholt.
+- [x] **Tastenkombinationen**: Windows wertet einen Portal-Trigger aus, wenn `key` leer ist; Modifier- und Release-Semantik durch Regressionstests geprüft, Desktop-Prüfung im Gate-Bericht.
 - [ ] **Standardgerät**: gefolgt wird der Rolle „Standardgerät“ (eConsole), nicht „Standardkommunikationsgerät“.
 - [ ] **Abmelden**: `WM_ENDSESSION` hält bis zu 5 s ohne `ShutdownBlockReasonCreate`.
+
+
+### Ergänzender Gate-Lauf auf 10.2.0.201
+
+`Research/windows-gate-2026-09-26.md` enthält die Ergebnisse des aktuellen
+Quellstands, Artefakt-Hash und Grenzen. Die Desktop-Tests laufen als
+`buffies` in Sitzung 1 über interaktive geplante Aufgaben; SSH allein läuft
+in einer anderen Sitzung und ersetzt keinen Desktop-Test.
+
+Native Tests auf Linux cross-bauen und auf Windows ausführen:
+
+```sh
+PATH="$PWD/build/win-aec:$PATH" cargo test --locked -p icu-client \
+  --target x86_64-pc-windows-gnu --lib --no-run
+```
+
+Die ausgegebene Test-EXE auf Windows mit `--test-threads=2` starten.
+Zwei opt-in Tests benötigen die interaktive Windows-Sitzung:
+
+- `live_wasapi --ignored --nocapture`: drei Sekunden leiser Prüfton;
+  Capture, Wiedergabe und nicht-stille Loopback-Referenz müssen liefern.
+- `live_raw_input --ignored --nocapture`: innerhalb von acht Sekunden F12
+  und Pause auf einer echten/virtuellen Tastatur drücken und loslassen;
+  beide Übergänge müssen ankommen (SendInput ist kein Raw-Input-Gerät).
+
+Zusätzlich prüfen: Audio-Dienst fünf Sekunden stoppen und wieder starten
+(nur Testmaschine), Wiederaufnahme aller drei Streams und Verschwinden der
+alten Audiofehlermeldung; Setup bei 1024×768 vollständig durchgehen;
+Passport exportieren und in einem getrennten Konfigurationsordner importieren.

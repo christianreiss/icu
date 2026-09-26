@@ -36,6 +36,9 @@ pub struct DeviceInfo {
 pub enum BackendEvent {
     /// The device list changed (hot-plug). Carries the complete new list.
     DevicesChanged(Vec<DeviceInfo>),
+    /// A default endpoint changed. Reopen all streams together so microphone,
+    /// playback and echo reference start a new timing epoch.
+    DefaultDeviceChanged,
     /// A stream ended with an error; the engine may reopen it.
     StreamError {
         /// Which stream.

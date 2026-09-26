@@ -498,65 +498,43 @@ fn run_stream(
     if spec.kind != StreamKind::Reference {
         super::rt::promote_current_thread(&name);
     }
-    let mut ready = Some(ready);
-    let mut failures = 0u32;
-    loop {
-        let generation = defaults.of(spec.flow()).load(Ordering::SeqCst);
-        let ended = match Stream::open(&spec) {
-            Ok(mut stream) => {
-                failures = 0;
-                if let Some(r) = ready.take() {
-                    let _ = r.send(Ok(()));
-                }
-                tracing::info!(
-                    stream = spec.name(),
-                    device = %stream.device_name,
-                    channels = stream.channels,
-                    period = stream.period,
-                    mode = stream.mode,
-                    "wasapi stream open"
-                );
-                let follows = spec.device.is_none();
-                stream.pump(&mut callback, &stop, || {
-                    follows && defaults.of(spec.flow()).load(Ordering::SeqCst) != generation
-                })
-            }
-            Err(e) => {
-                if let Some(r) = ready.take() {
-                    let _ = r.send(Err(e));
-                    return;
-                }
-                Ended::Failed(e)
-            }
-        };
-        match ended {
-            Ended::Stopped => return,
-            Ended::DefaultChanged => {
-                tracing::info!(stream = spec.name(), "default device changed, following it");
-            }
-            // Following the default: the next one takes over once Windows
-            // has picked it; give up after a few seconds without one.
-            Ended::DeviceLost | Ended::Failed(_) if spec.device.is_none() && failures < 10 => {
-                failures += 1;
-                std::thread::sleep(Duration::from_millis(300));
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
-            }
-            Ended::DeviceLost => {
-                let _ = events.send(BackendEvent::StreamError {
-                    stream: spec.kind,
-                    message: "Gerät nicht mehr verfügbar".into(),
-                });
-                return;
-            }
-            Ended::Failed(message) => {
-                let _ = events.send(BackendEvent::StreamError {
-                    stream: spec.kind,
-                    message,
-                });
-                return;
-            }
+    let generation = defaults.of(spec.flow()).load(Ordering::SeqCst);
+    let mut stream = match Stream::open(&spec) {
+        Ok(stream) => stream,
+        Err(e) => {
+            let _ = ready.send(Err(e.clone()));
+            // Initial failure also needs recovery (audio service restarting,
+            // or no endpoint yet). The engine applies its bounded backoff.
+            let _ = events.send(BackendEvent::StreamError {
+                stream: spec.kind,
+                message: e,
+            });
+            return;
+        }
+    };
+    let _ = ready.send(Ok(()));
+    tracing::info!(stream = spec.name(), device = %stream.device_name,
+        channels = stream.channels, period = stream.period, mode = stream.mode,
+        "wasapi stream open");
+    let ended = stream.pump(&mut callback, &stop, || {
+        spec.device.is_none() && defaults.of(spec.flow()).load(Ordering::SeqCst) != generation
+    });
+    // The engine owns recovery, including clearing the audio rings and resetting
+    // AEC. Reopening just this thread kept samples from unrelated device clocks.
+    match ended {
+        Ended::Stopped => {}
+        Ended::DefaultChanged => {
+            let _ = events.send(BackendEvent::DefaultDeviceChanged);
+        }
+        Ended::DeviceLost | Ended::Failed(_) => {
+            let message = match ended {
+                Ended::Failed(message) => message,
+                _ => "Gerät nicht mehr verfügbar".into(),
+            };
+            let _ = events.send(BackendEvent::StreamError {
+                stream: spec.kind,
+                message,
+            });
         }
     }
 }
@@ -955,6 +933,68 @@ fn set_properties(client: &IAudioClient, kind: StreamKind) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run in an interactive Windows desktop session, with a default input
+    /// and output. Plays a quiet tone for three seconds and measures loopback.
+    #[test]
+    #[ignore = "needs Windows audio endpoints; plays a quiet test tone"]
+    fn live_wasapi_capture_playback_and_loopback() {
+        use std::sync::atomic::AtomicUsize;
+        let mut backend = WasapiBackend::new().unwrap();
+        let devices = backend.devices();
+        assert!(devices.iter().any(|d| d.kind == DeviceKind::Input));
+        assert!(devices.iter().any(|d| d.kind == DeviceKind::Output));
+        let cap = Arc::new(AtomicUsize::new(0));
+        let reference = Arc::new(AtomicUsize::new(0));
+        let audible = Arc::new(AtomicUsize::new(0));
+        let counter = cap.clone();
+        backend
+            .open_capture(
+                None,
+                Box::new(move |samples| {
+                    assert!(samples.iter().all(|x| x.is_finite()));
+                    counter.fetch_add(samples.len(), Ordering::Relaxed);
+                }),
+            )
+            .unwrap();
+        let (counter, nonzero) = (reference.clone(), audible.clone());
+        backend
+            .open_reference(
+                None,
+                Box::new(move |samples| {
+                    counter.fetch_add(samples.len(), Ordering::Relaxed);
+                    nonzero.fetch_add(
+                        samples.iter().filter(|x| x.abs() > 0.00001).count(),
+                        Ordering::Relaxed,
+                    );
+                }),
+            )
+            .unwrap();
+        let mut phase = 0.0f32;
+        backend
+            .open_playback(
+                None,
+                Box::new(move |samples| {
+                    for sample in samples {
+                        *sample = phase.sin() * 0.02;
+                        phase = (phase + std::f32::consts::TAU * 997.0 / SAMPLE_RATE as f32)
+                            % std::f32::consts::TAU;
+                    }
+                }),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        drop(backend);
+        let (cap, reference, audible) = (
+            cap.load(Ordering::Relaxed),
+            reference.load(Ordering::Relaxed),
+            audible.load(Ordering::Relaxed),
+        );
+        eprintln!("WASAPI: capture={cap} reference={reference} nonzero_reference={audible}");
+        assert!(cap > 48_000, "capture did not keep running");
+        assert!(reference > 48_000, "loopback did not keep running");
+        assert!(audible > 24_000, "rendered tone did not reach loopback");
+    }
 
     #[test]
     fn the_period_is_the_first_fundamental_multiple_from_5_ms() {

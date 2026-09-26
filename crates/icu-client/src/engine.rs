@@ -896,6 +896,9 @@ impl Engine {
                     };
                     while let Ok(ev) = events.recv() {
                         match ev {
+                            BackendEvent::DefaultDeviceChanged => {
+                                schedule_reopen(Duration::from_millis(100));
+                            }
                             BackendEvent::DevicesChanged(list) => {
                                 shared.state.send_modify(|s| s.devices = list);
                                 // Decided against the backend's current list
@@ -1106,6 +1109,16 @@ fn effective_device(
 }
 
 fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Arc<Shared>) {
+    // Replace stale device errors with the outcome of this attempt. Keep
+    // unrelated storage/network errors; failed opens below report a fresh one.
+    shared.state.send_modify(|s| {
+        if s.banner
+            .as_ref()
+            .is_some_and(crate::problem::Problem::is_audio)
+        {
+            s.banner = None;
+        }
+    });
     let (input, output) = wanted_devices(settings, &backend.devices());
     if input.is_none() && settings.audio.input_device.is_some() {
         tracing::info!(saved = ?settings.audio.input_device, "microphone missing, using the default");
@@ -1195,6 +1208,14 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
         Ok(()) => {}
         Err(e) => {
             tracing::warn!(error = %e, "cannot open playback");
+            // WASAPI loopback has no clock while the endpoint is idle. Without
+            // playback it can stop delivering, stalling every outgoing block.
+            #[cfg(windows)]
+            if backend.name() == "wasapi" {
+                backend.close(StreamKind::Reference);
+                shared.reference_open.store(false, Ordering::Relaxed);
+                shared.state.send_modify(|s| s.aec_reference = false);
+            }
             shared
                 .state
                 .send_modify(|s| s.banner = Some(crate::problem::audio("Der Lautsprecher", &e)));

@@ -107,6 +107,11 @@ pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String
             // `window_visible` keeps the engine's view, so `logic` reports
             // the difference.
             app.hidden = start_minimized;
+            #[cfg(windows)]
+            if start_minimized {
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
             if start_minimized_to_dock {
                 cc.egui_ctx
                     .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -327,6 +332,12 @@ fn quit(quit_requested: &mut bool, ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
 }
 
+fn show_window(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
 /// Whether the window can start hidden in the tray (`can_hide` and a tray
 /// host on the session bus).
 fn start_hidden_possible() -> bool {
@@ -423,8 +434,7 @@ impl eframe::App for App {
             match tray.poll() {
                 Some(crate::tray::TrayEvent::ShowWindow) => {
                     self.hidden = false;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    show_window(ctx);
                 }
                 Some(crate::tray::TrayEvent::Quit) => quit(&mut self.quit_requested, ctx),
                 None => {}
@@ -436,8 +446,7 @@ impl eframe::App for App {
         // opens in Einstellungen → Allgemein, checked and ready to take.
         if let Some(request) = crate::instance::poll() {
             self.hidden = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            show_window(ctx);
             if let Some(text) = request.bundle {
                 if self.settings.is_none() {
                     self.settings = Some(self.new_settings_view());
@@ -477,6 +486,10 @@ impl eframe::App for App {
             match hide {
                 Some(true) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    // eframe 0.36 recognizes minimized/occluded viewports,
+                    // but not a hidden Win32 window, when skipping rendering.
+                    #[cfg(windows)]
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     self.hidden = true;
                 }
@@ -830,6 +843,14 @@ fn immediate_window(
         .with_inner_size(size);
     if let Some(min) = min_size {
         builder = builder.with_min_inner_size(min).with_resizable(true);
+    }
+    #[cfg(windows)]
+    if let Some(area) = super::work_area(ctx) {
+        let (fitted, pos) = super::fit_window(size, area);
+        builder = builder.with_inner_size(fitted).with_position(pos);
+        if let Some(min) = min_size {
+            builder = builder.with_min_inner_size(egui::vec2(min[0], min[1]).min(fitted));
+        }
     }
     let mut still_open = true;
     // The viewport callback is `FnMut`; `body` runs once per call.
@@ -2025,6 +2046,11 @@ pub fn run_enroll(
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx, &enroll_theme);
+            let ctx = cc.egui_ctx.clone();
+            crate::instance::set_waker(move || ctx.request_repaint());
+            let ctx = cc.egui_ctx.clone();
+            crate::signals::set_waker(move || ctx.request_repaint());
+            crate::signals::listen();
             let mut app = EnrollApp::new(paths, server_addr, result_app);
             if let Some(text) = text {
                 app.paste(text);
@@ -2063,6 +2089,8 @@ enum EnrollStep {
 /// file on it; check where it leads, pick a name, join. `pub` for
 /// `tests/ui_layout.rs`.
 pub struct EnrollApp {
+    #[cfg(windows)]
+    positioned: bool,
     paths: Paths,
     server_addr: Option<SocketAddr>,
     link: String,
@@ -2107,6 +2135,8 @@ impl EnrollApp {
     ) -> EnrollApp {
         let current = Identity::load(&paths).ok().flatten();
         EnrollApp {
+            #[cfg(windows)]
+            positioned: false,
             current,
             paths,
             server_addr,
@@ -2204,18 +2234,22 @@ impl EnrollApp {
 }
 
 impl eframe::App for EnrollApp {
-    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = root.ctx().clone();
-        ctx.request_repaint_after(Duration::from_millis(100));
-
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Registration completes on a worker, including while minimized.
+        // An idle invitation needs no periodic repaint.
+        if self.pending.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if crate::signals::requested() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // ICU started again (`crate::instance`): come to the front, with the
         // invite or passport it was given, unless a join is under way.
         if let Some(request) = crate::instance::poll() {
             if let Some(text) = request.bundle.filter(|_| self.pending.is_none()) {
                 self.paste(text);
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            show_window(ctx);
         }
 
         // Taken out of the slot first: holding the lock across the match
@@ -2248,6 +2282,22 @@ impl eframe::App for EnrollApp {
                     }
                 },
                 Err(e) => self.status = Some(EnrollStatus::Failed(e)),
+            }
+        }
+    }
+
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = root.ctx().clone();
+        #[cfg(windows)]
+        if !self.positioned {
+            if let Some(area) = super::work_area(&ctx) {
+                let (size, pos) = super::fit_window([560.0, 600.0], area);
+                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
+                    egui::vec2(480.0, 520.0).min(size),
+                ));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                self.positioned = true;
             }
         }
         let busy = self.pending.is_some();
@@ -2539,6 +2589,7 @@ impl eframe::App for EnrollApp {
             self.focus_paste = true;
         } else if join && join_ok && step == EnrollStep::Join {
             self.submit();
+            ctx.request_repaint();
         }
     }
 }

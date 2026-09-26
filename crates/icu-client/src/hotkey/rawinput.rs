@@ -429,9 +429,9 @@ pub async fn start(
     settings: &HotkeySettings,
     cmd: UnboundedSender<Command>,
 ) -> Result<Guard, String> {
-    let bindings: Vec<(u16, Action)> = super::bindings(settings)
+    let mut bindings: Vec<(super::chord::Chord, Action, bool)> = super::bindings(settings)
         .into_iter()
-        .filter_map(|(b, a)| keys::parse_key(&b.key).map(|k| (k, a)))
+        .filter_map(|(b, a)| super::chord::Chord::parse(b).map(|k| (k, a, false)))
         .collect();
     if bindings.is_empty() {
         return Err("no key bound".into());
@@ -440,13 +440,50 @@ pub async fn start(
         .await
         .map_err(|e| e.to_string())??;
     let mut dispatch = Dispatch::new(cmd);
+    let mut held = HashSet::new();
     let id = hub.add(Box::new(move |code, pressed| {
-        for (k, action) in &bindings {
-            if *k == code {
-                dispatch.key(*action, pressed);
+        if pressed {
+            held.insert(code);
+        } else {
+            held.remove(&code);
+        }
+        for (chord, action, active) in &mut bindings {
+            let now = chord.held(&held);
+            if now != *active {
+                *active = now;
+                dispatch.key(*action, now);
             }
         }
         true
     }));
     Ok(Guard { hub, id })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In the VM, inject F12 and Pause through its virtual keyboard during
+    /// this test (not SendInput, which is not a physical Raw Input device).
+    #[test]
+    #[ignore = "needs an interactive desktop and F12/Pause keyboard input"]
+    fn live_raw_input_releases_keys() {
+        let hub = hub().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = seen.clone();
+        let id = hub.add(Box::new(move |code, pressed| {
+            if code == 88 || code == keys::KEY_PAUSE {
+                events.lock().unwrap().push((code, pressed));
+            }
+            true
+        }));
+        std::thread::sleep(Duration::from_secs(8));
+        hub.remove(id);
+        let events = seen.lock().unwrap();
+        eprintln!("F12/Pause transitions: {events:?}");
+        for key in [88, keys::KEY_PAUSE] {
+            assert!(events.contains(&(key, true)), "key {key} was not pressed");
+            assert!(events.contains(&(key, false)), "key {key} remained held");
+        }
+    }
 }
