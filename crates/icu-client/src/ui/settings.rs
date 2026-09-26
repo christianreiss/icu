@@ -157,6 +157,9 @@ pub struct SettingsView {
     /// The overlay thread is running; without layer shell (GNOME) the
     /// overlay card says so instead of offering switches that do nothing.
     overlay_available: bool,
+    /// Closing can hide the main window to the tray on this desktop
+    /// (tray host, not Wayland); otherwise „Infobereich“ minimizes.
+    tray_available: bool,
     /// „Kein Echo feststellbar" was answered; it is not offered again while
     /// this window lives.
     aec_hint_dismissed: bool,
@@ -306,6 +309,7 @@ impl SettingsView {
             #[cfg(feature = "camera")]
             cameras_stale: true,
             overlay_available: cfg!(feature = "overlay"),
+            tray_available: cfg!(feature = "tray"),
             aec_hint_dismissed: false,
             capture: None,
             capture_error: None,
@@ -334,6 +338,12 @@ impl SettingsView {
     /// Whether the overlay could start on this desktop.
     pub fn with_overlay_available(mut self, available: bool) -> SettingsView {
         self.overlay_available = available;
+        self
+    }
+
+    /// Whether closing can hide the window to the tray on this desktop.
+    pub fn with_tray_available(mut self, available: bool) -> SettingsView {
+        self.tray_available = available;
         self
     }
 
@@ -1391,6 +1401,17 @@ impl SettingsView {
                     let id = state.me.as_ref().map(|m| m.user_id.to_string());
                     widgets::chip(ui, id.as_deref().unwrap_or("—"), 0.0)
                 });
+                // A desktop-integration knob, on by default: here rather
+                // than among the everyday rows, which „Beim Schließen“ fills.
+                widgets::setting_row(
+                    ui,
+                    true,
+                    "Einladungen mit ICU öffnen",
+                    Some(
+                        "Ein Doppelklick auf eine Einladung oder einen Passport (.icu) öffnet ICU.",
+                    ),
+                    |ui| widgets::toggle(ui, &mut self.draft.ui.register_uri_handler),
+                );
                 ui.separator();
             }
             widgets::setting_row(ui, !adv, "Farben", None, |ui| {
@@ -1413,19 +1434,40 @@ impl SettingsView {
                 }
                 r
             });
+            widgets::setting_row(ui, true, "Beim Schließen", None, |ui| {
+                let mut action = match self.draft.ui.close_action.as_str() {
+                    "minimize" => "minimize",
+                    "quit" => "quit",
+                    _ => "tray",
+                };
+                let r = widgets::segmented(
+                    ui,
+                    &mut action,
+                    &[
+                        ("tray", "Infobereich"),
+                        ("minimize", "Minimieren"),
+                        ("quit", "Beenden"),
+                    ],
+                );
+                if r.changed() {
+                    self.draft.ui.close_action = action.to_string();
+                }
+                r
+            });
+            if self.draft.ui.close_action == "tray" && !self.tray_available {
+                widgets::help_note(
+                    ui,
+                    "Hier kann ICU nicht in den Infobereich (Wayland oder kein \
+                     Infobereich, unter GNOME z. B. ohne die Erweiterung \
+                     „AppIndicator“) und minimiert stattdessen in die Taskleiste.",
+                );
+            }
             widgets::setting_row(
                 ui,
                 true,
                 "Minimiert starten",
-                Some("ICU startet unsichtbar im Infobereich der Taskleiste."),
+                Some("ICU startet im Infobereich, wo es keinen gibt, minimiert in der Taskleiste."),
                 |ui| widgets::toggle(ui, &mut self.draft.ui.start_minimized),
-            );
-            widgets::setting_row(
-                ui,
-                true,
-                "Einladungen mit ICU öffnen",
-                Some("Ein Doppelklick auf eine Einladung oder einen Passport (.icu) öffnet ICU."),
-                |ui| widgets::toggle(ui, &mut self.draft.ui.register_uri_handler),
             );
         });
 

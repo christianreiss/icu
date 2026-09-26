@@ -80,6 +80,10 @@ pub enum Exit {
 /// logging back in the window must not vanish to the tray.
 pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String> {
     let start_minimized = engine.snapshot().settings.ui.start_minimized && !show;
+    // Where the tray cannot take the window, „Minimiert starten“ starts in
+    // the task bar/dock instead of on screen.
+    let start_minimized_to_dock = start_minimized && !start_hidden_possible();
+    let start_minimized = start_minimized && !start_minimized_to_dock;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ICU")
@@ -103,6 +107,10 @@ pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String
             // `window_visible` keeps the engine's view, so `logic` reports
             // the difference.
             app.hidden = start_minimized;
+            if start_minimized_to_dock {
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
             Ok(Box::new(app))
         }),
     )
@@ -319,9 +327,19 @@ fn quit(quit_requested: &mut bool, ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
 }
 
+/// Whether the window can start hidden in the tray (`can_hide` and a tray
+/// host on the session bus).
+fn start_hidden_possible() -> bool {
+    #[cfg(feature = "tray")]
+    return can_hide() && crate::tray::host_present();
+    #[cfg(not(feature = "tray"))]
+    false
+}
+
 /// Whether the window can be hidden. winit cannot hide a window on
 /// Wayland (`set_visible` does nothing there): closing to the tray would
-/// leave it on screen and only the second [X] would quit, so there it quits.
+/// leave it on screen and only the second [X] would quit, so there it
+/// minimizes instead (`[ui] close_action`).
 #[cfg(feature = "tray")]
 fn can_hide() -> bool {
     if !cfg!(target_os = "linux") {
@@ -435,18 +453,31 @@ impl eframe::App for App {
             let _ = self.cmd.send(Command::SetMicTest(false));
         }
 
-        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested {
-            #[cfg(feature = "tray")]
-            if self.tray.is_some()
-                && self.can_hide
-                && !self.hidden
-                && !ctx.input(|i| i.modifiers.shift)
-            {
-                // Close = hide to tray; Shift+close, Strg+Q, the header's
-                // „Beenden“ or the tray menu quits. On Wayland close quits.
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-                self.hidden = true;
+        if ctx.input(|i| i.viewport().close_requested())
+            && !self.quit_requested
+            && !self.hidden
+            && !ctx.input(|i| i.modifiers.shift)
+        {
+            // `[ui] close_action`; Shift+close, Strg+Q, the header's
+            // „Beenden“ or the tray menu always quit.
+            let hide = match self.state.settings.ui.close_action.as_str() {
+                "quit" => None,
+                "minimize" => Some(false),
+                _ => Some(self.can_hide_to_tray()),
+            };
+            match hide {
+                Some(true) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    self.hidden = true;
+                }
+                // To the task bar/dock: also where the tray cannot take the
+                // window (Wayland, no tray host), instead of vanishing.
+                Some(false) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                None => {}
             }
         }
 
@@ -570,6 +601,15 @@ impl eframe::App for App {
 
 impl App {
     /// A fresh settings window over the current state.
+    /// Closing can hide the window to the tray: a tray, a panel drawing it
+    /// and a window system that can hide windows.
+    fn can_hide_to_tray(&self) -> bool {
+        #[cfg(feature = "tray")]
+        return self.can_hide && self.tray.as_ref().is_some_and(|t| t.host_available());
+        #[cfg(not(feature = "tray"))]
+        false
+    }
+
     fn new_settings_view(&self) -> SettingsView {
         let paths = self
             .engine
@@ -580,7 +620,8 @@ impl App {
             .unwrap_or_else(|| Paths::new(None));
         #[cfg_attr(not(feature = "camera"), allow(unused_mut))]
         let mut view = SettingsView::new(&self.state, self.stats.clone(), paths)
-            .with_overlay_available(self.overlay_available());
+            .with_overlay_available(self.overlay_available())
+            .with_tray_available(self.can_hide_to_tray());
         #[cfg(feature = "camera")]
         if let Some(camera) = &self.camera {
             view = view.with_preview(camera.preview_source());
