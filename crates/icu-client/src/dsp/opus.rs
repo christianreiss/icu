@@ -114,7 +114,7 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dsp::testsignal::{harmonic_voice, pearson, speechlike};
+    use crate::dsp::testsignal::{harmonic_voice, pearson, rms, speechlike};
 
     /// A peer's 60 ms packet must not panic FEC recovery into a buffer
     /// sized for 20 ms.
@@ -161,6 +161,112 @@ mod tests {
         assert_eq!(enc.loss_perc(), 20);
         enc.set_loss_permille(0).unwrap();
         assert_eq!(enc.loss_perc(), 0);
+    }
+
+    /// The 10 ms option (`frame_ms = 10`, `PROTOCOL.md` §3): 480-sample
+    /// frames encode, carry their duration in the TOC, and both FEC and PLC
+    /// recover a 10 ms frame.
+    #[test]
+    fn ten_ms_frames_with_fec_and_plc() {
+        let mut enc = Encoder::new().unwrap();
+        enc.set_loss_permille(100).unwrap();
+        let mut dec = Decoder::new().unwrap();
+        let sig = speechlike(48_000, 9, 3.0, 0.0, 0.1);
+        let packets: Vec<Vec<u8>> = sig
+            .as_chunks::<480>()
+            .0
+            .iter()
+            .map(|f| enc.encode(f).unwrap().to_vec())
+            .collect();
+        assert!(packets
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= MAX_PACKET));
+        let mut out = vec![0.0f32; 960];
+        for p in &packets[..20] {
+            assert_eq!(dec.nb_samples(p), 480);
+            assert_eq!(dec.decode(p, &mut out).unwrap(), 480);
+        }
+        // Packet 20 lost: FEC from 21, then PLC for a lost 22.
+        assert_eq!(dec.decode_fec(&packets[21], &mut out).unwrap(), 480);
+        assert_eq!(dec.decode(&packets[21], &mut out).unwrap(), 480);
+        assert_eq!(dec.conceal(&mut out).unwrap(), 480);
+        assert_eq!(dec.decode(&packets[23], &mut out).unwrap(), 480);
+    }
+
+    /// A `LossHint` makes the encoder spend bits on in-band FEC (LBRR):
+    /// packets grow, and a lost frame recovered from its successor is much
+    /// closer to the original than what concealment can extrapolate.
+    #[test]
+    fn loss_hint_buys_fec_that_beats_plc() {
+        let voice = crate::dsp::testsignal::voice(48_000 * 4, 5, 0.1).samples;
+        let frames = voice.as_chunks::<960>().0;
+        let size_at = |permille: u16| -> (f64, Vec<Vec<u8>>) {
+            let mut enc = Encoder::new().unwrap();
+            enc.set_loss_permille(permille).unwrap();
+            let packets: Vec<Vec<u8>> = frames
+                .iter()
+                .map(|f| enc.encode(f).unwrap().to_vec())
+                .collect();
+            let mean = packets.iter().map(|p| p.len()).sum::<usize>() as f64 / packets.len() as f64;
+            (mean, packets)
+        };
+        let (plain, _) = size_at(0);
+        let (with_fec, packets) = size_at(200);
+        eprintln!("mean packet {plain:.0} B without FEC, {with_fec:.0} B with a 20 % loss hint");
+        assert!(
+            with_fec > plain * 1.05,
+            "no FEC bits: {plain:.0} → {with_fec:.0} B"
+        );
+        // Three decoders in the same state up to frame k−1: the truth, the
+        // FEC recovery of frame k, and its concealment. After a lost frame
+        // all three consume k+1 to get back in step, so the loop skips it.
+        let mut truth = Decoder::new().unwrap();
+        let mut fec = Decoder::new().unwrap();
+        let mut plc = Decoder::new().unwrap();
+        let mut sum = (0.0f64, 0.0f64);
+        let mut worst_fec = 1.0f64;
+        let mut n = 0;
+        let mut out = vec![0.0f32; 960];
+        let mut k = 0;
+        while k + 1 < packets.len() {
+            let mut want = vec![0.0f32; 960];
+            truth.decode(&packets[k], &mut want).unwrap();
+            // Only voiced frames after some history say anything.
+            if k < 5 || rms(&want) < 0.05 {
+                fec.decode(&packets[k], &mut out).unwrap();
+                plc.decode(&packets[k], &mut out).unwrap();
+                k += 1;
+                continue;
+            }
+            let mut got_fec = vec![0.0f32; 960];
+            fec.decode_fec(&packets[k + 1], &mut got_fec).unwrap();
+            let mut got_plc = vec![0.0f32; 960];
+            plc.conceal(&mut got_plc).unwrap();
+            let c_fec = pearson(&want, &got_fec);
+            let c_plc = pearson(&want, &got_plc);
+            assert!(
+                c_fec.is_finite() && c_plc.is_finite(),
+                "frame {k}: silent output"
+            );
+            sum.0 += c_fec;
+            sum.1 += c_plc;
+            worst_fec = worst_fec.min(c_fec);
+            n += 1;
+            fec.decode(&packets[k + 1], &mut out).unwrap();
+            plc.decode(&packets[k + 1], &mut out).unwrap();
+            truth.decode(&packets[k + 1], &mut out).unwrap();
+            k += 2;
+        }
+        let (mean_fec, mean_plc) = (sum.0 / n as f64, sum.1 / n as f64);
+        eprintln!(
+            "{n} voiced frames: correlation with the original {mean_fec:.2} via FEC (worst {worst_fec:.2}), {mean_plc:.2} via PLC"
+        );
+        assert!(n > 50);
+        assert!(mean_fec > 0.7, "FEC recovery correlates {mean_fec:.2}");
+        assert!(
+            mean_fec > mean_plc + 0.15,
+            "FEC ({mean_fec:.2}) hardly beats PLC ({mean_plc:.2})"
+        );
     }
 
     #[test]
