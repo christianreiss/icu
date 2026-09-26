@@ -3,7 +3,10 @@
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -37,16 +40,26 @@ struct ReportingVerifier {
 /// from. A fresh instance is created per [`client_config`] call (i.e. per
 /// connection attempt), so there is no cross-attempt leakage.
 #[derive(Clone, Default, Debug)]
-pub struct CertFailure(Arc<Mutex<Option<rustls::Error>>>);
+pub struct CertFailure {
+    failure: Arc<Mutex<Option<rustls::Error>>>,
+    /// The server's `CertificateVerify` checked out: from here on a close
+    /// comes from the server, not from whoever can read our Initial packets.
+    proven: Arc<AtomicBool>,
+}
 
 impl CertFailure {
     fn record(&self, e: &rustls::Error) {
-        *lock(&self.0) = Some(e.clone());
+        *lock(&self.failure) = Some(e.clone());
     }
 
     /// Takes and clears the last recorded verification failure, if any.
     fn take(&self) -> Option<rustls::Error> {
-        lock(&self.0).take()
+        lock(&self.failure).take()
+    }
+
+    /// Whether the server proved it holds the key of its certificate.
+    fn server_proven(&self) -> bool {
+        self.proven.load(Ordering::Acquire)
     }
 }
 
@@ -79,7 +92,11 @@ impl ServerCertVerifier for ReportingVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        // Every handshake runs this: each config is fresh, so there is no
+        // session to resume without the server's signature.
+        self.inner
+            .verify_tls13_signature(message, cert, dss)
+            .inspect(|_| self.last_failure.proven.store(true, Ordering::Release))
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -311,7 +328,8 @@ pub async fn connect(
         Err(e) => {
             return Err(match cert_failure.take() {
                 Some(rustls::Error::InvalidCertificate(ce)) => certificate_error(server_name, &ce),
-                _ => ConnectError::from_connection_error(e),
+                _ if cert_failure.server_proven() => ConnectError::from_connection_error(e),
+                _ => ConnectError::unauthenticated(e),
             });
         }
     };
@@ -422,6 +440,11 @@ pub enum ConnectError {
     /// `protocol_version` or `no_application_protocol` (ALPN, `PROTOCOL.md`
     /// §8). Fatal: it takes an update, not a retry.
     Version(String),
+    /// Like [`ConnectError::Version`], but the alert came before the server
+    /// proved who it is (`protocol_version` and `no_application_protocol`
+    /// are sent in reply to our first packet): shown the same, retried with
+    /// backoff, because anyone on the path could have sent it.
+    VersionHint(String),
     /// The server's protocol minor is below [`icu_proto::MIN_PEER_MINOR`]:
     /// the server needs the update, not this client. Fatal.
     ServerTooOld(u16),
@@ -503,11 +526,27 @@ impl ConnectError {
         }
     }
 
+    /// Maps a close that ended the handshake before the server's signature
+    /// was checked. The keys of Initial packets follow from the connection
+    /// ID, so such a close proves nothing about the server: a forged
+    /// `certificate_revoked` must not end the reconnects for good. A real
+    /// server sends a certificate alert only after its own flight, and an
+    /// application close only after the handshake (RFC 9000 §10.2.3), so
+    /// only the version alerts can be genuine here.
+    pub fn unauthenticated(e: quinn::ConnectionError) -> ConnectError {
+        match ConnectError::from_connection_error(e.clone()) {
+            ConnectError::Version(v) => ConnectError::VersionHint(v),
+            _ => ConnectError::Transport(format!("vor der Server-Authentifizierung: {e}")),
+        }
+    }
+
     /// Whether the client must not reconnect (`PROTOCOL.md` §5).
     pub fn is_fatal(&self) -> bool {
         match self {
             ConnectError::Closed { code, .. } => icu_proto::error::is_fatal(*code),
-            ConnectError::Transport(_) | ConnectError::ServerCert(_) => false,
+            ConnectError::Transport(_)
+            | ConnectError::ServerCert(_)
+            | ConnectError::VersionHint(_) => false,
             ConnectError::Protocol(_)
             | ConnectError::Version(_)
             | ConnectError::ServerTooOld(_) => true,
@@ -528,7 +567,7 @@ impl ConnectError {
                 technical,
             ),
             ConnectError::Protocol(_) => Problem::new(problem::UPDATE_NEEDED, technical),
-            ConnectError::Version(_) => Problem::new(
+            ConnectError::Version(_) | ConnectError::VersionHint(_) => Problem::new(
                 problem::code_text(icu_proto::error::VERSION_UNSUPPORTED),
                 technical,
             ),
@@ -570,6 +609,7 @@ impl std::fmt::Display for ConnectError {
             ConnectError::ServerCert(s) => f.write_str(s),
             ConnectError::Protocol(s) => write!(f, "protocol: {s}"),
             ConnectError::Version(s) => write!(f, "version: {s}"),
+            ConnectError::VersionHint(s) => write!(f, "version (unbestätigt): {s}"),
             ConnectError::ServerTooOld(minor) => write!(
                 f,
                 "server protocol minor {minor} is below the minimum {}",
@@ -698,6 +738,50 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A TLS alert that ended the handshake before the server's signature
+    /// was checked, as quinn reports it.
+    fn early_alert(code: u8) -> ConnectError {
+        ConnectError::unauthenticated(quinn::ConnectionError::ConnectionClosed(
+            quinn::ConnectionClose {
+                error_code: quinn::TransportErrorCode::crypto(code),
+                frame_type: None,
+                reason: Default::default(),
+            },
+        ))
+    }
+
+    /// Before the server proved itself, an alert is anybody's: a forged
+    /// `certificate_revoked` in an Initial packet is a network error, and
+    /// the reconnects go on. The version alerts still read as "update", but
+    /// are retried too.
+    #[test]
+    fn alerts_before_server_authentication_are_retried() {
+        for code in [44, 48, 42, 80] {
+            let e = early_alert(code);
+            assert!(matches!(e, ConnectError::Transport(_)), "{code}: {e:?}");
+            assert!(!e.is_fatal());
+        }
+        for code in [70, 120] {
+            let e = early_alert(code);
+            assert!(matches!(e, ConnectError::VersionHint(_)), "{code}: {e:?}");
+            assert!(!e.is_fatal());
+            assert_eq!(
+                e.problem().text,
+                problem::code_text(icu_proto::error::VERSION_UNSUPPORTED)
+            );
+            crate::problem::tests::assert_readable(&e.problem());
+        }
+        let kicked = ConnectError::unauthenticated(quinn::ConnectionError::ApplicationClosed(
+            quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(icu_proto::error::KICKED),
+                reason: Default::default(),
+            },
+        ));
+        assert!(!kicked.is_fatal(), "{kicked:?}");
+        // After it, the same alert is the server's word.
+        assert!(alert(44).is_fatal());
     }
 
     /// Every connection failure reads as plain German; the raw error stays
