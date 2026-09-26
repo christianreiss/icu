@@ -369,3 +369,36 @@ async fn a_device_left_behind_by_a_renewal_is_pointed_to_the_passport() {
     engine_b.shutdown();
     server.handle.shutdown().await;
 }
+
+/// A passport is stored before it is taken into use. When it cannot be
+/// written, the identity in force stays — in memory, on disk and on the
+/// connection — and the window says so.
+#[tokio::test]
+async fn a_passport_that_cannot_be_stored_is_not_taken_over() {
+    let server = TestServer::start().await;
+    let (bob, _bob_paths, _bob_dir) = server.enroll("bob").await;
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+
+    // `identity.new` is a file, so the new set cannot be written.
+    std::fs::write(paths.identity_dir().with_extension("new"), b"").unwrap();
+    engine.command(Command::ReplaceIdentity(Box::new(bob)));
+    let state = wait_for(&engine, SOON, |s| s.banner.is_some()).await;
+    assert!(
+        state.banner.unwrap().text.contains("gespeichert"),
+        "a storage problem"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let state = engine.snapshot();
+    assert_eq!(state.me.unwrap().name, "alice");
+    assert!(matches!(
+        state.conn,
+        icu_client::engine::ConnStatus::Connected
+    ));
+    assert_eq!(leaf_cn(&paths), "alice");
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}

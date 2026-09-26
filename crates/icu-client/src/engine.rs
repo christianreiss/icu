@@ -537,6 +537,9 @@ struct Shared {
     /// Largest block the playback callback has asked for; the mixer keeps
     /// at least that much plus a block queued, whatever the graph quantum.
     play_request: Arc<AtomicUsize>,
+    /// The engine is shutting down: nothing may be written to `identity/`
+    /// any more — a logout deletes it as soon as `Engine::shutdown` returns.
+    closing: AtomicBool,
     /// Detected network condition (RTT, loss, congestion pressure); folded
     /// from quinn's own connection stats plus `LossHint`/
     /// `VideoCongestionHint` (`crate::netcond`).
@@ -554,6 +557,9 @@ pub struct Engine {
     cmd_tx: mpsc::UnboundedSender<Command>,
     state_rx: watch::Receiver<AppState>,
     runtime: Option<tokio::runtime::Runtime>,
+    /// Disconnects when the network task has ended (its sender is dropped
+    /// with it), for [`Engine::shutdown`] to wait on without a runtime.
+    net_done: Option<std::sync::mpsc::Receiver<()>>,
     threads: Vec<std::thread::JoinHandle<()>>,
     backend: Arc<Mutex<Box<dyn AudioBackend>>>,
     /// Where this instance's config/data live (`--config-dir` or default).
@@ -657,6 +663,7 @@ impl Engine {
             ref_prod: Arc::new(Mutex::new(ref_prod)),
             play_cons: Arc::new(Mutex::new(play_cons)),
             play_request: Arc::new(AtomicUsize::new(0)),
+            closing: AtomicBool::new(false),
             net: Mutex::new(NetworkTracker::new()),
             video_tier: AtomicU8::new(VideoTier::T0.as_u8()),
         });
@@ -690,10 +697,13 @@ impl Engine {
             );
         }
         // Backend events → state. Detached: it ends when the backend (and
-        // with it the event sender) is dropped.
+        // with it the event sender) is dropped — which is why it holds the
+        // backend only weakly. A strong reference kept the backend alive,
+        // and with it (PipeWire) the thread owning the event sender, so each
+        // engine leaked a PipeWire connection and two threads.
         if let Some(events) = events {
             let shared = shared.clone();
-            let backend = backend.clone();
+            let backend = Arc::downgrade(&backend);
             std::thread::Builder::new()
                 .name("icu-audio-events".into())
                 .spawn(move || {
@@ -744,7 +754,9 @@ impl Engine {
                                         &format!("{stream:?}: {message}"),
                                     ))
                                 });
-                                let _ = backend.lock().map(|mut b| b.close(stream));
+                                if let Some(backend) = backend.upgrade() {
+                                    lock(&backend).close(stream);
+                                }
                                 backoff = match last_error {
                                     Some(t) if t.elapsed() < Duration::from_secs(60) => {
                                         (backoff * 2).min(Duration::from_secs(30))
@@ -767,10 +779,14 @@ impl Engine {
             .enable_all()
             .build()
             .map_err(|e| EngineError(e.to_string()))?;
+        let (done_tx, net_done) = std::sync::mpsc::channel::<()>();
         {
             let shared = shared.clone();
             let backend = backend.clone();
-            runtime.spawn(net_task(cfg, shared, cmd_rx, backend));
+            runtime.spawn(async move {
+                let _done = done_tx;
+                net_task(cfg, shared, cmd_rx, backend).await;
+            });
         }
 
         Ok(Engine {
@@ -778,6 +794,7 @@ impl Engine {
             cmd_tx,
             state_rx,
             runtime: Some(runtime),
+            net_done: Some(net_done),
             threads,
             backend,
             paths,
@@ -836,14 +853,7 @@ impl Engine {
 
     /// Stops everything.
     pub fn shutdown(mut self) {
-        let _ = self.cmd_tx.send(Command::Quit);
-        self.shared.dsp.stop.store(true, Ordering::Relaxed);
-        if let Some(rt) = self.runtime.take() {
-            // Give the session loop a moment to send its close, then drop the
-            // runtime without blocking (we may be inside another runtime).
-            std::thread::sleep(Duration::from_millis(100));
-            rt.shutdown_background();
-        }
+        self.stop();
         if let Ok(mut b) = self.backend.lock() {
             b.close(StreamKind::Capture);
             b.close(StreamKind::Reference);
@@ -853,14 +863,35 @@ impl Engine {
             let _ = t.join();
         }
     }
-}
 
-impl Drop for Engine {
-    fn drop(&mut self) {
+    /// Ends the network task — the session closes, the settings are
+    /// written, an identity write in flight finishes — and then the runtime
+    /// and the audio threads. Bounded: a logout deletes `identity/` right
+    /// after this returns, and a renewal stored after that would bring it
+    /// back, so nothing may be written to it from here on. Waits on a plain
+    /// channel, not the runtime: callers may be inside another runtime.
+    fn stop(&mut self) {
+        self.shared.closing.store(true, Ordering::SeqCst);
+        let _ = self.cmd_tx.send(Command::Quit);
+        if let Some(done) = self.net_done.take() {
+            if done.recv_timeout(NET_STOP_WAIT) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                tracing::warn!("network task did not end within {NET_STOP_WAIT:?}");
+            }
+        }
         self.shared.dsp.stop.store(true, Ordering::Relaxed);
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_background();
         }
+    }
+}
+
+/// How long [`Engine::shutdown`] waits for the network task: the close
+/// handshake (≤ 0.5 s), the last settings write (≤ [`SETTINGS_FLUSH_WAIT`]).
+const NET_STOP_WAIT: Duration = Duration::from_secs(3);
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -1594,9 +1625,14 @@ async fn net_task(
     mut cmd_rx: mpsc::UnboundedReceiver<Command>,
     backend: Arc<Mutex<Box<dyn AudioBackend>>>,
 ) {
+    // Settings reach the disk from their own task, off the two workers that
+    // also time the audio datagrams (`settings_writer`).
+    let (settings_tx, settings_rx) = mpsc::unbounded_channel();
+    let writer = tokio::spawn(settings_writer(cfg.paths.clone(), settings_rx));
     let mut local = LocalState {
         flags: UserFlags::NONE,
         settings: cfg.settings.clone(),
+        settings_tx,
         paths: cfg.paths.clone(),
         // The name is whatever the certificate says, so the pre-`Welcome`
         // display cannot contradict it (`PROTOCOL.md` §2.1).
@@ -1651,7 +1687,7 @@ async fn net_task(
         // must not tell.
         end_session(&shared);
         match outcome {
-            SessionEnd::Quit => return,
+            SessionEnd::Quit => break,
             SessionEnd::Fatal(reason) => {
                 shared
                     .state
@@ -1659,7 +1695,7 @@ async fn net_task(
                 // Keep serving local commands (mute etc.) until Quit. A new
                 // identity (passport import) is the way out: reconnect with it.
                 match drain_until_quit(&mut cmd_rx, &mut local, &shared).await {
-                    SessionEnd::Quit => return,
+                    SessionEnd::Quit => break,
                     _ => attempt = 0,
                 }
             }
@@ -1673,13 +1709,54 @@ async fn net_task(
                 tokio::select! {
                     _ = tokio::time::sleep(wait) => {}
                     end = drain_until_quit(&mut cmd_rx, &mut local, &shared) => match end {
-                        SessionEnd::Quit => return,
+                        SessionEnd::Quit => break,
                         _ => attempt = 0,
                     }
                 }
             }
         }
     }
+    // Quit. Dropping the sender makes the writer store what is still
+    // pending: a change right before quitting must not be lost to the
+    // debounce.
+    drop(local);
+    if tokio::time::timeout(SETTINGS_FLUSH_WAIT, writer)
+        .await
+        .is_err()
+    {
+        tracing::warn!("settings not written within the shutdown wait");
+    }
+}
+
+/// How long changes must be quiet before `settings.toml` is written.
+const SETTINGS_QUIET: Duration = Duration::from_millis(500);
+
+/// How long a quitting engine waits for the last settings write.
+const SETTINGS_FLUSH_WAIT: Duration = Duration::from_secs(2);
+
+/// Writes `settings.toml` once changes have been quiet for
+/// [`SETTINGS_QUIET`], through `spawn_blocking`. A slider drag commits a
+/// change every UI frame; each used to be an atomic write with `fsync` right
+/// on one of the two network workers, which also stamp the arrival of the
+/// audio datagrams. When the sender is dropped, whatever is pending is
+/// written before the task ends. Returns the number of writes (tests).
+async fn settings_writer(paths: Paths, mut rx: mpsc::UnboundedReceiver<Settings>) -> usize {
+    let mut writes = 0;
+    while let Some(mut latest) = rx.recv().await {
+        // Newer ones replace it until the changes are quiet or the engine
+        // quits; then it is written.
+        while let Ok(Some(newer)) = tokio::time::timeout(SETTINGS_QUIET, rx.recv()).await {
+            latest = newer;
+        }
+        let paths = paths.clone();
+        match tokio::task::spawn_blocking(move || latest.save(&paths)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "cannot write settings.toml"),
+            Err(e) => tracing::warn!(error = %e, "settings writer failed"),
+        }
+        writes += 1;
+    }
+    writes
 }
 
 enum SessionEnd {
@@ -1763,10 +1840,10 @@ fn adopt_issued(
     fail: quinn::VarInt,
     what: &str,
 ) -> Result<(), Problem> {
-    match identity.save(&local.paths) {
+    match store_identity(&identity, &local.paths, shared) {
         Ok(()) => {
             connection.close(ok, b"");
-            local.replace_identity(identity, shared);
+            local.adopt(identity, shared);
             Ok(())
         }
         Err(e) => {
@@ -1774,6 +1851,22 @@ fn adopt_issued(
             Err(crate::problem::storage(what, &e))
         }
     }
+}
+
+/// Writes `identity` to disk before the engine takes it into use — unless
+/// the engine is shutting down: a logout deletes `identity/` as soon as
+/// `Engine::shutdown` returns, and a write after that would bring it back.
+fn store_identity(
+    identity: &Identity,
+    paths: &Paths,
+    shared: &Shared,
+) -> Result<(), crate::config::ConfigError> {
+    if shared.closing.load(Ordering::SeqCst) {
+        return Err(crate::config::ConfigError::Io(std::io::Error::other(
+            "the engine is shutting down",
+        )));
+    }
+    identity.save(paths)
 }
 
 /// Deliberate reconnect with new credentials; not a failure.
@@ -1786,6 +1879,8 @@ fn reconnect_with_new_identity() -> SessionEnd {
 struct LocalState {
     flags: UserFlags,
     settings: Settings,
+    /// Every committed change of `settings`, for `settings_writer`.
+    settings_tx: mpsc::UnboundedSender<Settings>,
     paths: Paths,
     name: String,
     backend: Arc<Mutex<Box<dyn AudioBackend>>>,
@@ -2107,6 +2202,8 @@ impl LocalState {
                 });
             }
             Command::ReplaceIdentity(identity) => {
+                // Taken into use at the next connect; the callers reconnect
+                // right away when it was stored.
                 self.replace_identity(*identity, shared);
             }
             Command::CreateInvite { .. }
@@ -2141,8 +2238,8 @@ impl LocalState {
     /// Takes a changed `self.settings` into effect. Everything that follows
     /// the settings — the DSP atomics, the master gain, the streams (when
     /// `reopen` says a device or the AEC switch changed), the published
-    /// state and the file — is re-derived here, in one place, so none of
-    /// them can drift from the settings. Returns whether `SetState` is due:
+    /// state and the file (debounced, `settings_writer`) — is re-derived
+    /// here, in one place, so none of them can drift from the settings. Returns whether `SetState` is due:
     /// the overlay switch is part of `VIEWING`.
     fn commit_settings(&mut self, shared: &Arc<Shared>, reopen: bool) -> bool {
         shared.dsp.apply_settings(&self.settings);
@@ -2157,19 +2254,36 @@ impl LocalState {
         }
         let settings = self.settings.clone();
         shared.state.send_modify(|s| s.settings = settings);
-        let _ = self.settings.save(&self.paths);
+        let _ = self.settings_tx.send(self.settings.clone());
         self.update_viewing()
     }
 
-    /// Takes over an imported identity: memory first, then disk, so a failed
-    /// write cannot leave the two disagreeing about which leaf is in force.
-    fn replace_identity(&mut self, identity: Identity, shared: &Arc<Shared>) {
+    /// Takes over an imported identity (passport import): stored first and
+    /// taken into use only once it is, like a renewed certificate
+    /// (`apply_renewed_leaf`). Connecting with one that is not on disk would
+    /// leave the next start on the old one — revoked, if the imported
+    /// certificate's first login retired it. A failed write keeps the
+    /// identity in force and says so. Returns whether it was taken over.
+    fn replace_identity(&mut self, identity: Identity, shared: &Arc<Shared>) -> bool {
+        if let Err(e) = store_identity(&identity, &self.paths, shared) {
+            tracing::warn!(error = %e, "cannot store the imported identity, keeping the old one");
+            shared.state.send_modify(|s| {
+                s.banner = Some(crate::problem::storage("Der Passport", &e));
+            });
+            return false;
+        }
+        self.adopt(identity, shared);
+        true
+    }
+
+    /// Takes an identity that is already on disk into use: the next connect
+    /// runs with it, and nothing of the old one's renewal state carries over.
+    fn adopt(&mut self, identity: Identity, shared: &Arc<Shared>) {
         self.identity = identity;
         self.set_pending_renew(None, shared);
         self.renew_attempted_at = None;
         self.renew_only = false;
         self.name = crate::conninfo::CertInfo::from_der(&self.identity.leaf_der).subject;
-        let saved = self.identity.save(&self.paths);
         let server = format!(
             "{}:{}",
             self.identity.server.host, self.identity.server.port
@@ -2179,9 +2293,6 @@ impl LocalState {
             s.server = server;
             s.server_name = server_name;
             s.name_error = None;
-            if let Err(e) = &saved {
-                s.banner = Some(crate::problem::storage("Der Passport", e));
-            }
         });
         tracing::info!(name = %self.name, "identity replaced");
     }
@@ -2227,7 +2338,7 @@ impl LocalState {
         // (`PROTOCOL.md` §2.2 Nr. 10), so reconnecting with a leaf that is
         // not on disk would leave the next start with a revoked certificate.
         // The old one stays valid until then; the next renewal tries again.
-        if let Err(e) = renewed.save(&self.paths) {
+        if let Err(e) = store_identity(&renewed, &self.paths, shared) {
             tracing::warn!(error = %e, "cannot store the renewed certificate, keeping the old one");
             shared.state.send_modify(|s| {
                 s.banner = Some(crate::problem::storage("Das neue Zertifikat", &e));
@@ -2608,8 +2719,9 @@ async fn run_session(
                         }
                     }
                     Command::ReplaceIdentity(identity) => {
-                        local.replace_identity(*identity, shared);
-                        break reconnect_with_new_identity();
+                        if local.replace_identity(*identity, shared) {
+                            break reconnect_with_new_identity();
+                        }
                     }
                     Command::CreateInvite { name, ttl_s } => {
                         let name = icu_proto::normalize_name(&name);
@@ -2870,12 +2982,15 @@ async fn drain_until_quit(
             Some(Command::Reconnect) => {
                 return SessionEnd::Retry(Problem::plain("Verbinde neu …"));
             }
-            Some(cmd) => {
-                let replaced = matches!(cmd, Command::ReplaceIdentity(_));
-                local.handle_local(cmd, shared);
-                if replaced {
+            // A new identity abandons the attempt made with the old one —
+            // once it is stored.
+            Some(Command::ReplaceIdentity(identity)) => {
+                if local.replace_identity(*identity, shared) {
                     return reconnect_with_new_identity();
                 }
+            }
+            Some(cmd) => {
+                local.handle_local(cmd, shared);
             }
         }
     }
@@ -3610,6 +3725,31 @@ mod tests {
             UserFlags(UserFlags::MUTED),
             UserFlags(UserFlags::DEAFENED)
         ));
+    }
+
+    /// A slider drag commits a change every frame; the file is written once
+    /// the changes are quiet, with the last value, and a quit writes what is
+    /// still pending at once.
+    #[tokio::test]
+    async fn a_burst_of_settings_is_written_once_with_the_last_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(settings_writer(paths.clone(), rx));
+        let volume = |v: f32| {
+            let mut s = Settings::default();
+            s.audio.output_volume = v;
+            s
+        };
+        for i in 0..100 {
+            tx.send(volume(i as f32)).unwrap();
+        }
+        tokio::time::sleep(SETTINGS_QUIET * 3).await;
+        assert_eq!(Settings::load(&paths).unwrap().audio.output_volume, 99.0);
+        tx.send(volume(7.0)).unwrap();
+        drop(tx);
+        assert_eq!(writer.await.unwrap(), 2, "one write per quiet burst");
+        assert_eq!(Settings::load(&paths).unwrap().audio.output_volume, 7.0);
     }
 
     #[test]

@@ -153,3 +153,115 @@ async fn undeafen_restores_the_previous_mute() {
     engine.shutdown();
     server.handle.shutdown().await;
 }
+
+/// A settings change right before quitting reaches the disk, although the
+/// file is only written once changes have been quiet for a while.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_right_before_quitting_is_saved() {
+    let server = TestServer::start().await;
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+    let mut settings = engine.snapshot().settings;
+    settings.audio.output_volume = 42.0;
+    engine.command(Command::UpdateSettings(Box::new(settings)));
+    engine.shutdown();
+    let stored = icu_client::config::Settings::load(&paths).unwrap();
+    assert_eq!(stored.audio.output_volume, 42.0);
+    server.handle.shutdown().await;
+}
+
+/// The engine lets go of its audio backend when it shuts down. The thread
+/// that forwards backend events used to hold it, and with it (PipeWire) the
+/// thread owning the event sender: every logout/login leaked a PipeWire
+/// connection and two threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutting_down_releases_the_audio_backend() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use icu_client::audio::{
+        AudioBackend, BackendError, BackendEvent, CaptureCallback, DeviceInfo, PlaybackCallback,
+        StreamKind,
+    };
+
+    /// The fake backend, telling when it is dropped.
+    struct Watched(FakeBackend, Arc<AtomicBool>);
+
+    impl Drop for Watched {
+        fn drop(&mut self) {
+            self.1.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl AudioBackend for Watched {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+        fn devices(&self) -> Vec<DeviceInfo> {
+            self.0.devices()
+        }
+        fn open_capture(
+            &mut self,
+            device: Option<&str>,
+            cb: CaptureCallback,
+        ) -> Result<(), BackendError> {
+            self.0.open_capture(device, cb)
+        }
+        fn open_reference(
+            &mut self,
+            sink: Option<&str>,
+            cb: CaptureCallback,
+        ) -> Result<(), BackendError> {
+            self.0.open_reference(sink, cb)
+        }
+        fn open_playback(
+            &mut self,
+            device: Option<&str>,
+            cb: PlaybackCallback,
+        ) -> Result<(), BackendError> {
+            self.0.open_playback(device, cb)
+        }
+        fn close(&mut self, stream: StreamKind) {
+            self.0.close(stream)
+        }
+        fn take_events(&mut self) -> Option<std::sync::mpsc::Receiver<BackendEvent>> {
+            self.0.take_events()
+        }
+    }
+
+    let server = TestServer::start().await;
+    let dropped = Arc::new(AtomicBool::new(false));
+    let backend = Watched(FakeBackend::silent().0, dropped.clone());
+    let (engine, _dir) = server.engine("alice", Box::new(backend), false).await;
+    wait_connected(&engine).await;
+    engine.shutdown();
+    assert!(
+        wait_until(SOON, || dropped.load(Ordering::SeqCst)).await,
+        "the backend outlived its engine"
+    );
+    server.handle.shutdown().await;
+}
+
+/// Logging out deletes `identity/` right after the engine is shut down. A
+/// renewal answered in that moment must not bring it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logging_out_during_a_rename_leaves_no_identity_behind() {
+    use icu_client::config::Identity;
+
+    let server = TestServer::start().await;
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+    engine.command(Command::RequestRename("alicia".into()));
+    engine.shutdown();
+    Identity::remove(&paths).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(Identity::load(&paths).unwrap().is_none());
+    assert!(!paths.identity_dir().exists());
+    server.handle.shutdown().await;
+}
