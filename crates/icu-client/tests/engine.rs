@@ -396,3 +396,152 @@ async fn the_speaking_indicator_goes_out_with_the_voice() {
     bob.shutdown();
     server.handle.shutdown().await;
 }
+
+/// Which stream was opened on which device, in order.
+type Opened =
+    std::sync::Arc<std::sync::Mutex<Vec<(icu_client::audio::StreamKind, Option<String>)>>>;
+
+/// A backend with a device list the test controls, recording which device
+/// each stream was opened on. It never calls back: no audio flows.
+struct Devices {
+    list: std::sync::Arc<std::sync::Mutex<Vec<icu_client::audio::DeviceInfo>>>,
+    opened: Opened,
+    events: Option<std::sync::mpsc::Receiver<icu_client::audio::BackendEvent>>,
+}
+
+impl icu_client::audio::AudioBackend for Devices {
+    fn name(&self) -> &'static str {
+        "test"
+    }
+    fn devices(&self) -> Vec<icu_client::audio::DeviceInfo> {
+        self.list.lock().unwrap().clone()
+    }
+    fn open_capture(
+        &mut self,
+        device: Option<&str>,
+        _cb: icu_client::audio::CaptureCallback,
+    ) -> Result<(), icu_client::audio::BackendError> {
+        let kind = icu_client::audio::StreamKind::Capture;
+        self.opened
+            .lock()
+            .unwrap()
+            .push((kind, device.map(str::to_string)));
+        Ok(())
+    }
+    fn open_reference(
+        &mut self,
+        sink: Option<&str>,
+        _cb: icu_client::audio::CaptureCallback,
+    ) -> Result<(), icu_client::audio::BackendError> {
+        let kind = icu_client::audio::StreamKind::Reference;
+        self.opened
+            .lock()
+            .unwrap()
+            .push((kind, sink.map(str::to_string)));
+        Ok(())
+    }
+    fn open_playback(
+        &mut self,
+        device: Option<&str>,
+        _cb: icu_client::audio::PlaybackCallback,
+    ) -> Result<(), icu_client::audio::BackendError> {
+        let kind = icu_client::audio::StreamKind::Playback;
+        self.opened
+            .lock()
+            .unwrap()
+            .push((kind, device.map(str::to_string)));
+        Ok(())
+    }
+    fn close(&mut self, _stream: icu_client::audio::StreamKind) {}
+    fn take_events(
+        &mut self,
+    ) -> Option<std::sync::mpsc::Receiver<icu_client::audio::BackendEvent>> {
+        self.events.take()
+    }
+}
+
+/// A saved microphone that is not plugged in: the default is opened and the
+/// choice kept; plugged in, it is used again; pulled, the default again. An
+/// unrelated device coming and going reopens nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_device_falls_back_to_the_default_and_returns() {
+    use icu_client::audio::{BackendEvent, DeviceInfo, DeviceKind, StreamKind};
+    use std::sync::{Arc, Mutex};
+
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let device = |id: &str, kind| DeviceInfo {
+        id: id.into(),
+        description: id.into(),
+        kind,
+    };
+    let list = Arc::new(Mutex::new(vec![
+        device("builtin-mic", DeviceKind::Input),
+        device("speaker", DeviceKind::Output),
+    ]));
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let (events, events_rx) = std::sync::mpsc::channel();
+    let backend = Devices {
+        list: list.clone(),
+        opened: opened.clone(),
+        events: Some(events_rx),
+    };
+    let mut settings = test_settings();
+    settings.audio.input_device = Some("usb-mic".into());
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, settings, paths);
+    cfg.server_addr = Some(server.addr());
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).expect("engine starts");
+    let last_capture = || {
+        opened
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(kind, _)| *kind == StreamKind::Capture)
+            .map(|(_, d)| d.clone())
+    };
+    let changed = |list: &Arc<Mutex<Vec<DeviceInfo>>>| {
+        events
+            .send(BackendEvent::DevicesChanged(list.lock().unwrap().clone()))
+            .unwrap()
+    };
+
+    assert_eq!(
+        last_capture(),
+        Some(None),
+        "the default, not a missing device"
+    );
+    let state = engine.snapshot();
+    assert_eq!(state.active_input, None);
+    assert_eq!(
+        state.settings.audio.input_device.as_deref(),
+        Some("usb-mic"),
+        "the choice is kept"
+    );
+
+    list.lock()
+        .unwrap()
+        .push(device("usb-mic", DeviceKind::Input));
+    changed(&list);
+    wait_for(&engine, SOON, |s| {
+        s.active_input.as_deref() == Some("usb-mic")
+    })
+    .await;
+    assert_eq!(last_capture(), Some(Some("usb-mic".into())));
+
+    list.lock().unwrap().retain(|d| d.id != "usb-mic");
+    changed(&list);
+    wait_for(&engine, SOON, |s| s.active_input.is_none()).await;
+    assert_eq!(last_capture(), Some(None));
+
+    let opens = opened.lock().unwrap().len();
+    list.lock()
+        .unwrap()
+        .push(device("headset", DeviceKind::Output));
+    changed(&list);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(opened.lock().unwrap().len(), opens, "nothing to follow");
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}

@@ -320,6 +320,8 @@ fn state() -> AppState {
                 DeviceKind::Output,
             ),
         ],
+        active_input: None,
+        active_output: None,
         backend: "pipewire",
         aec_available: true,
         aec_stats: Default::default(),

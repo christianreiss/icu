@@ -30,7 +30,7 @@ use ringbuf::{
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    audio::{AudioBackend, BackendEvent, DeviceInfo, StreamKind},
+    audio::{AudioBackend, BackendEvent, DeviceInfo, DeviceKind, StreamKind},
     config::{Identity, Paths, Settings},
     dsp::{
         aec::{Aec, AecStats},
@@ -232,6 +232,13 @@ pub struct AppState {
     pub restricted_deafened: bool,
     /// Devices.
     pub devices: Vec<DeviceInfo>,
+    /// The microphone actually open: the saved choice
+    /// (`settings.audio.input_device`) while the backend lists it, `None`
+    /// (the system default) when it is missing — unplugged, say. The saved
+    /// choice stays and is used again once the device is back.
+    pub active_input: Option<String>,
+    /// The playback device actually open, like [`AppState::active_input`].
+    pub active_output: Option<String>,
     /// Backend name.
     pub backend: &'static str,
     /// AEC could be created.
@@ -341,6 +348,9 @@ pub enum Command {
     HotkeyBackend(String),
     /// Reopen the audio streams after a backend error (`icu-audio-events`).
     ReopenStreams,
+    /// The device list changed (`icu-audio-events`, internal): reopen the
+    /// streams if a saved device came back or went away.
+    DevicesChanged,
     /// Stop everything.
     Quit,
 }
@@ -710,6 +720,8 @@ impl Engine {
             restricted_muted: false,
             restricted_deafened: false,
             devices: backend.devices(),
+            active_input: None,
+            active_output: None,
             backend: backend_name,
             aec_available: false,
             aec_stats: AecStats::default(),
@@ -821,6 +833,10 @@ impl Engine {
                         match ev {
                             BackendEvent::DevicesChanged(list) => {
                                 shared.state.send_modify(|s| s.devices = list);
+                                // Decided against the backend's current list
+                                // in the connection task: this one may be one
+                                // of a burst of partial lists.
+                                let _ = reopen_tx.send(Command::DevicesChanged);
                                 // A device came or went shortly after an
                                 // error: most likely the one that failed
                                 // (USB re-plug); try right away.
@@ -982,12 +998,49 @@ impl Drop for Engine {
     }
 }
 
+/// The devices to open for the saved choices: `(input, output)`, each the
+/// saved one while `devices` lists it and the system default (`None`) while
+/// it does not ([`effective_device`]).
+fn wanted_devices(settings: &Settings, devices: &[DeviceInfo]) -> (Option<String>, Option<String>) {
+    let audio = &settings.audio;
+    (
+        effective_device(audio.input_device.as_deref(), devices, DeviceKind::Input),
+        effective_device(audio.output_device.as_deref(), devices, DeviceKind::Output),
+    )
+}
+
+/// The device to open for a saved choice: the saved one while the backend
+/// lists it, the system default (`None`) when it does not — unplugged, say
+/// — instead of targeting a device that is not there on every reopen. A
+/// backend that lists no device of that kind cannot tell; the choice is
+/// tried as it is.
+fn effective_device(
+    saved: Option<&str>,
+    devices: &[DeviceInfo],
+    kind: DeviceKind,
+) -> Option<String> {
+    let saved = saved?;
+    let mut of_kind = devices.iter().filter(|d| d.kind == kind).peekable();
+    if of_kind.peek().is_none() || of_kind.any(|d| d.id == saved) {
+        Some(saved.to_string())
+    } else {
+        None
+    }
+}
+
 fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Arc<Shared>) {
+    let (input, output) = wanted_devices(settings, &backend.devices());
+    if input.is_none() && settings.audio.input_device.is_some() {
+        tracing::info!(saved = ?settings.audio.input_device, "microphone missing, using the default");
+    }
+    if output.is_none() && settings.audio.output_device.is_some() {
+        tracing::info!(saved = ?settings.audio.output_device, "speaker missing, using the default");
+    }
     let stats = shared.stats.clone();
     let cap_prod = shared.cap_prod.clone();
     let cycle = shared.cycle.clone();
     if let Err(e) = backend.open_capture(
-        settings.audio.input_device.as_deref(),
+        input.as_deref(),
         Box::new(move |block| {
             // A failed `try_lock` (stream reopen in flight) loses the block
             // like a full ring does; count both.
@@ -1012,7 +1065,7 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
         let cycle = shared.cycle.clone();
         let stats = shared.stats.clone();
         match backend.open_reference(
-            settings.audio.output_device.as_deref(),
+            output.as_deref(),
             Box::new(move |block| {
                 let pushed = ref_prod
                     .try_lock()
@@ -1031,9 +1084,13 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
     shared
         .reference_open
         .store(reference_open, Ordering::Relaxed);
-    shared
-        .state
-        .send_modify(|s| s.aec_reference = reference_open);
+    let active_input = input.clone();
+    let active_output = output.clone();
+    shared.state.send_modify(|s| {
+        s.aec_reference = reference_open;
+        s.active_input = active_input;
+        s.active_output = active_output;
+    });
     let play_cons = shared.play_cons.clone();
     let play_request = shared.play_request.clone();
     let stats = shared.stats.clone();
@@ -1041,7 +1098,7 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
     // back to it instead of keeping the old device's for the session.
     play_request.store(0, Ordering::Relaxed);
     match backend.open_playback(
-        settings.audio.output_device.as_deref(),
+        output.as_deref(),
         Box::new(move |out| {
             play_request.fetch_max(out.len(), Ordering::Relaxed);
             let n = match play_cons.try_lock() {
@@ -2375,6 +2432,19 @@ impl LocalState {
             Command::ReopenStreams => {
                 tracing::info!("reopening audio streams after a stream error");
                 self.reopen_streams(shared);
+            }
+            Command::DevicesChanged => {
+                // A saved device came back or went away: follow it. Anything
+                // else in the list changing leaves the streams alone.
+                let want = wanted_devices(&self.settings, &lock(&self.backend).devices());
+                let active = {
+                    let s = shared.state.borrow();
+                    (s.active_input.clone(), s.active_output.clone())
+                };
+                if want != active {
+                    tracing::info!(?want, ?active, "audio devices changed, reopening");
+                    self.reopen_streams(shared);
+                }
             }
             Command::RequestRename(_) => {
                 shared.state.send_modify(|s| {
@@ -3934,6 +4004,30 @@ mod tests {
             inbound(Err(NetError::Connect("reset".into()))),
             Inbound::End
         ));
+    }
+
+    /// A saved device the backend no longer lists is replaced by the system
+    /// default; a backend that lists nothing of that kind cannot tell.
+    #[test]
+    fn a_missing_device_means_the_default() {
+        let dev = |id: &str, kind| DeviceInfo {
+            id: id.into(),
+            description: id.into(),
+            kind,
+        };
+        let list = [
+            dev("mic", DeviceKind::Input),
+            dev("spk", DeviceKind::Output),
+        ];
+        let input = |saved, list: &[DeviceInfo]| effective_device(saved, list, DeviceKind::Input);
+        assert_eq!(input(Some("mic"), &list), Some("mic".into()));
+        assert_eq!(input(Some("usb"), &list), None);
+        assert_eq!(input(None, &list), None);
+        assert_eq!(
+            input(Some("usb"), &list[1..]),
+            Some("usb".into()),
+            "no inputs listed at all"
+        );
     }
 
     /// The transmit cue marks where sending starts and where its `END`
