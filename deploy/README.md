@@ -113,7 +113,12 @@ sudo systemctl enable --now icu-server
 `ca.key` (0600), `ca.crt`, `server.key` (0600), `server.crt`, `users.toml`
 und `state.lock`. **`ca.key` ist das einzige Geheimnis, das zählt** — geht es
 verloren, müssen sich alle Nutzer neu registrieren. Ein Backup von
-`/var/lib/icu/` gehört zur Inbetriebnahme.
+`/var/lib/icu/` gehört zur Inbetriebnahme. Eine neue CA legt der Server nur an,
+wenn `ca.crt` und `ca.key` beide fehlen; fehlt nur eine, ist eine nicht lesbar
+(etwa nach einem Restore mit falschem Besitzer) oder passen sie nicht
+zusammen, startet er nicht und sagt, welche Datei es ist. `server.crt` und
+`server.key` sind dagegen entbehrlich: passen sie nicht, stellt der Server beim
+Start selbst ein neues Leaf aus.
 
 **Nach dem Zurückspielen eines Backups** `icu-server rotate-server-cert`
 ausführen. Lag zwischen Backup und Restore eine Rotation, präsentiert der Server

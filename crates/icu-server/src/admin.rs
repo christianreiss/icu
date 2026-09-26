@@ -345,20 +345,44 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
 /// restart. Behind `rotate-server-cert` and the automatic rotation before
 /// expiry (`housekeeping`). Handshakes already done keep the old leaf until
 /// they reconnect.
+///
+/// Rotation first, the CRL entry after: a rotation that fails must leave
+/// the live leaf alone — on the CRL, every client would refuse the server
+/// until the next rotation succeeded. When the CRL entry cannot be written,
+/// the new leaf is in use anyway and the old one stays pending
+/// ([`Ca::keep_retired_leaves`](crate::ca::Ca::keep_retired_leaves)) for
+/// the next rotation or restart.
 pub async fn rotate_server_cert(server: &Arc<Server>) -> Result<()> {
-    // The old leaf goes on the CRL first: if rotating is the answer to a
-    // leaked server key, clients must refuse that leaf, and a failed rotation
-    // afterwards only leaves a spare entry.
-    {
+    let recorded = {
         let mut store = server.store.lock().await;
         let mut ca = server.ca.write().await;
-        let old = ca.server_der().clone();
-        let expires = crate::ca::leaf_not_after(&old);
-        store.revoke_server_cert(crate::ca::leaf_serial(&old), expires)?;
         ca.rotate_server_cert(&server.config.tls, &server.config.server.server_name)?;
-    }
+        record_retired_leaves(&mut store, &mut ca)
+    };
     // The new leaf and the CRL go live without a restart.
-    crate::endpoint::reload_tls(server).await
+    let reloaded = crate::endpoint::reload_tls(server).await;
+    recorded.context(
+        "the new server certificate is in use, but the old one is not on the CRL yet \
+         (retried with the next rotation or restart)",
+    )?;
+    reloaded
+}
+
+/// Puts the server leaves the CA retired on the CRL, in one store write;
+/// keeps them pending in the CA when that fails.
+pub fn record_retired_leaves(store: &mut Store, ca: &mut crate::ca::Ca) -> Result<()> {
+    let retired = ca.take_retired_leaves();
+    if retired.is_empty() {
+        return Ok(());
+    }
+    let entries: Vec<(String, String)> = retired
+        .iter()
+        .map(|der| (crate::ca::leaf_serial(der), crate::ca::leaf_not_after(der)))
+        .filter(|(serial, _)| !serial.is_empty())
+        .collect();
+    store.revoke_server_certs(&entries).inspect_err(|_| {
+        ca.keep_retired_leaves(retired);
+    })
 }
 
 /// Re-issues the CA certificate with the same key and subject, live without

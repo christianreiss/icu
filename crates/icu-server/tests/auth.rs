@@ -946,6 +946,87 @@ async fn rotating_the_server_certificate_revokes_the_old_one_live() {
     server.shutdown().await;
 }
 
+/// A rotation that fails — here the new certificate cannot be written —
+/// leaves the live leaf in use and off the CRL. Revoking it first, as
+/// before, locked every client out until a later rotation succeeded.
+#[tokio::test]
+async fn a_failed_rotation_leaves_the_live_server_certificate_alone() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let live = server_leaf(&server.connect(&alice).await.expect("connect").conn);
+
+    // A directory where the atomic writes put their temp files: whichever
+    // of the pair is written first, the write fails.
+    let dir = server.dir.path();
+    for tmp in [".server.crt.tmp", ".server.key.tmp"] {
+        std::fs::create_dir(dir.join(tmp)).expect("block the write");
+    }
+    let response = server.handle.admin(AdminRequest::RotateServerCert).await;
+    for tmp in [".server.crt.tmp", ".server.key.tmp"] {
+        std::fs::remove_dir(dir.join(tmp)).expect("unblock");
+    }
+    assert!(
+        matches!(response, AdminResponse::Error { .. }),
+        "{response:?}"
+    );
+    // Whatever rebuilds the CRL next — a revoke, a registration, a restart.
+    icu_server::endpoint::reload_tls(server.handle.server())
+        .await
+        .expect("reload");
+
+    let mut client = server.connect(&alice).await.expect("connect");
+    assert_eq!(server_leaf(&client.conn), live, "still the same leaf");
+    client.hello("alice").await;
+    client.expect_silence().await;
+    let serials = crl_serials(client.crl.as_ref().expect("CrlUpdate"), &server.ca());
+    assert!(
+        !serials.contains(&serial_of(&live)),
+        "the live leaf must not be on the CRL"
+    );
+
+    // Once writing works again, the rotation goes through.
+    let response = server.handle.admin(AdminRequest::RotateServerCert).await;
+    assert!(matches!(response, AdminResponse::Ok), "{response:?}");
+    server.shutdown().await;
+}
+
+/// A crash between the two writes of a rotation leaves a server key that
+/// does not match the certificate. The next start issues a new leaf instead
+/// of failing forever, and the one it found is on the CRL.
+#[tokio::test]
+async fn a_server_key_that_does_not_match_is_repaired_at_startup() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let old = server_leaf(&server.connect(&alice).await.expect("connect").conn);
+    let dir = server.dir.path().to_path_buf();
+    let TestServer { dir: tmp, handle } = server;
+    handle.shutdown().await;
+    icu_server::store::write_private(
+        &dir.join("server.key"),
+        &rcgen::KeyPair::generate().unwrap().serialize_pem(),
+    )
+    .unwrap();
+    let server = TestServer {
+        handle: icu_server::run(icu_server::config::Config::for_test(&dir))
+            .await
+            .expect("the server starts"),
+        dir: tmp,
+    };
+
+    let mut client = server.connect(&alice).await.expect("connect");
+    let new = server_leaf(&client.conn);
+    assert_ne!(new, old);
+    client.hello("alice").await;
+    client.expect_silence().await;
+    let serials = crl_serials(client.crl.as_ref().expect("CrlUpdate"), &server.ca());
+    assert!(
+        serials.contains(&serial_of(&old)),
+        "the replaced leaf is revoked"
+    );
+    assert!(!serials.contains(&serial_of(&new)));
+    server.shutdown().await;
+}
+
 /// A server leaf close to expiry is rotated by the server itself, right at
 /// startup: served live, the old one on the CRL, and `status` reports it.
 #[tokio::test]

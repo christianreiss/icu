@@ -805,13 +805,17 @@ impl Store {
         })
     }
 
-    /// Puts a server leaf on the CRL (`rotate-server-cert`).
-    pub fn revoke_server_cert(&mut self, serial: String, expires: String) -> Result<()> {
+    /// Puts replaced server leaves on the CRL (`rotate-server-cert`), each as
+    /// `(serial, expires)`, in one write.
+    pub fn revoke_server_certs(&mut self, leaves: &[(String, String)]) -> Result<()> {
         self.update_users(|users| {
-            if !users.revoked_server.iter().any(|s| s.serial == serial) {
-                users
-                    .revoked_server
-                    .push(RevokedServerCert { serial, expires });
+            for (serial, expires) in leaves {
+                if !users.revoked_server.iter().any(|s| &s.serial == serial) {
+                    users.revoked_server.push(RevokedServerCert {
+                        serial: serial.clone(),
+                        expires: expires.clone(),
+                    });
+                }
             }
             Ok(())
         })

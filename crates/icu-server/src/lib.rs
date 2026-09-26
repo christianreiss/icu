@@ -123,12 +123,13 @@ impl Server {
     /// commands running while no server is up (§5).
     pub fn offline(config: Config) -> Result<Arc<Server>> {
         config.validate()?;
-        let store = Store::open(&config.paths.state_dir)?;
-        let ca = Ca::load_or_create(
+        let mut store = Store::open(&config.paths.state_dir)?;
+        let mut ca = Ca::load_or_create(
             &config.paths.state_dir,
             &config.tls,
             &config.server.server_name,
         )?;
+        admin::record_retired_leaves(&mut store, &mut ca)?;
         Ok(Arc::new(Server::new(
             config,
             store,
@@ -260,11 +261,13 @@ pub async fn run(config: Config) -> Result<Handle> {
     if purged > 0 {
         tracing::info!(purged, "dropped expired registrations");
     }
-    let ca = Ca::load_or_create(
+    let mut ca = Ca::load_or_create(
         &config.paths.state_dir,
         &config.tls,
         &config.server.server_name,
     )?;
+    // A server leaf replaced while loading goes on the CRL built below.
+    admin::record_retired_leaves(&mut store, &mut ca)?;
 
     // 5–7: TLS, QUIC, one endpoint per listen address.
     // The CRL is rebuilt from the store on every start, so revocations made
