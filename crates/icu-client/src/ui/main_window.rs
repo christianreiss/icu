@@ -175,6 +175,9 @@ struct App {
     /// People in the list last frame; one more may grow the window.
     rows_seen: usize,
     quit_requested: bool,
+    /// Closing the window can hide it to the tray (`can_hide`).
+    #[cfg(feature = "tray")]
+    can_hide: bool,
     /// Set when the user logged out from the settings; read by `run`.
     logged_out: Arc<AtomicBool>,
 }
@@ -302,9 +305,33 @@ impl App {
             fitted: false,
             rows_seen: 0,
             quit_requested: false,
+            #[cfg(feature = "tray")]
+            can_hide: can_hide(),
             logged_out,
         }
     }
+}
+
+/// Ends ICU: sets `quit_requested` so the close is let through; `on_exit`
+/// shuts the engine down. A free function: `logic` holds borrows of `self`.
+fn quit(quit_requested: &mut bool, ctx: &egui::Context) {
+    *quit_requested = true;
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+}
+
+/// Whether the window can be hidden. winit cannot hide a window on
+/// Wayland (`set_visible` does nothing there): closing to the tray would
+/// leave it on screen and only the second [X] would quit, so there it quits.
+#[cfg(feature = "tray")]
+fn can_hide() -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+    // winit's own choice: Wayland when `WAYLAND_DISPLAY` is set, unless
+    // `WINIT_UNIX_BACKEND=x11` forces X11.
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|v| v == "x11");
+    !wayland || forced_x11
 }
 
 /// Wakes the window whenever the engine's state changes. A visible window
@@ -356,8 +383,12 @@ impl eframe::App for App {
 
         // A SIGTERM or Ctrl+C quits like the tray's „Beenden“.
         if crate::signals::requested() && !self.quit_requested {
-            self.quit_requested = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            quit(&mut self.quit_requested, ctx);
+        }
+        // So does Strg+Q.
+        let quit_key = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Q);
+        if ctx.input_mut(|i| i.consume_shortcut(&quit_key)) {
+            quit(&mut self.quit_requested, ctx);
         }
 
         #[cfg(feature = "tray")]
@@ -368,10 +399,7 @@ impl eframe::App for App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                Some(crate::tray::TrayEvent::Quit) => {
-                    self.quit_requested = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                Some(crate::tray::TrayEvent::Quit) => quit(&mut self.quit_requested, ctx),
                 None => {}
             }
             tray.update(state);
@@ -409,8 +437,13 @@ impl eframe::App for App {
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested {
             #[cfg(feature = "tray")]
-            if self.tray.is_some() && !self.hidden && !ctx.input(|i| i.modifiers.shift) {
-                // Close = hide to tray; Shift+close or the tray menu quits.
+            if self.tray.is_some()
+                && self.can_hide
+                && !self.hidden
+                && !ctx.input(|i| i.modifiers.shift)
+            {
+                // Close = hide to tray; Shift+close, Strg+Q, the header's
+                // „Beenden“ or the tray menu quits. On Wayland close quits.
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                 self.hidden = true;
@@ -501,6 +534,9 @@ impl eframe::App for App {
             };
         }
         self.fit_to_list(&ctx, out.list_overflow);
+        if out.quit {
+            quit(&mut self.quit_requested, &ctx);
+        }
 
         if let Some(next) = out.theme {
             self.theme = next.to_string();
@@ -811,6 +847,8 @@ pub struct MainOutput {
     /// How much taller the people list is than the room it got; negative
     /// when it is shorter. The window grows by it (`App::fit_to_list`).
     pub list_overflow: f32,
+    /// „Beenden“ in the header was clicked.
+    pub quit: bool,
 }
 
 impl MainView {
@@ -894,6 +932,12 @@ impl MainView {
 
                         widgets::rtl(ui, HEADER, |ui| {
                             ui.spacing_mut().item_spacing.x = 2.0;
+                            if widgets::icon_button(ui, icon::POWER, HEADER, false)
+                                .on_hover_text("Beenden (Strg+Q)")
+                                .clicked()
+                            {
+                                out.quit = true;
+                            }
                             if widgets::icon_button(ui, icon::GEAR_FINE, HEADER, env.settings_open)
                                 .on_hover_text("Einstellungen")
                                 .clicked()
