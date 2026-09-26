@@ -184,6 +184,9 @@ impl Server {
     }
 }
 
+/// How long shutdown waits for closed connections to drain.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(3);
+
 /// A running server.
 pub struct Handle {
     server: Arc<Server>,
@@ -246,9 +249,17 @@ impl Handle {
             let _ = std::fs::remove_file(path);
         }
         // Dropping the Arc releases the Store and with it `flock(state.lock)`,
-        // but only once every task holding a clone is gone.
-        for endpoint in &self.server.endpoints {
-            endpoint.wait_idle().await;
+        // but only once every task holding a clone is gone. The wait for the
+        // endpoints to drain is bounded: a closed connection whose peer never
+        // answers — a stalled handshake, a flood — lingers for three probe
+        // timeouts with their backoff, which held a stop up for a minute.
+        let drained = async {
+            for endpoint in &self.server.endpoints {
+                endpoint.wait_idle().await;
+            }
+        };
+        if tokio::time::timeout(SHUTDOWN_DRAIN, drained).await.is_err() {
+            tracing::info!("connections still draining, not waiting for them");
         }
     }
 }
