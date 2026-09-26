@@ -2517,6 +2517,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "ttf-parser",
  "wayland-client",
  "webrtc-audio-processing",
  "webrtc-audio-processing-config",

@@ -35,6 +35,8 @@ use icu_client::{
 };
 use icu_proto::{AudioParams, UserFlags, UserInfo, UserSummary};
 
+mod common;
+
 /// What the windows open with (`ui::main_window`).
 const MAIN: [f32; 2] = [400.0, 620.0];
 const SETTINGS: [f32; 2] = icu_client::ui::main_window::SETTINGS_SIZE;
@@ -462,27 +464,53 @@ fn connection_pages_fit() {
     overflows.assert_none();
 }
 
+/// The first-start window: empty, with an invite (asks for the name) and
+/// with a passport (does not), each checked where it leads before joining.
 #[test]
 fn enroll_window_fits() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (bundle, passport) = rt.block_on(async {
+        let server = common::TestServer::start().await;
+        let bundle = server.invite_bundle("neu-3fa2").await;
+        let (identity, _paths, _dir) = server.enroll("Chris").await;
+        (bundle, identity.to_passport())
+    });
     let mut overflows = Overflows::default();
     for theme_name in THEMES {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = Paths::new(Some(dir.path().to_path_buf()));
-        let result = Arc::new(Mutex::new(None));
-        let mut h = Harness::builder()
-            .with_size(egui::vec2(ENROLL[0], ENROLL[1]))
-            .with_theme(egui_theme(theme_name))
-            .build_eframe(move |cc| {
-                fonts::install(&cc.egui_ctx);
-                theme::apply(&cc.egui_ctx, theme_name);
-                EnrollApp::new(paths, None, result)
-            });
-        // The window asks for a repaint every 100 ms (the registration
-        // thread's result), so it never settles on its own.
-        h.run_steps(4);
-        let what = format!("enroll/paste/{theme_name}");
-        overflows.check(&what, h.state().overflow());
-        shot(&mut h, &what.replace('/', "-"));
+        for (case, text) in [
+            ("paste", None),
+            ("invite", Some(bundle.clone())),
+            ("passport", Some(passport.clone())),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::new(Some(dir.path().to_path_buf()));
+            let result = Arc::new(Mutex::new(None));
+            let mut h = Harness::builder()
+                .with_size(egui::vec2(ENROLL[0], ENROLL[1]))
+                .with_theme(egui_theme(theme_name))
+                .build_eframe(move |cc| {
+                    fonts::install(&cc.egui_ctx);
+                    theme::apply(&cc.egui_ctx, theme_name);
+                    let mut app = EnrollApp::new(paths, None, result);
+                    if let Some(text) = text {
+                        app.paste(text);
+                    }
+                    app
+                });
+            // The window asks for a repaint every 100 ms (the registration
+            // thread's result), so it never settles on its own.
+            h.run_steps(6);
+            let what = format!("enroll/{case}/{theme_name}");
+            overflows.check_window(&what, &h, ENROLL, false, h.state().overflow());
+            shot(&mut h, &what.replace('/', "-"));
+            if case == "invite" {
+                // One page: where it leads, the name, one button.
+                h.get_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    &format!("{}  Beitreten", egui_phosphor::regular::SIGN_IN),
+                );
+            }
+        }
     }
     overflows.assert_none();
 }

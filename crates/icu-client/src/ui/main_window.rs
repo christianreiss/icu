@@ -51,7 +51,7 @@ type Toggle = (
 /// What the settings window opens with: every page fits without a scroll
 /// bar at this size unless expert rows or a long member list make it grow
 /// (`tests/ui_layout.rs`).
-pub const SETTINGS_SIZE: [f32; 2] = [820.0, 640.0];
+pub const SETTINGS_SIZE: [f32; 2] = [820.0, 680.0];
 /// What the Verbindung window opens with: its first page fits; the longer
 /// ones grow it.
 pub const CONNECTION_SIZE: [f32; 2] = [720.0, 780.0];
@@ -428,24 +428,16 @@ impl eframe::App for App {
         if out.toggle_settings {
             self.settings = match self.settings.take() {
                 Some(_) => None,
-                None => {
-                    let paths = self
-                        .engine
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|e| e.paths())
-                        .unwrap_or_else(|| Paths::new(None));
-                    #[cfg_attr(not(feature = "camera"), allow(unused_mut))]
-                    let mut view = SettingsView::new(&self.state, self.stats.clone(), paths)
-                        .with_overlay_available(self.overlay_available());
-                    #[cfg(feature = "camera")]
-                    if let Some(camera) = &self.camera {
-                        view = view.with_preview(camera.preview_source());
-                    }
-                    Some(view)
-                }
+                None => Some(self.new_settings_view()),
             };
+        }
+        if out.open_import {
+            if self.settings.is_none() {
+                self.settings = Some(self.new_settings_view());
+            }
+            if let Some(view) = &mut self.settings {
+                view.open_import();
+            }
         }
         if out.toggle_connection {
             self.connection = match self.connection.take() {
@@ -483,6 +475,25 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// A fresh settings window over the current state.
+    fn new_settings_view(&self) -> SettingsView {
+        let paths = self
+            .engine
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|e| e.paths())
+            .unwrap_or_else(|| Paths::new(None));
+        #[cfg_attr(not(feature = "camera"), allow(unused_mut))]
+        let mut view = SettingsView::new(&self.state, self.stats.clone(), paths)
+            .with_overlay_available(self.overlay_available());
+        #[cfg(feature = "camera")]
+        if let Some(camera) = &self.camera {
+            view = view.with_preview(camera.preview_source());
+        }
+        view
+    }
+
     /// Whether the overlay thread is up: compositors without layer shell
     /// (GNOME) have none.
     fn overlay_available(&self) -> bool {
@@ -683,6 +694,9 @@ pub struct MainOutput {
     pub toggle_connection: bool,
     /// The header's theme button picked this theme.
     pub theme: Option<&'static str>,
+    /// „Passport einspielen" under a fatal error: open the settings on the
+    /// passport field.
+    pub open_import: bool,
     /// How much taller the people list is than the room it got; negative
     /// when it is shorter. The window grows by it (`App::fit_to_list`).
     pub list_overflow: f32,
@@ -836,7 +850,23 @@ impl MainView {
                             &problem.text,
                             None::<fn()>,
                         );
-                        reconnect(ui);
+                        // A renewed certificate on another device, a new
+                        // server: the way back is often a fresh passport,
+                        // one click away instead of three pages deep.
+                        ui.horizontal(|ui| {
+                            reconnect(ui);
+                            ui.add_space(4.0);
+                            if widgets::button(
+                                ui,
+                                widgets::ButtonKind::Neutral,
+                                icon::DOWNLOAD,
+                                "Passport einspielen",
+                            )
+                            .clicked()
+                            {
+                                out.open_import = true;
+                            }
+                        });
                     }
                     ConnStatus::Disconnected { reason, attempt } if *attempt >= 2 => {
                         widgets::banner(
@@ -1091,8 +1121,8 @@ impl MainView {
                                     &send,
                                 );
                             }
-                            if state.peers.is_empty() && state.conn == ConnStatus::Connected {
-                                alone(ui);
+                            if state.peers.is_empty() {
+                                empty(ui, &state.conn);
                             }
                         })
                 })
@@ -1742,14 +1772,21 @@ fn moderation_menu(
     }
 }
 
-/// The empty state: connected, but the only person here is you.
-fn alone(ui: &mut egui::Ui) {
+/// The empty list: alone in the room, or not in it at all — never a blank
+/// card that looks like something failed to draw.
+fn empty(ui: &mut egui::Ui, conn: &ConnStatus) {
     let tok = theme::tokens(ui.visuals());
+    let (glyph, text) = match conn {
+        ConnStatus::Connected => (icon::USERS, "Allein hier"),
+        ConnStatus::Connecting => (icon::PLUGS, "Verbinde…"),
+        ConnStatus::Disconnected { .. } => (icon::PLUGS, "Getrennt — verbinde gleich neu"),
+        ConnStatus::Fatal(_) => (icon::PLUGS, "Nicht verbunden"),
+    };
     ui.vertical_centered(|ui| {
         ui.add_space(48.0);
-        ui.label(RichText::new(icon::USERS).size(30.0).color(tok.dim_text));
+        ui.label(RichText::new(glyph).size(30.0).color(tok.dim_text));
         ui.add_space(2.0);
-        ui.label(RichText::new("Allein hier").size(12.5).color(tok.dim_text));
+        ui.label(RichText::new(text).size(12.5).color(tok.dim_text));
     });
 }
 
@@ -1806,22 +1843,20 @@ enum EnrollStatus {
     Failed(String),
 }
 
-/// The enrollment window walks through one question at a time: paste, check
-/// where it leads, pick a name (invites only), confirm.
+/// The enrollment window has two steps: paste, then join. Everything the
+/// user has to check (where the text leads) and decide (their name) sits on
+/// the second page, next to the one button that joins.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EnrollStep {
     /// The paste field, nothing else.
     Paste,
-    /// Only what the pasted text says: server, address, kind, name.
-    Check,
-    /// The own name; skipped for a passport, which already carries one.
-    Name,
-    /// Everything together, and the button that joins.
-    Confirm,
+    /// Where it leads, the own name (invites only), and the join button.
+    Join,
 }
 
-/// The first-start window: paste an invite (or a passport), check where it
-/// leads, pick a name, join. `pub` for `tests/ui_layout.rs`.
+/// The first-start window: paste an invite (or a passport), or drop the
+/// file on it; check where it leads, pick a name, join. `pub` for
+/// `tests/ui_layout.rs`.
 pub struct EnrollApp {
     paths: Paths,
     server_addr: Option<SocketAddr>,
@@ -1831,6 +1866,9 @@ pub struct EnrollApp {
     name: String,
     status: Option<EnrollStatus>,
     step: EnrollStep,
+    /// Put the cursor into the paste field: on the first frame, so Strg+V
+    /// works without a click, and again after going back.
+    focus_paste: bool,
     /// Put the cursor into the name field on the next frame.
     focus_name: bool,
     /// Whether the pasted text parsed last frame: a paste that turns it valid
@@ -1860,6 +1898,7 @@ impl EnrollApp {
             name: String::new(),
             status: None,
             step: EnrollStep::Paste,
+            focus_paste: true,
             focus_name: false,
             was_valid: false,
             pending: None,
@@ -1910,15 +1949,35 @@ impl EnrollApp {
         let client = crate::engine::client_string();
         let paths = self.paths.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("runtime");
-            let r = rt
-                .block_on(register(&identity, &name, &client, addr, &paths))
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "registration failed");
-                    e.problem().text
-                });
+            let r = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt
+                    .block_on(register(&identity, &name, &client, addr, &paths))
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, "registration failed");
+                        e.problem().text
+                    }),
+                Err(e) => Err(format!("ICU konnte nicht starten: {e}")),
+            };
             *slot.lock().unwrap() = Some(r);
         });
+    }
+
+    /// Takes a file dropped onto the window: an `.icu` invite or passport,
+    /// read as text. Anything unreadable is left for the field's verdict.
+    fn take_dropped(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| {
+            i.raw.dropped_files.iter().find_map(|f| {
+                std::fs::read_to_string(f.path())
+                    .ok()
+                    .or_else(|| f.bytes().ok().and_then(|b| String::from_utf8(b).ok()))
+            })
+        });
+        if let Some(text) = dropped {
+            self.link = text;
+            self.status = None;
+            self.step = EnrollStep::Paste;
+            self.was_valid = false;
+        }
     }
 }
 
@@ -1951,6 +2010,10 @@ impl eframe::App for EnrollApp {
             }
         }
         let busy = self.pending.is_some();
+        if !busy {
+            self.take_dropped(&ctx);
+        }
+        let dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let tok = theme::tokens(root.visuals());
 
         // A passport carries its own certificate; a registration bundle
@@ -1967,38 +2030,27 @@ impl eframe::App for EnrollApp {
         let ca = parsed
             .as_ref()
             .map(|id| crate::conninfo::CertInfo::from_der(&id.ca_der));
-        let registration = parsed.filter(Identity::is_registration);
-        let needs_name = registration.is_some();
+        let needs_name = parsed.as_ref().is_some_and(Identity::is_registration);
         let valid = summary.is_some();
-        let has_text = !self.link.trim().is_empty();
-        // The later steps only make sense for text that parses; if it stops
-        // parsing, start over at the field.
+        // The join page only makes sense for text that parses; if it stops
+        // parsing, start over at the field. A paste that parses moves on.
         if !valid {
             self.step = EnrollStep::Paste;
         } else if !self.was_valid && self.step == EnrollStep::Paste {
-            self.step = EnrollStep::Check;
+            self.step = EnrollStep::Join;
+            self.focus_name = needs_name;
         }
         self.was_valid = valid;
         let name_ok = !icu_proto::normalize_name(&self.name).is_empty();
         let step = self.step;
-        let (forward_ok, forward_glyph, forward_label) = match step {
-            // No button: a valid paste moves on by itself.
-            EnrollStep::Paste => (false, icon::ARROW_RIGHT, ""),
-            EnrollStep::Check => (true, icon::CHECK, "Stimmt, weiter"),
-            EnrollStep::Name => (name_ok, icon::ARROW_RIGHT, "Weiter"),
-            EnrollStep::Confirm if busy => (false, icon::SIGN_IN, "Verbinde…"),
-            EnrollStep::Confirm => (
-                !needs_name || name_ok,
-                icon::SIGN_IN,
-                "Diesem Server beitreten",
-            ),
-        };
-        let mut forward = false;
+        let join_ok = !busy && (!needs_name || name_ok);
+        let mut join = false;
         let mut back = false;
 
         // The actions sit at the bottom edge, so the window has a floor
-        // instead of trailing off into empty panel. The paste step has none.
-        if step != EnrollStep::Paste {
+        // instead of trailing off into empty panel. The paste step has none:
+        // a valid paste moves on by itself.
+        if step == EnrollStep::Join {
             egui::Panel::bottom("enroll_actions")
                 .frame(
                     egui::Frame::new()
@@ -2030,18 +2082,20 @@ impl eframe::App for EnrollApp {
                             .clicked();
                         // Not-ready is neutral grey rather than a faded accent,
                         // which read as a broken button.
-                        let kind = if forward_ok {
-                            widgets::ButtonKind::Primary
+                        let (kind, label) = if busy {
+                            (widgets::ButtonKind::Neutral, "Verbinde…")
+                        } else if join_ok {
+                            (widgets::ButtonKind::Primary, "Beitreten")
                         } else {
-                            widgets::ButtonKind::Neutral
+                            (widgets::ButtonKind::Neutral, "Beitreten")
                         };
-                        forward = ui
+                        join |= ui
                             .allocate_ui_with_layout(
                                 egui::vec2(ui.available_width(), 36.0),
                                 justified,
                                 |ui| {
-                                    ui.add_enabled_ui(forward_ok, |ui| {
-                                        widgets::button(ui, kind, forward_glyph, forward_label)
+                                    ui.add_enabled_ui(join_ok, |ui| {
+                                        widgets::button(ui, kind, icon::SIGN_IN, label)
                                     })
                                     .inner
                                 },
@@ -2052,16 +2106,15 @@ impl eframe::App for EnrollApp {
                 });
         }
 
-        let steps = if needs_name { 4 } else { 3 };
-        let (n, subtitle) = match step {
-            EnrollStep::Paste => (
-                1,
-                "Füge die Einladung ein, die du bekommen hast — oder deinen Passport \
-                 von einem anderen Gerät.",
-            ),
-            EnrollStep::Check => (2, "Das steht darin. Stimmt das?"),
-            EnrollStep::Name => (3, "Wie sollen dich die anderen sehen?"),
-            EnrollStep::Confirm => (steps, "Alles noch einmal zusammen. Dann beitreten."),
+        let subtitle = match step {
+            EnrollStep::Paste => {
+                "Füge die Einladung ein, die du bekommen hast, oder zieh die Datei hierher — \
+                 auch ein Passport von einem anderen Gerät geht."
+            }
+            EnrollStep::Join if needs_name => {
+                "Prüfe, wohin die Einladung führt, und wähle deinen Namen."
+            }
+            EnrollStep::Join => "Prüfe, wohin der Passport führt.",
         };
 
         egui::CentralPanel::default()
@@ -2075,7 +2128,8 @@ impl eframe::App for EnrollApp {
             )
             .show(root, |ui| {
                 // An error banner wraps to however many lines it needs, so the
-                // content can outgrow the window; it scrolls rather than clips.
+                // content can outgrow the window; it grows the window rather
+                // than scroll.
                 let out = egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let (badge, _) =
@@ -2099,105 +2153,66 @@ impl eframe::App for EnrollApp {
                             ui.label(RichText::new(subtitle).size(12.5).color(tok.muted_text));
                         });
                     });
-                    ui.add_space(14.0);
-                    ui.label(
-                        theme::caps_text(&format!("Schritt {n} von {steps}")).color(tok.dim_text),
-                    );
-                    ui.add_space(6.0);
+                    ui.add_space(16.0);
 
                     match step {
                         EnrollStep::Paste => self.paste_step(ui, &tok, busy, valid, needs_name),
-                        EnrollStep::Check => {
+                        EnrollStep::Join => {
                             if let Some(summary) = &summary {
                                 let mut rows = vec![
                                     ("Server", summary.server_name.clone()),
                                     ("Adresse", summary.address.clone()),
-                                    (
-                                        "Art",
-                                        if needs_name { "Einladung" } else { "Passport" }.into(),
-                                    ),
                                 ];
                                 // An invite's placeholder name is not the
-                                // user's; they pick their own next.
+                                // user's; they pick their own below.
                                 if !needs_name {
                                     rows.push(("Name", summary.name.clone()));
                                 }
-                                enroll_card(ui, &tok, "Einladung", &rows, Some(JOIN_NOTE));
+                                if let Some(ca) = &ca {
+                                    // 32 pairs on two lines, so it reads in
+                                    // halves when compared with the operator.
+                                    rows.push(("CA", wrap_fingerprint(&ca.fingerprint)));
+                                }
+                                let title = if needs_name { "Einladung" } else { "Passport" };
+                                enroll_card(ui, &tok, title, &rows, Some(JOIN_NOTE));
                             }
-                            if let Some(ca) = &ca {
-                                ui.add_space(12.0);
-                                let until = if ca.expires_in_days < 0 {
-                                    format!("{} (abgelaufen)", ca.not_after)
-                                } else {
-                                    format!("{} (noch {} Tage)", ca.not_after, ca.expires_in_days)
-                                };
-                                let rows = [
-                                    ("Name", ca.subject.clone()),
-                                    // 32 pairs on two lines, so it reads in halves.
-                                    ("SHA-256", wrap_fingerprint(&ca.fingerprint)),
-                                    ("Gültig ab", ca.not_before.clone()),
-                                    ("Gültig bis", until),
-                                    ("Signatur", ca.sig_alg.clone()),
-                                ];
-                                enroll_card(
-                                    ui,
-                                    &tok,
-                                    "Zertifizierungsstelle (CA)",
-                                    &rows,
-                                    Some(
-                                        "Der Server muss sich beim Beitreten mit einem Zertifikat \
-                                         dieser CA ausweisen, sonst bricht ICU ab. Den \
-                                         Fingerabdruck im Zweifel beim Betreiber gegenprüfen.",
-                                    ),
+                            if needs_name {
+                                ui.label(theme::caps_text("Dein Name"));
+                                ui.add_space(4.0);
+                                let field = ui.add_enabled(
+                                    !busy,
+                                    egui::TextEdit::singleline(&mut self.name)
+                                        .desired_width(f32::INFINITY)
+                                        .margin(egui::Margin::symmetric(10, 8))
+                                        .hint_text("So sehen dich alle anderen"),
                                 );
-                            }
-                        }
-                        EnrollStep::Name => {
-                            ui.label(theme::caps_text("Dein Name"));
-                            ui.add_space(4.0);
-                            let field = ui.add_enabled(
-                                !busy,
-                                egui::TextEdit::singleline(&mut self.name)
-                                    .desired_width(f32::INFINITY)
-                                    .margin(egui::Margin::symmetric(10, 8))
-                                    .hint_text("Name"),
-                            );
-                            if std::mem::take(&mut self.focus_name) {
-                                field.request_focus();
-                            }
-                            if name_ok
-                                && field.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                forward = true;
-                            }
-                            ui.label(
-                                RichText::new(
-                                    "So sehen dich alle anderen. Steht später in deinem \
-                                     Zertifikat.",
-                                )
-                                .size(11.5)
-                                .color(tok.dim_text),
-                            );
-                        }
-                        EnrollStep::Confirm => {
-                            if let Some(summary) = &summary {
-                                let name = if needs_name {
-                                    icu_proto::normalize_name(&self.name)
-                                } else {
-                                    summary.name.clone()
-                                };
-                                let rows = [
-                                    ("Server", summary.server_name.clone()),
-                                    ("Adresse", summary.address.clone()),
-                                    ("Name", name),
-                                ];
-                                enroll_card(ui, &tok, "Zusammenfassung", &rows, Some(JOIN_NOTE));
+                                if std::mem::take(&mut self.focus_name) {
+                                    field.request_focus();
+                                }
+                                if join_ok
+                                    && field.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                {
+                                    join = true;
+                                }
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new("Steht später in deinem Zertifikat.")
+                                        .size(11.5)
+                                        .color(tok.dim_text),
+                                );
+                            } else if join_ok && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                join = true;
                             }
                             ui.add_space(10.0);
                             match &self.status {
                                 Some(EnrollStatus::Busy(text)) => {
-                                    ui.label(RichText::new(text).size(12.0).color(tok.muted_text));
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label(
+                                            RichText::new(text).size(12.0).color(tok.muted_text),
+                                        );
+                                    });
                                 }
                                 Some(EnrollStatus::Failed(text)) => {
                                     widgets::banner(
@@ -2213,8 +2228,6 @@ impl eframe::App for EnrollApp {
                         }
                     }
                 });
-                // Past the paste field the content has a natural height: grow
-                // the window to show all of it instead of a scroll bar.
                 let overflow = out.content_size.y - out.inner_rect.height();
                 self.overflow = overflow;
                 if step != EnrollStep::Paste {
@@ -2222,26 +2235,32 @@ impl eframe::App for EnrollApp {
                 }
             });
 
+        // Dragging a file over the window: say what letting go will do.
+        if dragging && !busy {
+            let screen = ctx.content_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("enroll-drop"),
+            ));
+            painter.rect_filled(screen, 0.0, tok.accent_tint_2.gamma_multiply(0.92));
+            painter.text(
+                screen.center(),
+                egui::Align2::CENTER_CENTER,
+                format!(
+                    "{}  Datei loslassen, um sie zu öffnen",
+                    icon::FILE_ARROW_DOWN
+                ),
+                egui::FontId::new(16.0, super::fonts::semibold()),
+                tok.accent,
+            );
+        }
+
         if back && !busy {
             self.status = None;
-            self.step = match step {
-                EnrollStep::Paste | EnrollStep::Check => EnrollStep::Paste,
-                EnrollStep::Name => EnrollStep::Check,
-                EnrollStep::Confirm if needs_name => EnrollStep::Name,
-                EnrollStep::Confirm => EnrollStep::Check,
-            };
-        } else if forward && !busy {
-            match step {
-                EnrollStep::Paste if valid => self.step = EnrollStep::Check,
-                EnrollStep::Check if needs_name => {
-                    self.step = EnrollStep::Name;
-                    self.focus_name = true;
-                }
-                EnrollStep::Check => self.step = EnrollStep::Confirm,
-                EnrollStep::Name if name_ok => self.step = EnrollStep::Confirm,
-                EnrollStep::Confirm if has_text => self.submit(),
-                _ => {}
-            }
+            self.step = EnrollStep::Paste;
+            self.focus_paste = true;
+        } else if join && join_ok && step == EnrollStep::Join {
+            self.submit();
         }
     }
 }
@@ -2284,14 +2303,20 @@ impl EnrollApp {
                                 .min_size(egui::vec2(0.0, height))
                                 .font(egui::FontId::new(12.0, egui::FontFamily::Monospace))
                                 .hint_text(
-                                    RichText::new("Einladung hier einfügen (Strg+V)")
-                                        .size(13.0)
-                                        .color(tok.dim_text),
+                                    RichText::new(
+                                        "Einladung hier einfügen (Strg+V) oder die .icu-Datei \
+                                         hierher ziehen",
+                                    )
+                                    .size(13.0)
+                                    .color(tok.dim_text),
                                 ),
                         )
                     })
                     .inner
             });
+        if std::mem::take(&mut self.focus_paste) {
+            well.inner.request_focus();
+        }
         let border = if valid {
             tok.connected
         } else if has_text {

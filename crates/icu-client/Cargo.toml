@@ -100,6 +100,9 @@ tempfile.workspace = true
 # for the optional screenshots (`ICU_UI_SHOTS=<dir>`).
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Reads the embedded Inter files' cmap (`ui::fonts` test); already in the
+# tree through egui's font stack.
+ttf-parser = "0.25"
 
 [[test]]
 name = "ui_layout"

@@ -93,6 +93,10 @@ pub struct SettingsView {
     /// identity, and the passport brings its own server, so the user sees
     /// which one first (`PROTOCOL.md` §2.3.1).
     import_preview: Option<(Box<Identity>, config::ImportSummary)>,
+    /// The passport paste field is open.
+    import_open: bool,
+    /// Put the cursor into it on the next frame.
+    focus_import: bool,
     /// Display name for the next invite to mint (admin only).
     pub invite_name: String,
     /// Validity of the next invite, seconds.
@@ -195,6 +199,8 @@ impl SettingsView {
             passport_import: String::new(),
             passport_status: None,
             import_preview: None,
+            import_open: false,
+            focus_import: false,
             invite_name: String::new(),
             invite_ttl_s: icu_proto::limits::INVITE_TTL_S,
             invite_status: None,
@@ -221,6 +227,14 @@ impl SettingsView {
             cameras_stale: true,
             overlay_available: cfg!(feature = "overlay"),
         }
+    }
+
+    /// Opens Allgemein with the passport paste field ready: the way back
+    /// after a certificate was renewed on another device.
+    pub fn open_import(&mut self) {
+        self.tab = Tab::General;
+        self.import_open = true;
+        self.focus_import = true;
     }
 
     /// Whether the overlay could start on this desktop.
@@ -704,12 +718,15 @@ impl SettingsView {
                         }
                     }
                     if widgets::button(ui, widgets::ButtonKind::Neutral, icon::EXPORT, "Speichern")
-                        .on_hover_text("Als Datei neben die Konfiguration, nur für dich lesbar")
+                        .on_hover_text(
+                            "Als .icu-Datei in den Download-Ordner, nur für dich lesbar — \
+                             auf dem anderen Gerät doppelklicken",
+                        )
                         .clicked()
                     {
                         self.passport_status = Some(match self.passport_text() {
                             Ok(text) => {
-                                let path = self.paths.config_dir.join("icu-passport.txt");
+                                let path = passport_file();
                                 match crate::config::write_atomic(&path, text.as_bytes(), true) {
                                     Ok(()) => format!("Gespeichert: {}", path.display()),
                                     Err(e) => crate::problem::storage("Der Passport", &e).text,
@@ -720,106 +737,92 @@ impl SettingsView {
                     }
                 });
             });
+            widgets::setting_row(ui, true, "Passport von einem anderen Gerät", None, |ui| {
+                let (glyph, label) = if self.import_open {
+                    (icon::X, "Schließen")
+                } else {
+                    (icon::DOWNLOAD, "Einspielen")
+                };
+                let width = widgets::button_width(ui, glyph, label);
+                widgets::row_group(ui, width, |ui| {
+                    if widgets::button(ui, widgets::ButtonKind::Neutral, glyph, label).clicked() {
+                        self.import_open = !self.import_open;
+                        self.import_preview = None;
+                        self.passport_import.clear();
+                    }
+                });
+            });
+            if self.import_open {
+                self.import_area(ui, cmds);
+            }
+            self.logout_row(ui);
             widgets::card_note(ui, |ui| {
                 let tok = theme::tokens(ui.visuals());
                 ui.colored_label(
                     tok.error,
                     RichText::new(
-                        "Enthält deinen privaten Schlüssel — nur sicher weitergeben. Erneuert \
-                         ein Gerät sein Zertifikat (neuer Name, jährlich), braucht das andere \
-                         einen neuen Passport.",
+                        "Der Passport enthält deinen privaten Schlüssel — nur sicher \
+                         weitergeben. Erneuert ein Gerät sein Zertifikat (neuer Name, \
+                         jährlich), braucht das andere einen neuen Passport.",
                     )
                     .size(11.5),
                 );
             });
             self.passport_status_note(ui);
-            self.logout_row(ui);
-            if !self.draft.ui.show_advanced {
-                return;
+        });
+    }
+
+    /// The paste field for a passport and, as soon as it reads as one,
+    /// where it leads and the button that takes it: no separate „Prüfen".
+    fn import_area(&mut self, ui: &mut Ui, cmds: &mut Vec<Command>) {
+        let mut edited = false;
+        widgets::card_note(ui, |ui| {
+            let field = ui.add(
+                egui::TextEdit::multiline(&mut self.passport_import)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Passport hier einfügen (Strg+V)")
+                    .font(egui::TextStyle::Monospace),
+            );
+            if std::mem::take(&mut self.focus_import) {
+                field.request_focus();
             }
-            widgets::advanced_caption(ui);
-            widgets::setting_row(ui, false, "Passport einspielen", None, |ui| {
-                let width = widgets::button_width(ui, icon::MAGNIFYING_GLASS, "Prüfen");
-                widgets::row_group(ui, width, |ui| {
-                    let clicked = ui
-                        .add_enabled_ui(
-                            !self.passport_import.trim().is_empty()
-                                && self.import_preview.is_none(),
-                            |ui| {
-                                widgets::button(
-                                    ui,
-                                    widgets::ButtonKind::Neutral,
-                                    icon::MAGNIFYING_GLASS,
-                                    "Prüfen",
-                                )
-                            },
-                        )
-                        .inner
-                        .on_hover_text("Zeigt, zu welchem Server der Passport gehört")
-                        .clicked();
-                    if clicked {
-                        self.preview_passport();
-                    }
-                });
+            edited = field.changed();
+        });
+        // A confirmation belongs to the text it was made for.
+        if edited {
+            self.import_preview = None;
+            if !self.passport_import.trim().is_empty() {
+                self.preview_passport();
+            }
+        }
+        let Some((_, summary)) = &self.import_preview else {
+            return;
+        };
+        let lines = summary.lines();
+        let warn = summary.ca_changed;
+        widgets::card_note(ui, |ui| {
+            let tok = theme::tokens(ui.visuals());
+            for (i, line) in lines.iter().enumerate() {
+                let text = RichText::new(line).size(11.5).monospace();
+                if warn && i == lines.len() - 1 {
+                    ui.colored_label(tok.error, text);
+                } else {
+                    ui.label(text);
+                }
+            }
+        });
+        widgets::setting_row(ui, true, "Diesen Server übernehmen?", None, |ui| {
+            let width = widgets::button_width(ui, icon::CHECK, "Übernehmen");
+            widgets::row_group(ui, width, |ui| {
+                if widgets::button(ui, widgets::ButtonKind::Danger, icon::CHECK, "Übernehmen")
+                    .on_hover_text("Ersetzt Schlüssel, Zertifikat und Serverdaten dieses Geräts")
+                    .clicked()
+                {
+                    self.import_passport(cmds);
+                    self.import_open = false;
+                }
             });
-            if let Some((_, summary)) = &self.import_preview {
-                let lines = summary.lines();
-                let warn = summary.ca_changed;
-                widgets::card_note(ui, |ui| {
-                    let tok = theme::tokens(ui.visuals());
-                    for (i, line) in lines.iter().enumerate() {
-                        let text = RichText::new(line).size(11.5).monospace();
-                        if warn && i == lines.len() - 1 {
-                            ui.colored_label(tok.error, text);
-                        } else {
-                            ui.label(text);
-                        }
-                    }
-                });
-                widgets::setting_row(ui, true, "Diesen Server übernehmen?", None, |ui| {
-                    let width = widgets::button_width(ui, icon::CHECK, "Übernehmen")
-                        + 6.0
-                        + widgets::button_width(ui, icon::X, "Abbrechen");
-                    widgets::row_group(ui, width, |ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        if widgets::button(
-                            ui,
-                            widgets::ButtonKind::Danger,
-                            icon::CHECK,
-                            "Übernehmen",
-                        )
-                        .on_hover_text(
-                            "Ersetzt Schlüssel, Zertifikat und Serverdaten dieses Geräts",
-                        )
-                        .clicked()
-                        {
-                            self.import_passport(cmds);
-                        }
-                        if widgets::button(ui, widgets::ButtonKind::Neutral, icon::X, "Abbrechen")
-                            .clicked()
-                        {
-                            self.import_preview = None;
-                            self.passport_status = Some("Import abgebrochen.".into());
-                        }
-                    });
-                });
-            }
-            let mut edited = false;
-            widgets::card_note(ui, |ui| {
-                edited = ui
-                    .add(
-                        egui::TextEdit::multiline(&mut self.passport_import)
-                            .desired_rows(3)
-                            .desired_width(f32::INFINITY)
-                            .hint_text(icu_proto::passport::ARMOR_BEGIN)
-                            .font(egui::TextStyle::Monospace),
-                    )
-                    .changed();
-            });
-            // A confirmation belongs to the text it was made for.
-            if edited {
-                self.import_preview = None;
-            }
         });
     }
 
@@ -839,29 +842,23 @@ impl SettingsView {
             // Let the armed button fall back on its own after 3 s.
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
-        widgets::setting_row(
-            ui,
-            true,
-            "Abmelden",
-            Some("Löscht deine Zugangsdaten hier; zurück nur mit Passport oder Einladung."),
-            |ui| {
-                let label = if confirming { "Wirklich?" } else { "Abmelden" };
-                let width = widgets::button_width(ui, icon::SIGN_OUT, label);
-                widgets::row_group(ui, width, |ui| {
-                    if widgets::button(ui, widgets::ButtonKind::Danger, icon::SIGN_OUT, label)
-                        .on_hover_text("Löscht Schlüssel und Zertifikat auf diesem Gerät")
-                        .clicked()
-                    {
-                        if confirming {
-                            self.confirm_logout = None;
-                            self.logout_requested = true;
-                        } else {
-                            self.confirm_logout = Some(Instant::now());
-                        }
+        widgets::setting_row(ui, true, "Von diesem Gerät abmelden", None, |ui| {
+            let label = if confirming { "Wirklich?" } else { "Abmelden" };
+            let width = widgets::button_width(ui, icon::SIGN_OUT, label);
+            widgets::row_group(ui, width, |ui| {
+                if widgets::button(ui, widgets::ButtonKind::Danger, icon::SIGN_OUT, label)
+                    .on_hover_text("Löscht Schlüssel und Zertifikat auf diesem Gerät")
+                    .clicked()
+                {
+                    if confirming {
+                        self.confirm_logout = None;
+                        self.logout_requested = true;
+                    } else {
+                        self.confirm_logout = Some(Instant::now());
                     }
-                });
-            },
-        );
+                }
+            });
+        });
     }
 
     /// The armored passport for the identity on disk. Disk, not `AppState`:
@@ -1942,6 +1939,21 @@ impl SettingsView {
         self.diagnose.ref_underruns = DebugStats::get(&self.stats.reference_underruns).to_string();
         self.diagnose.reconnects = DebugStats::get(&self.stats.reconnects).to_string();
     }
+}
+
+/// Where „Speichern" puts the passport: the download folder, where a file
+/// to be carried to another device is looked for first; the home directory
+/// or the config directory without one. `.icu`, so a double-click on the
+/// other device opens it in ICU.
+fn passport_file() -> std::path::PathBuf {
+    let dir = directories::UserDirs::new()
+        .and_then(|u| {
+            u.download_dir()
+                .map(std::path::Path::to_path_buf)
+                .or_else(|| Some(u.home_dir().to_path_buf()))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    dir.join("icu-passport.icu")
 }
 
 /// `2026-09-24T…` → `24.09.2026`; anything unexpected comes back as is.
