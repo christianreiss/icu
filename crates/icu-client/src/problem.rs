@@ -54,6 +54,22 @@ impl std::fmt::Display for Problem {
 pub const CREDENTIALS_STALE: &str = "Deine Zugangsdaten passen nicht (mehr) zu diesem Server – \
      vermutlich wurde er neu eingerichtet. Bitte beim Admin eine neue Einladung anfordern.";
 
+/// Our certificate was revoked. Since 2026-09-25 that is what a second
+/// device holding the same passport sees once the other one renewed or
+/// renamed and logged in with the new certificate: that login revokes every
+/// older one (`PROTOCOL.md` §2.2 Nr. 10). A new invitation would create a
+/// second account, so the text names the passport as the way back, and the
+/// admin only for a real revocation.
+pub const SUPERSEDED_REVOKED: &str = "Dieses Zertifikat gilt nicht mehr. Wurde ICU auf einem \
+     anderen Gerät erneuert oder umbenannt, dort den Passport speichern und hier einspielen – \
+     sonst den Admin fragen.";
+
+/// The server does not know our certificate: the same multi-device case once
+/// the replaced certificate has expired and left `users.toml`.
+pub const SUPERSEDED_UNKNOWN: &str = "Der Server kennt dieses Zertifikat nicht (mehr). Wurde \
+     ICU auf einem anderen Gerät erneuert oder umbenannt, dort den Passport speichern und hier \
+     einspielen – sonst den Admin fragen.";
+
 /// The server cannot be reached.
 pub const UNREACHABLE: &str = "Der Server ist nicht erreichbar. Läuft er, stimmt die Adresse \
      und besteht eine Internetverbindung? ICU versucht es weiter.";
@@ -70,14 +86,8 @@ pub fn code_text(code: u32) -> String {
         codes::VERSION_UNSUPPORTED => {
             "Diese ICU-Version passt nicht zum Server. Bitte ICU aktualisieren."
         }
-        codes::AUTH_UNKNOWN_CERT => {
-            "Der Server kennt dieses Gerät nicht (mehr). Bitte beim Admin eine neue Einladung \
-             anfordern."
-        }
-        codes::AUTH_REVOKED => {
-            "Der Zugang dieses Geräts wurde gesperrt. Wende dich an den Admin, wenn das ein \
-             Irrtum ist."
-        }
+        codes::AUTH_UNKNOWN_CERT => SUPERSEDED_UNKNOWN,
+        codes::AUTH_REVOKED => SUPERSEDED_REVOKED,
         codes::SERVER_FULL => "Der Server ist voll. ICU versucht es gleich noch einmal.",
         codes::KICKED => "Ein Admin hat dich vom Server geworfen.",
         codes::HELLO_TIMEOUT | codes::TIMEOUT => {
@@ -112,8 +122,9 @@ pub fn code_text(code: u32) -> String {
         }
         codes::NO_SUCH_USER => "Diesen Nutzer gibt es nicht (mehr).",
         codes::SESSION_REPLACED => {
-            "Du hast dich mit denselben Zugangsdaten auf einem anderen Gerät verbunden – \
-             hier wurde deshalb getrennt."
+            "Mit denselben Zugangsdaten ist ein anderes Gerät verbunden, deshalb wurde hier \
+             getrennt. „Neu verbinden“ holt die Sitzung hierher zurück – dann wird das andere \
+             Gerät getrennt."
         }
         codes::REGISTRATION_STORED => "Registrierung abgeschlossen.",
         codes::RENEW_REQUIRED => "Das eigene Zertifikat ist abgelaufen und wird erneuert …",
@@ -252,6 +263,21 @@ pub(crate) mod tests {
             assert!(p.technical.unwrap().contains(codes::name(code)));
         }
         assert!(code_text(0xEE).contains("0xEE") || code_text(0xEE).contains("238"));
+    }
+
+    /// A second device whose passport went stale is told how to get back
+    /// in — not to request an invitation, which would make a second account.
+    #[test]
+    fn a_superseded_certificate_points_to_the_passport() {
+        for code in [codes::AUTH_REVOKED, codes::AUTH_UNKNOWN_CERT] {
+            let text = code_text(code);
+            assert!(text.contains("Passport"), "{text}");
+            assert!(text.contains("anderen Gerät"), "{text}");
+            assert!(!text.contains("Einladung"), "{text}");
+        }
+        let replaced = code_text(codes::SESSION_REPLACED);
+        assert!(replaced.contains("Neu verbinden"), "{replaced}");
+        assert!(replaced.contains("andere"), "{replaced}");
     }
 
     #[test]

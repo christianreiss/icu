@@ -183,7 +183,10 @@ fn init_tracing() {
 fn run(cli: Cli) -> Result<(), String> {
     let paths = Paths::new(cli.config_dir.clone());
     std::fs::create_dir_all(&paths.config_dir).map_err(|e| e.to_string())?;
-    let settings = Settings::load(&paths).map_err(|e| e.to_string())?;
+    // An unreadable settings.toml does not stop a desktop start: it is moved
+    // aside and the window says so.
+    let (settings, mut settings_problem) =
+        Settings::load_or_recover(&paths).map_err(|e| e.to_string())?;
 
     // As text, read here: the running instance it may be handed to can sit
     // in another working directory.
@@ -294,7 +297,8 @@ fn run(cli: Cli) -> Result<(), String> {
             }
         };
 
-        let mut settings = Settings::load(&paths).map_err(|e| e.to_string())?;
+        let (mut settings, problem) =
+            Settings::load_or_recover(&paths).map_err(|e| e.to_string())?;
         if let Some(cam) = &cli.camera {
             settings.camera.device = Some(cam.clone());
             settings.camera.enabled = true;
@@ -302,6 +306,7 @@ fn run(cli: Cli) -> Result<(), String> {
         let mut cfg = EngineConfig::new(identity, settings.clone(), paths.clone());
         cfg.server_addr = cli.server_addr;
         cfg.test_tone = cli.test_tone;
+        cfg.banner = settings_problem.take().or(problem);
         let engine = Engine::start(cfg, backend).map_err(|e| e.to_string())?;
 
         // Hotkeys come up in the background: the Portal may show a dialog and

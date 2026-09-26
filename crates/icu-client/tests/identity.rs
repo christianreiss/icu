@@ -306,3 +306,99 @@ async fn a_failed_save_does_not_burn_the_bundle() {
         .expect("the bundle is still valid");
     assert_eq!(leaf_cn(&paths), "dora");
 }
+
+/// Two devices share one passport. Device A renames and logs in with the new
+/// certificate, which revokes every older one (`PROTOCOL.md` §2.2 Nr. 10).
+/// Device B, still on the old certificate, is refused — and told to fetch the
+/// passport from the other device, not to ask for an invitation (which would
+/// create a second account).
+#[tokio::test]
+async fn a_device_left_behind_by_a_renewal_is_pointed_to_the_passport() {
+    let server = TestServer::start().await;
+    let (stale, paths_a, _dir_a) = server.enroll("alice").await;
+    let dir_b = tempfile::tempdir().expect("tempdir");
+    let paths_b = Paths::new(Some(dir_b.path().to_path_buf()));
+    stale.save(&paths_b).expect("seed device b");
+
+    // Device A renames: a new certificate, stored on disk.
+    let engine_a = server
+        .engine_from(
+            stale.clone(),
+            paths_a.clone(),
+            Box::new(FakeBackend::silent().0),
+            false,
+        )
+        .expect("engine a");
+    wait_connected(&engine_a).await;
+    engine_a.command(Command::RequestRename("alicia".into()));
+    assert!(
+        wait_until(SOON, || leaf_cn(&paths_a) == "alicia").await,
+        "device a stores the renamed certificate"
+    );
+    engine_a.shutdown();
+
+    // ... and logs in with it: that login retires the old certificate.
+    let renewed = Identity::load(&paths_a).unwrap().unwrap();
+    let engine_a = server
+        .engine_from(
+            renewed,
+            paths_a.clone(),
+            Box::new(FakeBackend::silent().0),
+            false,
+        )
+        .expect("engine a, renewed");
+    let state = wait_connected(&engine_a).await;
+    assert_eq!(state.me.unwrap().name, "alicia");
+
+    // Device B still holds the old certificate.
+    let engine_b = server
+        .engine_from(stale, paths_b, Box::new(FakeBackend::silent().0), false)
+        .expect("engine b");
+    let state = wait_for(&engine_b, SOON, |s| {
+        matches!(s.conn, icu_client::engine::ConnStatus::Fatal(_))
+    })
+    .await;
+    let icu_client::engine::ConnStatus::Fatal(problem) = state.conn else {
+        unreachable!("the predicate waited for Fatal");
+    };
+    assert!(problem.text.contains("Passport"), "{}", problem.text);
+    assert!(problem.text.contains("anderen Gerät"), "{}", problem.text);
+    assert!(!problem.text.contains("Einladung"), "{}", problem.text);
+
+    engine_a.shutdown();
+    engine_b.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// A passport is stored before it is taken into use. When it cannot be
+/// written, the identity in force stays — in memory, on disk and on the
+/// connection — and the window says so.
+#[tokio::test]
+async fn a_passport_that_cannot_be_stored_is_not_taken_over() {
+    let server = TestServer::start().await;
+    let (bob, _bob_paths, _bob_dir) = server.enroll("bob").await;
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+
+    // `identity.new` is a file, so the new set cannot be written.
+    std::fs::write(paths.identity_dir().with_extension("new"), b"").unwrap();
+    engine.command(Command::ReplaceIdentity(Box::new(bob)));
+    let state = wait_for(&engine, SOON, |s| s.banner.is_some()).await;
+    assert!(
+        state.banner.unwrap().text.contains("gespeichert"),
+        "a storage problem"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let state = engine.snapshot();
+    assert_eq!(state.me.unwrap().name, "alice");
+    assert!(matches!(
+        state.conn,
+        icu_client::engine::ConnStatus::Connected
+    ));
+    assert_eq!(leaf_cn(&paths), "alice");
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}

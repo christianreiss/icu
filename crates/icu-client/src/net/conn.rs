@@ -114,23 +114,8 @@ pub fn client_config_with_crl(
     // which reads like a network error and would be retried forever. No
     // reconnect can fix it, so say so before trying.
     check_not_expired(&identity.leaf_der, unix_now())?;
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(CertificateDer::from(identity.ca_der.clone()))
-        .map_err(|e| NetError::Tls(format!("ca: {e}")))?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut builder = rustls::client::WebPkiServerVerifier::builder_with_provider(
-        Arc::new(roots),
-        provider.clone(),
-    );
-    if let Some(crl) = crl {
-        builder = builder
-            .with_crls([rustls::pki_types::CertificateRevocationListDer::from(
-                crl.to_vec(),
-            )])
-            .only_check_end_entity_revocation();
-    }
-    let webpki_verifier = builder.build().map_err(|e| NetError::Tls(e.to_string()))?;
+    let webpki_verifier = server_verifier(&identity.ca_der, crl, provider.clone())?;
     let cert_failure = CertFailure::default();
     let verifier = Arc::new(ReportingVerifier {
         inner: webpki_verifier,
@@ -168,6 +153,31 @@ pub fn client_config_with_crl(
     )));
     config.transport_config(Arc::new(transport));
     Ok((config, cert_failure))
+}
+
+/// The check of the server's certificate: against our CA only and, with a
+/// CRL, against that for the leaf (`PROTOCOL.md` §1). Also how `crate::crl`
+/// finds out whether rustls takes a CRL at all, so the trial and the real
+/// build cannot drift apart.
+pub(crate) fn server_verifier(
+    ca_der: &[u8],
+    crl: Option<&[u8]>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<rustls::client::WebPkiServerVerifier>, NetError> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca_der.to_vec()))
+        .map_err(|e| NetError::Tls(format!("ca: {e}")))?;
+    let mut builder =
+        rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider);
+    if let Some(crl) = crl {
+        builder = builder
+            .with_crls([rustls::pki_types::CertificateRevocationListDer::from(
+                crl.to_vec(),
+            )])
+            .only_check_end_entity_revocation();
+    }
+    builder.build().map_err(|e| NetError::Tls(e.to_string()))
 }
 
 /// Refuses a registration certificate whose `notAfter` lies before `now`
@@ -325,7 +335,10 @@ pub async fn connect(
     )
     .await
     .map_err(|_| ConnectError::Transport("no Welcome".into()))?
-    .map_err(|e| ConnectError::on(&conn, e))?;
+    .map_err(|e| match e {
+        NetError::Protocol(s) => ConnectError::Protocol(s),
+        e => ConnectError::on(&conn, e),
+    })?;
     match ControlMsg::decode(&body).map_err(|e| ConnectError::Protocol(e.to_string()))? {
         ControlMsg::Welcome {
             minor,
@@ -383,6 +396,10 @@ pub enum ConnectError {
     ServerCert(String),
     /// We could not make sense of what the server sent.
     Protocol(String),
+    /// The server speaks another protocol version: TLS alert
+    /// `protocol_version` or `no_application_protocol` (ALPN, `PROTOCOL.md`
+    /// §8). Fatal: it takes an update, not a retry.
+    Version(String),
     /// TLS certificate verification failed for `server_name`. Never
     /// retryable: retrying will not fix a hostname/cert mismatch.
     Certificate {
@@ -430,23 +447,31 @@ impl ConnectError {
             quinn::ConnectionError::ConnectionClosed(c)
                 if (0x100..0x200).contains(&u64::from(c.error_code)) =>
             {
-                // 44 = certificate_revoked: the server's CRL lists our leaf
-                // (`PROTOCOL.md` §1).
-                if u64::from(c.error_code) - 0x100 == 44 {
-                    return ConnectError::Certificate {
+                let alert = u64::from(c.error_code) - 0x100;
+                match alert {
+                    // certificate_revoked: the server's CRL lists our leaf
+                    // (`PROTOCOL.md` §1).
+                    44 => ConnectError::Certificate {
                         server_name: String::new(),
                         issue: CertIssue::RevokedByServer,
                         detail: "Der Server hat dieses Zertifikat widerrufen.".into(),
-                    };
-                }
-                ConnectError::Certificate {
-                    server_name: String::new(),
-                    issue: CertIssue::Untrusted,
-                    detail: format!(
-                        "Server hat das Client-Zertifikat abgelehnt (TLS-Alert {}): {}",
-                        u64::from(c.error_code) - 0x100,
+                    },
+                    // protocol_version, no_application_protocol: the server
+                    // speaks another TLS or ICU major version (ALPN, §8) —
+                    // nothing wrong with the certificate, and only an update
+                    // can fix it.
+                    70 | 120 => ConnectError::Version(format!(
+                        "TLS-Alert {alert}: {}",
                         String::from_utf8_lossy(&c.reason)
-                    ),
+                    )),
+                    _ => ConnectError::Certificate {
+                        server_name: String::new(),
+                        issue: CertIssue::Untrusted,
+                        detail: format!(
+                            "Server hat das Client-Zertifikat abgelehnt (TLS-Alert {alert}): {}",
+                            String::from_utf8_lossy(&c.reason)
+                        ),
+                    },
                 }
             }
             other => ConnectError::Transport(other.to_string()),
@@ -458,7 +483,7 @@ impl ConnectError {
         match self {
             ConnectError::Closed { code, .. } => icu_proto::error::is_fatal(*code),
             ConnectError::Transport(_) | ConnectError::ServerCert(_) => false,
-            ConnectError::Protocol(_) => true,
+            ConnectError::Protocol(_) | ConnectError::Version(_) => true,
             ConnectError::Certificate { .. } => true,
         }
     }
@@ -476,6 +501,10 @@ impl ConnectError {
                 technical,
             ),
             ConnectError::Protocol(_) => Problem::new(problem::UPDATE_NEEDED, technical),
+            ConnectError::Version(_) => Problem::new(
+                problem::code_text(icu_proto::error::VERSION_UNSUPPORTED),
+                technical,
+            ),
             ConnectError::Certificate { issue, .. } => match issue {
                 CertIssue::NameMismatch => Problem::new(
                     "Die Serveradresse passt nicht zum Zertifikat des Servers. Bitte beim \
@@ -512,6 +541,7 @@ impl std::fmt::Display for ConnectError {
             ConnectError::Transport(s) => write!(f, "transport: {s}"),
             ConnectError::ServerCert(s) => f.write_str(s),
             ConnectError::Protocol(s) => write!(f, "protocol: {s}"),
+            ConnectError::Version(s) => write!(f, "version: {s}"),
             ConnectError::Certificate {
                 server_name,
                 detail,
@@ -577,6 +607,50 @@ mod tests {
         let wrong_name = certificate_error("x", &rustls::CertificateError::NotValidForName);
         assert!(matches!(wrong_name, ConnectError::Certificate { .. }));
         assert!(wrong_name.is_fatal());
+    }
+
+    /// A TLS alert from the server, as quinn reports it.
+    fn alert(code: u8) -> ConnectError {
+        ConnectError::from_connection_error(quinn::ConnectionError::ConnectionClosed(
+            quinn::ConnectionClose {
+                error_code: quinn::TransportErrorCode::crypto(code),
+                frame_type: None,
+                reason: Default::default(),
+            },
+        ))
+    }
+
+    /// `protocol_version` and `no_application_protocol` mean another
+    /// protocol version, not a certificate problem: the user is told to
+    /// update, and nothing is retried.
+    #[test]
+    fn version_alerts_ask_for_an_update() {
+        for code in [70, 120] {
+            let e = alert(code);
+            assert!(matches!(e, ConnectError::Version(_)), "{code}: {e:?}");
+            assert!(e.is_fatal());
+            let p = e.problem();
+            assert_eq!(
+                p.text,
+                problem::code_text(icu_proto::error::VERSION_UNSUPPORTED)
+            );
+            assert!(p.technical.unwrap().contains(&code.to_string()));
+            crate::problem::tests::assert_readable(&e.problem());
+        }
+        assert!(matches!(
+            alert(44),
+            ConnectError::Certificate {
+                issue: CertIssue::RevokedByServer,
+                ..
+            }
+        ));
+        assert!(matches!(
+            alert(48),
+            ConnectError::Certificate {
+                issue: CertIssue::Untrusted,
+                ..
+            }
+        ));
     }
 
     /// Every connection failure reads as plain German; the raw error stays

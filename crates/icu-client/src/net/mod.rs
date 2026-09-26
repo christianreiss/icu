@@ -24,6 +24,10 @@ pub enum NetError {
     User(crate::problem::Problem),
     /// Connection setup or transport.
     Connect(String),
+    /// The peer broke the framing or sent a message that does not decode
+    /// (`PROTOCOL.md` §2, §6 `PROTOCOL_VIOLATION`). Fatal: reconnecting to
+    /// the same server would only loop.
+    Protocol(String),
     /// The server answered with an error code.
     Rejected {
         /// Error code (`PROTOCOL.md` §6).
@@ -46,6 +50,7 @@ impl std::fmt::Display for NetError {
             NetError::Handshake(e) => write!(f, "connection: {e}"),
             NetError::User(p) => f.write_str(&p.full()),
             NetError::Connect(s) => write!(f, "connection: {s}"),
+            NetError::Protocol(s) => write!(f, "protocol: {s}"),
             NetError::Rejected { code, detail } => {
                 write!(f, "{} ({code}): {detail}", icu_proto::error::name(*code))
             }
@@ -85,6 +90,7 @@ impl NetError {
                 "Die Verbindung zum Server ist abgebrochen. Bitte noch einmal versuchen.",
                 technical,
             ),
+            NetError::Protocol(_) => Problem::new(problem::UPDATE_NEEDED, technical),
             NetError::Rejected { code, detail } => problem::from_code(*code, detail),
             NetError::Other(_) => Problem::new(
                 "Etwas ist unerwartet schiefgegangen. Bitte noch einmal versuchen.",
@@ -125,13 +131,24 @@ pub async fn read_frame(recv: &mut quinn::RecvStream, max: usize) -> Result<Vec<
     recv.read_exact(&mut prefix)
         .await
         .map_err(|e| NetError::Connect(e.to_string()))?;
-    let len = icu_proto::framing::frame_len(prefix);
-    icu_proto::framing::check_len(len, max).map_err(|e| NetError::Other(e.to_string()))?;
+    let len = checked_len(prefix, max)?;
     let mut body = vec![0u8; len];
     recv.read_exact(&mut body)
         .await
         .map_err(|e| NetError::Connect(e.to_string()))?;
     Ok(body)
+}
+
+/// The body length a frame prefix announces. Outside `1..=max` it is a
+/// `PROTOCOL_VIOLATION` (`PROTOCOL.md` §2), not a transport failure: the
+/// same server would send the same frame again after a reconnect.
+fn checked_len(
+    prefix: [u8; icu_proto::framing::LEN_PREFIX],
+    max: usize,
+) -> Result<usize, NetError> {
+    let len = icu_proto::framing::frame_len(prefix);
+    icu_proto::framing::check_len(len, max).map_err(|e| NetError::Protocol(e.to_string()))?;
+    Ok(len)
 }
 
 /// Splits `host[:port]`, `[v6]` or `[v6]:port`; a missing port is the
@@ -173,6 +190,17 @@ pub fn server_name_for(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bad_frame_length_is_a_protocol_violation() {
+        let max = icu_proto::MAX_CONTROL_FRAME;
+        assert_eq!(checked_len(5u16.to_le_bytes(), max).unwrap(), 5);
+        for bad in [0u16, max as u16 + 1] {
+            let e = checked_len(bad.to_le_bytes(), max).unwrap_err();
+            assert!(matches!(e, NetError::Protocol(_)), "{bad}: {e}");
+            assert_eq!(e.problem().text, crate::problem::UPDATE_NEEDED);
+        }
+    }
 
     #[test]
     fn host_port_forms() {
