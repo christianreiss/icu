@@ -99,9 +99,11 @@ pub async fn start(
     .await;
     let bind = match bound {
         Ok(Ok(bind)) => Ok(bind),
-        Ok(Err(ashpd::Error::Response(ResponseError::Cancelled))) => {
-            Err(Declined("the portal dialog was cancelled".into()))
-        }
+        // The dialog's answer, or the portal's D-Bus error of that name.
+        Ok(Err(
+            ashpd::Error::Response(ResponseError::Cancelled)
+            | ashpd::Error::Portal(ashpd::PortalError::Cancelled(_)),
+        )) => Err(Declined("the portal dialog was cancelled".into())),
         Ok(Err(e)) => Err(Unavailable(format!("bind_shortcuts: {e}"))),
         Err(_) => Err(Declined(format!(
             "the portal dialog was not answered in {} s",
