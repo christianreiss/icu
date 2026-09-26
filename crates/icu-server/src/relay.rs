@@ -122,11 +122,27 @@ struct CongestionWindow {
     displacements: u32,
 }
 
-/// Per-sender video state: frame rate bucket, bitrate bucket, one slot per
-/// receiver, and the rolling counts behind `VideoCongestionHint`.
-pub struct VideoSender {
+/// A user's video allowance (`PROTOCOL.md` §7): frame rate and bytes. Kept
+/// per user on the [`Server`], not per connection, so reconnecting does not
+/// hand out a fresh burst.
+pub struct VideoBudget {
     frames: TokenBucket,
     bitrate: TokenBucket,
+}
+
+impl VideoBudget {
+    /// A full allowance from the configured limits.
+    pub fn new(limits: &crate::config::LimitsSection) -> VideoBudget {
+        VideoBudget {
+            frames: TokenBucket::per_second(limits.video_frames_per_s),
+            bitrate: TokenBucket::bitrate(limits.video_kbit_s, Duration::from_secs(2)),
+        }
+    }
+}
+
+/// Per-connection video state: one slot per receiver, and the rolling
+/// counts behind `VideoCongestionHint`.
+pub struct VideoSender {
     slots: HashMap<Session, Arc<Slot>>,
     congestion: HashMap<Session, CongestionWindow>,
     window_start: Instant,
@@ -134,11 +150,9 @@ pub struct VideoSender {
 }
 
 impl VideoSender {
-    /// Builds the per-sender limiter from the configured limits.
-    pub fn new(limits: &crate::config::LimitsSection) -> VideoSender {
+    /// No receivers yet, an empty congestion window.
+    pub fn new() -> VideoSender {
         VideoSender {
-            frames: TokenBucket::per_second(limits.video_frames_per_s),
-            bitrate: TokenBucket::bitrate(limits.video_kbit_s, Duration::from_secs(2)),
             slots: HashMap::new(),
             congestion: HashMap::new(),
             window_start: Instant::now(),
@@ -196,6 +210,12 @@ impl VideoSender {
         } else {
             None
         }
+    }
+}
+
+impl Default for VideoSender {
+    fn default() -> VideoSender {
+        VideoSender::new()
     }
 }
 
@@ -279,6 +299,7 @@ pub async fn video(
     sender: Session,
     mut recv: quinn::RecvStream,
     state: Arc<Mutex<VideoSender>>,
+    budget: Arc<Mutex<VideoBudget>>,
 ) {
     Counters::inc(&server.counters.video_frames_in);
     let refuse = |recv: &mut quinn::RecvStream| {
@@ -315,14 +336,42 @@ pub async fn video(
         refuse(&mut recv);
         return;
     }
-    if !lock(&state).frames.take_one() {
-        Counters::inc(&server.counters.video_dropped_rate);
-        refuse(&mut recv);
-        return;
+    // The byte budget decides before the payload is read: a sender in debt
+    // is stopped here, and its bytes never cross more than the stream's
+    // receive window. An admitted frame is read to its end and charged as
+    // it arrives, into debt if need be — a frame larger than the 2 s burst,
+    // a big IDR, still passes when the budget is not spent — so frames in
+    // flight at the same time see each other's bytes.
+    {
+        let mut budget = lock(&budget);
+        if !budget.bitrate.has_credit() || !budget.frames.take_one() {
+            drop(budget);
+            Counters::inc(&server.counters.video_dropped_rate);
+            refuse(&mut recv);
+            return;
+        }
+        budget.bitrate.charge(VIDEO_HEADER_LEN as f64);
     }
 
-    let payload = match tokio::time::timeout_at(deadline, recv.read_to_end(VIDEO_MAX_FRAME)).await {
-        Ok(Ok(payload)) => payload,
+    let mut payload = Vec::new();
+    let read = tokio::time::timeout_at(deadline, async {
+        while let Some(chunk) = recv.read_chunk(usize::MAX, true).await? {
+            lock(&budget).bitrate.charge(chunk.bytes.len() as f64);
+            if payload.len() + chunk.bytes.len() > VIDEO_MAX_FRAME {
+                return Ok(false);
+            }
+            payload.extend_from_slice(&chunk.bytes);
+        }
+        Ok::<_, quinn::ReadError>(true)
+    })
+    .await;
+    match read {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            tracing::debug!(sender, "video frame larger than {VIDEO_MAX_FRAME} bytes");
+            refuse(&mut recv);
+            return;
+        }
         Ok(Err(e)) => {
             tracing::debug!(sender, error = %e, "video frame read failed");
             return;
@@ -331,16 +380,6 @@ pub async fn video(
             stalled(&mut recv);
             return;
         }
-    };
-    // The byte budget can only be charged once the size is known. It runs
-    // into debt rather than refusing outright, so a frame larger than the
-    // 2 s burst — a big IDR — still passes when the budget is not spent.
-    if !lock(&state)
-        .bitrate
-        .take_debt((VIDEO_HEADER_LEN + payload.len()) as f64)
-    {
-        Counters::inc(&server.counters.video_dropped_rate);
-        return;
     }
     let mut frame = Vec::with_capacity(VIDEO_HEADER_LEN + payload.len());
     frame.extend_from_slice(&header);
@@ -462,8 +501,6 @@ mod tests {
 
     fn sender() -> VideoSender {
         VideoSender {
-            frames: TokenBucket::per_second(1000),
-            bitrate: TokenBucket::bitrate(u32::MAX, Duration::from_secs(2)),
             slots: HashMap::new(),
             congestion: HashMap::new(),
             window_start: Instant::now(),

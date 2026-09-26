@@ -25,6 +25,15 @@ pub const AUDIO_MAX_DATAGRAM: usize = AUDIO_HEADER_LEN + AUDIO_MAX_PAYLOAD;
 pub const VIDEO_HEADER_LEN: usize = 12;
 /// Largest video frame payload (`PROTOCOL.md` §4, §7).
 pub const VIDEO_MAX_FRAME: usize = 512 * 1024;
+/// Largest picture a receiver decodes, in pixels (`PROTOCOL.md` §4): twice
+/// the 320×240 profile in each direction, headroom for a later profile. A
+/// frame whose SPS asks for more is refused before the decoder sees it.
+pub const VIDEO_MAX_WIDTH: usize = 640;
+/// See [`VIDEO_MAX_WIDTH`].
+pub const VIDEO_MAX_HEIGHT: usize = 480;
+/// Most reference frames an SPS may ask for; the decoder's picture buffer
+/// grows with it. The encoder uses one.
+pub const VIDEO_MAX_REF_FRAMES: u32 = 4;
 
 /// bit0 of the audio `flags`: last packet of a talk spurt.
 pub const AUDIO_FLAG_END: u8 = 1 << 0;

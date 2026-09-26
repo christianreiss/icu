@@ -176,3 +176,100 @@ async fn a_server_leaf_on_the_crl_is_refused() {
     server.handle.shutdown().await;
     drop(dir);
 }
+
+/// Connects `identity` once to `addr` and returns why the handshake failed.
+async fn handshake_error(
+    identity: &icu_client::config::Identity,
+    addr: std::net::SocketAddr,
+) -> icu_client::net::conn::ConnectError {
+    let (config, cert_failure) = icu_client::net::conn::client_config(identity).expect("config");
+    let endpoint = icu_client::net::bind_endpoint(addr).expect("endpoint");
+    icu_client::net::conn::connect(
+        &endpoint,
+        config,
+        addr,
+        "localhost",
+        "icu-test/0.1.0 linux",
+        icu_proto::UserFlags::NONE,
+        "alice",
+        &cert_failure,
+    )
+    .await
+    .err()
+    .expect("the handshake fails")
+}
+
+/// A revoked client learns it from the server's `certificate_revoked`,
+/// sent after the server proved its identity: that stays fatal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_client_is_told_so_after_the_server_proved_itself() {
+    let server = TestServer::start().await;
+    let (_admin, _paths, _admin_dir) = server.enroll("alice").await;
+    let (identity, _paths, dir) = server.enroll("bob").await;
+    server
+        .handle
+        .admin(icu_server::AdminRequest::Revoke { user: "bob".into() })
+        .await;
+    let err = handshake_error(&identity, server.addr()).await;
+    assert!(
+        matches!(
+            err,
+            icu_client::net::conn::ConnectError::Certificate {
+                issue: icu_client::net::conn::CertIssue::RevokedByServer,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(err.is_fatal());
+    server.handle.shutdown().await;
+    drop(dir);
+}
+
+/// An alert in reply to our first packet — here a real one, from a QUIC
+/// server with another ALPN — comes before the server proved anything.
+/// Anyone on the path could send it, so it is retried, not fatal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_alert_before_server_authentication_is_retried() {
+    let server = TestServer::start().await;
+    let (identity, _paths, dir) = server.enroll("alice").await;
+
+    let key = rcgen::KeyPair::generate().expect("key");
+    let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+        .expect("params")
+        .self_signed(&key)
+        .expect("cert");
+    let mut tls = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .expect("tls13")
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+    )
+    .expect("server tls");
+    tls.alpn_protocols = vec![b"not-icu".to_vec()];
+    let quic = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("quic"),
+    ));
+    let other = quinn::Endpoint::server(quic, "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = other.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        if let Some(incoming) = other.accept().await {
+            let _ = incoming.await;
+        }
+        other
+    });
+
+    let err = handshake_error(&identity, addr).await;
+    assert!(
+        matches!(err, icu_client::net::conn::ConnectError::VersionHint(_)),
+        "{err:?}"
+    );
+    assert!(!err.is_fatal());
+    drop(accept.await);
+    server.handle.shutdown().await;
+    drop(dir);
+}

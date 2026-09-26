@@ -242,7 +242,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
     match &request {
         AdminRequest::Invite { name, ttl_s } => {
             // `issue` owns the default and the clamp; absent or 0 means default.
-            match crate::registration::issue(server, name, ttl_s.unwrap_or(0)).await {
+            match crate::registration::issue(server, None, name, ttl_s.unwrap_or(0)).await {
                 Ok(issued) => AdminResponse::Invite {
                     bundle: issued.bundle,
                     expires: issued.expires,
@@ -436,20 +436,44 @@ async fn resolve(server: &Arc<Server>, user: &str) -> std::result::Result<UserId
         .ok_or_else(|| AdminResponse::err("NO_SUCH_USER", format!("no user {user:?}")))
 }
 
-/// Under one store lock: an in-band `actor` must still be an admin and
-/// `target` must exist (the socket passes `None`, its authentication is the
-/// file permissions), then `change` runs. The lock is released before this
-/// returns, so the callers' asynchronous side effects — the CRL reload —
-/// never run under it.
+/// Who asks for an in-band admin action: the user and the certificate the
+/// session authenticated with. The socket has none — its authentication is
+/// the file permissions.
+#[derive(Debug, Clone)]
+pub struct Actor {
+    /// The session's user.
+    pub user_id: UserId,
+    /// SHA-256 of the session's leaf, as the store keys it.
+    pub cert_fp: String,
+}
+
+impl Actor {
+    /// Whether `store`, as it is now, still lets this actor act as admin:
+    /// its certificate admitted (known, not revoked, the user not disabled)
+    /// and its user an admin. Checked under the same lock as the change it
+    /// guards — the session was admitted earlier, and an action queued on
+    /// the store lock may run after the disable or revoke that kicks it.
+    pub fn is_admin(&self, store: &Store) -> bool {
+        crate::session::admit(store, &self.cert_fp)
+            .is_ok_and(|(user_id, _, _)| user_id == self.user_id)
+            && store.is_admin(self.user_id)
+    }
+}
+
+/// Under one store lock: an in-band `actor` must still be an admin
+/// ([`Actor::is_admin`]) and `target` must exist (the socket passes `None`),
+/// then `change` runs. The lock is released before this returns, so the
+/// callers' asynchronous side effects — the CRL reload — never run under
+/// it.
 async fn change<T>(
     server: &Arc<Server>,
-    actor: Option<UserId>,
+    actor: Option<&Actor>,
     target: UserId,
     change: impl FnOnce(&mut Store) -> Result<T>,
 ) -> Result<T> {
     let mut store = server.store.lock().await;
     if let Some(actor) = actor {
-        if !store.is_admin(actor) {
+        if !actor.is_admin(&store) {
             return Err(Error::coded(ec::NOT_ADMIN, "not an admin"));
         }
         if store.user(target).is_none() {
@@ -464,12 +488,12 @@ async fn change<T>(
 /// Behind `revoke` and `AdminRevokeUser`.
 pub async fn revoke_user(
     server: &Arc<Server>,
-    actor: Option<UserId>,
+    actor: Option<&Actor>,
     target: UserId,
 ) -> Result<usize> {
     change(server, actor, target, |store| store.revoke(target)).await?;
     let closed = kick_user(server, target, ec::KICKED);
-    tracing::info!(actor, target, closed, "revoked");
+    tracing::info!(actor = actor.map(|a| a.user_id), target, closed, "revoked");
     crate::endpoint::reload_tls_logged(server).await;
     Ok(closed)
 }
@@ -481,7 +505,7 @@ pub async fn revoke_user(
 /// `promote`/`demote` and `AdminSetRole`.
 pub async fn set_role(
     server: &Arc<Server>,
-    actor: Option<UserId>,
+    actor: Option<&Actor>,
     target: UserId,
     is_admin: bool,
 ) -> Result<()> {
@@ -501,7 +525,7 @@ pub async fn set_role(
                 .broadcast(&ControlMsg::UserState { session: s, flags });
         }
     }
-    tracing::info!(actor, target, is_admin, "admin role changed");
+    tracing::info!(actor = actor.map(|a| a.user_id), target, is_admin, "admin role changed");
     Ok(())
 }
 
@@ -511,7 +535,7 @@ pub async fn set_role(
 /// Behind `disable`/`enable` and `AdminSetDisabled`.
 pub async fn set_disabled(
     server: &Arc<Server>,
-    actor: Option<UserId>,
+    actor: Option<&Actor>,
     target: UserId,
     disabled: bool,
 ) -> Result<usize> {
@@ -524,17 +548,17 @@ pub async fn set_disabled(
     } else {
         0
     };
-    tracing::info!(actor, target, disabled, closed, "disabled state changed");
+    tracing::info!(actor = actor.map(|a| a.user_id), target, disabled, closed, "disabled state changed");
     Ok(closed)
 }
 
 /// Closes the target's live connections with `KICKED` and changes nothing
 /// else: they may connect again. Returns how many were closed. Behind
 /// `kick` and `AdminKick`.
-pub async fn kick(server: &Arc<Server>, actor: Option<UserId>, target: UserId) -> Result<usize> {
+pub async fn kick(server: &Arc<Server>, actor: Option<&Actor>, target: UserId) -> Result<usize> {
     change(server, actor, target, |_| Ok(false)).await?;
     let closed = kick_user(server, target, ec::KICKED);
-    tracing::info!(actor, target, closed, "kicked");
+    tracing::info!(actor = actor.map(|a| a.user_id), target, closed, "kicked");
     Ok(closed)
 }
 
@@ -552,7 +576,7 @@ pub async fn kick(server: &Arc<Server>, actor: Option<UserId>, target: UserId) -
 /// here or sees the new one.
 pub async fn set_restriction(
     server: &Arc<Server>,
-    actor: Option<UserId>,
+    actor: Option<&Actor>,
     target: UserId,
     update: impl FnOnce((bool, bool)) -> (bool, bool),
 ) -> Result<(bool, bool)> {
@@ -572,7 +596,7 @@ pub async fn set_restriction(
         Ok((muted, deafened))
     })
     .await?;
-    tracing::info!(actor, target, muted, deafened, "restriction changed");
+    tracing::info!(actor = actor.map(|a| a.user_id), target, muted, deafened, "restriction changed");
     Ok((muted, deafened))
 }
 
