@@ -96,6 +96,11 @@ pub const UNREACHABLE: &str = "Der Server ist nicht erreichbar. Läuft er, stimm
 pub const UPDATE_NEEDED: &str =
     "Der Server antwortet unerwartet. Bitte ICU auf die neueste Version aktualisieren.";
 
+/// The server speaks a protocol older than this client accepts
+/// (`Welcome.server_minor`, `PROTOCOL.md` §8).
+pub const SERVER_TOO_OLD: &str = "Der Server ist älter als diese ICU-Version. Bitte den \
+     Server-Betreiber, den Server zu aktualisieren.";
+
 /// German text for a protocol code (`PROTOCOL.md` §6).
 pub fn code_text(code: u32) -> String {
     let s = match code {

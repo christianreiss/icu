@@ -361,6 +361,13 @@ impl core::fmt::Display for Version {
     }
 }
 
+/// The SemVer out of `Hello.client`, `<name>/<semver> <os>` (`PROTOCOL.md`
+/// §2.2). The server compares it against `server.min_client`.
+pub fn client_version(client: &str) -> Result<Version, VersionError> {
+    let (_, rest) = client.split_once('/').ok_or(VersionError)?;
+    Version::parse(rest.split(' ').next().unwrap_or(""))
+}
+
 /// A string that is not a `major.minor.patch` SemVer version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionError;
@@ -505,5 +512,17 @@ mod tests {
         assert!(Version::parse("1.2.3.4").is_err());
         assert!(Version::parse("x.y.z").is_err());
         assert_eq!(Version::parse("1.2.3").unwrap().to_string(), "1.2.3");
+    }
+
+    #[test]
+    fn client_version_from_hello() {
+        let v = |s| client_version(s).map(|v| v.to_string());
+        assert_eq!(v("icu/0.1.0 linux"), Ok("0.1.0".into()));
+        assert_eq!(v("icu-test/1.2.3 windows"), Ok("1.2.3".into()));
+        assert_eq!(v("icu/0.2.0-rc.1 macos"), Ok("0.2.0".into()));
+        assert_eq!(v("icu/0.1.0"), Ok("0.1.0".into()));
+        assert!(client_version("icu 0.1.0 linux").is_err());
+        assert!(client_version("icu/x.y.z linux").is_err());
+        assert!(client_version("").is_err());
     }
 }

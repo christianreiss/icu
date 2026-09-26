@@ -11,11 +11,18 @@ use crate::{
     AudioParams, ProtoError, Session, UserFlags, UserId, UserInfo, UserSummary,
 };
 
-/// Protocol minor version of this implementation. v1 baseline is 1; a minor 0
-/// does not exist (`PROTOCOL.md` §2.2, §8). New mandatory variants (like
-/// `UserRtt`) ship without a minor bump: client and server are always
-/// deployed in lockstep in this project (`PROTOCOL.md` §2.2).
-pub const MINOR: u16 = 1;
+/// Protocol minor version of this implementation: the client sends it in
+/// `Hello.minor`, the server in `Welcome.server_minor` (`PROTOCOL.md` §8).
+/// A minor 0 does not exist. New mandatory variants (like `UserRtt`) ship
+/// without a minor bump: client and server are always deployed in lockstep in
+/// this project (`PROTOCOL.md` §2.2). Minor 2 appended
+/// `Welcome.server_minor` (2026-09-26).
+pub const MINOR: u16 = 2;
+
+/// Lowest protocol minor this build talks to, in both directions: the server
+/// closes a `Hello` below it with `VERSION_UNSUPPORTED`, the client a
+/// `Welcome` whose `server_minor` is below it (`PROTOCOL.md` §8).
+pub const MIN_PEER_MINOR: u16 = 2;
 
 /// Capability bits. All zero in v1, reserved for later extensions.
 pub const CAPS: u32 = 0;
@@ -61,6 +68,10 @@ pub enum ControlMsg {
         /// the room, and the only message the server accepts besides `Ping` is
         /// a `RenewRequest` with a fresh key.
         registration: bool,
+        /// The server's own protocol minor ([`MINOR`]), since minor 2. The
+        /// client closes with `VERSION_UNSUPPORTED` below its
+        /// [`MIN_PEER_MINOR`].
+        server_minor: u16,
     },
     /// 2, S→C.
     UserJoined {
@@ -421,6 +432,7 @@ mod tests {
                 min_client: "0.1.0".into(),
                 is_admin: true,
                 registration: false,
+                server_minor: MINOR,
             },
             ControlMsg::UserJoined {
                 user: user(4, 4, "dave"),
@@ -592,6 +604,21 @@ mod tests {
         let err = ControlMsg::decode(&[0u8]).unwrap_err();
         assert!(matches!(err, ProtoError::Decode(_)));
         assert_eq!(err.error_code(), crate::error::PROTOCOL_VIOLATION);
+    }
+
+    /// postcard ignores trailing bytes: a minor-1 reader decodes a minor-2
+    /// `Welcome` without seeing `server_minor`, so the server, not the old
+    /// client, has to turn it away (`Hello.minor` below `MIN_PEER_MINOR`).
+    /// The other way round, a minor-1 `Welcome` is too short for this build.
+    #[test]
+    fn welcome_server_minor_is_appended() {
+        let welcome = all_variants().remove(1);
+        let body = postcard::to_stdvec(&welcome).unwrap();
+        assert_eq!(*body.last().unwrap(), MINOR as u8);
+        assert!(ControlMsg::decode(&body[..body.len() - 1]).is_err());
+        let mut longer = body.clone();
+        longer.push(7);
+        assert_eq!(ControlMsg::decode(&longer).unwrap(), welcome);
     }
 
     #[test]

@@ -107,7 +107,7 @@ listen = ["0.0.0.0:4711", "[::]:4711"]
 server_name = "icu.example.org"      # durch den eigenen Namen ersetzen
 public_host = "icu.example.org:4711"
 max_users = 16
-min_client = "0.1.0"
+min_client = "0.1.0"                 # ältere Clients werden beim Hello abgewiesen
 admin_socket_group = "icu"
 
 [log]

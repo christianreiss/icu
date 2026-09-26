@@ -437,12 +437,36 @@ async fn read_hello(server: &Arc<Server>, conn: &quinn::Connection) -> Result<He
             "Hello.client is longer than 64 bytes",
         ));
     }
-    // `min(client, server)`; a minor 0 does not exist (`PROTOCOL.md` §8).
-    if minor == 0 {
+    // Both minimums (`PROTOCOL.md` §8): the protocol minor, then the client
+    // version against `server.min_client`. A client string without a readable
+    // version cannot prove it is new enough.
+    if minor < icu_proto::MIN_PEER_MINOR {
         return Err(Error::coded(
             ec::VERSION_UNSUPPORTED,
-            format!("minor {minor} is not supported"),
+            format!(
+                "protocol minor {minor} is below the minimum {}",
+                icu_proto::MIN_PEER_MINOR
+            ),
         ));
+    }
+    let min_client = &server.config.server.min_client;
+    match (
+        icu_proto::client_version(&client),
+        icu_proto::Version::parse(min_client),
+    ) {
+        (Ok(version), Ok(min)) if version >= min => {}
+        (Ok(version), _) => {
+            return Err(Error::coded(
+                ec::VERSION_UNSUPPORTED,
+                format!("client {version} is below min_client {min_client}"),
+            ));
+        }
+        (Err(_), _) => {
+            return Err(Error::coded(
+                ec::VERSION_UNSUPPORTED,
+                format!("Hello.client {client:?} carries no version"),
+            ));
+        }
     }
     let minor = minor.min(icu_proto::MINOR);
 
@@ -978,6 +1002,7 @@ fn welcome(
         min_client: server.config.server.min_client.clone(),
         is_admin,
         registration,
+        server_minor: icu_proto::MINOR,
     }
 }
 

@@ -11,6 +11,7 @@ server_name = "icu.example.org"
 # host:port written into registration bundles.
 public_host = "icu.example.org:4711"
 max_users = 16
+# Lowest client version; older clients are refused at Hello (VERSION_UNSUPPORTED).
 min_client = "0.1.0"
 admin_socket_group = "icu"
 

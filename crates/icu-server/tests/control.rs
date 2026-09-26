@@ -45,15 +45,55 @@ async fn a_full_room_closes_with_server_full() {
 }
 
 #[tokio::test]
-async fn minor_zero_is_version_unsupported() {
+async fn a_minor_below_the_minimum_is_version_unsupported() {
     let server = TestServer::start().await;
     let identity = server.enroll("alice").await;
-    let mut client = server.connect(&identity).await.expect("connect");
-    assert!(client
-        .hello_with("alice", 0, UserFlags::NONE)
-        .await
-        .is_none());
-    assert_eq!(client.closed_code().await, Some(ec::VERSION_UNSUPPORTED));
+    for minor in [0, icu_proto::MIN_PEER_MINOR - 1] {
+        let mut client = server.connect(&identity).await.expect("connect");
+        assert!(client
+            .hello_with("alice", minor, UserFlags::NONE)
+            .await
+            .is_none());
+        assert_eq!(
+            client.closed_code().await,
+            Some(ec::VERSION_UNSUPPORTED),
+            "minor {minor}"
+        );
+    }
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_client_below_min_client_is_version_unsupported() {
+    // The harness registers as `icu-test/0.1.0`, so the minimum is exactly that.
+    let server = TestServer::start_with(|c| c.server.min_client = "0.1.0".into()).await;
+    let identity = server.enroll("alice").await;
+    for client_string in ["icu/0.0.9 linux", "icu linux", "icu/0.1 linux", ""] {
+        let mut client = server.connect(&identity).await.expect("connect");
+        assert!(
+            client.hello_as("alice", client_string).await.is_none(),
+            "{client_string:?} got a Welcome"
+        );
+        assert_eq!(
+            client.closed_code().await,
+            Some(ec::VERSION_UNSUPPORTED),
+            "{client_string:?}"
+        );
+    }
+    for client_string in [
+        "icu/0.1.0 linux",
+        "icu/0.1.0-rc.1 linux",
+        "icu/1.0.0 windows",
+    ] {
+        let mut client = server.connect(&identity).await.expect("connect");
+        assert!(
+            matches!(
+                client.hello_as("alice", client_string).await,
+                Some(ControlMsg::Welcome { .. })
+            ),
+            "{client_string:?} got no Welcome"
+        );
+    }
     server.shutdown().await;
 }
 
@@ -67,7 +107,14 @@ async fn a_higher_client_minor_is_negotiated_down() {
         .await
         .expect("Welcome");
     match welcome {
-        ControlMsg::Welcome { minor, .. } => assert_eq!(minor, icu_proto::MINOR),
+        ControlMsg::Welcome {
+            minor,
+            server_minor,
+            ..
+        } => {
+            assert_eq!(minor, icu_proto::MINOR);
+            assert_eq!(server_minor, icu_proto::MINOR);
+        }
         other => panic!("expected Welcome, got {other:?}"),
     }
     server.shutdown().await;
