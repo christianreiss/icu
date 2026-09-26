@@ -71,5 +71,16 @@ pub fn run_enroll_window(
     paths: Paths,
     server_addr: Option<SocketAddr>,
 ) -> Result<Option<Identity>, String> {
-    main_window::run_enroll(paths, server_addr)
+    main_window::run_enroll(paths, server_addr, None)
+}
+
+/// The enrollment window with an invite or passport already filled in —
+/// `icu <file>` from a file manager or a double-click on an `.icu` file:
+/// the window shows where it leads and joins on one click.
+pub fn run_enroll_window_with(
+    paths: Paths,
+    server_addr: Option<SocketAddr>,
+    text: String,
+) -> Result<Option<Identity>, String> {
+    main_window::run_enroll(paths, server_addr, Some(text))
 }

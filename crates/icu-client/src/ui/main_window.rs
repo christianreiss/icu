@@ -1762,6 +1762,7 @@ fn alone(ui: &mut egui::Ui) {
 pub fn run_enroll(
     paths: Paths,
     server_addr: Option<SocketAddr>,
+    text: Option<String>,
 ) -> Result<Option<Identity>, String> {
     let result: Arc<Mutex<Option<Identity>>> = Arc::new(Mutex::new(None));
     let result_app = result.clone();
@@ -1782,7 +1783,11 @@ pub fn run_enroll(
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx, &enroll_theme);
-            Ok(Box::new(EnrollApp::new(paths, server_addr, result_app)))
+            let mut app = EnrollApp::new(paths, server_addr, result_app);
+            if let Some(text) = text {
+                app.paste(text);
+            }
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| e.to_string())?;
@@ -1867,6 +1872,12 @@ impl EnrollApp {
     /// (negative: shorter). The window grows by it itself; tests read it.
     pub fn overflow(&self) -> f32 {
         self.overflow
+    }
+
+    /// Fills in an invite or passport as if it had been pasted: the window
+    /// opens on what it leads to.
+    pub fn paste(&mut self, text: String) {
+        self.link = text;
     }
 
     /// Reads the pasted text and either takes it as it is (a passport) or
