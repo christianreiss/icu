@@ -1,5 +1,7 @@
 # ICU server configuration. Adjust server_name and public_host, then:
 #   sudo systemctl enable --now icu-server
+# Until then the server refuses to start and `icu-server invite` refuses to
+# issue anything: the names go into the CA and every certificate.
 # Reference: /usr/share/doc/icu-server/README.md
 
 [server]

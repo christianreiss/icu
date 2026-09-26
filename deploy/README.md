@@ -95,7 +95,7 @@ sudo install -d -m0755 /etc/icu
 sudo install -m0640 -g icu /dev/stdin /etc/icu/server.toml <<'TOML'
 [server]
 listen = ["0.0.0.0:4711", "[::]:4711"]
-server_name = "icu.example.org"
+server_name = "icu.example.org"      # durch den eigenen Namen ersetzen
 public_host = "icu.example.org:4711"
 max_users = 16
 min_client = "0.1.0"
@@ -108,6 +108,12 @@ TOML
 sudo systemctl daemon-reload
 sudo systemctl enable --now icu-server
 ```
+
+`server_name` und `public_host` landen in der CA und in jedem Zertifikat;
+später ändern heißt neue CA und alle registrieren sich neu. Mit den Namen aus
+dem Beispiel (`example.org`, `.example`, `.invalid`, `.test`, RFC 2606) startet
+der Server deshalb nicht, und `icu-server invite` stellt nichts aus.
+`localhost` und IP-Adressen gehen.
 
 `StateDirectory=icu` legt `/var/lib/icu/` an; beim ersten Start entstehen dort
 `ca.key` (0600), `ca.crt`, `server.key` (0600), `server.crt`, `users.toml`

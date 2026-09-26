@@ -262,6 +262,20 @@ impl TimingSection {
     }
 }
 
+/// Whether `host` is reserved for documentation and testing (RFC 2606,
+/// RFC 6761): `example.com`, `.net`, `.org` and their subdomains, and the
+/// top-level domains `.example`, `.invalid` and `.test`. `localhost` stays
+/// allowed — tests and trial runs on one machine use it — as do IP
+/// addresses.
+fn reserved_name(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let tld = host.rsplit('.').next().unwrap_or_default();
+    matches!(tld, "example" | "invalid" | "test")
+        || ["example.com", "example.net", "example.org"]
+            .iter()
+            .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+}
+
 /// Longest certificate lifetime a configuration may ask for: 100 years. The
 /// date arithmetic behind a larger one overflows.
 pub const MAX_VALIDITY_DAYS: u32 = 36_500;
@@ -357,6 +371,17 @@ impl Config {
                 "server.server_name {server_name:?} is not a valid DNS name or IP address"
             )));
         }
+        // The shipped example must not end up in the CA and every
+        // certificate: fixing that later means a new CA, and every user
+        // registering again.
+        if reserved_name(server_name) {
+            return Err(Error::msg(format!(
+                "server.server_name {server_name:?} is a name reserved for examples \
+                 (RFC 2606); set it to the DNS name or IP address clients connect to, \
+                 before the first start or invite: it goes into the CA and every \
+                 certificate"
+            )));
+        }
         if self.server.max_users < 1 || self.server.max_users > pl::MAX_MAX_USERS {
             return Err(Error::msg(format!(
                 "server.max_users must be 1..={}, got {}",
@@ -375,6 +400,16 @@ impl Config {
         if !public_host.is_ascii() || public_host.contains(char::is_whitespace) || !port_ok {
             return Err(Error::msg(format!(
                 "server.public_host {public_host:?} must be ASCII host:port"
+            )));
+        }
+        let host = public_host
+            .rsplit_once(':')
+            .map_or(public_host.as_str(), |(host, _)| host);
+        if reserved_name(host.trim_start_matches('[').trim_end_matches(']')) {
+            return Err(Error::msg(format!(
+                "server.public_host {public_host:?} names a host reserved for examples \
+                 (RFC 2606); set it to the host:port clients dial, it goes into every \
+                 client certificate"
             )));
         }
         Version::parse(&self.server.min_client)
@@ -519,12 +554,53 @@ server_validity_days = 365
 level = "info"
 format = "text"
 "#;
-        let config: Config = toml::from_str(text).unwrap();
+        let mut config: Config = toml::from_str(text).unwrap();
+        // The example names are placeholders: taken as they are, they would
+        // end up in the CA and every certificate.
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("server.server_name"), "{err}");
+        config.server.server_name = "icu.home.arpa".into();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("server.public_host"), "{err}");
+        config.server.public_host = "icu.home.arpa:4711".into();
         config.validate().unwrap();
         assert_eq!(config.server.listen.len(), 2);
         assert_eq!(config.server.max_users, 16);
-        assert_eq!(config.public_host(), "icu.example.org:4711");
+        assert_eq!(config.public_host(), "icu.home.arpa:4711");
         assert_eq!(config.admin_socket(), Path::new("/run/icu/admin.sock"));
+    }
+
+    #[test]
+    fn reserved_example_names_are_refused() {
+        for (name, reserved) in [
+            ("icu.example.org", true),
+            ("example.com", true),
+            ("EXAMPLE.NET.", true),
+            ("chat.example", true),
+            ("host.invalid", true),
+            ("icu.test", true),
+            ("localhost", false),
+            ("127.0.0.1", false),
+            ("::1", false),
+            ("icu.home.arpa", false),
+            ("myexample.org", false),
+            ("example.org.de", false),
+            ("testing.net", false),
+        ] {
+            assert_eq!(reserved_name(name), reserved, "{name}");
+        }
+        let mut c = base();
+        c.server.server_name = "icu.example.org".into();
+        c.server.public_host = "localhost:4711".into();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("server.server_name"), "{err}");
+        let mut c = base();
+        c.server.public_host = "icu.test:4711".into();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("server.public_host"), "{err}");
+        let mut c = base();
+        c.server.public_host = String::new();
+        assert!(c.validate().is_ok(), "falls back to localhost");
     }
 
     #[test]
