@@ -9,7 +9,7 @@ geschützt“), weil icu.exe nicht signiert ist: „Weitere Informationen“, da
 ICU trägt sich beim Start für .icu-Dateien ein (Einladungen und Passports,
 per Doppelklick) und legt seine Daten ab unter:
   %APPDATA%\icu\config        Einstellungen und Identität
-  %LOCALAPPDATA%\icu\icu.log  Protokoll des letzten Starts
+  %LOCALAPPDATA%\icu\data\icu.log  Protokoll (ab 1 MiB nach icu.log.1)
 
 Der private Schlüssel ist mit dem Windows-Konto verschlüsselt (DPAPI): auf
 einen anderen Rechner oder in ein anderes Konto zieht ICU per Passport um,

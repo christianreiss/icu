@@ -9,7 +9,7 @@
 //!
 //! On Windows `icu.exe` is a GUI program: a double-click opens no console.
 //! Started from a terminal it writes to that terminal (`AttachConsole`);
-//! otherwise the log goes to `%LOCALAPPDATA%\icu\icu.log`.
+//! otherwise the log goes to `%LOCALAPPDATA%\icu\data\icu.log`.
 
 // A desktop start must not open a console window next to ICU's own.
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -227,14 +227,24 @@ fn attach_console() -> bool {
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok()
 }
 
-/// `%LOCALAPPDATA%\icu\icu.log`, started afresh on every start.
+/// `%LOCALAPPDATA%\icu\data\icu.log`, appended to: a second start (which
+/// hands over to the running ICU and ends) must not cut the running one's
+/// log. Over 1 MiB it moves to `icu.log.1` first.
 #[cfg(windows)]
 fn windows_log_file() -> Option<std::fs::File> {
     let dir = directories::ProjectDirs::from("", "", "icu")?
         .data_local_dir()
         .to_path_buf();
     std::fs::create_dir_all(&dir).ok()?;
-    std::fs::File::create(dir.join("icu.log")).ok()
+    let log = dir.join("icu.log");
+    if std::fs::metadata(&log).is_ok_and(|m| m.len() > 1 << 20) {
+        let _ = std::fs::rename(&log, dir.join("icu.log.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .ok()
 }
 
 #[cfg(windows)]

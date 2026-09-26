@@ -10,7 +10,7 @@
 //! - Capture runs as category Other with the RAW option (no system effects
 //!   in front of ICU's own processing), playback as GameChat.
 //! - The AEC reference is loopback capture of the output device
-//!   (`AUDCLNT_STREAMFLAGS_LOOPBACK`), read every 5 ms: loopback has no
+//!   (`AUDCLNT_STREAMFLAGS_LOOPBACK`), read every 2 ms: loopback has no
 //!   event of its own. ICU's own playback on the same device keeps it
 //!   delivering while nothing else plays.
 //! - `IMMNotificationClient` reports hot-plug as `DevicesChanged`; a stream
@@ -70,8 +70,9 @@ use super::backend::{
 /// How long a stream thread waits for its event before looking at the stop
 /// flag and the default device again.
 const WAIT_MS: u32 = 100;
-/// How often loopback is read.
-const LOOPBACK_POLL: Duration = Duration::from_millis(5);
+/// How often loopback is read: well inside the microphone's period, so a
+/// reference packet reaches the engine soon after the matching capture.
+const LOOPBACK_POLL: Duration = Duration::from_millis(2);
 /// Hot-plug notifications arrive in bursts; the list is sent once they
 /// settle.
 const SETTLE: Duration = Duration::from_millis(250);
@@ -422,6 +423,14 @@ impl AudioBackend for WasapiBackend {
 
     fn take_events(&mut self) -> Option<mpsc::Receiver<BackendEvent>> {
         self.events.take()
+    }
+
+    /// Microphone and loopback are two free-running streams. Measured in
+    /// the VM (QEMU, HDA): loopback stalls up to ~35 ms, then delivers the
+    /// backlog in one go; without this slack the engine counted each stall
+    /// as a dropout and reset the AEC every 10 s.
+    fn reference_slack(&self) -> Duration {
+        Duration::from_millis(40)
     }
 }
 
@@ -865,11 +874,21 @@ impl Stream {
                 capture.ReleaseBuffer(frames)?;
             }
         }
+        // The engine pairs microphone and reference per push
+        // (`dsp::refalign`) and waits up to 1.5 microphone pushes for the
+        // reference. The two WASAPI threads run on their own phases, so a
+        // microphone push spans at least the device period (resampled
+        // packets vary around it), never a single block.
+        let min = if self.loopback {
+            BLOCK_SAMPLES
+        } else {
+            (self.period as usize).div_ceil(BLOCK_SAMPLES).max(2) * BLOCK_SAMPLES
+        };
         let whole = self.pending.len() / BLOCK_SAMPLES * BLOCK_SAMPLES;
-        for block in self.pending[..whole].as_chunks::<BLOCK_SAMPLES>().0 {
-            cb(block);
+        if whole >= min {
+            cb(&self.pending[..whole]);
+            self.pending.drain(..whole);
         }
-        self.pending.drain(..whole);
         Ok(())
     }
 

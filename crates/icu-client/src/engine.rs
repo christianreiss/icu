@@ -1154,7 +1154,10 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
                 cycle.reference_pushed();
             }),
         ) {
-            Ok(()) => reference_open = true,
+            Ok(()) => {
+                reference_open = true;
+                shared.cycle.set_slack(backend.reference_slack());
+            }
             Err(e) => tracing::warn!(error = %e, "cannot open AEC reference"),
         }
     }

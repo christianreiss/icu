@@ -288,7 +288,7 @@ mod windows {
             Storage::FileSystem::{FlushFileBuffers, ReadFile, PIPE_ACCESS_DUPLEX},
             System::{
                 Pipes::{
-                    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
+                    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_MESSAGE,
                     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES,
                     PIPE_WAIT,
                 },
@@ -443,9 +443,10 @@ mod windows {
         let handle = conn.handle();
         let mut file = std::fs::File::from(conn.0);
         file.write_all(b"ok\n")?;
+        // Flushed, then closed: the start on the other end reads `ok` and
+        // EOF. (DisconnectNamedPipe would throw the answer away unread.)
         unsafe {
             let _ = FlushFileBuffers(handle);
-            let _ = DisconnectNamedPipe(handle);
         }
         Ok(())
     }
@@ -471,9 +472,11 @@ mod windows {
             .write(true)
             .open(pipe)?;
         conn.write_all(&encode(request))?;
-        let mut answer = String::new();
-        conn.take(16).read_to_string(&mut answer)?;
-        if answer == "ok\n" {
+        // Exactly the answer: what follows it is the pipe closing, which a
+        // client end may report as an error rather than EOF.
+        let mut answer = [0u8; 3];
+        conn.read_exact(&mut answer)?;
+        if &answer == b"ok\n" {
             Ok(())
         } else {
             Err(std::io::Error::other("no answer"))
