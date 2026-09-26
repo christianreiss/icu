@@ -142,6 +142,11 @@ pub struct DebugStats {
     pub jitter_late: AtomicU64,
     /// Frames concealed while a jitter buffer waited for a late packet.
     pub jitter_underruns: AtomicU64,
+    /// Frames concealed on purpose to deepen a jitter buffer inside a spurt.
+    pub jitter_stretched: AtomicU64,
+    /// Packets a jitter buffer wrote off as lost: a later packet was there,
+    /// the one for the slot was not.
+    pub jitter_lost: AtomicU64,
     /// Packets skipped to shed delay grown by underruns.
     pub jitter_skipped: AtomicU64,
     /// Packets dropped to drain a backlog after a network stall.
@@ -224,7 +229,7 @@ impl DebugStats {
         let jitter_delay = self.jitter_delay.lock().unwrap().summary();
         let capture_to_send = self.capture_to_send.lock().unwrap().summary();
         format!(
-            "icu stats: sent={} recv={} bad={} decoded={} fec={} plc={} played={} play_underruns={} jb_late={} jb_underruns={} jb_skipped={} jb_dropped={} dsp_blocks={} ref_underruns={} cap_overruns={} ref_overruns={} cap_backlog={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
+            "icu stats: sent={} recv={} bad={} decoded={} fec={} plc={} played={} play_underruns={} jb_late={} jb_underruns={} jb_stretched={} jb_skipped={} jb_dropped={} jb_lost={} dsp_blocks={} ref_underruns={} cap_overruns={} ref_overruns={} cap_backlog={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
             Self::get(&self.datagrams_sent),
             Self::get(&self.datagrams_received),
             Self::get(&self.datagrams_bad),
@@ -235,8 +240,10 @@ impl DebugStats {
             Self::get(&self.playback_underruns),
             Self::get(&self.jitter_late),
             Self::get(&self.jitter_underruns),
+            Self::get(&self.jitter_stretched),
             Self::get(&self.jitter_skipped),
             Self::get(&self.jitter_dropped),
+            Self::get(&self.jitter_lost),
             Self::get(&self.dsp_blocks),
             Self::get(&self.reference_underruns),
             Self::get(&self.capture_overruns),

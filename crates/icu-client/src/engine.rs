@@ -481,6 +481,23 @@ struct Speaker {
     report_base: (u64, u64),
     last_reported_permille: u16,
     loss_hinted: bool,
+    /// The frame last queued for this speaker was quiet (below
+    /// [`QUIET_RMS`]): the jitter buffer may adjust its depth now without
+    /// anyone hearing it (`JitterBuffer::pop_quiet`).
+    quiet: bool,
+}
+
+/// RMS below which a decoded frame counts as quiet for depth adjustments:
+/// −40 dBFS, the level of a pause between words after the denoiser.
+const QUIET_RMS: f32 = 0.01;
+
+/// Whether `samples` is quiet enough to hide a concealed or skipped frame.
+fn frame_quiet(samples: &[f32]) -> bool {
+    if samples.is_empty() {
+        return true;
+    }
+    let energy: f32 = samples.iter().map(|s| s * s).sum();
+    energy < QUIET_RMS * QUIET_RMS * samples.len() as f32
 }
 
 impl Speaker {
@@ -499,6 +516,7 @@ impl Speaker {
             report_base: (0, 0),
             last_reported_permille: 0,
             loss_hinted: false,
+            quiet: true,
         })
     }
 }
@@ -745,6 +763,18 @@ impl Engine {
                                     ))
                                 });
                                 let _ = backend.lock().map(|mut b| b.close(stream));
+                                if stream == StreamKind::Reference {
+                                    // Until the reopen (1–30 s of backoff) the
+                                    // DSP thread must not wait for a reference
+                                    // that is not coming: with the flag still
+                                    // set it stalled every block for the stall
+                                    // wait and, counting the misses as a
+                                    // dropout, cleared the capture ring and
+                                    // reinitialized the AEC every 10 s — a gap
+                                    // in the outgoing audio each time.
+                                    shared.reference_open.store(false, Ordering::Relaxed);
+                                    shared.state.send_modify(|s| s.aec_reference = false);
+                                }
                                 backoff = match last_error {
                                     Some(t) if t.elapsed() < Duration::from_secs(60) => {
                                         (backoff * 2).min(Duration::from_secs(30))
@@ -1456,13 +1486,14 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
             for sp in speakers.values_mut() {
                 let before = sp.jitter.stats();
                 while sp.pending.len() < BLOCK {
-                    match sp.jitter.pop(now) {
+                    match sp.jitter.pop_quiet(now, sp.quiet) {
                         Pop::Packet(p) => {
                             if let Some(d) = sp.jitter.last_delay() {
                                 stats.jitter_delay.lock().unwrap().record(d);
                             }
                             let n = sp.decoder.decode(&p.payload, &mut fec_scratch).unwrap_or(0);
                             DebugStats::inc(&stats.frames_decoded);
+                            sp.quiet = frame_quiet(&fec_scratch[..n]);
                             queue_decoded(sp, n, &fec_scratch);
                         }
                         Pop::Lost { fec_source, .. } => {
@@ -1478,17 +1509,21 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                                     sp.decoder.conceal(&mut fec_scratch).unwrap_or(0)
                                 }
                             };
+                            sp.quiet = frame_quiet(&fec_scratch[..n]);
                             queue_decoded(sp, n, &fec_scratch);
                         }
                         Pop::Silence => {
+                            sp.quiet = true;
                             sp.pending.extend(std::iter::repeat_n(0.0, BLOCK));
                         }
                     }
                 }
                 let after = sp.jitter.stats();
                 DebugStats::add(&stats.jitter_underruns, after.underruns - before.underruns);
+                DebugStats::add(&stats.jitter_stretched, after.stretched - before.stretched);
                 DebugStats::add(&stats.jitter_skipped, after.skipped - before.skipped);
                 DebugStats::add(&stats.jitter_dropped, after.dropped - before.dropped);
+                DebugStats::add(&stats.jitter_lost, after.lost - before.lost);
                 if inputs.len() <= n_inputs {
                     inputs.push((vec![0.0f32; BLOCK], 0.0));
                 }
@@ -2856,20 +2891,26 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
             Ok((header, payload)) => {
                 DebugStats::inc(&shared.stats.datagrams_received);
                 DebugStats::add(&shared.stats.audio_bytes_received, datagram.len() as u64);
+                // The real-time mixer takes the same lock for every block:
+                // allocate the payload copy, and a decoder for a session
+                // seen for the first time, before taking it.
+                let payload = payload.to_vec();
                 let mut speakers = lock(&shared.speakers);
-                let sp = match speakers.get_mut(&header.speaker) {
-                    Some(sp) => sp,
-                    None => {
-                        // Unknown session (UserJoined may still be in flight).
-                        match Speaker::new(0, 100.0, frame_samples) {
-                            Ok(sp) => speakers.entry(header.speaker).or_insert(sp),
-                            Err(_) => continue,
-                        }
-                    }
+                if !speakers.contains_key(&header.speaker) {
+                    // Unknown session (UserJoined may still be in flight).
+                    drop(speakers);
+                    let Ok(fresh) = Speaker::new(0, 100.0, frame_samples) else {
+                        continue;
+                    };
+                    speakers = lock(&shared.speakers);
+                    speakers.entry(header.speaker).or_insert(fresh);
+                }
+                let Some(sp) = speakers.get_mut(&header.speaker) else {
+                    continue;
                 };
                 sp.last_packet = Some(now);
                 // The TOC byte gives the peer's frame length (no decode).
-                let samples = sp.decoder.nb_samples(payload);
+                let samples = sp.decoder.nb_samples(&payload);
                 sp.jitter.set_frame_samples(samples as u32);
                 let late = sp.jitter.stats().late;
                 sp.jitter.push(
@@ -2877,7 +2918,7 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                         seq: header.seq,
                         ts: header.ts,
                         end: header.end(),
-                        payload: payload.to_vec(),
+                        payload,
                     },
                     now,
                 );
