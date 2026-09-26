@@ -46,6 +46,10 @@ pub const HANDSHAKES_IN_FLIGHT_PER_48: u32 = 16;
 /// `SERVER_FULL`. A backstop: outsiders cannot keep a connection past the
 /// handshake, and each certificate holds one at most.
 pub const MAX_CONNECTIONS: u32 = 256;
+/// Sessions outside the room — registration and renew-only — open at the
+/// same time, server wide. Each holds a connection without joining the room,
+/// so the room size does not bound them.
+pub const MAX_ROOMLESS_SESSIONS: usize = 8;
 /// Seconds a QUIC handshake may take before the server drops it. Without
 /// this, a half-open handshake lives for the whole idle timeout.
 pub const HANDSHAKE_TIMEOUT_S: u64 = 5;

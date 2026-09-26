@@ -53,6 +53,15 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
         }
     };
 
+    let roomless = identity.registration || identity.expired;
+    if roomless {
+        // Registration and renew-only sessions read nothing but their control
+        // stream, whose credit the handshake already granted. Streams nobody
+        // accepts are buffered by quinn: no credit for any further one.
+        conn.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+        conn.set_max_concurrent_bi_streams(quinn::VarInt::from_u32(0));
+    }
+
     // The registration budget comes before the slot: a refused attempt must
     // not first close a registration of the same bundle that is in progress.
     if identity.registration {
@@ -65,9 +74,25 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
     }
 
     // One live connection per certificate: this one wins (`PROTOCOL.md` §7).
-    // Not for a renew-only session: it never joins the room, and must not
-    // kick a session still running on the same certificate.
-    let _live = (!identity.expired).then(|| LiveCert::claim(&server, &identity.cert_fp, &conn));
+    // A renew-only session has a table of its own: it must not kick a room
+    // session still running on the same certificate.
+    let slots = if roomless {
+        Slots::Roomless
+    } else {
+        Slots::Room
+    };
+    let Some(_live) = LiveCert::claim(&server, slots, &identity, &conn) else {
+        tracing::info!(
+            %remote,
+            user_id = identity.user_id,
+            "too many sessions outside the room, refusing"
+        );
+        wire::close(&conn, ec::SERVER_FULL);
+        return Err(Error::coded(
+            ec::SERVER_FULL,
+            "too many registration and renew-only sessions",
+        ));
+    };
 
     let served = if identity.registration {
         let exchange = |deadline| registration_exchange(&server, &conn, &identity, deadline);
@@ -89,53 +114,125 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
     }
 }
 
-/// Holds a certificate's slot in [`Server::live_certs`] for as long as its
-/// connection lives. A newer connection with the same certificate takes the
-/// slot over and closes this one with `SESSION_REPLACED`: newest wins, so a
-/// client whose old path is still waiting for its idle timeout is not locked
-/// out, and a stolen passport in use shows up as a kicked owner.
+/// The table a connection's certificate slot is kept in.
+#[derive(Debug, Clone, Copy)]
+enum Slots {
+    /// Room sessions, and those still waiting for `Hello`
+    /// ([`Server::live_certs`]).
+    Room,
+    /// Registration and renew-only sessions ([`Server::roomless`]), capped
+    /// at [`pl::MAX_ROOMLESS_SESSIONS`].
+    Roomless,
+}
+
+impl Slots {
+    fn table(self, server: &Server) -> &Mutex<crate::CertSlots> {
+        match self {
+            Slots::Room => &server.live_certs,
+            Slots::Roomless => &server.roomless,
+        }
+    }
+}
+
+/// Holds a certificate's slot for as long as its connection lives. A newer
+/// connection with the same certificate takes the slot over and closes this
+/// one with `SESSION_REPLACED`: newest wins, so a client whose old path is
+/// still waiting for its idle timeout is not locked out, and a stolen
+/// passport in use shows up as a kicked owner.
 struct LiveCert {
     server: Arc<Server>,
+    slots: Slots,
     fp: String,
     id: usize,
 }
 
 impl LiveCert {
-    fn claim(server: &Arc<Server>, fp: &str, conn: &quinn::Connection) -> LiveCert {
-        let old = lock(&server.live_certs).insert(fp.to_string(), conn.clone());
-        if let Some(old) = old.filter(|old| old.stable_id() != conn.stable_id()) {
-            // Through the room when it is in there, so `UserLeft` carries the
-            // code. An old session still before `room.join` sees its closed
-            // connection right after joining and leaves again.
-            if !server
-                .room
-                .close_connection(old.stable_id(), ec::SESSION_REPLACED)
+    /// Takes the slot of `identity`'s certificate for `conn`. `None` when the
+    /// roomless table is full and `conn` would not replace an entry in it;
+    /// a replacement always gets in, the connection it replaces leaves.
+    fn claim(
+        server: &Arc<Server>,
+        slots: Slots,
+        identity: &Identity,
+        conn: &quinn::Connection,
+    ) -> Option<LiveCert> {
+        let fp = identity.cert_fp.clone();
+        let old = {
+            let mut table = lock(slots.table(server));
+            if matches!(slots, Slots::Roomless)
+                && table.len() >= pl::MAX_ROOMLESS_SESSIONS
+                && !table.contains_key(&fp)
             {
-                wire::close(&old, ec::SESSION_REPLACED);
+                return None;
             }
+            table.insert(fp.clone(), (identity.user_id, conn.clone()))
+        };
+        if let Some((_, old)) = old.filter(|(_, old)| old.stable_id() != conn.stable_id()) {
+            close_connection(server, &old, ec::SESSION_REPLACED);
             tracing::info!(
-                fingerprint = fp,
+                fingerprint = %fp,
                 old = %old.remote_address(),
                 new = %conn.remote_address(),
                 "certificate connected again, older connection replaced"
             );
         }
-        LiveCert {
+        Some(LiveCert {
             server: server.clone(),
-            fp: fp.to_string(),
+            slots,
+            fp,
             id: conn.stable_id(),
-        }
+        })
     }
 }
 
 impl Drop for LiveCert {
     fn drop(&mut self) {
-        let mut live = lock(&self.server.live_certs);
+        let mut table = lock(self.slots.table(&self.server));
         // Only our own entry: a replacement already sits there otherwise.
-        if live.get(&self.fp).is_some_and(|c| c.stable_id() == self.id) {
-            live.remove(&self.fp);
+        if table
+            .get(&self.fp)
+            .is_some_and(|(_, c)| c.stable_id() == self.id)
+        {
+            table.remove(&self.fp);
         }
     }
+}
+
+/// Closes `conn` with `code`: through the room when it is in there, so
+/// `UserLeft` carries the code. A session still before `room.join` sees its
+/// closed connection right after joining and leaves again.
+fn close_connection(server: &Server, conn: &quinn::Connection, code: u32) {
+    if !server.room.close_connection(conn.stable_id(), code) {
+        wire::close(conn, code);
+    }
+}
+
+/// Closes every connection of `user_id` with `code` and returns how many:
+/// its room sessions — through the room, so `UserLeft` carries the code —
+/// and every other connection on one of its certificates, a session still
+/// waiting for `Hello`, a registration or a renew-only session. Behind
+/// revoke, disable and kick.
+pub(crate) fn close_user(server: &Server, user_id: UserId, code: u32) -> usize {
+    let mut closed: std::collections::HashSet<usize> =
+        server.room.close_user(user_id, code).into_iter().collect();
+    let others: Vec<quinn::Connection> = [Slots::Room, Slots::Roomless]
+        .into_iter()
+        .flat_map(|slots| {
+            lock(slots.table(server))
+                .values()
+                .filter(|(owner, _)| *owner == user_id)
+                .map(|(_, conn)| conn.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for conn in others {
+        // One that already ended — a registration session lingering for its
+        // store write after the client closed — is not closed again.
+        if conn.close_reason().is_none() && closed.insert(conn.stable_id()) {
+            wire::close(&conn, code);
+        }
+    }
+    closed.len()
 }
 
 /// Who is on the other end.
@@ -249,23 +346,22 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
 }
 
 /// Closes live connections still running on certificates that were just
-/// revoked by their successor's login — a second device holding a copy, or
-/// a connection this client already left.
+/// revoked by their successor's login — a second device holding a copy, a
+/// renew-only session on an expired copy, or a connection this client
+/// already left.
 fn close_retired(server: &Arc<Server>, fingerprints: &[String]) {
-    let live: Vec<quinn::Connection> = {
-        let live = lock(&server.live_certs);
-        fingerprints
-            .iter()
-            .filter_map(|fp| live.get(fp).cloned())
-            .collect()
-    };
+    let live: Vec<quinn::Connection> = [Slots::Room, Slots::Roomless]
+        .into_iter()
+        .flat_map(|slots| {
+            let table = lock(slots.table(server));
+            fingerprints
+                .iter()
+                .filter_map(|fp| table.get(fp).map(|(_, conn)| conn.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     for conn in live {
-        if !server
-            .room
-            .close_connection(conn.stable_id(), ec::AUTH_REVOKED)
-        {
-            wire::close(&conn, ec::AUTH_REVOKED);
-        }
+        close_connection(server, &conn, ec::AUTH_REVOKED);
     }
 }
 
@@ -612,6 +708,12 @@ async fn recovery_exchange(
                         // from here could overtake the response.
                         let _ = tokio::time::timeout(REGISTRATION_LINGER, conn.closed()).await;
                         return Ok(());
+                    }
+                    // The certificate lost its admission during the session
+                    // (revoked, retired by a successor, user disabled): the
+                    // session ends with that code.
+                    Err((code, detail)) if ec::is_fatal(code) => {
+                        return Err(Error::coded(code, detail));
                     }
                     Err((code, detail)) => {
                         write_msg(&mut send, &ControlMsg::Error { code, detail }).await?;
@@ -1104,6 +1206,11 @@ async fn renew_leaf(
     let store_err = |e: Error| (e.code().unwrap_or(ec::RENEW_REJECTED), e.to_string());
 
     let mut store = server.store.lock().await;
+    // Admission again, under the lock every revoke, disable and retirement
+    // happens under: since this session authenticated, its certificate may
+    // have been revoked, or retired by a successor's first login — a copy of
+    // an expired certificate must not renew once its owner moved on.
+    admit(&store, &identity.cert_fp).map_err(store_err)?;
     let Some(user) = store.user(user_id) else {
         return Err((ec::RENEW_REJECTED, "unknown user".into()));
     };

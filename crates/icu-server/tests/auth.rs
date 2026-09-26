@@ -815,6 +815,77 @@ async fn a_registration_session_is_replaced_by_a_newer_one() {
     server.shutdown().await;
 }
 
+/// `PROTOCOL.md` §7: sessions outside the room — registration and
+/// renew-only — are capped server wide, since the room size does not bound
+/// them. A room session is not affected, and a freed slot is taken again.
+#[tokio::test]
+async fn sessions_outside_the_room_are_capped() {
+    use icu_proto::limits::MAX_ROOMLESS_SESSIONS;
+    let server = TestServer::start_with(|c| {
+        // Every session comes from 127.0.0.1 within a second.
+        c.limits.handshakes_per_ip_per_s = 1000;
+        c.limits.enroll_per_ip_per_min = 1000;
+        c.limits.enroll_global_per_min = 1000;
+    })
+    .await;
+    let admin = server.enroll("admin").await;
+    let registration = |bundle: &str| common::identity_from_bundle(bundle);
+
+    let mut open = Vec::new();
+    for _ in 0..MAX_ROOMLESS_SESSIONS {
+        let bundle = server.invite("").await;
+        let mut client = server
+            .connect(&registration(&bundle))
+            .await
+            .expect("connect");
+        assert!(matches!(
+            client.hello("").await,
+            ControlMsg::Welcome {
+                registration: true,
+                ..
+            }
+        ));
+        open.push(client);
+    }
+    let bundle = server.invite("").await;
+    let refused = server
+        .connect(&registration(&bundle))
+        .await
+        .expect("the handshake completes");
+    assert_eq!(refused.closed_code().await, Some(ec::SERVER_FULL));
+    assert!(
+        !ec::is_fatal(ec::SERVER_FULL),
+        "the client tries again later"
+    );
+
+    let mut member = server.connect(&admin).await.expect("connect");
+    assert!(
+        matches!(member.hello("admin").await, ControlMsg::Welcome { .. }),
+        "the room is not affected"
+    );
+
+    open.pop().expect("a session").conn.close(0u32.into(), b"");
+    let roomless = &server.handle.server().roomless;
+    for _ in 0..200 {
+        if roomless.lock().unwrap().len() < MAX_ROOMLESS_SESSIONS {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut again = server
+        .connect(&registration(&bundle))
+        .await
+        .expect("connect");
+    assert!(matches!(
+        again.hello("").await,
+        ControlMsg::Welcome {
+            registration: true,
+            ..
+        }
+    ));
+    server.shutdown().await;
+}
+
 /// `PROTOCOL.md` §1/§2.2: the CRL follows `Welcome`, and a revoke puts the
 /// certificate on a new one that reaches everybody online at once.
 #[tokio::test]

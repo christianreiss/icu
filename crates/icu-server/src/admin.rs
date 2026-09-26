@@ -513,15 +513,10 @@ pub async fn set_restriction(
     Ok(())
 }
 
-/// Closes every connection of a user with `code`, through the room so that
-/// `UserLeft` carries it.
+/// Closes every connection of a user with `code`, room or not
+/// (`session::close_user`).
 fn kick_user(server: &Arc<Server>, user_id: UserId, code: u32) -> usize {
-    server
-        .room
-        .sessions_of_user(user_id)
-        .into_iter()
-        .filter(|session| server.room.close(*session, code))
-        .count()
+    crate::session::close_user(server, user_id, code)
 }
 
 /// Maps a store failure onto a response. A coded error reports under its own

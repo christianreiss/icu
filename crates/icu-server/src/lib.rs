@@ -57,6 +57,10 @@ use crate::{
     store::Store,
 };
 
+/// Live connections by client certificate fingerprint, each with the user
+/// it belongs to.
+pub type CertSlots = std::collections::HashMap<String, (icu_proto::UserId, quinn::Connection)>;
+
 /// Everything the connection tasks share.
 pub struct Server {
     /// Validated configuration.
@@ -80,9 +84,16 @@ pub struct Server {
     /// Established connections right now, over all endpoints
     /// (`limits.max_connections`).
     pub open_connections: std::sync::atomic::AtomicUsize,
-    /// The one live connection per client certificate fingerprint; a newer
-    /// one replaces it (`PROTOCOL.md` §7).
-    pub live_certs: std::sync::Mutex<std::collections::HashMap<String, quinn::Connection>>,
+    /// The one live connection per client certificate fingerprint, with its
+    /// user; a newer one replaces it (`PROTOCOL.md` §7). Room sessions, and
+    /// those still waiting for `Hello`.
+    pub live_certs: std::sync::Mutex<CertSlots>,
+    /// The same for sessions outside the room — registration and renew-only
+    /// (`PROTOCOL.md` §2.3) — with a server wide cap
+    /// ([`icu_proto::limits::MAX_ROOMLESS_SESSIONS`]). Separate, so renewing
+    /// an expired certificate never replaces a room session that still runs
+    /// on it.
+    pub roomless: std::sync::Mutex<CertSlots>,
     /// The QUIC endpoints, so a new CRL or server leaf reaches the TLS
     /// config without a restart (`endpoint::reload_tls`). Empty offline.
     pub endpoints: Vec<quinn::Endpoint>,
@@ -143,7 +154,8 @@ impl Server {
             loss: std::sync::Mutex::new(LossTracker::default()),
             handshakes: std::sync::atomic::AtomicUsize::new(0),
             open_connections: std::sync::atomic::AtomicUsize::new(0),
-            live_certs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            live_certs: std::sync::Mutex::new(CertSlots::new()),
+            roomless: std::sync::Mutex::new(CertSlots::new()),
             endpoints,
             crl: std::sync::RwLock::new(crl),
             counters: Counters::default(),

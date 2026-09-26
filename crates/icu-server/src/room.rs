@@ -273,6 +273,20 @@ impl Room {
         }
     }
 
+    /// Closes every session of `user_id` with `code`, so that their
+    /// `UserLeft` carries it. Returns the `stable_id`s of their connections.
+    pub fn close_user(&self, user_id: UserId, code: u32) -> Vec<usize> {
+        self.lock()
+            .members
+            .values_mut()
+            .filter(|m| m.user_id == user_id)
+            .map(|m| {
+                m.close(code);
+                m.conn.stable_id()
+            })
+            .collect()
+    }
+
     /// Closes the connection with this `stable_id` if it is in the room, so
     /// that its `UserLeft` carries `code`. Returns whether it was.
     pub fn close_connection(&self, stable_id: usize, code: u32) -> bool {

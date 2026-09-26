@@ -124,6 +124,7 @@ impl TestServer {
         close_code: u32,
     ) -> Result<Identity, EnrollFail> {
         let registration = identity_from_bundle(bundle);
+        let registration_fp = icu_server::store::fingerprint(&registration.cert);
         let mut client = self
             .connect(&registration)
             .await
@@ -165,6 +166,20 @@ impl TestServer {
             })),
         };
         client.conn.close(quinn::VarInt::from_u32(close_code), b"");
+        // The server finishes the session after the close — the receipt is
+        // a store write — so wait for that: whatever the test does next
+        // sees a finished registration, not one in progress.
+        let roomless = &self.handle.server().roomless;
+        for _ in 0..200 {
+            if !roomless
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&registration_fp)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         result
     }
 
