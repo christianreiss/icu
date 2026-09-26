@@ -8,7 +8,8 @@ Was sich ohne Hardware prüfen lässt, prüfen die Tests (`cargo test --workspac
 
 ```sh
 cd ~/Documents/ICU
-cargo build --release -p icu-server -p icu-client      # Debug geht auch, dann target/debug/…
+cargo build --release -p icu-client                   # Debug geht auch, dann target/debug/…
+cargo build --profile release-server -p icu-server    # wie im Paket: ein Panic beendet nur eine Sitzung
 ```
 
 Voraussetzungen auf dem Build-Host: `pipewire-devel`, `clang-devel`, `meson`, `ninja-build`, `abseil-cpp-devel`, `llvm`, `cmake`, `nasm`, `libxkbcommon-devel`, `wayland-devel` und der Symlink `/usr/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-objcopy` → `/usr/bin/llvm-objcopy` (`Client/IMPLEMENTATION.md` §12). Pakete (rpm/deb) baut `packaging/build.sh`.
@@ -30,7 +31,7 @@ runtime_dir = "/run/user/1000/icu-live"
 
 ```sh
 mkdir -p ~/icu-live/server /run/user/1000/icu-live
-./target/release/icu-server --config ~/icu-live/server.toml run
+./target/release-server/icu-server --config ~/icu-live/server.toml run
 ```
 
 Erwartet: `icu-server listening addrs=[127.0.0.1:4711] max_users=16`, **keine** Warnung „admin socket unavailable“.
@@ -40,8 +41,8 @@ Erwartet: `icu-server listening addrs=[127.0.0.1:4711] max_users=16`, **keine** 
 In einem zweiten Terminal (Server läuft weiter):
 
 ```sh
-./target/release/icu-server --config ~/icu-live/server.toml invite --name chris1 --out ~/icu-live/chris1.icu
-./target/release/icu-server --config ~/icu-live/server.toml invite --name chris2 --out ~/icu-live/chris2.icu
+./target/release-server/icu-server --config ~/icu-live/server.toml invite --name chris1 --out ~/icu-live/chris1.icu
+./target/release-server/icu-server --config ~/icu-live/server.toml invite --name chris2 --out ~/icu-live/chris2.icu
 ```
 
 Jede Datei ist ein **Registrierungs-Bundle** (`-----BEGIN ICU PASSPORT-----`, Modus 0600): kurzlebiges Registrierungszertifikat plus CA, Standard 24 h gültig (`--ttl`, höchstens 7 Tage). `--name` ist nur ein Platzhalter; der Eingeladene wählt seinen Namen selbst. Admin wird, wer als Erster seine Registrierung abschließt. Ohne `--out` steht das Bundle auf stdout.
