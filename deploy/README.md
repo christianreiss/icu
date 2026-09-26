@@ -37,14 +37,20 @@ Kommentaren der beiden Skripte.
 ### Host-Build (Entwicklung, Tests)
 
 ```bash
-cargo build --release -p icu-server
+cargo build --profile release-server -p icu-server
 cargo test --workspace
 ```
 
 Fedora 43 mit dem Paket `rust` (1.98.1) reicht; rustup wird **nicht** gebraucht
 und darf für dieses Projekt auch nicht installiert werden. Das Binary liegt
-dann unter `target/release/icu-server` und ist dynamisch gegen die System-libc
-gelinkt — gut für Tests, nicht für die Auslieferung.
+dann unter `target/release-server/icu-server` und ist dynamisch gegen die
+System-libc gelinkt — gut für Tests, nicht für die Auslieferung.
+
+Der Server wird mit dem Profil `release-server` gebaut (`Cargo.toml`): das
+`release`-Profil mit `panic = "unwind"` statt `abort`. Ein Panic in einer
+Verbindung beendet dann nur diese — der Server protokolliert ihn, nimmt die
+Sitzung aus dem Raum und alle anderen Gespräche laufen weiter —, statt den
+Prozess und damit jedes Gespräch zu beenden. Der Client bleibt bei `abort`.
 
 ### Statisches musl-Binary (Auslieferung)
 
@@ -57,10 +63,10 @@ podman run --rm \
   -v "$PWD":/src:Z -w /src \
   docker.io/rust:1-alpine \
   sh -c 'apk add --no-cache musl-dev && \
-         cargo build --release -p icu-server --target x86_64-unknown-linux-musl'
+         cargo build --profile release-server -p icu-server --target x86_64-unknown-linux-musl'
 ```
 
-Ergebnis: `target/musl/x86_64-unknown-linux-musl/release/icu-server`,
+Ergebnis: `target/musl/x86_64-unknown-linux-musl/release-server/icu-server`,
 rund 4,6 MB, `static-pie linked`, `ldd` meldet `statically linked`.
 
 Hinweise:
@@ -79,15 +85,15 @@ Hinweise:
 Prüfen:
 
 ```bash
-file   target/musl/x86_64-unknown-linux-musl/release/icu-server   # static-pie
-ldd    target/musl/x86_64-unknown-linux-musl/release/icu-server   # statically linked
-       target/musl/x86_64-unknown-linux-musl/release/icu-server --version
+file   target/musl/x86_64-unknown-linux-musl/release-server/icu-server   # static-pie
+ldd    target/musl/x86_64-unknown-linux-musl/release-server/icu-server   # statically linked
+       target/musl/x86_64-unknown-linux-musl/release-server/icu-server --version
 ```
 
 ## 2. Installieren von Hand (systemd)
 
 ```bash
-sudo install -m0755 target/musl/x86_64-unknown-linux-musl/release/icu-server \
+sudo install -m0755 target/musl/x86_64-unknown-linux-musl/release-server/icu-server \
   /usr/bin/icu-server
 sudo install -m0644 deploy/icu-server.service /etc/systemd/system/
 sudo groupadd --system icu            # Gruppe für den Admin-Socket
@@ -231,13 +237,13 @@ podman exec icu /icu-server invite --name alice
 ```
 
 Das Image erwartet das musl-Binary aus Schritt 1 unter
-`target/x86_64-unknown-linux-musl/release/icu-server`. Baut man mit dem
+`target/x86_64-unknown-linux-musl/release-server/icu-server`. Baut man mit dem
 `CARGO_TARGET_DIR` von oben, entweder den Pfad im Dockerfile anpassen oder
 
 ```bash
-mkdir -p target/x86_64-unknown-linux-musl/release
-cp target/musl/x86_64-unknown-linux-musl/release/icu-server \
-   target/x86_64-unknown-linux-musl/release/
+mkdir -p target/x86_64-unknown-linux-musl/release-server
+cp target/musl/x86_64-unknown-linux-musl/release-server/icu-server \
+   target/x86_64-unknown-linux-musl/release-server/
 ```
 
 Der Admin-Socket liegt im Container unter `/run/icu/admin.sock`; die CLI läuft

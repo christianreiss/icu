@@ -297,8 +297,8 @@ pub async fn accept_loop(server: Arc<Server>, endpoint: Endpoint) {
         };
         if let Some(handshake) = admit(&server, incoming) {
             let server = server.clone();
-            tokio::spawn(async move {
-                let remote = handshake.remote;
+            let remote = handshake.remote;
+            crate::spawn_logged(format!("connection {remote}"), async move {
                 if let Err(e) = dispatch(server, handshake).await {
                     tracing::debug!(%remote, error = %e, "connection ended");
                 }

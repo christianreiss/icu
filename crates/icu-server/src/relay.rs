@@ -386,12 +386,10 @@ pub async fn video(
                 .entry(*session)
                 .or_insert_with(|| {
                     let slot = Arc::new(Slot::new(conn.stable_id()));
-                    tokio::spawn(forward_frames(
-                        server.clone(),
-                        conn.clone(),
-                        slot.clone(),
-                        *session,
-                    ));
+                    crate::spawn_logged(
+                        "video forwarder",
+                        forward_frames(server.clone(), conn.clone(), slot.clone(), *session),
+                    );
                     slot
                 })
                 .clone();

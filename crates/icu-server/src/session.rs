@@ -517,7 +517,6 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
             .send_to(session, &ControlMsg::CrlUpdate { crl_der });
     }
 
-    let writer = tokio::spawn(writer_task(send, out_rx));
     tracing::info!(
         session,
         user_id = identity.user_id,
@@ -527,17 +526,36 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         "joined"
     );
 
-    // 4. Datagram and uni-stream readers alongside the control loop.
-    let datagrams = tokio::spawn(datagram_task(server.clone(), conn.clone(), session));
-    let uni = tokio::spawn(uni_task(server.clone(), conn.clone(), session));
+    // 4. The control writer, datagram and uni-stream readers alongside the
+    // control loop, held by the seat: it takes the session out of the room
+    // however this function ends.
+    let mut seat = Seat {
+        server,
+        conn,
+        session,
+        tasks: vec![
+            crate::spawn_logged(
+                format!("session {session} control writer"),
+                writer_task(send, out_rx),
+            ),
+            crate::spawn_logged(
+                format!("session {session} audio"),
+                datagram_task(server.clone(), conn.clone(), session),
+            ),
+            crate::spawn_logged(
+                format!("session {session} video"),
+                uni_task(server.clone(), conn.clone(), session),
+            ),
+        ],
+        left: false,
+    };
 
     let outcome = control_loop(server, conn, session, identity, &mut recv).await;
 
     // 6. Leave and announce.
-    datagrams.abort();
-    uni.abort();
-    writer.abort();
+    seat.abort_tasks();
     let member = server.room.leave(session);
+    seat.left = true;
     for (speaker, loss_permille) in lock(&server.loss).forget(session) {
         server
             .room
@@ -559,6 +577,50 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     });
     tracing::info!(session, reason = ec::name(reason), "left");
     outcome
+}
+
+/// A session's place in the room and the tasks serving it. On the normal
+/// way out `serve` leaves the room itself and this only stops the tasks.
+/// Dropped while unwinding from a panic, it closes the connection with the
+/// non-fatal `SHUTDOWN` — the client reconnects — takes the session out of
+/// the room and announces it: a bug in one session must not leave a member
+/// behind that holds a room slot, with its tasks running, until the next
+/// restart.
+struct Seat<'a> {
+    server: &'a Arc<Server>,
+    conn: &'a quinn::Connection,
+    session: Session,
+    tasks: Vec<tokio::task::AbortHandle>,
+    left: bool,
+}
+
+impl Seat<'_> {
+    fn abort_tasks(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for Seat<'_> {
+    fn drop(&mut self) {
+        self.abort_tasks();
+        if self.left {
+            return;
+        }
+        wire::close(self.conn, ec::SHUTDOWN);
+        if self.server.room.leave(self.session).is_some() {
+            lock(&self.server.loss).forget(self.session);
+            self.server.room.broadcast(&ControlMsg::UserLeft {
+                session: self.session,
+                reason: ec::SHUTDOWN as u8,
+            });
+        }
+        tracing::error!(
+            session = self.session,
+            "session ended abnormally, taken out of the room"
+        );
+    }
 }
 
 /// How long a registration session may stay open in total. Long enough for a
@@ -963,7 +1025,7 @@ async fn uni_task(server: Arc<Server>, conn: quinn::Connection, session: Session
                     continue;
                 };
                 let (server, state) = (server.clone(), state.clone());
-                tokio::spawn(async move {
+                crate::spawn_logged("video frame", async move {
                     relay::video(server, session, recv, state).await;
                     drop(permit);
                 });

@@ -41,7 +41,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::{sync::watch, task::JoinHandle};
+use tokio::{sync::watch, task::AbortHandle};
 
 pub use crate::{
     admin::{AdminRequest, AdminResponse},
@@ -188,7 +188,7 @@ impl Server {
 pub struct Handle {
     server: Arc<Server>,
     addrs: Vec<SocketAddr>,
-    tasks: Vec<JoinHandle<()>>,
+    tasks: Vec<AbortHandle>,
     admin_socket: Option<std::path::PathBuf>,
 }
 
@@ -298,12 +298,12 @@ pub async fn run(config: Config) -> Result<Handle> {
 
     let mut tasks = Vec::new();
     for endpoint in &server.endpoints {
-        tasks.push(tokio::spawn(endpoint::accept_loop(
-            server.clone(),
-            endpoint.clone(),
-        )));
+        tasks.push(spawn_logged(
+            "accept loop",
+            endpoint::accept_loop(server.clone(), endpoint.clone()),
+        ));
     }
-    tasks.push(tokio::spawn(housekeeping(server.clone())));
+    tasks.push(spawn_logged("housekeeping", housekeeping(server.clone())));
 
     // 8: admin socket. Not being able to create it is not fatal — the server
     // still serves; only the CLI is then unavailable (deviation, see report).
@@ -365,7 +365,7 @@ async fn housekeeping(server: Arc<Server>) {
         // leaf is renewed before it expires, because an expired leaf locks
         // every client out and only the server can fix it.
         if prune_counter.is_multiple_of(36_000) {
-            tokio::spawn(check_cert_expiry(server.clone()));
+            spawn_logged("certificate check", check_cert_expiry(server.clone()));
         }
 
         prune_counter += 1;
@@ -427,6 +427,33 @@ fn renewal_due(days_left: Option<i64>, validity_days: u32, cap_days: i64) -> boo
     days_left.is_none_or(|left| left < threshold)
 }
 
+/// Spawns `task` and watches its `JoinHandle` instead of dropping it, so a
+/// panic in it is logged with `what` rather than lost. With the server's
+/// `panic = "unwind"` (`[profile.release-server]`) a panic ends only this
+/// task; the process and every other connection keep running. Returns the
+/// handle to abort the task with.
+pub(crate) fn spawn_logged<F>(what: impl std::fmt::Display + Send + 'static, task: F) -> AbortHandle
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = tokio::spawn(task);
+    let abort = handle.abort_handle();
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                let payload = e.into_panic();
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                tracing::error!(task = %what, panic = %message, "task panicked, the server keeps running");
+            }
+        }
+    });
+    abort
+}
+
 /// Locks a `std` mutex, recovering from poisoning: the state behind every
 /// lock in this crate is a plain map or counter that stays consistent when a
 /// holder panics, so nothing is gained by propagating the panic.
@@ -446,4 +473,22 @@ pub fn init_tracing(log: &config::LogSection) {
         tracing::subscriber::set_global_default(builder.finish())
     };
     let _ = result;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panic in a task spawned this way ends that task only: it is
+    /// reported, not propagated, and the runtime keeps serving.
+    #[tokio::test]
+    async fn a_panicking_task_is_contained() {
+        spawn_logged("test task", async { panic!("boom") });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        spawn_logged("next task", async move {
+            let _ = tx.send(42);
+        });
+        assert_eq!(rx.await.ok(), Some(42));
+        tokio::task::yield_now().await;
+    }
 }

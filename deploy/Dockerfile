@@ -7,7 +7,7 @@
 #
 #   podman run --rm -v "$PWD":/src:Z -w /src docker.io/rust:1-alpine \
 #     sh -c 'apk add --no-cache musl-dev && \
-#            cargo build --release -p icu-server --target x86_64-unknown-linux-musl'
+#            cargo build --profile release-server -p icu-server --target x86_64-unknown-linux-musl'
 #   podman build -f deploy/Dockerfile -t icu-server .
 #
 # Then run it with the state and config mounted:
@@ -31,7 +31,7 @@ RUN mkdir -p /out/run/icu /out/var/lib/icu
 FROM scratch
 
 COPY --from=dirs --chown=65532:65532 /out/ /
-COPY target/x86_64-unknown-linux-musl/release/icu-server /icu-server
+COPY target/x86_64-unknown-linux-musl/release-server/icu-server /icu-server
 
 # State, runtime and configuration. Declare the state volume so an accidental
 # `podman rm` does not take the CA with it.

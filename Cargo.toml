@@ -58,3 +58,11 @@ lto = "fat"
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Der Server wird mit diesem Profil gebaut (packaging/build.sh,
+# deploy/Dockerfile): ein Panic in einem Verbindungs-Task soll diesen Task
+# beenden, nicht jedes Gespraech auf dem Server. panic laesst sich nur in
+# einem eigenen Profil setzen, nicht je Paket; der Client bleibt bei abort.
+[profile.release-server]
+inherits = "release"
+panic = "unwind"

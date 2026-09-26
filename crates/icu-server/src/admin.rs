@@ -13,7 +13,7 @@ use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    task::JoinHandle,
+    task::AbortHandle,
 };
 
 use crate::{
@@ -621,7 +621,7 @@ fn tls_status(server: &Arc<Server>) -> serde_json::Value {
 ///
 /// Returns the socket path and the serving task. Failure to bind is not fatal
 /// for the server; only the CLI becomes unavailable.
-pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, JoinHandle<()>)> {
+pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, AbortHandle)> {
     let path = server.config.admin_socket();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).context(format!("cannot create {}", dir.display()))?;
@@ -642,7 +642,7 @@ pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, JoinHandle<()>)> {
         }
     }
 
-    let task = tokio::spawn(serve(server, listener));
+    let task = crate::spawn_logged("admin socket", serve(server, listener));
     Ok((path, task))
 }
 
@@ -678,7 +678,7 @@ async fn serve(server: Arc<Server>, listener: UnixListener) {
             _ = server.shutdown_requested() => return,
         };
         let server = server.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged("admin connection", async move {
             if let Err(e) = serve_one(server, stream).await {
                 tracing::debug!(error = %e, "admin connection ended");
             }
