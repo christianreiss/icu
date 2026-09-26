@@ -956,24 +956,23 @@ fn blocking<R>(f: impl FnOnce() -> R) -> R {
 }
 
 fn write_mode_now(path: &Path, contents: &str, mode: u32) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let tmp = dir.join(format!(
-        ".{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("state")
-    ));
-    {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(mode)
-            .open(&tmp)
-            .context(format!("cannot create {}", tmp.display()))?;
-        file.write_all(contents.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path).context(format!("cannot rename onto {}", path.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // Exclusive creation with a random name: a stale or hostile .name.tmp
+    // must neither expose private material nor redirect a write via symlink.
+    let mut file = tempfile::Builder::new()
+        .prefix(".icu-")
+        .permissions(std::fs::Permissions::from_mode(mode))
+        .tempfile_in(dir)
+        .context(format!("cannot create temporary file in {}", dir.display()))?;
+    file.write_all(contents.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(path)
+        .map_err(|e| e.error)
+        .context(format!("cannot rename onto {}", path.display()))?;
     if let Ok(dirfile) = File::open(dir) {
         let _ = dirfile.sync_all();
     }
@@ -1007,6 +1006,26 @@ mod tests {
             superseded: false,
             serial: None,
         }
+    }
+
+    #[test]
+    fn private_write_does_not_follow_a_preexisting_temporary_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("unrelated");
+        std::fs::write(&victim, "preserve me").unwrap();
+        symlink(&victim, dir.path().join(".secret.key.tmp")).unwrap();
+        let key = dir.path().join("secret.key");
+        write_private(&key, "private test material").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "preserve me");
+        assert_eq!(
+            std::fs::read_to_string(&key).unwrap(),
+            "private test material"
+        );
+        assert_eq!(
+            std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     fn store() -> (tempfile::TempDir, Store) {

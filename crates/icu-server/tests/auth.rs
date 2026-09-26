@@ -1076,15 +1076,16 @@ async fn a_failed_rotation_leaves_the_live_server_certificate_alone() {
     let alice = server.enroll("alice").await;
     let live = server_leaf(&server.connect(&alice).await.expect("connect").conn);
 
-    // A directory where the atomic writes put their temp files: whichever
-    // of the pair is written first, the write fails.
+    // A directory at each destination prevents either atomic rename.
     let dir = server.dir.path();
-    for tmp in [".server.crt.tmp", ".server.key.tmp"] {
-        std::fs::create_dir(dir.join(tmp)).expect("block the write");
+    for name in ["server.crt", "server.key"] {
+        std::fs::rename(dir.join(name), dir.join(format!("{name}.backup"))).unwrap();
+        std::fs::create_dir(dir.join(name)).expect("block the write");
     }
     let response = server.handle.admin(AdminRequest::RotateServerCert).await;
-    for tmp in [".server.crt.tmp", ".server.key.tmp"] {
-        std::fs::remove_dir(dir.join(tmp)).expect("unblock");
+    for name in ["server.crt", "server.key"] {
+        std::fs::remove_dir(dir.join(name)).expect("unblock");
+        std::fs::rename(dir.join(format!("{name}.backup")), dir.join(name)).unwrap();
     }
     assert!(
         matches!(response, AdminResponse::Error { .. }),
@@ -1122,8 +1123,10 @@ async fn a_replaced_server_certificate_is_revoked_at_the_next_start_when_the_sto
     let alice = server.enroll("alice").await;
     let old = server_leaf(&server.connect(&alice).await.expect("connect").conn);
 
-    // Every write of users.toml fails: its temp file cannot be created.
-    let blocker = server.dir.path().join(".users.toml.tmp");
+    // Every write of users.toml fails: the destination is a directory.
+    let blocker = server.dir.path().join("users.toml");
+    let backup = server.dir.path().join("users.toml.backup");
+    std::fs::rename(&blocker, &backup).unwrap();
     std::fs::create_dir(&blocker).expect("block users.toml");
     let response = server.handle.admin(AdminRequest::RotateServerCert).await;
     let AdminResponse::Error { error, detail } = response else {
@@ -1138,6 +1141,7 @@ async fn a_replaced_server_certificate_is_revoked_at_the_next_start_when_the_sto
         "as reported: the new leaf is not in use yet"
     );
     std::fs::remove_dir(&blocker).expect("unblock");
+    std::fs::rename(&backup, &blocker).unwrap();
 
     let server = server.restart_with(|_| {}).await;
     let mut client = server.connect(&alice).await.expect("connect");

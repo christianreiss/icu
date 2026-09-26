@@ -178,9 +178,10 @@ sudo firewall-cmd --permanent --add-port=4711/udp && sudo firewall-cmd --reload
 ### Im offenen Internet
 
 Freigeben muss man nur den einen UDP-Port; der Server braucht keinen
-Reverse-Proxy und kein TLS davor, er terminiert QUIC/TLS 1.3 selbst. Ohne
-gültiges Zertifikat der eigenen CA kommt niemand über den Handshake hinaus —
-die Angriffsfläche für Unbekannte ist genau dieser Handshake. Dafür gilt
+Reverse-Proxy und kein TLS davor, er terminiert QUIC/TLS 1.3 selbst. Ohne gültiges Zertifikat der eigenen CA gibt es weder Raumzugang noch Medien.
+Unbekannte Zertifikate scheitern an TLS; ohne Zertifikat darf TLS für die
+lesbare Fehlermeldung `AUTH_REQUIRED` abschließen, danach wird sofort getrennt.
+Dafür gilt
 (`PROTOCOL.md` §7, Werte in `[limits]`/`[timing]` überschreibbar):
 
 * Handshakes 10/s pro Quell-IP, IPv6 pro /64, und 100/s global; ab 32
@@ -197,6 +198,29 @@ Speicher mit `MemoryMax=1G` als Rückfallebene und ist so weit gehärtet, dass
 `systemd-analyze security icu-server` 1,4 meldet (vorher 3,5). Gegen volumetrische UDP-Floods
 hilft nur Upstream-Filterung (Provider, Firewall) — das kann kein Prozess
 selbst.
+
+### Verschlüsselung, Qualität und Produktionsfreigabe
+
+Audio, Video und Steuerung laufen ausschließlich über QUIC/TLS 1.3; 0-RTT ist
+aus. Client und Server prüfen Zertifikate der Server-CA. Der Server ist ein
+**vertrauenswürdiger Relay**: TLS endet dort, daher ist das keine
+Ende-zu-Ende-Verschlüsselung zwischen Teilnehmern. Zugriff auf den Server oder
+seine CA erlaubt Zugriff auf die Vertrauensgrenze des Raums.
+
+Der Server transkodiert nichts und erhält die Codec-Nutzlast bytegenau.
+Das aktuelle Client-Profil ist Mono-Opus mit 48 kHz, 48 kbit/s VBR, Komplexität
+10 und FEC sowie H.264 mit 320×240 bei 15 fps und Ziel 150 kbit/s. Die Grenzen
+von 400 Byte Audio pro Paket und 512 KiB Video pro Frame lassen Spitzen zu;
+der Video-Missbrauchsdeckel beträgt 400 kbit/s über 2 s. Das ist das aktuelle
+Sprach-/Overlay-Profil, keine HD-Videokonferenz. Höhere Auflösung oder echte
+Ende-zu-Ende-Verschlüsselung brauchen abgestimmte Änderungen an Clients und
+Protokoll; bloßes Anheben eines Serverlimits genügt nicht.
+
+Die Serverprüfung und reproduzierbaren Tests stehen in
+[`Research/server-production-gate-2026-09-26.md`](../Research/server-production-gate-2026-09-26.md).
+Eine Freigabe des konkreten Internet-Hosts erfordert zusätzlich den Test von
+außerhalb seines Netzes (IPv4/IPv6, Firewall/NAT, Wiederverbindung), ein
+wiederherstellbares State-Backup und Messungen mit den vorgesehenen Clients.
 
 ## 3. Bedienen
 
