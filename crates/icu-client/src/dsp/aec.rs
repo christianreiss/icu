@@ -471,6 +471,51 @@ mod tests {
         );
     }
 
+    /// A digitally silent microphone (a virtual source, a muted input)
+    /// while the far end starts talking: the canceller's comfort-noise
+    /// transient scores up to 0.6 in RNNoise although it lies at −96 dBFS
+    /// (idle canceller) or up to −63 dBFS (onset right after init). The VAD
+    /// must not take it for voice, or every far-end onset holds the gate
+    /// open for the whole hangover (live test 2026-09-26).
+    #[test]
+    fn silent_mic_transient_does_not_read_as_voice() {
+        // The lowest threshold `vad_auto` starts from: floor 0.05 + 0.18.
+        const AUTO_START: f32 = 0.23;
+        let far = voice(SR * 3, 7, 0.1).samples;
+        for idle_blocks in [0usize, 100] {
+            let mut aec = Aec::new().unwrap();
+            let mut dn = crate::dsp::denoise::Denoiser::new();
+            let mut cap = [0.0f32; FRAME];
+            for _ in 0..idle_blocks {
+                cap.fill(0.0);
+                aec.process(&[0.0; FRAME], &mut cap);
+                dn.process(&mut cap);
+            }
+            let (mut trusted, mut voiced) = (0, 0);
+            for r in far.chunks(FRAME) {
+                cap.fill(0.0);
+                aec.process(r, &mut cap);
+                let p = dn.process(&mut cap);
+                trusted += usize::from(p >= AUTO_START);
+                let level = crate::dsp::meter::measure(&cap);
+                voiced += usize::from(crate::dsp::vad::is_voice(AUTO_START, Some(p), level));
+            }
+            eprintln!(
+                "idle {idle_blocks} blocks: RNNoise ≥ {AUTO_START} on {trusted}, voice on {voiced}"
+            );
+            if idle_blocks == 0 {
+                assert!(
+                    trusted > 0,
+                    "the transient no longer fools RNNoise; drop this test?"
+                );
+            }
+            assert_eq!(
+                voiced, 0,
+                "idle {idle_blocks}: the transient opens the gate"
+            );
+        }
+    }
+
     /// The self-diagnosis on the statistics the APM really reports over
     /// 30 s: a headset (no echo path) ends in "no echo", a reference that
     /// misses the game audio in "echo not removed", a working canceller in
