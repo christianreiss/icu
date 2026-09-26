@@ -74,6 +74,12 @@ pub fn server_config(
 
     let mut quic = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     quic.migration(true);
+    // Connection attempts the accept loop has not decided on yet. It decides
+    // at once, so these only fill up in a burst; past them quinn refuses by
+    // itself instead of buffering (defaults: 65 536 and 100 MiB).
+    quic.max_incoming(INCOMING_QUEUE);
+    quic.incoming_buffer_size(64 * 1024);
+    quic.incoming_buffer_size_total(4 * 1024 * 1024);
 
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
@@ -87,11 +93,24 @@ pub fn server_config(
     transport.max_concurrent_uni_streams(VarInt::from_u32(pl::max_uni_streams(
         config.server.max_users,
     )));
-    transport.max_concurrent_bidi_streams(VarInt::from_u32(2));
+    // One control stream per connection (`PROTOCOL.md` §1).
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(1));
+    // Flow control (`PROTOCOL.md` §1). quinn's defaults are 1.25 MB per
+    // stream and no limit per connection: a member with 36 video streams
+    // open could pin ~47 MB of server memory. Streams nobody reads — a
+    // renew-only session never accepts any — count against the connection
+    // window as well.
+    transport.stream_receive_window(VarInt::from_u32(pl::STREAM_RECEIVE_WINDOW));
+    transport.receive_window(VarInt::from_u32(pl::CONNECTION_RECEIVE_WINDOW));
+    transport.send_window(pl::SEND_WINDOW);
     quic.transport_config(Arc::new(transport));
 
     Ok(quic)
 }
+
+/// Connection attempts quinn queues for the accept loop before it refuses
+/// further ones by itself.
+const INCOMING_QUEUE: usize = 1024;
 
 /// Lets an **expired** client certificate through the handshake, so its
 /// holder can renew it however long ago it expired (`PROTOCOL.md` §2.3).

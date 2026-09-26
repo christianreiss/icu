@@ -577,6 +577,8 @@ pub struct Counters {
     /// Video frames dropped because the sender's camera is off or it is not
     /// active.
     pub video_dropped_not_allowed: AtomicU64,
+    /// Video frames whose stream stalled past `timing.video_frame_timeout_ms`.
+    pub video_dropped_stalled: AtomicU64,
     /// Control messages received.
     pub control_in: AtomicU64,
     /// `Error(RATE_LIMITED)` sent.

@@ -845,12 +845,27 @@ async fn datagram_task(server: Arc<Server>, conn: quinn::Connection, session: Se
 }
 
 /// Accepts one unidirectional stream per video frame.
+///
+/// A sender has at most `VIDEO_STREAMS_PER_SENDER` frames in flight here: a
+/// camera sends one frame at a time, and every frame in flight holds a task
+/// and up to 512 KiB of payload. A stream beyond that is stopped unread with
+/// `RATE_LIMITED`, which also hands its flow control credit back.
 async fn uni_task(server: Arc<Server>, conn: quinn::Connection, session: Session) {
     let state = Arc::new(Mutex::new(VideoSender::new(&server.config.limits)));
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(pl::VIDEO_STREAMS_PER_SENDER));
     loop {
         match conn.accept_uni().await {
-            Ok(recv) => {
-                tokio::spawn(relay::video(server.clone(), session, recv, state.clone()));
+            Ok(mut recv) => {
+                let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+                    Counters::inc(&server.counters.video_dropped_rate);
+                    let _ = recv.stop(quinn::VarInt::from_u32(ec::RATE_LIMITED));
+                    continue;
+                };
+                let (server, state) = (server.clone(), state.clone());
+                tokio::spawn(async move {
+                    relay::video(server, session, recv, state).await;
+                    drop(permit);
+                });
             }
             Err(_) => return,
         }

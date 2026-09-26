@@ -7,7 +7,11 @@ mod common;
 use std::time::Duration;
 
 use common::{TestServer, BRIEFLY, SOON};
-use icu_proto::{ControlMsg, UserFlags};
+use icu_proto::{
+    error as ec,
+    header::{VideoHeader, VIDEO_CODEC_H264, VIDEO_HEADER_LEN, VIDEO_MAX_FRAME},
+    ControlMsg, UserFlags,
+};
 use icu_server::room::Counters;
 
 /// §10: video relay with the `speaker` field set.
@@ -282,5 +286,102 @@ async fn a_keyframe_request_is_forwarded_to_the_speaker() {
     })
     .await;
     alice.expect_silence().await;
+    server.shutdown().await;
+}
+
+/// Opens a video stream, writes the first `bytes` of a frame and stops
+/// there, without a FIN: a sender that stalls mid-frame.
+async fn stalled_frame(client: &common::Client, bytes: usize) -> quinn::SendStream {
+    let header = VideoHeader {
+        flags: 0,
+        speaker: 0,
+        seq: 1,
+        ts: 0,
+        codec: VIDEO_CODEC_H264,
+    };
+    let mut frame = header.encode().to_vec();
+    frame.extend_from_slice(&[7; 64]);
+    let mut send = client.conn.open_uni().await.expect("open_uni");
+    send.write_all(&frame[..bytes]).await.expect("write");
+    send
+}
+
+/// How the server ended a stream: the code it stopped it with.
+async fn stop_code(send: &mut quinn::SendStream, within: Duration) -> Option<u32> {
+    let stopped = tokio::time::timeout(within, send.stopped())
+        .await
+        .expect("the server ends the stream in time")
+        .expect("stopped, not lost");
+    stopped.map(|code| u64::from(code) as u32)
+}
+
+/// A frame whose sender stops writing, in the header or in the payload, is
+/// dropped after `timing.video_frame_timeout_ms` instead of holding a relay
+/// task for as long as the connection lives (`PROTOCOL.md` §4).
+#[tokio::test]
+async fn a_stalled_video_frame_is_dropped() {
+    let server = TestServer::start_with(|c| c.timing.video_frame_timeout_ms = 300).await;
+    let mut alice = server.client("alice").await;
+    let bob = viewer(&server, "bob").await;
+    camera_on(&mut alice, 1).await;
+
+    for bytes in [5, VIDEO_HEADER_LEN + 10] {
+        let mut send = stalled_frame(&alice, bytes).await;
+        assert_eq!(stop_code(&mut send, SOON).await, Some(ec::RATE_LIMITED));
+    }
+    let counters = &server.handle.server().counters;
+    assert_eq!(Counters::get(&counters.video_dropped_stalled), 2);
+
+    // Nothing else is affected: the next frame goes through.
+    alice.send_video(2, 3200, true, &[0x42; 64]).await;
+    assert!(bob.recv_video(SOON).await.is_some());
+    server.shutdown().await;
+}
+
+/// A sender has at most `VIDEO_STREAMS_PER_SENDER` frames in flight on the
+/// server: one more stream is refused at once, and the slots come back once
+/// the stalled frames time out.
+#[tokio::test]
+async fn more_frames_in_flight_than_a_camera_sends_are_refused() {
+    let server = TestServer::start_with(|c| c.timing.video_frame_timeout_ms = 1500).await;
+    let mut alice = server.client("alice").await;
+    let bob = viewer(&server, "bob").await;
+    camera_on(&mut alice, 1).await;
+
+    let mut stalled = Vec::new();
+    for _ in 0..icu_proto::limits::VIDEO_STREAMS_PER_SENDER {
+        stalled.push(stalled_frame(&alice, 5).await);
+    }
+    let mut one_more = stalled_frame(&alice, 5).await;
+    assert_eq!(
+        stop_code(&mut one_more, Duration::from_millis(1000)).await,
+        Some(ec::RATE_LIMITED),
+        "refused before any slot frees up"
+    );
+    for send in &mut stalled {
+        assert_eq!(stop_code(send, SOON).await, Some(ec::RATE_LIMITED));
+    }
+    alice.send_video(2, 3200, true, &[0x42; 64]).await;
+    assert!(
+        bob.recv_video(SOON).await.is_some(),
+        "the slots are free again"
+    );
+    server.shutdown().await;
+}
+
+/// The flow control windows are no size limit: a frame of the largest size
+/// the protocol allows still flows, window by window (`PROTOCOL.md` §1, §4).
+#[tokio::test]
+async fn a_video_frame_of_the_maximum_size_still_flows() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let bob = viewer(&server, "bob").await;
+    camera_on(&mut alice, 1).await;
+
+    let payload: Vec<u8> = (0..VIDEO_MAX_FRAME).map(|i| i as u8).collect();
+    alice.send_video(1, 0, true, &payload).await;
+    let (header, got) = bob.recv_video(SOON).await.expect("the frame arrives");
+    assert_eq!(header.speaker, alice.session);
+    assert!(got == payload, "all {} bytes, in order", payload.len());
     server.shutdown().await;
 }

@@ -562,6 +562,7 @@ fn status(server: &Arc<Server>) -> serde_json::Value {
                 "video_rate": Counters::get(&c.video_dropped_rate),
                 "video_slow_receiver": Counters::get(&c.video_dropped_slow_receiver),
                 "video_not_allowed": Counters::get(&c.video_dropped_not_allowed),
+                "video_stalled": Counters::get(&c.video_dropped_stalled),
             }
         },
         "enroll": {

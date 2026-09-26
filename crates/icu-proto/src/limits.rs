@@ -61,6 +61,23 @@ pub const HELLO_TIMEOUT_S: u64 = 5;
 pub const MAX_IDLE_TIMEOUT_S: u64 = 60;
 /// Client keepalive interval.
 pub const KEEP_ALIVE_INTERVAL_S: u64 = 15;
+/// Bytes a peer may send on one stream before the server has read them
+/// (QUIC stream flow control). Flow control, not a size limit: a 512 KiB
+/// video frame still flows, in windows of this size.
+pub const STREAM_RECEIVE_WINDOW: u32 = 64 * 1024;
+/// Bytes a peer may send over all streams of a connection before the server
+/// has read them. Caps what a connection can pin in server memory, streams
+/// the server never reads included (quinn's default is unbounded).
+pub const CONNECTION_RECEIVE_WINDOW: u32 = 1024 * 1024;
+/// Bytes the server holds for one connection before its writes wait:
+/// unacknowledged video and control data towards one client.
+pub const SEND_WINDOW: u64 = 1024 * 1024;
+/// Video frames one sender may have in flight on the server at a time; a
+/// further stream is stopped with `RATE_LIMITED` right away.
+pub const VIDEO_STREAMS_PER_SENDER: usize = 4;
+/// Seconds a video frame may take to arrive, header and payload, before the
+/// server stops its stream with `RATE_LIMITED`.
+pub const VIDEO_FRAME_TIMEOUT_S: u64 = 5;
 /// Datagram receive buffer size on both sides, and the server's send buffer
 /// (its send queue carries every speaker's audio to one receiver).
 pub const DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;

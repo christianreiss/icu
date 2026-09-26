@@ -16,7 +16,8 @@ Stand 2026-09-20. Abgeleitet aus `Research/transport.md`, `Research/protocol/wir
 | Idle / Keepalive | `max_idle_timeout` 60 s beidseitig; Client `keep_alive_interval` 15 s. |
 | Migration | quinn-Default (erlaubt). |
 | Datagram-Puffer | `datagram_receive_buffer_size` = 64 KiB auf beiden Seiten; `datagram_send_buffer_size` Server 64 KiB (die Sendewarteschlange trägt die Audio aller Sprecher an einen Empfänger), Client **8 KiB** (2026-09-24; nur die eigene Audio, 20–50 Pakete = 0,4–1 s). `send_datagram` verwirft bei vollem Puffer das älteste Datagram: 64 KiB wären beim Client 3–8 s Audio gewesen, die nach einem Netzhänger verspätet ankämen, der Jitter-Buffer des Empfängers (Klemme 200 ms, `drain_backlog`) sowieso verwirft und die als Burst das Ratenlimit des Servers (110/s) reißen. |
-| Streams | Client eröffnet genau einen bidirektionalen Control-Stream. Video: ein unidirektionaler Stream pro Frame, in beide Richtungen. `max_concurrent_uni_streams` = `2 × max_users + 4` pro Richtung, vom Server aus seiner Config gesetzt und vom Client übernommen (bei `max_users` = 16 also 36). Das Protokoll deckelt die Zahl gleichzeitig aktiver Kameras nicht. |
+| Streams | Client eröffnet genau einen bidirektionalen Control-Stream (der Server lässt nur einen zu, `max_concurrent_bidi_streams` = 1). Video: ein unidirektionaler Stream pro Frame, in beide Richtungen. `max_concurrent_uni_streams` = `2 × max_users + 4` pro Richtung, vom Server aus seiner Config gesetzt und vom Client übernommen (bei `max_users` = 16 also 36). Das Protokoll deckelt die Zahl gleichzeitig aktiver Kameras nicht. |
+| Flusskontrolle | Server: `stream_receive_window` 64 KiB, `receive_window` 1 MiB je Verbindung, `send_window` 1 MiB (2026-09-26; quinns Defaults waren 1,25 MB je Stream und unbegrenzt je Verbindung, ein Teilnehmer konnte mit 36 Video-Streams ~47 MB Serverspeicher binden). Das ist Flusskontrolle, keine Größengrenze: ein Video-Frame von 512 KiB fließt fensterweise. Streams, die der Server nie liest (renew-only- und Registrierungssitzungen, §2.3), zählen gegen das Verbindungsfenster. |
 | Datagram-Größe | Laufzeitwert `max_datagram_size()` (Spike 2: 1162 B nach Handshake, 1414 B nach MTU-Discovery). Audio-Datagrams sind ≤ 410 B. |
 
 **Verbunden heißt `Welcome` empfangen.** Auf Client-Seite liefert `connect().await` auch dann `Ok`, wenn der Server das Client-Cert gleich darauf ablehnt (Spike 2). Der Client darf vor `Welcome` weder Audio senden noch „verbunden“ anzeigen.
@@ -195,7 +196,7 @@ Server-Relay pro Datagram: Länge/`kind` prüfen → Absender `Active` und nicht
 
 ## 4. Video-Frame (unidirektionaler Stream)
 
-Header 12 Byte, dann Frame-Bytes bis Stream-FIN. Empfänger `read_to_end(512 KiB)`.
+Header 12 Byte, dann Frame-Bytes bis Stream-FIN. Empfänger `read_to_end(512 KiB)`. Der Server gibt einem Frame 5 s für Header und Nutzlast zusammen und stoppt den Stream danach mit `stop(RATE_LIMITED)`; je Sender nimmt er höchstens 4 Frames gleichzeitig an, einen weiteren Stream stoppt er sofort ungelesen mit `stop(RATE_LIMITED)` (2026-09-26).
 
 | Offset | Größe | Feld | Inhalt |
 | --- | --- | --- | --- |
@@ -265,7 +266,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | Control-Frame | ≤ 16 KiB |
 | Control-Messages | ≤ 50/s pro Client |
 | Audio-Datagrams | ≤ 110/s pro Client, ≤ 410 B |
-| Video-Frames | ≤ 20/s pro Client, ≤ 512 KiB; nur bei `camera_on` |
+| Video-Frames | ≤ 20/s pro Client, ≤ 512 KiB; nur bei `camera_on`; ≤ 4 gleichzeitig je Sender, ≤ 5 s je Frame (`timing.video_frame_timeout_ms`) |
 | Video-Bitrate | ≤ 400 kbit/s pro Sender (gleitend über 2 s), darüber Frames verwerfen. Bewusste Festlegung als Missbrauchs-Deckel, nicht aus dem Research hergeleitet: Zielbitrate ist 150 kbit/s (§4), der Abstand fängt CBR-Spitzen bei 15 fps ab. |
 | Users | `max_users` (Default 16, Obergrenze 64); beim Erreichen `close(SERVER_FULL)` |
 | Uni-Streams | `max_concurrent_uni_streams` = `2 × max_users + 4` je Richtung |

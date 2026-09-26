@@ -203,6 +203,8 @@ pub struct TimingSection {
     pub max_idle_timeout_ms: u64,
     /// How long a QUIC handshake may take.
     pub handshake_timeout_ms: u64,
+    /// How long a video frame may take to arrive, header and payload.
+    pub video_frame_timeout_ms: u64,
 }
 
 impl Default for TimingSection {
@@ -216,6 +218,7 @@ impl Default for TimingSection {
             shutdown_grace_ms: 1000,
             max_idle_timeout_ms: pl::MAX_IDLE_TIMEOUT_S * 1000,
             handshake_timeout_ms: pl::HANDSHAKE_TIMEOUT_S * 1000,
+            video_frame_timeout_ms: pl::VIDEO_FRAME_TIMEOUT_S * 1000,
         }
     }
 }
@@ -228,6 +231,10 @@ impl TimingSection {
     /// `handshake_timeout_ms` as a `Duration`.
     pub fn handshake_timeout(&self) -> Duration {
         Duration::from_millis(self.handshake_timeout_ms)
+    }
+    /// `video_frame_timeout_ms` as a `Duration`.
+    pub fn video_frame_timeout(&self) -> Duration {
+        Duration::from_millis(self.video_frame_timeout_ms)
     }
     /// `speaking_silence_ms` as a `Duration`.
     pub fn speaking_silence(&self) -> Duration {
