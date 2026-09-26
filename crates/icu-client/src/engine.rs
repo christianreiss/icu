@@ -481,6 +481,23 @@ struct Speaker {
     report_base: (u64, u64),
     last_reported_permille: u16,
     loss_hinted: bool,
+    /// The frame last queued for this speaker was quiet (below
+    /// [`QUIET_RMS`]): the jitter buffer may adjust its depth now without
+    /// anyone hearing it (`JitterBuffer::pop_quiet`).
+    quiet: bool,
+}
+
+/// RMS below which a decoded frame counts as quiet for depth adjustments:
+/// −40 dBFS, the level of a pause between words after the denoiser.
+const QUIET_RMS: f32 = 0.01;
+
+/// Whether `samples` is quiet enough to hide a concealed or skipped frame.
+fn frame_quiet(samples: &[f32]) -> bool {
+    if samples.is_empty() {
+        return true;
+    }
+    let energy: f32 = samples.iter().map(|s| s * s).sum();
+    energy < QUIET_RMS * QUIET_RMS * samples.len() as f32
 }
 
 impl Speaker {
@@ -499,6 +516,7 @@ impl Speaker {
             report_base: (0, 0),
             last_reported_permille: 0,
             loss_hinted: false,
+            quiet: true,
         })
     }
 }
@@ -1456,13 +1474,14 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
             for sp in speakers.values_mut() {
                 let before = sp.jitter.stats();
                 while sp.pending.len() < BLOCK {
-                    match sp.jitter.pop(now) {
+                    match sp.jitter.pop_quiet(now, sp.quiet) {
                         Pop::Packet(p) => {
                             if let Some(d) = sp.jitter.last_delay() {
                                 stats.jitter_delay.lock().unwrap().record(d);
                             }
                             let n = sp.decoder.decode(&p.payload, &mut fec_scratch).unwrap_or(0);
                             DebugStats::inc(&stats.frames_decoded);
+                            sp.quiet = frame_quiet(&fec_scratch[..n]);
                             queue_decoded(sp, n, &fec_scratch);
                         }
                         Pop::Lost { fec_source, .. } => {
@@ -1478,17 +1497,21 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                                     sp.decoder.conceal(&mut fec_scratch).unwrap_or(0)
                                 }
                             };
+                            sp.quiet = frame_quiet(&fec_scratch[..n]);
                             queue_decoded(sp, n, &fec_scratch);
                         }
                         Pop::Silence => {
+                            sp.quiet = true;
                             sp.pending.extend(std::iter::repeat_n(0.0, BLOCK));
                         }
                     }
                 }
                 let after = sp.jitter.stats();
                 DebugStats::add(&stats.jitter_underruns, after.underruns - before.underruns);
+                DebugStats::add(&stats.jitter_stretched, after.stretched - before.stretched);
                 DebugStats::add(&stats.jitter_skipped, after.skipped - before.skipped);
                 DebugStats::add(&stats.jitter_dropped, after.dropped - before.dropped);
+                DebugStats::add(&stats.jitter_lost, after.lost - before.lost);
                 if inputs.len() <= n_inputs {
                     inputs.push((vec![0.0f32; BLOCK], 0.0));
                 }

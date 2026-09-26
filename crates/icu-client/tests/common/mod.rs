@@ -34,6 +34,14 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn start() -> TestServer {
+        // `RUST_LOG=icu_client::dsp::jitter=debug` traces the jitter
+        // buffers; without the variable nothing is installed.
+        if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_test_writer()
+                .try_init();
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         let config = Config::for_test(dir.path());
         let handle = icu_server::run(config).await.expect("server starts");
