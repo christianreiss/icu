@@ -340,6 +340,12 @@ pub struct Speak<'a> {
     pub threshold: Option<f32>,
     /// The push-to-talk key, shown as a keycap beside the label.
     pub key: Option<&'a str>,
+    /// Muted, yet talking (voice heard, or the PTT key held): the surface
+    /// says so instead of letting people talk into the void (Mumble's
+    /// "mute cue").
+    pub talking_muted: bool,
+    /// The microphone clips: the level line turns red.
+    pub clipping: bool,
 }
 
 /// The big control: the speak button in push-to-talk, a readout in voice
@@ -367,21 +373,27 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         .animate_bool_with_time(response.id, s.open && !s.offline, 0.08);
     let hot = open > 0.5;
     painter.rect_filled(rect, R_ROW, lerp_color(tok.surface_hi, tok.accent, open));
+    if s.talking_muted {
+        let time = ui.input(|i| i.time);
+        let pulse = ((time * 3.0).sin() as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
+        painter.rect_filled(
+            rect,
+            R_ROW,
+            tok.error_tint.gamma_multiply(0.6 + 0.4 * pulse),
+        );
+        ui.ctx().request_repaint();
+    }
     if s.ptt && !s.offline && response.hovered() {
         painter.rect_filled(rect, R_ROW, tok.hover_overlay);
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
     // The level line, eased so it glides instead of flickering at 30 fps.
-    let level = ui.ctx().animate_value_with_time(
-        response.id.with("level"),
-        if s.muted {
-            0.0
-        } else {
-            s.level.clamp(0.0, 1.0)
-        },
-        0.12,
-    );
+    // Muted, the line still moves (dimmed): it shows the microphone works,
+    // just that nothing goes out.
+    let level =
+        ui.ctx()
+            .animate_value_with_time(response.id.with("level"), s.level.clamp(0.0, 1.0), 0.12);
     let line = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 14.0, rect.bottom() - 9.0),
         egui::pos2(rect.right() - 14.0, rect.bottom() - 6.0),
@@ -391,11 +403,21 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
             tok.on_accent.gamma_multiply(0.18),
             tok.on_accent.gamma_multiply(0.7),
         )
+    } else if s.muted {
+        (
+            ui.visuals().widgets.inactive.bg_stroke.color,
+            tok.error.gamma_multiply(0.5),
+        )
     } else {
         (
             ui.visuals().widgets.inactive.bg_stroke.color,
             if s.ptt { tok.level } else { tok.accent },
         )
+    };
+    let fill = if s.clipping && !s.muted {
+        tok.error
+    } else {
+        fill
     };
     painter.rect_filled(line, 1.5, track);
     if level > 0.0 {
@@ -414,7 +436,9 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         );
     }
 
-    let (glyph, label, color) = if s.muted {
+    let (glyph, label, color) = if s.talking_muted {
+        (icon::MICROPHONE_SLASH, "Stumm — du sprichst", tok.error)
+    } else if s.muted {
         (icon::MICROPHONE_SLASH, "Stumm", tok.error)
     } else if s.offline {
         (icon::PLUGS, "Getrennt", tok.muted_text)

@@ -259,6 +259,7 @@ fn state() -> AppState {
         deafened: false,
         ptt_down: false,
         sending: false,
+        voice: false,
         level: icu_client::dsp::meter::Level {
             peak_db: -12.0,
             rms_db: -24.0,
@@ -345,6 +346,7 @@ fn main_window(
             video: &|_| None,
             self_video: None,
             settings_open: false,
+            overlay_available: true,
         };
         *out.borrow_mut() = view.ui(root, &state, &env).list_overflow;
     });
@@ -483,4 +485,59 @@ fn enroll_window_fits() {
         shot(&mut h, &what.replace('/', "-"));
     }
     overflows.assert_none();
+}
+
+/// The latest `UpdateSettings` the settings window handed out.
+fn last_update(cmds: &[Command]) -> Settings {
+    cmds.iter()
+        .rev()
+        .find_map(|c| match c {
+            Command::UpdateSettings(s) => Some((**s).clone()),
+            _ => None,
+        })
+        .expect("an UpdateSettings")
+}
+
+/// A hotkey, the tray or the main window change settings while the settings
+/// window is open: the window takes the change over instead of writing its
+/// stale copy back with the next edit (review 2026-09-23, Netz #4).
+#[test]
+fn settings_window_keeps_outside_changes() {
+    let shared = Rc::new(RefCell::new(state()));
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let (state_in, cmds_out) = (shared.clone(), cmds.clone());
+    let mut view = SettingsView::new(
+        &shared.borrow(),
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        let out = view.ui(ui, &state_in.borrow(), false);
+        cmds_out.borrow_mut().extend(out.cmds);
+    });
+
+    // The user switches to voice activation; the engine applies it.
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Automatisch")
+        .click();
+    h.run();
+    let sent = last_update(&cmds.borrow());
+    assert_eq!(sent.audio.mode, ModeSetting::Vad);
+    shared.borrow_mut().settings = sent;
+    h.run();
+
+    // A hotkey flips back to push-to-talk behind the window's back.
+    shared.borrow_mut().settings.audio.mode = ModeSetting::Ptt;
+    h.run();
+
+    // The next edit in the window keeps push-to-talk.
+    h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Senden beginnt oder endet")
+        .click();
+    h.run();
+    let sent = last_update(&cmds.borrow());
+    assert_eq!(
+        sent.audio.mode,
+        ModeSetting::Ptt,
+        "outside change written back"
+    );
+    assert!(sent.audio.cue_tx);
 }

@@ -56,6 +56,9 @@ pub const SETTINGS_SIZE: [f32; 2] = [820.0, 640.0];
 /// ones grow it.
 pub const CONNECTION_SIZE: [f32; 2] = [720.0, 780.0];
 
+/// A microphone peak at or above this reads as clipping.
+const CLIP_DB: f32 = -1.0;
+
 /// Above this round-trip time a row's ping turns amber.
 const SLOW_RTT_MS: u16 = 150;
 
@@ -230,6 +233,7 @@ impl App {
 
         fonts::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, &theme_name);
+        wake_on_change(state_rx.clone(), cc.egui_ctx.clone());
         #[cfg(feature = "tray")]
         let tray = crate::tray::Tray::start(cmd.clone(), cc.egui_ctx.clone()).ok();
         #[cfg(feature = "overlay")]
@@ -284,6 +288,31 @@ impl App {
             quit_requested: false,
             logged_out,
         }
+    }
+}
+
+/// Wakes the window whenever the engine's state changes. A visible window
+/// repaints on its own timer; one hidden to the tray runs `App::logic` only
+/// when asked, and without this the tray icon would keep showing the state
+/// from when the window was hidden (a hotkey mute, a lost connection).
+/// Ends with the engine, when the sender is dropped.
+fn wake_on_change(mut state: tokio::sync::watch::Receiver<AppState>, ctx: egui::Context) {
+    let spawned = std::thread::Builder::new()
+        .name("icu-ui-wake".into())
+        .spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().build() else {
+                return;
+            };
+            rt.block_on(async {
+                while state.changed().await.is_ok() {
+                    // Not immediate: a visible window repaints every 33 ms
+                    // anyway, and the levels change 20 times a second.
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+            });
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(%e, "no wake-up thread; the tray may lag while hidden");
     }
 }
 
@@ -392,6 +421,7 @@ impl eframe::App for App {
             video: &|session| videos.get(session),
             self_video,
             settings_open: self.settings.is_some(),
+            overlay_available: self.overlay_available(),
         };
         let out = self.view.ui(root, &self.state, &env);
 
@@ -407,7 +437,8 @@ impl eframe::App for App {
                         .map(|e| e.paths())
                         .unwrap_or_else(|| Paths::new(None));
                     #[cfg_attr(not(feature = "camera"), allow(unused_mut))]
-                    let mut view = SettingsView::new(&self.state, self.stats.clone(), paths);
+                    let mut view = SettingsView::new(&self.state, self.stats.clone(), paths)
+                        .with_overlay_available(self.overlay_available());
                     #[cfg(feature = "camera")]
                     if let Some(camera) = &self.camera {
                         view = view.with_preview(camera.preview_source());
@@ -452,6 +483,15 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// Whether the overlay thread is up: compositors without layer shell
+    /// (GNOME) have none.
+    fn overlay_available(&self) -> bool {
+        #[cfg(feature = "overlay")]
+        return self.overlay.is_some();
+        #[cfg(not(feature = "overlay"))]
+        false
+    }
+
     /// The `--debug-stats` window: a monospace dump, refreshed every 2s.
     fn debug_window(&mut self, ctx: &egui::Context) {
         if (self.debug_stats || self.debug_window_open)
@@ -629,6 +669,9 @@ pub struct MainEnv<'a> {
     pub self_video: Option<egui::load::SizedTexture>,
     /// The settings window is open, which the gear shows.
     pub settings_open: bool,
+    /// The overlay could start (a layer-shell compositor): without it the
+    /// Overlay tile would switch nothing, so it is left out.
+    pub overlay_available: bool,
 }
 
 /// What one frame of the main view asks of the app around it.
@@ -762,6 +805,11 @@ impl MainView {
                         ),
                         None::<fn()>,
                     );
+                    ui.add_space(2.0);
+                    ui.hyperlink_to(
+                        format!("{}  Neue Version herunterladen", icon::DOWNLOAD_SIMPLE),
+                        concat!(env!("CARGO_PKG_REPOSITORY"), "/releases"),
+                    );
                 }
                 // Non-techies do not hover: a connection that will not come
                 // back on its own says why right here, not only in the
@@ -877,8 +925,8 @@ impl MainView {
                         widgets::Role::Accent,
                         widgets::RecDot::Off,
                         None,
-                        cfg!(feature = "overlay")
-                            .then(|| Command::SetOverlay(!state.settings.overlay.enabled)),
+                        (cfg!(feature = "overlay") && env.overlay_available)
+                            .then_some(Command::SetOverlay(!state.settings.overlay.enabled)),
                     ),
                 ];
                 let toggles: Vec<_> = toggles.into_iter().filter(|t| t.6.is_some()).collect();
@@ -1110,9 +1158,17 @@ fn speak_row(
         },
         threshold: (!ptt).then_some(state.vad_threshold),
         key: ptt.then_some(key.as_str()),
+        talking_muted: state.muted && (state.voice || (ptt && state.ptt_down)),
+        clipping: !offline && state.level.peak_db >= CLIP_DB,
     };
     // Built only while hovered: three floats formatted per frame otherwise.
     let tooltip = |ui: &mut egui::Ui| {
+        if speak.talking_muted {
+            ui.label("Du bist stummgeschaltet — niemand hört dich.");
+        }
+        if speak.clipping {
+            ui.label("Übersteuert — leiser sprechen oder das Mikrofon herunterregeln.");
+        }
         ui.label(if offline {
             format!(
                 "Nicht verbunden — es wird nichts gesendet\nPegel {:.0} dBFS",
@@ -1408,13 +1464,22 @@ fn participant_row(
                                 ui.label(format!("Ping {ms} ms"));
                             });
                         }
-                        // Always the same glyph: the crossed-out speaker is the
-                        // badge for "this person hears nothing", and a volume
-                        // handle wearing it would read as that.
+                        // Not the crossed-out speaker: that is the badge for
+                        // "this person hears nothing". At 0 % the handle shows
+                        // the speaker with an x — muted for you only.
                         if let Some(vol) = p.volume {
-                            if widgets::icon_button(ui, icon::SPEAKER_HIGH, 28.0, expanded)
+                            let glyph = if vol <= 0.0 {
+                                icon::SPEAKER_X
+                            } else {
+                                icon::SPEAKER_HIGH
+                            };
+                            if widgets::icon_button(ui, glyph, 28.0, expanded)
                                 .on_hover_ui(|ui| {
-                                    ui.label(format!("Lautstärke {vol:.0} %"));
+                                    ui.label(if vol <= 0.0 {
+                                        "Für dich stumm".to_string()
+                                    } else {
+                                        format!("Lautstärke {vol:.0} %")
+                                    });
                                 })
                                 .clicked()
                             {
@@ -1572,8 +1637,28 @@ fn details(ui: &mut egui::Ui, p: &Participant<'_>, tok: &theme::Tokens, send: &i
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.add_space(40.0);
-            widgets::rtl(ui, 22.0, |ui| {
+            widgets::rtl(ui, 24.0, |ui| {
                 widgets::chip(ui, &format!("{v:.0} %"), 46.0);
+                // One click to silence somebody for yourself, and back.
+                let muted = v <= 0.0;
+                let glyph = if muted {
+                    icon::SPEAKER_X
+                } else {
+                    icon::SPEAKER_HIGH
+                };
+                if widgets::icon_button(ui, glyph, 24.0, muted)
+                    .on_hover_text(if muted {
+                        "Wieder hören"
+                    } else {
+                        "Für mich stummschalten"
+                    })
+                    .clicked()
+                {
+                    send(Command::SetVolume(
+                        p.user_id,
+                        if muted { 100.0 } else { 0.0 },
+                    ));
+                }
                 if widgets::slider(ui, &mut v, 0.0..=200.0).changed() {
                     send(Command::SetVolume(p.user_id, v));
                 }

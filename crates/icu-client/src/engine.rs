@@ -173,6 +173,9 @@ pub struct AppState {
     pub ptt_down: bool,
     /// Gate open (audio is going out).
     pub sending: bool,
+    /// The voice detector heard speech in the last state push (~50 ms),
+    /// muted or not: the main window warns about talking while muted.
+    pub voice: bool,
     /// Microphone level after processing.
     pub level: Level,
     /// RNNoise voice probability.
@@ -595,6 +598,7 @@ impl Engine {
             deafened: false,
             ptt_down: false,
             sending: false,
+            voice: false,
             level: Level::default(),
             vad_prob: 0.0,
             vad_threshold: settings.audio.vad_threshold,
@@ -1011,6 +1015,8 @@ fn dsp_thread(
     let mut ref_underruns_window = 0u32;
     let mut window_start = Instant::now();
     let mut last_state_push = Instant::now();
+    // Speech heard since the last push into the UI state.
+    let mut voice_since_push = false;
     let mut last_aec_stats = Instant::now();
     // Reference energy since the last stats push, and how many pushes in a
     // row looked like "echo present, not removed".
@@ -1203,6 +1209,7 @@ fn dsp_thread(
         let voice = vad::is_voice(threshold, prob, level);
         prev_voice = voice;
         voice_in_frame |= voice;
+        voice_since_push |= voice;
 
         // Voice optimizer: nonlinear, so after AEC; after the meter and VAD,
         // so its makeup gain does not move the thresholds.
@@ -1323,12 +1330,14 @@ fn dsp_thread(
             let ptt = ctl.ptt_down.load(Ordering::Relaxed);
             let p = ctl.vad_prob.load();
             let vad_threshold = ctl.vad_effective_threshold.load();
+            let voice = std::mem::take(&mut voice_since_push);
             shared.state.send_modify(|s| {
                 s.level = level;
                 s.vad_prob = p;
                 s.vad_threshold = vad_threshold;
                 s.sending = sending;
                 s.ptt_down = ptt;
+                s.voice = voice;
             });
         }
     }

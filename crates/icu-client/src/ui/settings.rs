@@ -137,6 +137,15 @@ pub struct SettingsView {
     /// change is noticed by comparison instead of by cloning the whole
     /// draft on every frame.
     applied: Settings,
+    /// The engine's settings as last seen. When they move to something
+    /// this window did not send (a hotkey switched the mode, the tray muted,
+    /// a volume changed in the main window), the draft takes them over —
+    /// otherwise the next change made here would write the old values back.
+    seen: Settings,
+    /// What this window sent and the engine may not have echoed yet: a
+    /// slider drag sends a new version every frame, and an echo of an older
+    /// one must not pull the slider back.
+    sent: std::collections::VecDeque<Settings>,
     /// Live picture for the Kamera tab, fed by the running capture thread.
     #[cfg(feature = "camera")]
     preview: Option<crate::camera::CameraPreview>,
@@ -149,6 +158,9 @@ pub struct SettingsView {
     /// opened, so a camera plugged in meanwhile shows up on the next visit.
     #[cfg(feature = "camera")]
     cameras_stale: bool,
+    /// The overlay thread is running; without layer shell (GNOME) the
+    /// overlay card says so instead of offering switches that do nothing.
+    overlay_available: bool,
 }
 
 /// What one frame of the settings window asks the main window to do.
@@ -176,6 +188,8 @@ impl SettingsView {
         SettingsView {
             draft: state.settings.clone(),
             applied: state.settings.clone(),
+            seen: state.settings.clone(),
+            sent: std::collections::VecDeque::new(),
             name: name.clone(),
             name_synced: name,
             passport_import: String::new(),
@@ -205,7 +219,14 @@ impl SettingsView {
             cameras: Vec::new(),
             #[cfg(feature = "camera")]
             cameras_stale: true,
+            overlay_available: cfg!(feature = "overlay"),
         }
+    }
+
+    /// Whether the overlay could start on this desktop.
+    pub fn with_overlay_available(mut self, available: bool) -> SettingsView {
+        self.overlay_available = available;
+        self
     }
 
     /// Gives the Kamera tab a live picture from the running capture thread.
@@ -223,11 +244,31 @@ impl SettingsView {
         self.applied.ui.theme = theme.to_string();
     }
 
+    /// Takes over settings the engine changed on its own. An echo of one of
+    /// our own `UpdateSettings` is left alone; anything else came from
+    /// elsewhere and wins.
+    fn adopt_outside_changes(&mut self, engine: &Settings) {
+        if *engine == self.seen {
+            return;
+        }
+        self.seen.clone_from(engine);
+        if let Some(i) = self.sent.iter().position(|s| s == engine) {
+            // Our own, possibly an older one: everything sent before it has
+            // been superseded by it.
+            self.sent.drain(..=i);
+            return;
+        }
+        self.sent.clear();
+        self.draft.clone_from(engine);
+        self.applied.clone_from(engine);
+    }
+
     /// Draws the panel content. `debug_window_open` is what `App` knows;
     /// the answer comes back in the output.
     pub fn ui(&mut self, ui: &mut Ui, state: &AppState, debug_window_open: bool) -> SettingsOutput {
         let mut cmds = Vec::new();
         self.debug_window_open = debug_window_open;
+        self.adopt_outside_changes(&state.settings);
 
         // A live demote can orphan the tab: it is only in the rail while
         // `state.is_admin`, so bounce back to Allgemein instead of rendering
@@ -321,6 +362,10 @@ impl SettingsView {
 
         if self.draft != self.applied {
             self.applied.clone_from(&self.draft);
+            if self.sent.len() == 32 {
+                self.sent.pop_front();
+            }
+            self.sent.push_back(self.draft.clone());
             cmds.push(Command::UpdateSettings(Box::new(self.draft.clone())));
         }
         // A page taller than the window (expert rows, a long member list)
@@ -680,8 +725,9 @@ impl SettingsView {
                 ui.colored_label(
                     tok.error,
                     RichText::new(
-                        "Der Passport enthält deinen privaten Schlüssel — nur über einen \
-                         sicheren Weg weitergeben.",
+                        "Enthält deinen privaten Schlüssel — nur sicher weitergeben. Erneuert \
+                         ein Gerät sein Zertifikat (neuer Name, jährlich), braucht das andere \
+                         einen neuen Passport.",
                     )
                     .size(11.5),
                 );
@@ -1014,6 +1060,15 @@ impl SettingsView {
         });
 
         widgets::group_card(ui, "Video-Overlay", |ui| {
+            if !self.overlay_available {
+                widgets::help_note(
+                    ui,
+                    "Diese Arbeitsumgebung erlaubt keine Fenster über Spielen (Wayland \
+                     ohne Layer-Shell, etwa GNOME). Die Kameras erscheinen dann nur in der \
+                     Teilnehmerliste.",
+                );
+                return;
+            }
             widgets::setting_row(
                 ui,
                 false,
@@ -1150,8 +1205,8 @@ impl SettingsView {
                 widgets::advanced_caption(ui);
                 widgets::help_note(
                     ui,
-                    "Der Name steht im Zertifikat. Eine Änderung stellt ein neues aus; das \
-                     alte bleibt bis zum Ablauf gültig.",
+                    "Der Name steht im Zertifikat: eine Änderung stellt ein neues aus. \
+                     Geräte mit einem älteren Passport brauchen danach einen neuen.",
                 );
                 widgets::setting_row(ui, true, "Server", None, |ui| {
                     widgets::chip(ui, &state.server, 0.0)
