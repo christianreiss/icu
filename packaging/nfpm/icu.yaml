@@ -27,6 +27,15 @@ contents:
   - src: packaging/files/icu.desktop
     dst: /usr/share/applications/icu.desktop
     file_info: {mode: 0644}
+  # Invites and passports (`*.icu`, the passport armor) are
+  # application/x-icu and open with `icu %f`. No scriptlets: the MIME and
+  # desktop databases are rebuilt by the distros' own triggers — Fedora's
+  # shared-mime-info and desktop-file-utils have file triggers on
+  # /usr/share/mime and /usr/share/applications, Debian's have
+  # `interest-noawait` on /usr/share/mime/packages and /usr/share/applications.
+  - src: packaging/files/icu-mime.xml
+    dst: /usr/share/mime/packages/icu.xml
+    file_info: {mode: 0644}
   - src: packaging/files/icu.svg
     dst: /usr/share/icons/hicolor/scalable/apps/icu.svg
     file_info: {mode: 0644}
@@ -40,3 +49,5 @@ contents:
 recommends:
   - xdg-desktop-portal
   - xdg-utils
+  - shared-mime-info
+  - desktop-file-utils

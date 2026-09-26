@@ -1,7 +1,9 @@
 //! `icu` — the ICU voice client.
 //!
-//! `icu <bundle> --name <name>` registers (then starts), `icu` starts. `--config-dir`
-//! allows two instances on one machine, `--headless` runs without a window,
+//! `icu` starts. `icu <file>` opens an invite or passport in the first-start
+//! window (with `--name`/`--yes`/`--headless` it is taken on the terminal),
+//! then starts. `--config-dir` allows two instances on one machine,
+//! `--headless` runs without a window,
 //! `--debug-stats` prints latency histograms to stderr every 2 s,
 //! `--test-tone` replaces the microphone with a synthetic voice.
 
@@ -18,8 +20,11 @@ use icu_client::{
 #[derive(Debug, Parser)]
 #[command(name = "icu", version, about, long_about = None)]
 struct Cli {
-    /// Registration bundle or passport to take over: a file, or the armored
-    /// text itself (`-----BEGIN ICU PASSPORT-----`).
+    /// Invite (registration bundle) or passport to take over: an `.icu`
+    /// file, or the armored text itself (`-----BEGIN ICU PASSPORT-----`). It
+    /// opens in the first-start window, which shows where it leads and joins
+    /// on a click; with --yes, --name or --headless it is taken on the
+    /// terminal instead.
     bundle: Option<String>,
     /// The name to register with. It goes into the certificate, so it is what
     /// everyone sees. Needed for a registration bundle, ignored for a
@@ -49,7 +54,8 @@ struct Cli {
     /// Override the server address (tests: `127.0.0.1:port`).
     #[arg(long)]
     server_addr: Option<std::net::SocketAddr>,
-    /// Do not register the `icu://` URI handler.
+    /// Do not register ICU for invites and passports (`.icu` files, MIME
+    /// type application/x-icu).
     #[arg(long)]
     no_uri_handler: bool,
     /// Do not start global hotkeys.
@@ -110,6 +116,54 @@ fn read_bundle(arg: &str) -> Result<String, String> {
     Ok(text)
 }
 
+/// Whether `icu <file>` opens the first-start window: a desktop start has
+/// no terminal to confirm on, and the window asks for the name itself.
+fn in_window(cli: &Cli) -> bool {
+    cfg!(feature = "gui") && !cli.headless && !cli.yes && cli.name.is_none()
+}
+
+/// Takes an invite or passport on the terminal: shows where it leads,
+/// asks `[j/N]` (or `--yes`), registers under `--name` or stores it.
+fn import_in_terminal(cli: &Cli, paths: &Paths, text: &str) -> Result<(), String> {
+    let mut identity = Identity::from_passport(text)?;
+    // A passport brings its own CA and address: show where it leads
+    // before anything is replaced (`PROTOCOL.md` §2.3.1).
+    let current = Identity::load(paths).ok().flatten();
+    let summary = icu_client::config::ImportSummary::of(&identity, current.as_ref());
+    for line in summary.lines() {
+        eprintln!("icu: {line}");
+    }
+    if !cli.yes && !confirm_import()? {
+        return Err("import cancelled".into());
+    }
+    if identity.is_registration() {
+        let name = cli
+            .name
+            .clone()
+            .ok_or("a registration bundle needs --name <display name>")?;
+        let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+        identity = rt
+            .block_on(register(
+                &identity,
+                &name,
+                &icu_client::engine::client_string(),
+                cli.server_addr,
+                paths,
+            ))
+            .map_err(|e| e.to_string())?;
+    } else {
+        identity.save(paths).map_err(|e| e.to_string())?;
+    }
+    eprintln!(
+        "icu: registered as {} at {}:{}, identity stored in {}",
+        identity.server.name,
+        identity.server.host,
+        identity.server.port,
+        paths.identity_dir().display()
+    );
+    Ok(())
+}
+
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -121,8 +175,11 @@ fn init_tracing() {
     );
 }
 
-// Without `gui` there is no logout, so nothing loops.
-#[cfg_attr(not(feature = "gui"), allow(unused_mut, clippy::never_loop))]
+// Without `gui` there is no logout, so nothing loops, and no window to show.
+#[cfg_attr(
+    not(feature = "gui"),
+    allow(unused_mut, unused_variables, clippy::never_loop)
+)]
 fn run(cli: Cli) -> Result<(), String> {
     let paths = Paths::new(cli.config_dir.clone());
     std::fs::create_dir_all(&paths.config_dir).map_err(|e| e.to_string())?;
@@ -130,7 +187,21 @@ fn run(cli: Cli) -> Result<(), String> {
 
     // As text, read here: the running instance it may be handed to can sit
     // in another working directory.
-    let bundle = cli.bundle.as_deref().map(read_bundle).transpose()?;
+    let bundle = match cli.bundle.as_deref() {
+        // A click on an old invite link still starts ICU.
+        Some(link)
+            if link
+                .get(..6)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("icu://")) =>
+        {
+            eprintln!(
+                "icu: icu://-Links gibt es nicht mehr. Eine Einladung ist eine .icu-Datei oder \
+                 ein Textblock „-----BEGIN ICU PASSPORT-----“; ICU startet ohne den Link."
+            );
+            None
+        }
+        arg => arg.map(read_bundle).transpose()?,
+    };
 
     // One client per configuration directory: a second start brings the
     // running one to the front and hands over what it was given, instead of
@@ -151,49 +222,37 @@ fn run(cli: Cli) -> Result<(), String> {
         }
     }
 
+    // Joined through the window: the main window follows on screen, even
+    // with „Minimiert starten“.
+    let mut show = false;
     if let Some(text) = &bundle {
-        let mut identity = Identity::from_passport(text)?;
-        // A passport brings its own CA and address: show where it leads
-        // before anything is replaced (`PROTOCOL.md` §2.3.1).
-        let current = Identity::load(&paths).ok().flatten();
-        let summary = icu_client::config::ImportSummary::of(&identity, current.as_ref());
-        for line in summary.lines() {
-            eprintln!("icu: {line}");
-        }
-        if !cli.yes && !confirm_import()? {
-            return Err("import cancelled".into());
-        }
-        if identity.is_registration() {
-            let name = cli
-                .name
-                .clone()
-                .ok_or("a registration bundle needs --name <display name>")?;
-            let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-            identity = rt
-                .block_on(register(
-                    &identity,
-                    &name,
-                    &icu_client::engine::client_string(),
+        if in_window(&cli) {
+            // A double-click, a file manager: no terminal to ask on. The
+            // first-start window shows where it leads, asks for a name where
+            // one is needed, and replaces an existing identity only on
+            // „Diesem Server beitreten“. Closed without joining: nothing
+            // changed, and nothing starts either.
+            #[cfg(feature = "gui")]
+            {
+                let joined = icu_client::ui::run_enroll_window_with(
+                    paths.clone(),
                     cli.server_addr,
-                    &paths,
-                ))
-                .map_err(|e| e.to_string())?;
+                    text.clone(),
+                )?;
+                if joined.is_none() {
+                    return Ok(());
+                }
+                show = true;
+            }
         } else {
-            identity.save(&paths).map_err(|e| e.to_string())?;
+            import_in_terminal(&cli, &paths, text)?;
         }
-        eprintln!(
-            "icu: registered as {} at {}:{}, identity stored in {}",
-            identity.server.name,
-            identity.server.host,
-            identity.server.port,
-            paths.identity_dir().display()
-        );
     }
 
     if settings.ui.register_uri_handler && !cli.no_uri_handler && !cli.headless {
         match icu_client::uri::register() {
-            Ok(p) => tracing::info!(path = %p.display(), "URI handler registered"),
-            Err(e) => tracing::info!(%e, "URI handler not registered"),
+            Ok(p) => tracing::info!(path = %p.display(), "ICU opens invites and passports"),
+            Err(e) => tracing::info!(%e, "file association not registered"),
         }
     }
 
@@ -260,7 +319,7 @@ fn run(cli: Cli) -> Result<(), String> {
             return run_headless(engine, cli.debug_stats);
         }
         #[cfg(feature = "gui")]
-        match icu_client::ui::run_main_window(engine, cli.debug_stats, logged_out)? {
+        match icu_client::ui::run_main_window(engine, cli.debug_stats, logged_out || show)? {
             icu_client::ui::Exit::Quit => return Ok(()),
             // Back to the invite window; closing that one quits.
             icu_client::ui::Exit::LoggedOut => logged_out = true,
