@@ -6,10 +6,7 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     str::FromStr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -90,14 +87,51 @@ pub fn list_devices() -> Vec<InputDevice> {
         .collect()
 }
 
-/// Stops the reader tasks when dropped.
+/// The tasks of one running evdev backend: the readers (one per device)
+/// and the hot-plug rescan. Stopping aborts them all at once, and a task
+/// added after the stop — a rescan that was still running — is aborted
+/// right away.
+#[derive(Clone, Default)]
+struct Tasks(Arc<Mutex<TaskSet>>);
+
+#[derive(Default)]
+struct TaskSet {
+    stopped: bool,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Tasks {
+    fn add(&self, task: &tokio::task::JoinHandle<()>) {
+        let mut set = self.0.lock().unwrap();
+        if set.stopped {
+            task.abort();
+        } else {
+            // Readers of unplugged devices have ended by themselves.
+            set.tasks.retain(|t| !t.is_finished());
+            set.tasks.push(task.abort_handle());
+        }
+    }
+
+    fn stop(&self) {
+        let mut set = self.0.lock().unwrap();
+        set.stopped = true;
+        for task in set.tasks.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+/// Stops the reader tasks when dropped — at once, not at their next
+/// wake-up: an old and a new backend reading side by side would fire every
+/// toggle key twice. An aborted reader drops its `Dispatch`, which releases
+/// a held PTT key.
 pub struct Guard {
-    stop: Arc<AtomicBool>,
+    tasks: Tasks,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.tasks.stop();
     }
 }
 
@@ -114,23 +148,25 @@ pub async fn start(
     if bindings.is_empty() {
         return Err("no evdev key bound".into());
     }
-    let stop = Arc::new(AtomicBool::new(false));
-    let opened = Arc::new(std::sync::Mutex::new(HashSet::<PathBuf>::new()));
-    let n = scan_blocking(&bindings, &cmd, &stop, &opened).await;
+    let tasks = Tasks::default();
+    let opened = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
+    let n = scan_blocking(&bindings, &cmd, &tasks, &opened).await;
     if n == 0 {
+        tasks.stop();
         return Err("no readable input device has the bound keys".into());
     }
     // Hot-plug: rescan periodically.
-    {
-        let stop = stop.clone();
+    let rescan = {
+        let tasks = tasks.clone();
         tokio::spawn(async move {
-            while !stop.load(Ordering::Relaxed) {
+            loop {
                 tokio::time::sleep(Duration::from_secs(3)).await;
-                scan_blocking(&bindings, &cmd, &stop, &opened).await;
+                scan_blocking(&bindings, &cmd, &tasks, &opened).await;
             }
-        });
-    }
-    Ok((Guard { stop }, n))
+        })
+    };
+    tasks.add(&rescan);
+    Ok((Guard { tasks }, n))
 }
 
 /// [`scan`] on the blocking pool: it opens and queries every input device,
@@ -139,12 +175,16 @@ pub async fn start(
 async fn scan_blocking(
     bindings: &[(KeyCode, Action)],
     cmd: &UnboundedSender<Command>,
-    stop: &Arc<AtomicBool>,
-    opened: &Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    tasks: &Tasks,
+    opened: &Arc<Mutex<HashSet<PathBuf>>>,
 ) -> usize {
-    let (bindings, cmd, stop, opened) =
-        (bindings.to_vec(), cmd.clone(), stop.clone(), opened.clone());
-    tokio::task::spawn_blocking(move || scan(&bindings, &cmd, &stop, &opened))
+    let (bindings, cmd, tasks, opened) = (
+        bindings.to_vec(),
+        cmd.clone(),
+        tasks.clone(),
+        opened.clone(),
+    );
+    tokio::task::spawn_blocking(move || scan(&bindings, &cmd, &tasks, &opened))
         .await
         .unwrap_or(0)
 }
@@ -152,8 +192,8 @@ async fn scan_blocking(
 fn scan(
     bindings: &[(KeyCode, Action)],
     cmd: &UnboundedSender<Command>,
-    stop: &Arc<AtomicBool>,
-    opened: &Arc<std::sync::Mutex<HashSet<PathBuf>>>,
+    tasks: &Tasks,
+    opened: &Arc<Mutex<HashSet<PathBuf>>>,
 ) -> usize {
     let mut n = 0;
     for path in event_paths() {
@@ -176,14 +216,8 @@ fn scan(
             name = dev.name().unwrap_or("?"),
             "evdev hotkey device"
         );
-        spawn_reader(
-            dev,
-            path,
-            bindings.to_vec(),
-            cmd.clone(),
-            stop.clone(),
-            opened.clone(),
-        );
+        let reader = spawn_reader(dev, path, bindings.to_vec(), cmd.clone(), opened.clone());
+        tasks.add(&reader);
     }
     n
 }
@@ -193,9 +227,8 @@ fn spawn_reader(
     path: PathBuf,
     bindings: Vec<(KeyCode, Action)>,
     cmd: UnboundedSender<Command>,
-    stop: Arc<AtomicBool>,
-    opened: Arc<std::sync::Mutex<HashSet<PathBuf>>>,
-) {
+    opened: Arc<Mutex<HashSet<PathBuf>>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut stream = match dev.into_event_stream() {
             Ok(s) => s,
@@ -205,18 +238,11 @@ fn spawn_reader(
                 return;
             }
         };
-        // Dropped on every way out: a PTT key held then is released, or the
-        // mic would stay open.
+        // Dropped on every way out, abort included: a PTT key held then is
+        // released, or the mic would stay open.
         let mut dispatch = Dispatch::new(cmd);
         loop {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            let ev = tokio::select! {
-                ev = stream.next_event() => ev,
-                _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
-            };
-            let ev = match ev {
+            let ev = match stream.next_event().await {
                 Ok(ev) => ev,
                 Err(_) => {
                     // Device gone; let the rescan pick it up again.
@@ -237,7 +263,7 @@ fn spawn_reader(
                 }
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]
@@ -251,5 +277,32 @@ mod tests {
         assert_eq!(parse_key("code:97"), Some(KeyCode::KEY_RIGHTCTRL));
         assert_eq!(parse_key(""), None);
         assert_eq!(parse_key("KEY_NOPE"), None);
+    }
+
+    /// Dropping the guard ends a reader at once — not at its next wake-up —
+    /// and the reader's `Dispatch` releases the PTT key it held.
+    #[tokio::test]
+    async fn dropping_the_guard_releases_a_held_key_at_once() {
+        let (cmd, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let guard = Guard {
+            tasks: Tasks::default(),
+        };
+        let reader = tokio::spawn(async move {
+            let mut dispatch = Dispatch::new(cmd);
+            dispatch.key(Action::Ptt, true);
+            std::future::pending::<()>().await;
+        });
+        guard.tasks.add(&reader);
+        assert!(matches!(commands.recv().await, Some(Command::Ptt(true))));
+        let tasks = guard.tasks.clone();
+        drop(guard);
+        let released = tokio::time::timeout(Duration::from_millis(500), commands.recv())
+            .await
+            .expect("released at once");
+        assert!(matches!(released, Some(Command::Ptt(false))));
+        // A reader a late rescan still spawns is stopped on arrival.
+        let late = tokio::spawn(std::future::pending::<()>());
+        tasks.add(&late);
+        assert!(late.await.unwrap_err().is_cancelled());
     }
 }

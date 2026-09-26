@@ -213,20 +213,14 @@ fn run(cli: Cli) -> Result<(), String> {
         let engine = Engine::start(cfg, backend).map_err(|e| e.to_string())?;
 
         // Hotkeys come up in the background: the Portal may show a dialog and
-        // the window must not wait for it. The guard lives on the runtime.
+        // the window must not wait for it. The supervisor lives on the
+        // runtime and follows the settings (a changed binding applies
+        // without a restart).
         if !cli.no_hotkeys {
-            let cmd = engine.command_sender();
-            let hk_settings = settings.hotkeys.clone();
-            engine.runtime().spawn(async move {
-                let hotkeys = icu_client::hotkey::start(&hk_settings, cmd.clone()).await;
-                tracing::info!(backend = %hotkeys.backend, "hotkeys");
-                let _ = cmd.send(icu_client::engine::Command::HotkeyBackend(
-                    hotkeys.backend.clone(),
-                ));
-                // Keep the guard alive for the lifetime of the runtime.
-                std::future::pending::<()>().await;
-                drop(hotkeys);
-            });
+            engine.runtime().spawn(icu_client::hotkey::supervise(
+                engine.state(),
+                engine.command_sender(),
+            ));
         }
 
         if cli.headless {

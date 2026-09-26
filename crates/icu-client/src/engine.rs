@@ -244,6 +244,9 @@ pub struct AppState {
     pub hotkey_backend: String,
     /// Settings as the engine holds them.
     pub settings: Settings,
+    /// Bumped by `Command::RetryHotkeys`; the hotkey supervisor
+    /// (`crate::hotkey::supervise`) binds again whenever it changes.
+    pub hotkey_retries: u32,
 }
 
 /// Commands from UI, tray and hotkeys.
@@ -338,6 +341,10 @@ pub enum Command {
     ReopenStreams,
     /// Stop everything.
     Quit,
+    /// Bind the hotkeys again with the current settings, e.g. to have the
+    /// portal ask again after its dialog was turned down
+    /// (`hotkey_backend == "portal-declined"`).
+    RetryHotkeys,
 }
 
 /// An `f32` the audio threads read every block without a lock.
@@ -628,6 +635,7 @@ impl Engine {
             camera_on: false,
             hotkey_backend: String::new(),
             settings: settings.clone(),
+            hotkey_retries: 0,
         };
         let (state_tx, state_rx) = watch::channel(initial);
         // Ring buffers between backend callbacks and the DSP/mixer threads.
@@ -2099,6 +2107,11 @@ impl LocalState {
             | Command::SetUserRestriction { .. }
             | Command::Reconnect
             | Command::Quit => {}
+            Command::RetryHotkeys => {
+                shared
+                    .state
+                    .send_modify(|s| s.hotkey_retries = s.hotkey_retries.wrapping_add(1));
+            }
         }
         set_state
     }
