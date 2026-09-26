@@ -30,6 +30,7 @@ use icu_client::{
         fonts,
         main_window::{EnrollApp, MainEnv, MainView},
         settings::SettingsView,
+        setup::{SetupView, Step},
         theme,
     },
 };
@@ -41,6 +42,7 @@ mod common;
 const MAIN: [f32; 2] = [400.0, 620.0];
 const SETTINGS: [f32; 2] = icu_client::ui::main_window::SETTINGS_SIZE;
 const CONNECTION: [f32; 2] = icu_client::ui::main_window::CONNECTION_SIZE;
+const SETUP: [f32; 2] = icu_client::ui::main_window::SETUP_SIZE;
 const ENROLL: [f32; 2] = [560.0, 600.0];
 
 const THEMES: [&str; 2] = ["light", "dark"];
@@ -574,4 +576,153 @@ fn settings_window_keeps_outside_changes() {
         "outside change written back"
     );
     assert!(sent.audio.cue_tx);
+}
+
+/// „Weiter“ in the setup's bottom bar.
+fn next_label() -> String {
+    format!("Weiter  {}", egui_phosphor::regular::ARROW_RIGHT)
+}
+
+/// The setup's four steps, walked through with „Weiter“ the way a new user
+/// does: each fits the window it opens with. Sprechen once for
+/// push-to-talk and once for voice activation; Klang with the optimizer on,
+/// its tallest form. A banner about the keys may grow the window.
+#[test]
+fn setup_steps_fit() {
+    let mut overflows = Overflows::default();
+    for theme_name in THEMES {
+        for mode in [ModeSetting::Ptt, ModeSetting::Vad] {
+            let mut s = state();
+            s.settings.ui.setup_done = false;
+            s.settings.audio.mode = mode;
+            s.settings.audio.voice_opt = true;
+            let overflow = Rc::new(RefCell::new(0.0));
+            let step = Rc::new(RefCell::new(Step::Devices));
+            let (out, at) = (overflow.clone(), step.clone());
+            let mut view = SetupView::new(&s);
+            let mut h = harness(SETUP, theme_name, true, move |ui| {
+                *out.borrow_mut() = view.ui(ui, &s).overflow;
+                *at.borrow_mut() = view.step();
+            });
+            for i in 0..Step::ALL.len() {
+                let now = *step.borrow();
+                assert_eq!(now, Step::ALL[i]);
+                let what = format!("setup/{now:?}/{mode:?}/{theme_name}");
+                overflows.check_window(&what, &h, SETUP, false, *overflow.borrow());
+                shot(&mut h, &what.replace('/', "-"));
+                if i + 1 < Step::ALL.len() {
+                    h.get_by_role_and_label(egui::accesskit::Role::Button, &next_label())
+                        .click();
+                    h.run();
+                }
+            }
+        }
+        for backend in ["", "none", "portal-declined"] {
+            let mut s = state();
+            s.hotkey_backend = backend.into();
+            let overflow = Rc::new(RefCell::new(0.0));
+            let out = overflow.clone();
+            let mut view = SetupView::new(&s);
+            let mut h = harness(SETUP, theme_name, true, move |ui| {
+                *out.borrow_mut() = view.ui(ui, &s).overflow;
+            });
+            h.get_by_role_and_label(egui::accesskit::Role::Button, &next_label())
+                .click();
+            h.run();
+            let what = format!("setup/Speak/backend-{backend}/{theme_name}");
+            overflows.check_window(&what, &h, SETUP, true, *overflow.borrow());
+            shot(&mut h, &what.replace('/', "-"));
+        }
+    }
+    overflows.assert_none();
+}
+
+/// The setup mutes on its first frame; „Fertig“ at the end marks it done
+/// and unmutes, the way the main window closes it (`App::setup_window`).
+#[test]
+fn setup_finish_marks_done_and_unmutes() {
+    let shared = Rc::new(RefCell::new(state()));
+    shared.borrow_mut().settings.ui.setup_done = false;
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let (state_in, cmds_out) = (shared.clone(), cmds.clone());
+    let mut view = SetupView::new(&shared.borrow());
+    let mut h = harness(SETUP, "light", true, move |ui| {
+        let state = state_in.borrow();
+        let out = view.ui(ui, &state);
+        cmds_out.borrow_mut().extend(out.cmds);
+        if out.done {
+            cmds_out.borrow_mut().extend(view.close(&state));
+        }
+    });
+    assert!(
+        matches!(cmds.borrow().first(), Some(Command::SetMuted(true))),
+        "muted while the setup is open"
+    );
+    // The engine applies it.
+    shared.borrow_mut().muted = true;
+    h.run();
+
+    for _ in 1..Step::ALL.len() {
+        h.get_by_role_and_label(egui::accesskit::Role::Button, &next_label())
+            .click();
+        h.run();
+    }
+    assert!(
+        !cmds
+            .borrow()
+            .iter()
+            .any(|c| matches!(c, Command::SetMuted(false))),
+        "still muted before „Fertig“"
+    );
+    h.get_by_role_and_label(
+        egui::accesskit::Role::Button,
+        &format!("{}  Fertig", egui_phosphor::regular::CHECK),
+    )
+    .click();
+    h.run();
+    assert!(last_update(&cmds.borrow()).ui.setup_done);
+    assert!(
+        matches!(cmds.borrow().last(), Some(Command::SetMuted(false))),
+        "unmuted by „Fertig“"
+    );
+}
+
+/// „Überspringen“ on the first step ends the setup for good without
+/// touching anything else; a user who was muted already stays muted.
+#[test]
+fn setup_skip_keeps_everything_and_an_earlier_mute() {
+    let mut s = state();
+    s.settings.ui.setup_done = false;
+    s.muted = true;
+    let before = s.settings.clone();
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let cmds_out = cmds.clone();
+    let mut view = SetupView::new(&s);
+    let mut h = harness(SETUP, "dark", true, move |ui| {
+        let out = view.ui(ui, &s);
+        cmds_out.borrow_mut().extend(out.cmds);
+        if out.done {
+            cmds_out.borrow_mut().extend(view.close(&s));
+        }
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Überspringen")
+        .click();
+    h.run();
+    let sent = last_update(&cmds.borrow());
+    assert!(sent.ui.setup_done);
+    assert_eq!(
+        Settings {
+            ui: before.ui.clone(),
+            ..sent.clone()
+        },
+        before,
+        "nothing but the flag changed"
+    );
+    assert!(
+        !cmds
+            .borrow()
+            .iter()
+            .any(|c| matches!(c, Command::SetMuted(_))),
+        "a mute from before the setup is not the setup's to lift"
+    );
 }

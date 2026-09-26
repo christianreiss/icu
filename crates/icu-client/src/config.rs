@@ -342,6 +342,10 @@ pub struct UiSettings {
     /// A desktop notification when someone comes or goes, besides the tone
     /// (`AudioSettings::cue_join`). Off by default.
     pub notify_join: bool,
+    /// The first-run setup („ICU — Einrichtung“, `ui::setup`) was finished
+    /// or skipped. While `false` the main window opens it; a file from
+    /// before the setup existed has no such key, so it shows once there too.
+    pub setup_done: bool,
 }
 
 impl Default for UiSettings {
@@ -353,6 +357,7 @@ impl Default for UiSettings {
             theme: "system".into(),
             show_advanced: false,
             notify_join: false,
+            setup_done: false,
         }
     }
 }
@@ -911,6 +916,7 @@ mod tests {
         s.set_volume(7, 120.0);
         s.set_volume(9, 100.0);
         s.ui.name = Some("chris".into());
+        s.ui.setup_done = true;
         s.save(&paths).unwrap();
 
         let back = Settings::load(&paths).unwrap();
@@ -928,6 +934,7 @@ mod tests {
         assert!(text.contains("voice_strength = \"strong\""));
         assert!(text.contains("corner = \"bottom-left\""));
         assert!(text.contains("[volumes]"));
+        assert!(text.contains("setup_done = true"));
     }
 
     #[test]
@@ -952,6 +959,14 @@ mod tests {
         assert!(s.audio.normalize_outgoing);
         assert_eq!(s.audio.voice_strength, VoiceStrength::Medium);
         assert!(s.overlay.dim_non_speaking, "old settings.toml default on");
+        assert!(
+            !s.ui.setup_done,
+            "a file from before the setup shows it once"
+        );
+        assert!(
+            !Settings::default().ui.setup_done,
+            "a fresh install shows it"
+        );
     }
 
     /// A CA named like a current server's and a leaf with the URI SAN, as

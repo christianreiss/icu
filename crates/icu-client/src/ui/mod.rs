@@ -1,10 +1,11 @@
-//! eframe/egui user interface: main window, settings and enrollment
+//! eframe/egui user interface: main window, settings, setup and enrollment
 //! (`Client/IMPLEMENTATION.md` §10).
 
 pub mod connection;
 pub mod fonts;
 pub mod main_window;
 pub mod settings;
+pub mod setup;
 pub mod theme;
 pub mod widgets;
 
