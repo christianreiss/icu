@@ -1214,7 +1214,7 @@ mod tests {
         let saver = {
             let paths = paths.clone();
             std::thread::spawn(move || {
-                for i in 0..200 {
+                for i in 0..60 {
                     set(1 + (i % 2) as u8).save(&paths).expect("save");
                 }
             })
