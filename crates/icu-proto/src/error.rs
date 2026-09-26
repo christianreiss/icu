@@ -120,6 +120,7 @@ pub fn is_fatal(code: u32) -> bool {
             | AUTH_UNKNOWN_CERT
             | AUTH_REVOKED
             | KICKED
+            | AUTH_REQUIRED
             | RATE_LIMITED_FATAL
             | ENROLL_BAD_TOKEN
             | ENROLL_BAD_CSR
@@ -176,6 +177,7 @@ mod tests {
             AUTH_UNKNOWN_CERT,
             AUTH_REVOKED,
             KICKED,
+            AUTH_REQUIRED,
             RATE_LIMITED_FATAL,
             ENROLL_BAD_TOKEN,
             ENROLL_BAD_CSR,
