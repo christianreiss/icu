@@ -94,7 +94,7 @@ Tabelle „Feature | v1 | Grund". „Perfekt" = das Kriterium in der Grund-Spalt
 | Attenuation anderer Apps beim Sprechen | nein | Systemweite Lautstärkeeingriffe (Ducking) sind plattformspezifisch und überraschend; Spiel-Lautstärke regelt das OS. |
 | Idle-Auto-Mute/Deafen | nein | Mit PTT irrelevant, mit VAD wird Stille ohnehin nicht gesendet. |
 | Text-to-Speech, Avatare, Themes, Fonts | nein | Kosmetik bzw. Barrierefreiheitsfeature ohne Nachfrage in der Gruppe; Themes folgen dem System (hell/dunkel). |
-| Zertifikatsverwaltung im Client | nein | **Revidiert 2026-09-22.** Weiterhin keine Zertifikats*verwaltung* (kein Ausstellen, kein Widerrufen, kein Store) — aber der Nutzer sieht sein Zertifikat sehr wohl: das Verbindungsfenster zeigt es lesend an, eine Namensänderung erneuert es still, und der Passport (`PROTOCOL.md` §2.3.2) exportiert und importiert die ganze Identität. Widerruf bleibt Sache von Server-CLI und Admin-Tab. |
+| Zertifikatsverwaltung im Client | nein | **Revidiert 2026-09-22.** Weiterhin keine Zertifikats*verwaltung* (kein Ausstellen, kein Widerrufen, kein Store) — aber der Nutzer sieht sein Zertifikat sehr wohl: das Verbindungsfenster zeigt es lesend an, eine Namensänderung erneuert es still, und der Passport (`PROTOCOL.md` §2.3.1) exportiert und importiert die ganze Identität, seit 2026-09-26 samt Einstellungen (ohne Geräteauswahl; beim Import abwählbar). Widerruf bleibt Sache von Server-CLI und Admin-Tab. |
 | Positionierbare Overlay-Layouts (FPS, Uhr) | nein | Overlay zeigt Sprecher und Kamera, sonst nichts; FPS/Uhr liefern Spiele/OS. |
 
 ### Grauzone mit Empfehlung
