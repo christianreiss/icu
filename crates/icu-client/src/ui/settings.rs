@@ -2350,16 +2350,16 @@ fn device_combo(
         .as_deref()
         .filter(|id| !devices.iter().any(|d| d.id == *id));
     let current = match selected.as_deref() {
-        None => "Standard".to_string(),
+        None => "System-Standard".to_string(),
         Some(id) => devices
             .iter()
             .find(|d| d.id == id)
             .map(|d| d.description.clone())
-            .unwrap_or_else(|| "Fehlt – Standard läuft".to_string()),
+            .unwrap_or_else(|| "Fehlt – System-Standard läuft".to_string()),
     };
     let hint = missing.map(|id| {
         format!(
-            "{id} ist nicht angeschlossen. Bis es wieder da ist, läuft das Standardgerät; \
+            "{id} ist nicht angeschlossen. Bis es wieder da ist, läuft der System-Standard; \
              danach nimmt ICU es von selbst wieder."
         )
     });
@@ -2369,7 +2369,7 @@ fn device_combo(
             .width(240.0)
             .show_ui(ui, |ui| {
                 if ui
-                    .selectable_label(selected.is_none(), "Standard")
+                    .selectable_label(selected.is_none(), "System-Standard")
                     .clicked()
                 {
                     *selected = None;

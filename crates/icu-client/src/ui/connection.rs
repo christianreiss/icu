@@ -1199,17 +1199,17 @@ fn aec_text(state: &AppState) -> String {
     text
 }
 
-/// The human-readable name of the selected device, or „Standard“.
+/// The human-readable name of the selected device, or „System-Standard“.
 fn device_name(state: &AppState, kind: DeviceKind, id: Option<&str>) -> String {
     let Some(id) = id else {
-        return "Standard".to_string();
+        return "System-Standard".to_string();
     };
     state
         .devices
         .iter()
         .find(|d| d.kind == kind && d.id == id)
         .map(|d| d.description.clone())
-        .unwrap_or_else(|| format!("{id} (nicht gefunden)"))
+        .unwrap_or_else(|| format!("{id} (fehlt, System-Standard läuft)"))
 }
 
 // ---------------------------------------------------------------------------

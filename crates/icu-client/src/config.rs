@@ -178,7 +178,8 @@ pub struct KeyBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum HotkeyBackend {
-    /// Portal first, evdev if the portal cancels.
+    /// Portal first; evdev only when there is no portal or it fails. A
+    /// declined portal dialog stays declined (`hotkey::BACKEND_PORTAL_DECLINED`).
     #[default]
     Auto,
     /// Portal only.
