@@ -120,6 +120,7 @@ impl Ca {
                 may_create()?;
                 tracing::warn!(
                     dir = %dir.display(),
+                    server_name,
                     "no CA in the state directory, creating a new one"
                 );
                 create_ca(dir, tls, server_name)?
@@ -566,6 +567,32 @@ pub fn leaf_info(der: &[u8]) -> LeafInfo {
         validity: Some(validity(cert)),
     })
     .unwrap_or_default()
+}
+
+/// The server name an existing CA in `dir` carries in its CN
+/// (`ICU CA <server_name>`): `Ok(None)` without a `ca.crt`, an error when it
+/// cannot be read or names no server — a CA from before the name moved into
+/// its CN.
+pub fn ca_server_name(dir: &Path) -> Result<Option<String>> {
+    let path = dir.join(CA_CRT);
+    let pem = match std::fs::read(&path) {
+        Ok(pem) => pem,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::msg(format!("cannot read {}: {e}", path.display()))),
+    };
+    let der = read_cert_pem(&pem).context("ca.crt")?;
+    let cn = with_leaf(&der, common_name).unwrap_or_default();
+    match cn
+        .strip_prefix(CA_COMMON_NAME)
+        .and_then(|rest| rest.strip_prefix(' '))
+    {
+        Some(name) if !name.trim().is_empty() => Ok(Some(name.trim().to_string())),
+        _ => Err(Error::msg(format!(
+            "the CA in {} ({cn:?}) names no server; set server.server_name to the \
+             name its server certificate carries",
+            path.display()
+        ))),
+    }
 }
 
 fn common_name(cert: &X509Certificate<'_>) -> String {

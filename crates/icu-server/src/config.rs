@@ -42,7 +42,9 @@ pub struct ServerSection {
     /// UDP addresses to bind. One endpoint per entry.
     pub listen: Vec<SocketAddr>,
     /// SNI in the server certificate; also part of the CA's CN, which is
-    /// where clients take their SNI from.
+    /// where clients take their SNI from. Unset in a config file: the name
+    /// an existing CA carries, else the host's FQDN if it resolves to an
+    /// address of this host ([`Config::load`]).
     pub server_name: String,
     /// `host:port` clients dial. Written into every client certificate as
     /// URI SAN `icu://<public_host>` (`PROTOCOL.md` §2.3).
@@ -276,6 +278,107 @@ fn reserved_name(host: &str) -> bool {
             .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
 }
 
+/// `server_name` for a config file that leaves it unset: the name an existing
+/// CA carries — it is baked in there for good, and a changed hostname must not
+/// move it — else the host's FQDN, confirmed by DNS ([`verify_fqdn`]).
+fn default_server_name(state_dir: &Path) -> Result<String> {
+    if let Some(name) = crate::ca::ca_server_name(state_dir)? {
+        return Ok(name);
+    }
+    let name = host_fqdn();
+    verify_fqdn(
+        &name,
+        |name| {
+            use std::net::ToSocketAddrs;
+            (name, 0)
+                .to_socket_addrs()
+                .map(|addrs| addrs.map(|a| a.ip()).collect())
+                .unwrap_or_default()
+        },
+        // Binding succeeds only for an address of this host.
+        |ip| std::net::UdpSocket::bind((ip, 0)).is_ok(),
+    )
+    .map_err(|why| {
+        Error::msg(format!(
+            "server.server_name is not set and the host's FQDN {name:?} cannot stand \
+             in for it: {why}. Set server.server_name (and server.public_host, if \
+             clients connect through NAT) to the DNS name or IP address clients \
+             connect to"
+        ))
+    })
+}
+
+/// `169.254.0.0/16` or `fe80::/10`: no client elsewhere can dial it.
+fn link_local(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
+    }
+}
+
+/// What `hostname --fqdn` prints, else the kernel's host name.
+fn host_fqdn() -> String {
+    std::process::Command::new("hostname")
+        .arg("--fqdn")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            rustix::system::uname()
+                .nodename()
+                .to_string_lossy()
+                .into_owned()
+        })
+}
+
+/// `name`, normalised, if it can go into a new CA: a dotted DNS name, not
+/// `localhost` or reserved for examples, that `resolve`s to at least one
+/// address that is neither loopback, unspecified nor link-local and
+/// `is_local` to this host — so a name pointing elsewhere, only at Debian's
+/// `127.0.1.1` entry in `/etc/hosts`, or only at the `fe80::` address
+/// nss-myhostname hands out, is refused. The error says why.
+fn verify_fqdn(
+    name: &str,
+    resolve: impl Fn(&str) -> Vec<std::net::IpAddr>,
+    is_local: impl Fn(std::net::IpAddr) -> bool,
+) -> std::result::Result<String, String> {
+    let name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() {
+        return Err("the host has no name".into());
+    }
+    if !name.contains('.') || name.parse::<std::net::IpAddr>().is_ok() {
+        return Err("it is not a fully qualified domain name".into());
+    }
+    if name == "localhost" || name.starts_with("localhost.") {
+        return Err("it is a name for loopback".into());
+    }
+    if reserved_name(&name) {
+        return Err("it is reserved for examples (RFC 2606)".into());
+    }
+    let addrs = resolve(&name);
+    if addrs.is_empty() {
+        return Err("it does not resolve".into());
+    }
+    if addrs
+        .iter()
+        .any(|ip| !ip.is_loopback() && !ip.is_unspecified() && !link_local(*ip) && is_local(*ip))
+    {
+        Ok(name)
+    } else {
+        let addrs = addrs
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "it resolves to {addrs}, none of them a routable address of this host"
+        ))
+    }
+}
+
 /// Longest certificate lifetime a configuration may ask for: 100 years. The
 /// date arithmetic behind a larger one overflows.
 pub const MAX_VALIDITY_DAYS: u32 = 36_500;
@@ -289,8 +392,11 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .context(format!("cannot read config {}", path.display()))?;
-        let config: Config =
+        let mut config: Config =
             toml::from_str(&text).context(format!("cannot parse config {}", path.display()))?;
+        if config.server.server_name.trim().is_empty() {
+            config.server.server_name = default_server_name(&config.paths.state_dir)?;
+        }
         config.validate()?;
         config.validate_lifetimes()?;
         Ok(config)
@@ -546,6 +652,72 @@ mod tests {
         assert_eq!(limits.video_kbit_s, 400);
         assert_eq!(ServerSection::default().max_users, 16);
         assert_eq!(TimingSection::default().hello_timeout().as_secs(), 5);
+    }
+
+    #[test]
+    fn fqdn_must_resolve_to_this_host() {
+        use std::net::IpAddr;
+        let local: IpAddr = "192.0.2.10".parse().unwrap();
+        let foreign: IpAddr = "198.51.100.7".parse().unwrap();
+        let resolve = |_: &str| vec!["127.0.1.1".parse().unwrap(), foreign, local];
+        let is_local = |ip: IpAddr| ip == local || ip.is_loopback() || !ip.is_ipv4();
+        assert_eq!(
+            verify_fqdn("ICU.Home.Arpa.\n", resolve, is_local).unwrap(),
+            "icu.home.arpa"
+        );
+        for (name, addrs, why) in [
+            ("", vec![local], "no name"),
+            ("srv1", vec![local], "fully qualified"),
+            ("192.0.2.10", vec![local], "fully qualified"),
+            ("localhost.localdomain", vec![local], "loopback"),
+            ("icu.example.org", vec![local], "reserved"),
+            ("icu.home.arpa", vec![], "does not resolve"),
+            (
+                "icu.home.arpa",
+                vec!["127.0.1.1".parse().unwrap()],
+                "127.0.1.1",
+            ),
+            ("icu.home.arpa", vec![foreign], "198.51.100.7"),
+            ("icu.home.arpa", vec!["fe80::1".parse().unwrap()], "fe80::1"),
+        ] {
+            let err = verify_fqdn(name, |_| addrs.clone(), is_local).unwrap_err();
+            assert!(err.contains(why), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn unset_server_name_comes_from_an_existing_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        crate::ca::Ca::load_or_create(&state, &TlsSection::default(), "icu.internal.lan").unwrap();
+        let file = dir.path().join("server.toml");
+        std::fs::write(
+            &file,
+            format!("[paths]\nstate_dir = {:?}\n", state.to_str().unwrap()),
+        )
+        .unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.server_name, "icu.internal.lan");
+        assert_eq!(config.public_host(), "icu.internal.lan:4711");
+
+        // A CA from before the name moved into its CN names no server.
+        let old = dir.path().join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, crate::ca::CA_COMMON_NAME);
+        let cert = params.self_signed(&key).unwrap();
+        std::fs::write(old.join("ca.crt"), cert.pem()).unwrap();
+        std::fs::write(
+            &file,
+            format!("[paths]\nstate_dir = {:?}\n", old.to_str().unwrap()),
+        )
+        .unwrap();
+        let err = Config::load(&file).unwrap_err().to_string();
+        assert!(err.contains("names no server"), "{err}");
     }
 
     #[test]
