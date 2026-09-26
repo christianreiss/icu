@@ -447,29 +447,27 @@ impl SettingsView {
             .collect();
 
         widgets::group_card(ui, "Geräte", |ui| {
+            // The mic test sits next to the microphone: hearing yourself
+            // answers „bin ich zu leise, klinge ich blechern?" without a
+            // second person; it plays what the others get, after the whole
+            // send chain.
             device_combo(
                 ui,
                 false,
                 "Mikrofon",
                 &mut self.draft.audio.input_device,
                 &inputs,
-            );
-            // Hearing yourself answers „bin ich zu leise, klinge ich
-            // blechern?" without a second person; it plays what the others
-            // get, after the whole send chain.
-            widgets::setting_row(
-                ui,
-                true,
-                "Mikrofontest",
-                Some("Du hörst dich so, wie die anderen dich hören."),
                 |ui| {
                     let (kind, glyph, label) = if state.mic_test {
                         (widgets::ButtonKind::Primary, icon::STOP, "Beenden")
                     } else {
-                        (widgets::ButtonKind::Neutral, icon::HEADPHONES, "Anhören")
+                        (widgets::ButtonKind::Neutral, icon::HEADPHONES, "Testen")
                     };
                     if widgets::button(ui, kind, glyph, label)
-                        .on_hover_text("Endet von selbst nach einer Minute")
+                        .on_hover_text(
+                            "Mikrofontest: du hörst dich so, wie die anderen dich hören. \
+                             Endet von selbst nach einer Minute.",
+                        )
                         .clicked()
                     {
                         cmds.push(Command::SetMicTest(!state.mic_test));
@@ -482,6 +480,7 @@ impl SettingsView {
                 "Lautsprecher",
                 &mut self.draft.audio.output_device,
                 &outputs,
+                |_| {},
             );
             widgets::slider_row(
                 ui,
@@ -607,7 +606,7 @@ impl SettingsView {
             }
         });
 
-        widgets::group_card(ui, "Hinweistöne", |ui| {
+        widgets::group_card(ui, "Hinweise", |ui| {
             widgets::card_note(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
@@ -622,6 +621,15 @@ impl SettingsView {
                         );
                     widgets::chip_toggle(ui, &mut audio.cue_mute, "Stummschalten")
                         .on_hover_text("Zwei Töne beim Stummschalten und wieder Einschalten");
+                    widgets::chip_toggle(
+                        ui,
+                        &mut self.draft.ui.notify_join,
+                        "Meldung bei Kommen und Gehen",
+                    )
+                    .on_hover_text(
+                        "Zusätzlich zum Ton eine Benachrichtigung der Arbeitsumgebung – \
+                         hilfreich, solange ICU im Tray liegt",
+                    );
                 });
             });
         });
@@ -2327,12 +2335,14 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
     });
 }
 
+/// A device choice; `extra` goes left of the list, in the same row.
 fn device_combo(
     ui: &mut Ui,
     divider: bool,
     label: &str,
     selected: &mut Option<String>,
     devices: &[&crate::audio::DeviceInfo],
+    extra: impl FnOnce(&mut Ui),
 ) {
     // A saved device that is not plugged in: the engine plays through the
     // system default meanwhile and goes back to it once it returns.
@@ -2374,6 +2384,7 @@ fn device_combo(
         if let Some(hint) = hint {
             combo.response.on_hover_text(hint);
         }
+        extra(ui);
     });
 }
 

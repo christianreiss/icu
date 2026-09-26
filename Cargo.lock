@@ -2524,6 +2524,7 @@ dependencies = [
  "webrtc-audio-processing-config",
  "windows",
  "x509-parser",
+ "zbus",
  "zune-jpeg",
 ]
 

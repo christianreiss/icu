@@ -14,6 +14,7 @@ pub mod hotkey;
 pub mod instance;
 pub mod net;
 pub mod netcond;
+pub mod notify;
 #[cfg(feature = "overlay")]
 pub mod overlay;
 pub mod problem;

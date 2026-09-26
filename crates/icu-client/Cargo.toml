@@ -84,6 +84,8 @@ pipewire = { version = "0.10.1", features = ["v0_3_49"] }
 libc = "0.2"
 ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "global_shortcuts"] }
 evdev = { version = "0.13.2", features = ["tokio"] }
+# Join/leave notifications (`notify`); already in the tree through ashpd.
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 futures-util = "0.3"
 smithay-client-toolkit = { version = "0.21.1", features = ["calloop"], optional = true }
 wayland-client = { version = "0.31", optional = true }

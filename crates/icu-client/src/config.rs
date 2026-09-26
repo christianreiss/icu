@@ -329,7 +329,8 @@ pub struct UiSettings {
     pub name: Option<String>,
     /// Start in the tray.
     pub start_minimized: bool,
-    /// Register the `icu://` URI handler on start.
+    /// Register the `.icu` file association on start (`crate::uri`); the
+    /// name is from when it was an `icu://` handler.
     pub register_uri_handler: bool,
     /// Theme: `system`, `light`, `dark`.
     pub theme: String,
@@ -337,6 +338,9 @@ pub struct UiSettings {
     /// times, hotkey backend, passport, diagnostics) next to the everyday
     /// ones. Off by default: most people never need them.
     pub show_advanced: bool,
+    /// A desktop notification when someone comes or goes, besides the tone
+    /// (`AudioSettings::cue_join`). Off by default.
+    pub notify_join: bool,
 }
 
 impl Default for UiSettings {
@@ -347,6 +351,7 @@ impl Default for UiSettings {
             register_uri_handler: true,
             theme: "system".into(),
             show_advanced: false,
+            notify_join: false,
         }
     }
 }

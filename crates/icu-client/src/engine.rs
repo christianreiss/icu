@@ -1960,6 +1960,7 @@ async fn net_task(
         renew_attempted_at: None,
         window_visible: !cfg.settings.ui.start_minimized,
         muted_before_deafen: false,
+        notifier: crate::notify::Notifier::default(),
     };
     local.update_viewing();
     let mut attempt: u32 = 0;
@@ -2243,6 +2244,8 @@ struct LocalState {
     window_visible: bool,
     /// The mute from before deafening, restored by undeafening.
     muted_before_deafen: bool,
+    /// Join/leave notifications (`UiSettings::notify_join`).
+    notifier: crate::notify::Notifier,
 }
 
 /// A renewal in flight: which name it asks for, and why it was sent.
@@ -3648,6 +3651,9 @@ async fn handle_control(
         ControlMsg::UserJoined { user } => {
             let peer = admit(shared, &local.settings, &user);
             local.cue(shared, Cue::Join);
+            if local.settings.ui.notify_join {
+                local.notifier.show(crate::notify::Note::joined(&user.name));
+            }
             shared.state.send_modify(|s| {
                 s.peers.retain(|p| p.info.session != user.session);
                 s.peers.push(peer);
@@ -3658,6 +3664,18 @@ async fn handle_control(
             lock(&shared.speakers).remove(&session);
             shared.video.lock().unwrap().remove(session);
             local.cue(shared, Cue::Leave);
+            if local.settings.ui.notify_join {
+                let name = shared
+                    .state
+                    .borrow()
+                    .peers
+                    .iter()
+                    .find(|p| p.info.session == session)
+                    .map(|p| p.info.name.clone());
+                if let Some(name) = name {
+                    local.notifier.show(crate::notify::Note::left(&name));
+                }
+            }
             shared
                 .state
                 .send_modify(|s| s.peers.retain(|p| p.info.session != session));
