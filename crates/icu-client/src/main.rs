@@ -317,6 +317,12 @@ fn run(cli: Cli) -> Result<(), String> {
         // runtime and follows the settings (a changed binding applies
         // without a restart).
         if !cli.no_hotkeys {
+            // Until the first backend reports — on KDE, until its dialog is
+            // answered — the window says they are coming, not that they
+            // are off. Before the spawn, so the report cannot overtake it.
+            engine.command(icu_client::engine::Command::HotkeyBackend(
+                icu_client::hotkey::BACKEND_STARTING.into(),
+            ));
             engine.runtime().spawn(icu_client::hotkey::supervise(
                 engine.state(),
                 engine.command_sender(),

@@ -1127,6 +1127,7 @@ impl SettingsView {
                     let tok = theme::tokens(ui.visuals());
                     let (color, text) = match backend {
                         "" => (tok.connecting, "abgeschaltet"),
+                        crate::hotkey::BACKEND_STARTING => (tok.connecting, "wird eingerichtet"),
                         crate::hotkey::BACKEND_NONE => (tok.error, "keiner"),
                         crate::hotkey::BACKEND_PORTAL_DECLINED => (tok.connecting, "abgelehnt"),
                         backend => (tok.connected, backend),
@@ -2274,11 +2275,12 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
 }
 
 /// What the Tastenkürzel page and the setup say while the hotkeys do not
-/// work: never started, the portal's dialog turned down (with the two ways
-/// on), or no way to read keys at all. Nothing while they work. `backend` is
-/// what `crate::hotkey` reports — "portal", "evdev (n devices)",
-/// "portal-declined" or "none"; the empty string means it was never started
-/// (`--no-hotkeys`). `choice` is the draft's backend setting.
+/// work: still being set up, never started, the portal's dialog turned down
+/// (with the two ways on), or no way to read keys at all. Nothing while they
+/// work. `backend` is what `crate::hotkey` reports — "starting", "portal",
+/// "evdev (n devices)", "portal-declined" or "none"; the empty string means
+/// it was never started (`--no-hotkeys`). `choice` is the draft's backend
+/// setting.
 pub(super) fn hotkey_notice(
     ui: &mut Ui,
     backend: &str,
@@ -2286,6 +2288,17 @@ pub(super) fn hotkey_notice(
     cmds: &mut Vec<Command>,
 ) {
     match backend {
+        crate::hotkey::BACKEND_STARTING => {
+            widgets::banner(
+                ui,
+                widgets::BannerKind::Warning,
+                "Tastenkürzel werden eingerichtet",
+                "Fragt die Arbeitsumgebung in einem eigenen Dialog nach, dort bestätigen — \
+                 danach wirken die Tasten.",
+                None::<fn()>,
+            );
+            ui.add_space(12.0);
+        }
         "" => {
             widgets::banner(
                 ui,

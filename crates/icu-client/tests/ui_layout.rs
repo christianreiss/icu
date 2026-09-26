@@ -617,7 +617,7 @@ fn setup_steps_fit() {
                 }
             }
         }
-        for backend in ["", "none", "portal-declined"] {
+        for backend in ["starting", "", "none", "portal-declined"] {
             let mut s = state();
             s.hotkey_backend = backend.into();
             let overflow = Rc::new(RefCell::new(0.0));

@@ -125,6 +125,11 @@ pub const BACKEND_NONE: &str = "none";
 /// the portal is there, and asking again may well work.
 pub const BACKEND_PORTAL_DECLINED: &str = "portal-declined";
 
+/// `AppState::hotkey_backend` from the moment the supervisor is started
+/// until the first backend reports: the portal's dialog may be waiting for
+/// an answer. The empty string stays for „never started“ (`--no-hotkeys`).
+pub const BACKEND_STARTING: &str = "starting";
+
 /// A running hotkey backend.
 pub struct Hotkeys {
     /// Human readable backend description for the settings view:
