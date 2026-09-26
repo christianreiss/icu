@@ -1,4 +1,4 @@
-# ICU Live-Test (Linux-Client gegen lokalen Server)
+# ICU Live-Test (Linux-Client gegen lokalen Server; Windows §7)
 
 Stand 2026-09-26 (Pre-Release-Gate). Alles auf einem Rechner (KDE Plasma Wayland, PipeWire). Zwei Client-Instanzen laufen mit getrennten `--config-dir`, damit jede ihre eigene Identität (Zertifikat) und Einstellungen hat; je Konfigurationsverzeichnis läuft höchstens eine Instanz mit Fenster (ein zweiter Start holt nur das Fenster der laufenden nach vorn; `--headless` prüft das nicht).
 
@@ -132,5 +132,27 @@ icu stats: sent=498 recv=500 bad=0 decoded=499 fec=0 plc=0 played=480960 play_un
 - **Akustisches Echo**: ERLE mit echtem Lautsprecher und Mikrofon, Drift über 10 min (`Research/aec.md` A2/A5).
 - **Interaktiv**: Portal-Dialog auf KDE (inkl. Maustasten mit „Listening for mouse buttons“), Overlay über einem Borderless-Spiel und seine Klick-Durchlässigkeit, Tray-Menü.
 - **Kamera**: `/dev/video0` (C270) braucht ~3 s bis zum ersten Bild (Auto-Belichtung); bei wenig Licht 4–6 fps statt 15.
-- **Windows**: nicht Teil dieses Releases (WASAPI, Raw Input, Layered Window und DPAPI sind nicht implementiert).
+- **Windows**: implementiert (2026-09-26), auf echtem Windows noch nicht gelaufen; Checkliste in §7.
 - Der Debug-Build braucht ~1,2 ms je 10-ms-Block; für Latenzmessungen den Release-Build nehmen.
+
+## 7. Windows (offen)
+
+Stand 2026-09-26: der Windows-Client ist gebaut (`packaging/windows/build.sh` → `dist/<ver>/icu-<ver>-windows-x86_64.zip`, Features `aec,gui,camera,tray,overlay`) und nur unter Wine 11 getestet (Unit-Tests 216/217, der eine an Wines `WSAENOPROTOOPT` für quinn-Sockets). Alles Folgende ist Laufzeit auf echtem Windows und **offen**. Ziel für den ersten Durchgang: VM `win10-test` (10.2.0.201), sobald der SSH-Zugang steht; was echte Hardware braucht, ist „offen, Hardware“. Server wie §1, aber auf einer Adresse, die die VM erreicht.
+
+- [ ] **Start** (offen): ZIP entpacken, `icu.exe` starten; SmartScreen-Dialog (unsigniert) mit „Trotzdem ausführen“; kein Konsolenfenster; Log unter `%LOCALAPPDATA%\icu\icu.log`, aus `cmd` gestartet Log in der Konsole (`AttachConsole`).
+- [ ] **Registrierung** (offen): Einladung per Doppelklick auf die `.icu`-Datei → Erststart-Fenster vorbelegt; Dateizuordnung unter `HKCU\Software\Classes\.icu`/`ICU.Invite` mit Icon im Explorer.
+- [ ] **Eine Instanz** (offen): zweiter Start holt das Fenster nach vorn (auch aus dem Tray), Doppelklick auf eine `.icu`-Datei bei laufendem ICU landet im offenen Fenster.
+- [ ] **DPAPI** (offen): `identity\key.pk8` beginnt mit `ICU-DPAPI/1`; Passport-Export/-Import funktioniert; eine alte, unversiegelte `key.pk8` wird gelesen und beim nächsten Speichern versiegelt.
+- [ ] **WASAPI** (offen): Geräteliste; Periode im Log (IAudioClient3 bei float32 @ 48 kHz: 240 Frames bzw. nächstes Vielfaches; sonst `AUTOCONVERTPCM` mit 20 ms, z. B. Gerät auf 44,1 kHz stellen); `--debug-stats` wie §5 (`play_underruns=0`, `cap_overruns=0`); zwei Clients sprechen miteinander.
+- [ ] **Hot-Plug** (offen): Standardgerät in den Windows-Einstellungen wechseln → „Standard“-Streams folgen; USB-Headset ziehen/stecken; fest gewähltes Gerät ziehen → Fehlermeldung statt Absturz.
+- [ ] **AEC-Referenz** (offen): Loopback des Ausgabegeräts liefert (`ref_underruns` nur beim Start); Spielton/Musik über Lautsprecher verschwindet aus dem gesendeten Signal; ERL/ERLE unter Erweitert plausibel.
+- [ ] **A6 Drift** Loopback ↔ Mikrofon über 10 min in ppm (offen, Hardware; `Research/aec.md` A6).
+- [ ] **MMCSS** (offen): Engine-Threads in der Aufgabe „Pro Audio“ (z. B. Process Explorer), kein Stottern unter CPU-Last.
+- [ ] **Raw Input** (offen): PTT/Mute/Deafen mit fokussiertem anderem Fenster; „Aufnehmen“ erkennt Tasten, Pause, Seitentasten der Maus (`BTN_SIDE`/`BTN_EXTRA`); kein Auto-Repeat; Tasten bleiben nach dem Öffnen weiterer Fenster wirksam (Neuregistrierung gegen winit).
+- [ ] **Raw Input im Spiel** mit Gaming-Maus bei fokussiertem Borderless-Spiel (offen, Hardware).
+- [ ] **UIPI** (offen, Hardware): Spiel als Administrator → Tasten kommen nicht an, Hinweis in ⚙ → Tastenkürzel stimmt; ICU als Administrator → Tasten kommen an.
+- [ ] **Overlay** (offen): klick-durchlässig, bleibt oben, Ecke/Offset im Arbeitsbereich des primären Monitors, auch bei Skalierung ≠ 100 %; über einem Borderless-Spiel (offen, Hardware).
+- [ ] **Toast** (offen): „Meldung bei Kommen und Gehen“ an → Toast mit Absender „ICU“, ein neuer ersetzt den vorigen, kein Systemton.
+- [ ] **Tray** (offen): Icon-Varianten, Menü, Doppelklick, „Beim Schließen“ Infobereich/Minimieren/Beenden.
+- [ ] **Kamera** (offen): MediaFoundation-Kamera, Vorschau, Bild beim Gegenüber.
+- [ ] **Beenden** (offen): Abmelden/Herunterfahren mit laufendem ICU → sauberes Ende (letzte Einstellung gespeichert), kein „Diese App verhindert das Herunterfahren“; Strg+C in der Konsole.

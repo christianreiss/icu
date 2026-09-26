@@ -2260,7 +2260,10 @@ impl eframe::App for EnrollApp {
         // A passport carries its own certificate; a registration bundle
         // needs a name, which the user types in: the placeholder is the
         // inviter's, not theirs.
-        let parsed = Identity::from_passport_with_settings(&self.link).ok();
+        // Nothing pasted yet: nothing to decode, and no log line per frame.
+        let parsed = (!self.link.trim().is_empty())
+            .then(|| Identity::from_passport_with_settings(&self.link).ok())
+            .flatten();
         let carries_settings = parsed.as_ref().is_some_and(|(_, s)| s.is_some());
         let parsed = parsed.map(|(identity, _)| identity);
         // Where the pasted text leads, shown before joining: it brings its
