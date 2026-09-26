@@ -302,6 +302,29 @@ mod tests {
         assert_eq!(enc.loss_perc(), FEC_FLOOR_PERCENT);
     }
 
+    /// Any loss percentage forces SILK-only for voice (`opus_encoder.c`,
+    /// `useInBandFEC && packetLossPercentage > …`); above wideband that is
+    /// promoted back to hybrid. The floor must not cost fullband.
+    #[test]
+    fn fec_floor_stays_fullband_hybrid() {
+        let voice = crate::dsp::testsignal::voice(48_000 * 2, 5, 0.1).samples;
+        let mut enc = Encoder::new().unwrap();
+        let mut voiced = 0;
+        for frame in voice.as_chunks::<960>().0 {
+            let pkt = enc.encode(frame).unwrap();
+            if pkt.len() < 20 {
+                continue;
+            }
+            // SAFETY: pointer to a live packet's TOC byte.
+            let bw = unsafe { ffi::opus_packet_get_bandwidth(pkt.as_ptr()) };
+            let config = pkt[0] >> 3;
+            assert_eq!(bw, ffi::OPUS_BANDWIDTH_FULLBAND, "TOC config {config}");
+            assert!((14..=15).contains(&config), "not hybrid FB: config {config}");
+            voiced += 1;
+        }
+        assert!(voiced > 50);
+    }
+
     #[test]
     fn new_encoder_starts_at_fec_floor() {
         assert_eq!(Encoder::new().unwrap().loss_perc(), FEC_FLOOR_PERCENT);

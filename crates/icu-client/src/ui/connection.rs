@@ -951,7 +951,7 @@ fn audio_section(state: &AppState, stats: &DebugStats, jitter: &str) -> Section 
         .row(Row::mono(
             "In-Band-FEC",
             format!(
-                "an · Verlusthinweis {} %",
+                "an · ausgelegt auf {} % Verlust",
                 stats.packet_loss_perc.load(Ordering::Relaxed)
             ),
         ))

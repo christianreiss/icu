@@ -2118,7 +2118,7 @@ impl SettingsView {
             widgets::setting_row(ui, true, "DSP-Block p50/max", None, |ui| {
                 widgets::chip(ui, &self.diagnose.dsp_block, 0.0)
             });
-            widgets::setting_row(ui, true, "Paketverlust", None, |ui| {
+            widgets::setting_row(ui, true, "FEC-Auslegung", None, |ui| {
                 widgets::chip(ui, &self.diagnose.packet_loss, 0.0)
             });
             widgets::setting_row(ui, true, "FEC/PLC", None, |ui| {
