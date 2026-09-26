@@ -1,5 +1,8 @@
 //! TLS hostname/certificate verification (main session), an in-process
 //! server and the fake audio backend (`Client/IMPLEMENTATION.md` §14).
+//!
+//! Unix only: the in-process server (`common`) is.
+#![cfg(unix)]
 
 mod common;
 

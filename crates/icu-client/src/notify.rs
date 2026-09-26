@@ -2,8 +2,9 @@
 //! (`Research/feature-freeze.md`, Join/Leave-Hinweis: tone and
 //! notification, each switched on its own). On Linux through
 //! `org.freedesktop.Notifications` on the session bus, which KDE, GNOME and
-//! the notification daemons of the smaller desktops all serve; elsewhere
-//! nothing is shown yet.
+//! the notification daemons of the smaller desktops all serve; on Windows
+//! as a toast under ICU's own app id (`windows_toast`); elsewhere nothing
+//! is shown.
 
 /// One notification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,9 +84,81 @@ async fn run(mut rx: tokio::sync::mpsc::UnboundedReceiver<Note>) {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "windows")]
+async fn run(mut rx: tokio::sync::mpsc::UnboundedReceiver<Note>) {
+    let mut warned = false;
+    while let Some(note) = rx.recv().await {
+        let shown = tokio::task::spawn_blocking(move || windows_toast::show(&note))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        if let Err(e) = shown {
+            if !std::mem::replace(&mut warned, true) {
+                tracing::warn!(error = %e, "cannot show a notification");
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 async fn run(mut rx: tokio::sync::mpsc::UnboundedReceiver<Note>) {
     while rx.recv().await.is_some() {}
+}
+
+/// Toasts. A desktop program without a package shows them under an app
+/// id registered for the user (`HKCU\Software\Classes\AppUserModelId`);
+/// the process takes the same id (`main`), so the toast belongs to ICU's
+/// taskbar button. Every toast carries the same tag, so a new one replaces
+/// the last in the action center — the `replaces_id` of Linux. Silent: ICU
+/// plays its own join and leave sounds.
+#[cfg(target_os = "windows")]
+mod windows_toast {
+    use std::sync::Once;
+
+    use windows::{
+        core::HSTRING,
+        Data::Xml::Dom::XmlDocument,
+        Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED},
+        UI::Notifications::{ToastNotification, ToastNotificationManager},
+    };
+
+    use super::Note;
+    use crate::winreg::{set_class_string, APP_ID};
+
+    pub fn show(note: &Note) -> Result<(), String> {
+        static REGISTERED: Once = Once::new();
+        REGISTERED.call_once(|| {
+            let key = format!(r"AppUserModelId\{APP_ID}");
+            if let Err(e) = set_class_string(&key, Some("DisplayName"), "ICU") {
+                tracing::warn!(%e, "toast app id not registered");
+            }
+        });
+        // SAFETY: joins the thread to the multithreaded apartment; a
+        // thread already in it gets S_FALSE, which is fine.
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let xml = format!(
+            "<toast><visual><binding template=\"ToastGeneric\"><text>ICU</text>\
+             <text>{}</text></binding></visual><audio silent=\"true\"/></toast>",
+            escape(&note.text)
+        );
+        let e = |e: windows::core::Error| e.to_string();
+        let doc = XmlDocument::new().map_err(e)?;
+        doc.LoadXml(&HSTRING::from(xml)).map_err(e)?;
+        let toast = ToastNotification::CreateToastNotification(&doc).map_err(e)?;
+        toast.SetTag(&HSTRING::from("presence")).map_err(e)?;
+        toast.SetGroup(&HSTRING::from("icu")).map_err(e)?;
+        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))
+            .map_err(e)?
+            .Show(&toast)
+            .map_err(e)
+    }
+
+    /// `text` as XML character data.
+    pub fn escape(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
 }
 
 /// `Notify` of the Desktop Notifications Specification; returns the id the

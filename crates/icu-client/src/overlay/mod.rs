@@ -1,13 +1,13 @@
-//! Wayland layer-shell overlay (`Client/IMPLEMENTATION.md` §9, Spike 4b):
-//! own thread, own Wayland connection, calloop with a 15 fps timer, layer
-//! `Overlay`, empty input region, exclusive zone −1. Composes, in
-//! premultiplied ARGB into a wl_shm buffer, a camera tile with the name for
-//! everyone whose camera is on, and a name plate for everyone without one
-//! while they talk — so the overlay answers „wer spricht?" in a voice-only
-//! round too.
+//! Speaking overlay (`Client/IMPLEMENTATION.md` §9): a click-through window
+//! above everything that shows, for everyone whose camera is on, a camera
+//! tile with the name, and for everyone without one a name plate while they
+//! talk — so the overlay answers „wer spricht?" in a voice-only round too.
 //!
-//! Windows layered-window overlay is M3; without layer shell (GNOME) `start`
-//! fails, the Overlay tile is left out and the settings say why.
+//! What is shown and how it is drawn (premultiplied BGRA, 15 fps) lives
+//! here; the window is the platform's: a wlr layer-shell surface on Linux
+//! (`wayland`), a layered topmost window on Windows (`windows`). Without
+//! layer shell (GNOME) `start` fails, the Overlay tile is left out and the
+//! settings say why.
 
 use std::{
     collections::HashMap,
@@ -20,46 +20,29 @@ use std::{
 };
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
-
 use icu_proto::Session;
-use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState, Region},
-    delegate_registry,
-    output::{OutputHandler, OutputState},
-    reexports::{
-        calloop::{
-            timer::{TimeoutAction, Timer},
-            EventLoop,
-        },
-        calloop_wayland_source::WaylandSource,
-    },
-    registry::{ProvidesRegistryState, RegistryState},
-    registry_handlers,
-    shell::{
-        wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
-            LayerSurfaceConfigure,
-        },
-        WaylandSurface,
-    },
-    shm::{slot::SlotPool, Shm, ShmHandler},
-};
 use tokio::sync::watch;
-use wayland_client::{
-    globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
-    Connection, QueueHandle,
-};
 
 use crate::{
     config::{Corner, Expand, OverlaySettings, TileSize},
     engine::{AppState, VideoFrames},
 };
 
+#[cfg(target_os = "linux")]
+mod wayland;
+#[cfg(target_os = "linux")]
+use wayland as platform;
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+use self::windows as platform;
+
 const GAP: u32 = 8;
 const BORDER: u32 = 3;
 /// Brightness multiplier (out of 256) applied to dimmed, non-speaking tiles.
 const DIM_MUL: u32 = 128;
+/// Frame interval: 15 fps.
+const TICK: Duration = Duration::from_millis(1000 / 15);
 
 /// Owns the overlay thread.
 pub struct OverlayHandle {
@@ -68,8 +51,8 @@ pub struct OverlayHandle {
 }
 
 impl OverlayHandle {
-    /// Connects to the compositor on a new thread. Fails when there is no
-    /// Wayland display or no layer shell (GNOME).
+    /// Opens the overlay on a new thread. Fails when the platform has no
+    /// way to show one (no Wayland display, no layer shell).
     pub fn start(
         state: watch::Receiver<AppState>,
         frames: VideoFrames,
@@ -79,7 +62,7 @@ impl OverlayHandle {
         let stop_t = stop.clone();
         let thread = std::thread::Builder::new()
             .name("icu-overlay".into())
-            .spawn(move || overlay_thread(state, frames, stop_t, ready_tx))
+            .spawn(move || platform::run(Scene::new(state, frames), stop_t, ready_tx))
             .map_err(|e| e.to_string())?;
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => Ok(OverlayHandle {
@@ -89,8 +72,8 @@ impl OverlayHandle {
             Ok(Err(e)) => Err(e),
             Err(_) => {
                 // No handle owns the thread now: tell it to end on its own
-                // once `setup` returns, instead of running on unseen. Not
-                // joined here — `setup` may be stuck for a while yet.
+                // once its setup returns, instead of running on unseen. Not
+                // joined here — the setup may be stuck for a while yet.
                 stop.store(true, Ordering::Relaxed);
                 Err("overlay thread did not start".into())
             }
@@ -244,109 +227,47 @@ fn blend_label(canvas: &mut [u8], stride: usize, x: u32, y: u32, label: &Label) 
     }
 }
 
-struct App {
-    registry: RegistryState,
-    outputs: OutputState,
-    compositor: CompositorState,
-    layer_shell: LayerShell,
-    shm: Shm,
-    pool: SlotPool,
-    surface: Option<LayerSurface>,
-    configured: bool,
-    width: u32,
-    height: u32,
-    /// The overlay settings as of the last tick.
+/// What the overlay shows, taken from the state once per frame, and the
+/// size it needs.
+struct Scene {
+    /// The overlay settings as of the last update.
     settings: OverlaySettings,
     tiles: Vec<Tile>,
     /// Name rendering; `None` only if the embedded font failed to parse.
     labels: Option<Labels>,
     state: watch::Receiver<AppState>,
     frames: VideoFrames,
-    qh: QueueHandle<App>,
+    width: u32,
+    height: u32,
 }
 
-fn overlay_thread(
-    state: watch::Receiver<AppState>,
-    frames: VideoFrames,
-    stop: Arc<AtomicBool>,
-    ready: std::sync::mpsc::Sender<Result<(), String>>,
-) {
-    let (conn, mut event_loop, mut app) = match setup(state, frames) {
-        Ok(x) => x,
-        Err(e) => {
-            let _ = ready.send(Err(e));
-            return;
-        }
-    };
-    let _ = ready.send(Ok(()));
-    while !stop.load(Ordering::Relaxed) {
-        if let Err(e) = event_loop.dispatch(Some(Duration::from_millis(100)), &mut app) {
-            tracing::warn!(%e, "overlay loop");
-            break;
+/// What [`Scene::update`] found.
+struct Update {
+    /// Something to show: overlay on and at least one tile.
+    shown: bool,
+    /// Position or tile size changed: the window is placed anew. (The
+    /// Windows overlay places and sizes itself every frame.)
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    layout_changed: bool,
+    /// The needed size changed.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    size_changed: bool,
+}
+
+impl Scene {
+    fn new(state: watch::Receiver<AppState>, frames: VideoFrames) -> Scene {
+        let settings = state.borrow().settings.overlay.clone();
+        Scene {
+            settings,
+            tiles: Vec::new(),
+            labels: Labels::new(),
+            state,
+            frames,
+            width: 0,
+            height: 0,
         }
     }
-    app.surface = None;
-    let _ = conn.flush();
-}
 
-/// Connects to the compositor, binds the globals and builds the event loop
-/// with its 15 fps timer. Each step names itself in the error the window
-/// shows as "nicht verfügbar".
-fn setup(
-    state: watch::Receiver<AppState>,
-    frames: VideoFrames,
-) -> Result<(Connection, EventLoop<'static, App>, App), String> {
-    let conn = Connection::connect_to_env().map_err(|e| format!("wayland: {e}"))?;
-    let (globals, event_queue) =
-        registry_queue_init::<App>(&conn).map_err(|e| format!("registry: {e}"))?;
-    let qh = event_queue.handle();
-    let compositor =
-        CompositorState::bind(&globals, &qh).map_err(|e| format!("compositor: {e}"))?;
-    let layer_shell = LayerShell::bind(&globals, &qh)
-        .map_err(|e| format!("kein zwlr_layer_shell_v1 (GNOME?): {e}"))?;
-    let shm = Shm::bind(&globals, &qh).map_err(|e| format!("shm: {e}"))?;
-    let pool = SlotPool::new(320 * 240 * 4 * 4, &shm).map_err(|e| format!("pool: {e}"))?;
-    let event_loop: EventLoop<App> = EventLoop::try_new().map_err(|e| format!("calloop: {e}"))?;
-    WaylandSource::new(conn.clone(), event_queue)
-        .insert(event_loop.handle())
-        .map_err(|e| format!("wayland source: {e}"))?;
-    let tick = Duration::from_millis(1000 / 15);
-    event_loop
-        .handle()
-        .insert_source(Timer::from_duration(tick), move |_, _, app| {
-            app.tick();
-            TimeoutAction::ToDuration(tick)
-        })
-        .map_err(|e| format!("timer: {e}"))?;
-    let settings = state.borrow().settings.overlay.clone();
-    let app = App {
-        registry: RegistryState::new(&globals),
-        outputs: OutputState::new(&globals, &qh),
-        compositor,
-        layer_shell,
-        shm,
-        pool,
-        surface: None,
-        configured: false,
-        width: 0,
-        height: 0,
-        settings,
-        tiles: Vec::new(),
-        labels: Labels::new(),
-        state,
-        frames,
-        qh: qh.clone(),
-    };
-    Ok((conn, event_loop, app))
-}
-
-/// What decides the layer surface's anchor, margin and size: a change here
-/// needs the surface created anew.
-fn layout(s: &OverlaySettings) -> (Corner, [u32; 2], TileSize, Expand) {
-    (s.corner, s.offset, s.size, s.expand)
-}
-
-impl App {
     fn tile_dims(&self) -> (u32, u32) {
         match self.settings.size {
             TileSize::Small => (160, 120),
@@ -390,7 +311,8 @@ impl App {
         }
     }
 
-    fn tick(&mut self) {
+    /// Takes the tiles and settings from the state and works out the size.
+    fn update(&mut self) -> Update {
         // Only what a tile needs leaves the state: the whole `AppState`
         // (device list, user list, invite text) is not worth cloning at
         // 15 Hz.
@@ -438,12 +360,13 @@ impl App {
             })
             .collect();
 
-        let want = self.settings.enabled && !self.tiles.is_empty();
-        if !want {
-            if self.surface.take().is_some() {
-                self.configured = false;
-            }
-            return;
+        let shown = self.settings.enabled && !self.tiles.is_empty();
+        if !shown {
+            return Update {
+                shown,
+                layout_changed,
+                size_changed: false,
+            };
         }
         let (tw, _) = self.tile_dims();
         let n = self.tiles.len() as u32;
@@ -461,61 +384,16 @@ impl App {
         let size_changed = width != self.width || height != self.height;
         self.width = width;
         self.height = height;
-        if self.surface.is_none() || layout_changed {
-            self.surface = None;
-            self.configured = false;
-            let surface = self.compositor.create_surface(&self.qh);
-            let layer = self.layer_shell.create_layer_surface(
-                &self.qh,
-                surface,
-                Layer::Overlay,
-                Some("icu-overlay"),
-                None,
-            );
-            let anchor = match self.settings.corner {
-                Corner::TopLeft => Anchor::TOP | Anchor::LEFT,
-                Corner::TopRight => Anchor::TOP | Anchor::RIGHT,
-                Corner::BottomLeft => Anchor::BOTTOM | Anchor::LEFT,
-                Corner::BottomRight => Anchor::BOTTOM | Anchor::RIGHT,
-                // No LEFT/RIGHT: wlr-layer-shell centers the surface on the
-                // horizontal axis when neither of its edges is anchored.
-                Corner::Top => Anchor::TOP,
-                Corner::Bottom => Anchor::BOTTOM,
-            };
-            layer.set_anchor(anchor);
-            let (ox, oy) = (
-                self.settings.offset[0] as i32,
-                self.settings.offset[1] as i32,
-            );
-            layer.set_margin(oy, ox, oy, ox);
-            layer.set_size(width, height);
-            layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-            layer.set_exclusive_zone(-1);
-            if let Ok(empty) = Region::new(&self.compositor) {
-                layer.set_input_region(Some(empty.wl_region()));
-            }
-            layer.commit();
-            tracing::info!(width, height, tiles = n, "overlay layer surface created");
-            self.surface = Some(layer);
-            return;
-        }
-        if size_changed {
-            if let Some(layer) = &self.surface {
-                layer.set_size(width, height);
-                layer.commit();
-            }
-        }
-        if self.configured {
-            self.draw();
+        Update {
+            shown,
+            layout_changed,
+            size_changed,
         }
     }
 
-    fn draw(&mut self) {
-        let Some(layer) = &self.surface else { return };
-        let (w, h) = (self.width as i32, self.height as i32);
-        if w <= 0 || h <= 0 {
-            return;
-        }
+    /// Draws the tiles into `canvas`, premultiplied BGRA of
+    /// `self.width × self.height`.
+    fn draw(&mut self, canvas: &mut [u8]) {
         let (tile_w, camera_h) = self.tile_dims();
         let (plate_h, name_px) = self.plate_dims();
         let geometry = Geometry {
@@ -530,18 +408,14 @@ impl App {
             speaking_frame: self.settings.speaking_frame,
             frame_color: self.settings.frame_color,
         };
-        let Ok((buffer, canvas)) = self
-            .pool
-            .create_buffer(w, h, w * 4, wl_shm::Format::Argb8888)
-        else {
-            return;
-        };
         compose(canvas, &geometry, &self.tiles, self.labels.as_mut());
-        layer.wl_surface().damage_buffer(0, 0, w, h);
-        if buffer.attach_to(layer.wl_surface()).is_ok() {
-            layer.commit();
-        }
     }
+}
+
+/// What decides the window's position and tile size: a change here needs
+/// the window placed anew.
+fn layout(s: &OverlaySettings) -> (Corner, [u32; 2], TileSize, Expand) {
+    (s.corner, s.offset, s.size, s.expand)
 }
 
 /// Where and how big the tiles are; everything [`compose`] needs besides
@@ -675,90 +549,6 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
         }
     }
 }
-
-impl CompositorHandler for App {
-    fn scale_factor_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
-    ) {
-    }
-    fn transform_changed(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: wl_output::Transform,
-    ) {
-    }
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {}
-    fn surface_enter(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
-    fn surface_leave(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
-    ) {
-    }
-}
-
-impl OutputHandler for App {
-    fn output_state(&mut self) -> &mut OutputState {
-        &mut self.outputs
-    }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-}
-
-impl LayerShellHandler for App {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.surface = None;
-        self.configured = false;
-    }
-    fn configure(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &LayerSurface,
-        c: LayerSurfaceConfigure,
-        _: u32,
-    ) {
-        if c.new_size.0 > 0 && c.new_size.1 > 0 {
-            self.width = c.new_size.0;
-            self.height = c.new_size.1;
-        }
-        tracing::debug!(size = ?c.new_size, "overlay configured");
-        self.configured = true;
-        self.draw();
-    }
-}
-
-impl ShmHandler for App {
-    fn shm_state(&mut self) -> &mut Shm {
-        &mut self.shm
-    }
-}
-
-impl ProvidesRegistryState for App {
-    fn registry(&mut self) -> &mut RegistryState {
-        &mut self.registry
-    }
-    registry_handlers![OutputState];
-}
-
-delegate_registry!(App);
-smithay_client_toolkit::delegate_dispatch2!(App);
 
 #[cfg(test)]
 mod tests {

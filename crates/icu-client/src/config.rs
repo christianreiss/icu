@@ -803,7 +803,7 @@ impl Identity {
                 return Ok(None);
             }
         }
-        let key_der = fs::read(dir.join("key.pk8"))?;
+        let key_der = key_seal::open(fs::read(dir.join("key.pk8"))?)?;
         let leaf_der = fs::read(dir.join("leaf.der"))?;
         let ca_der = fs::read(dir.join("ca.der"))?;
         let server: ServerInfo = toml::from_str(&fs::read_to_string(dir.join("server.toml"))?)
@@ -830,7 +830,11 @@ impl Identity {
         let previous = dir.with_extension("old");
         remove_dir_if_present(&fresh)?;
         fs::create_dir_all(&fresh)?;
-        write_atomic(&fresh.join("key.pk8"), &self.key_der, true)?;
+        write_atomic(
+            &fresh.join("key.pk8"),
+            &key_seal::seal(&self.key_der)?,
+            true,
+        )?;
         write_atomic(&fresh.join("leaf.der"), &self.leaf_der, false)?;
         write_atomic(&fresh.join("ca.der"), &self.ca_der, false)?;
         let text =
@@ -1012,6 +1016,135 @@ pub fn import_settings(paths: &Paths, incoming: Settings) -> Result<(), ConfigEr
     settings.save(paths)
 }
 
+/// The private key at rest. On Windows `key.pk8` is sealed for the
+/// current user with DPAPI (`CryptProtectData`): another account, or the
+/// file copied to another machine, cannot use it. The sealed file starts
+/// with [`key_seal::MAGIC`]; a plain PKCS#8 file (written before) is still
+/// read and sealed on the next save. Elsewhere the file mode (0600) guards
+/// it and the key is stored as it is.
+mod key_seal {
+    use super::ConfigError;
+
+    /// First bytes of a sealed key; PKCS#8 DER starts with 0x30.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub const MAGIC: &[u8] = b"ICU-DPAPI/1\n";
+
+    #[cfg(not(windows))]
+    pub fn seal(der: &[u8]) -> Result<Vec<u8>, ConfigError> {
+        Ok(der.to_vec())
+    }
+
+    #[cfg(not(windows))]
+    pub fn open(data: Vec<u8>) -> Result<Vec<u8>, ConfigError> {
+        Ok(data)
+    }
+
+    #[cfg(windows)]
+    pub fn seal(der: &[u8]) -> Result<Vec<u8>, ConfigError> {
+        let mut out = MAGIC.to_vec();
+        out.extend(dpapi::protect(der)?);
+        Ok(out)
+    }
+
+    #[cfg(windows)]
+    pub fn open(data: Vec<u8>) -> Result<Vec<u8>, ConfigError> {
+        match data.strip_prefix(MAGIC) {
+            Some(sealed) => dpapi::unprotect(sealed),
+            None => Ok(data),
+        }
+    }
+
+    #[cfg(windows)]
+    mod dpapi {
+        use windows::Win32::{
+            Foundation::{LocalFree, HLOCAL},
+            Security::Cryptography::{
+                CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+            },
+        };
+
+        use super::ConfigError;
+
+        fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
+            CRYPT_INTEGER_BLOB {
+                cbData: data.len() as u32,
+                pbData: data.as_ptr() as *mut u8,
+            }
+        }
+
+        /// Copies DPAPI's output and frees it.
+        fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
+            // SAFETY: DPAPI hands back `cbData` bytes at `pbData`, to be
+            // released with LocalFree.
+            unsafe {
+                let v = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+                LocalFree(Some(HLOCAL(out.pbData.cast())));
+                v
+            }
+        }
+
+        fn error(what: &str, e: windows::core::Error) -> ConfigError {
+            ConfigError::Io(std::io::Error::other(format!("{what}: {e}")))
+        }
+
+        pub fn protect(data: &[u8]) -> Result<Vec<u8>, ConfigError> {
+            let mut out = CRYPT_INTEGER_BLOB::default();
+            // SAFETY: `blob` borrows `data` for the call only.
+            unsafe {
+                CryptProtectData(
+                    &blob(data),
+                    windows::core::w!("ICU"),
+                    None,
+                    None,
+                    None,
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &mut out,
+                )
+            }
+            .map_err(|e| error("CryptProtectData", e))?;
+            Ok(take(out))
+        }
+
+        pub fn unprotect(data: &[u8]) -> Result<Vec<u8>, ConfigError> {
+            let mut out = CRYPT_INTEGER_BLOB::default();
+            // SAFETY: as in `protect`.
+            unsafe {
+                CryptUnprotectData(
+                    &blob(data),
+                    None,
+                    None,
+                    None,
+                    None,
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &mut out,
+                )
+            }
+            .map_err(|e| error("CryptUnprotectData (Schlüssel eines anderen Kontos?)", e))?;
+            Ok(take(out))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Sealed and opened again gives the key back; a key written
+        /// before sealing existed still opens.
+        #[test]
+        fn a_sealed_key_opens_again() {
+            let der = vec![0x30, 0x82, 1, 2, 3, 4, 5];
+            let sealed = seal(&der).unwrap();
+            assert_eq!(open(sealed.clone()).unwrap(), der);
+            assert_eq!(open(der.clone()).unwrap(), der, "plain file");
+            #[cfg(windows)]
+            {
+                assert!(sealed.starts_with(MAGIC));
+                assert!(!sealed.windows(der.len()).any(|w| w == der.as_slice()));
+            }
+        }
+    }
+}
+
 /// Writes `data` to `path` via a temporary file and rename.
 pub fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
@@ -1026,6 +1159,10 @@ pub fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<(), Confi
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(if private { 0o600 } else { 0o644 });
         }
+        // Windows: the profile's ACL already keeps others out of
+        // %APPDATA%; the private key is sealed with DPAPI on top.
+        #[cfg(not(unix))]
+        let _ = private;
         let mut file = options.open(&tmp)?;
         use io::Write;
         file.write_all(data)?;

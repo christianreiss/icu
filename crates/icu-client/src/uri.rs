@@ -5,7 +5,9 @@
 //! else registers itself for the user, under `~/.local/share`. Switched
 //! with `[ui] register_uri_handler` (the name is older than the file type:
 //! until 2026-09-24 this registered `icu://` links, which no longer exist).
-//! Windows: M3.
+//! On Windows the association goes under `HKCU\Software\Classes` (`.icu` →
+//! `ICU.Invite`, opened with `"icu.exe" "%1"`), which needs no administrator
+//! and follows the exe wherever the ZIP was unpacked.
 
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
@@ -132,10 +134,50 @@ pub fn register() -> Result<PathBuf, String> {
     Ok(data.join("applications").join("icu.desktop"))
 }
 
-/// Windows registration is M3.
+/// The ProgID `.icu` files point to.
+#[cfg(target_os = "windows")]
+const PROG_ID: &str = "ICU.Invite";
+
+/// Registers this exe for `.icu` files for the current user; returns the
+/// exe. Idempotent: only differing values are written, and Explorer is
+/// told only when something changed.
 #[cfg(target_os = "windows")]
 pub fn register() -> Result<std::path::PathBuf, String> {
-    Err("Unsupported: file association not implemented (M3)".into())
+    use crate::winreg::set_class_string;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let shown = exe.display().to_string();
+    let mut changed = false;
+    for (key, name, value) in [
+        (".icu".to_string(), None, PROG_ID.to_string()),
+        (
+            ".icu".to_string(),
+            Some("Content Type"),
+            MIME_TYPE.to_string(),
+        ),
+        (
+            PROG_ID.to_string(),
+            None,
+            "ICU-Einladung oder -Passport".to_string(),
+        ),
+        (
+            format!(r"{PROG_ID}\DefaultIcon"),
+            None,
+            format!("\"{shown}\",0"),
+        ),
+        (
+            format!(r"{PROG_ID}\shell\open\command"),
+            None,
+            format!("\"{shown}\" \"%1\""),
+        ),
+    ] {
+        changed |= set_class_string(&key, name, &value)?;
+    }
+    if changed {
+        use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+        // SAFETY: a notification without items.
+        unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None) };
+    }
+    Ok(exe)
 }
 
 /// Other platforms.

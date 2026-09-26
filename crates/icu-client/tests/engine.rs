@@ -1,6 +1,9 @@
 //! Engine behaviour against an in-process server: what reaches the server of
 //! the local state, and how mute, deafen and admin restrictions interact
 //! (`Client/IMPLEMENTATION.md` §5, §10).
+//!
+//! Unix only: the in-process server (`common`) is.
+#![cfg(unix)]
 
 mod common;
 

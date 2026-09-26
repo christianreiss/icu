@@ -17,6 +17,8 @@
 //! (`engine::MAX_CAPTURE_BACKLOG`) keeps its catch-up after a stall to a few
 //! blocks for exactly this reason.
 //!
+//! On Windows the same threads join MMCSS („Pro Audio“) instead.
+//!
 //! Failure is not an error: without module-rt, RTKit or the rlimits the
 //! threads simply stay best effort, as they were before.
 
@@ -109,7 +111,37 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Windows: the Multimedia Class Scheduler (MMCSS) task „Pro Audio“, the
+/// class WASAPI's own audio engine threads use; without it (the service
+/// disabled) a time-critical thread priority. The MMCSS registration lasts
+/// as long as the thread.
+#[cfg(target_os = "windows")]
+mod imp {
+    use windows::{
+        core::w,
+        Win32::System::Threading::{
+            AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority, GetCurrentThread,
+            SetThreadPriority, AVRT_PRIORITY_HIGH, THREAD_PRIORITY_TIME_CRITICAL,
+        },
+    };
+
+    pub fn promote(_priority: i32) -> Result<(), String> {
+        let mut index = 0u32;
+        // SAFETY: plain Win32 calls on the calling thread.
+        unsafe {
+            match AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut index) {
+                Ok(task) => {
+                    let _ = AvSetMmThreadPriority(task, AVRT_PRIORITY_HIGH);
+                    Ok(())
+                }
+                Err(mmcss) => SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)
+                    .map_err(|e| format!("MMCSS: {mmcss}; SetThreadPriority: {e}")),
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 mod imp {
     pub fn promote(_priority: i32) -> Result<(), String> {
         Err("not implemented on this platform".into())

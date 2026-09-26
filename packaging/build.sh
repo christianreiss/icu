@@ -154,7 +154,7 @@ for d in $DISTS; do
     nfpm "$cfg" "$(dist_format "$d")"
 done
 
-(cd "$OUT" && rm -f SHA256SUMS && sha256sum -- *.rpm *.deb > SHA256SUMS)
+(cd "$OUT" && rm -f SHA256SUMS && sha256sum -- $(ls *.rpm *.deb *.zip 2>/dev/null) > SHA256SUMS)
 
 if [ "${SKIP_SMOKE:-0}" != 1 ]; then
     VERSION=$VERSION RELEASE=$RELEASE DISTS=$DISTS SERVER_DISTS=${SERVER_DISTS-"debian12 alma10"} \

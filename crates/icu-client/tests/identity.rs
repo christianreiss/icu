@@ -1,6 +1,9 @@
 //! The name lives in the certificate (`PROTOCOL.md` §2.1): renaming issues a
 //! new certificate, a device that missed a rename catches up by itself, and a
 //! passport moves the whole identity to another installation.
+//!
+//! Unix only: the in-process server (`common`) is.
+#![cfg(unix)]
 
 mod common;
 

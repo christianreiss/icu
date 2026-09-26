@@ -6,7 +6,8 @@
 //! connect a second client with the same certificate: the server would
 //! replace the running session (`SESSION_REPLACED`). The first windowed
 //! instance holds a lock and listens on a Unix socket in `$XDG_RUNTIME_DIR`
-//! (only this user can reach it), both named after a hash of its
+//! (only this user can reach it) — on Windows a named mutex and a named
+//! pipe (`windows`) — both named after a hash of its
 //! configuration directory, so `--config-dir` test instances stay apart. A
 //! later start hands its request over — „show“, plus the text of the invite
 //! or passport it was given — and exits. `--headless` does none of this.
@@ -70,12 +71,16 @@ pub fn key(paths: &Paths) -> String {
 /// answer — starting a second client then would only knock the first one's
 /// session off the server.
 pub fn claim(paths: &Paths, request: &Request) -> Result<Claim, String> {
+    #[cfg(windows)]
+    return claim_in(std::path::Path::new(""), &key(paths), request, HAND_OVER);
+    #[cfg(not(windows))]
     let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .filter(|d| d.is_absolute() && d.is_dir())
     else {
         return Ok(Claim::Unguarded("no XDG_RUNTIME_DIR".into()));
     };
+    #[cfg(not(windows))]
     claim_in(&dir, &key(paths), request, HAND_OVER)
 }
 
@@ -254,11 +259,233 @@ mod unix {
     }
 }
 
-/// Without Unix sockets (Windows, M3) there is no guard.
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub use windows::{claim_in, Listener};
+
+/// Windows: a named mutex in the session's namespace (`Local\\icu-…`)
+/// decides who is first — Windows destroys it with the last handle, so a
+/// crashed instance never blocks a start — and a named pipe
+/// (`\\.\pipe\icu-…`, local clients only) takes the requests. Pipes have
+/// no half-close: the pipe runs in message mode and a request is one
+/// message.
+#[cfg(windows)]
+mod windows {
+    use std::{
+        io::{Read, Write},
+        os::windows::io::{FromRawHandle, OwnedHandle},
+        path::Path,
+        sync::{mpsc, Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    use ::windows::{
+        core::HSTRING,
+        Win32::{
+            Foundation::{
+                GetLastError, ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, HANDLE,
+                INVALID_HANDLE_VALUE,
+            },
+            Storage::FileSystem::{FlushFileBuffers, ReadFile, PIPE_ACCESS_DUPLEX},
+            System::{
+                Pipes::{
+                    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
+                    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES,
+                    PIPE_WAIT,
+                },
+                Threading::CreateMutexW,
+            },
+        },
+    };
+
+    use super::{encode, parse, Claim, Request, MAX_REQUEST};
+
+    /// What to call when a request arrived.
+    type Waker = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
+
+    /// The running instance's end: requests from later starts.
+    pub struct Listener {
+        requests: Mutex<mpsc::Receiver<Request>>,
+        waker: Waker,
+        /// Held for as long as this instance runs.
+        _mutex: OwnedHandle,
+    }
+
+    impl Listener {
+        /// The next request, if one arrived.
+        pub fn try_recv(&self) -> Option<Request> {
+            self.requests.lock().unwrap().try_recv().ok()
+        }
+
+        /// Called after every request: a window hidden to the tray runs its
+        /// logic only when woken (`egui::Context::request_repaint`).
+        pub fn set_waker(&self, wake: impl Fn() + Send + 'static) {
+            *self.waker.lock().unwrap() = Some(Box::new(wake));
+        }
+    }
+
+    fn pipe_name(key: &str) -> String {
+        format!(r"\\.\pipe\{key}")
+    }
+
+    /// [`super::claim`] for `key` (`_dir` is for Unix), trying `hand_over`
+    /// long to reach an instance that holds the mutex.
+    pub fn claim_in(
+        _dir: &Path,
+        key: &str,
+        request: &Request,
+        hand_over: Duration,
+    ) -> Result<Claim, String> {
+        let name = HSTRING::from(format!(r"Local\{key}"));
+        let mutex = match unsafe { CreateMutexW(None, false, &name) } {
+            Ok(handle) => unsafe { OwnedHandle::from_raw_handle(handle.0) },
+            Err(e) => return Ok(Claim::Unguarded(format!("mutex: {e}"))),
+        };
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            return hand(&pipe_name(key), request, hand_over);
+        }
+        let pipe = pipe_name(key);
+        let (tx, rx) = mpsc::channel();
+        let waker = Waker::default();
+        let wake = waker.clone();
+        // The first pipe instance before `First` is returned: a start right
+        // after this one finds it.
+        let first = create_pipe(&pipe).map_err(|e| format!("pipe: {e}"))?;
+        std::thread::Builder::new()
+            .name("icu-instance".into())
+            .spawn(move || {
+                let mut next = Some(first);
+                loop {
+                    let conn = match next.take().map(Ok).unwrap_or_else(|| create_pipe(&pipe)) {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            tracing::warn!(%e, "instance pipe");
+                            return;
+                        }
+                    };
+                    let connected = unsafe { ConnectNamedPipe(conn.handle(), None) };
+                    if let Err(e) = connected {
+                        if e.code() != ERROR_PIPE_CONNECTED.to_hresult() {
+                            tracing::debug!(%e, "instance pipe connect");
+                            continue;
+                        }
+                    }
+                    // One thread per request: a client that connects and
+                    // says nothing must not hold up the next one.
+                    let (tx, wake) = (tx.clone(), wake.clone());
+                    let _ = std::thread::Builder::new()
+                        .name("icu-instance-req".into())
+                        .spawn(move || {
+                            if let Err(e) = serve(conn, &tx, &wake) {
+                                tracing::debug!(%e, "instance request");
+                            }
+                        });
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Claim::First(Listener {
+            requests: Mutex::new(rx),
+            waker,
+            _mutex: mutex,
+        }))
+    }
+
+    /// One server end of the pipe.
+    struct Pipe(OwnedHandle);
+
+    impl Pipe {
+        fn handle(&self) -> HANDLE {
+            use std::os::windows::io::AsRawHandle;
+            HANDLE(self.0.as_raw_handle())
+        }
+    }
+
+    fn create_pipe(name: &str) -> std::io::Result<Pipe> {
+        let handle = unsafe {
+            CreateNamedPipeW(
+                &HSTRING::from(name),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_UNLIMITED_INSTANCES,
+                4096,
+                MAX_REQUEST as u32 + 1,
+                0,
+                None,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE || handle.is_invalid() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Pipe(unsafe { OwnedHandle::from_raw_handle(handle.0) }))
+    }
+
+    /// Takes one request: queued and the window woken before the answer, so
+    /// a start that heard `ok` knows it arrived.
+    fn serve(conn: Pipe, tx: &mpsc::Sender<Request>, wake: &Waker) -> std::io::Result<()> {
+        let mut data = vec![0u8; MAX_REQUEST + 1];
+        let mut n = 0u32;
+        // One message is one request; one too big for the buffer fails
+        // with ERROR_MORE_DATA and is not taken.
+        unsafe { ReadFile(conn.handle(), Some(&mut data), Some(&mut n), None) }
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        data.truncate(n as usize);
+        let request = (data.len() <= MAX_REQUEST)
+            .then(|| parse(&data))
+            .flatten()
+            .ok_or_else(|| std::io::Error::other("not an instance request"))?;
+        tracing::info!(
+            bundle = request.bundle.is_some(),
+            "another start handed over"
+        );
+        let _ = tx.send(request);
+        if let Some(wake) = &*wake.lock().unwrap() {
+            wake();
+        }
+        let handle = conn.handle();
+        let mut file = std::fs::File::from(conn.0);
+        file.write_all(b"ok\n")?;
+        unsafe {
+            let _ = FlushFileBuffers(handle);
+            let _ = DisconnectNamedPipe(handle);
+        }
+        Ok(())
+    }
+
+    /// Hands `request` to the instance behind `pipe`, retrying while it may
+    /// still be starting up.
+    fn hand(pipe: &str, request: &Request, hand_over: Duration) -> Result<Claim, String> {
+        let deadline = Instant::now() + hand_over;
+        loop {
+            match send(pipe, request) {
+                Ok(()) => return Ok(Claim::Handed),
+                Err(e) if Instant::now() >= deadline => {
+                    return Err(format!("ICU läuft bereits, antwortet aber nicht ({e})"))
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+
+    fn send(pipe: &str, request: &Request) -> std::io::Result<()> {
+        let mut conn = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe)?;
+        conn.write_all(&encode(request))?;
+        let mut answer = String::new();
+        conn.take(16).read_to_string(&mut answer)?;
+        if answer == "ok\n" {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("no answer"))
+        }
+    }
+}
+
+/// Neither Unix nor Windows: no guard.
+#[cfg(not(any(unix, windows)))]
 pub struct Listener;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl Listener {
     /// Never anything.
     pub fn try_recv(&self) -> Option<Request> {
@@ -270,7 +497,7 @@ impl Listener {
 }
 
 /// See the Unix version; here there is no guard.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn claim_in(
     _dir: &std::path::Path,
     _key: &str,
@@ -278,7 +505,7 @@ pub fn claim_in(
     _hand_over: Duration,
 ) -> Result<Claim, String> {
     Ok(Claim::Unguarded(
-        "single instance needs Unix sockets".into(),
+        "no single-instance guard on this system".into(),
     ))
 }
 

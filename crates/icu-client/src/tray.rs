@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;

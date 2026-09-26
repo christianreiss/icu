@@ -4,6 +4,9 @@
 //! concealed frame or skipped/inserted frame shows up as a glitch.
 //!
 //! Run with `--nocapture` to see the numbers.
+//!
+//! Unix only: the in-process server (`common`) is.
+#![cfg(unix)]
 
 mod common;
 

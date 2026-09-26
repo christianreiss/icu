@@ -8,6 +8,9 @@
 //! ```sh
 //! ICU_UI_SHOTS=/tmp/icu-shots cargo test -p icu-client --test ui_layout -- --nocapture
 //! ```
+//!
+//! Unix only: the in-process server (`common`) is.
+#![cfg(unix)]
 
 use std::{
     cell::RefCell,

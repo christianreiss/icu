@@ -96,13 +96,43 @@ tray-icon = { version = "0.25.1", default-features = false, features = ["ksni"],
 ab_glyph = { version = "0.2.32", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# Windows audio until the WASAPI backend (M3); see audio::native_backend.
+# Emergency audio host when WASAPI cannot open a device (audio::native_backend).
 cpal = "0.18.2"
-windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_UI_Input", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Security_Cryptography"] }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Data_Xml_Dom",
+    "UI_Notifications",
+] }
 tray-icon = { version = "0.25.1", optional = true }
+# `#[implement]` (the WASAPI hot-plug callback) expands to `windows_core` paths.
+windows-core = "0.62.2"
+# Rasterizes names in the overlay, as on Linux.
+ab_glyph = { version = "0.2.32", optional = true }
 
 [dev-dependencies]
-icu-server = { path = "../icu-server" }
 tempfile.workspace = true
 # Headless rendering of every window for `tests/ui_layout.rs`; `wgpu` only
 # for the optional screenshots (`ICU_UI_SHOTS=<dir>`).
@@ -111,6 +141,11 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # Reads the embedded Inter files' cmap (`ui::fonts` test); already in the
 # tree through egui's font stack (epaint).
 skrifa = "0.44"
+
+# The server runs on Unix only; the tests that start one in-process are
+# Unix only with it.
+[target.'cfg(unix)'.dev-dependencies]
+icu-server = { path = "../icu-server" }
 
 [[test]]
 name = "ui_layout"
