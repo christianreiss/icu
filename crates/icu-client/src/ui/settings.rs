@@ -190,6 +190,9 @@ pub struct SettingsOutput {
     /// (`CameraHandle::set_preview`): the Kamera page is on screen and the
     /// user asked for it.
     pub camera_preview: bool,
+    /// The Audio page, home of the mic test, is on screen; anywhere else a
+    /// running test is stopped.
+    pub mic_test_page: bool,
     /// How much taller the page is than the window shows (negative:
     /// shorter).
     pub overflow: f32,
@@ -391,7 +394,7 @@ impl SettingsView {
                     .show(ui, |ui| {
                         ui.set_max_width(ui.available_width().min(CONTENT_MAX_W));
                         match self.tab {
-                            Tab::Audio => self.audio_tab(ui, state),
+                            Tab::Audio => self.audio_tab(ui, state, &mut cmds),
                             Tab::Sound => self.sound_tab(ui, state),
                             Tab::Hotkeys => self.hotkeys_tab(ui, state, &mut cmds),
                             Tab::Camera => self.camera_tab(ui, state),
@@ -419,11 +422,12 @@ impl SettingsView {
             debug_window_open: self.debug_window_open,
             logout: std::mem::take(&mut self.logout_requested),
             camera_preview: self.tab == Tab::Camera && self.camera_preview,
+            mic_test_page: self.tab == Tab::Audio,
             overflow,
         }
     }
 
-    fn audio_tab(&mut self, ui: &mut Ui, state: &AppState) {
+    fn audio_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         let adv = self.draft.ui.show_advanced;
         widgets::page_header(
             ui,
@@ -449,6 +453,28 @@ impl SettingsView {
                 "Mikrofon",
                 &mut self.draft.audio.input_device,
                 &inputs,
+            );
+            // Hearing yourself answers „bin ich zu leise, klinge ich
+            // blechern?" without a second person; it plays what the others
+            // get, after the whole send chain.
+            widgets::setting_row(
+                ui,
+                true,
+                "Mikrofontest",
+                Some("Du hörst dich so, wie die anderen dich hören."),
+                |ui| {
+                    let (kind, glyph, label) = if state.mic_test {
+                        (widgets::ButtonKind::Primary, icon::STOP, "Beenden")
+                    } else {
+                        (widgets::ButtonKind::Neutral, icon::HEADPHONES, "Anhören")
+                    };
+                    if widgets::button(ui, kind, glyph, label)
+                        .on_hover_text("Endet von selbst nach einer Minute")
+                        .clicked()
+                    {
+                        cmds.push(Command::SetMicTest(!state.mic_test));
+                    }
+                },
             );
             device_combo(
                 ui,
@@ -591,7 +617,9 @@ impl SettingsView {
                             "Ein kurzer Ton, wenn jemand den Raum betritt oder verlässt",
                         );
                     widgets::chip_toggle(ui, &mut audio.cue_tx, "Senden beginnt oder endet")
-                        .on_hover_text("Ein Klick beim Drücken und Loslassen der Sprechtaste");
+                        .on_hover_text(
+                            "Ein hoher Ton, wenn du zu hören bist, ein tieferer, wenn nicht mehr",
+                        );
                     widgets::chip_toggle(ui, &mut audio.cue_mute, "Stummschalten")
                         .on_hover_text("Zwei Töne beim Stummschalten und wieder Einschalten");
                 });
@@ -964,7 +992,9 @@ impl SettingsView {
         if let Some((identity, _)) = self.import_preview.take() {
             cmds.push(Command::ReplaceIdentity(identity));
             self.passport_import.clear();
-            self.passport_status = Some("Identität ersetzt, verbinde neu…".into());
+            // The engine saves it first; a failed save keeps the old one
+            // and says so in the main window's banner.
+            self.passport_status = Some("Wird übernommen, ICU verbindet neu …".into());
         }
     }
 
@@ -1490,7 +1520,11 @@ impl SettingsView {
         ui.ctx().request_repaint_after(every);
 
         let me = state.me.as_ref().map(|m| m.user_id);
-        let (removed, rest): (Vec<_>, Vec<_>) = state.user_list.iter().partition(|u| u.revoked);
+        // A list too long for one frame ends in a row with `user_id` 0 that
+        // only counts the rest (`PROTOCOL.md` §2.2 Nr. 27): no member, no
+        // buttons.
+        let (more, listed): (Vec<_>, Vec<_>) = state.user_list.iter().partition(|u| u.user_id == 0);
+        let (removed, rest): (Vec<_>, Vec<_>) = listed.into_iter().partition(|u| u.revoked);
         let (mut pending, rest): (Vec<_>, Vec<_>) = rest.into_iter().partition(|u| u.pending);
         // The ban list: blocked, but not removed for good.
         let (mut banned, mut members): (Vec<_>, Vec<_>) =
@@ -1571,6 +1605,10 @@ impl SettingsView {
                     ui,
                     "Noch bist du allein hier. Über „Einladen“ holst du jemanden dazu.",
                 );
+            }
+            for row in &more {
+                ui.separator();
+                widgets::help_note(ui, &row.name);
             }
         });
 
@@ -2296,16 +2334,27 @@ fn device_combo(
     selected: &mut Option<String>,
     devices: &[&crate::audio::DeviceInfo],
 ) {
-    let current = match selected {
+    // A saved device that is not plugged in: the engine plays through the
+    // system default meanwhile and goes back to it once it returns.
+    let missing = selected
+        .as_deref()
+        .filter(|id| !devices.iter().any(|d| d.id == *id));
+    let current = match selected.as_deref() {
         None => "Standard".to_string(),
         Some(id) => devices
             .iter()
-            .find(|d| &d.id == id)
+            .find(|d| d.id == id)
             .map(|d| d.description.clone())
-            .unwrap_or_else(|| format!("{id} (nicht vorhanden)")),
+            .unwrap_or_else(|| "Fehlt – Standard läuft".to_string()),
     };
+    let hint = missing.map(|id| {
+        format!(
+            "{id} ist nicht angeschlossen. Bis es wieder da ist, läuft das Standardgerät; \
+             danach nimmt ICU es von selbst wieder."
+        )
+    });
     widgets::setting_row(ui, divider, label, None, |ui| {
-        egui::ComboBox::from_id_salt(label)
+        let combo = egui::ComboBox::from_id_salt(label)
             .selected_text(current)
             .width(240.0)
             .show_ui(ui, |ui| {
@@ -2322,6 +2371,9 @@ fn device_combo(
                     }
                 }
             });
+        if let Some(hint) = hint {
+            combo.response.on_hover_text(hint);
+        }
     });
 }
 

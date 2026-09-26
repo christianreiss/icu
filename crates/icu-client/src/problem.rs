@@ -70,6 +70,24 @@ pub const SUPERSEDED_UNKNOWN: &str = "Der Server kennt dieses Zertifikat nicht (
      ICU auf einem anderen Gerät erneuert oder umbenannt, dort den Passport speichern und hier \
      einspielen – sonst den Admin fragen.";
 
+/// For a single attempt nobody repeats — joining with an invitation: the
+/// texts are written for the engine, which keeps trying, and promise that;
+/// here the promise becomes a request to try again.
+pub fn one_shot(text: String) -> String {
+    for promise in [
+        " ICU versucht es gleich noch einmal.",
+        " – ICU versucht es weiter.",
+        " ICU versucht es weiter.",
+    ] {
+        if let Some(rest) = text.strip_suffix(promise) {
+            let rest = rest.trim_end_matches('.');
+            let stop = if rest.ends_with(['?', '!']) { "" } else { "." };
+            return format!("{rest}{stop} Bitte noch einmal versuchen.");
+        }
+    }
+    text
+}
+
 /// The server cannot be reached.
 pub const UNREACHABLE: &str = "Der Server ist nicht erreichbar. Läuft er, stimmt die Adresse \
      und besteht eine Internetverbindung? ICU versucht es weiter.";
@@ -282,6 +300,22 @@ pub(crate) mod tests {
         let replaced = code_text(codes::SESSION_REPLACED);
         assert!(replaced.contains("Neu verbinden"), "{replaced}");
         assert!(replaced.contains("andere"), "{replaced}");
+    }
+
+    /// Joining tries once: no text there may promise that ICU keeps trying.
+    #[test]
+    fn a_single_attempt_promises_no_retry() {
+        for code in codes::ALL_CODES {
+            let text = one_shot(code_text(*code));
+            assert!(!text.contains("versucht es"), "{text}");
+        }
+        for text in [UNREACHABLE.to_string(), code_text(codes::SERVER_FULL)] {
+            let text = one_shot(text);
+            assert!(text.ends_with(" Bitte noch einmal versuchen."), "{text}");
+            assert!(!text.contains("..") && !text.contains("?."), "{text}");
+        }
+        let untouched = code_text(codes::KICKED);
+        assert_eq!(one_shot(untouched.clone()), untouched);
     }
 
     #[test]

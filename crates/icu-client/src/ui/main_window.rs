@@ -383,6 +383,10 @@ impl eframe::App for App {
             }
             camera.sync(state);
         }
+        // So does the mic test to the Audio page (`settings_window`).
+        if self.settings.is_none() && state.mic_test {
+            let _ = self.cmd.send(Command::SetMicTest(false));
+        }
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_requested {
             #[cfg(feature = "tray")]
@@ -627,6 +631,9 @@ impl App {
         #[cfg(feature = "camera")]
         if let Some(camera) = &mut self.camera {
             camera.set_preview(out.camera_preview && still_open);
+        }
+        if self.state.mic_test && !(out.mic_test_page && still_open) {
+            let _ = self.cmd.send(Command::SetMicTest(false));
         }
         if out.logout {
             self.logged_out.store(true, Ordering::Relaxed);
@@ -1988,7 +1995,7 @@ impl EnrollApp {
                     .block_on(register(&identity, &name, &client, addr, &paths))
                     .map_err(|e| {
                         tracing::warn!(error = %e, "registration failed");
-                        e.problem().text
+                        crate::problem::one_shot(e.problem().text)
                     }),
                 Err(e) => Err(format!("ICU konnte nicht starten: {e}")),
             };
