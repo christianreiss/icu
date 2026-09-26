@@ -279,6 +279,153 @@ pub fn harmonic_voice(n: usize, rms_target: f32) -> Vec<f32> {
     out
 }
 
+/// A synthetic voice, as far as RNNoise is concerned: its voice probability
+/// is ≥ 0.5 on more than 98 % of the loud vowel blocks, with at most a few
+/// misses in a row, and it attenuates the voice by under 1 dB — like real
+/// speech, unlike [`harmonic_voice`], which it drops for whole seconds.
+/// Glottal pulses (f0 around 120 Hz, a contour per syllable, 1 % jitter)
+/// through three gliding formant resonators; syllables of 160–280 ms with
+/// 20/40 ms attack/release, 50–130 ms gaps, and on most syllables a 30–60 ms
+/// fricative burst. No sentence pauses: a test imposes its own.
+#[derive(Debug, Clone)]
+pub struct Voice {
+    /// Samples, RMS `rms_target` over the whole signal.
+    pub samples: Vec<f32>,
+    /// Per 480-sample block: the block lies in the loud part of a vowel (its
+    /// RMS within 6 dB of the 90th percentile of all blocks).
+    pub loud: Vec<bool>,
+}
+
+/// Two-pole resonator (a formant).
+struct Resonator {
+    a1: f32,
+    a2: f32,
+    gain: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl Resonator {
+    fn new(hz: f32, bandwidth_hz: f32) -> Resonator {
+        let mut r = Resonator {
+            a1: 0.0,
+            a2: 0.0,
+            gain: 0.0,
+            y1: 0.0,
+            y2: 0.0,
+        };
+        r.tune(hz, bandwidth_hz);
+        r
+    }
+
+    fn tune(&mut self, hz: f32, bandwidth_hz: f32) {
+        let r = (-std::f32::consts::PI * bandwidth_hz / SR as f32).exp();
+        let w = 2.0 * std::f32::consts::PI * hz / SR as f32;
+        self.a1 = 2.0 * r * w.cos();
+        self.a2 = -r * r;
+        self.gain = (1.0 - r) * (1.0 - 2.0 * r * w.cos() + r * r).sqrt();
+    }
+
+    fn run(&mut self, x: f32) -> f32 {
+        let y = self.gain * x + self.a1 * self.y1 + self.a2 * self.y2;
+        self.y2 = self.y1;
+        self.y1 = y;
+        y
+    }
+}
+
+/// See [`Voice`].
+pub fn voice(n: usize, seed: u64, rms_target: f32) -> Voice {
+    // (F1, F2, F3) of a, i, u, e, o, æ.
+    const VOWELS: [(f32, f32, f32); 6] = [
+        (730.0, 1090.0, 2440.0),
+        (270.0, 2290.0, 3010.0),
+        (300.0, 870.0, 2240.0),
+        (530.0, 1840.0, 2480.0),
+        (570.0, 840.0, 2410.0),
+        (660.0, 1720.0, 2410.0),
+    ];
+    const BLOCK: usize = 480;
+    let sr = SR as f32;
+    let mut rng = Rng::new(seed);
+    let mut u01 = move || (rng.uniform() + 1.0) / 2.0;
+    let mut noise = Rng::new(seed ^ 0x5EED);
+    let mut samples = vec![0.0f32; n];
+    let mut f1 = Resonator::new(500.0, 80.0);
+    let mut f2 = Resonator::new(1500.0, 100.0);
+    let mut f3 = Resonator::new(2500.0, 140.0);
+    let mut fricative = Resonator::new(3500.0, 1500.0);
+    let mut glottis = 0.0f32;
+    let mut phase = 0.0f32;
+    let mut f0_base = 120.0f32;
+    let mut vowel = VOWELS[0];
+    let mut i = 0usize;
+    while i < n {
+        let next = VOWELS[(u01() * VOWELS.len() as f32) as usize % VOWELS.len()];
+        let vowel_len = (sr * (0.16 + 0.12 * u01())) as usize;
+        let gap_len = (sr * (0.05 + 0.08 * u01())) as usize;
+        let burst_len = if u01() < 0.6 {
+            (sr * (0.03 + 0.03 * u01())) as usize
+        } else {
+            0
+        };
+        let f0_start = f0_base * (0.9 + 0.2 * u01());
+        let f0_end = f0_start * (0.85 + 0.25 * u01());
+        f0_base = (f0_base + 0.3 * (f0_end - f0_base)).clamp(95.0, 150.0);
+        for k in 0..burst_len.min(n - i) {
+            let env = ((k as f32 / burst_len as f32) * std::f32::consts::PI).sin();
+            // Fricatives sit well below the vowels, as in speech.
+            samples[i] = 0.04 * env * fricative.run(2.0 * noise.uniform());
+            i += 1;
+        }
+        for k in 0..vowel_len.min(n - i) {
+            // Formants glide from the previous vowel over the first 40 ms.
+            let glide = (k as f32 / (0.04 * sr)).min(1.0);
+            if k % 48 == 0 {
+                f1.tune(vowel.0 + (next.0 - vowel.0) * glide, 80.0);
+                f2.tune(vowel.1 + (next.1 - vowel.1) * glide, 100.0);
+                f3.tune(vowel.2 + (next.2 - vowel.2) * glide, 140.0);
+            }
+            let f0 = f0_start + (f0_end - f0_start) * k as f32 / vowel_len as f32;
+            phase += f0 * (1.0 + 0.01 * noise.uniform()) / sr;
+            let pulse = if phase >= 1.0 {
+                phase -= 1.0;
+                1.0
+            } else {
+                0.0
+            };
+            // Leaky integration gives the glottal −12 dB/oct rolloff.
+            glottis = 0.97 * glottis + pulse;
+            let source = glottis + 0.02 * noise.uniform();
+            let v = f1.run(source) + 0.6 * f2.run(source) + 0.3 * f3.run(source);
+            let attack = (k as f32 / (0.02 * sr)).min(1.0);
+            let release = ((vowel_len - k) as f32 / (0.04 * sr)).min(1.0);
+            samples[i] = 0.4 * v * attack * release;
+            i += 1;
+        }
+        vowel = next;
+        i += gap_len.min(n - i);
+    }
+    let r = rms(&samples);
+    if r > 0.0 {
+        let g = rms_target / r;
+        for s in samples.iter_mut() {
+            *s *= g;
+        }
+    }
+    let block_rms: Vec<f32> = samples
+        .as_chunks::<BLOCK>()
+        .0
+        .iter()
+        .map(|b| rms(b))
+        .collect();
+    let mut sorted = block_rms.clone();
+    sorted.sort_by(f32::total_cmp);
+    let p90 = sorted.get(sorted.len() * 9 / 10).copied().unwrap_or(0.0);
+    let loud = block_rms.iter().map(|&r| r > 0.5 * p90).collect();
+    Voice { samples, loud }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -99,9 +99,11 @@ mod imp {
             // Report what the scheduler says, not what was asked for.
             match libc::sched_getscheduler(0) {
                 libc::SCHED_FIFO | libc::SCHED_RR => Ok(()),
-                _ => Err("module-rt reported success, but the thread is still SCHED_OTHER \
+                _ => Err(
+                    "module-rt reported success, but the thread is still SCHED_OTHER \
                           (RTKit did not apply it)"
-                    .into()),
+                        .into(),
+                ),
             }
         }
     }
@@ -125,7 +127,11 @@ pub fn register_context(context: *mut std::ffi::c_void) {
 /// Never fails the caller.
 pub fn promote_current_thread(name: &str) {
     match imp::promote(PRIORITY) {
-        Ok(()) => tracing::info!(thread = name, priority = PRIORITY, "real-time priority acquired"),
+        Ok(()) => tracing::info!(
+            thread = name,
+            priority = PRIORITY,
+            "real-time priority acquired"
+        ),
         Err(error) => tracing::info!(
             thread = name,
             %error,

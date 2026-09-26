@@ -264,6 +264,9 @@ pub fn tile(
 ) -> egui::Response {
     let tok = theme::tokens(ui.visuals());
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), active, label)
+    });
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(response.id, active);
         let (on, on_tint) = match role {
@@ -337,6 +340,12 @@ pub struct Speak<'a> {
     pub threshold: Option<f32>,
     /// The push-to-talk key, shown as a keycap beside the label.
     pub key: Option<&'a str>,
+    /// Muted, yet talking (voice heard, or the PTT key held): the surface
+    /// says so instead of letting people talk into the void (Mumble's
+    /// "mute cue").
+    pub talking_muted: bool,
+    /// The microphone clips: the level line turns red.
+    pub clipping: bool,
 }
 
 /// The big control: the speak button in push-to-talk, a readout in voice
@@ -352,6 +361,9 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         Sense::hover()
     };
     let (rect, response) = ui.allocate_exact_size(size, sense);
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Sprechen")
+    });
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -361,21 +373,28 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         .animate_bool_with_time(response.id, s.open && !s.offline, 0.08);
     let hot = open > 0.5;
     painter.rect_filled(rect, R_ROW, lerp_color(tok.surface_hi, tok.accent, open));
+    if s.talking_muted {
+        let time = ui.input(|i| i.time);
+        let pulse = ((time * 3.0).sin() as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
+        // No repaint request of its own: the main window repaints every
+        // 33 ms anyway, which is plenty for this pulse.
+        painter.rect_filled(
+            rect,
+            R_ROW,
+            tok.error_tint.gamma_multiply(0.6 + 0.4 * pulse),
+        );
+    }
     if s.ptt && !s.offline && response.hovered() {
         painter.rect_filled(rect, R_ROW, tok.hover_overlay);
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
 
     // The level line, eased so it glides instead of flickering at 30 fps.
-    let level = ui.ctx().animate_value_with_time(
-        response.id.with("level"),
-        if s.muted {
-            0.0
-        } else {
-            s.level.clamp(0.0, 1.0)
-        },
-        0.12,
-    );
+    // Muted, the line still moves (dimmed): it shows the microphone works,
+    // just that nothing goes out.
+    let level =
+        ui.ctx()
+            .animate_value_with_time(response.id.with("level"), s.level.clamp(0.0, 1.0), 0.12);
     let line = egui::Rect::from_min_max(
         egui::pos2(rect.left() + 14.0, rect.bottom() - 9.0),
         egui::pos2(rect.right() - 14.0, rect.bottom() - 6.0),
@@ -385,11 +404,21 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
             tok.on_accent.gamma_multiply(0.18),
             tok.on_accent.gamma_multiply(0.7),
         )
+    } else if s.muted {
+        (
+            ui.visuals().widgets.inactive.bg_stroke.color,
+            tok.error.gamma_multiply(0.5),
+        )
     } else {
         (
             ui.visuals().widgets.inactive.bg_stroke.color,
             if s.ptt { tok.level } else { tok.accent },
         )
+    };
+    let fill = if s.clipping && !s.muted {
+        tok.error
+    } else {
+        fill
     };
     painter.rect_filled(line, 1.5, track);
     if level > 0.0 {
@@ -408,7 +437,9 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         );
     }
 
-    let (glyph, label, color) = if s.muted {
+    let (glyph, label, color) = if s.talking_muted {
+        (icon::MICROPHONE_SLASH, "Stumm — du sprichst", tok.error)
+    } else if s.muted {
         (icon::MICROPHONE_SLASH, "Stumm", tok.error)
     } else if s.offline {
         (icon::PLUGS, "Getrennt", tok.muted_text)
@@ -467,6 +498,8 @@ pub fn status_link(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
     );
     let size = egui::vec2(galley.size().x + 26.0, 24.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), text));
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if response.hovered() {
@@ -496,6 +529,9 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
         *on = !*on;
         response.mark_changed();
     }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "")
+    });
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(response.id, *on);
         let tok = theme::tokens(ui.visuals());
@@ -611,6 +647,55 @@ pub fn segmented<T: PartialEq + Copy>(
     response
 }
 
+/// A chip that switches one thing on and off, for a row of related
+/// switches that would each be a row of their own otherwise: tinted with a
+/// check when on, an outline when off.
+pub fn chip_toggle(ui: &mut Ui, on: &mut bool, label: &str) -> egui::Response {
+    let tok = theme::tokens(ui.visuals());
+    let text = if *on {
+        format!("{}  {label}", icon::CHECK)
+    } else {
+        label.to_string()
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, seg_font(), ui.visuals().text_color());
+    let size = egui::vec2(galley.size().x + SEG_PAD * 2.0, 28.0);
+    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label)
+    });
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let (fill, stroke, color) = if *on {
+            (tok.accent_tint, tok.accent.gamma_multiply(0.45), tok.accent)
+        } else {
+            (
+                ui.visuals().extreme_bg_color,
+                ui.visuals().widgets.inactive.bg_stroke.color,
+                tok.muted_text,
+            )
+        };
+        painter.rect_filled(rect, CornerRadius::same(R_CTRL), fill);
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(R_CTRL),
+            Stroke::new(1.0, stroke),
+            StrokeKind::Inside,
+        );
+        if response.hovered() {
+            painter.rect_filled(rect, CornerRadius::same(R_CTRL), tok.hover_overlay);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+    }
+    response
+}
+
 /// A slider drawn in the same hand as [`toggle`]: a thin recessed track, an
 /// accent trail up to the value, a light knob. Fills the available width and
 /// takes a click or a drag anywhere along the row.
@@ -622,6 +707,8 @@ pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui:
     let width = ui.available_width().max(KNOB * 4.0);
     let (rect, mut response) =
         ui.allocate_exact_size(egui::vec2(width, HEIGHT), Sense::click_and_drag());
+    let shown = f64::from(*value);
+    response.widget_info(|| egui::WidgetInfo::slider(ui.is_enabled(), shown, ""));
     // The knob centre never leaves the track, so the value stays reachable
     // at both ends without the knob hanging over the edge.
     let span = (rect.left() + KNOB)..=(rect.right() - KNOB);
@@ -860,7 +947,7 @@ pub fn chip(ui: &mut Ui, text: &str, min_width: f32) -> egui::Response {
 
 /// The width [`chip`] will take for the widest of `samples`, so a row can
 /// reserve it up front.
-fn chip_width(ui: &Ui, samples: &[String]) -> f32 {
+pub fn chip_width(ui: &Ui, samples: &[String]) -> f32 {
     let font = FontId::new(11.0, egui::FontFamily::Monospace);
     samples
         .iter()
@@ -977,6 +1064,14 @@ pub fn rail_button(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool 
     let tok = theme::tokens(ui.visuals());
     let text_color = if active { tok.accent } else { tok.muted_text };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(64.0, 38.0), egui::Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            active,
+            label,
+        )
+    });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if active {
@@ -1021,6 +1116,14 @@ pub fn nav_item(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
     let tok = theme::tokens(ui.visuals());
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), NAV_H), Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            active,
+            label,
+        )
+    });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let (fill, color) = if active {
@@ -1076,9 +1179,8 @@ pub fn page_header<R>(
             rtl(ui, 30.0, actions)
         })
         .inner;
-    ui.add_space(2.0);
     ui.label(RichText::new(description).size(12.5).color(tok.muted_text));
-    ui.add_space(16.0);
+    ui.add_space(12.0);
     result
 }
 
@@ -1163,6 +1265,9 @@ pub fn badge(ui: &mut Ui, text: &str, kind: BadgeKind) -> egui::Response {
 pub fn more_button(ui: &mut Ui) -> egui::Response {
     let tok = theme::tokens(ui.visuals());
     let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Aktionen")
+    });
     if ui.is_rect_visible(rect) {
         let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
         let (fill, color) = if open {
@@ -1253,7 +1358,7 @@ pub fn group_card<R>(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui
             add_contents(ui)
         })
         .inner;
-    ui.add_space(14.0);
+    ui.add_space(12.0);
     result
 }
 
@@ -1274,7 +1379,7 @@ pub fn setting_row<R>(
     }
     let tok = theme::tokens(ui.visuals());
     Frame::new()
-        .inner_margin(egui::Margin::symmetric(12, 10))
+        .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
             // The label goes straight into the row, where the placer centers
             // it on the control; the help text runs underneath at full width
@@ -1287,7 +1392,7 @@ pub fn setting_row<R>(
                 })
                 .inner;
             if let Some(h) = help {
-                ui.add_space(3.0);
+                ui.add_space(1.0);
                 ui.label(RichText::new(h).size(11.5).color(tok.dim_text));
             }
             result

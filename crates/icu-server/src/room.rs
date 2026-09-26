@@ -273,6 +273,20 @@ impl Room {
         }
     }
 
+    /// Closes every session of `user_id` with `code`, so that their
+    /// `UserLeft` carries it. Returns the `stable_id`s of their connections.
+    pub fn close_user(&self, user_id: UserId, code: u32) -> Vec<usize> {
+        self.lock()
+            .members
+            .values_mut()
+            .filter(|m| m.user_id == user_id)
+            .map(|m| {
+                m.close(code);
+                m.conn.stable_id()
+            })
+            .collect()
+    }
+
     /// Closes the connection with this `stable_id` if it is in the room, so
     /// that its `UserLeft` carries `code`. Returns whether it was.
     pub fn close_connection(&self, stable_id: usize, code: u32) -> bool {
@@ -368,13 +382,14 @@ impl Room {
         Some((flags, flipped))
     }
 
-    /// Connections to hand a video frame to: everybody else. Deafened only
-    /// concerns audio.
+    /// Connections to hand a video frame to: everybody else who is viewing
+    /// (`PROTOCOL.md` §4). A user's own deafen only concerns audio; one an
+    /// admin enforces cuts video as well (`PROTOCOL.md` §2.2 Nr. 33).
     pub fn video_receivers(&self, sender: Session) -> Vec<(Session, quinn::Connection)> {
         self.lock()
             .members
             .values()
-            .filter(|m| m.session != sender && m.flags.viewing())
+            .filter(|m| m.session != sender && m.flags.viewing() && !m.forced.deafened())
             .map(|m| (m.session, m.conn.clone()))
             .collect()
     }
@@ -459,7 +474,13 @@ impl Room {
             .members
             .values()
             .map(|m| {
-                let ms = m.conn.stats().path.rtt.as_millis().min(u128::from(u16::MAX));
+                let ms = m
+                    .conn
+                    .stats()
+                    .path
+                    .rtt
+                    .as_millis()
+                    .min(u128::from(u16::MAX));
                 (m.session, ms as u16)
             })
             .collect()
@@ -571,6 +592,8 @@ pub struct Counters {
     /// Video frames dropped because the sender's camera is off or it is not
     /// active.
     pub video_dropped_not_allowed: AtomicU64,
+    /// Video frames whose stream stalled past `timing.video_frame_timeout_ms`.
+    pub video_dropped_stalled: AtomicU64,
     /// Control messages received.
     pub control_in: AtomicU64,
     /// `Error(RATE_LIMITED)` sent.

@@ -30,15 +30,29 @@ pub const HANDSHAKES_PER_IP_PER_S: u32 = 10;
 /// Handshakes per second, server wide. Caps what many source addresses
 /// together can make the server spend on TLS.
 pub const HANDSHAKES_GLOBAL_PER_S: u32 = 100;
-/// Open connections, handshaking or established, above which the server
-/// sends a Retry.
+/// Handshakes in flight from which on a source that has not proven its
+/// address gets a Retry instead of a handshake.
 pub const HANDSHAKES_IN_FLIGHT_RETRY: usize = 32;
-/// Open connections, handshaking or established, above which the server
+/// Handshakes in flight, over all listen addresses, above which the server
 /// refuses new ones outright.
+pub const MAX_HANDSHAKES: u32 = 256;
+/// Handshakes in flight per validated source (IPv4 address, IPv6 /64). A
+/// source that answers the Retry and then stalls holds at most this many.
+pub const HANDSHAKES_IN_FLIGHT_PER_IP: u32 = 4;
+/// Handshakes in flight per IPv6 /48 over all its /64s: a single customer
+/// usually holds a whole /48.
+pub const HANDSHAKES_IN_FLIGHT_PER_48: u32 = 16;
+/// Established connections above which a completed handshake is closed with
+/// `SERVER_FULL`. A backstop: outsiders cannot keep a connection past the
+/// handshake, and each certificate holds one at most.
 pub const MAX_CONNECTIONS: u32 = 256;
+/// Sessions outside the room — registration and renew-only — open at the
+/// same time, server wide. Each holds a connection without joining the room,
+/// so the room size does not bound them.
+pub const MAX_ROOMLESS_SESSIONS: usize = 8;
 /// Seconds a QUIC handshake may take before the server drops it. Without
 /// this, a half-open handshake lives for the whole idle timeout.
-pub const HANDSHAKE_TIMEOUT_S: u64 = 10;
+pub const HANDSHAKE_TIMEOUT_S: u64 = 5;
 /// IPv6 sources are rate limited per prefix of this length: a single host
 /// usually holds a whole /64, so per-address buckets would not limit it.
 pub const IPV6_LIMIT_PREFIX: u8 = 64;
@@ -51,6 +65,23 @@ pub const HELLO_TIMEOUT_S: u64 = 5;
 pub const MAX_IDLE_TIMEOUT_S: u64 = 60;
 /// Client keepalive interval.
 pub const KEEP_ALIVE_INTERVAL_S: u64 = 15;
+/// Bytes a peer may send on one stream before the server has read them
+/// (QUIC stream flow control). Flow control, not a size limit: a 512 KiB
+/// video frame still flows, in windows of this size.
+pub const STREAM_RECEIVE_WINDOW: u32 = 64 * 1024;
+/// Bytes a peer may send over all streams of a connection before the server
+/// has read them. Caps what a connection can pin in server memory, streams
+/// the server never reads included (quinn's default is unbounded).
+pub const CONNECTION_RECEIVE_WINDOW: u32 = 1024 * 1024;
+/// Bytes the server holds for one connection before its writes wait:
+/// unacknowledged video and control data towards one client.
+pub const SEND_WINDOW: u64 = 1024 * 1024;
+/// Video frames one sender may have in flight on the server at a time; a
+/// further stream is stopped with `RATE_LIMITED` right away.
+pub const VIDEO_STREAMS_PER_SENDER: usize = 4;
+/// Seconds a video frame may take to arrive, header and payload, before the
+/// server stops its stream with `RATE_LIMITED`.
+pub const VIDEO_FRAME_TIMEOUT_S: u64 = 5;
 /// Datagram receive buffer size on both sides, and the server's send buffer
 /// (its send queue carries every speaker's audio to one receiver).
 pub const DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
@@ -83,6 +114,9 @@ pub const RATE_VIOLATION_WINDOW_S: u64 = 60;
 
 /// Certificate renewals per day and `user_id`.
 pub const RENEW_PER_DAY: u32 = 1;
+/// Registration bundles one admin may mint per hour over the authenticated
+/// connection (`CreateInviteRequest`). The host's CLI is not limited.
+pub const INVITES_PER_ADMIN_PER_HOUR: u32 = 20;
 /// How long a registration certificate stays valid by default.
 pub const INVITE_TTL_S: u64 = 24 * 60 * 60;
 /// Organizational unit of a registration certificate (`PROTOCOL.md` §2.3).

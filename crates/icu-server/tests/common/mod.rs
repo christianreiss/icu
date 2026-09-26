@@ -124,6 +124,7 @@ impl TestServer {
         close_code: u32,
     ) -> Result<Identity, EnrollFail> {
         let registration = identity_from_bundle(bundle);
+        let registration_fp = icu_server::store::fingerprint(&registration.cert);
         let mut client = self
             .connect(&registration)
             .await
@@ -165,6 +166,20 @@ impl TestServer {
             })),
         };
         client.conn.close(quinn::VarInt::from_u32(close_code), b"");
+        // The server finishes the session after the close — the receipt is
+        // a store write — so wait for that: whatever the test does next
+        // sees a finished registration, not one in progress.
+        let roomless = &self.handle.server().roomless;
+        for _ in 0..200 {
+            if !roomless
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&registration_fp)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         result
     }
 
@@ -184,7 +199,11 @@ impl TestServer {
     /// Connects with `identity` and returns the code the connection ends
     /// with, handshake alert or application close, whichever comes.
     pub async fn rejection(&self, identity: &Identity) -> Option<u32> {
-        let endpoint = client_endpoint(self.ca(), Some(identity.clone()), icu_proto::limits::ALPN_MAIN);
+        let endpoint = client_endpoint(
+            self.ca(),
+            Some(identity.clone()),
+            icu_proto::limits::ALPN_MAIN,
+        );
         let conn = match endpoint.connect(self.addr(), "localhost").ok()?.await {
             Ok(conn) => conn,
             Err(e) => return code_of(&e),
@@ -363,13 +382,11 @@ impl Client {
     pub async fn recv_timeout(&mut self, timeout: Duration) -> Option<ControlMsg> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let body = tokio::time::timeout_at(
-                deadline,
-                read_frame(&mut self.recv, MAX_CONTROL_FRAME),
-            )
-            .await
-            .ok()?
-            .ok()?;
+            let body =
+                tokio::time::timeout_at(deadline, read_frame(&mut self.recv, MAX_CONTROL_FRAME))
+                    .await
+                    .ok()?
+                    .ok()?;
             match ControlMsg::decode(&body).ok()? {
                 ControlMsg::CrlUpdate { crl_der } => self.crl = Some(crl_der),
                 msg => return Some(msg),
@@ -520,6 +537,32 @@ pub fn client_endpoint(
     identity: Option<Identity>,
     alpn: &[u8],
 ) -> Endpoint {
+    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");
+    endpoint.set_default_client_config(client_config(ca, identity, alpn));
+    endpoint
+}
+
+/// The client configuration of [`client_endpoint`], for an endpoint built
+/// some other way.
+pub fn client_config(
+    ca: CertificateDer<'static>,
+    identity: Option<Identity>,
+    alpn: &[u8],
+) -> ClientConfig {
+    client_config_with_chain(
+        ca,
+        identity.map(|identity| (vec![identity.cert.clone()], identity.key())),
+        alpn,
+    )
+}
+
+/// [`client_config`] presenting `auth`'s certificate chain as it is — the
+/// leaf first — with its key.
+pub fn client_config_with_chain(
+    ca: CertificateDer<'static>,
+    auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    alpn: &[u8],
+) -> ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca).expect("add ca");
     // Always build from an explicit provider: several servers and clients live
@@ -530,15 +573,14 @@ pub fn client_endpoint(
     .with_protocol_versions(&[&rustls::version::TLS13])
     .expect("tls13")
     .with_root_certificates(roots);
-    let mut tls = match identity {
-        Some(identity) => builder
-            .with_client_auth_cert(vec![identity.cert.clone()], identity.key())
+    let mut tls = match auth {
+        Some((chain, key)) => builder
+            .with_client_auth_cert(chain, key)
             .expect("client auth"),
         None => builder.with_no_client_auth(),
     };
     tls.alpn_protocols = vec![alpn.to_vec()];
 
-    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");
     let mut config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client config"),
     ));
@@ -557,8 +599,7 @@ pub fn client_endpoint(
         icu_proto::limits::max_uni_streams(icu_proto::limits::DEFAULT_MAX_USERS),
     ));
     config.transport_config(Arc::new(transport));
-    endpoint.set_default_client_config(config);
-    endpoint
+    config
 }
 
 /// Connects on ALPN `icu/1` and opens the control stream.

@@ -77,6 +77,10 @@ pub const REGISTRATION_STORED: u32 = 0x1A;
 /// `RenewRequest`/`Ping`; the client renews with its existing key and
 /// reconnects with the new leaf (`PROTOCOL.md` §2.2). Not fatal.
 pub const RENEW_REQUIRED: u32 = 0x1B;
+/// The server could not carry out an action — as a rule it could not write
+/// its state — and changed nothing; trying again later may work. Only ever
+/// sent as `Error` or `AdminActionError`, never as a close. Not fatal.
+pub const SERVER_ERROR: u32 = 0x1C;
 
 /// All codes defined by v1, in ascending order.
 pub const ALL_CODES: &[u32] = &[
@@ -106,6 +110,7 @@ pub const ALL_CODES: &[u32] = &[
     SESSION_REPLACED,
     REGISTRATION_STORED,
     RENEW_REQUIRED,
+    SERVER_ERROR,
 ];
 
 /// Fatal codes (`PROTOCOL.md` §5/§6): the client must not reconnect.
@@ -120,6 +125,7 @@ pub fn is_fatal(code: u32) -> bool {
             | AUTH_UNKNOWN_CERT
             | AUTH_REVOKED
             | KICKED
+            | AUTH_REQUIRED
             | RATE_LIMITED_FATAL
             | ENROLL_BAD_TOKEN
             | ENROLL_BAD_CSR
@@ -159,6 +165,7 @@ pub fn name(code: u32) -> &'static str {
         SESSION_REPLACED => "SESSION_REPLACED",
         REGISTRATION_STORED => "REGISTRATION_STORED",
         RENEW_REQUIRED => "RENEW_REQUIRED",
+        SERVER_ERROR => "SERVER_ERROR",
         _ => "UNKNOWN",
     }
 }
@@ -176,6 +183,7 @@ mod tests {
             AUTH_UNKNOWN_CERT,
             AUTH_REVOKED,
             KICKED,
+            AUTH_REQUIRED,
             RATE_LIMITED_FATAL,
             ENROLL_BAD_TOKEN,
             ENROLL_BAD_CSR,

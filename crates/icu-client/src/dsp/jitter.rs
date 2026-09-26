@@ -5,6 +5,18 @@
 //! period. All `seq`/`ts` comparisons are signed differences modulo 2^16 /
 //! 2^32 (`PROTOCOL.md` §3). Loss (a `seq` gap) is told apart from a pause
 //! (a `ts` jump with gapless `seq`); the latter re-anchors the buffer.
+//!
+//! Depth. The playout runs `target` behind the spurt's earliest arrival
+//! (the anchor): a packet is on time as long as its arrival delay relative
+//! to the anchor stays below that margin. The target is the larger of two
+//! terms — the 95 % quantile of the delay histogram plus a frame (jitter),
+//! and the tallest delay of the last 20–40 s that the jitter term did not
+//! cover, plus two frames (a stall that recurs, as Wi-Fi power saving and
+//! congested links produce). Inside a spurt the depth follows a grown
+//! target by concealing extra frames — while an underrun is being concealed
+//! anyway, or at a quiet frame — and sheds excess by skipping a packet
+//! before decode (RFC 6716 §4.4.1), so a monologue adapts without waiting
+//! for a pause; between spurts the prefill sets the depth outright.
 
 use std::{
     collections::BTreeMap,
@@ -59,7 +71,10 @@ pub struct JitterStats {
     /// Frames concealed because the next packet was not here yet; the
     /// buffer waits for it instead of writing it off (delay grows a frame).
     pub underruns: u64,
-    /// Packets skipped before decode to shed delay grown by underruns.
+    /// Frames concealed on purpose to deepen the buffer to a target that
+    /// grew inside a spurt (`stretch`).
+    pub stretched: u64,
+    /// Packets skipped before decode to shed excess delay.
     pub skipped: u64,
     /// Packets dropped because the queue held more than `max_delay` (a
     /// stall's burst); keeps the backlog from becoming lasting latency.
@@ -103,9 +118,34 @@ const MAX_EARLY: Duration = Duration::from_millis((BUCKETS as f64 * BUCKET_MS) a
 /// 95 % quantile at a third of all spurt ends and the target collapsed
 /// (`spurt_target_does_not_depend_on_the_anchor_packet`).
 const FORGET: f64 = 0.997;
-/// Consecutive pops with more than target + 1 frame queued before one
+/// Consecutive pops with more than target + 2 frames queued before one
 /// packet is skipped to shed the excess: half a second at 20 ms frames.
 const EXCESS_POPS: u32 = 25;
+/// Pops a due stretch or skip waits for a quiet frame before it goes ahead
+/// in the middle of speech: a second at 20 ms frames. A pause between
+/// words normally comes sooner; a speaker who never pauses gets the
+/// adjustment anyway rather than the underrun it prevents.
+const QUIET_PATIENCE: u32 = 50;
+/// Half of the stall memory: the tallest spike of the current and the
+/// previous half-window sets the target, so a stall is remembered for
+/// 20–40 s. Shorter, and a monologue's target would sag between stalls
+/// that keep coming every few seconds.
+const SPIKE_HALF_WINDOW: Duration = Duration::from_secs(20);
+/// Frames of headroom above the tallest spike: one because the spike
+/// measured a packet, not the stall — the next packet of the same stall
+/// can be up to a frame later — and one for a stall that is a little
+/// taller than the last.
+const SPIKE_HEADROOM_FRAMES: u32 = 2;
+
+/// Arrival time, `ts` and unwrapped `seq` of the earliest-arriving packet of
+/// the current spurt; every later packet's expected arrival is measured
+/// from it.
+#[derive(Debug, Clone, Copy)]
+struct Anchor {
+    arrival: Instant,
+    ts: u32,
+    seq: i64,
+}
 
 /// The buffer.
 #[derive(Debug)]
@@ -120,12 +160,16 @@ pub struct JitterBuffer {
     next: Option<i64>,
     /// Consecutive misses inside a spurt.
     misses: u32,
-    /// Arrival time and ts of the first packet of the current spurt.
-    anchor: Option<(Instant, u32)>,
+    anchor: Option<Anchor>,
     /// Arrival of the first queued packet while prefilling.
     prefill_since: Option<Instant>,
     /// Arrival delay histogram in 5 ms buckets.
     hist: [f64; BUCKETS],
+    /// Tallest spike of the current half-window and when it started.
+    spike_cur: Duration,
+    spike_since: Option<Instant>,
+    /// Tallest spike of the previous half-window.
+    spike_prev: Duration,
     target: Duration,
     /// Lower clamp: one frame while the encoder is told about loss (FEC needs
     /// n+1), otherwise 5 ms.
@@ -136,8 +180,14 @@ pub struct JitterBuffer {
     last_delay: Option<Duration>,
     /// Frames inserted by underruns this spurt and not yet shed again.
     grown: u32,
-    /// Consecutive pops that found more than target + 1 frame queued.
+    /// Consecutive pops that found more than target + 2 frames queued.
     excess_pops: u32,
+    /// Pops a due stretch has waited for a quiet frame.
+    stretch_wait: u32,
+    /// The last pop concealed a frame without advancing (underrun or
+    /// stretch): another concealment continues it instead of starting a
+    /// second interruption.
+    concealing: bool,
     /// Unwrapped seq of the last slot `pop` consumed (played or written off
     /// as lost). Survives the end of a spurt: a straggler from a finished
     /// spurt is late, not the start of a new one.
@@ -157,6 +207,9 @@ impl JitterBuffer {
             anchor: None,
             prefill_since: None,
             hist: [0.0; BUCKETS],
+            spike_cur: Duration::ZERO,
+            spike_since: None,
+            spike_prev: Duration::ZERO,
             target: frame * cfg.start_frames,
             min_target: Duration::from_millis(5),
             stats: JitterStats::default(),
@@ -165,6 +218,8 @@ impl JitterBuffer {
             last_delay: None,
             grown: 0,
             excess_pops: 0,
+            stretch_wait: 0,
+            concealing: false,
             played_hwm: None,
         }
     }
@@ -258,10 +313,10 @@ impl JitterBuffer {
         // from a spurt full of it. A packet that arrives earlier than the
         // anchor predicts therefore becomes the anchor (delay 0), and the
         // remaining packets are measured against it.
-        if let Some((anchor_arrival, anchor_ts)) = self.anchor.as_mut() {
-            let expected = *anchor_arrival
+        if let Some(anchor) = self.anchor.as_mut() {
+            let expected = anchor.arrival
                 + Duration::from_micros(
-                    ts_diff(packet.ts, *anchor_ts).max(0) as u64 * 1_000_000 / 48_000,
+                    ts_diff(packet.ts, anchor.ts).max(0) as u64 * 1_000_000 / 48_000,
                 );
             let delay = if now >= expected {
                 now - expected
@@ -273,17 +328,27 @@ impl JitterBuffer {
                 // its epoch, and a peer's `ts` is not to be trusted.
                 let early = expected - now;
                 if early <= MAX_EARLY {
-                    if let Some(a) = anchor_arrival.checked_sub(early) {
-                        *anchor_arrival = a;
+                    if let Some(a) = anchor.arrival.checked_sub(early) {
+                        anchor.arrival = a;
                     }
                 }
                 Duration::ZERO
             };
-            self.observe(delay);
+            self.observe(delay, now);
             // Mid-spurt the target only grows; it shrinks in pauses.
             let before = self.target;
             self.adapt();
             self.target = self.target.max(before);
+            if delay >= Duration::from_millis(25) {
+                tracing::debug!(
+                    seq = packet.seq,
+                    delay_ms = delay.as_millis() as u64,
+                    target_ms = self.target.as_millis() as u64,
+                    queued = self.queue.len(),
+                    played = self.stats.played,
+                    "jitter spike"
+                );
+            }
         } else if self.prefill_since.is_none() {
             self.prefill_since = Some(now);
         }
@@ -300,7 +365,23 @@ impl JitterBuffer {
         self.queue.insert(u, (packet, now));
     }
 
-    fn observe(&mut self, delay: Duration) {
+    fn observe(&mut self, delay: Duration, now: Instant) {
+        // Stall memory: a delay the jitter term does not cover is a spike,
+        // and the tallest of the last 20–40 s stays in the target.
+        let since = *self.spike_since.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(since);
+        if elapsed >= SPIKE_HALF_WINDOW {
+            self.spike_prev = if elapsed >= 2 * SPIKE_HALF_WINDOW {
+                Duration::ZERO
+            } else {
+                self.spike_cur
+            };
+            self.spike_cur = Duration::ZERO;
+            self.spike_since = Some(now);
+        }
+        if delay > self.spike_threshold() {
+            self.spike_cur = self.spike_cur.max(delay);
+        }
         for b in self.hist.iter_mut() {
             *b *= FORGET;
         }
@@ -308,23 +389,63 @@ impl JitterBuffer {
         self.hist[idx] += 1.0;
     }
 
-    /// Recomputes the target from the histogram: 95 % quantile + 1 frame.
-    fn adapt(&mut self) {
+    /// The tallest spike remembered.
+    fn spike(&self) -> Duration {
+        self.spike_cur.max(self.spike_prev)
+    }
+
+    /// Upper edge of the histogram bucket at quantile `q`, once four
+    /// observations are in.
+    fn quantile(&self, q: f64) -> Option<Duration> {
         let total: f64 = self.hist.iter().sum();
         if total < 4.0 {
-            return;
+            return None;
         }
         let mut acc = 0.0;
-        let mut q95 = 0usize;
+        let mut bucket = 0usize;
         for (i, b) in self.hist.iter().enumerate() {
             acc += b;
-            if acc >= 0.95 * total {
-                q95 = i;
+            if acc >= q * total {
+                bucket = i;
                 break;
             }
         }
-        let q = Duration::from_micros((((q95 + 1) as f64) * BUCKET_MS * 1000.0) as u64);
-        self.target = q + self.frame_duration();
+        Some(Duration::from_micros(
+            (((bucket + 1) as f64) * BUCKET_MS * 1000.0) as u64,
+        ))
+    }
+
+    /// 95 % quantile of the histogram + 1 frame, or the start target while
+    /// the histogram is still empty.
+    fn jitter_target(&self) -> Duration {
+        match self.quantile(0.95) {
+            Some(q) => q + self.frame_duration(),
+            None => self.frame_duration() * self.cfg.start_frames,
+        }
+    }
+
+    /// Delays above this are stalls, not jitter: a whole frame over the
+    /// median, i.e. the packet came after its successor was due. The median
+    /// rather than the 95 % quantile because the latter is a handful of
+    /// packets early in a spurt — one moderately late packet of a burst,
+    /// delivered ahead of its taller sibling, once lifted it to the
+    /// sibling's height and hid the stall (traced 2026-09-26). The spike
+    /// term is a maximum, so with a stable threshold the order inside a
+    /// burst no longer matters.
+    fn spike_threshold(&self) -> Duration {
+        self.quantile(0.5).unwrap_or_default() + self.frame_duration()
+    }
+
+    /// Recomputes the target: the jitter term, or the tallest remembered
+    /// spike plus its headroom, whichever is larger.
+    fn adapt(&mut self) {
+        let jitter = self.jitter_target();
+        let spike = self.spike();
+        self.target = if spike.is_zero() {
+            jitter
+        } else {
+            jitter.max(spike + self.frame_duration() * SPIKE_HEADROOM_FRAMES)
+        };
         self.clamp_target();
     }
 
@@ -347,6 +468,18 @@ impl JitterBuffer {
         self.prefill_since = None;
         self.grown = 0;
         self.excess_pops = 0;
+        self.stretch_wait = 0;
+        self.concealing = false;
+    }
+
+    /// How far behind the anchor's schedule slot `slot` is played at `now`:
+    /// the margin a packet of that slot had against arriving late.
+    fn margin(&self, slot: i64, now: Instant, frame: Duration) -> Duration {
+        let Some(anchor) = self.anchor else {
+            return Duration::ZERO;
+        };
+        let ahead = (slot - anchor.seq).clamp(0, u32::MAX as i64) as u32;
+        now.saturating_duration_since(anchor.arrival + frame * ahead)
     }
 
     /// Caps the queue at `max_delay` (or target + 2 frames, if larger): past
@@ -378,14 +511,26 @@ impl JitterBuffer {
         }
     }
 
-    /// Called once per frame period by the playout side.
+    /// Called once per frame period by the playout side; adjustments that
+    /// can wait for a quiet frame are made at once.
     pub fn pop(&mut self, now: Instant) -> Pop {
+        self.pop_quiet(now, true)
+    }
+
+    /// [`JitterBuffer::pop`] told whether the frame last decoded for this
+    /// speaker was quiet: a stretch (an extra concealed frame) or a skip
+    /// that is due waits up to `QUIET_PATIENCE` pops for one, so the
+    /// adjustment lands in a pause instead of a word.
+    pub fn pop_quiet(&mut self, now: Instant, quiet: bool) -> Pop {
         let frame = self.frame_duration();
         self.drain_backlog(frame);
         if self.next.is_none() {
-            // Prefill: start once the target delay has elapsed since the first
-            // queued packet, or enough packets are queued to cover it.
+            // Prefill: start once the first packet has waited the target,
+            // or once the queue holds the target plus the frame about to
+            // play (a burst) — either way the playout then runs `target`
+            // behind the earliest arrival.
             let Some((&first, _)) = self.queue.iter().next() else {
+                self.concealing = false;
                 return Pop::Silence;
             };
             let waited = self
@@ -393,41 +538,107 @@ impl JitterBuffer {
                 .map(|t| now.saturating_duration_since(t))
                 .unwrap_or_default();
             let queued = frame * self.queue.len() as u32;
-            if waited < self.target && queued < self.target {
+            if waited < self.target && queued < self.target + frame {
                 return Pop::Silence;
             }
             let (first_pkt, first_arrival) = &self.queue[&first];
-            self.anchor = Some((*first_arrival, first_pkt.ts));
+            self.anchor = Some(Anchor {
+                arrival: *first_arrival,
+                ts: first_pkt.ts,
+                seq: first,
+            });
             self.next = Some(first);
             self.misses = 0;
+            self.stretch_wait = 0;
+            self.concealing = false;
             self.stats.spurts += 1;
+            tracing::debug!(
+                waited_ms = waited.as_millis() as u64,
+                queued_ms = queued.as_millis() as u64,
+                target_ms = self.target.as_millis() as u64,
+                played = self.stats.played,
+                "jitter prefill done"
+            );
         }
         let mut next = self.next.unwrap_or(0);
         // Delay beyond what the target asks for is shed by skipping one
         // packet before decode (RFC 6716 §4.4.1): at once when underruns
-        // grew it (`grown`) and two frames of slack are exceeded; otherwise
-        // — a burst at spurt start, a sender whose clock runs fast — down
-        // to the same target + 1 frame `drain_backlog` trims to, but only
-        // once the excess has persisted for `EXCESS_POPS` pops, so a jitter
-        // spike the target is still absorbing is not mistaken for it.
+        // grew it (`grown`); otherwise — a burst at spurt start, a sender
+        // whose clock runs fast — only once more than target + 2 frames
+        // has been queued for `EXCESS_POPS` pops, so a jitter spike the
+        // target is still absorbing is not mistaken for it, and preferably
+        // at a quiet frame. Two frames, because the playout sits up to a
+        // frame past the target after a prefill or stretch, and the queue
+        // is measured in whole frames.
         let queued = frame * self.queue.range(next..).count() as u32;
-        self.excess_pops = if queued > self.target + frame {
-            self.excess_pops + 1
-        } else {
-            0
-        };
-        let shed = (self.grown > 0 && queued > self.target + 2 * frame)
-            || self.excess_pops >= EXCESS_POPS;
+        let excess = queued > self.target + 2 * frame;
+        self.excess_pops = if excess { self.excess_pops + 1 } else { 0 };
+        let shed = excess
+            && (self.grown > 0
+                || (self.excess_pops >= EXCESS_POPS
+                    && (quiet || self.excess_pops >= EXCESS_POPS + QUIET_PATIENCE)));
         if shed && self.queue.remove(&next).is_some() {
+            tracing::debug!(
+                seq = (next & 0xFFFF) as u16,
+                queued_ms = queued.as_millis() as u64,
+                target_ms = self.target.as_millis() as u64,
+                grown = self.grown,
+                excess_pops = self.excess_pops,
+                played = self.stats.played,
+                "jitter skip"
+            );
             self.grown = self.grown.saturating_sub(1);
             self.excess_pops = 0;
             self.stats.skipped += 1;
             next += 1;
             self.next = Some(next);
         }
+        // Stretch: the target grew more than a frame beyond the depth the
+        // playout actually has — the margin against the anchor's schedule,
+        // or the queue if a burst filled it deeper — so one more frame is
+        // concealed before this packet and the schedule moves a frame
+        // later. Right away while a concealment is running anyway (the
+        // underrun that revealed the stall), at a quiet frame otherwise;
+        // and once started it goes on until the depth reaches the target,
+        // so the next spike a little taller than the last is covered
+        // without a second interruption. Only with the packet here: a
+        // missing one is an underrun below.
+        if self.queue.contains_key(&next) {
+            let depth = self
+                .margin(next, now, frame)
+                .max(queued.saturating_sub(frame));
+            let short = if self.concealing {
+                depth < self.target
+            } else {
+                depth + frame < self.target
+            };
+            if short {
+                if quiet || self.concealing || self.stretch_wait >= QUIET_PATIENCE {
+                    tracing::debug!(
+                        seq = (next & 0xFFFF) as u16,
+                        depth_ms = depth.as_millis() as u64,
+                        target_ms = self.target.as_millis() as u64,
+                        played = self.stats.played,
+                        "jitter stretch"
+                    );
+                    self.stretch_wait = 0;
+                    self.concealing = true;
+                    self.grown = 0;
+                    self.stats.stretched += 1;
+                    return Pop::Lost {
+                        seq: (next & 0xFFFF) as u16,
+                        fec_source: None,
+                    };
+                }
+                self.stretch_wait += 1;
+            } else {
+                self.stretch_wait = 0;
+            }
+        }
         if let Some((pkt, arrived)) = self.queue.remove(&next) {
             self.last_delay = Some(now.saturating_duration_since(arrived));
             self.misses = 0;
+            self.concealing = false;
             self.stats.played += 1;
             let end = pkt.end;
             self.next = Some(next + 1);
@@ -448,8 +659,16 @@ impl JitterBuffer {
                 // A later packet is here: `next` is lost, not late.
                 self.stats.lost += 1;
                 self.misses = 0;
+                self.concealing = false;
                 let fec_source = if k == next + 1 { Some(pkt) } else { None };
                 let seq = (next & 0xFFFF) as u16;
+                tracing::debug!(
+                    seq,
+                    present = (k & 0xFFFF) as u16,
+                    queued = self.queue.len(),
+                    played = self.stats.played,
+                    "jitter loss"
+                );
                 self.next = Some(next + 1);
                 self.played_hwm = Some(next);
                 Pop::Lost { seq, fec_source }
@@ -471,7 +690,17 @@ impl JitterBuffer {
                 // the buffer just as shallow for the next jitter spike.
                 self.stats.underruns += 1;
                 self.grown += 1;
+                self.concealing = true;
                 let seq = (next & 0xFFFF) as u16;
+                tracing::debug!(
+                    seq,
+                    target_ms = self.target.as_millis() as u64,
+                    grown = self.grown,
+                    misses = self.misses,
+                    played = self.stats.played,
+                    last_delay_ms = self.last_delay.map_or(0, |d| d.as_millis() as u64),
+                    "jitter underrun"
+                );
                 Pop::Lost {
                     seq,
                     fec_source: None,
@@ -507,11 +736,28 @@ mod tests {
         let t0 = Instant::now();
         let mut jb = buffer();
         jb.push(pkt(0, 0, false), t0);
-        assert_eq!(jb.pop(t0), Pop::Silence, "one packet, target 2 frames");
+        assert_eq!(jb.pop(t0), Pop::Silence, "one packet, target 40 ms");
         jb.push(pkt(1, 960, false), t0 + ms(20));
-        // Two frames queued = 40 ms = target → starts.
-        assert!(matches!(jb.pop(t0 + ms(20)), Pop::Packet(p) if p.seq == 0));
-        assert!(matches!(jb.pop(t0 + ms(40)), Pop::Packet(p) if p.seq == 1));
+        // Two frames queued cover the target but not the frame about to
+        // play; the first packet starts once it has waited the target.
+        assert_eq!(jb.pop(t0 + ms(20)), Pop::Silence);
+        assert!(matches!(jb.pop(t0 + ms(40)), Pop::Packet(p) if p.seq == 0));
+        assert!(matches!(jb.pop(t0 + ms(60)), Pop::Packet(p) if p.seq == 1));
+        assert_eq!(
+            jb.last_delay(),
+            Some(ms(40)),
+            "each packet waited the target"
+        );
+    }
+
+    #[test]
+    fn a_burst_that_covers_the_target_starts_at_once() {
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        for i in 0..3u16 {
+            jb.push(pkt(i, i as u32 * 960, false), t0);
+        }
+        assert!(matches!(jb.pop(t0), Pop::Packet(p) if p.seq == 0));
     }
 
     #[test]
@@ -547,7 +793,8 @@ mod tests {
         // Resume after 500 ms: seq 2, ts far ahead.
         jb.push(pkt(2, 960 + 48_000 / 2, false), t0 + ms(520));
         jb.push(pkt(3, 960 + 48_000 / 2 + 960, false), t0 + ms(540));
-        assert!(matches!(jb.pop(t0 + ms(540)), Pop::Packet(p) if p.seq == 2));
+        assert_eq!(jb.pop(t0 + ms(540)), Pop::Silence, "prefilling again");
+        assert!(matches!(jb.pop(t0 + ms(560)), Pop::Packet(p) if p.seq == 2));
         assert_eq!(jb.stats().lost, 0, "a pause is not loss");
         assert_eq!(jb.stats().spurts, 2, "re-anchored");
     }
@@ -573,7 +820,8 @@ mod tests {
         let lost_before = jb.stats().lost;
         jb.push(pkt(2, 960 + 20_000, false), t0 + ms(600));
         jb.push(pkt(3, 960 + 20_000 + 960, false), t0 + ms(620));
-        assert!(matches!(jb.pop(t0 + ms(620)), Pop::Packet(p) if p.seq == 2));
+        assert_eq!(jb.pop(t0 + ms(620)), Pop::Silence, "prefilling again");
+        assert!(matches!(jb.pop(t0 + ms(640)), Pop::Packet(p) if p.seq == 2));
         assert_eq!(jb.stats().lost, lost_before);
     }
 
@@ -629,14 +877,18 @@ mod tests {
         // Packet 2 turns up now, reordered behind the END packet. Before the
         // high-water mark it prefilled and played as a 20 ms spurt of its own.
         jb.push(pkt(2, 2 * 960, false), t0 + ms(130));
-        assert_eq!(jb.pop(t0 + ms(140)), Pop::Silence, "straggler must stay silent");
+        assert_eq!(
+            jb.pop(t0 + ms(140)),
+            Pop::Silence,
+            "straggler must stay silent"
+        );
         assert_eq!(jb.pop(t0 + ms(400)), Pop::Silence);
         let st = jb.stats();
         assert_eq!((st.late, st.spurts, st.played), (1, 1, 3));
         // The next real spurt starts normally.
         jb.push(pkt(4, 4 * 960 + 48_000, false), t0 + ms(1200));
         jb.push(pkt(5, 5 * 960 + 48_000, false), t0 + ms(1220));
-        assert!(matches!(jb.pop(t0 + ms(1220)), Pop::Packet(p) if p.seq == 4));
+        assert!(matches!(jb.pop(t0 + ms(1240)), Pop::Packet(p) if p.seq == 4));
         assert_eq!(jb.stats().spurts, 2);
     }
 
@@ -664,7 +916,7 @@ mod tests {
         let st = jb.stats();
         assert!(st.skipped >= 1, "excess must be shed: {st:?}");
         assert!(st.skipped <= 3, "but gently: {st:?}");
-        assert_eq!(st.lost + st.late + st.underruns, 0, "{st:?}");
+        assert_eq!(st.lost + st.late + st.underruns + st.stretched, 0, "{st:?}");
         // Steady state before the skip: four frames queued at every pop.
         let before = delays[10];
         let after = *delays.last().unwrap();
@@ -673,7 +925,11 @@ mod tests {
             after + ms(15) < before,
             "delay should have dropped by a frame: {before:?} → {after:?}"
         );
-        assert!(after <= jb.target() + ms(25), "{after:?} vs target {:?}", jb.target());
+        assert!(
+            after <= jb.target() + ms(25),
+            "{after:?} vs target {:?}",
+            jb.target()
+        );
     }
 
     #[test]
@@ -687,7 +943,11 @@ mod tests {
             t += ms(20);
         }
         let st = jb.stats();
-        assert_eq!((st.skipped, st.lost, st.underruns), (0, 0, 0), "{st:?}");
+        assert_eq!(
+            (st.skipped, st.lost, st.underruns, st.stretched),
+            (0, 0, 0, 0),
+            "{st:?}"
+        );
     }
 
     #[test]
@@ -726,20 +986,109 @@ mod tests {
         assert!(jb.target() >= ms(5));
     }
 
+    /// A packet 50 ms late runs the buffer dry: one frame is concealed
+    /// while waiting for it, and since a 50 ms stall is a spike the jitter
+    /// term did not cover, the target jumps to 50 + 2 frames and the
+    /// concealment is extended until the depth is there. The packet is then
+    /// played, never dropped, and the next stall of that size finds the
+    /// buffer deep enough.
     #[test]
-    fn late_packet_after_underrun_is_played_not_dropped() {
+    fn late_packet_deepens_the_buffer_and_is_played_not_dropped() {
         let t0 = Instant::now();
         let mut jb = buffer();
         jb.push(pkt(0, 0, false), t0);
         jb.push(pkt(1, 960, false), t0 + ms(20));
-        assert!(matches!(jb.pop(t0 + ms(20)), Pop::Packet(p) if p.seq == 0));
-        assert!(matches!(jb.pop(t0 + ms(40)), Pop::Packet(p) if p.seq == 1));
-        // Packet 2 is 30 ms late: the buffer runs dry and conceals once.
-        assert!(matches!(jb.pop(t0 + ms(60)), Pop::Lost { seq: 2, .. }));
-        jb.push(pkt(2, 2 * 960, false), t0 + ms(70));
-        assert!(matches!(jb.pop(t0 + ms(80)), Pop::Packet(p) if p.seq == 2));
+        assert!(matches!(jb.pop(t0 + ms(40)), Pop::Packet(p) if p.seq == 0));
+        assert!(matches!(jb.pop(t0 + ms(60)), Pop::Packet(p) if p.seq == 1));
+        assert!(matches!(jb.pop(t0 + ms(80)), Pop::Lost { seq: 2, .. }));
+        jb.push(pkt(2, 2 * 960, false), t0 + ms(90));
+        assert_eq!(jb.target(), ms(90), "spike 50 ms + 2 frames");
+        for t in [100, 120] {
+            assert!(
+                matches!(jb.pop(t0 + ms(t)), Pop::Lost { seq: 2, .. }),
+                "the concealment is extended to reach the new depth"
+            );
+        }
+        assert!(matches!(jb.pop(t0 + ms(140)), Pop::Packet(p) if p.seq == 2));
         let st = jb.stats();
-        assert_eq!((st.late, st.lost, st.underruns), (0, 0, 1));
+        assert_eq!(
+            (st.late, st.lost, st.underruns, st.stretched),
+            (0, 0, 1, 2),
+            "{st:?}"
+        );
+        // The stream goes on punctually, packet i playing at 20 i + 100 ms;
+        // packet 6 is 50 ms late again and still in time.
+        for i in 3..12u16 {
+            let late = if i == 6 { 50 } else { 0 };
+            jb.push(pkt(i, i as u32 * 960, false), t0 + ms(20 * i as u64 + late));
+            let p = jb.pop(t0 + ms(20 * i as u64 + 100));
+            assert!(matches!(p, Pop::Packet(ref q) if q.seq == i), "{i}: {p:?}");
+        }
+        let st = jb.stats();
+        assert_eq!(
+            (st.underruns, st.stretched, st.skipped),
+            (1, 2, 0),
+            "{st:?}"
+        );
+    }
+
+    /// Plays six punctual packets so the jitter term settles at 25 ms, then
+    /// delivers packet 6 thirty ms late: in time (the depth is 40 ms), but a
+    /// spike, so the target becomes 30 + 2 frames = 70 ms.
+    fn spurt_with_a_spike() -> (JitterBuffer, Instant) {
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        for i in 0..6u16 {
+            jb.push(pkt(i, i as u32 * 960, false), t0 + ms(20 * i as u64));
+            assert!(matches!(
+                jb.pop(t0 + ms(20 * i as u64 + 40)),
+                Pop::Packet(_)
+            ));
+        }
+        jb.push(pkt(6, 6 * 960, false), t0 + ms(150));
+        assert_eq!(jb.target(), ms(70), "spike 30 ms + 2 frames");
+        (jb, t0)
+    }
+
+    /// A stretch that is due waits for a quiet frame unless a concealment is
+    /// running already, and goes ahead in speech after `QUIET_PATIENCE`.
+    #[test]
+    fn stretch_waits_for_a_quiet_frame_or_loses_patience() {
+        let (mut jb, t0) = spurt_with_a_spike();
+        // Loud frames: the stretch is held back, packets play on time.
+        let mut t = t0 + ms(160);
+        let mut seq = 6u16;
+        for _ in 0..QUIET_PATIENCE {
+            assert!(matches!(jb.pop_quiet(t, false), Pop::Packet(ref p) if p.seq == seq));
+            seq += 1;
+            t += ms(20);
+            jb.push(pkt(seq, seq as u32 * 960, false), t - ms(40));
+        }
+        assert_eq!(jb.stats().stretched, 0);
+        // A quiet frame: now, and on until the depth reaches the target.
+        assert!(matches!(jb.pop_quiet(t, true), Pop::Lost { .. }));
+        t += ms(20);
+        assert!(matches!(jb.pop_quiet(t, false), Pop::Lost { .. }));
+        t += ms(20);
+        assert!(matches!(jb.pop_quiet(t, false), Pop::Packet(ref p) if p.seq == seq));
+        assert_eq!(jb.stats().stretched, 2);
+        assert!(jb.last_delay().unwrap() >= ms(70), "{:?}", jb.last_delay());
+
+        // The same spike on a speaker who never pauses: patience runs out.
+        let (mut jb, t0) = spurt_with_a_spike();
+        let mut t = t0 + ms(160);
+        let mut seq = 6u16;
+        let mut stretched_at = None;
+        for i in 0..2 * QUIET_PATIENCE {
+            if matches!(jb.pop_quiet(t, false), Pop::Lost { .. }) {
+                stretched_at = Some(i);
+                break;
+            }
+            seq += 1;
+            t += ms(20);
+            jb.push(pkt(seq, seq as u32 * 960, false), t - ms(40));
+        }
+        assert_eq!(stretched_at, Some(QUIET_PATIENCE));
     }
 
     #[test]
@@ -769,15 +1118,16 @@ mod tests {
         });
         jb.push(pkt(0, 0, false), t0);
         jb.push(pkt(1, 960, false), t0 + ms(20));
-        assert!(matches!(jb.pop(t0 + ms(20)), Pop::Packet(_)));
         assert!(matches!(jb.pop(t0 + ms(40)), Pop::Packet(_)));
-        // A 100 ms stall, then the backlog arrives at once.
+        assert!(matches!(jb.pop(t0 + ms(60)), Pop::Packet(_)));
+        // An 80 ms stall, then the backlog arrives at once.
         for i in 0..4u64 {
-            assert!(matches!(jb.pop(t0 + ms(60 + 20 * i)), Pop::Lost { .. }));
+            assert!(matches!(jb.pop(t0 + ms(80 + 20 * i)), Pop::Lost { .. }));
         }
         for i in 2..8u16 {
             jb.push(pkt(i, i as u32 * 960, false), t0 + ms(140));
         }
+        assert_eq!(jb.target(), ms(60), "clamped");
         let mut t = t0 + ms(140);
         while jb.stats().skipped == 0 && t < t0 + ms(400) {
             let _ = jb.pop(t);
@@ -837,7 +1187,7 @@ mod tests {
         let mut jb = buffer();
         jb.push(pkt(0, 0, false), t0);
         jb.push(pkt(1, 960, false), t0 + ms(20));
-        assert!(matches!(jb.pop(t0 + ms(20)), Pop::Packet(_)));
+        assert!(matches!(jb.pop(t0 + ms(40)), Pop::Packet(_)));
         let target = jb.target();
         jb.push(pkt(3, 1 << 30, false), t0 + ms(60));
         jb.push(pkt(4, 4 * 960, false), t0 + ms(80));
@@ -911,18 +1261,282 @@ mod tests {
         let min_target = per_spurt_targets[5..].iter().min().unwrap();
         let st = jb.stats();
         eprintln!("underruns after warm-up: {underruns}, min target {min_target:?}, {st:?}");
-        // 10 % of the packets are delayed by 60–120 ms: the 95 % quantile
-        // sits in the middle of that range, so the target settles around
-        // 100–120 ms and the top of the spike range (about 1 % of all
-        // packets) is written off by design. Before the anchor followed the
-        // earliest arrival and the histogram remembered ~60 packets, the
-        // target fell to 25–40 ms at a third of the spurt starts, with 16
-        // underruns and 4 % of the packets lost after warm-up.
+        // 10 % of the packets are delayed by 60–120 ms. The 95 % quantile
+        // sits in the middle of that range; the spike term covers the top
+        // of it, so after warm-up nothing is written off. Before the anchor
+        // followed the earliest arrival and the histogram remembered ~60
+        // packets, the target fell to 25–40 ms at a third of the spurt
+        // starts, with 16 underruns and 4 % of the packets lost after
+        // warm-up.
         assert!(*min_target >= ms(80), "target collapsed to {min_target:?}");
         assert!(underruns <= 3, "{underruns} underruns after warm-up");
         assert!(
             st.lost <= st.played / 50,
             "more than 2 % of the packets written off: {st:?}"
         );
+    }
+
+    /// A remembered spike expires after 20–40 s without another, and the
+    /// target falls back to the jitter term at the next spurt boundary.
+    #[test]
+    fn spike_memory_expires() {
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        // Spurt 1 with one 60 ms spike.
+        let mut t = t0;
+        for i in 0..20u16 {
+            let late = if i == 5 { 60 } else { 0 };
+            jb.push(pkt(i, i as u32 * 960, i == 19), t + ms(late));
+            let _ = jb.pop(t + ms(40));
+            t += ms(20);
+        }
+        while jb.active() {
+            let _ = jb.pop(t);
+            t += ms(20);
+        }
+        assert_eq!(jb.target(), ms(100), "spike 60 + 2 frames");
+        // Spurts 2 and 3, punctual, 25 s apart: the spike is remembered
+        // through the first, forgotten by the second.
+        let mut seq = 20u16;
+        let mut ts = 20 * 960 + 48_000;
+        let mut targets = Vec::new();
+        for spurt in 0..2 {
+            t += ms(25_000);
+            for i in 0..50u16 {
+                jb.push(pkt(seq, ts, i == 49), t);
+                let _ = jb.pop(t + ms(100));
+                seq += 1;
+                ts += 960;
+                t += ms(20);
+            }
+            while jb.active() {
+                let _ = jb.pop(t);
+                t += ms(20);
+            }
+            targets.push(jb.target());
+            ts += 48_000;
+            let _ = spurt;
+        }
+        assert_eq!(targets[0], ms(100), "still remembered after 25 s");
+        assert_eq!(targets[1], ms(25), "forgotten after 50 s: q95 + 1 frame");
+    }
+
+    // ---------------------------------------------------------------------
+    // Link simulations: the mixer's pop cadence (one 480-sample block per
+    // 10 ms; a frame covers two blocks, silence one) against a delay model.
+    // ---------------------------------------------------------------------
+
+    /// Drives `jb` with `arrivals` (ms, packet), sorted, popping like the
+    /// mixer, and returns the stats at `at_ms` (before) and at the end.
+    fn play(
+        jb: &mut JitterBuffer,
+        arrivals: &[(u64, Packet)],
+        at_ms: u64,
+        end_ms: u64,
+        quiet: impl Fn(u16) -> bool,
+    ) -> (JitterStats, JitterStats, Duration) {
+        let t0 = Instant::now();
+        let mut ai = 0;
+        let mut pending = 0usize;
+        let mut before = None;
+        let mut max_delay = Duration::ZERO;
+        let mut t = 3u64;
+        while t < end_ms {
+            if before.is_none() && t >= at_ms {
+                before = Some(jb.stats());
+            }
+            while ai < arrivals.len() && arrivals[ai].0 <= t {
+                jb.push(arrivals[ai].1.clone(), t0 + ms(arrivals[ai].0));
+                ai += 1;
+            }
+            while pending < 480 {
+                let seq = jb.next.map_or(0, |n| (n & 0xFFFF) as u16);
+                match jb.pop_quiet(t0 + ms(t), quiet(seq)) {
+                    Pop::Silence => pending += 480,
+                    Pop::Packet(_) => {
+                        pending += 960;
+                        if before.is_some() {
+                            max_delay = max_delay.max(jb.last_delay().unwrap_or_default());
+                        }
+                    }
+                    Pop::Lost { .. } => pending += 960,
+                }
+            }
+            pending -= 480;
+            t += 10;
+        }
+        (before.unwrap_or_default(), jb.stats(), max_delay)
+    }
+
+    /// The link of `tests/playout.rs::playout_survives_network_jitter`:
+    /// up to `spread` ms of jitter per packet and, with `chance` per
+    /// packet, a stall of `stall` ms that holds everything back and then
+    /// releases it in one burst (`tests/common/mod.rs::JitterProxy`).
+    fn wifi_arrivals(
+        seed: u64,
+        packets: u64,
+        spread: f32,
+        chance: f32,
+        stall: (f32, f32),
+    ) -> Vec<(u64, Packet)> {
+        use crate::dsp::testsignal::Rng;
+        let mut rng = Rng::new(seed);
+        let u = |r: &mut Rng| (r.uniform() + 1.0) / 2.0;
+        let mut hold = 0.0f32;
+        let mut out = Vec::new();
+        for i in 0..packets {
+            let sent = 20.0 * i as f32;
+            if u(&mut rng) < chance && hold <= sent {
+                hold = sent + stall.0 + (stall.1 - stall.0) * u(&mut rng);
+            }
+            let own = sent + spread * u(&mut rng);
+            let at = own.max(hold);
+            out.push((at as u64, pkt(i as u16, i as u32 * 960, false)));
+        }
+        out.sort_by_key(|(t, _)| *t);
+        out
+    }
+
+    /// The test tone (`testsignal::harmonic_voice`) is quiet for 60 % of
+    /// every 400 ms; packet `seq` carries frame `seq`.
+    fn tone_quiet(seq: u16) -> bool {
+        let f = (seq as f64 * 20.0 % 400.0) / 400.0;
+        !(0.055..0.445).contains(&f)
+    }
+
+    /// Replica of the failing run of `playout_survives_network_jitter`
+    /// (seed 7, traced 2026-09-26): stalls delaying the first held packet
+    /// by 53 ms at seq 9, 53 at 35, 55 at 55, then 43 at 163, 53 at 173, 50
+    /// at 194, 69 at 273, 55 at 321, 46 at 353, 31 at 396, 63 at 421. The
+    /// recording window opens 1.1 s after the first packet and lasts 6 s;
+    /// inside it nothing may be concealed, stretched or skipped. Before the
+    /// fix the first stall grew the depth to ~65 ms by two underruns, the
+    /// 75 ms target was never applied, and the 69 ms stall at seq 273 sat
+    /// exactly at the margin.
+    #[test]
+    fn traced_wifi_run_is_clean_after_the_first_second() {
+        let stalls: &[(u16, u64)] = &[
+            (9, 53),
+            (35, 53),
+            (55, 55),
+            (163, 43),
+            (173, 53),
+            (194, 50),
+            (273, 69),
+            (321, 55),
+            (353, 46),
+            (396, 31),
+            (421, 63),
+        ];
+        // A stall's burst comes out of the proxy's timers in any order; the
+        // tallest packet last is the adversarial one (seq 11 before 10 in
+        // the traced run), so every burst is released in reverse.
+        let mut arrivals = Vec::new();
+        let mut hold_until = 0u64;
+        let mut burst_first = 0u64;
+        for i in 0..450u16 {
+            let sent = 20 * i as u64;
+            if let Some((_, s)) = stalls.iter().find(|(n, _)| *n == i) {
+                hold_until = sent + s;
+                burst_first = i as u64;
+            }
+            let own = sent + (i as u64 * 7) % 15;
+            let at = if own < hold_until {
+                hold_until - (i as u64 - burst_first)
+            } else {
+                own
+            };
+            arrivals.push((at, pkt(i, i as u32 * 960, false)));
+        }
+        arrivals.sort_by_key(|(t, _)| *t);
+        let mut jb = buffer();
+        let (before, after, max_delay) = play(&mut jb, &arrivals, 1100, 8000, tone_quiet);
+        eprintln!(
+            "settle: {before:?}\nwindow: {after:?}\nmax delay {max_delay:?} target {:?}",
+            jb.target()
+        );
+        assert!(before.underruns >= 1, "the first stall costs a concealment");
+        assert!(before.stretched >= 1, "and the depth follows the spike");
+        assert_eq!(
+            (
+                after.underruns - before.underruns,
+                after.stretched - before.stretched,
+                after.skipped - before.skipped,
+                after.lost - before.lost,
+            ),
+            (0, 0, 0, 0),
+            "adjustments inside the window: {after:?}"
+        );
+        assert!(
+            jb.target() >= ms(90) && jb.target() <= ms(120),
+            "{:?}",
+            jb.target()
+        );
+        assert!(max_delay <= jb.target() + ms(25), "{max_delay:?}");
+    }
+
+    /// The same link, random seeds, 40 s each: how often does the steady
+    /// state (after 10 s) still get interrupted? Stalls up to 70 ms recur
+    /// every 0.7 s; the spike term keeps the depth above the tallest one.
+    #[test]
+    fn wifi_profile_steady_state_is_almost_never_interrupted() {
+        let seeds = 60u64;
+        let mut underruns = 0u64;
+        let mut stretched = 0u64;
+        let mut skipped = 0u64;
+        let mut targets = Vec::new();
+        for seed in 0..seeds {
+            let arrivals = wifi_arrivals(100 + seed, 2000, 15.0, 0.03, (30.0, 70.0));
+            let mut jb = buffer();
+            let (before, after, _) = play(&mut jb, &arrivals, 10_000, 40_000, tone_quiet);
+            underruns += after.underruns - before.underruns;
+            stretched += after.stretched - before.stretched;
+            skipped += after.skipped - before.skipped;
+            targets.push(jb.target());
+        }
+        targets.sort();
+        let minutes = seeds as f64 * 0.5;
+        eprintln!(
+            "per minute: underruns {:.2} stretched {:.2} skipped {:.2}; target p50 {:?} max {:?}",
+            underruns as f64 / minutes,
+            stretched as f64 / minutes,
+            skipped as f64 / minutes,
+            targets[targets.len() / 2],
+            targets.last().unwrap()
+        );
+        assert!(
+            (underruns as f64) / minutes <= 0.5,
+            "{underruns} underruns in {minutes} min"
+        );
+        assert!(
+            (stretched + skipped) as f64 / minutes <= 1.0,
+            "{stretched} stretches, {skipped} skips in {minutes} min"
+        );
+        assert!(*targets.last().unwrap() <= ms(130), "{targets:?}");
+    }
+
+    /// A LAN: 0–3 ms of jitter, no stalls. The target stays at the jitter
+    /// term (25 ms), nothing is ever adjusted, and packets wait no more
+    /// than the target plus a frame.
+    #[test]
+    fn lan_stays_shallow_and_untouched() {
+        for seed in 0..5u64 {
+            let arrivals = wifi_arrivals(seed, 1500, 3.0, 0.0, (0.0, 0.0));
+            let mut jb = buffer();
+            let (before, after, max_delay) = play(&mut jb, &arrivals, 2000, 30_000, |_| true);
+            let st = after;
+            assert_eq!(
+                (
+                    st.underruns - before.underruns,
+                    st.stretched,
+                    st.skipped,
+                    st.lost
+                ),
+                (0, 0, 0, 0),
+                "{st:?}"
+            );
+            assert!(jb.target() <= ms(40), "{:?}", jb.target());
+            assert!(max_delay <= ms(45), "{max_delay:?}");
+        }
     }
 }

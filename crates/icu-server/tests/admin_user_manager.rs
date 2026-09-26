@@ -246,7 +246,9 @@ async fn promoting_a_peer_broadcasts_the_admin_bit_to_everyone() {
 
     // ...and alice, who is not the target, also sees Bob's UserState flip.
     let state = alice
-        .recv_matching(|m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob.session))
+        .recv_matching(
+            |m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob.session),
+        )
         .await;
     let Some(ControlMsg::UserState { flags, .. }) = state else {
         panic!("expected UserState, got {state:?}");
@@ -328,7 +330,10 @@ async fn admin_kick_closes_with_kicked_and_the_user_may_come_back() {
 
     // Nothing in the store changed: the same certificate gets back in.
     let mut again = server.connect(&identity).await.expect("reconnect");
-    assert!(matches!(again.hello("bob").await, ControlMsg::Welcome { .. }));
+    assert!(matches!(
+        again.hello("bob").await,
+        ControlMsg::Welcome { .. }
+    ));
     server.shutdown().await;
 }
 
@@ -377,7 +382,9 @@ async fn admin_restriction_is_enforced_persisted_and_lifted() {
         .await;
     // The `UserState` broadcast goes out before the ack.
     let seen = alice
-        .recv_matching(|m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob.session))
+        .recv_matching(
+            |m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob.session),
+        )
         .await;
     let Some(ControlMsg::UserState { flags, .. }) = seen else {
         panic!("{seen:?}")
@@ -407,7 +414,10 @@ async fn admin_restriction_is_enforced_persisted_and_lifted() {
 
     // Muted: nothing relayed to alice.
     bob.send_audio(1, 960, &[0xF8, 1, 2, 3]);
-    assert!(alice.recv_audio(std::time::Duration::from_millis(300)).await.is_none());
+    assert!(alice
+        .recv_audio(std::time::Duration::from_millis(300))
+        .await
+        .is_none());
 
     // Survives a reconnect, announced right after `Welcome`.
     bob.conn.close(0u32.into(), b"");
@@ -462,5 +472,243 @@ async fn admin_restriction_is_enforced_persisted_and_lifted() {
         panic!("{state:?}")
     };
     assert!(!flags.muted() && !flags.deafened());
+    server.shutdown().await;
+}
+
+/// An enforced deafen implies an enforced mute — who hears nobody must not
+/// talk into the room — and cuts video to that user as well
+/// (`PROTOCOL.md` §2.2 Nr. 33).
+#[tokio::test]
+async fn an_enforced_deafen_mutes_and_stops_video() {
+    use icu_proto::UserFlags;
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await; // sole bootstrap admin
+    let identity = server.enroll("bob").await;
+    let mut bob = server.connect(&identity).await.expect("connect");
+    bob.hello_with("bob", icu_proto::MINOR, UserFlags(UserFlags::VIEWING))
+        .await
+        .expect("Welcome");
+    let mut carol = server.client("carol").await;
+
+    alice
+        .send_msg(&ControlMsg::AdminSetRestriction {
+            user_id: bob.user_id,
+            muted: false,
+            deafened: true,
+        })
+        .await;
+    let pushed = bob
+        .recv_matching(|m| matches!(m, ControlMsg::UserRestrictionChanged { .. }))
+        .await;
+    assert_eq!(
+        pushed,
+        Some(ControlMsg::UserRestrictionChanged {
+            muted: true,
+            deafened: true
+        }),
+        "deafened includes muted"
+    );
+    let bob_session = bob.session;
+    let seen = alice
+        .recv_matching(
+            |m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob_session),
+        )
+        .await;
+    let Some(ControlMsg::UserState { flags, .. }) = seen else {
+        panic!("{seen:?}")
+    };
+    assert!(flags.muted() && flags.deafened());
+
+    // Bob's audio is not relayed.
+    bob.send_audio(1, 960, &[0xF8, 1, 2, 3]);
+    assert!(alice
+        .recv_audio(std::time::Duration::from_millis(300))
+        .await
+        .is_none());
+
+    // Carol's camera does not reach bob, although he is viewing.
+    carol
+        .send_msg(&ControlMsg::SetState {
+            flags: UserFlags(UserFlags::CAMERA_ON),
+        })
+        .await;
+    let carol_session = carol.session;
+    carol
+        .recv_matching(|m| matches!(m, ControlMsg::UserState { session, flags } if *session == carol_session && flags.camera_on()))
+        .await
+        .expect("camera on");
+    carol.send_video(1, 0, true, &[0x42; 64]).await;
+    assert!(bob
+        .recv_video(std::time::Duration::from_millis(300))
+        .await
+        .is_none());
+
+    // The restriction stored is what the admin set; the list says so.
+    alice.send_msg(&ControlMsg::UserListRequest).await;
+    let Some(ControlMsg::UserListResponse { users }) = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserListResponse { .. }))
+        .await
+    else {
+        panic!("no UserListResponse")
+    };
+    let row = users.iter().find(|u| u.name == "bob").unwrap();
+    assert!(!row.muted && row.deafened);
+
+    // Lifted, video flows again.
+    alice
+        .send_msg(&ControlMsg::AdminSetRestriction {
+            user_id: bob.user_id,
+            muted: false,
+            deafened: false,
+        })
+        .await;
+    bob.recv_matching(|m| {
+        matches!(
+            m,
+            ControlMsg::UserRestrictionChanged {
+                deafened: false,
+                ..
+            }
+        )
+    })
+    .await
+    .expect("lifted");
+    carol.send_video(2, 3200, true, &[0x43; 64]).await;
+    assert!(bob.recv_video(common::SOON).await.is_some());
+    server.shutdown().await;
+}
+
+/// A write that fails is the server's trouble, not a policy refusal: the
+/// admin gets `SERVER_ERROR`, not `LAST_ADMIN` or `NAME_TAKEN`, nothing
+/// changes, and the connection stays.
+#[tokio::test]
+async fn a_failed_write_is_a_server_error_not_a_refusal() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await; // sole bootstrap admin
+    let bob = server.client("bob").await;
+
+    // A directory where the atomic write puts its temp file.
+    let blocker = server.dir.path().join(".users.toml.tmp");
+    std::fs::create_dir(&blocker).expect("block the write");
+    alice
+        .send_msg(&ControlMsg::AdminSetRole {
+            user_id: bob.user_id,
+            is_admin: true,
+        })
+        .await;
+    let answer = alice
+        .recv_matching(|m| {
+            matches!(
+                m,
+                ControlMsg::AdminActionError { .. } | ControlMsg::AdminSetRoleOk { .. }
+            )
+        })
+        .await;
+    assert!(
+        matches!(answer, Some(ControlMsg::AdminActionError { code, .. }) if code == ec::SERVER_ERROR),
+        "{answer:?}"
+    );
+    alice
+        .send_msg(&ControlMsg::CreateInviteRequest {
+            name: String::new(),
+            ttl_s: 0,
+        })
+        .await;
+    let answer = alice
+        .recv_matching(|m| {
+            matches!(
+                m,
+                ControlMsg::Error { .. } | ControlMsg::CreateInviteResponse { .. }
+            )
+        })
+        .await;
+    assert!(
+        matches!(answer, Some(ControlMsg::Error { code, .. }) if code == ec::SERVER_ERROR),
+        "{answer:?}"
+    );
+    assert!(!ec::is_fatal(ec::SERVER_ERROR));
+    std::fs::remove_dir(&blocker).expect("unblock");
+
+    alice
+        .send_msg(&ControlMsg::AdminSetRole {
+            user_id: bob.user_id,
+            is_admin: true,
+        })
+        .await;
+    assert!(alice
+        .recv_matching(|m| matches!(m, ControlMsg::AdminSetRoleOk { .. }))
+        .await
+        .is_some());
+    server.shutdown().await;
+}
+
+/// A user list longer than one control frame is shortened, not dropped:
+/// online users and admins first, and a last row with `user_id` 0 saying
+/// how many are left out (`PROTOCOL.md` §2.2 Nr. 27).
+#[tokio::test]
+async fn a_user_list_too_long_for_a_frame_is_shortened() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await; // sole bootstrap admin
+    let bob = server.enroll("bob").await;
+    let common::TestServer { dir, handle } = server;
+    handle.shutdown().await;
+    // 600 accounts with long names: years of invitations, most removed.
+    let users = dir.path().join("users.toml");
+    let mut text = std::fs::read_to_string(&users).unwrap();
+    const EXTRA: u32 = 600;
+    for i in 0..EXTRA {
+        text.push_str(&format!(
+            "\n[user.{id}]\nname = \"old-account-with-a-long-name-{i:03}\"\n\
+             created = \"2026-01-01T00:00:00Z\"\n\n[[user.{id}.cert]]\n\
+             fingerprint = \"{i:064x}\"\nissued = \"2026-01-01T00:00:00Z\"\n\
+             expires = \"2099-01-01T00:00:00Z\"\nrevoked = {revoked}\n",
+            id = 10_000 + i,
+            revoked = i % 3 != 0,
+        ));
+    }
+    std::fs::write(&users, text).unwrap();
+    let server = TestServer {
+        handle: icu_server::run(icu_server::config::Config::for_test(dir.path()))
+            .await
+            .expect("restarts"),
+        dir,
+    };
+    let mut alice = server.connect(&alice).await.expect("connect");
+    alice.hello("alice").await;
+    let mut bob = server.connect(&bob).await.expect("connect");
+    bob.hello("bob").await;
+
+    alice.send_msg(&ControlMsg::UserListRequest).await;
+    let Some(ControlMsg::UserListResponse { users }) = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserListResponse { .. }))
+        .await
+    else {
+        panic!("no UserListResponse")
+    };
+    let rest = users.last().expect("rows");
+    assert_eq!(rest.user_id, 0, "the last row stands for the rest");
+    let left_out: usize = rest
+        .name
+        .split_whitespace()
+        .find_map(|w| w.parse().ok())
+        .expect("a count in the name");
+    assert_eq!(
+        users.len() - 1 + left_out,
+        EXTRA as usize + 2,
+        "{}",
+        rest.name
+    );
+    assert!(
+        users.len() > 100,
+        "a frame still carries a lot: {}",
+        users.len()
+    );
+    assert!(users[..2].iter().all(|u| u.online), "online users first");
+    assert!(
+        users[..users.len() - 1]
+            .windows(2)
+            .all(|w| w[0].revoked <= w[1].revoked),
+        "removed accounts last"
+    );
     server.shutdown().await;
 }

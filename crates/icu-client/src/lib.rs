@@ -11,12 +11,15 @@ pub mod cues;
 pub mod dsp;
 pub mod engine;
 pub mod hotkey;
+pub mod instance;
 pub mod net;
 pub mod netcond;
+pub mod notify;
 #[cfg(feature = "overlay")]
 pub mod overlay;
 pub mod problem;
 pub mod quality;
+pub mod signals;
 pub mod stats;
 pub mod sync;
 #[cfg(feature = "tray")]

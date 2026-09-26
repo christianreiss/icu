@@ -39,6 +39,9 @@ async fn record(engine_b: &Engine, probe_b: &icu_client::audio::fake::FakeProbe)
             &st.jitter_late,
             &st.jitter_underruns,
             &st.jitter_skipped,
+            &st.jitter_stretched,
+            &st.jitter_lost,
+            &st.datagrams_received,
         ]
         .map(DebugStats::get)
     };
@@ -59,9 +62,11 @@ async fn record(engine_b: &Engine, probe_b: &icu_client::audio::fake::FakeProbe)
     let after = counters();
     let d: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
     eprintln!(
-        "{c:?} while recording: plc={} fec={} play_underruns={} jb_late={} jb_underruns={} jb_skipped={}",
-        d[0], d[1], d[2], d[3], d[4], d[5],
+        "{c:?} while recording: plc={} fec={} play_underruns={} jb_late={} jb_underruns={} jb_skipped={} jb_stretched={} jb_lost={} received={}",
+        d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8],
     );
+    // Arrival-to-playout delay over the whole run: the buffer's depth.
+    eprintln!("jitter delay {}", st.jitter_delay.lock().unwrap().summary());
     assert!(c.windows > 100, "too little voiced audio compared: {c:?}");
     c
 }

@@ -144,8 +144,8 @@ async fn renewal_with_a_new_cn_renames_and_broadcasts_user_renamed() {
         );
     }
 
-    // The pre-rename certificate stays valid until it expires, and sees the
-    // current name.
+    // The pre-rename certificate stays valid until the renamed one first
+    // logs in (`PROTOCOL.md` §2.2 Nr. 10), and sees the current name.
     let mut stale = server.connect(&old).await.expect("old cert still connects");
     match stale.hello("alice").await {
         ControlMsg::Welcome { you, .. } => assert_eq!(you.name, "alicia"),

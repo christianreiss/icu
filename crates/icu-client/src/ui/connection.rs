@@ -247,8 +247,9 @@ impl ConnectionView {
     }
 
     /// Draws the whole window body: the status strip, then the icon rail
-    /// and whichever page it is on.
-    pub fn ui(&mut self, ui: &mut Ui, state: &AppState) {
+    /// and whichever page it is on. Returns how much taller the page is than
+    /// the room it got (negative: shorter).
+    pub fn ui(&mut self, ui: &mut Ui, state: &AppState) -> f32 {
         hero(ui, state);
         ui.add_space(10.0);
 
@@ -286,17 +287,30 @@ impl ConnectionView {
         let jitter = self.cache.get(&self.stats).to_string();
         let cards = self.page(state, &jitter);
 
-        egui::ScrollArea::vertical()
+        let page = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for card in &cards {
-                    match card {
-                        Card::Plain(section) => self.draw_section(ui, section),
-                        Card::Certs(certs) => self.draw_certs(ui, certs),
-                    }
-                }
-                self.footer(ui, state, &jitter);
+                // Clear of the window edge and of the overlay scroll bar.
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: 4,
+                        right: 10,
+                        top: 0,
+                        bottom: 0,
+                    })
+                    .show(ui, |ui| {
+                        for card in &cards {
+                            match card {
+                                Card::Plain(section) => self.draw_section(ui, section),
+                                Card::Certs(certs) => self.draw_certs(ui, certs),
+                            }
+                        }
+                        self.footer(ui, state, &jitter);
+                    });
             });
+        let overflow = page.content_size.y - page.inner_rect.height();
+        super::grow_to_fit(ui.ctx(), overflow);
+        overflow
     }
 
     /// The cards the current tab shows.
@@ -1185,17 +1199,17 @@ fn aec_text(state: &AppState) -> String {
     text
 }
 
-/// The human-readable name of the selected device, or „Standard“.
+/// The human-readable name of the selected device, or „System-Standard“.
 fn device_name(state: &AppState, kind: DeviceKind, id: Option<&str>) -> String {
     let Some(id) = id else {
-        return "Standard".to_string();
+        return "System-Standard".to_string();
     };
     state
         .devices
         .iter()
         .find(|d| d.kind == kind && d.id == id)
         .map(|d| d.description.clone())
-        .unwrap_or_else(|| format!("{id} (nicht gefunden)"))
+        .unwrap_or_else(|| format!("{id} (fehlt, System-Standard läuft)"))
 }
 
 // ---------------------------------------------------------------------------

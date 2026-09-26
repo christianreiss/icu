@@ -4,7 +4,9 @@
 //! settings change and must not rebuild the atlas.
 
 const INTER_REGULAR: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Regular.ttf");
-const INTER_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-SemiBold.ttf");
+/// Also rasterizes the names in the overlay (`crate::overlay`).
+pub(crate) const INTER_SEMIBOLD: &[u8] =
+    include_bytes!("../../assets/fonts/inter/Inter-SemiBold.ttf");
 
 /// Font family used for headings and button labels (semibold weight).
 pub fn semibold() -> egui::FontFamily {
@@ -38,27 +40,14 @@ pub fn install(ctx: &egui::Context) {
         .cloned()
         .collect();
 
-    // Inter goes *first*, ahead of phosphor. An earlier version of this
-    // file put phosphor first on the (false) assumption that it only
-    // defines glyphs in the Private Use Area; in fact egui-phosphor's font
-    // is built on a template that also maps ordinary `a`-`z`, digits `0`/`1`,
-    // space and hyphen to blank glyphs (the pieces Phosphor's own ligatures
-    // are built from — this is documented in the crate's own
-    // `add_font_bytes_as_family`). With phosphor first, every one of those
-    // codepoints resolved to an invisible blank glyph instead of falling
-    // through to Inter, so almost every word lost most of its letters
-    // (`"Sprechen"` rendered as just `"S"`). Putting Inter first fixes that,
-    // at the cost of the *opposite*, much narrower problem this file used
-    // to work around: Inter's own PUA-range glyphs (stylistic-alternate
-    // slots) collide with some Phosphor icon codepoints and win the lookup
-    // instead of falling through, rendering as the wrong Latin letter
-    // instead of the icon (observed: the gear icon rendered as "ÿ"). Of the
-    // handful of icons this app actually uses, three collided
-    // (`icon::GEAR`, `icon::INFO`, `icon::KEYBOARD`); every call site was
-    // moved to a non-colliding equivalent (`GEAR_FINE`, `QUESTION`,
-    // `COMMAND`) rather than solving it here, since egui has no per-codepoint
-    // exclusion for a registered font — verified against Inter's cmap via
-    // `fontTools` that no other icon used in this crate collides.
+    // Inter goes *first*, ahead of phosphor: egui-phosphor's font maps
+    // ordinary `a`-`z`, digits `0`/`1`, space and hyphen to blank glyphs (the
+    // pieces of its ligatures, documented in the crate's own
+    // `add_font_bytes_as_family`), so with phosphor first almost every word
+    // lost most of its letters. The other direction — Inter's own glyphs in
+    // the Private Use Area, where Phosphor's icons live, winning over the
+    // icon — is solved in the embedded font files: their PUA mappings are
+    // removed (`assets/fonts/inter/README.md`), and a test keeps it so.
     let mut proportional = vec!["Inter".to_string(), "phosphor".to_string()];
     proportional.extend(defaults.clone());
     fonts
@@ -136,85 +125,31 @@ mod tests {
         }
     }
 
-    /// The handful of Phosphor icons this crate actually uses must not
-    /// collide with one of Inter's own PUA-range stylistic-alternate glyphs
-    /// (the *other* direction of the same family-ordering tradeoff — see
-    /// `install`'s doc comment): with Inter now first, a collision would
-    /// make that icon render as the wrong Latin letter instead of falling
-    /// through to Phosphor. Checked against Inter alone (no phosphor, no
-    /// egui default fallbacks) so a `true` here can only come from Inter's
-    /// own cmap.
+    /// Phosphor's icons live in the Private Use Area, where Inter also
+    /// maps hundreds of stylistic-alternate glyphs. With Inter first in the
+    /// chain (see `install`), any such mapping would win and draw a wrong
+    /// letter instead of the icon (seen: the gear as „ÿ“, the back arrow as
+    /// „ʅ“). The embedded copies have those mappings removed; this keeps it
+    /// so for every icon, used today or later.
     #[test]
-    fn used_icons_do_not_collide_with_inter() {
-        let mut fonts = egui::FontDefinitions::empty();
-        fonts.font_data.insert(
-            "Inter".into(),
-            egui::FontData::from_static(INTER_REGULAR).into(),
-        );
-        fonts.font_data.insert(
-            "Inter-SemiBold".into(),
-            egui::FontData::from_static(INTER_SEMIBOLD).into(),
-        );
-        fonts
-            .families
-            .insert(egui::FontFamily::Proportional, vec!["Inter".into()]);
-        fonts.families.insert(
-            egui::FontFamily::Name("Inter-SemiBold".into()),
-            vec!["Inter-SemiBold".into()],
-        );
-        let ctx = egui::Context::default();
-        ctx.set_fonts(fonts);
-        ctx.begin_pass(egui::RawInput::default()); // materializes the fonts
-
-        for icon in [
-            egui_phosphor::regular::ARROWS_CLOCKWISE,
-            egui_phosphor::regular::BUG,
-            egui_phosphor::regular::CERTIFICATE,
-            egui_phosphor::regular::CHECK,
-            egui_phosphor::regular::COPY,
-            egui_phosphor::regular::EXPORT,
-            egui_phosphor::regular::GAUGE,
-            egui_phosphor::regular::GEAR_FINE,
-            egui_phosphor::regular::HAND_TAP,
-            egui_phosphor::regular::QUESTION,
-            egui_phosphor::regular::COMMAND,
-            egui_phosphor::regular::MICROPHONE,
-            egui_phosphor::regular::MICROPHONE_SLASH,
-            egui_phosphor::regular::LOCK_KEY,
-            egui_phosphor::regular::PENCIL_SIMPLE,
-            egui_phosphor::regular::PLUGS,
-            egui_phosphor::regular::PLUGS_CONNECTED,
-            egui_phosphor::regular::PROHIBIT,
-            egui_phosphor::regular::SHIELD_STAR,
-            egui_phosphor::regular::SIGN_IN,
-            egui_phosphor::regular::SLIDERS,
-            egui_phosphor::regular::SPEAKER_HIGH,
-            egui_phosphor::regular::SPEAKER_SLASH,
-            egui_phosphor::regular::SQUARES_FOUR,
-            egui_phosphor::regular::TICKET,
-            egui_phosphor::regular::TRASH,
-            egui_phosphor::regular::USERS,
-            egui_phosphor::regular::USERS_THREE,
-            egui_phosphor::regular::VIDEO_CAMERA,
-            egui_phosphor::regular::WARNING,
-            egui_phosphor::regular::WARNING_CIRCLE,
-            egui_phosphor::regular::WAVEFORM,
-            egui_phosphor::regular::X,
+    fn inter_maps_nothing_in_the_private_use_area() {
+        for (name, bytes) in [
+            ("Inter-Regular", INTER_REGULAR),
+            ("Inter-SemiBold", INTER_SEMIBOLD),
         ] {
-            let c = icon.chars().next().expect("icon constants are one char");
-            for family in [
-                egui::FontFamily::Proportional,
-                egui::FontFamily::Name("Inter-SemiBold".into()),
-            ] {
-                let font_id = egui::FontId::new(16.0, family.clone());
-                let collides = ctx.fonts_mut(|f| f.has_glyph(&font_id, c));
-                assert!(
-                    !collides,
-                    "icon {c:?} ({:#06x}) collides with Inter in family {family:?} — \
-                     pick a different egui_phosphor::regular constant for this spot",
-                    c as u32
-                );
-            }
+            use skrifa::MetadataProvider;
+            let font = skrifa::FontRef::new(bytes).expect("embedded font parses");
+            let charmap = font.charmap();
+            let mapped: Vec<u32> = (0xE000u32..=0xF8FF)
+                .filter(|&c| charmap.map(c).is_some())
+                .collect();
+            assert!(
+                mapped.is_empty(),
+                "{name} maps {} PUA codepoints (first {:#06x}); strip them as \
+                 assets/fonts/inter/README.md describes",
+                mapped.len(),
+                mapped[0]
+            );
         }
     }
 }

@@ -1,0 +1,577 @@
+//! Every window of the client, drawn headless at the size it opens with, in
+//! both themes: the everyday pages must fit without a scroll bar and without
+//! growing the window; the expert pages may grow it, but must then fit on a
+//! 1080p screen. With
+//! `ICU_UI_SHOTS=<dir>` each window is also saved as a PNG for a visual
+//! check (needs a GPU or lavapipe):
+//!
+//! ```sh
+//! ICU_UI_SHOTS=/tmp/icu-shots cargo test -p icu-client --test ui_layout -- --nocapture
+//! ```
+
+use std::{
+    cell::RefCell,
+    net::SocketAddr,
+    rc::Rc,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
+
+use egui_kittest::{kittest::Queryable, Harness};
+use icu_client::{
+    audio::{DeviceInfo, DeviceKind},
+    config::{ModeSetting, Paths, Settings},
+    conninfo::{CertInfo, ConnInfo, ConnStats},
+    engine::{AppState, Command, ConnStatus, Peer},
+    problem::Problem,
+    stats::DebugStats,
+    ui::{
+        connection::ConnectionView,
+        fonts,
+        main_window::{EnrollApp, MainEnv, MainView},
+        settings::SettingsView,
+        theme,
+    },
+};
+use icu_proto::{AudioParams, UserFlags, UserInfo, UserSummary};
+
+mod common;
+
+/// What the windows open with (`ui::main_window`).
+const MAIN: [f32; 2] = [400.0, 620.0];
+const SETTINGS: [f32; 2] = icu_client::ui::main_window::SETTINGS_SIZE;
+const CONNECTION: [f32; 2] = icu_client::ui::main_window::CONNECTION_SIZE;
+const ENROLL: [f32; 2] = [560.0, 600.0];
+
+const THEMES: [&str; 2] = ["light", "dark"];
+
+/// One window body in a real eframe root, the way the app shows it: the main
+/// window draws straight into the root, the others into a central panel of
+/// their own viewport (`main_window::immediate_window`).
+struct Window<F: FnMut(&mut egui::Ui)> {
+    body: F,
+    panel: bool,
+}
+
+impl<F: FnMut(&mut egui::Ui)> eframe::App for Window<F> {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.panel {
+            egui::CentralPanel::default().show(root, |ui| (self.body)(ui));
+        } else {
+            (self.body)(root);
+        }
+    }
+}
+
+fn harness<'a, F: FnMut(&mut egui::Ui) + 'static>(
+    size: [f32; 2],
+    theme_name: &'static str,
+    panel: bool,
+    body: F,
+) -> Harness<'a, Window<F>> {
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(size[0], size[1]))
+        .with_theme(egui_theme(theme_name))
+        .build_eframe(move |cc| {
+            fonts::install(&cc.egui_ctx);
+            theme::apply(&cc.egui_ctx, theme_name);
+            Window { body, panel }
+        });
+    harness.run();
+    harness
+}
+
+/// The kittest theme matching a theme setting: `theme::apply` styles the
+/// context's current theme, and kittest would otherwise pick dark.
+fn egui_theme(theme_name: &str) -> egui::Theme {
+    if theme_name == "dark" {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    }
+}
+
+/// Saves the current frame when `ICU_UI_SHOTS` names a directory.
+fn shot<S>(harness: &mut Harness<'_, S>, name: &str) {
+    let Ok(dir) = std::env::var("ICU_UI_SHOTS") else {
+        return;
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = harness.render().expect("render");
+    image.save(format!("{dir}/{name}.png")).unwrap();
+}
+
+/// The tallest a window may grow to: a 1080p screen minus title bar and
+/// panel.
+const MAX_HEIGHT: f32 = 980.0;
+
+/// Everything that overflowed, collected so one run lists all of it.
+#[derive(Default)]
+struct Overflows(Vec<String>);
+
+impl Overflows {
+    fn check(&mut self, what: &str, overflow: f32) {
+        eprintln!("{what:<44} overflow {overflow:>7.1} px");
+        if overflow > 0.5 {
+            self.0.push(format!("{what}: {overflow:.0} px"));
+        }
+    }
+
+    /// A window that grows itself: after settling it must show everything,
+    /// and it may have grown only if `may_grow`, and then only so far.
+    fn check_window<S>(
+        &mut self,
+        what: &str,
+        h: &Harness<'_, S>,
+        open: [f32; 2],
+        may_grow: bool,
+        overflow: f32,
+    ) {
+        let height = h.ctx.content_rect().height();
+        let grew = height - open[1];
+        eprintln!("{what:<44} overflow {overflow:>7.1} px, grew {grew:>6.1} px");
+        if overflow > 0.5 {
+            self.0
+                .push(format!("{what}: still {overflow:.0} px too tall"));
+        }
+        if grew > 0.5 && !may_grow {
+            self.0
+                .push(format!("{what}: grew the window by {grew:.0} px"));
+        }
+        if height > MAX_HEIGHT {
+            self.0.push(format!("{what}: {height:.0} px tall"));
+        }
+    }
+
+    fn assert_none(self) {
+        assert!(
+            self.0.is_empty(),
+            "needs a scroll bar at its default size:\n  {}",
+            self.0.join("\n  ")
+        );
+    }
+}
+
+fn cert(subject: &str, issuer: &str, days: i64) -> CertInfo {
+    CertInfo {
+        subject: subject.into(),
+        issuer: issuer.into(),
+        not_before: "2026-09-20".into(),
+        not_after: "2027-09-20".into(),
+        expires_in_days: days,
+        valid_days: 365,
+        fingerprint: "3F:A1:07:9C:55:D2:8E:41:0B:77:C3:9A:12:6F:E8:04:\
+                      9D:2B:61:F0:34:AA:5E:C7:88:13:DE:92:4C:0A:B5:67"
+            .replace(' ', ""),
+        sig_alg: "ecdsa-with-SHA256".into(),
+    }
+}
+
+fn peer(user_id: u32, name: &str, flags: u8, rtt: u16) -> Peer {
+    let mut p = Peer::new(
+        UserInfo {
+            user_id,
+            session: user_id as u16 + 10,
+            name: name.into(),
+            flags: UserFlags(flags),
+        },
+        100.0,
+    );
+    p.rtt_ms = Some(rtt);
+    p.recv_loss_permille = Some(3);
+    p
+}
+
+fn summary(user_id: u32, name: &str) -> UserSummary {
+    UserSummary {
+        user_id,
+        name: name.into(),
+        created: "2026-09-21T18:00:00Z".into(),
+        is_admin: false,
+        disabled: false,
+        revoked: false,
+        online: false,
+        pending: false,
+        muted: false,
+        deafened: false,
+    }
+}
+
+/// A connected admin in a room of six, the way a real evening looks.
+fn state() -> AppState {
+    let mut settings = Settings::default();
+    settings.audio.mode = ModeSetting::Ptt;
+    let peers = vec![
+        peer(
+            2,
+            "Anna",
+            UserFlags::SPEAKING | UserFlags::PTT | UserFlags::VIEWING,
+            18,
+        ),
+        peer(3, "Bernd", UserFlags::MUTED, 34),
+        peer(4, "Carla", UserFlags::CAMERA_ON | UserFlags::VIEWING, 61),
+        peer(5, "Dennis", UserFlags::DEAFENED | UserFlags::MUTED, 170),
+        peer(6, "Eva-Maria Schulte", UserFlags::ADMIN, 22),
+    ];
+    let mut users: Vec<UserSummary> = [
+        (1, "Chris"),
+        (2, "Anna"),
+        (3, "Bernd"),
+        (4, "Carla"),
+        (5, "Dennis"),
+        (6, "Eva-Maria Schulte"),
+        (7, "Frank"),
+    ]
+    .into_iter()
+    .map(|(id, name)| summary(id, name))
+    .collect();
+    for u in &mut users {
+        u.online = u.user_id <= 6;
+        u.is_admin = u.user_id == 1 || u.user_id == 6;
+    }
+    users.push(UserSummary {
+        pending: true,
+        ..summary(8, "neu-3fa2")
+    });
+    users.push(UserSummary {
+        disabled: true,
+        ..summary(9, "Gregor")
+    });
+    users.push(UserSummary {
+        revoked: true,
+        ..summary(10, "Hanna")
+    });
+    let device = |id: &str, description: &str, kind| DeviceInfo {
+        id: id.into(),
+        description: description.into(),
+        kind,
+    };
+    AppState {
+        conn: ConnStatus::Connected,
+        server: "icu.example.org:4711".into(),
+        server_name: "icu.example.org".into(),
+        me: Some(UserInfo {
+            user_id: 1,
+            session: 11,
+            name: "Chris".into(),
+            flags: UserFlags(UserFlags::ADMIN | UserFlags::VIEWING | UserFlags::PTT),
+        }),
+        peers,
+        muted: false,
+        deafened: false,
+        ptt_down: false,
+        sending: false,
+        voice: false,
+        level: icu_client::dsp::meter::Level {
+            peak_db: -12.0,
+            rms_db: -24.0,
+        },
+        vad_prob: 0.1,
+        vad_threshold: 0.5,
+        rtt_ms: Some(21.4),
+        server_rtt_ms: Some(20),
+        clock_offset_ms: Some(3),
+        conn_info: Some(Arc::new(ConnInfo {
+            remote: "203.0.113.7:4711".parse::<SocketAddr>().unwrap(),
+            local_ip: Some("192.168.1.20".parse().unwrap()),
+            alpn: "icu/1".into(),
+            minor: 1,
+            caps: 0,
+            min_client: "0.1.0".into(),
+            client_string: "icu/0.1.0 linux".into(),
+            audio: AudioParams {
+                sample_rate: 48_000,
+                frame_ms: 20,
+                max_bitrate: 64_000,
+            },
+            connected_at: Instant::now(),
+            server_cert: cert("icu.example.org", "ICU CA icu.example.org", 300),
+            client_cert: cert("Chris", "ICU CA icu.example.org", 280),
+            ca_cert: cert("ICU CA icu.example.org", "ICU CA icu.example.org", 3400),
+        })),
+        conn_stats: Some(ConnStats {
+            rtt_ms: 21.0,
+            min_rtt_ms: 19.0,
+            cwnd: 120_000,
+            sent_packets: 40_000,
+            lost_packets: 12,
+            current_mtu: 1452,
+            max_datagram_size: Some(1400),
+            tx_kbps: 74.0,
+            ..ConnStats::default()
+        }),
+        update_required: None,
+        banner: None,
+        notice: None,
+        name_error: None,
+        rename_pending: false,
+        is_admin: true,
+        last_invite: None,
+        invite_error: None,
+        user_list: users,
+        user_action_error: None,
+        restricted_muted: false,
+        restricted_deafened: false,
+        devices: vec![
+            device("mic", "Jabra Evolve2 65 Mono", DeviceKind::Input),
+            device("cam", "HD Pro Webcam C920 Analog Stereo", DeviceKind::Input),
+            device("hs", "Jabra Evolve2 65 Mono", DeviceKind::Output),
+            device(
+                "hdmi",
+                "GA104 High Definition Audio Controller Digital Stereo (HDMI 2)",
+                DeviceKind::Output,
+            ),
+        ],
+        active_input: None,
+        active_output: None,
+        backend: "pipewire",
+        aec_available: true,
+        aec_stats: Default::default(),
+        aec_reference: true,
+        aec_suspect: false,
+        aec_no_echo: false,
+        aec_reference_silent: false,
+        mic_test: false,
+        camera_on: false,
+        hotkey_backend: "portal".into(),
+        settings,
+        hotkey_retries: 0,
+    }
+}
+
+fn main_window(
+    state: AppState,
+    theme_name: &'static str,
+) -> (Harness<'static, impl eframe::App>, Rc<RefCell<f32>>) {
+    let overflow = Rc::new(RefCell::new(0.0));
+    let out = overflow.clone();
+    let (cmd, _rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+    let mut view = MainView::default();
+    let harness = harness(MAIN, theme_name, false, move |root| {
+        let env = MainEnv {
+            cmd: &cmd,
+            video_tier: icu_client::video::VideoTier::T0,
+            video: &|_| None,
+            self_video: None,
+            settings_open: false,
+            overlay_available: true,
+        };
+        *out.borrow_mut() = view.ui(root, &state, &env).list_overflow;
+    });
+    (harness, overflow)
+}
+
+#[test]
+fn main_window_fits() {
+    let mut overflows = Overflows::default();
+    let cases: Vec<(&str, AppState)> = vec![
+        ("room", state()),
+        ("alone", {
+            let mut s = state();
+            s.peers.clear();
+            s
+        }),
+        ("fatal", {
+            let mut s = state();
+            s.conn = ConnStatus::Fatal(Problem::plain(
+                "Der Server kennt dieses Zertifikat nicht. Bitte eine neue Einladung anfordern.",
+            ));
+            s.peers.clear();
+            s.me = None;
+            s
+        }),
+        ("restricted", {
+            let mut s = state();
+            s.muted = true;
+            s.restricted_muted = true;
+            s
+        }),
+    ];
+    for theme_name in THEMES {
+        for (name, s) in &cases {
+            let (mut h, overflow) = main_window(s.clone(), theme_name);
+            let what = format!("main/{name}/{theme_name}");
+            overflows.check(&what, *overflow.borrow());
+            shot(&mut h, &what.replace('/', "-"));
+        }
+    }
+    overflows.assert_none();
+}
+
+/// The settings pages as the sidebar names them.
+const PAGES: [&str; 7] = [
+    "Audio",
+    "Klang",
+    "Tastenkürzel",
+    "Kamera",
+    "Allgemein",
+    "Nutzer",
+    "Über ICU",
+];
+
+#[test]
+fn settings_pages_fit() {
+    let mut overflows = Overflows::default();
+    for theme_name in THEMES {
+        for advanced in [false, true] {
+            for page in PAGES {
+                let mut s = state();
+                s.settings.ui.show_advanced = advanced;
+                let overflow = Rc::new(RefCell::new(0.0));
+                let out = overflow.clone();
+                let mut view = SettingsView::new(
+                    &s,
+                    Arc::new(DebugStats::default()),
+                    Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+                );
+                let mut h = harness(SETTINGS, theme_name, true, move |ui| {
+                    *out.borrow_mut() = view.ui(ui, &s, false).overflow;
+                });
+                h.get_by_role_and_label(egui::accesskit::Role::Button, page)
+                    .click();
+                h.run();
+                let mode = if advanced { "advanced" } else { "plain" };
+                let what = format!("settings/{page}/{mode}/{theme_name}");
+                // The member list is as long as the group is big.
+                let may_grow = advanced || page == "Nutzer";
+                overflows.check_window(&what, &h, SETTINGS, may_grow, *overflow.borrow());
+                shot(&mut h, &what.replace('/', "-"));
+            }
+        }
+    }
+    overflows.assert_none();
+}
+
+/// The Verbindung window's pages as its rail names them.
+const CONNECTION_PAGES: [&str; 6] = ["Server", "Netz", "Krypto", "Audio", "Video", "Wer"];
+
+#[test]
+fn connection_pages_fit() {
+    let mut overflows = Overflows::default();
+    for theme_name in THEMES {
+        for page in CONNECTION_PAGES {
+            let s = state();
+            let overflow = Rc::new(RefCell::new(0.0));
+            let out = overflow.clone();
+            let mut view = ConnectionView::new(Arc::new(DebugStats::default()));
+            let mut h = harness(CONNECTION, theme_name, true, move |ui| {
+                *out.borrow_mut() = view.ui(ui, &s);
+            });
+            h.get_by_role_and_label(egui::accesskit::Role::Button, page)
+                .click();
+            h.run();
+            let what = format!("connection/{page}/{theme_name}");
+            // The first page fits as the window opens; the long ones grow it.
+            let may_grow = page != "Server";
+            overflows.check_window(&what, &h, CONNECTION, may_grow, *overflow.borrow());
+            shot(&mut h, &what.replace('/', "-"));
+        }
+    }
+    overflows.assert_none();
+}
+
+/// The first-start window: empty, with an invite (asks for the name) and
+/// with a passport (does not), each checked where it leads before joining.
+#[test]
+fn enroll_window_fits() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (bundle, passport) = rt.block_on(async {
+        let server = common::TestServer::start().await;
+        let bundle = server.invite_bundle("neu-3fa2").await;
+        let (identity, _paths, _dir) = server.enroll("Chris").await;
+        (bundle, identity.to_passport())
+    });
+    let mut overflows = Overflows::default();
+    for theme_name in THEMES {
+        for (case, text) in [
+            ("paste", None),
+            ("invite", Some(bundle.clone())),
+            ("passport", Some(passport.clone())),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::new(Some(dir.path().to_path_buf()));
+            let result = Arc::new(Mutex::new(None));
+            let mut h = Harness::builder()
+                .with_size(egui::vec2(ENROLL[0], ENROLL[1]))
+                .with_theme(egui_theme(theme_name))
+                .build_eframe(move |cc| {
+                    fonts::install(&cc.egui_ctx);
+                    theme::apply(&cc.egui_ctx, theme_name);
+                    let mut app = EnrollApp::new(paths, None, result);
+                    if let Some(text) = text {
+                        app.paste(text);
+                    }
+                    app
+                });
+            // The window asks for a repaint every 100 ms (the registration
+            // thread's result), so it never settles on its own.
+            h.run_steps(6);
+            let what = format!("enroll/{case}/{theme_name}");
+            overflows.check_window(&what, &h, ENROLL, false, h.state().overflow());
+            shot(&mut h, &what.replace('/', "-"));
+            if case == "invite" {
+                // One page: where it leads, the name, one button.
+                h.get_by_role_and_label(
+                    egui::accesskit::Role::Button,
+                    &format!("{}  Beitreten", egui_phosphor::regular::SIGN_IN),
+                );
+            }
+        }
+    }
+    overflows.assert_none();
+}
+
+/// The latest `UpdateSettings` the settings window handed out.
+fn last_update(cmds: &[Command]) -> Settings {
+    cmds.iter()
+        .rev()
+        .find_map(|c| match c {
+            Command::UpdateSettings(s) => Some((**s).clone()),
+            _ => None,
+        })
+        .expect("an UpdateSettings")
+}
+
+/// A hotkey, the tray or the main window change settings while the settings
+/// window is open: the window takes the change over instead of writing its
+/// stale copy back with the next edit (review 2026-09-23, Netz #4).
+#[test]
+fn settings_window_keeps_outside_changes() {
+    let shared = Rc::new(RefCell::new(state()));
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let (state_in, cmds_out) = (shared.clone(), cmds.clone());
+    let mut view = SettingsView::new(
+        &shared.borrow(),
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        let out = view.ui(ui, &state_in.borrow(), false);
+        cmds_out.borrow_mut().extend(out.cmds);
+    });
+
+    // The user switches to voice activation; the engine applies it.
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Automatisch")
+        .click();
+    h.run();
+    let sent = last_update(&cmds.borrow());
+    assert_eq!(sent.audio.mode, ModeSetting::Vad);
+    shared.borrow_mut().settings = sent;
+    h.run();
+
+    // A hotkey flips back to push-to-talk behind the window's back.
+    shared.borrow_mut().settings.audio.mode = ModeSetting::Ptt;
+    h.run();
+
+    // The next edit in the window keeps push-to-talk.
+    h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Senden beginnt oder endet")
+        .click();
+    h.run();
+    let sent = last_update(&cmds.borrow());
+    assert_eq!(
+        sent.audio.mode,
+        ModeSetting::Ptt,
+        "outside change written back"
+    );
+    assert!(sent.audio.cue_tx);
+}

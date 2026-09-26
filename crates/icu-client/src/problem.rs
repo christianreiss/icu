@@ -54,6 +54,40 @@ impl std::fmt::Display for Problem {
 pub const CREDENTIALS_STALE: &str = "Deine Zugangsdaten passen nicht (mehr) zu diesem Server – \
      vermutlich wurde er neu eingerichtet. Bitte beim Admin eine neue Einladung anfordern.";
 
+/// Our certificate was revoked. Since 2026-09-25 that is what a second
+/// device holding the same passport sees once the other one renewed or
+/// renamed and logged in with the new certificate: that login revokes every
+/// older one (`PROTOCOL.md` §2.2 Nr. 10). A new invitation would create a
+/// second account, so the text names the passport as the way back, and the
+/// admin only for a real revocation.
+pub const SUPERSEDED_REVOKED: &str = "Dieses Zertifikat gilt nicht mehr. Wurde ICU auf einem \
+     anderen Gerät erneuert oder umbenannt, dort den Passport speichern und hier einspielen – \
+     sonst den Admin fragen.";
+
+/// The server does not know our certificate: the same multi-device case once
+/// the replaced certificate has expired and left `users.toml`.
+pub const SUPERSEDED_UNKNOWN: &str = "Der Server kennt dieses Zertifikat nicht (mehr). Wurde \
+     ICU auf einem anderen Gerät erneuert oder umbenannt, dort den Passport speichern und hier \
+     einspielen – sonst den Admin fragen.";
+
+/// For a single attempt nobody repeats — joining with an invitation: the
+/// texts are written for the engine, which keeps trying, and promise that;
+/// here the promise becomes a request to try again.
+pub fn one_shot(text: String) -> String {
+    for promise in [
+        " ICU versucht es gleich noch einmal.",
+        " – ICU versucht es weiter.",
+        " ICU versucht es weiter.",
+    ] {
+        if let Some(rest) = text.strip_suffix(promise) {
+            let rest = rest.trim_end_matches('.');
+            let stop = if rest.ends_with(['?', '!']) { "" } else { "." };
+            return format!("{rest}{stop} Bitte noch einmal versuchen.");
+        }
+    }
+    text
+}
+
 /// The server cannot be reached.
 pub const UNREACHABLE: &str = "Der Server ist nicht erreichbar. Läuft er, stimmt die Adresse \
      und besteht eine Internetverbindung? ICU versucht es weiter.";
@@ -70,14 +104,8 @@ pub fn code_text(code: u32) -> String {
         codes::VERSION_UNSUPPORTED => {
             "Diese ICU-Version passt nicht zum Server. Bitte ICU aktualisieren."
         }
-        codes::AUTH_UNKNOWN_CERT => {
-            "Der Server kennt dieses Gerät nicht (mehr). Bitte beim Admin eine neue Einladung \
-             anfordern."
-        }
-        codes::AUTH_REVOKED => {
-            "Der Zugang dieses Geräts wurde gesperrt. Wende dich an den Admin, wenn das ein \
-             Irrtum ist."
-        }
+        codes::AUTH_UNKNOWN_CERT => SUPERSEDED_UNKNOWN,
+        codes::AUTH_REVOKED => SUPERSEDED_REVOKED,
         codes::SERVER_FULL => "Der Server ist voll. ICU versucht es gleich noch einmal.",
         codes::KICKED => "Ein Admin hat dich vom Server geworfen.",
         codes::HELLO_TIMEOUT | codes::TIMEOUT => {
@@ -112,11 +140,16 @@ pub fn code_text(code: u32) -> String {
         }
         codes::NO_SUCH_USER => "Diesen Nutzer gibt es nicht (mehr).",
         codes::SESSION_REPLACED => {
-            "Du hast dich mit denselben Zugangsdaten auf einem anderen Gerät verbunden – \
-             hier wurde deshalb getrennt."
+            "Mit denselben Zugangsdaten ist ein anderes Gerät verbunden, deshalb wurde hier \
+             getrennt. „Neu verbinden“ holt die Sitzung hierher zurück – dann wird das andere \
+             Gerät getrennt."
         }
         codes::REGISTRATION_STORED => "Registrierung abgeschlossen.",
         codes::RENEW_REQUIRED => "Das eigene Zertifikat ist abgelaufen und wird erneuert …",
+        codes::SERVER_ERROR => {
+            "Der Server konnte das gerade nicht speichern, es hat sich nichts geändert. Bitte \
+             später noch einmal versuchen."
+        }
         other => return format!("Unerwarteter Fehler (Code {other})."),
     };
     s.to_string()
@@ -252,6 +285,37 @@ pub(crate) mod tests {
             assert!(p.technical.unwrap().contains(codes::name(code)));
         }
         assert!(code_text(0xEE).contains("0xEE") || code_text(0xEE).contains("238"));
+    }
+
+    /// A second device whose passport went stale is told how to get back
+    /// in — not to request an invitation, which would make a second account.
+    #[test]
+    fn a_superseded_certificate_points_to_the_passport() {
+        for code in [codes::AUTH_REVOKED, codes::AUTH_UNKNOWN_CERT] {
+            let text = code_text(code);
+            assert!(text.contains("Passport"), "{text}");
+            assert!(text.contains("anderen Gerät"), "{text}");
+            assert!(!text.contains("Einladung"), "{text}");
+        }
+        let replaced = code_text(codes::SESSION_REPLACED);
+        assert!(replaced.contains("Neu verbinden"), "{replaced}");
+        assert!(replaced.contains("andere"), "{replaced}");
+    }
+
+    /// Joining tries once: no text there may promise that ICU keeps trying.
+    #[test]
+    fn a_single_attempt_promises_no_retry() {
+        for code in codes::ALL_CODES {
+            let text = one_shot(code_text(*code));
+            assert!(!text.contains("versucht es"), "{text}");
+        }
+        for text in [UNREACHABLE.to_string(), code_text(codes::SERVER_FULL)] {
+            let text = one_shot(text);
+            assert!(text.ends_with(" Bitte noch einmal versuchen."), "{text}");
+            assert!(!text.contains("..") && !text.contains("?."), "{text}");
+        }
+        let untouched = code_text(codes::KICKED);
+        assert_eq!(one_shot(untouched.clone()), untouched);
     }
 
     #[test]

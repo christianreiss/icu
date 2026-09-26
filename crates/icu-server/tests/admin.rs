@@ -5,7 +5,7 @@ mod common;
 
 use common::TestServer;
 use icu_proto::ControlMsg;
-use icu_server::{admin, AdminRequest};
+use icu_server::{admin, AdminRequest, AdminResponse};
 
 /// §10: a registration bundle issued through the socket works right away,
 /// without a restart.
@@ -25,7 +25,10 @@ async fn an_invite_over_the_socket_works_without_a_restart() {
     .expect("admin request");
     assert_eq!(response["ok"], serde_json::json!(true));
     let bundle = response["bundle"].as_str().expect("bundle").to_string();
-    assert!(icu_proto::passport::Passport::looks_like(&bundle), "{bundle}");
+    assert!(
+        icu_proto::passport::Passport::looks_like(&bundle),
+        "{bundle}"
+    );
     assert_eq!(response["name"], serde_json::json!("bob"));
     assert_eq!(response["user_id"], serde_json::json!(1));
     assert_eq!(response["is_admin"], serde_json::json!(true), "first user");
@@ -267,4 +270,165 @@ async fn the_offline_path_is_blocked_while_a_server_runs() {
     let error = icu_server::Server::offline(config).expect_err("the lock is held");
     assert!(error.to_string().contains("cannot lock"), "{error}");
     server.shutdown().await;
+}
+
+/// `mute` and `deafen` each change one side of the pair and keep the other
+/// as it is at the moment of the write.
+#[tokio::test]
+async fn mute_and_deafen_over_the_socket_keep_each_other() {
+    let server = TestServer::start().await;
+    server.enroll("alice").await;
+    server.enroll("bob").await;
+    let bob = || "bob".to_string();
+    for request in [
+        AdminRequest::Mute { user: bob() },
+        AdminRequest::Deafen { user: bob() },
+    ] {
+        assert!(matches!(
+            server.handle.admin(request).await,
+            AdminResponse::Ok
+        ));
+    }
+    let restriction = |users: &[icu_server::admin::AdminUser]| {
+        let row = users.iter().find(|u| u.name == "bob").unwrap();
+        (row.muted, row.deafened)
+    };
+    let AdminResponse::Users(users) = server.handle.admin(AdminRequest::Users).await else {
+        panic!("users")
+    };
+    assert_eq!(restriction(&users), (true, true));
+    assert!(matches!(
+        server
+            .handle
+            .admin(AdminRequest::Unmute { user: bob() })
+            .await,
+        AdminResponse::Ok
+    ));
+    let AdminResponse::Users(users) = server.handle.admin(AdminRequest::Users).await else {
+        panic!("users")
+    };
+    assert_eq!(restriction(&users), (false, true));
+    server.shutdown().await;
+}
+
+/// `invite` says whether an admin has registered yet: until one has, not
+/// the first bundle issued but the first one completed makes an admin, and
+/// the CLI points that out (`PROTOCOL.md` §2.3).
+#[tokio::test]
+async fn invite_says_whether_an_admin_has_registered() {
+    let server = TestServer::start().await;
+    let invite = || AdminRequest::Invite {
+        name: String::new(),
+        ttl_s: None,
+    };
+    let first = server.handle.admin(invite()).await;
+    assert!(
+        matches!(
+            first,
+            AdminResponse::Invite {
+                is_admin: true,
+                admin_confirmed: false,
+                ..
+            }
+        ),
+        "{first:?}"
+    );
+    assert_eq!(first.to_json()["admin_confirmed"], serde_json::json!(false));
+    server.enroll("alice").await;
+    let later = server.handle.admin(invite()).await;
+    assert!(
+        matches!(
+            later,
+            AdminResponse::Invite {
+                is_admin: false,
+                admin_confirmed: true,
+                ..
+            }
+        ),
+        "{later:?}"
+    );
+    server.shutdown().await;
+}
+
+/// A name reserved for examples (`icu.example.org`) is refused only where it
+/// would be baked in for the first time: a new CA, the first invitation. An
+/// install whose CA already carries one, from before the check, keeps
+/// starting and answering `status` and `users` — refusing it in the config,
+/// as before, took such a server down with the upgrade, and every CLI command
+/// with it.
+#[tokio::test]
+async fn reserved_example_names_are_refused_only_where_they_are_new() {
+    let example = |dir: &std::path::Path| {
+        let mut config = icu_server::Config::for_test(dir);
+        config.server.server_name = "icu.example.org".into();
+        config.server.public_host = "icu.example.org:4711".into();
+        config
+    };
+    let invite = || AdminRequest::Invite {
+        name: String::new(),
+        ttl_s: None,
+    };
+
+    // A fresh install: neither the server nor the offline CLI makes a CA.
+    let dir = tempfile::tempdir().unwrap();
+    let config = example(dir.path());
+    let started = icu_server::run(config.clone()).await.err();
+    let offline = icu_server::Server::offline(config.clone()).err();
+    for error in [started, offline] {
+        let error = error.expect("refused").to_string();
+        assert!(error.contains("server.server_name"), "{error}");
+    }
+    assert!(!dir.path().join("ca.crt").exists(), "no CA was created");
+
+    // An install from before the check: its CA carries the example name.
+    icu_server::ca::Ca::load_or_create(dir.path(), &config.tls, "icu.example.org").unwrap();
+    let handle = icu_server::run(config)
+        .await
+        .expect("an existing CA starts");
+    assert!(matches!(
+        handle.admin(AdminRequest::Status).await,
+        AdminResponse::Status(_)
+    ));
+    // Nobody holds a certificate yet, so the first invitation would be the
+    // first to carry the example `public_host`.
+    let first = handle.admin(invite()).await;
+    assert!(
+        matches!(&first, AdminResponse::Error { detail, .. } if detail.contains("server.public_host")),
+        "{first:?}"
+    );
+    handle.shutdown().await;
+
+    // With users on record, invitations go on: their certificates already
+    // carry the name.
+    let dir = tempfile::tempdir().unwrap();
+    let config = example(dir.path());
+    icu_server::ca::Ca::load_or_create(dir.path(), &config.tls, "icu.example.org").unwrap();
+    std::fs::write(
+        dir.path().join("users.toml"),
+        format!(
+            "schema = 1\nnext_user_id = 2\ncrl_number = 1790000000\n\n\
+             [user.1]\nname = \"alice\"\ncreated = \"2026-01-01T00:00:00Z\"\nis_admin = true\n\n\
+             [[user.1.cert]]\nfingerprint = \"{:064x}\"\nissued = \"2026-01-01T00:00:00Z\"\n\
+             expires = \"2099-01-01T00:00:00Z\"\nrevoked = false\n",
+            1
+        ),
+    )
+    .unwrap();
+    let handle = icu_server::run(config).await.expect("starts");
+    let later = handle.admin(invite()).await;
+    assert!(matches!(later, AdminResponse::Invite { .. }), "{later:?}");
+    let AdminResponse::Users(users) = handle.admin(AdminRequest::Users).await else {
+        panic!("users")
+    };
+    assert_eq!(users.len(), 2);
+    handle.shutdown().await;
+
+    // Every CLI command loads the configuration file first.
+    let file = dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        "[server]\nserver_name = \"icu.example.org\"\npublic_host = \"icu.example.org:4711\"\n",
+    )
+    .unwrap();
+    icu_server::Config::load(&file).expect("the configuration loads");
 }

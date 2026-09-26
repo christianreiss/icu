@@ -53,21 +53,43 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
         }
     };
 
-    // The registration budget comes before the slot: a refused attempt must
-    // not first close a registration of the same bundle that is in progress.
-    if identity.registration {
-        if let Err(e) = enroll_budget(&server, &conn) {
-            tracing::info!(%remote, user_id = identity.user_id, error = %e, "rejected");
-            let code = ec::ENROLL_RATE_LIMITED;
-            wire::close(&conn, code);
-            return Err(e);
-        }
+    let roomless = identity.registration || identity.expired;
+    if roomless {
+        // Registration and renew-only sessions read nothing but their control
+        // stream, whose credit the handshake already granted. Streams nobody
+        // accepts are buffered by quinn: no credit for any further one.
+        conn.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(0));
+        conn.set_max_concurrent_bi_streams(quinn::VarInt::from_u32(0));
     }
 
     // One live connection per certificate: this one wins (`PROTOCOL.md` §7).
-    // Not for a renew-only session: it never joins the room, and must not
-    // kick a session still running on the same certificate.
-    let _live = (!identity.expired).then(|| LiveCert::claim(&server, &identity.cert_fp, &conn));
+    // A renew-only session has a table of its own: it must not kick a room
+    // session still running on the same certificate.
+    let slots = if roomless {
+        Slots::Roomless
+    } else {
+        Slots::Room
+    };
+    // A registration pays its budget once there is room for it and before it
+    // takes the slot. Turned away as full — not fatal, the client comes back
+    // — it has spent nothing, or its retries would end in the fatal
+    // `ENROLL_RATE_LIMITED`; refused by the budget, it has not first closed
+    // a registration of the same bundle that is in progress.
+    let charge = || {
+        if identity.registration {
+            enroll_budget(&server, &conn)
+        } else {
+            Ok(())
+        }
+    };
+    let _live = match LiveCert::claim(&server, slots, &identity, &conn, charge) {
+        Ok(live) => live,
+        Err(e) => {
+            tracing::info!(%remote, user_id = identity.user_id, error = %e, "rejected");
+            wire::close(&conn, e.code().unwrap_or(ec::SERVER_FULL));
+            return Err(e);
+        }
+    };
 
     let served = if identity.registration {
         let exchange = |deadline| registration_exchange(&server, &conn, &identity, deadline);
@@ -89,53 +111,134 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
     }
 }
 
-/// Holds a certificate's slot in [`Server::live_certs`] for as long as its
-/// connection lives. A newer connection with the same certificate takes the
-/// slot over and closes this one with `SESSION_REPLACED`: newest wins, so a
-/// client whose old path is still waiting for its idle timeout is not locked
-/// out, and a stolen passport in use shows up as a kicked owner.
+/// The table a connection's certificate slot is kept in.
+#[derive(Debug, Clone, Copy)]
+enum Slots {
+    /// Room sessions, and those still waiting for `Hello`
+    /// ([`Server::live_certs`]).
+    Room,
+    /// Registration and renew-only sessions ([`Server::roomless`]), capped
+    /// at [`pl::MAX_ROOMLESS_SESSIONS`].
+    Roomless,
+}
+
+impl Slots {
+    fn table(self, server: &Server) -> &Mutex<crate::CertSlots> {
+        match self {
+            Slots::Room => &server.live_certs,
+            Slots::Roomless => &server.roomless,
+        }
+    }
+}
+
+/// Holds a certificate's slot for as long as its connection lives. A newer
+/// connection with the same certificate takes the slot over and closes this
+/// one with `SESSION_REPLACED`: newest wins, so a client whose old path is
+/// still waiting for its idle timeout is not locked out, and a stolen
+/// passport in use shows up as a kicked owner.
 struct LiveCert {
     server: Arc<Server>,
+    slots: Slots,
     fp: String,
     id: usize,
 }
 
 impl LiveCert {
-    fn claim(server: &Arc<Server>, fp: &str, conn: &quinn::Connection) -> LiveCert {
-        let old = lock(&server.live_certs).insert(fp.to_string(), conn.clone());
-        if let Some(old) = old.filter(|old| old.stable_id() != conn.stable_id()) {
-            // Through the room when it is in there, so `UserLeft` carries the
-            // code. An old session still before `room.join` sees its closed
-            // connection right after joining and leaves again.
-            if !server
-                .room
-                .close_connection(old.stable_id(), ec::SESSION_REPLACED)
+    /// Takes the slot of `identity`'s certificate for `conn`. `SERVER_FULL`
+    /// when the roomless table is full and `conn` would not replace an entry
+    /// in it; a replacement always gets in, the connection it replaces
+    /// leaves. With room, `charge` runs first, under the table's lock, and
+    /// its refusal is returned as it is.
+    fn claim(
+        server: &Arc<Server>,
+        slots: Slots,
+        identity: &Identity,
+        conn: &quinn::Connection,
+        charge: impl FnOnce() -> Result<()>,
+    ) -> Result<LiveCert> {
+        let fp = identity.cert_fp.clone();
+        let old = {
+            let mut table = lock(slots.table(server));
+            if matches!(slots, Slots::Roomless)
+                && table.len() >= pl::MAX_ROOMLESS_SESSIONS
+                && !table.contains_key(&fp)
             {
-                wire::close(&old, ec::SESSION_REPLACED);
+                return Err(Error::coded(
+                    ec::SERVER_FULL,
+                    "too many registration and renew-only sessions",
+                ));
             }
+            // Lock order: the slot table, then `ip_limits` in `charge`;
+            // nothing takes them the other way round.
+            charge()?;
+            table.insert(fp.clone(), (identity.user_id, conn.clone()))
+        };
+        if let Some((_, old)) = old.filter(|(_, old)| old.stable_id() != conn.stable_id()) {
+            close_connection(server, &old, ec::SESSION_REPLACED);
             tracing::info!(
-                fingerprint = fp,
+                fingerprint = %fp,
                 old = %old.remote_address(),
                 new = %conn.remote_address(),
                 "certificate connected again, older connection replaced"
             );
         }
-        LiveCert {
+        Ok(LiveCert {
             server: server.clone(),
-            fp: fp.to_string(),
+            slots,
+            fp,
             id: conn.stable_id(),
-        }
+        })
     }
 }
 
 impl Drop for LiveCert {
     fn drop(&mut self) {
-        let mut live = lock(&self.server.live_certs);
+        let mut table = lock(self.slots.table(&self.server));
         // Only our own entry: a replacement already sits there otherwise.
-        if live.get(&self.fp).is_some_and(|c| c.stable_id() == self.id) {
-            live.remove(&self.fp);
+        if table
+            .get(&self.fp)
+            .is_some_and(|(_, c)| c.stable_id() == self.id)
+        {
+            table.remove(&self.fp);
         }
     }
+}
+
+/// Closes `conn` with `code`: through the room when it is in there, so
+/// `UserLeft` carries the code. A session still before `room.join` sees its
+/// closed connection right after joining and leaves again.
+fn close_connection(server: &Server, conn: &quinn::Connection, code: u32) {
+    if !server.room.close_connection(conn.stable_id(), code) {
+        wire::close(conn, code);
+    }
+}
+
+/// Closes every connection of `user_id` with `code` and returns how many:
+/// its room sessions — through the room, so `UserLeft` carries the code —
+/// and every other connection on one of its certificates, a session still
+/// waiting for `Hello`, a registration or a renew-only session. Behind
+/// revoke, disable and kick.
+pub(crate) fn close_user(server: &Server, user_id: UserId, code: u32) -> usize {
+    let mut closed: std::collections::HashSet<usize> =
+        server.room.close_user(user_id, code).into_iter().collect();
+    let others: Vec<quinn::Connection> = [Slots::Room, Slots::Roomless]
+        .into_iter()
+        .flat_map(|slots| {
+            lock(slots.table(server))
+                .values()
+                .filter(|(owner, _)| *owner == user_id)
+                .map(|(_, conn)| conn.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    for conn in others {
+        // One that already ended — a registration session lingering for its
+        // store write after the client closed — is not closed again.
+        if conn.close_reason().is_none() && closed.insert(conn.stable_id()) {
+            wire::close(&conn, code);
+        }
+    }
+    closed.len()
 }
 
 /// Who is on the other end.
@@ -227,7 +330,11 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
     };
     drop(store);
     if !retired.is_empty() {
-        tracing::info!(user_id, count = retired.len(), "replaced certificates revoked");
+        tracing::info!(
+            user_id,
+            count = retired.len(),
+            "replaced certificates revoked"
+        );
         close_retired(server, &retired);
     }
     if consumed || !retired.is_empty() {
@@ -245,17 +352,22 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
 }
 
 /// Closes live connections still running on certificates that were just
-/// revoked by their successor's login — a second device holding a copy, or
-/// a connection this client already left.
+/// revoked by their successor's login — a second device holding a copy, a
+/// renew-only session on an expired copy, or a connection this client
+/// already left.
 fn close_retired(server: &Arc<Server>, fingerprints: &[String]) {
-    let live: Vec<quinn::Connection> = {
-        let live = lock(&server.live_certs);
-        fingerprints.iter().filter_map(|fp| live.get(fp).cloned()).collect()
-    };
+    let live: Vec<quinn::Connection> = [Slots::Room, Slots::Roomless]
+        .into_iter()
+        .flat_map(|slots| {
+            let table = lock(slots.table(server));
+            fingerprints
+                .iter()
+                .filter_map(|fp| table.get(fp).map(|(_, conn)| conn.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     for conn in live {
-        if !server.room.close_connection(conn.stable_id(), ec::AUTH_REVOKED) {
-            wire::close(&conn, ec::AUTH_REVOKED);
-        }
+        close_connection(server, &conn, ec::AUTH_REVOKED);
     }
 }
 
@@ -393,6 +505,14 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
             return Err(Error::coded(ec::SERVER_FULL, "room is full"));
         }
     };
+    // Still under the store lock, which every restriction change holds while
+    // it pushes: an admin lifting the restriction right now reaches this
+    // session after this push, not before it with a stale one following.
+    if forced_muted || forced_deafened {
+        server
+            .room
+            .send_to(session, &restriction_changed(forced_muted, forced_deafened));
+    }
     drop(store);
     // The client checks the server leaf against the newest CRL it holds;
     // this is how it gets one (`PROTOCOL.md` §2.2).
@@ -402,17 +522,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
             .room
             .send_to(session, &ControlMsg::CrlUpdate { crl_der });
     }
-    if forced_muted || forced_deafened {
-        server.room.send_to(
-            session,
-            &ControlMsg::UserRestrictionChanged {
-                muted: forced_muted,
-                deafened: forced_deafened,
-            },
-        );
-    }
 
-    let writer = tokio::spawn(writer_task(send, out_rx));
     tracing::info!(
         session,
         user_id = identity.user_id,
@@ -422,17 +532,36 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         "joined"
     );
 
-    // 4. Datagram and uni-stream readers alongside the control loop.
-    let datagrams = tokio::spawn(datagram_task(server.clone(), conn.clone(), session));
-    let uni = tokio::spawn(uni_task(server.clone(), conn.clone(), session));
+    // 4. The control writer, datagram and uni-stream readers alongside the
+    // control loop, held by the seat: it takes the session out of the room
+    // however this function ends.
+    let mut seat = Seat {
+        server,
+        conn,
+        session,
+        tasks: vec![
+            crate::spawn_logged(
+                format!("session {session} control writer"),
+                writer_task(send, out_rx),
+            ),
+            crate::spawn_logged(
+                format!("session {session} audio"),
+                datagram_task(server.clone(), conn.clone(), session),
+            ),
+            crate::spawn_logged(
+                format!("session {session} video"),
+                uni_task(server.clone(), conn.clone(), session),
+            ),
+        ],
+        left: false,
+    };
 
     let outcome = control_loop(server, conn, session, identity, &mut recv).await;
 
     // 6. Leave and announce.
-    datagrams.abort();
-    uni.abort();
-    writer.abort();
+    seat.abort_tasks();
     let member = server.room.leave(session);
+    seat.left = true;
     for (speaker, loss_permille) in lock(&server.loss).forget(session) {
         server
             .room
@@ -454,6 +583,56 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     });
     tracing::info!(session, reason = ec::name(reason), "left");
     outcome
+}
+
+/// A session's place in the room and the tasks serving it. On the normal
+/// way out `serve` leaves the room itself and this only stops the tasks.
+/// Dropped while unwinding from a panic, it closes the connection with the
+/// non-fatal `SHUTDOWN` — the client reconnects — takes the session out of
+/// the room and announces it: a bug in one session must not leave a member
+/// behind that holds a room slot, with its tasks running, until the next
+/// restart.
+struct Seat<'a> {
+    server: &'a Arc<Server>,
+    conn: &'a quinn::Connection,
+    session: Session,
+    tasks: Vec<tokio::task::AbortHandle>,
+    left: bool,
+}
+
+impl Seat<'_> {
+    fn abort_tasks(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for Seat<'_> {
+    fn drop(&mut self) {
+        self.abort_tasks();
+        if self.left {
+            return;
+        }
+        wire::close(self.conn, ec::SHUTDOWN);
+        if self.server.room.leave(self.session).is_some() {
+            lock(&self.server.loss).forget(self.session);
+            self.server.room.broadcast(&ControlMsg::UserLeft {
+                session: self.session,
+                reason: ec::SHUTDOWN as u8,
+            });
+        }
+        // A panic is a bug worth an error; a task cancelled at shutdown is
+        // not.
+        if std::thread::panicking() {
+            tracing::error!(
+                session = self.session,
+                "session panicked, taken out of the room"
+            );
+        } else {
+            tracing::debug!(session = self.session, "session cancelled, left the room");
+        }
+    }
 }
 
 /// How long a registration session may stay open in total. Long enough for a
@@ -590,24 +769,30 @@ async fn recovery_exchange(
                 }
                 continue;
             }
-            ControlMsg::RenewRequest { csr_der } => match renew_leaf(server, identity, &csr_der)
-                .await
-            {
-                Ok(renewed) => {
-                    let response = ControlMsg::RenewResponse {
-                        leaf_der: renewed.leaf,
-                    };
-                    write_msg(&mut send, &response).await?;
-                    let _ = send.finish();
-                    // The client closes once it has stored the leaf; a close
-                    // from here could overtake the response.
-                    let _ = tokio::time::timeout(REGISTRATION_LINGER, conn.closed()).await;
-                    return Ok(());
+            ControlMsg::RenewRequest { csr_der } => {
+                match renew_leaf(server, identity, &csr_der).await {
+                    Ok(renewed) => {
+                        let response = ControlMsg::RenewResponse {
+                            leaf_der: renewed.leaf,
+                        };
+                        write_msg(&mut send, &response).await?;
+                        let _ = send.finish();
+                        // The client closes once it has stored the leaf; a close
+                        // from here could overtake the response.
+                        let _ = tokio::time::timeout(REGISTRATION_LINGER, conn.closed()).await;
+                        return Ok(());
+                    }
+                    // The certificate lost its admission during the session
+                    // (revoked, retired by a successor, user disabled): the
+                    // session ends with that code.
+                    Err((code, detail)) if ec::is_fatal(code) => {
+                        return Err(Error::coded(code, detail));
+                    }
+                    Err((code, detail)) => {
+                        write_msg(&mut send, &ControlMsg::Error { code, detail }).await?;
+                    }
                 }
-                Err((code, detail)) => {
-                    write_msg(&mut send, &ControlMsg::Error { code, detail }).await?;
-                }
-            },
+            }
             _ => write_msg(&mut send, &required).await?,
         }
         attempts += 1;
@@ -835,12 +1020,27 @@ async fn datagram_task(server: Arc<Server>, conn: quinn::Connection, session: Se
 }
 
 /// Accepts one unidirectional stream per video frame.
+///
+/// A sender has at most `VIDEO_STREAMS_PER_SENDER` frames in flight here: a
+/// camera sends one frame at a time, and every frame in flight holds a task
+/// and up to 512 KiB of payload. A stream beyond that is stopped unread with
+/// `RATE_LIMITED`, which also hands its flow control credit back.
 async fn uni_task(server: Arc<Server>, conn: quinn::Connection, session: Session) {
     let state = Arc::new(Mutex::new(VideoSender::new(&server.config.limits)));
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(pl::VIDEO_STREAMS_PER_SENDER));
     loop {
         match conn.accept_uni().await {
-            Ok(recv) => {
-                tokio::spawn(relay::video(server.clone(), session, recv, state.clone()));
+            Ok(mut recv) => {
+                let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+                    Counters::inc(&server.counters.video_dropped_rate);
+                    let _ = recv.stop(quinn::VarInt::from_u32(ec::RATE_LIMITED));
+                    continue;
+                };
+                let (server, state) = (server.clone(), state.clone());
+                crate::spawn_logged("video frame", async move {
+                    relay::video(server, session, recv, state).await;
+                    drop(permit);
+                });
             }
             Err(_) => return,
         }
@@ -988,8 +1188,9 @@ async fn control_loop(
                 deafened,
             } => {
                 let done =
-                    admin::set_restriction(server, Some(user_id), target, muted, deafened).await;
-                let answer = admin_answer(target, done, |()| ControlMsg::AdminSetRestrictionOk {
+                    admin::set_restriction(server, Some(user_id), target, |_| (muted, deafened))
+                        .await;
+                let answer = admin_answer(target, done, |_| ControlMsg::AdminSetRestrictionOk {
                     user_id: target,
                     muted,
                     deafened,
@@ -1079,6 +1280,11 @@ async fn renew_leaf(
     let store_err = |e: Error| (e.code().unwrap_or(ec::RENEW_REJECTED), e.to_string());
 
     let mut store = server.store.lock().await;
+    // Admission again, under the lock every revoke, disable and retirement
+    // happens under: since this session authenticated, its certificate may
+    // have been revoked, or retired by a successor's first login — a copy of
+    // an expired certificate must not renew once its owner moved on.
+    admit(&store, &identity.cert_fp).map_err(store_err)?;
     let Some(user) = store.user(user_id) else {
         return Err((ec::RENEW_REJECTED, "unknown user".into()));
     };
@@ -1106,9 +1312,15 @@ async fn renew_leaf(
         // An hour for an expired certificate: a renewal whose answer got lost
         // must not strand its holder for a day.
         let (bound, detail) = if identity.expired {
-            (time::Duration::hours(1), "this certificate was renewed within the hour")
+            (
+                time::Duration::hours(1),
+                "this certificate was renewed within the hour",
+            )
         } else {
-            (time::Duration::days(1), "this certificate already caught up today")
+            (
+                time::Duration::days(1),
+                "this certificate already caught up today",
+            )
         };
         if let Some(last) = store.cert_renewed(user_id, &identity.cert_fp) {
             if now() - last < bound {
@@ -1133,8 +1345,8 @@ async fn renew_leaf(
         let expires_at = parse_rfc3339(expires).ok()?;
         Some((expires_at, renew_window(issued, expires)))
     });
-    let in_window = identity.expired
-        || window.is_none_or(|(expires, window)| expires - now() <= window);
+    let in_window =
+        identity.expired || window.is_none_or(|(expires, window)| expires - now() <= window);
     if !in_window && !rename && !catch_up {
         let days = window.map(|(_, w)| w.whole_days()).unwrap_or_default();
         return Err((
@@ -1188,12 +1400,7 @@ async fn renew_leaf(
 
 /// `RenewRequest` in the room: [`renew_leaf`], the answer, and a rename
 /// pushed to every session of the user.
-async fn handle_renew(
-    server: &Arc<Server>,
-    session: Session,
-    identity: &Identity,
-    csr_der: &[u8],
-) {
+async fn handle_renew(server: &Arc<Server>, session: Session, identity: &Identity, csr_der: &[u8]) {
     let renewed = match renew_leaf(server, identity, csr_der).await {
         Ok(renewed) => renewed,
         Err((code, detail)) => {
@@ -1237,12 +1444,42 @@ async fn handle_create_invite(
             .send_to(session, &reject(ec::NOT_ADMIN, "not an admin".into()));
         return;
     }
-    // The label is only a placeholder name, so the failures are a malformed
-    // or taken one, or a failed write. `NAME_TAKEN` is the non-fatal code the
-    // client already shows next to the invite field.
-    match crate::registration::issue(server, name, ttl_s).await {
+    // Each bundle is a user in `users.toml` until it is confirmed or
+    // expires; an admin certificate in the wrong hands must not be able to
+    // fill it.
+    let per_hour = server.config.limits.invites_per_admin_per_hour;
+    if !lock(&server.invite_budget)
+        .entry(user_id)
+        .or_insert_with(|| TokenBucket::per_hour(per_hour))
+        .take_one()
+    {
+        server.room.send_to(
+            session,
+            &reject(
+                ec::RATE_LIMITED,
+                format!("at most {per_hour} invitations per hour"),
+            ),
+        );
+        return;
+    }
+    // `issue` codes its refusals (`NAME_TAKEN` for a malformed or taken
+    // label, `RATE_LIMITED`); anything uncoded is the server's own trouble,
+    // a failed write, and must not read as a taken name. Refused, it minted
+    // nothing: the token goes back, or a taken name, a full server or a disk
+    // problem would use up the admin's hour.
+    let issued = crate::registration::issue(server, name, ttl_s).await;
+    if issued.is_err() {
+        if let Some(bucket) = lock(&server.invite_budget).get_mut(&user_id) {
+            bucket.refund_one();
+        }
+    }
+    match issued {
         Ok(issued) => {
-            tracing::info!(user_id, invited = issued.user_id, "registration bundle minted");
+            tracing::info!(
+                user_id,
+                invited = issued.user_id,
+                "registration bundle minted"
+            );
             server.room.send_to(
                 session,
                 &ControlMsg::CreateInviteResponse {
@@ -1252,23 +1489,37 @@ async fn handle_create_invite(
             );
         }
         Err(e) => {
+            tracing::warn!(user_id, error = %e, "cannot issue a registration");
             server.room.send_to(
                 session,
-                &reject(e.code().unwrap_or(ec::NAME_TAKEN), e.to_string()),
+                &reject(e.code().unwrap_or(ec::SERVER_ERROR), e.to_string()),
             );
         }
     }
 }
 
-/// The `UserFlags` bits an admin restriction keeps set.
+/// The `UserFlags` bits an admin restriction keeps set. Deafened implies
+/// muted: a user who hears nobody must not talk into the room either.
 pub(crate) fn restriction_flags(muted: bool, deafened: bool) -> icu_proto::UserFlags {
     icu_proto::UserFlags::NONE
-        .with_bit(icu_proto::UserFlags::MUTED, muted)
+        .with_bit(icu_proto::UserFlags::MUTED, muted || deafened)
         .with_bit(icu_proto::UserFlags::DEAFENED, deafened)
 }
 
+/// `UserRestrictionChanged` for a restriction, as enforced: deafened
+/// includes muted ([`restriction_flags`]).
+pub(crate) fn restriction_changed(muted: bool, deafened: bool) -> ControlMsg {
+    ControlMsg::UserRestrictionChanged {
+        muted: muted || deafened,
+        deafened,
+    }
+}
+
 /// The in-band answer to an admin action: `ok` on success, else
-/// `AdminActionError` with the code the store gave (`PROTOCOL.md` §2.2).
+/// `AdminActionError` with the code the store gave (`PROTOCOL.md` §2.2). An
+/// uncoded error is the server's own trouble — a failed write — and goes out
+/// as `SERVER_ERROR`, not as a policy refusal the admin would read as their
+/// mistake.
 fn admin_answer<T>(
     target: UserId,
     done: Result<T>,
@@ -1276,11 +1527,16 @@ fn admin_answer<T>(
 ) -> ControlMsg {
     match done {
         Ok(value) => ok(value),
-        Err(e) => ControlMsg::AdminActionError {
-            user_id: target,
-            code: e.code().unwrap_or(ec::LAST_ADMIN),
-            detail: e.to_string(),
-        },
+        Err(e) => {
+            if e.code().is_none() {
+                tracing::warn!(target, error = %e, "admin action failed");
+            }
+            ControlMsg::AdminActionError {
+                user_id: target,
+                code: e.code().unwrap_or(ec::SERVER_ERROR),
+                detail: e.to_string(),
+            }
+        }
     }
 }
 
@@ -1302,7 +1558,7 @@ async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor:
         return;
     }
     let online = server.room.online_users();
-    let users = store
+    let mut rows: Vec<icu_proto::UserSummary> = store
         .users()
         .map(|(id, u)| icu_proto::UserSummary {
             user_id: id,
@@ -1318,9 +1574,68 @@ async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor:
         })
         .collect();
     drop(store);
+    // Most useful first, so a list too long for one frame loses the least
+    // useful rows: online, then admins, then everybody else, removed
+    // accounts last, the newest first within each.
+    rows.sort_by_key(|u| {
+        let rank = match () {
+            _ if u.online => 0,
+            _ if u.is_admin => 1,
+            _ if !u.revoked => 2,
+            _ => 3,
+        };
+        (rank, std::cmp::Reverse(u.user_id))
+    });
+    let users = fit_user_list(rows);
     server
         .room
         .send_to(session, &ControlMsg::UserListResponse { users });
+}
+
+/// `users` as they fit one `UserListResponse` (`PROTOCOL.md` §2.2 Nr. 27):
+/// all of them, or the longest head that fits together with a last row that
+/// stands for the rest — `user_id` 0, the number left out in `name`. Without
+/// this, a list past a control frame (~230 users) was not sent at all.
+fn fit_user_list(users: Vec<icu_proto::UserSummary>) -> Vec<icu_proto::UserSummary> {
+    let fits = |users: Vec<icu_proto::UserSummary>| {
+        ControlMsg::UserListResponse { users }.encode().is_ok()
+    };
+    if fits(users.clone()) {
+        return users;
+    }
+    let total = users.len();
+    let head = |k: usize| {
+        let mut head = users[..k].to_vec();
+        head.push(icu_proto::UserSummary {
+            user_id: 0,
+            name: format!("… und {} weitere", total - k),
+            created: String::new(),
+            is_admin: false,
+            disabled: false,
+            revoked: false,
+            online: false,
+            pending: false,
+            muted: false,
+            deafened: false,
+        });
+        head
+    };
+    // `head(lo)` fits (with `lo` 0, just the rest row), `head(hi)` does not.
+    let (mut lo, mut hi) = (0, total);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(head(mid)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    tracing::warn!(
+        total,
+        listed = lo,
+        "user list too long for one frame, shortened"
+    );
+    head(lo)
 }
 
 /// The code the peer closed with, reduced to the `UserLeft.reason` range.

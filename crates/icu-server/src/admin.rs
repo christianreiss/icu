@@ -13,7 +13,7 @@ use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    task::JoinHandle,
+    task::AbortHandle,
 };
 
 use crate::{
@@ -110,8 +110,12 @@ pub enum AdminResponse {
         user_id: UserId,
         /// Their placeholder name.
         name: String,
-        /// Whether they will be an admin (the first user is).
+        /// Whether they are marked admin (the first bundle of an empty
+        /// server, provisionally).
         is_admin: bool,
+        /// Whether some admin has confirmed a registration; while none has,
+        /// whoever confirms one first becomes admin.
+        admin_confirmed: bool,
     },
     /// `users`
     Users(Vec<AdminUser>),
@@ -191,6 +195,7 @@ impl AdminResponse {
                 user_id,
                 name,
                 is_admin,
+                admin_confirmed,
             } => json!({
                 "ok": true,
                 "bundle": bundle,
@@ -198,13 +203,15 @@ impl AdminResponse {
                 "user_id": user_id,
                 "name": name,
                 "is_admin": is_admin,
+                "admin_confirmed": admin_confirmed,
             }),
             AdminResponse::Users(users) => json!({"ok": true, "users": users}),
             AdminResponse::Revoke { user_id, closed } => {
                 json!({"ok": true, "user_id": user_id, "closed": closed})
             }
             AdminResponse::Ok => json!({"ok": true}),
-            AdminResponse::Disable { user_id, closed } | AdminResponse::Kick { user_id, closed } => {
+            AdminResponse::Disable { user_id, closed }
+            | AdminResponse::Kick { user_id, closed } => {
                 json!({"ok": true, "user_id": user_id, "closed": closed})
             }
             AdminResponse::Status(value) => {
@@ -242,8 +249,9 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     user_id: issued.user_id,
                     name: issued.name,
                     is_admin: issued.is_admin,
+                    admin_confirmed: issued.admin_confirmed,
                 },
-                Err(e) => store_err(e, "BAD_NAME"),
+                Err(e) => store_err(e, "INVITE_FAILED"),
             }
         }
         AdminRequest::Users => {
@@ -314,15 +322,17 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
         | AdminRequest::Deafen { user }
         | AdminRequest::Undeafen { user } => match resolve(server, user).await {
             Ok(user_id) => {
-                let (mut muted, mut deafened) = server.store.lock().await.restriction(user_id);
-                match request {
-                    AdminRequest::Mute { .. } => muted = true,
-                    AdminRequest::Unmute { .. } => muted = false,
-                    AdminRequest::Deafen { .. } => deafened = true,
-                    _ => deafened = false,
-                }
-                match set_restriction(server, None, user_id, muted, deafened).await {
-                    Ok(()) => AdminResponse::Ok,
+                // One side of the pair changes, the other stays as it is at
+                // the moment of the write: computed under the store lock, so
+                // a `mute` and a `deafen` at once cannot undo each other.
+                let update = |(muted, deafened): (bool, bool)| match request {
+                    AdminRequest::Mute { .. } => (true, deafened),
+                    AdminRequest::Unmute { .. } => (false, deafened),
+                    AdminRequest::Deafen { .. } => (muted, true),
+                    _ => (muted, false),
+                };
+                match set_restriction(server, None, user_id, update).await {
+                    Ok(_) => AdminResponse::Ok,
                     Err(e) => store_err(e, "RESTRICT_FAILED"),
                 }
             }
@@ -344,20 +354,66 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
 /// restart. Behind `rotate-server-cert` and the automatic rotation before
 /// expiry (`housekeeping`). Handshakes already done keep the old leaf until
 /// they reconnect.
+///
+/// Rotation first, the CRL entry after: a rotation that fails must leave
+/// the live leaf alone — on the CRL, every client would refuse the server
+/// until the next rotation succeeded. When the CRL entry cannot be written,
+/// the old leaf stays pending in the CA and in `server.crt.retired`
+/// ([`Ca::keep_retired_leaves`](crate::ca::Ca::keep_retired_leaves)) for
+/// the next rotation or start. The error says which of the two halves is in
+/// force: the new leaf serves only once the TLS config is rebuilt, which
+/// needs a store write for the CRL number as well.
 pub async fn rotate_server_cert(server: &Arc<Server>) -> Result<()> {
-    // The old leaf goes on the CRL first: if rotating is the answer to a
-    // leaked server key, clients must refuse that leaf, and a failed rotation
-    // afterwards only leaves a spare entry.
-    {
+    let recorded = {
         let mut store = server.store.lock().await;
         let mut ca = server.ca.write().await;
-        let old = ca.server_der().clone();
-        let expires = crate::ca::leaf_not_after(&old);
-        store.revoke_server_cert(crate::ca::leaf_serial(&old), expires)?;
-        ca.rotate_server_cert(&server.config.tls, &server.config.server.server_name)?;
-    }
+        ca.rotate_server_cert(&server.config.tls, &server.config.server.server_name)
+            .context("no new server certificate, the current one stays in use")?;
+        record_retired_leaves(&mut store, &mut ca)
+    };
     // The new leaf and the CRL go live without a restart.
-    crate::endpoint::reload_tls(server).await
+    let reloaded = crate::endpoint::reload_tls(server).await;
+    const PENDING: &str = "the old one is not on the CRL yet (kept in server.crt.retired, \
+                           recorded with the next rotation or restart)";
+    match (recorded, reloaded) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) => Err(e.context(format!(
+            "the new server certificate is in use, but {PENDING}"
+        ))),
+        (Ok(()), Err(e)) => Err(e.context(
+            "the new server certificate is issued and the old one recorded for the CRL, \
+             but neither is in force before the next successful reload or restart",
+        )),
+        (Err(e), Err(_)) => Err(e.context(format!(
+            "the new server certificate is issued, but not in use before the next \
+             successful reload or restart, and {PENDING}"
+        ))),
+    }
+}
+
+/// Puts the server leaves the CA retired on the CRL, in one store write, and
+/// then clears them from `server.crt.retired`; keeps them pending in the CA
+/// and in that file when the write fails.
+pub fn record_retired_leaves(store: &mut Store, ca: &mut crate::ca::Ca) -> Result<()> {
+    let retired = ca.take_retired_leaves();
+    if !retired.is_empty() {
+        let entries: Vec<(String, String)> = retired
+            .iter()
+            .map(|der| (crate::ca::leaf_serial(der), crate::ca::leaf_not_after(der)))
+            .filter(|(serial, _)| !serial.is_empty())
+            .collect();
+        if let Err(e) = store.revoke_server_certs(&entries) {
+            ca.keep_retired_leaves(retired);
+            return Err(e);
+        }
+    }
+    // Also with nothing taken: a file still listing the leaf in use, from a
+    // rotation that failed, goes. One that cannot be removed only gets its
+    // leaves recorded once more at the next start.
+    if let Err(e) = ca.retired_recorded() {
+        tracing::warn!(error = %e, "cannot clear server.crt.retired");
+    }
+    Ok(())
 }
 
 /// Re-issues the CA certificate with the same key and subject, live without
@@ -365,11 +421,7 @@ pub async fn rotate_server_cert(server: &Arc<Server>) -> Result<()> {
 /// expires (`housekeeping`). Clients keep their stored CA certificate: the
 /// trust anchor is subject and key, not the dates (`Ca::renew_ca_cert`).
 pub async fn renew_ca(server: &Arc<Server>) -> Result<()> {
-    server
-        .ca
-        .write()
-        .await
-        .renew_ca_cert(&server.config.tls)?;
+    server.ca.write().await.renew_ca_cert(&server.config.tls)?;
     crate::endpoint::reload_tls(server).await
 }
 
@@ -387,14 +439,14 @@ async fn resolve(server: &Arc<Server>, user: &str) -> std::result::Result<UserId
 /// Under one store lock: an in-band `actor` must still be an admin and
 /// `target` must exist (the socket passes `None`, its authentication is the
 /// file permissions), then `change` runs. The lock is released before this
-/// returns, so the callers' side effects — kicks, control frames, the CRL
-/// reload — never run under it.
-async fn change(
+/// returns, so the callers' asynchronous side effects — the CRL reload —
+/// never run under it.
+async fn change<T>(
     server: &Arc<Server>,
     actor: Option<UserId>,
     target: UserId,
-    change: impl FnOnce(&mut Store) -> Result<bool>,
-) -> Result<bool> {
+    change: impl FnOnce(&mut Store) -> Result<T>,
+) -> Result<T> {
     let mut store = server.store.lock().await;
     if let Some(actor) = actor {
         if !store.is_admin(actor) {
@@ -488,43 +540,46 @@ pub async fn kick(server: &Arc<Server>, actor: Option<UserId>, target: UserId) -
 
 /// Enforces or lifts mute and deafen, persisted and live: the target's own
 /// sessions get `UserRestrictionChanged`, and every session whose flags
-/// changed a `UserState` broadcast. Behind `mute`/`unmute`/`deafen`/
-/// `undeafen` and `AdminSetRestriction`.
+/// changed a `UserState` broadcast. `update` maps the current `(muted,
+/// deafened)` to the new pair, which is returned. Behind `mute`/`unmute`/
+/// `deafen`/`undeafen` and `AdminSetRestriction`.
+///
+/// Store write, room change and pushes happen under the store lock, all of
+/// it synchronous: two admins at once cannot leave the room enforcing one
+/// pair while the store holds the other, their pushes cannot arrive the
+/// wrong way round, and a session joining meanwhile, which reads the store
+/// under that lock too, sees either the old pair and gets the new one from
+/// here or sees the new one.
 pub async fn set_restriction(
     server: &Arc<Server>,
     actor: Option<UserId>,
     target: UserId,
-    muted: bool,
-    deafened: bool,
-) -> Result<()> {
-    change(server, actor, target, |store| {
-        store.set_restriction(target, muted, deafened)
+    update: impl FnOnce((bool, bool)) -> (bool, bool),
+) -> Result<(bool, bool)> {
+    let (muted, deafened) = change(server, actor, target, |store| {
+        let (muted, deafened) = update(store.restriction(target));
+        store.set_restriction(target, muted, deafened)?;
+        let pushed = crate::session::restriction_changed(muted, deafened);
+        for s in server.room.sessions_of_user(target) {
+            server.room.send_to(s, &pushed);
+        }
+        let forced = crate::session::restriction_flags(muted, deafened);
+        for (session, flags) in server.room.set_forced(target, forced) {
+            server
+                .room
+                .broadcast(&ControlMsg::UserState { session, flags });
+        }
+        Ok((muted, deafened))
     })
     .await?;
-    for s in server.room.sessions_of_user(target) {
-        server
-            .room
-            .send_to(s, &ControlMsg::UserRestrictionChanged { muted, deafened });
-    }
-    let forced = crate::session::restriction_flags(muted, deafened);
-    for (session, flags) in server.room.set_forced(target, forced) {
-        server
-            .room
-            .broadcast(&ControlMsg::UserState { session, flags });
-    }
     tracing::info!(actor, target, muted, deafened, "restriction changed");
-    Ok(())
+    Ok((muted, deafened))
 }
 
-/// Closes every connection of a user with `code`, through the room so that
-/// `UserLeft` carries it.
+/// Closes every connection of a user with `code`, room or not
+/// (`session::close_user`).
 fn kick_user(server: &Arc<Server>, user_id: UserId, code: u32) -> usize {
-    server
-        .room
-        .sessions_of_user(user_id)
-        .into_iter()
-        .filter(|session| server.room.close(*session, code))
-        .count()
+    crate::session::close_user(server, user_id, code)
 }
 
 /// Maps a store failure onto a response. A coded error reports under its own
@@ -565,6 +620,7 @@ fn status(server: &Arc<Server>) -> serde_json::Value {
                 "video_rate": Counters::get(&c.video_dropped_rate),
                 "video_slow_receiver": Counters::get(&c.video_dropped_slow_receiver),
                 "video_not_allowed": Counters::get(&c.video_dropped_not_allowed),
+                "video_stalled": Counters::get(&c.video_dropped_stalled),
             }
         },
         "enroll": {
@@ -594,7 +650,7 @@ fn tls_status(server: &Arc<Server>) -> serde_json::Value {
 ///
 /// Returns the socket path and the serving task. Failure to bind is not fatal
 /// for the server; only the CLI becomes unavailable.
-pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, JoinHandle<()>)> {
+pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, AbortHandle)> {
     let path = server.config.admin_socket();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).context(format!("cannot create {}", dir.display()))?;
@@ -615,7 +671,7 @@ pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, JoinHandle<()>)> {
         }
     }
 
-    let task = tokio::spawn(serve(server, listener));
+    let task = crate::spawn_logged("admin socket", serve(server, listener));
     Ok((path, task))
 }
 
@@ -651,7 +707,7 @@ async fn serve(server: Arc<Server>, listener: UnixListener) {
             _ = server.shutdown_requested() => return,
         };
         let server = server.clone();
-        tokio::spawn(async move {
+        crate::spawn_logged("admin connection", async move {
             if let Err(e) = serve_one(server, stream).await {
                 tracing::debug!(error = %e, "admin connection ended");
             }

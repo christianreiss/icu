@@ -49,6 +49,9 @@ const CA_CRT: &str = "ca.crt";
 const CA_KEY: &str = "ca.key";
 const SERVER_CRT: &str = "server.crt";
 const SERVER_KEY: &str = "server.key";
+/// Replaced server leaves that are not on the CRL yet, PEM one after the
+/// other. Gone again once the store has them ([`Ca::retired_recorded`]).
+const SERVER_RETIRED: &str = "server.crt.retired";
 
 /// CA and server certificate material.
 pub struct Ca {
@@ -59,6 +62,13 @@ pub struct Ca {
     issuer: Issuer<'static, KeyPair>,
     server_der: CertificateDer<'static>,
     server_key: PrivateKeyDer<'static>,
+    /// Server leaves replaced here but not on the CRL yet: every rotation
+    /// adds the leaf it replaces, and loading adds a leaf that did not match
+    /// its key. Whoever holds the store records them
+    /// ([`Ca::take_retired_leaves`]). Kept in `server.crt.retired` as well,
+    /// from before the rotation replaces anything until they are recorded,
+    /// so a crash or a failed store write in between loses no revocation.
+    retired: Vec<CertificateDer<'static>>,
 }
 
 impl std::fmt::Debug for Ca {
@@ -73,15 +83,68 @@ impl std::fmt::Debug for Ca {
 impl Ca {
     /// Loads CA and server certificate from `dir`, creating whatever is
     /// missing (§6.1.2, §6.1.3).
+    ///
+    /// A new CA is created only where there has never been one: `ca.crt` and
+    /// `ca.key` both absent. Anything else that keeps them from loading — one
+    /// of them lost, unreadable for this user after a restore, garbled, or not
+    /// a pair — is an error: a new CA would silently invalidate every
+    /// certificate, passport and bundle ever issued, and the old key with it.
+    ///
+    /// The server leaf is disposable. When it does not load, does not match
+    /// its key or was not issued by this CA — a crash between the two writes
+    /// of a rotation, a restore mixing files — a new one is issued, and the
+    /// one found is kept for the CRL ([`Ca::take_retired_leaves`]), as is
+    /// every leaf `server.crt.retired` lists, except the one in use.
     pub fn load_or_create(dir: &Path, tls: &TlsSection, server_name: &str) -> Result<Ca> {
+        Ca::load_or_create_if(dir, tls, server_name, || Ok(()))
+    }
+
+    /// [`Ca::load_or_create`], asking `may_create` first where it would
+    /// create a new CA; its error is returned instead. What a new CA needs
+    /// beyond the two files missing — a state that never saw a user — is the
+    /// caller's to know.
+    pub fn load_or_create_if(
+        dir: &Path,
+        tls: &TlsSection,
+        server_name: &str,
+        may_create: impl FnOnce() -> Result<()>,
+    ) -> Result<Ca> {
+        use std::io::ErrorKind::NotFound;
         std::fs::create_dir_all(dir)?;
         let (ca_der, ca_key_pem) = match (
             std::fs::read(dir.join(CA_CRT)),
             std::fs::read_to_string(dir.join(CA_KEY)),
         ) {
-            (Ok(crt), Ok(key)) => (read_cert_pem(&crt)?, key),
-            _ => create_ca(dir, tls, server_name)?,
+            (Ok(crt), Ok(key)) => (read_cert_pem(&crt).context("ca.crt")?, key),
+            (Err(crt), Err(key)) if crt.kind() == NotFound && key.kind() == NotFound => {
+                may_create()?;
+                tracing::warn!(
+                    dir = %dir.display(),
+                    "no CA in the state directory, creating a new one"
+                );
+                create_ca(dir, tls, server_name)?
+            }
+            (crt, key) => {
+                return Err(Error::msg(format!(
+                    "cannot load the CA from {} ({}; {}). Refusing to create a new \
+                     one: it would invalidate every certificate and bundle issued so \
+                     far. Restore ca.crt and ca.key together, readable for the \
+                     server, or move the state directory aside to start over with a \
+                     new CA",
+                    dir.display(),
+                    file_state(CA_CRT, &crt),
+                    file_state(CA_KEY, &key)
+                )));
+            }
         };
+        let key = KeyPair::from_pem(&ca_key_pem).context("cannot load ca.key")?;
+        if rcgen::PublicKeyData::subject_public_key_info(&key) != leaf_public_key(&ca_der) {
+            return Err(Error::msg(format!(
+                "ca.key in {} does not belong to ca.crt; refusing to start. Restore \
+                 the pair from the same backup",
+                dir.display()
+            )));
+        }
 
         let mut ca = Ca {
             dir: dir.to_path_buf(),
@@ -90,23 +153,100 @@ impl Ca {
             ca_key_pem,
             server_der: CertificateDer::from(Vec::new()),
             server_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(Vec::new())),
+            retired: read_retired(dir)?,
         };
 
         match (
             std::fs::read(dir.join(SERVER_CRT)),
             std::fs::read_to_string(dir.join(SERVER_KEY)),
         ) {
-            (Ok(crt), Ok(key)) => {
-                ca.server_der = read_cert_pem(&crt)?;
-                ca.server_key = pkcs8(&KeyPair::from_pem(&key).context("cannot load server.key")?);
+            (Err(crt), Err(key)) if crt.kind() == NotFound && key.kind() == NotFound => {
+                ca.rotate_server_cert(tls, server_name)?;
             }
-            _ => ca.rotate_server_cert(tls, server_name)?,
+            (crt, key) => {
+                let found = crt.as_deref().ok().and_then(|pem| read_cert_pem(pem).ok());
+                match ca.server_pair(found.as_ref(), key.as_deref().ok()) {
+                    Ok((der, key)) => {
+                        // Listed, yet still the pair on disk: the rotation
+                        // that listed it never got to replace it. In use,
+                        // so not retired.
+                        ca.retired.retain(|leaf| *leaf != der);
+                        ca.server_der = der;
+                        ca.server_key = key;
+                    }
+                    Err(why) => {
+                        tracing::warn!(
+                            dir = %dir.display(),
+                            reason = %why,
+                            "server certificate unusable, issuing a new one"
+                        );
+                        // Whatever leaf was found goes on the CRL: after a
+                        // crash mid-rotation it is the one being replaced.
+                        // As the outgoing leaf, the rotation lists it before
+                        // it writes the new pair.
+                        if let Some(found) = found.filter(|der| !der.is_empty()) {
+                            ca.server_der = found;
+                        }
+                        ca.rotate_server_cert(tls, server_name)?;
+                    }
+                }
+            }
         }
         Ok(ca)
     }
 
+    /// The server leaf and key as found on disk, if they are a pair and the
+    /// leaf was issued by this CA; else why not.
+    fn server_pair(
+        &self,
+        crt: Option<&CertificateDer<'static>>,
+        key_pem: Option<&str>,
+    ) -> std::result::Result<(CertificateDer<'static>, PrivateKeyDer<'static>), String> {
+        let crt = crt.ok_or_else(|| format!("{SERVER_CRT} missing or unreadable"))?;
+        let key = key_pem
+            .ok_or_else(|| format!("{SERVER_KEY} missing or unreadable"))
+            .and_then(|pem| KeyPair::from_pem(pem).map_err(|e| format!("{SERVER_KEY}: {e}")))?;
+        if rcgen::PublicKeyData::subject_public_key_info(&key) != leaf_public_key(crt) {
+            return Err(format!("{SERVER_KEY} does not belong to {SERVER_CRT}"));
+        }
+        if !issued_by(crt, &self.ca_der) {
+            return Err(format!("{SERVER_CRT} was not issued by this CA"));
+        }
+        Ok((crt.clone(), pkcs8(&key)))
+    }
+
+    /// Server leaves that were replaced but are not on the CRL yet; the
+    /// caller puts them there and then calls [`Ca::retired_recorded`]. Hand
+    /// them back with [`Ca::keep_retired_leaves`] when that fails.
+    pub fn take_retired_leaves(&mut self) -> Vec<CertificateDer<'static>> {
+        std::mem::take(&mut self.retired)
+    }
+
+    /// Returns leaves from [`Ca::take_retired_leaves`] that could not be put
+    /// on the CRL, for the next attempt.
+    pub fn keep_retired_leaves(&mut self, leaves: Vec<CertificateDer<'static>>) {
+        self.retired.extend(leaves);
+    }
+
+    /// Brings `server.crt.retired` in line once the leaves from
+    /// [`Ca::take_retired_leaves`] are on the CRL: it keeps only what is
+    /// still pending, normally nothing, and then the file goes.
+    pub fn retired_recorded(&self) -> Result<()> {
+        write_retired(&self.dir, &self.retired)
+    }
+
     /// Issues a fresh server leaf from the same CA. Clients need no change
-    /// (`Server/IMPLEMENTATION.md` §5, `rotate-server-cert`).
+    /// (`Server/IMPLEMENTATION.md` §5, `rotate-server-cert`). The leaf it
+    /// replaces is retired ([`Ca::take_retired_leaves`]).
+    ///
+    /// The leaf being replaced goes into `server.crt.retired` before anything
+    /// is replaced, so no crash or failed store write afterwards can keep it
+    /// off the CRL for good: [`Ca::load_or_create`] retires it from there. A
+    /// crash before the new pair is written leaves the live leaf listed,
+    /// which loading drops again. The key is written before the certificate:
+    /// a crash between the two leaves a pair that does not match, which
+    /// [`Ca::load_or_create`] repairs with a new leaf, retiring the old one
+    /// on disk as this rotation meant to.
     pub fn rotate_server_cert(&mut self, tls: &TlsSection, server_name: &str) -> Result<()> {
         let key = KeyPair::generate()?;
         let mut params = CertificateParams::default();
@@ -125,16 +265,28 @@ impl Ca {
         }];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.use_authority_key_identifier_extension = true;
-        set_validity(&mut params, tls.server_validity_days);
+        set_validity(&mut params, tls.server_validity_days)?;
         params.serial_number = Some(random_serial());
 
         // rcgen 0.14: the direct form takes the public key AND the issuer
         // (A10); only the CSR form takes the issuer alone.
         let cert = params.signed_by(&key, &self.issuer)?;
-        store::write_atomic(&self.dir.join(SERVER_CRT), &cert.pem())?;
-        store::write_private(&self.dir.join(SERVER_KEY), &key.serialize_pem())?;
+        let mut retired = self.retired.clone();
+        if !self.server_der.is_empty() && !retired.contains(&self.server_der) {
+            retired.push(self.server_der.clone());
+        }
+        write_retired(&self.dir, &retired)?;
+        let written = store::write_private(&self.dir.join(SERVER_KEY), &key.serialize_pem())
+            .and_then(|()| store::write_atomic(&self.dir.join(SERVER_CRT), &cert.pem()));
+        if let Err(e) = written {
+            // The live leaf stays in use, so off the list again; should even
+            // that fail, loading drops it.
+            let _ = write_retired(&self.dir, &self.retired);
+            return Err(e);
+        }
         self.server_der = cert.der().clone();
         self.server_key = pkcs8(&key);
+        self.retired = retired;
         Ok(())
     }
 
@@ -151,7 +303,7 @@ impl Ca {
         if cn.is_empty() {
             return Err(Error::msg("ca.crt has no readable CN"));
         }
-        let cert = ca_params(&cn, tls.ca_validity_days).self_signed(self.issuer.key())?;
+        let cert = ca_params(&cn, tls.ca_validity_days)?.self_signed(self.issuer.key())?;
         store::write_atomic(&self.dir.join(CA_CRT), &cert.pem())?;
         self.ca_der = cert.der().clone();
         self.issuer = issuer(&self.ca_der, &self.ca_key_pem)?;
@@ -198,7 +350,7 @@ impl Ca {
         csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         csr.params.use_authority_key_identifier_extension = true;
         match lifetime.into() {
-            Lifetime::Days(days) => set_validity(&mut csr.params, days),
+            Lifetime::Days(days) => set_validity(&mut csr.params, days)?,
             Lifetime::Keep {
                 not_before,
                 not_after,
@@ -339,15 +491,13 @@ pub fn csr_common_name(csr_der: &[u8]) -> Result<String> {
             format!("csr is {} bytes, limit is 2 KiB", csr_der.len()),
         ));
     }
-    let (_, csr) =
-        x509_parser::certification_request::X509CertificationRequest::from_der(csr_der).map_err(
-            |e| {
-                Error::coded(
-                    icu_proto::error::ENROLL_BAD_CSR,
-                    format!("csr not parsable: {e}"),
-                )
-            },
-        )?;
+    let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(csr_der)
+        .map_err(|e| {
+            Error::coded(
+                icu_proto::error::ENROLL_BAD_CSR,
+                format!("csr not parsable: {e}"),
+            )
+        })?;
     let mut cns = csr.certification_request_info.subject.iter_common_name();
     let Some(cn) = cns.next() else {
         return Err(Error::coded(
@@ -518,23 +668,49 @@ pub fn leaf_common_name(der: &[u8]) -> String {
     with_leaf(der, common_name).unwrap_or_default()
 }
 
+/// Whether `leaf` carries a valid signature by `ca`'s key.
+fn issued_by(leaf: &[u8], ca: &[u8]) -> bool {
+    use x509_parser::prelude::FromDer;
+    let (Ok((_, leaf)), Ok((_, ca))) = (
+        X509Certificate::from_der(leaf),
+        X509Certificate::from_der(ca),
+    ) else {
+        return false;
+    };
+    leaf.verify_signature(Some(ca.public_key())).is_ok()
+}
+
+/// How reading one of the state files went, for an error message.
+fn file_state<T>(name: &str, read: &std::io::Result<T>) -> String {
+    match read {
+        Ok(_) => format!("{name} present"),
+        Err(e) => format!("{name}: {e}"),
+    }
+}
+
 fn create_ca(
     dir: &Path,
     tls: &TlsSection,
     server_name: &str,
 ) -> Result<(CertificateDer<'static>, String)> {
     let key = KeyPair::generate()?; // P-256 by default (Spike 2b)
-    let cert = ca_params(&format!("{CA_COMMON_NAME} {server_name}"), tls.ca_validity_days)
-        .self_signed(&key)?;
+    let cert = ca_params(
+        &format!("{CA_COMMON_NAME} {server_name}"),
+        tls.ca_validity_days,
+    )?
+    .self_signed(&key)?;
     let key_pem = key.serialize_pem();
-    store::write_atomic(&dir.join(CA_CRT), &cert.pem())?;
+    // Key first: a crash in between leaves a key without a certificate,
+    // which the next start refuses with a clear message, instead of a
+    // certificate whose key is gone.
     store::write_private(&dir.join(CA_KEY), &key_pem)?;
+    store::write_atomic(&dir.join(CA_CRT), &cert.pem())?;
     Ok((cert.der().clone(), key_pem))
 }
 
 /// Parameters of the self-signed CA certificate: new, and re-issued under the
 /// same key by [`Ca::renew_ca_cert`].
-fn ca_params(common_name: &str, days: u32) -> CertificateParams {
+fn ca_params(common_name: &str, days: u32) -> Result<CertificateParams> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -542,15 +718,20 @@ fn ca_params(common_name: &str, days: u32) -> CertificateParams {
     params
         .distinguished_name
         .push(DnType::CommonName, common_name);
-    set_validity(&mut params, days);
+    set_validity(&mut params, days)?;
     params.serial_number = Some(random_serial());
-    params
+    Ok(params)
 }
 
-fn set_validity(params: &mut CertificateParams, days: u32) {
+/// From an hour ago (clock slack) for `days` days. Checked: an absurd
+/// lifetime is an error here, not a panic in the date arithmetic.
+fn set_validity(params: &mut CertificateParams, days: u32) -> Result<()> {
     let now = store::now();
     params.not_before = now - time::Duration::hours(1);
-    params.not_after = now + time::Duration::days(i64::from(days));
+    params.not_after = now
+        .checked_add(time::Duration::days(i64::from(days)))
+        .ok_or_else(|| Error::msg(format!("a validity of {days} days is out of range")))?;
+    Ok(())
 }
 
 /// Big-endian bytes of `n` without leading zeros (at least one byte).
@@ -572,6 +753,63 @@ fn read_cert_pem(bytes: &[u8]) -> Result<CertificateDer<'static>> {
     CertificateDer::from_pem_slice(bytes)
         .map(|c| c.into_owned())
         .map_err(|e| Error::msg(format!("cannot parse certificate pem: {e}")))
+}
+
+/// The leaves `server.crt.retired` lists, none when it does not exist. Any
+/// other trouble reading it is an error: what it lists must not escape the
+/// CRL unnoticed.
+fn read_retired(dir: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let path = dir.join(SERVER_RETIRED);
+    let pem = match std::fs::read(&path) {
+        Ok(pem) => pem,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(Error::msg(format!(
+                "cannot read {}: {e}. It lists replaced server certificates that \
+                 still have to go on the CRL; make it readable for the server",
+                path.display()
+            )));
+        }
+    };
+    let mut leaves: Vec<CertificateDer<'static>> = Vec::new();
+    for leaf in CertificateDer::pem_slice_iter(&pem) {
+        match leaf {
+            Ok(leaf) if !leaves.contains(&leaf) => leaves.push(leaf),
+            Ok(_) => {}
+            // Written atomically, so only a hand edit gets here.
+            Err(e) => {
+                tracing::warn!(file = %path.display(), error = %e, "unreadable entry, ignoring the rest");
+                break;
+            }
+        }
+    }
+    Ok(leaves)
+}
+
+/// Writes `leaves` to `server.crt.retired` atomically, or removes the file
+/// when there are none.
+fn write_retired(dir: &Path, leaves: &[CertificateDer<'static>]) -> Result<()> {
+    let path = dir.join(SERVER_RETIRED);
+    if leaves.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(Error::from(e).context(format!("cannot remove {}", path.display())))
+            }
+            _ => Ok(()),
+        };
+    }
+    let pem: String = leaves.iter().map(|leaf| cert_pem(leaf)).collect();
+    store::write_atomic(&path, &pem)
+}
+
+/// A certificate as a PEM block, laid out as rcgen writes `server.crt`.
+/// rcgen armors only what it signed itself, and a leaf read back from disk
+/// is plain DER.
+fn cert_pem(der: &[u8]) -> String {
+    pem::encode_config(
+        &pem::Pem::new("CERTIFICATE", der.to_vec()),
+        pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),
+    )
 }
 
 #[cfg(test)]
@@ -684,7 +922,9 @@ mod tests {
         params
             .distinguished_name
             .push(DnType::CommonName, "admin-impersonator");
-        params.distinguished_name.push(DnType::OrganizationName, "evil corp");
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "evil corp");
         params.subject_alt_names = vec![SanType::DnsName("icu.example.org".try_into().unwrap())];
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -756,7 +996,10 @@ mod tests {
         assert_eq!(lifetime, 3600 + 3600, "ttl plus the hour of clock slack");
 
         let key = KeyPair::try_from(key_der.as_slice()).unwrap();
-        assert_eq!(leaf_public_key(&leaf), rcgen::PublicKeyData::subject_public_key_info(&key));
+        assert_eq!(
+            leaf_public_key(&leaf),
+            rcgen::PublicKeyData::subject_public_key_info(&key)
+        );
         assert!(ca
             .issue_registration("bad\nname", Duration::from_secs(60), HOST)
             .is_err());
@@ -765,7 +1008,10 @@ mod tests {
     #[test]
     fn csr_public_key_matches_the_signing_key() {
         let (key, csr) = csr_with_cn("alice");
-        assert_eq!(csr_public_key(&csr).unwrap(), rcgen::PublicKeyData::subject_public_key_info(&key));
+        assert_eq!(
+            csr_public_key(&csr).unwrap(),
+            rcgen::PublicKeyData::subject_public_key_info(&key)
+        );
         assert!(csr_public_key(b"junk").is_err());
         assert!(leaf_public_key(b"junk").is_empty());
     }
@@ -909,12 +1155,252 @@ mod tests {
     fn rotating_the_server_cert_keeps_the_ca() {
         let dir = tempfile::tempdir().unwrap();
         let mut ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert!(
+            ca.take_retired_leaves().is_empty(),
+            "a first leaf replaces none"
+        );
         let ca_fp = ca.ca_fingerprint();
-        let old = store::fingerprint(ca.server_der());
+        let old = ca.server_der().clone();
         ca.rotate_server_cert(&tls(), "localhost").unwrap();
         assert_eq!(ca.ca_fingerprint(), ca_fp);
-        assert_ne!(store::fingerprint(ca.server_der()), old);
+        assert_ne!(ca.server_der(), &old);
         assert!(!ca.server_key().secret_der().is_empty());
+        assert_eq!(
+            ca.take_retired_leaves(),
+            vec![old],
+            "the replaced leaf is retired"
+        );
+    }
+
+    /// A lost or unreadable half of the CA must stop the server, never be
+    /// replaced by a new CA: that would invalidate every certificate issued.
+    #[test]
+    fn a_missing_ca_file_is_an_error_not_a_new_ca() {
+        for lost in [CA_CRT, CA_KEY] {
+            let dir = tempfile::tempdir().unwrap();
+            Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+            let kept = if lost == CA_CRT { CA_KEY } else { CA_CRT };
+            let before = std::fs::read(dir.path().join(kept)).unwrap();
+            std::fs::remove_file(dir.path().join(lost)).unwrap();
+
+            let err = Ca::load_or_create(dir.path(), &tls(), "localhost")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Refusing to create a new one"), "{err}");
+            assert!(err.contains(lost), "names the missing file: {err}");
+            assert_eq!(
+                std::fs::read(dir.path().join(kept)).unwrap(),
+                before,
+                "{kept} is left alone"
+            );
+            assert!(!dir.path().join(lost).exists(), "nothing was created");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_ca_key_is_an_error_not_a_new_ca() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fp = Ca::load_or_create(dir.path(), &tls(), "localhost")
+            .unwrap()
+            .ca_fingerprint();
+        let key = dir.path().join(CA_KEY);
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&key).is_ok() {
+            // Root reads it anyway; nothing to test then.
+            return;
+        }
+        let result = Ca::load_or_create(dir.path(), &tls(), "localhost");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(result.is_err(), "a permission problem is not a missing CA");
+        let again = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert_eq!(again.ca_fingerprint(), fp, "the CA is still the old one");
+    }
+
+    #[test]
+    fn a_ca_key_that_does_not_belong_to_the_certificate_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        Ca::load_or_create(other.path(), &tls(), "localhost").unwrap();
+        std::fs::copy(other.path().join(CA_KEY), dir.path().join(CA_KEY)).unwrap();
+        let err = Ca::load_or_create(dir.path(), &tls(), "localhost")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not belong"), "{err}");
+    }
+
+    /// A crash between the two writes of a rotation leaves a key that does
+    /// not match the certificate; loading issues a new leaf instead of
+    /// failing forever, and retires the one it found.
+    #[test]
+    fn a_server_key_that_does_not_match_is_replaced_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Ca::load_or_create(dir.path(), &tls(), "localhost")
+            .unwrap()
+            .server_der()
+            .clone();
+        store::write_private(
+            &dir.path().join(SERVER_KEY),
+            &KeyPair::generate().unwrap().serialize_pem(),
+        )
+        .unwrap();
+
+        let mut ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert_ne!(ca.server_der(), &old, "a new leaf");
+        assert_eq!(ca.take_retired_leaves(), vec![old]);
+        client_accepts(ca.ca_der(), &ca).expect("the new pair works");
+
+        // Written as a pair: the next start loads it as it is.
+        let again = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert_eq!(again.server_der(), ca.server_der());
+    }
+
+    #[test]
+    fn a_server_leaf_from_another_ca_or_garbage_is_replaced_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = Ca::load_or_create(dir.path(), &tls(), "localhost")
+            .unwrap()
+            .ca_fingerprint();
+        let other = tempfile::tempdir().unwrap();
+        let foreign = Ca::load_or_create(other.path(), &tls(), "localhost")
+            .unwrap()
+            .server_der()
+            .clone();
+        for name in [SERVER_CRT, SERVER_KEY] {
+            std::fs::copy(other.path().join(name), dir.path().join(name)).unwrap();
+        }
+        let mut ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert_eq!(ca.ca_fingerprint(), fp);
+        assert_ne!(ca.server_der(), &foreign);
+        assert_eq!(ca.take_retired_leaves(), vec![foreign]);
+        ca.retired_recorded().unwrap();
+        client_accepts(ca.ca_der(), &ca).expect("issued by this CA again");
+
+        std::fs::write(dir.path().join(SERVER_CRT), b"garbage").unwrap();
+        let mut ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert!(
+            ca.take_retired_leaves().is_empty(),
+            "nothing to put on a CRL"
+        );
+        client_accepts(ca.ca_der(), &ca).expect("a working leaf");
+    }
+
+    /// A replaced leaf is listed on disk until it is recorded: a crash or a
+    /// failed store write after the rotation must not keep it off the CRL
+    /// for good. Before, it lived in memory only.
+    #[test]
+    fn a_replaced_leaf_stays_listed_until_it_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        let old = ca.server_der().clone();
+        ca.rotate_server_cert(&tls(), "localhost").unwrap();
+        let new = ca.server_der().clone();
+        // The process ends before the store has it.
+        drop(ca);
+
+        let mut ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert_eq!(ca.server_der(), &new, "the new pair is in use");
+        assert_eq!(ca.take_retired_leaves(), vec![old.clone()]);
+        // Not recorded this time either: handed back, still listed.
+        ca.keep_retired_leaves(vec![old.clone()]);
+        drop(ca);
+        let mut ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert_eq!(ca.take_retired_leaves(), vec![old]);
+        ca.retired_recorded().unwrap();
+        assert!(!dir.path().join(SERVER_RETIRED).exists(), "recorded: gone");
+
+        let mut ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert!(ca.take_retired_leaves().is_empty());
+    }
+
+    /// The same for a leaf replaced at load because it did not match its
+    /// key: the new pair is on disk right away, the old leaf only listed.
+    #[test]
+    fn a_leaf_replaced_at_load_stays_listed_until_it_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Ca::load_or_create(dir.path(), &tls(), "localhost")
+            .unwrap()
+            .server_der()
+            .clone();
+        store::write_private(
+            &dir.path().join(SERVER_KEY),
+            &KeyPair::generate().unwrap().serialize_pem(),
+        )
+        .unwrap();
+        let repaired = Ca::load_or_create(dir.path(), &tls(), "localhost")
+            .unwrap()
+            .server_der()
+            .clone();
+        assert_ne!(repaired, old);
+
+        let mut ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert_eq!(ca.server_der(), &repaired, "the repaired pair loads");
+        assert_eq!(ca.take_retired_leaves(), vec![old]);
+    }
+
+    /// A crash after listing the outgoing leaf and before writing the new
+    /// pair, or a rotation whose write failed, leaves the leaf in use
+    /// listed. It must not be retired: on the CRL, every client would refuse
+    /// the server.
+    #[test]
+    fn a_listed_leaf_still_in_use_is_not_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        let live = ca.server_der().clone();
+
+        // A rotation whose write fails.
+        let blocker = dir.path().join(".server.key.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        assert!(ca.rotate_server_cert(&tls(), "localhost").is_err());
+        std::fs::remove_dir(&blocker).unwrap();
+        assert_eq!(ca.server_der(), &live);
+        assert!(ca.take_retired_leaves().is_empty());
+        assert!(!dir.path().join(SERVER_RETIRED).exists(), "off the list");
+
+        // A crash right after listing it.
+        write_retired(dir.path(), std::slice::from_ref(&live)).unwrap();
+        let mut ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        assert!(
+            ca.take_retired_leaves().is_empty(),
+            "the leaf in use is not retired"
+        );
+        client_accepts(ca.ca_der(), &ca).expect("still served");
+    }
+
+    /// `server.crt.retired` is PEM like `server.crt`, readable with the
+    /// usual tools.
+    #[test]
+    fn retired_leaves_are_written_as_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        let on_disk = std::fs::read_to_string(dir.path().join(SERVER_CRT)).unwrap();
+        assert_eq!(cert_pem(ca.server_der()), on_disk, "as rcgen writes it");
+        for len in 0..4 {
+            let der = CertificateDer::from(vec![0xa5; len]);
+            let pem = cert_pem(&der);
+            assert_eq!(
+                CertificateDer::from_pem_slice(pem.as_bytes()).unwrap(),
+                der,
+                "{pem}"
+            );
+        }
+    }
+
+    /// A lifetime the date arithmetic cannot represent is an error, not a
+    /// panic that takes the server down on the next registration.
+    #[test]
+    fn an_absurd_validity_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let absurd = TlsSection {
+            server_validity_days: u32::MAX,
+            ..tls()
+        };
+        assert!(Ca::load_or_create(dir.path(), &absurd, "localhost").is_err());
+        let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        let (_key, csr) = csr_with_cn("alice");
+        let err = ca.sign_client_csr(&csr, u32::MAX, HOST).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
     }
 
     #[test]
@@ -978,7 +1464,10 @@ mod tests {
         let new = ca.ca_der().clone();
         assert!(!leaf_expired(&new));
         assert!(leaf_days_left(&new) > 3600);
-        assert_eq!(parse(&new).subject().as_raw(), parse(&old).subject().as_raw());
+        assert_eq!(
+            parse(&new).subject().as_raw(),
+            parse(&old).subject().as_raw()
+        );
         assert_eq!(leaf_public_key(&new), leaf_public_key(&old));
         assert_ne!(leaf_serial(&new), leaf_serial(&old));
         client_accepts(&new, &ca).expect("renewed anchor, old leaf");

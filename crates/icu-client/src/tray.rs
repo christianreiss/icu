@@ -1,5 +1,5 @@
 //! Tray icon (tray-icon 0.25, ksni on Linux): status icon, menu with
-//! Mute/Deafen/Fenster/Beenden.
+//! Fenster anzeigen/Stumm/Taub/Beenden, in the words the main window uses.
 
 use std::sync::mpsc;
 
@@ -40,8 +40,8 @@ impl Tray {
     pub fn start(cmd: UnboundedSender<Command>, ctx: egui::Context) -> Result<Tray, String> {
         let menu = Menu::new();
         let show = MenuItem::new("Fenster anzeigen", true, None);
-        let mute = CheckMenuItem::new("Mute", true, false, None);
-        let deafen = CheckMenuItem::new("Deafen", true, false, None);
+        let mute = CheckMenuItem::new("Stumm", true, false, None);
+        let deafen = CheckMenuItem::new("Taub", true, false, None);
         let quit = MenuItem::new("Beenden", true, None);
         menu.append(&show).map_err(|e| e.to_string())?;
         menu.append(&mute).map_err(|e| e.to_string())?;
@@ -142,7 +142,7 @@ impl Tray {
                 ConnStatus::Fatal(_) => "Fehler",
             },
             if state.deafened {
-                ", deafened"
+                ", taub"
             } else if state.muted {
                 ", stumm"
             } else {

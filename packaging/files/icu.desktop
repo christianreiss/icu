@@ -2,8 +2,8 @@
 Type=Application
 Name=ICU
 Comment=ICU voice client
-Exec=icu %u
+Exec=icu %f
 Icon=icu
 Terminal=false
 Categories=Network;Audio;
-MimeType=x-scheme-handler/icu;
+MimeType=application/x-icu;

@@ -159,7 +159,7 @@ Nicht geprüft: MSMF (Windows), 15 fps unter Tageslicht, Decoder-Seite, Latenz K
 | 4a PTT-Hotkey | evdev PASS, Portal OFFEN (interaktiv nötig) |
 | 4b Overlay Layer-Shell | PASS (KWin 6.7.5, Screenshot) |
 | 5 Kamera + H.264 | PASS mit Einschränkung (Kamera lichtbedingt 4–6 fps) |
-| 6 Echo Cancellation (AEC3 vs. Speex, offline) | PASS (AEC3: ERLE 37 dB, 47 µs/Frame, +9 ms; Cross-Build nach Windows-gnu FAIL, siehe `aec.md` A1) |
+| 6 Echo Cancellation (AEC3 vs. Speex, offline) | PASS (AEC3: ERLE 37 dB — mit fehlerhaftem Rauschgenerator gemessen, korrigiert 2026-09-25 auf 28,9/27,4 dB, `aec.md` „Korrektur"; 47 µs/Frame, +9 ms; Cross-Build nach Windows-gnu FAIL, siehe `aec.md` A1) |
 
 ## Nicht von diesem Host verifizierbar
 

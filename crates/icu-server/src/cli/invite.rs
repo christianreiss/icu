@@ -9,7 +9,12 @@
 use crate::{cli, config::Config, error::Result, AdminRequest};
 
 /// Issues a registration bundle and prints it, or writes it to `out`.
-pub async fn run(config: &Config, name: Option<&str>, ttl: &str, out: Option<&std::path::Path>) -> Result<()> {
+pub async fn run(
+    config: &Config,
+    name: Option<&str>,
+    ttl: &str,
+    out: Option<&std::path::Path>,
+) -> Result<()> {
     let request = AdminRequest::Invite {
         name: name.unwrap_or_default().to_string(),
         ttl_s: Some(parse_duration(ttl)?),
@@ -36,7 +41,20 @@ pub async fn run(config: &Config, name: Option<&str>, ttl: &str, out: Option<&st
         },
         value.get("expires").and_then(|v| v.as_str()).unwrap_or("?")
     );
+    if let Some(hint) = admin_hint(&value) {
+        eprintln!("{hint}");
+    }
     Ok(())
+}
+
+/// What to point out while no admin has confirmed a registration: not the
+/// first bundle issued makes its holder admin, the first one completed does
+/// (`PROTOCOL.md` §2.3).
+fn admin_hint(value: &serde_json::Value) -> Option<&'static str> {
+    (value.get("admin_confirmed").and_then(|v| v.as_bool()) == Some(false)).then_some(
+        "note: no admin has registered yet. Whoever completes a registration first \
+         becomes admin, so redeem your own bundle before handing out others.",
+    )
 }
 
 /// Parses `90s`, `30m`, `24h`, `7d` or a bare number of seconds.
@@ -58,6 +76,16 @@ pub fn parse_duration(value: &str) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::parse_duration;
+
+    #[test]
+    fn the_admin_hint_shows_until_an_admin_registered() {
+        let hint = |confirmed: bool| {
+            super::admin_hint(&serde_json::json!({"ok": true, "admin_confirmed": confirmed}))
+        };
+        assert!(hint(false).is_some());
+        assert!(hint(true).is_none());
+        assert!(super::admin_hint(&serde_json::json!({"ok": true})).is_none());
+    }
 
     #[test]
     fn durations_parse() {

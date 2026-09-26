@@ -405,7 +405,11 @@ fn open_stream(
                     let n = d.chunk().size() as usize / 4;
                     let offset = d.chunk().offset() as usize;
                     let Some(bytes) = d.data() else { return };
-                    let n = n.min(bytes.len().saturating_sub(offset) / 4);
+                    // A chunk offset past the mapped buffer would panic the
+                    // real-time thread even for an empty slice; clamp it and
+                    // take what is there.
+                    let offset = offset.min(bytes.len());
+                    let n = n.min((bytes.len() - offset) / 4);
                     data.scratch.clear();
                     data.scratch.extend(
                         bytes[offset..offset + n * 4]

@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Shipped as rpm/deb and from GitHub releases, never to crates.io; also lets
+# cargo-deny accept the path dependencies between the three crates.
+publish = false
 default-run = "icu"
 
 [lib]
@@ -27,8 +30,9 @@ gui = ["dep:eframe", "dep:egui", "dep:egui-phosphor"]
 glow = ["eframe?/glow"]
 # Camera capture and H.264.
 camera = ["dep:nokhwa", "dep:openh264"]
-# Wayland layer-shell overlay.
-overlay = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:calloop", "dep:calloop-wayland-source"]
+# Wayland layer-shell overlay. Needs `gui`: it is started by the main window
+# and draws names with the window's font (ab_glyph).
+overlay = ["gui", "dep:smithay-client-toolkit", "dep:wayland-client", "dep:calloop", "dep:calloop-wayland-source", "dep:ab_glyph"]
 # Tray icon (ksni on Linux).
 tray = ["dep:tray-icon"]
 # Emergency audio host through cpal (ALSA) instead of pipewire-rs. Always on
@@ -80,12 +84,16 @@ pipewire = { version = "0.10.1", features = ["v0_3_49"] }
 libc = "0.2"
 ashpd = { version = "0.13.13", default-features = false, features = ["tokio", "global_shortcuts"] }
 evdev = { version = "0.13.2", features = ["tokio"] }
+# Join/leave notifications (`notify`); already in the tree through ashpd.
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 futures-util = "0.3"
 smithay-client-toolkit = { version = "0.21.1", features = ["calloop"], optional = true }
 wayland-client = { version = "0.31", optional = true }
 calloop = { version = "0.14", optional = true }
 calloop-wayland-source = { version = "0.4", optional = true }
 tray-icon = { version = "0.25.1", default-features = false, features = ["ksni"], optional = true }
+# Rasterizes names in the overlay; already in the tree through egui.
+ab_glyph = { version = "0.2.32", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows audio until the WASAPI backend (M3); see audio::native_backend.
@@ -96,3 +104,14 @@ tray-icon = { version = "0.25.1", optional = true }
 [dev-dependencies]
 icu-server = { path = "../icu-server" }
 tempfile.workspace = true
+# Headless rendering of every window for `tests/ui_layout.rs`; `wgpu` only
+# for the optional screenshots (`ICU_UI_SHOTS=<dir>`).
+egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Reads the embedded Inter files' cmap (`ui::fonts` test); already in the
+# tree through egui's font stack (epaint).
+skrifa = "0.44"
+
+[[test]]
+name = "ui_layout"
+required-features = ["gui"]

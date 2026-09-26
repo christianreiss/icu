@@ -392,11 +392,25 @@ mod tests {
 
     #[test]
     fn names_hide_nothing() {
-        for ok in ["Chris", "Ärger", "neu-1a2b", "Anna Lena", "日本語", "Ωμέγα", "o'Neil 2"] {
+        for ok in [
+            "Chris",
+            "Ärger",
+            "neu-1a2b",
+            "Anna Lena",
+            "日本語",
+            "Ωμέγα",
+            "o'Neil 2",
+        ] {
             assert_eq!(validate_name(ok), Ok(()), "{ok:?}");
         }
-        assert_eq!(validate_name("abc\u{202E}def"), Err(NameError::InvisibleChar));
-        assert_eq!(validate_name("ad\u{200B}min"), Err(NameError::InvisibleChar));
+        assert_eq!(
+            validate_name("abc\u{202E}def"),
+            Err(NameError::InvisibleChar)
+        );
+        assert_eq!(
+            validate_name("ad\u{200B}min"),
+            Err(NameError::InvisibleChar)
+        );
         assert_eq!(validate_name("x\u{E000}"), Err(NameError::InvisibleChar));
         assert_eq!(validate_name("x\u{3164}"), Err(NameError::InvisibleChar));
         assert_eq!(validate_name("a\u{2028}b"), Err(NameError::InvisibleChar));

@@ -156,7 +156,7 @@ async fn exchange(
     conn::write_msg(send, &ControlMsg::RenewRequest { csr_der }).await?;
     loop {
         let body = read_frame(recv, MAX_CONTROL_FRAME).await?;
-        match ControlMsg::decode(&body).map_err(|e| NetError::Other(e.to_string()))? {
+        match ControlMsg::decode(&body).map_err(|e| NetError::Protocol(e.to_string()))? {
             ControlMsg::RenewResponse { leaf_der } => {
                 let key_der = key.serialize_der();
                 if let Err(detail) = crate::conninfo::check_issued_leaf(&leaf_der, name, &key_der) {

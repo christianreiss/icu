@@ -21,8 +21,8 @@ struct Cli {
 enum Command {
     /// Start the server. Creates CA and server certificate on first run.
     Run,
-    /// Issue a registration bundle and print it. The first one on an empty
-    /// server is for an admin.
+    /// Issue a registration bundle and print it. While no admin has
+    /// registered, whoever completes a registration first becomes admin.
     Invite {
         /// Placeholder name until the invited user picks their own.
         #[arg(long)]

@@ -2,6 +2,7 @@
 //! buffer, receive-side normalization, mixer.
 
 pub mod aec;
+pub mod chain;
 pub mod denoise;
 pub mod gate;
 pub mod jitter;

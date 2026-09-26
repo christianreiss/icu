@@ -1,22 +1,33 @@
 //! Loudness normalization: brings a voice to a common level.
 //!
 //! Three uses, one per [`Profile`]: receive side (each remote speaker before
-//! their volume slider and the mix), mic auto leveling (a slow automatic
-//! input gain ahead of denoise and VAD) and outbound normalization (right
-//! before the encoder). The level estimate only moves on blocks clearly
-//! above the voice's own noise floor (the minimum block level of the last
-//! 1.5–3 s, so steady hiss never counts as speech) and, on the send side,
-//! only while the VAD hears voice; in pauses the gain holds, so nothing
-//! pumps or lifts room noise. The estimate follows an upper envelope — fast
-//! up so a loud onset is caught early, slow down so the gain does not
-//! breathe between words. 48 kHz, any block length, allocates nothing.
+//! their volume slider and the mix), mic auto leveling (the automatic input
+//! gain ahead of denoise and VAD) and outbound normalization (right before
+//! the encoder, only while the mic leveler is off — `dsp::chain`). The
+//! level estimate only moves on blocks clearly above the voice's own noise
+//! floor (the minimum block level of the last 1.5–3 s of sound, so steady
+//! hiss never counts as speech) and, on the send side, only while the VAD
+//! hears voice; in pauses the gain holds, so nothing pumps or lifts room
+//! noise. The estimate follows an upper envelope — fast up so a loud onset
+//! is caught early, slow down so the gain does not breathe between words.
+//!
+//! One leveler per direction. Two fast-attack/slow-release stages in
+//! series fight: on a louder voice both cut at once, then the downstream
+//! one releases only as slowly as the upstream one takes over, and the
+//! voice sags for seconds (measured 6 dB after a +15 dB jump,
+//! `tests/cascade.rs`). So the send side runs one leveler, and the receive
+//! side, which meets voices the sender already leveled, attacks slower and
+//! leaves a ±3 dB dead band around the target untouched. 48 kHz, any block
+//! length, allocates nothing.
 
 use super::meter::{from_db, measure, to_db};
 
 /// Target, bounds and speed of one normalizer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Profile {
-    /// Target level of the speech envelope in dBFS RMS.
+    /// Target of the level estimate in dBFS: the RMS of 10 ms blocks,
+    /// followed with the profile's rise time — a fast rise tracks the loud
+    /// blocks of every syllable, so the voice's RMS lands a few dB lower.
     pub target_db: f32,
     /// Gain bounds in dB.
     pub max_boost_db: f32,
@@ -24,33 +35,55 @@ pub struct Profile {
     /// Envelope time constants in seconds.
     pub rise_s: f32,
     pub fall_s: f32,
+    /// No gain while the level is this close to the target; beyond it, the
+    /// correction starts from zero (no jump at the edge).
+    pub dead_band_db: f32,
+    /// Blocks below this level never count as speech, whatever the floor.
+    pub speech_min_db: f32,
 }
 
 impl Profile {
-    /// Each remote speaker, in the mixer.
+    /// Each remote speaker, in the mixer: a backstop behind the sender's
+    /// own leveling, so it must not fight it (see the module docs). Voices
+    /// the sender leveled arrive within its dead band and pass untouched;
+    /// their denoised pauses are near digital silence, so the absolute
+    /// speech floor, not the noise floor, keeps consonants and tails from
+    /// dragging the estimate down.
     pub const RECEIVE: Profile = Profile {
         target_db: -22.0,
         max_boost_db: 12.0,
         max_cut_db: -12.0,
+        rise_s: 0.6,
+        fall_s: 2.0,
+        dead_band_db: 2.0,
+        speech_min_db: -40.0,
+    };
+    /// Mic auto leveling: down within a word (a louder voice is caught
+    /// before the receive side reacts), up over seconds. −20 dBFS on the
+    /// block envelope puts the voice's RMS near −23 dBFS.
+    pub const MIC_LEVEL: Profile = Profile {
+        target_db: -20.0,
+        max_boost_db: 15.0,
+        max_cut_db: -15.0,
+        rise_s: 0.2,
+        fall_s: 4.0,
+        dead_band_db: 0.0,
+        speech_min_db: -50.0,
+    };
+    /// Own voice right before the encoder, when the mic leveler is off.
+    pub const OUTBOUND: Profile = Profile {
+        target_db: -20.0,
+        max_boost_db: 12.0,
+        max_cut_db: -12.0,
         rise_s: 0.08,
         fall_s: 2.0,
+        dead_band_db: 0.0,
+        speech_min_db: -50.0,
     };
-    /// Mic auto leveling: a slow hand on the input fader.
-    pub const MIC_LEVEL: Profile = Profile {
-        target_db: -22.0,
-        max_boost_db: 15.0,
-        max_cut_db: -10.0,
-        rise_s: 0.5,
-        fall_s: 4.0,
-    };
-    /// Own voice right before the encoder.
-    pub const OUTBOUND: Profile = Profile::RECEIVE;
 }
 
-/// A block counts as speech this far above the noise floor…
+/// A block counts as speech this far above the noise floor.
 const SPEECH_MARGIN_DB: f32 = 10.0;
-/// …and never below this absolute level.
-const SPEECH_MIN_DB: f32 = -50.0;
 /// Floor = minimum over the current and the previous window of this length.
 const FLOOR_WINDOW_S: f32 = 1.5;
 const SR: f32 = 48_000.0;
@@ -126,12 +159,13 @@ impl Normalizer {
         }
         let rms_db = measure(block).rms_db;
 
-        // Exact silence (jitter-buffer gaps, DTX) says nothing about the
-        // speaker's noise floor.
+        // Exact silence (jitter-buffer gaps, a closed gate) says nothing
+        // about the speaker's noise floor: neither counted nor clocked, so
+        // the floor survives a pause instead of being forgotten after 3 s.
         if rms_db > -99.0 {
             self.win_min = self.win_min.min(rms_db);
+            self.win_samples += block.len();
         }
-        self.win_samples += block.len();
         if self.win_samples as f32 >= FLOOR_WINDOW_S * SR {
             self.prev_win_min = self.win_min;
             self.win_min = f32::INFINITY;
@@ -140,7 +174,7 @@ impl Normalizer {
         let floor = self.win_min.min(self.prev_win_min);
 
         let p = self.profile;
-        if voice != Some(false) && rms_db > SPEECH_MIN_DB.max(floor + SPEECH_MARGIN_DB) {
+        if voice != Some(false) && rms_db > p.speech_min_db.max(floor + SPEECH_MARGIN_DB) {
             let a = if rms_db > self.level_db {
                 alpha(p.rise_s, block.len())
             } else {
@@ -149,7 +183,9 @@ impl Normalizer {
             self.level_db += a * (rms_db - self.level_db);
         }
 
-        let target = from_db((p.target_db - self.level_db).clamp(p.max_cut_db, p.max_boost_db));
+        let error = p.target_db - self.level_db;
+        let wanted = error.signum() * (error.abs() - p.dead_band_db).max(0.0);
+        let target = from_db(wanted.clamp(p.max_cut_db, p.max_boost_db));
         let start = self.gain;
         let step = (target - start) / block.len() as f32;
         for (i, s) in block.iter_mut().enumerate() {
@@ -206,16 +242,66 @@ mod tests {
 
     #[test]
     fn quiet_speaker_is_raised() {
-        let mut n = Normalizer::new();
+        let mut n = Normalizer::with(Profile::OUTBOUND);
         run(&mut n, talk(-34.0, -70.0, 10.0));
         assert!(n.gain_db() > 9.0, "gain {}", n.gain_db());
     }
 
     #[test]
     fn loud_speaker_is_lowered_quickly() {
-        let mut n = Normalizer::new();
+        let mut n = Normalizer::with(Profile::OUTBOUND);
         run(&mut n, talk(-8.0, -70.0, 1.0));
         assert!(n.gain_db() < -9.0, "gain {}", n.gain_db());
+    }
+
+    /// The receive profile leaves a voice near the target alone and takes
+    /// only the part beyond the dead band, without a jump at its edge.
+    #[test]
+    fn receive_dead_band() {
+        let mut n = Normalizer::new();
+        run(&mut n, talk(-23.5, -70.0, 10.0));
+        assert_eq!(n.gain_db(), 0.0, "1.5 dB off the target is left alone");
+        let mut n = Normalizer::new();
+        run(&mut n, talk(-34.0, -70.0, 10.0));
+        assert!(
+            (9.0..10.2).contains(&n.gain_db()),
+            "12 dB off → 10 dB, got {}",
+            n.gain_db()
+        );
+        let mut n = Normalizer::new();
+        run(&mut n, talk(-10.0, -70.0, 10.0));
+        assert!(
+            (-10.2..-9.0).contains(&n.gain_db()),
+            "12 dB over → −10 dB, got {}",
+            n.gain_db()
+        );
+        // Just beyond the edge, the gain is just above zero.
+        let mut n = Normalizer::new();
+        run(&mut n, talk(-25.0, -70.0, 10.0));
+        assert!(
+            (0.3..1.3).contains(&n.gain_db()),
+            "3 dB off → ~1 dB, got {}",
+            n.gain_db()
+        );
+    }
+
+    /// The receive profile attacks slower than the sender's leveler, so a
+    /// jump the sender is already correcting does not get cut twice.
+    #[test]
+    fn receive_attacks_slower_than_the_mic_leveler() {
+        // 200 ms of room noise first, so the floor is known.
+        let mut rx = Normalizer::new();
+        run(&mut rx, talk(-100.0, -70.0, 0.2));
+        run(&mut rx, talk(-8.0, -70.0, 0.15));
+        let mut mic = Normalizer::with(Profile::MIC_LEVEL);
+        run(&mut mic, talk(-100.0, -70.0, 0.2));
+        run(&mut mic, talk(-8.0, -70.0, 0.15));
+        assert!(
+            mic.gain_db() < rx.gain_db() - 3.0,
+            "after 150 ms: mic {} dB, receive {} dB",
+            mic.gain_db(),
+            rx.gain_db()
+        );
     }
 
     #[test]
@@ -226,6 +312,28 @@ mod tests {
         let mut n = Normalizer::new();
         run(&mut n, talk(0.0, -90.0, 5.0));
         assert!(n.gain_db() >= Profile::RECEIVE.max_cut_db - 0.01);
+    }
+
+    /// After a pause of digital silence the floor is still known, so the
+    /// next spurt moves the estimate from its first blocks on. With the
+    /// floor forgotten, a spurt that starts loud and steady would not count
+    /// as speech until it had a quiet moment of its own.
+    #[test]
+    fn floor_survives_digital_silence() {
+        let mut n = Normalizer::with(Profile::OUTBOUND);
+        run(&mut n, talk(-34.0, -70.0, 5.0));
+        let held = n.gain_db();
+        run(&mut n, vec![vec![0.0; BLOCK]; 500]);
+        assert_eq!(n.gain_db(), held);
+        // 300 ms of a louder voice, no quiet block in it.
+        let loud: Vec<Vec<f32>> = talk(-14.0, -70.0, 0.3).into_iter().take(30).collect();
+        run(&mut n, loud);
+        assert!(
+            n.gain_db() < held - 6.0,
+            "the louder spurt was not caught: {} → {} dB",
+            held,
+            n.gain_db()
+        );
     }
 
     #[test]
@@ -247,7 +355,7 @@ mod tests {
 
     #[test]
     fn speech_over_hiss_is_normalized() {
-        let mut n = Normalizer::new();
+        let mut n = Normalizer::with(Profile::OUTBOUND);
         run(&mut n, talk(-30.0, -45.0, 10.0));
         assert!(n.gain_db() > 5.0, "gain {}", n.gain_db());
     }
@@ -269,12 +377,18 @@ mod tests {
     }
 
     #[test]
-    fn mic_level_is_slow() {
+    fn mic_level_cuts_fast_and_recovers_slowly() {
         let mut n = Normalizer::with(Profile::MIC_LEVEL);
+        run(&mut n, talk(-100.0, -70.0, 0.2));
         run(&mut n, talk(-8.0, -70.0, 0.3));
-        assert!(n.gain_db() > -9.0, "gain {}", n.gain_db());
-        run(&mut n, talk(-8.0, -70.0, 10.0));
-        assert!(n.gain_db() < -9.5, "gain {}", n.gain_db());
+        assert!(n.gain_db() < -8.0, "300 ms in: gain {}", n.gain_db());
+        run(&mut n, talk(-8.0, -70.0, 2.0));
+        assert!(n.gain_db() < -9.9, "gain {}", n.gain_db());
+        // Quiet again: the boost comes back over seconds, not syllables.
+        run(&mut n, talk(-34.0, -70.0, 1.0));
+        assert!(n.gain_db() < -4.0, "1 s later: gain {}", n.gain_db());
+        run(&mut n, talk(-34.0, -70.0, 19.0));
+        assert!(n.gain_db() > 11.0, "20 s later: gain {}", n.gain_db());
     }
 
     #[test]
@@ -290,7 +404,7 @@ mod tests {
 
     #[test]
     fn no_voice_hint_holds_gain() {
-        let mut n = Normalizer::new();
+        let mut n = Normalizer::with(Profile::OUTBOUND);
         for mut b in talk(-34.0, -70.0, 10.0) {
             n.process_hinted(&mut b, Some(false));
         }
