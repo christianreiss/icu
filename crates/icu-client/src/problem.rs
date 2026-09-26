@@ -117,6 +117,10 @@ pub fn code_text(code: u32) -> String {
         }
         codes::REGISTRATION_STORED => "Registrierung abgeschlossen.",
         codes::RENEW_REQUIRED => "Das eigene Zertifikat ist abgelaufen und wird erneuert …",
+        codes::SERVER_ERROR => {
+            "Der Server konnte das gerade nicht speichern, es hat sich nichts geändert. Bitte \
+             später noch einmal versuchen."
+        }
         other => return format!("Unerwarteter Fehler (Code {other})."),
     };
     s.to_string()

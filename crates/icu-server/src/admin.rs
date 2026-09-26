@@ -244,7 +244,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     name: issued.name,
                     is_admin: issued.is_admin,
                 },
-                Err(e) => store_err(e, "BAD_NAME"),
+                Err(e) => store_err(e, "INVITE_FAILED"),
             }
         }
         AdminRequest::Users => {

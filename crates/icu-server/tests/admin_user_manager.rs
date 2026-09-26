@@ -577,3 +577,67 @@ async fn an_enforced_deafen_mutes_and_stops_video() {
     assert!(bob.recv_video(common::SOON).await.is_some());
     server.shutdown().await;
 }
+
+/// A write that fails is the server's trouble, not a policy refusal: the
+/// admin gets `SERVER_ERROR`, not `LAST_ADMIN` or `NAME_TAKEN`, nothing
+/// changes, and the connection stays.
+#[tokio::test]
+async fn a_failed_write_is_a_server_error_not_a_refusal() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await; // sole bootstrap admin
+    let bob = server.client("bob").await;
+
+    // A directory where the atomic write puts its temp file.
+    let blocker = server.dir.path().join(".users.toml.tmp");
+    std::fs::create_dir(&blocker).expect("block the write");
+    alice
+        .send_msg(&ControlMsg::AdminSetRole {
+            user_id: bob.user_id,
+            is_admin: true,
+        })
+        .await;
+    let answer = alice
+        .recv_matching(|m| {
+            matches!(
+                m,
+                ControlMsg::AdminActionError { .. } | ControlMsg::AdminSetRoleOk { .. }
+            )
+        })
+        .await;
+    assert!(
+        matches!(answer, Some(ControlMsg::AdminActionError { code, .. }) if code == ec::SERVER_ERROR),
+        "{answer:?}"
+    );
+    alice
+        .send_msg(&ControlMsg::CreateInviteRequest {
+            name: String::new(),
+            ttl_s: 0,
+        })
+        .await;
+    let answer = alice
+        .recv_matching(|m| {
+            matches!(
+                m,
+                ControlMsg::Error { .. } | ControlMsg::CreateInviteResponse { .. }
+            )
+        })
+        .await;
+    assert!(
+        matches!(answer, Some(ControlMsg::Error { code, .. }) if code == ec::SERVER_ERROR),
+        "{answer:?}"
+    );
+    assert!(!ec::is_fatal(ec::SERVER_ERROR));
+    std::fs::remove_dir(&blocker).expect("unblock");
+
+    alice
+        .send_msg(&ControlMsg::AdminSetRole {
+            user_id: bob.user_id,
+            is_admin: true,
+        })
+        .await;
+    assert!(alice
+        .recv_matching(|m| matches!(m, ControlMsg::AdminSetRoleOk { .. }))
+        .await
+        .is_some());
+    server.shutdown().await;
+}

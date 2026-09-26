@@ -1388,9 +1388,9 @@ async fn handle_create_invite(
         );
         return;
     }
-    // The label is only a placeholder name, so the failures are a malformed
-    // or taken one, or a failed write. `NAME_TAKEN` is the non-fatal code the
-    // client already shows next to the invite field.
+    // `issue` codes its refusals (`NAME_TAKEN` for a malformed or taken
+    // label, `RATE_LIMITED`); anything uncoded is the server's own trouble,
+    // a failed write, and must not read as a taken name.
     match crate::registration::issue(server, name, ttl_s).await {
         Ok(issued) => {
             tracing::info!(
@@ -1407,9 +1407,10 @@ async fn handle_create_invite(
             );
         }
         Err(e) => {
+            tracing::warn!(user_id, error = %e, "cannot issue a registration");
             server.room.send_to(
                 session,
-                &reject(e.code().unwrap_or(ec::NAME_TAKEN), e.to_string()),
+                &reject(e.code().unwrap_or(ec::SERVER_ERROR), e.to_string()),
             );
         }
     }
@@ -1433,7 +1434,10 @@ pub(crate) fn restriction_changed(muted: bool, deafened: bool) -> ControlMsg {
 }
 
 /// The in-band answer to an admin action: `ok` on success, else
-/// `AdminActionError` with the code the store gave (`PROTOCOL.md` §2.2).
+/// `AdminActionError` with the code the store gave (`PROTOCOL.md` §2.2). An
+/// uncoded error is the server's own trouble — a failed write — and goes out
+/// as `SERVER_ERROR`, not as a policy refusal the admin would read as their
+/// mistake.
 fn admin_answer<T>(
     target: UserId,
     done: Result<T>,
@@ -1441,11 +1445,16 @@ fn admin_answer<T>(
 ) -> ControlMsg {
     match done {
         Ok(value) => ok(value),
-        Err(e) => ControlMsg::AdminActionError {
-            user_id: target,
-            code: e.code().unwrap_or(ec::LAST_ADMIN),
-            detail: e.to_string(),
-        },
+        Err(e) => {
+            if e.code().is_none() {
+                tracing::warn!(target, error = %e, "admin action failed");
+            }
+            ControlMsg::AdminActionError {
+                user_id: target,
+                code: e.code().unwrap_or(ec::SERVER_ERROR),
+                detail: e.to_string(),
+            }
+        }
     }
 }
 
