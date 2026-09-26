@@ -169,3 +169,47 @@ async fn stalled_handshakes_from_one_source_do_not_lock_out_others() {
     drop(flood);
     server.shutdown().await;
 }
+
+/// A client presents its leaf and nothing else. Extra certificates would
+/// only be issuer candidates for the path search, signature checks an
+/// unauthenticated peer could have the server run in bulk, so a longer
+/// chain fails the handshake before any of them.
+#[tokio::test]
+async fn a_client_chain_with_intermediates_is_refused() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");
+    let chain = vec![alice.cert.clone(), alice.ca.clone(), alice.ca.clone()];
+    endpoint.set_default_client_config(common::client_config_with_chain(
+        server.ca(),
+        Some((chain, alice.key())),
+        icu_proto::limits::ALPN_MAIN,
+    ));
+    let code = match endpoint
+        .connect(server.addr(), "localhost")
+        .expect("connect")
+        .await
+    {
+        Ok(conn) => {
+            let _ = conn.open_bi().await;
+            let reason = tokio::time::timeout(common::SOON, conn.closed())
+                .await
+                .expect("closed");
+            common::code_of(&reason)
+        }
+        Err(e) => common::code_of(&e),
+    };
+    assert!(
+        code.is_some_and(|c| c >= 0x100),
+        "a TLS alert, not a session: {code:?}"
+    );
+
+    // The leaf alone is fine.
+    let mut client = server.connect(&alice).await.expect("connect");
+    assert!(matches!(
+        client.hello("alice").await,
+        ControlMsg::Welcome { .. }
+    ));
+    server.shutdown().await;
+}

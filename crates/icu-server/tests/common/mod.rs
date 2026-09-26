@@ -549,6 +549,20 @@ pub fn client_config(
     identity: Option<Identity>,
     alpn: &[u8],
 ) -> ClientConfig {
+    client_config_with_chain(
+        ca,
+        identity.map(|identity| (vec![identity.cert.clone()], identity.key())),
+        alpn,
+    )
+}
+
+/// [`client_config`] presenting `auth`'s certificate chain as it is — the
+/// leaf first — with its key.
+pub fn client_config_with_chain(
+    ca: CertificateDer<'static>,
+    auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    alpn: &[u8],
+) -> ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca).expect("add ca");
     // Always build from an explicit provider: several servers and clients live
@@ -559,9 +573,9 @@ pub fn client_config(
     .with_protocol_versions(&[&rustls::version::TLS13])
     .expect("tls13")
     .with_root_certificates(roots);
-    let mut tls = match identity {
-        Some(identity) => builder
-            .with_client_auth_cert(vec![identity.cert.clone()], identity.key())
+    let mut tls = match auth {
+        Some((chain, key)) => builder
+            .with_client_auth_cert(chain, key)
             .expect("client auth"),
         None => builder.with_no_client_auth(),
     };

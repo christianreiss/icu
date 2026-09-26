@@ -114,6 +114,7 @@ const INCOMING_QUEUE: usize = 1024;
 
 /// Lets an **expired** client certificate through the handshake, so its
 /// holder can renew it however long ago it expired (`PROTOCOL.md` §2.3).
+/// Refuses a chain longer than the leaf before any check.
 ///
 /// Only expiry is forgiven: when the inner verifier's sole complaint is that
 /// the leaf has expired, the leaf is checked again as of one second before its
@@ -145,6 +146,15 @@ impl ClientCertVerifier for ExpiredClientCertVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> std::result::Result<ClientCertVerified, rustls::Error> {
+        // Clients send their leaf and nothing else: the CA issues leaves
+        // directly. Anything more would only be issuer candidates for the
+        // path search — signature checks an unauthenticated peer could have
+        // the server run by the dozen per handshake.
+        if !intermediates.is_empty() {
+            return Err(rustls::Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ));
+        }
         match self.0.verify_client_cert(end_entity, intermediates, now) {
             Err(rustls::Error::InvalidCertificate(
                 CertificateError::Expired | CertificateError::ExpiredContext { .. },
