@@ -16,7 +16,7 @@ und Debian 12+) und der Client `icu` je Distro (Fedora 42, Fedora 43, Debian 13)
 ```bash
 sudo dnf install ./icu-server-<ver>-1.x86_64.rpm        # Fedora, AlmaLinux 10+
 sudo apt install ./icu-server_<ver>-1_amd64.deb          # Debian 12+
-sudoedit /etc/icu/server.toml                            # server_name, public_host
+sudoedit /etc/icu/server.toml                            # server_name, public_host (optional)
 sudo systemctl enable --now icu-server
 sudo firewall-cmd --permanent --add-service=icu && sudo firewall-cmd --reload
 ```
@@ -25,7 +25,14 @@ Das Paket legt die Gruppe `icu` an (`/usr/lib/sysusers.d/icu-server.conf`),
 installiert die Unit nach `/usr/lib/systemd/system/`, eine Beispielkonfiguration
 nach `/etc/icu/server.toml` (bleibt bei Updates erhalten), den firewalld-Dienst
 `icu` und den Checkmk-Check nach `/usr/share/icu-server/checkmk/`. Der Dienst
-wird **nicht** automatisch gestartet, weil `server_name` gesetzt sein muss.
+wird **nicht** automatisch gestartet: erst `server_name` prüfen. Ohne
+`server_name` nimmt der Server den FQDN des Hosts (`hostname --fqdn`), aber
+nur, wenn der Name per DNS auf eine Adresse dieses Hosts zeigt, die weder
+Loopback noch Link-local ist (Debians `127.0.1.1`-Eintrag und `fe80::` von
+nss-myhostname zählen nicht); sonst startet er nicht
+und sagt, warum. Gibt es schon eine CA, gilt der Name aus ihrem CN
+(`ICU CA <server_name>`), egal wie der Host inzwischen heißt. Hinter NAT oder
+unter einem DNS-Alias `server_name` und `public_host` selbst setzen.
 Deinstallieren lässt den State (`/var/lib/private/icu/`, darin `ca.key`) liegen.
 
 Bauen aller Pakete (nur podman nötig): `packaging/build.sh`, Ergebnis unter
@@ -104,7 +111,7 @@ sudo install -d -m0755 /etc/icu
 sudo install -m0640 -g icu /dev/stdin /etc/icu/server.toml <<'TOML'
 [server]
 listen = ["0.0.0.0:4711", "[::]:4711"]
-server_name = "icu.example.org"      # durch den eigenen Namen ersetzen
+server_name = "icu.example.org"      # eigener Name; weglassen = FQDN des Hosts
 public_host = "icu.example.org:4711"
 max_users = 16
 min_client = "0.1.0"                 # ältere Clients werden beim Hello abgewiesen
