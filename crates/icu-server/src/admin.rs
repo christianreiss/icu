@@ -110,8 +110,12 @@ pub enum AdminResponse {
         user_id: UserId,
         /// Their placeholder name.
         name: String,
-        /// Whether they will be an admin (the first user is).
+        /// Whether they are marked admin (the first bundle of an empty
+        /// server, provisionally).
         is_admin: bool,
+        /// Whether some admin has confirmed a registration; while none has,
+        /// whoever confirms one first becomes admin.
+        admin_confirmed: bool,
     },
     /// `users`
     Users(Vec<AdminUser>),
@@ -191,6 +195,7 @@ impl AdminResponse {
                 user_id,
                 name,
                 is_admin,
+                admin_confirmed,
             } => json!({
                 "ok": true,
                 "bundle": bundle,
@@ -198,6 +203,7 @@ impl AdminResponse {
                 "user_id": user_id,
                 "name": name,
                 "is_admin": is_admin,
+                "admin_confirmed": admin_confirmed,
             }),
             AdminResponse::Users(users) => json!({"ok": true, "users": users}),
             AdminResponse::Revoke { user_id, closed } => {
@@ -243,6 +249,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     user_id: issued.user_id,
                     name: issued.name,
                     is_admin: issued.is_admin,
+                    admin_confirmed: issued.admin_confirmed,
                 },
                 Err(e) => store_err(e, "INVITE_FAILED"),
             }

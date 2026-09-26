@@ -34,6 +34,9 @@ pub struct Issued {
     pub name: String,
     /// Whether this is the first user, and therefore an admin.
     pub is_admin: bool,
+    /// Whether some admin has confirmed a registration. While none has,
+    /// whoever confirms one first becomes admin (`PROTOCOL.md` §2.3).
+    pub admin_confirmed: bool,
 }
 
 /// Issues a registration. `label` becomes the placeholder name when given,
@@ -83,6 +86,7 @@ pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issu
     let cert = CertRecord::issued(&leaf, name.clone(), rfc3339(now()), true);
     let expires = cert.expires.clone();
     let (user_id, is_admin) = store.add_registration(cert)?;
+    let admin_confirmed = store.has_confirmed_admin();
     drop(store);
 
     tracing::info!(user_id, name = %name, is_admin, %expires, "registration issued");
@@ -98,6 +102,7 @@ pub async fn issue(server: &Arc<Server>, label: &str, ttl_s: u64) -> Result<Issu
         user_id,
         name,
         is_admin,
+        admin_confirmed,
     })
 }
 

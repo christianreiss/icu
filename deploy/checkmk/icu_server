@@ -72,8 +72,9 @@ fi
 echo "$STATUS ICU_Server online=$ONLINE;;;0;$MAX|uptime=$UPTIME|connections=$CONNECTIONS|datagrams_in=$IN|datagrams_out=$OUT $TEXT"
 
 # Certificates: WARN below 30 days, CRIT below 7. The server renews its own
-# leaf 30 days ahead, so a WARN on it means the automatic rotation failed
-# (journal). The CA is not renewed automatically (deploy/README.md).
+# leaf 30 days ahead and re-issues the CA certificate under the same key a
+# year ahead, so a WARN on either means the automatic renewal failed
+# (journal; by hand: icu-server rotate-server-cert / renew-ca).
 cert_line() {
     item=$1 left=$2 what=$3
     [ -n "$left" ] || return 0

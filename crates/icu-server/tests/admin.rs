@@ -310,3 +310,42 @@ async fn mute_and_deafen_over_the_socket_keep_each_other() {
     assert_eq!(restriction(&users), (false, true));
     server.shutdown().await;
 }
+
+/// `invite` says whether an admin has registered yet: until one has, not
+/// the first bundle issued but the first one completed makes an admin, and
+/// the CLI points that out (`PROTOCOL.md` §2.3).
+#[tokio::test]
+async fn invite_says_whether_an_admin_has_registered() {
+    let server = TestServer::start().await;
+    let invite = || AdminRequest::Invite {
+        name: String::new(),
+        ttl_s: None,
+    };
+    let first = server.handle.admin(invite()).await;
+    assert!(
+        matches!(
+            first,
+            AdminResponse::Invite {
+                is_admin: true,
+                admin_confirmed: false,
+                ..
+            }
+        ),
+        "{first:?}"
+    );
+    assert_eq!(first.to_json()["admin_confirmed"], serde_json::json!(false));
+    server.enroll("alice").await;
+    let later = server.handle.admin(invite()).await;
+    assert!(
+        matches!(
+            later,
+            AdminResponse::Invite {
+                is_admin: false,
+                admin_confirmed: true,
+                ..
+            }
+        ),
+        "{later:?}"
+    );
+    server.shutdown().await;
+}

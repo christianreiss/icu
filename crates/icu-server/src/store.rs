@@ -347,7 +347,8 @@ impl Store {
     }
 
     /// Whether the store has no users at all yet. The first registration
-    /// issued against an empty store is for an admin (§6.3).
+    /// issued against an empty store is marked admin — provisionally: the
+    /// first user to confirm a registration becomes admin (§6.3).
     pub fn is_empty(&self) -> bool {
         self.users.users.is_empty()
     }
@@ -434,8 +435,9 @@ impl Store {
 
     /// Appends a newly issued certificate to an existing user and adopts its
     /// CN as the user's current name — together with [`Store::add_user`] the
-    /// only writer of `UserRecord.name`. The older certificate stays valid
-    /// until it expires.
+    /// only writer of `UserRecord.name`. The older certificates stay valid
+    /// until the new one first logs in, which retires them
+    /// ([`Store::retire_predecessors`], `PROTOCOL.md` §2.2 Nr. 10).
     ///
     /// `supersedes` stamps the certificate the request was made with, and is
     /// passed only for catch-up renewals — that stamp is what bounds them.
@@ -539,6 +541,14 @@ impl Store {
         self.users()
             .filter(|(id, _)| self.is_functional_admin(*id))
             .count()
+    }
+
+    /// Whether some functional admin has confirmed their registration. While
+    /// none has, whoever confirms a registration first becomes admin, which
+    /// `icu-server invite` points out.
+    pub fn has_confirmed_admin(&self) -> bool {
+        self.users()
+            .any(|(id, u)| !u.is_pending() && self.is_functional_admin(id))
     }
 
     /// Whether someone other than `except` is a functional admin who has

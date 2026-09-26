@@ -189,11 +189,14 @@ icu-server rotate-server-cert              # neues Server-Leaf derselben CA
 icu-server renew-ca                        # CA-Zertifikat neu, selber Schlüssel
 ```
 
-**Erster Admin:** das erste Bundle auf einem leeren Server ist das des Admins —
-direkt nach der Installation also `icu-server invite --out admin.txt` (geht auch
-ohne laufenden Server), die Datei auf den eigenen Rechner bringen und dort
-`icu admin.txt --name <name>` ausführen oder den Inhalt ins Erststart-Fenster
-einfügen. Das Bundle enthält einen privaten Schlüssel und gilt, bis es
+**Erster Admin:** Admin wird, wer als Erster eine Registrierung abschließt
+(quittiert), solange es noch keinen bestätigten Admin gibt — nicht das zuerst
+ausgestellte Bundle (`PROTOCOL.md` §2.3). Direkt nach der Installation also
+`icu-server invite --out admin.txt` (geht auch ohne laufenden Server), die Datei
+auf den eigenen Rechner bringen und dort `icu admin.txt --name <name>` ausführen
+oder den Inhalt ins Erststart-Fenster einfügen — bevor weitere Einladungen
+hinausgehen. Solange es keinen bestätigten Admin gibt, weist `invite` darauf
+hin. Das Bundle enthält einen privaten Schlüssel und gilt, bis es
 eingelöst oder abgelaufen ist; es gehört nicht in einen Chat, den andere lesen.
 Weitere Bundles stellt ein Admin auch im Client aus (⚙ → Allgemein →
 Einladung). Die Serveradresse steht in den Zertifikaten (`public_host`,
@@ -264,8 +267,10 @@ sudo usermod -aG icu root      # oder den Agent-User in die Gruppe icu
 Er ruft `icu-server status --json` auf und liefert `online`, `uptime` und die
 Relay-Zähler als Metriken. Ist der Server unten, geht der Check auf CRIT.
 Dazu kommen `ICU_Server_Certificate` und `ICU_CA_Certificate` (`tls` im
-Status-JSON): WARN unter 30, CRIT unter 7 Tagen Restlaufzeit. Beim Server-Leaf
-heißt WARN, dass die automatische Rotation gescheitert ist (Journal).
+Status-JSON): WARN unter 30, CRIT unter 7 Tagen Restlaufzeit. Beide erneuert
+der Server selbst (Leaf 30 Tage, CA ein Jahr vor Ablauf), ein WARN heißt also,
+dass das gescheitert ist (Journal; von Hand `rotate-server-cert` bzw.
+`renew-ca`).
 
 ## 6. Grenzen
 
