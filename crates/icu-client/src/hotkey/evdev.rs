@@ -28,6 +28,85 @@ pub fn parse_key(name: &str) -> Option<KeyCode> {
     KeyCode::from_str(name).ok()
 }
 
+/// The binding name for `code`, in the form [`parse_key`] reads back:
+/// `KEY_F12`, `BTN_SIDE`, `BTN_EXTRA`, or `code:<n>` for a code evdev has
+/// no name for.
+pub fn key_name(code: KeyCode) -> String {
+    let name = format!("{code:?}");
+    if parse_key(&name) == Some(code) {
+        name
+    } else {
+        format!("code:{}", code.code())
+    }
+}
+
+/// What [`capture_next_key`] says when there is nothing it may read.
+const NO_DEVICE: &str = "ICU kann keine Tastatur und keine Maus lesen. Tasten direkt lesen \
+                         darf ICU nur als Mitglied der Gruppe „input“.";
+
+/// Waits for the next key or button press on any input device and returns
+/// its binding name ([`key_name`]) — for the settings' „Taste drücken“.
+/// Call it from a background task.
+///
+/// Every readable `/dev/input/event*` is opened read-only and not grabbed,
+/// so the press still reaches whatever has the focus, and every device is
+/// closed again when this returns. A press counts; releases and auto-repeat
+/// do not, nor do left/right clicks and touch contacts ([`captured`]).
+/// Errors, as text for the window: no device readable (not in group
+/// `input`), or no press within `timeout`.
+pub async fn capture_next_key(timeout: Duration) -> Result<String, String> {
+    let devices = tokio::task::spawn_blocking(open_all)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<KeyCode>(1);
+    // Dropped on return, which aborts every reader and closes its device.
+    let mut readers = tokio::task::JoinSet::new();
+    for (path, dev) in devices {
+        if dev.supported_keys().is_none() {
+            continue;
+        }
+        let mut stream = match dev.into_event_stream() {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::debug!(?path, %e, "key capture: no event stream");
+                continue;
+            }
+        };
+        let tx = tx.clone();
+        readers.spawn(async move {
+            while let Ok(ev) = stream.next_event().await {
+                if let Some(code) = captured(ev) {
+                    let _ = tx.send(code).await;
+                    return;
+                }
+            }
+        });
+    }
+    drop(tx);
+    if readers.is_empty() {
+        return Err(NO_DEVICE.into());
+    }
+    match tokio::time::timeout(timeout, rx.recv()).await {
+        Ok(Some(code)) => Ok(key_name(code)),
+        Ok(None) => Err("Die Eingabegeräte sind verschwunden.".into()),
+        Err(_) => Err("Keine Taste gedrückt.".into()),
+    }
+}
+
+/// The key an event presses, if it is one to offer as a binding. Left and
+/// right click operate the window the capture runs in, and touchpads and
+/// pens report every contact as a key (`BTN_TOUCH`, `BTN_TOOL_*`): none of
+/// those is what the user meant to press.
+fn captured(ev: evdev::InputEvent) -> Option<KeyCode> {
+    let EventSummary::Key(_, code, 1) = ev.destructure() else {
+        return None;
+    };
+    let click = code == KeyCode::BTN_LEFT || code == KeyCode::BTN_RIGHT;
+    let touch =
+        (KeyCode::BTN_TOOL_PEN.code()..=KeyCode::BTN_TOOL_QUADTAP.code()).contains(&code.code());
+    (!click && !touch).then_some(code)
+}
+
 /// One readable input device.
 #[derive(Debug, Clone)]
 pub struct InputDevice {
@@ -277,6 +356,42 @@ mod tests {
         assert_eq!(parse_key("code:97"), Some(KeyCode::KEY_RIGHTCTRL));
         assert_eq!(parse_key(""), None);
         assert_eq!(parse_key("KEY_NOPE"), None);
+    }
+
+    /// What the capture returns, the evdev backend reads back as the same
+    /// key — for every code there is, named or not.
+    #[test]
+    fn captured_names_read_back() {
+        for code in 0..0x300 {
+            let code = KeyCode::new(code);
+            let name = key_name(code);
+            assert_eq!(parse_key(&name), Some(code), "{name}");
+        }
+        assert_eq!(key_name(KeyCode::KEY_F12), "KEY_F12");
+        assert_eq!(key_name(KeyCode::KEY_RIGHTCTRL), "KEY_RIGHTCTRL");
+        assert_eq!(key_name(KeyCode::BTN_SIDE), "BTN_SIDE");
+        assert_eq!(key_name(KeyCode::BTN_EXTRA), "BTN_EXTRA");
+        assert_eq!(key_name(KeyCode::new(0x2f0)), "code:752", "no name");
+    }
+
+    #[test]
+    fn only_presses_of_real_keys_are_captured() {
+        use evdev::{EventType, InputEvent};
+        let key = |code: KeyCode, value| InputEvent::new(EventType::KEY.0, code.code(), value);
+        assert_eq!(captured(key(KeyCode::KEY_F12, 1)), Some(KeyCode::KEY_F12));
+        assert_eq!(captured(key(KeyCode::BTN_SIDE, 1)), Some(KeyCode::BTN_SIDE));
+        assert_eq!(
+            captured(key(KeyCode::BTN_MIDDLE, 1)),
+            Some(KeyCode::BTN_MIDDLE)
+        );
+        assert_eq!(captured(key(KeyCode::KEY_F12, 0)), None, "release");
+        assert_eq!(captured(key(KeyCode::KEY_F12, 2)), None, "auto-repeat");
+        assert_eq!(captured(key(KeyCode::BTN_LEFT, 1)), None, "click");
+        assert_eq!(captured(key(KeyCode::BTN_RIGHT, 1)), None, "click");
+        assert_eq!(captured(key(KeyCode::BTN_TOUCH, 1)), None, "touchpad");
+        assert_eq!(captured(key(KeyCode::BTN_TOOL_FINGER, 1)), None, "touchpad");
+        let motion = InputEvent::new(EventType::RELATIVE.0, 0, 5);
+        assert_eq!(captured(motion), None);
     }
 
     /// Dropping the guard ends a reader at once — not at its next wake-up —
