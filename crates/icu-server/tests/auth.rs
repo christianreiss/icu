@@ -886,6 +886,76 @@ async fn sessions_outside_the_room_are_capped() {
     server.shutdown().await;
 }
 
+/// A registration turned away because the sessions outside the room are
+/// full has not paid for it. `SERVER_FULL` is not fatal and the client comes
+/// back; each attempt used to cost a token of the enrollment budget first,
+/// until the fatal `ENROLL_RATE_LIMITED` ended the registration for good.
+#[tokio::test]
+async fn a_registration_turned_away_as_full_keeps_its_budget() {
+    use icu_proto::limits::MAX_ROOMLESS_SESSIONS;
+    let server = TestServer::start_with(|c| {
+        c.limits.handshakes_per_ip_per_s = 1000;
+        // Enough for the sessions that fill the table and one more.
+        c.limits.enroll_per_ip_per_min = MAX_ROOMLESS_SESSIONS as u32 + 1;
+        c.limits.enroll_global_per_min = 1000;
+    })
+    .await;
+    let registration = |bundle: &str| common::identity_from_bundle(bundle);
+
+    let mut open = Vec::new();
+    for _ in 0..MAX_ROOMLESS_SESSIONS {
+        let bundle = server.invite("").await;
+        let mut client = server
+            .connect(&registration(&bundle))
+            .await
+            .expect("connect");
+        assert!(matches!(
+            client.hello("").await,
+            ControlMsg::Welcome {
+                registration: true,
+                ..
+            }
+        ));
+        open.push(client);
+    }
+    let bundle = server.invite("").await;
+    for _ in 0..3 {
+        let refused = server
+            .connect(&registration(&bundle))
+            .await
+            .expect("the handshake completes");
+        assert_eq!(refused.closed_code().await, Some(ec::SERVER_FULL));
+    }
+
+    open.pop().expect("a session").conn.close(0u32.into(), b"");
+    let roomless = &server.handle.server().roomless;
+    for _ in 0..200 {
+        if roomless.lock().unwrap().len() < MAX_ROOMLESS_SESSIONS {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut again = server
+        .connect(&registration(&bundle))
+        .await
+        .expect("connect");
+    let welcome = again
+        .hello_with("", icu_proto::MINOR, icu_proto::UserFlags::NONE)
+        .await;
+    assert!(
+        matches!(
+            welcome,
+            Some(ControlMsg::Welcome {
+                registration: true,
+                ..
+            })
+        ),
+        "the budget is still there: {:?}",
+        again.conn.close_reason()
+    );
+    server.shutdown().await;
+}
+
 /// `PROTOCOL.md` §1/§2.2: a revoke is in force in the handshake at once,
 /// without a restart. The CRL clients get follows `Welcome` and lists only
 /// replaced server leaves — a revoked client certificate is none of their
