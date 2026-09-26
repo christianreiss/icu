@@ -664,7 +664,15 @@ fn server_section(state: &AppState) -> Section {
         .row(Row::mono("TLS-Name (SNI)", &state.server_name))
         .row(Row::mono(
             "Protokoll",
-            opt(info.map(|i| format!("{} · Minor {}", i.alpn, i.minor))),
+            opt(info.map(|i| {
+                format!(
+                    "{} · Minor {} (Client {}, Server {})",
+                    i.alpn,
+                    i.minor,
+                    icu_proto::MINOR,
+                    i.server_minor
+                )
+            })),
         ))
         .row(Row::mono(
             "Fähigkeiten",

@@ -177,8 +177,10 @@ pub struct ConnInfo {
     pub local_ip: Option<IpAddr>,
     /// Negotiated ALPN, normally `icu/1`.
     pub alpn: String,
-    /// `Welcome.minor`.
+    /// `Welcome.minor`, the negotiated one.
     pub minor: u16,
+    /// `Welcome.server_minor`, the server's own.
+    pub server_minor: u16,
     /// `Welcome.caps`.
     pub caps: u32,
     /// `Welcome.min_client`.
@@ -211,6 +213,7 @@ impl ConnInfo {
             local_ip: conn.local_ip(),
             alpn: alpn(conn),
             minor: welcome.minor,
+            server_minor: welcome.server_minor,
             caps: welcome.caps,
             min_client: welcome.min_client.clone(),
             client_string: client_string.to_string(),

@@ -271,6 +271,8 @@ pub struct Welcome {
     /// Authenticated with a registration certificate: nothing works until it
     /// is swapped (`net::register::complete`).
     pub registration: bool,
+    /// The server's own protocol minor.
+    pub server_minor: u16,
 }
 
 /// An established, welcomed connection.
@@ -349,26 +351,46 @@ pub async fn connect(
             min_client,
             is_admin,
             registration,
-        } => Ok(Session {
-            conn,
-            send,
-            recv,
-            welcome: Welcome {
-                minor,
-                caps,
-                you,
-                audio,
-                users,
-                min_client,
-                is_admin,
-                registration,
-            },
-        }),
+            server_minor,
+        } => {
+            if let Err(e) = check_server(server_minor) {
+                conn.close(
+                    icu_proto::error::VERSION_UNSUPPORTED.into(),
+                    b"server protocol minor below minimum",
+                );
+                return Err(e);
+            }
+            Ok(Session {
+                conn,
+                send,
+                recv,
+                welcome: Welcome {
+                    minor,
+                    caps,
+                    you,
+                    audio,
+                    users,
+                    min_client,
+                    is_admin,
+                    registration,
+                    server_minor,
+                },
+            })
+        }
         other => Err(ConnectError::Protocol(format!(
             "expected Welcome, got {}",
             other.variant()
         ))),
     }
+}
+
+/// The client's half of the version gate (`PROTOCOL.md` §8): the server
+/// checked our `Hello.minor` and version, we check its `Welcome.server_minor`.
+fn check_server(server_minor: u16) -> Result<(), ConnectError> {
+    if server_minor < icu_proto::MIN_PEER_MINOR {
+        return Err(ConnectError::ServerTooOld(server_minor));
+    }
+    Ok(())
 }
 
 /// Writes one control message.
@@ -400,6 +422,9 @@ pub enum ConnectError {
     /// `protocol_version` or `no_application_protocol` (ALPN, `PROTOCOL.md`
     /// §8). Fatal: it takes an update, not a retry.
     Version(String),
+    /// The server's protocol minor is below [`icu_proto::MIN_PEER_MINOR`]:
+    /// the server needs the update, not this client. Fatal.
+    ServerTooOld(u16),
     /// TLS certificate verification failed for `server_name`. Never
     /// retryable: retrying will not fix a hostname/cert mismatch.
     Certificate {
@@ -483,7 +508,9 @@ impl ConnectError {
         match self {
             ConnectError::Closed { code, .. } => icu_proto::error::is_fatal(*code),
             ConnectError::Transport(_) | ConnectError::ServerCert(_) => false,
-            ConnectError::Protocol(_) | ConnectError::Version(_) => true,
+            ConnectError::Protocol(_)
+            | ConnectError::Version(_)
+            | ConnectError::ServerTooOld(_) => true,
             ConnectError::Certificate { .. } => true,
         }
     }
@@ -505,6 +532,7 @@ impl ConnectError {
                 problem::code_text(icu_proto::error::VERSION_UNSUPPORTED),
                 technical,
             ),
+            ConnectError::ServerTooOld(_) => Problem::new(problem::SERVER_TOO_OLD, technical),
             ConnectError::Certificate { issue, .. } => match issue {
                 CertIssue::NameMismatch => Problem::new(
                     "Die Serveradresse passt nicht zum Zertifikat des Servers. Bitte beim \
@@ -542,6 +570,11 @@ impl std::fmt::Display for ConnectError {
             ConnectError::ServerCert(s) => f.write_str(s),
             ConnectError::Protocol(s) => write!(f, "protocol: {s}"),
             ConnectError::Version(s) => write!(f, "version: {s}"),
+            ConnectError::ServerTooOld(minor) => write!(
+                f,
+                "server protocol minor {minor} is below the minimum {}",
+                icu_proto::MIN_PEER_MINOR
+            ),
             ConnectError::Certificate {
                 server_name,
                 detail,
@@ -618,6 +651,20 @@ mod tests {
                 reason: Default::default(),
             },
         ))
+    }
+
+    /// A server below our minimum protocol minor is fatal and blamed on the
+    /// server; one at or above it passes.
+    #[test]
+    fn server_minor_below_the_minimum_is_fatal() {
+        let e = check_server(icu_proto::MIN_PEER_MINOR - 1).unwrap_err();
+        assert!(matches!(e, ConnectError::ServerTooOld(_)), "{e:?}");
+        assert!(e.is_fatal());
+        assert_eq!(e.problem().text, problem::SERVER_TOO_OLD);
+        crate::problem::tests::assert_readable(&e.problem());
+        assert!(check_server(icu_proto::MIN_PEER_MINOR).is_ok());
+        assert!(check_server(icu_proto::MINOR).is_ok());
+        assert!(check_server(u16::MAX).is_ok());
     }
 
     /// `protocol_version` and `no_application_protocol` mean another

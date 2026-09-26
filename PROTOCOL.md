@@ -74,7 +74,7 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | Nr | Variante | Richtung | Felder | Semantik |
 | --- | --- | --- | --- | --- |
 | 0 | `Hello` | C→S | `minor: u16`, `caps: u32`, `client: String` (≤ 64 B, Format `<name>/<semver> <os>`, z. B. `icu/0.1.0 linux`), `initial: UserFlags`, `name: Name` | Erste Message nach Handshake, binnen 5 s. `name` ist obsolet: der Server ignoriert es, weil der Name im Zertifikat steht (§2.1). Das Feld bleibt aus Wire-Kompatibilität erhalten. Namensänderung läuft ausschließlich über `RenewRequest` (Nr. 9). |
-| 1 | `Welcome` | S→C | `minor: u16`, `caps: u32`, `you: UserInfo`, `audio: AudioParams`, `users: Vec<UserInfo>` (ohne sich selbst), `min_client: String`, `is_admin: bool`, `registration: bool` | Vollständiger State. `you` ist der eigene Eintrag inklusive `user_id` und dem serverseitig gespeicherten Namen — der Client übernimmt diesen Namen, auch wenn er von seinem `Hello.name` abweicht. `min_client` = niedrigste erlaubte Client-Version als SemVer-String; der Client vergleicht sie in SemVer-Ordnung gegen die eigene Version. `is_admin` erlaubt `CreateInviteRequest` (§2.3). `registration = true` heißt: der Client hat sich mit einem Registrierungszertifikat angemeldet (§2.3); dann ist `users` leer, `you.session` = 0, die Sitzung ist nicht im Raum, und außer `Ping` nimmt der Server nur `RenewRequest` an. Weicht `you.name` vom CN des eigenen Zertifikats ab, fordert der Client ein neues Zertifikat mit dem aktuellen Namen an; der Server lässt das außerhalb des Tageslimits zu (Nr. 9). |
+| 1 | `Welcome` | S→C | `minor: u16`, `caps: u32`, `you: UserInfo`, `audio: AudioParams`, `users: Vec<UserInfo>` (ohne sich selbst), `min_client: String`, `is_admin: bool`, `registration: bool`, `server_minor: u16` (seit Minor 2) | Vollständiger State. `minor` ist das ausgehandelte Minor, `server_minor` das eigene des Servers (§8). `you` ist der eigene Eintrag inklusive `user_id` und dem serverseitig gespeicherten Namen — der Client übernimmt diesen Namen, auch wenn er von seinem `Hello.name` abweicht. `min_client` = niedrigste erlaubte Client-Version als SemVer-String. Durchgesetzt wird sie vom Server schon beim `Hello` gegen die Version in `Hello.client` (§8); der Client zeigt sie nur an. `is_admin` erlaubt `CreateInviteRequest` (§2.3). `registration = true` heißt: der Client hat sich mit einem Registrierungszertifikat angemeldet (§2.3); dann ist `users` leer, `you.session` = 0, die Sitzung ist nicht im Raum, und außer `Ping` nimmt der Server nur `RenewRequest` an. Weicht `you.name` vom CN des eigenen Zertifikats ab, fordert der Client ein neues Zertifikat mit dem aktuellen Namen an; der Server lässt das außerhalb des Tageslimits zu (Nr. 9). |
 | 2 | `UserJoined` | S→C | `user: UserInfo` | |
 | 3 | `UserLeft` | S→C | `session: Session`, `reason: u8` (Fehlercode < 256) | |
 | 4 | `UserState` | S→C | `session: Session`, `flags: UserFlags` | Broadcast nach jeder Änderung, inkl. an den Verursacher. |
@@ -114,7 +114,7 @@ Varianten 19–28 (und 31, 33) sind die ersten C→S-Nachrichten, bei denen der 
 
 Fehlercodes kommen wie Varianten additiv hinzu (§6, zuletzt `SERVER_ERROR` 2026-09-26); ein Client, der einen Code nicht kennt, behandelt ihn als nicht fatal.
 
-Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline ist `minor = 1`; ein Minor 0 existiert nicht, und alle 36 Variantennummern (0–35) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
+Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-Baseline war `minor = 1`, aktuell ist `minor = 2` (`Welcome.server_minor`, 2026-09-26); ein Minor 0 existiert nicht, und alle 36 Variantennummern (0–35) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
 ### 2.3 Registrierung (revidiert 2026-09-24, nur Zertifikate)
 
@@ -237,7 +237,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | --- | --- | --- | --- |
 | 0x00 | `NO_ERROR` | – | normales Close |
 | 0x01 | `PROTOCOL_VIOLATION` | ja | Framing/Decode-Fehler, falsche erste Message, Limit überschritten; kein Reconnect (würde loopen) |
-| 0x02 | `VERSION_UNSUPPORTED` | ja | `Hello.minor` nicht bedienbar |
+| 0x02 | `VERSION_UNSUPPORTED` | ja | Server: `Hello.minor` unter seinem Mindest-Minor, oder die Version in `Hello.client` liegt unter `min_client` bzw. ist nicht lesbar. Client: `Welcome.server_minor` unter seinem Mindest-Minor (§8) |
 | 0x03 | `AUTH_UNKNOWN_CERT` | ja | Cert gültig gegen CA, Fingerprint unbekannt |
 | 0x04 | `AUTH_REVOKED` | ja | Fingerprint revoked. Seit der CRL (§1) nur noch für Zertifikate ohne Seriennummer in `users.toml` und für ein Zertifikat, das zwischen Handshake und Anmeldung widerrufen wurde; sonst endet schon der Handshake mit `certificate_revoked` |
 | 0x05 | `SERVER_FULL` | nein | `max_users` erreicht, `limits.max_connections` etablierte Verbindungen oder 8 Sitzungen außerhalb des Raums (§7); Client reconnectet mit Backoff |
@@ -287,7 +287,11 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 ## 8. Versionierung
 
 - Major = ALPN-String (`icu/1`). Inkompatible Änderung → `icu/2`, Server bietet ggf. beide.
-- Minor = `Hello.minor` / `Welcome.minor`; Server antwortet mit `min(client, server)`; Varianten oberhalb des ausgehandelten Minors werden nie gesendet. v1-Baseline ist `minor = 1` (ein Minor 0 gibt es nicht); kann der Server ein gemeldetes Minor nicht bedienen, schließt er mit `VERSION_UNSUPPORTED`.
+- Minor: der Client nennt sein Protokoll-Minor in `Hello.minor`, der Server seins in `Welcome.server_minor`; `Welcome.minor` ist das ausgehandelte `min(client, server)`. Varianten oberhalb des ausgehandelten Minors werden nie gesendet. Ein Minor 0 gibt es nicht; aktuell ist `minor = 2`.
+- Mindestversionen, beidseitig durchgesetzt (2026-09-26). Jede Seite hat ein Mindest-Minor für die Gegenseite (`icu_proto::MIN_PEER_MINOR`, derzeit 2):
+  - Der Server schließt mit `VERSION_UNSUPPORTED`, wenn `Hello.minor` darunter liegt, oder wenn die SemVer in `Hello.client` (`<name>/<semver> <os>`, Pre-Release-Suffix zählt nicht) unter `server.min_client` liegt oder sich nicht lesen lässt. Das gilt für jede Sitzung, Registrierung und renew-only eingeschlossen.
+  - Der Client schließt selbst mit `VERSION_UNSUPPORTED`, wenn `Welcome.server_minor` darunter liegt, fatal, mit dem Hinweis, dass der Server aktualisiert werden muss.
+  - Ein Client von vor Minor 2 dekodiert das längere `Welcome` ohne Fehler (postcard ignoriert überzählige Bytes); deshalb weist ihn der Server über `Hello.minor` ab. Umgekehrt kann ein Client ab Minor 2 das kürzere `Welcome` eines älteren Servers nicht dekodieren und zeigt das allgemeine „Update nötig“ — hingenommen, weil Client und Server im Lockstep ausgeliefert werden (§2.2).
 - `caps` für optionale Features innerhalb eines Minors.
 - Header-`kind` trägt die Version (`0x01` Audio v1, `0x02` Video v1); ein Audio-v2-Header bekäme `0x03`.
 - Unbekannte Enum-Variante beim Decode ist ein `Err` (Spike 2b) und führt zu `PROTOCOL_VIOLATION`; deshalb nie Varianten senden, die die Gegenseite nicht kennt.

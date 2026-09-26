@@ -344,10 +344,27 @@ impl Client {
         minor: u16,
         initial: UserFlags,
     ) -> Option<ControlMsg> {
+        self.hello_full(name, minor, "icu-test/0.1.0 linux", initial)
+            .await
+    }
+
+    /// `Hello` with an explicit `client` string, for the `min_client` check.
+    pub async fn hello_as(&mut self, name: &str, client: &str) -> Option<ControlMsg> {
+        self.hello_full(name, icu_proto::MINOR, client, UserFlags::NONE)
+            .await
+    }
+
+    async fn hello_full(
+        &mut self,
+        name: &str,
+        minor: u16,
+        client: &str,
+        initial: UserFlags,
+    ) -> Option<ControlMsg> {
         self.send_msg(&ControlMsg::Hello {
             minor,
             caps: 0,
-            client: "icu-test/0.1.0 linux".into(),
+            client: client.to_string(),
             initial,
             name: name.to_string(),
         })
