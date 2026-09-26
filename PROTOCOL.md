@@ -279,8 +279,8 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | Control-Frame | ≤ 16 KiB |
 | Control-Messages | ≤ 50/s pro Client |
 | Audio-Datagrams | ≤ 110/s pro Client, ≤ 410 B |
-| Video-Frames | ≤ 20/s pro Client, ≤ 512 KiB; nur bei `camera_on`; ≤ 4 gleichzeitig je Sender, ≤ 5 s je Frame (`timing.video_frame_timeout_ms`) |
-| Video-Bitrate | ≤ 400 kbit/s pro Sender (gleitend über 2 s), darüber Frames verwerfen. Bewusste Festlegung als Missbrauchs-Deckel, nicht aus dem Research hergeleitet: Zielbitrate ist 150 kbit/s (§4), der Abstand fängt CBR-Spitzen bei 15 fps ab. |
+| Video-Frames | ≤ 20/s pro Nutzer (über Reconnects hinweg), ≤ 512 KiB; nur bei `camera_on`; ≤ 4 gleichzeitig je Sender, ≤ 5 s je Frame (`timing.video_frame_timeout_ms`) |
+| Video-Bitrate | ≤ 400 kbit/s pro Nutzer (gleitend über 2 s, über Reconnects hinweg). Entschieden wird **vor** der Nutzlast: steht das Budget im Minus, stoppt der Server den Stream nach dem Header mit `RATE_LIMITED` und liest nichts weiter; ein angenommener Frame wird beim Eintreffen abgebucht, auch ins Minus, damit ein IDR größer als der 2-s-Burst durchgeht. Bewusste Festlegung als Missbrauchs-Deckel, nicht aus dem Research hergeleitet: Zielbitrate ist 150 kbit/s (§4), der Abstand fängt CBR-Spitzen bei 15 fps ab. |
 | Users | `max_users` (Default 16, Obergrenze 64); beim Erreichen `close(SERVER_FULL)` |
 | Uni-Streams | `max_concurrent_uni_streams` = `2 × max_users + 4` je Richtung |
 | `Welcome`-Größe | Server validiert beim Start, dass `max_users` × 100 B + Reserve unter dem 16-KiB-Frame-Limit bleibt |

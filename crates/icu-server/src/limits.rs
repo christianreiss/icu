@@ -108,6 +108,31 @@ impl TokenBucket {
         self.take_debt_at(n, Instant::now())
     }
 
+    /// Whether the bucket is not in debt: what [`TokenBucket::take_debt`]
+    /// would decide, without taking anything. Lets a byte budget refuse an
+    /// item before reading it, and [`TokenBucket::charge`] it as it arrives.
+    pub fn has_credit(&mut self) -> bool {
+        self.has_credit_at(Instant::now())
+    }
+
+    /// [`TokenBucket::has_credit`] with an explicit clock, for tests.
+    pub fn has_credit_at(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens > 0.0
+    }
+
+    /// Takes `n` tokens unconditionally, into debt if need be: bytes that
+    /// were already admitted and have now arrived.
+    pub fn charge(&mut self, n: f64) {
+        self.charge_at(n, Instant::now());
+    }
+
+    /// [`TokenBucket::charge`] with an explicit clock, for tests.
+    pub fn charge_at(&mut self, n: f64, now: Instant) {
+        self.refill(now);
+        self.tokens -= n;
+    }
+
     /// [`TokenBucket::take_debt`] with an explicit clock, for tests.
     pub fn take_debt_at(&mut self, n: f64, now: Instant) -> bool {
         self.refill(now);
@@ -363,6 +388,19 @@ mod tests {
         assert!(!b.take_debt_at(1.0, t0), "in debt");
         assert!(!b.take_debt_at(1.0, t0 + Duration::from_millis(900)));
         assert!(b.take_debt_at(1.0, t0 + Duration::from_millis(1100)));
+    }
+
+    #[test]
+    fn charged_bytes_run_into_debt_that_refuses_the_next_item() {
+        let t0 = Instant::now();
+        let mut b = TokenBucket::bitrate(400, Duration::from_secs(2));
+        assert!(b.has_credit_at(t0));
+        b.charge_at(60_000.0, t0);
+        assert!(b.has_credit_at(t0), "within the burst");
+        b.charge_at(90_000.0, t0);
+        assert!(!b.has_credit_at(t0), "50 000 bytes in debt");
+        assert!(!b.has_credit_at(t0 + Duration::from_millis(900)));
+        assert!(b.has_credit_at(t0 + Duration::from_millis(1100)));
     }
 
     #[test]

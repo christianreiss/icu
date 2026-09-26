@@ -19,7 +19,7 @@ use crate::{
     error::{Context, Error, Result},
     limits::{TokenBucket, ViolationCounter},
     lock,
-    relay::{self, VideoSender},
+    relay::{self, VideoBudget, VideoSender},
     room::{Counters, JoinError},
     store::{fingerprint, now, parse_rfc3339, rfc3339, unix_millis, CertRecord, Store, UserRecord},
     wire, Server,
@@ -574,7 +574,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
             ),
             crate::spawn_logged(
                 format!("session {session} video"),
-                uni_task(server.clone(), conn.clone(), session),
+                uni_task(server.clone(), conn.clone(), session, identity.user_id),
             ),
         ],
         left: false,
@@ -1050,8 +1050,12 @@ async fn datagram_task(server: Arc<Server>, conn: quinn::Connection, session: Se
 /// camera sends one frame at a time, and every frame in flight holds a task
 /// and up to 512 KiB of payload. A stream beyond that is stopped unread with
 /// `RATE_LIMITED`, which also hands its flow control credit back.
-async fn uni_task(server: Arc<Server>, conn: quinn::Connection, session: Session) {
-    let state = Arc::new(Mutex::new(VideoSender::new(&server.config.limits)));
+async fn uni_task(server: Arc<Server>, conn: quinn::Connection, session: Session, user_id: UserId) {
+    let state = Arc::new(Mutex::new(VideoSender::new()));
+    let budget = lock(&server.video_budget)
+        .entry(user_id)
+        .or_insert_with(|| Arc::new(Mutex::new(VideoBudget::new(&server.config.limits))))
+        .clone();
     let in_flight = Arc::new(tokio::sync::Semaphore::new(pl::VIDEO_STREAMS_PER_SENDER));
     loop {
         match conn.accept_uni().await {
@@ -1061,9 +1065,9 @@ async fn uni_task(server: Arc<Server>, conn: quinn::Connection, session: Session
                     let _ = recv.stop(quinn::VarInt::from_u32(ec::RATE_LIMITED));
                     continue;
                 };
-                let (server, state) = (server.clone(), state.clone());
+                let (server, state, budget) = (server.clone(), state.clone(), budget.clone());
                 crate::spawn_logged("video frame", async move {
-                    relay::video(server, session, recv, state).await;
+                    relay::video(server, session, recv, state, budget).await;
                     drop(permit);
                 });
             }

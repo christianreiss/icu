@@ -385,3 +385,96 @@ async fn a_video_frame_of_the_maximum_size_still_flows() {
     assert!(got == payload, "all {} bytes, in order", payload.len());
     server.shutdown().await;
 }
+
+/// Sends one video frame and returns its stream, to see whether the server
+/// stopped it. Unfinished, a stream can only settle by being stopped: a
+/// finished small one may be acknowledged before the server reads it.
+async fn send_frame(
+    client: &common::Client,
+    seq: u16,
+    len: usize,
+    finish: bool,
+) -> quinn::SendStream {
+    let header = VideoHeader {
+        flags: 0,
+        speaker: 0,
+        seq,
+        ts: 0,
+        codec: VIDEO_CODEC_H264,
+    };
+    let mut frame = header.encode().to_vec();
+    frame.resize(VIDEO_HEADER_LEN + len, 0x42);
+    let mut send = client.conn.open_uni().await.expect("open_uni");
+    let _ = send.write_all(&frame).await;
+    if finish {
+        let _ = send.finish();
+    }
+    send
+}
+
+/// Connects `identity` as `name`, not viewing.
+async fn connect_as(
+    server: &TestServer,
+    identity: &common::Identity,
+    name: &str,
+) -> common::Client {
+    let mut client = server.connect(identity).await.expect("connect");
+    client
+        .hello_with(name, icu_proto::MINOR, UserFlags::NONE)
+        .await
+        .expect("Welcome");
+    client
+}
+
+/// §7: a sender in debt on its byte budget is stopped before the server
+/// reads the frame, not after — the budget limits what crosses the wire,
+/// not only what is forwarded. A frame larger than the burst still passes
+/// while the budget is not spent.
+#[tokio::test]
+async fn a_sender_in_debt_is_stopped_before_its_frame_is_read() {
+    // 1000 bytes/s, 2000 bytes of burst.
+    let server = TestServer::start_with(|config| config.limits.video_kbit_s = 8).await;
+    let identity = server.enroll("alice").await;
+    let mut alice = connect_as(&server, &identity, "alice").await;
+    let bob = viewer(&server, "bob").await;
+    let session = alice.session;
+    camera_on(&mut alice, session).await;
+
+    assert_eq!(stop_code(&mut send_frame(&alice, 0, 10_000, true).await, SOON).await, None);
+    assert!(bob.recv_video(SOON).await.is_some(), "the big frame passes");
+
+    let mut refused = send_frame(&alice, 1, 100, false).await;
+    // At once, not after the 5 s stall timeout of a frame read in full.
+    assert_eq!(
+        stop_code(&mut refused, Duration::from_secs(1)).await,
+        Some(ec::RATE_LIMITED)
+    );
+    assert!(bob.recv_video(BRIEFLY).await.is_none());
+    server.shutdown().await;
+}
+
+/// §7: the budget belongs to the user, not the connection. Reconnecting
+/// does not wipe the debt of the connection before.
+#[tokio::test]
+async fn a_reconnect_does_not_refill_the_video_budget() {
+    let server = TestServer::start_with(|config| config.limits.video_kbit_s = 8).await;
+    let identity = server.enroll("alice").await;
+    let mut alice = connect_as(&server, &identity, "alice").await;
+    let bob = viewer(&server, "bob").await;
+    let session = alice.session;
+    camera_on(&mut alice, session).await;
+    assert_eq!(stop_code(&mut send_frame(&alice, 0, 10_000, true).await, SOON).await, None);
+    assert!(bob.recv_video(SOON).await.is_some());
+
+    let mut again = connect_as(&server, &identity, "alice").await;
+    let session = again.session;
+    camera_on(&mut again, session).await;
+    let mut refused = send_frame(&again, 0, 100, false).await;
+    // At once, not after the 5 s stall timeout of a frame read in full.
+    assert_eq!(
+        stop_code(&mut refused, Duration::from_secs(1)).await,
+        Some(ec::RATE_LIMITED)
+    );
+    assert!(bob.recv_video(BRIEFLY).await.is_none());
+    server.shutdown().await;
+}
