@@ -28,6 +28,11 @@ use crate::error::{Context, Error, Result};
 /// Schema version of the state file.
 pub const SCHEMA: u32 = 1;
 
+/// Redeems of one registration bundle without a receipt (`PROTOCOL.md`
+/// §2.3). One is the rule, a second repairs a lost answer; past this many
+/// something is wrong, and each one costs a certificate on the CRL.
+pub const REDEEMS_PER_BUNDLE: usize = 5;
+
 /// File name of the user database.
 pub const USERS_FILE: &str = "users.toml";
 /// File name of the lock file.
@@ -119,8 +124,10 @@ pub struct CertRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub registration: bool,
     /// Revoked because a later certificate of the same user logged in
-    /// ([`Store::retire_predecessors`]), not by an admin. Once expired, such a
-    /// record goes and leaves the CRL: its fingerprint is then simply unknown.
+    /// ([`Store::retire_predecessors`]) or a later redeem of the same bundle
+    /// replaced it ([`Store::redeem_registration`]), not by an admin. Once
+    /// expired, such a record goes and leaves the CRL: its fingerprint is
+    /// then simply unknown.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub superseded: bool,
     /// Serial number, lowercase hex of the DER integer's content octets —
@@ -683,8 +690,23 @@ impl Store {
                     "registration certificate already used",
                 ));
             }
+            // A pending user has had no renewal: every other certificate
+            // came from a redeem of this bundle.
+            let redeems = record.certs.iter().filter(|c| !c.registration).count();
+            if redeems >= REDEEMS_PER_BUNDLE {
+                return Err(Error::coded(
+                    ec::RENEW_REJECTED,
+                    format!(
+                        "this invitation was redeemed {redeems} times without a receipt; \
+                         ask for a new one"
+                    ),
+                ));
+            }
+            // Superseded, not only revoked: once expired they leave the store
+            // and the CRL instead of piling up with every repeated redeem.
             for earlier in record.certs.iter_mut().filter(|c| !c.registration) {
                 earlier.revoked = true;
+                earlier.superseded = true;
             }
             record.name = cert.cn.clone();
             if promote {
@@ -788,6 +810,18 @@ impl Store {
             .filter(|s| s.live(now))
             .map(|s| s.serial.clone());
         clients.chain(servers).collect()
+    }
+
+    /// Serials of the replaced server leaves that have not expired yet: the
+    /// CRL clients get (`CrlUpdate`), since the server leaf is all they check.
+    pub fn revoked_server_serials(&self) -> Vec<String> {
+        let now = now();
+        self.users
+            .revoked_server
+            .iter()
+            .filter(|s| s.live(now))
+            .map(|s| s.serial.clone())
+            .collect()
     }
 
     /// Reserves the next CRL number and drops expired server entries in the
@@ -1377,11 +1411,13 @@ mod tests {
         assert!(!reg.revoked, "unconfirmed: the bundle still works");
 
         // The answer was lost: the same bundle redeems again, and the first
-        // certificate, which nobody holds, is revoked.
+        // certificate, which nobody holds, is revoked — as superseded, so it
+        // leaves store and CRL once expired.
         s.redeem_registration(id, "reg", named_cert("again", "alice2"))
             .unwrap();
         assert_eq!(s.user(id).unwrap().name, "alice2");
-        assert!(s.by_fingerprint("new").unwrap().2.revoked);
+        let first = s.by_fingerprint("new").unwrap().2;
+        assert!(first.revoked && first.superseded);
         assert!(!s.by_fingerprint("again").unwrap().2.revoked);
 
         assert!(s.consume_registration(id).unwrap());
@@ -1394,6 +1430,54 @@ mod tests {
             .redeem_registration(id, "reg", named_cert("third", "alice3"))
             .unwrap_err();
         assert_eq!(err.code(), Some(ec::AUTH_REVOKED));
+    }
+
+    /// Unconfirmed redeems of one bundle are capped: each leaves a
+    /// certificate on the CRL.
+    #[test]
+    fn redeems_of_one_bundle_are_capped() {
+        let (_dir, mut s) = store();
+        let (id, _) = s.add_registration(named_cert("reg", "neu-0001")).unwrap();
+        for i in 0..REDEEMS_PER_BUNDLE {
+            s.redeem_registration(
+                id,
+                "reg",
+                named_cert(&format!("r{i}"), &format!("alice{i}")),
+            )
+            .unwrap();
+        }
+        let err = s
+            .redeem_registration(id, "reg", named_cert("one-more", "alice"))
+            .unwrap_err();
+        assert_eq!(err.code(), Some(ec::RENEW_REJECTED));
+        assert!(
+            s.by_fingerprint("one-more").is_none(),
+            "nothing was written"
+        );
+        // Earlier redeems are superseded: they leave the CRL once expired.
+        let user = s.user(id).unwrap();
+        assert_eq!(
+            user.certs.iter().filter(|c| c.superseded).count(),
+            REDEEMS_PER_BUNDLE - 1
+        );
+    }
+
+    /// Clients get a CRL of the replaced server leaves only: revoked client
+    /// certificates would grow it past a control frame.
+    #[test]
+    fn the_client_crl_lists_only_server_leaves() {
+        let (_dir, mut s) = store();
+        let mut cert = named_cert("aa", "alice");
+        cert.serial = Some("0a".into());
+        let alice = s.add_user(cert, false).unwrap();
+        s.add_user(named_cert("bb", "bob"), true).unwrap();
+        s.revoke(alice).unwrap();
+        s.revoke_server_certs(&[("0b".into(), rfc3339(now() + Duration::from_secs(60)))])
+            .unwrap();
+        s.revoke_server_certs(&[("0c".into(), rfc3339(now() - Duration::from_secs(60)))])
+            .unwrap();
+        assert_eq!(s.crl_serials(), vec!["0a".to_string(), "0b".to_string()]);
+        assert_eq!(s.revoked_server_serials(), vec!["0b".to_string()]);
     }
 
     /// An unused first bundle that expired must not cost the next one its

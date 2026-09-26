@@ -97,7 +97,8 @@ pub struct Server {
     /// The QUIC endpoints, so a new CRL or server leaf reaches the TLS
     /// config without a restart (`endpoint::reload_tls`). Empty offline.
     pub endpoints: Vec<quinn::Endpoint>,
-    /// The current CRL, DER, as last sent to clients (`CrlUpdate`).
+    /// The current CRL for clients — replaced server leaves only — DER, as
+    /// last sent to them (`CrlUpdate`).
     pub crl: std::sync::RwLock<Vec<u8>>,
     /// Flipped to `true` on shutdown.
     pub shutdown: watch::Sender<bool>,
@@ -273,8 +274,8 @@ pub async fn run(config: Config) -> Result<Handle> {
     // The CRL is rebuilt from the store on every start, so revocations made
     // offline (CLI without a running server) are in force from the first
     // handshake.
-    let crl = endpoint::build_crl(&mut store, &ca)?;
-    let quic_config = endpoint::server_config(&config, &ca, &crl)?;
+    let crls = endpoint::build_crls(&mut store, &ca)?;
+    let quic_config = endpoint::server_config(&config, &ca, &crls.handshake)?;
     let mut endpoints = Vec::new();
     let mut addrs = Vec::new();
     for addr in &config.server.listen {
@@ -283,7 +284,13 @@ pub async fn run(config: Config) -> Result<Handle> {
         endpoints.push(endpoint);
     }
 
-    let server = Arc::new(Server::new(config, store, ca, endpoints, crl.to_vec()));
+    let server = Arc::new(Server::new(
+        config,
+        store,
+        ca,
+        endpoints,
+        crls.clients.to_vec(),
+    ));
 
     let mut tasks = Vec::new();
     for endpoint in &server.endpoints {

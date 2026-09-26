@@ -185,14 +185,31 @@ impl ClientCertVerifier for ExpiredClientCertVerifier {
     }
 }
 
-/// Signs a fresh CRL from the store under the next CRL number.
-pub fn build_crl(store: &mut Store, ca: &Ca) -> Result<CertificateRevocationListDer<'static>> {
+/// The two CRLs of one reload (`PROTOCOL.md` §1), signed under the same
+/// CRL number.
+pub struct Crls {
+    /// Every revoked certificate the handshake has to refuse: client leaves,
+    /// spent and superseded registration and client certificates, replaced
+    /// server leaves. Stays in the server.
+    pub handshake: CertificateRevocationListDer<'static>,
+    /// Only the replaced server leaves, which is all a client checks: what
+    /// `CrlUpdate` carries. Revoked client certificates would only grow it
+    /// past a control frame, after which clients stopped learning about a
+    /// rotated server leaf at all.
+    pub clients: CertificateRevocationListDer<'static>,
+}
+
+/// Signs fresh CRLs from the store under the next CRL number.
+pub fn build_crls(store: &mut Store, ca: &Ca) -> Result<Crls> {
     let number = store.next_crl_number()?;
-    ca.crl(number, &store.crl_serials())
+    Ok(Crls {
+        handshake: ca.crl(number, &store.crl_serials())?,
+        clients: ca.crl(number, &store.revoked_server_serials())?,
+    })
 }
 
 /// Puts the current revocations and server leaf into force without a
-/// restart: a new CRL, a new TLS config on every endpoint (new handshakes
+/// restart: new CRLs, a new TLS config on every endpoint (new handshakes
 /// only; live connections are the kick's business), and a `CrlUpdate` to
 /// every client in the room. Call it after anything that revokes a
 /// certificate or replaces the server leaf, never while holding the store
@@ -201,14 +218,14 @@ pub async fn reload_tls(server: &Arc<Server>) -> Result<()> {
     let crl = {
         let mut store = server.store.lock().await;
         let ca = server.ca.read().await;
-        let crl = build_crl(&mut store, &ca)?;
+        let crls = build_crls(&mut store, &ca)?;
         if !server.endpoints.is_empty() {
-            let quic = server_config(&server.config, &ca, &crl)?;
+            let quic = server_config(&server.config, &ca, &crls.handshake)?;
             for endpoint in &server.endpoints {
                 endpoint.set_server_config(Some(quic.clone()));
             }
         }
-        crl
+        crls.clients
     };
     let crl_der = crl.to_vec();
     tracing::info!(bytes = crl_der.len(), "CRL and TLS config reloaded");

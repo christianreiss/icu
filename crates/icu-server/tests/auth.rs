@@ -886,16 +886,21 @@ async fn sessions_outside_the_room_are_capped() {
     server.shutdown().await;
 }
 
-/// `PROTOCOL.md` §1/§2.2: the CRL follows `Welcome`, and a revoke puts the
-/// certificate on a new one that reaches everybody online at once.
+/// `PROTOCOL.md` §1/§2.2: a revoke is in force in the handshake at once,
+/// without a restart. The CRL clients get follows `Welcome` and lists only
+/// replaced server leaves — a revoked client certificate is none of their
+/// business.
 #[tokio::test]
-async fn a_revoke_updates_the_crl_live() {
+async fn a_revoke_takes_effect_in_the_handshake_live() {
     let server = TestServer::start().await;
     let mut alice = server.client("alice").await;
     alice.expect_silence().await;
     let first = alice.crl.clone().expect("CrlUpdate after Welcome");
     let ca = server.ca();
-    crl_serials(&first, &ca); // signed by the CA
+    assert!(
+        crl_serials(&first, &ca).is_empty(),
+        "signed by the CA, empty"
+    );
 
     let bob = server.enroll("bob").await;
     server
@@ -903,15 +908,61 @@ async fn a_revoke_updates_the_crl_live() {
         .admin(AdminRequest::Revoke { user: "bob".into() })
         .await;
     alice.expect_silence().await;
-    let updated = alice.crl.clone().expect("a new CRL was broadcast");
-    assert_ne!(updated, first);
-    assert!(crl_serials(&updated, &ca).contains(&serial_of(&bob.cert)));
+    let updated = alice.crl.clone().expect("CrlUpdate");
+    assert!(
+        crl_serials(&updated, &ca).is_empty(),
+        "no client certificate in the clients' CRL"
+    );
 
     // Refused in the handshake, without a restart.
     assert_eq!(
         server.rejection(&bob).await,
         Some(common::TLS_CERTIFICATE_REVOKED)
     );
+    server.shutdown().await;
+}
+
+/// However many client certificates are revoked, the CRL clients get stays
+/// a replaced server leaf or two. It used to list every revoked certificate
+/// and stopped fitting a control frame past ~430 of them, and from then on
+/// clients silently stopped learning about a rotated server leaf.
+#[tokio::test]
+async fn the_crl_for_clients_stays_small_however_many_certificates_are_revoked() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let TestServer { dir, handle } = server;
+    handle.shutdown().await;
+    // 1000 revoked client certificates, as years of renames and revokes
+    // would leave them.
+    let users = dir.path().join("users.toml");
+    let mut text = std::fs::read_to_string(&users).unwrap();
+    for i in 0..1000u32 {
+        text.push_str(&format!(
+            "\n[user.{id}]\nname = \"gone-{i}\"\ncreated = \"2026-01-01T00:00:00Z\"\n\n\
+             [[user.{id}.cert]]\nfingerprint = \"{i:064x}\"\nissued = \"2026-01-01T00:00:00Z\"\n\
+             expires = \"2099-01-01T00:00:00Z\"\nrevoked = true\nserial = \"{serial:032x}\"\n",
+            id = 10_000 + i,
+            serial = 0x4000_0000_0000_0000_0000_0000_0000_0000u128 + u128::from(i),
+        ));
+    }
+    std::fs::write(&users, text).unwrap();
+    let config = icu_server::config::Config::for_test(dir.path());
+    let server = TestServer {
+        handle: icu_server::run(config).await.expect("restarts"),
+        dir,
+    };
+
+    let before = server_leaf(&server.connect(&alice).await.expect("connect").conn);
+    let response = server.handle.admin(AdminRequest::RotateServerCert).await;
+    assert!(matches!(response, AdminResponse::Ok), "{response:?}");
+    let mut client = server.connect(&alice).await.expect("connect");
+    client.hello("alice").await;
+    client.expect_silence().await;
+    let crl = client
+        .crl
+        .clone()
+        .expect("the CRL still reaches the client");
+    assert_eq!(crl_serials(&crl, &server.ca()), vec![serial_of(&before)]);
     server.shutdown().await;
 }
 
