@@ -616,10 +616,16 @@ impl Drop for Seat<'_> {
                 reason: ec::SHUTDOWN as u8,
             });
         }
-        tracing::error!(
-            session = self.session,
-            "session ended abnormally, taken out of the room"
-        );
+        // A panic is a bug worth an error; a task cancelled at shutdown is
+        // not.
+        if std::thread::panicking() {
+            tracing::error!(
+                session = self.session,
+                "session panicked, taken out of the room"
+            );
+        } else {
+            tracing::debug!(session = self.session, "session cancelled, left the room");
+        }
     }
 }
 
