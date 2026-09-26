@@ -144,7 +144,7 @@ Stand 2026-09-26: der Windows-Client ist gebaut (`packaging/windows/build.sh` �
 - [x] **Eine Instanz** (VM ✓: zweiter Start übergibt genau einmal und endet; zunächst 30 Übergaben, weil `DisconnectNamedPipe` das `ok` verwarf — behoben): zweiter Start holt das Fenster nach vorn (auch aus dem Tray), Doppelklick auf eine `.icu`-Datei bei laufendem ICU landet im offenen Fenster.
 - [x] **DPAPI** (VM ✓ `ICU-DPAPI/1` und Passport mit Einstellungen exportiert/importiert; Altbestand offen): `identity\key.pk8` beginnt mit `ICU-DPAPI/1`; Passport-Export/-Import funktioniert; eine alte, unversiegelte `key.pk8` wird gelesen und beim nächsten Speichern versiegelt.
 - [x] **WASAPI** (VM ✓: Mikrofon „Line In“ und Loopback über `AUTOCONVERTPCM`, Wiedergabe `IAudioClient3` mit 256 Frames; Stimme des Linux-Clients kommt an, Sprechanzeige; Debug-Stats geprüft; echtes akustisches Gespräch offen): Geräteliste; Periode im Log (IAudioClient3 bei float32 @ 48 kHz: 240 Frames bzw. nächstes Vielfaches; sonst `AUTOCONVERTPCM` mit 20 ms, z. B. Gerät auf 44,1 kHz stellen); `--debug-stats` wie §5 (`play_underruns=0`, `cap_overruns=0`); zwei Clients sprechen miteinander.
-- [ ] **Hot-Plug** (Audio-Dienst-Neustart mit Stream-Wiederaufnahme und Banner-Rücksetzung VM ✓; physisches Geräteziehen/-wechseln offen): Standardgerät in den Windows-Einstellungen wechseln → „Standard“-Streams folgen; USB-Headset ziehen/stecken; fest gewähltes Gerät ziehen → Fehlermeldung statt Absturz.
+- [ ] **Hot-Plug** (Audio-Dienst-Neustart und C270-USB-Mikrofon mit Rückfall auf HDA VM ✓; physischer Ausgabewechsel offen): Standardgerät in den Windows-Einstellungen wechseln → „Standard“-Streams folgen; USB-Headset ziehen/stecken; fest gewähltes Gerät ziehen → Fehlermeldung statt Absturz.
 - [ ] **AEC-Referenz** (VM: Loopback liefert; in der VM stockt es bis ~35 ms und liefert dann gesammelt — ohne Toleranz „AEC reference dropped out“ alle 10 s, mit `reference_slack` 40 ms in 60 s keiner; Auslöschung selbst offen): Loopback des Ausgabegeräts liefert (`ref_underruns` nur beim Start); Spielton/Musik über Lautsprecher verschwindet aus dem gesendeten Signal; ERL/ERLE unter Erweitert plausibel.
 - [ ] **A6 Drift** Loopback ↔ Mikrofon über 10 min in ppm (offen, Hardware; `Research/aec.md` A6).
 - [ ] **MMCSS** (VM: `real-time priority acquired` für alle vier Threads; Stottern unter Last offen): Engine-Threads in der Aufgabe „Pro Audio“ (z. B. Process Explorer), kein Stottern unter CPU-Last.
@@ -154,7 +154,7 @@ Stand 2026-09-26: der Windows-Client ist gebaut (`packaging/windows/build.sh` �
 - [x] **Overlay** (VM ✓ auf dem Desktop: Namensschild oben rechts mit Sprechrahmen; Skalierung ≠ 100 % offen): klick-durchlässig, bleibt oben, Ecke/Offset im Arbeitsbereich des primären Monitors, auch bei Skalierung ≠ 100 %; über einem Borderless-Spiel (offen, Hardware).
 - [ ] **Toast** (VM ✓ sichtbarer Join-Toast mit Absender ICU; Ersetzen offen): „Meldung bei Kommen und Gehen“ an → Toast mit Absender „ICU“, ein neuer ersetzt den vorigen, kein Systemton.
 - [ ] **Tray** (VM ✓ Menü/Stumm, Schließen in den Tray, minimierter Start und Wiederherstellen durch zweiten Start; Doppelklick und weitere Schließen-Modi offen): Icon-Varianten, Menü, Doppelklick, „Beim Schließen“ Infobereich/Minimieren/Beenden.
-- [ ] **Kamera** (synthetisches Video in beide Richtungen und Overlay VM ✓; physische Kamera offen): MediaFoundation-Kamera, Vorschau, Bild beim Gegenüber.
+- [ ] **Kamera** (C270: 1.856 dekodierte Frames in 150 s, USB-Wiederaufnahme nach 18 s VM ✓; lokale GUI-Vorschau offen): MediaFoundation-Kamera, Vorschau, Bild beim Gegenüber.
 - [x] **Beenden** (VM ✓ Abmelden: `session ends, quitting`, Server `left reason=NO_ERROR` 0,9 s später; Herunterfahren und Strg+C offen): Abmelden/Herunterfahren mit laufendem ICU → sauberes Ende (letzte Einstellung gespeichert), kein „Diese App verhindert das Herunterfahren“; Strg+C in der Konsole.
 
 Bekannte Abweichungen von Linux (Paritäts-Audit 2026-09-26), gezielt prüfen:
@@ -193,3 +193,27 @@ Zusätzlich prüfen: Audio-Dienst fünf Sekunden stoppen und wieder starten
 (nur Testmaschine), Wiederaufnahme aller drei Streams und Verschwinden der
 alten Audiofehlermeldung; Setup bei 1024×768 vollständig durchgehen;
 Passport exportieren und in einem getrennten Konfigurationsordner importieren.
+
+Konsolen-Regression (echte Windows-Konsole, keine Wine-Abnahme):
+
+```sh
+PATH="$PWD/build/win-aec:$PATH" cargo test --locked -p icu-client \
+  --target x86_64-pc-windows-gnu --test windows_console --no-run
+```
+
+Auf Windows `ICU_TEST_EXE` auf die zu prüfende `icu.exe` setzen und die
+ausgegebene Test-EXE starten. Geprüft werden `--help > Datei`, Fehler nach
+`2> Datei`, `> NUL` und `--version | findstr`.
+
+Physische Kamera vom Windows-Client (`--headless --camera 0`) an eine eigene
+Linux-Testidentität senden. Der Empfänger zählt erfolgreich dekodierte
+Bilder, speichert aber keine Kameraaufnahmen:
+
+```sh
+cargo run --locked -p icu-client --example video_receive_probe -- CONFIG_DIR 150
+```
+
+Währenddessen USB-Kamera für 18 Sekunden abziehen und wieder anschließen;
+Frame-Zähler muss nach der Pause weiterlaufen und die Verbindung bestehen
+bleiben. `PASS` allein bestätigt frische Bilder am Ende; die Wiederaufnahme
+zusätzlich am Verlauf und am Sender prüfen.
