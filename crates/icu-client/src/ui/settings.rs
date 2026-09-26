@@ -165,6 +165,9 @@ pub struct SettingsView {
     /// The overlay thread is running; without layer shell (GNOME) the
     /// overlay card says so instead of offering switches that do nothing.
     overlay_available: bool,
+    /// „Kein Echo feststellbar" was answered; it is not offered again while
+    /// this window lives.
+    aec_hint_dismissed: bool,
 }
 
 /// What one frame of the settings window asks the main window to do.
@@ -226,6 +229,7 @@ impl SettingsView {
             #[cfg(feature = "camera")]
             cameras_stale: true,
             overlay_available: cfg!(feature = "overlay"),
+            aec_hint_dismissed: false,
         }
     }
 
@@ -603,7 +607,9 @@ impl SettingsView {
             });
             let tok = theme::tokens(ui.visuals());
             if state.aec_available && self.draft.audio.aec {
-                let problem = if !state.aec_reference {
+                // `dsp::aec::Diagnosis`: what the canceller's own statistics
+                // say about the echo path it sees.
+                let problem = if !state.aec_reference || state.aec_reference_silent {
                     Some("Gerade wirkungslos: das Audiosystem liefert nicht, was du hörst.")
                 } else if state.aec_suspect {
                     Some("Echo erkannt, wird aber nicht entfernt — Lautsprecher-Auswahl prüfen.")
@@ -613,6 +619,43 @@ impl SettingsView {
                 if let Some(problem) = problem {
                     widgets::card_note(ui, |ui| {
                         ui.colored_label(tok.connecting, RichText::new(problem).size(11.5));
+                    });
+                } else if state.aec_no_echo && !self.aec_hint_dismissed {
+                    // Once, dismissible (§6): with a headset the canceller
+                    // only costs latency.
+                    widgets::card_note(ui, |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Kein Echo feststellbar — mit Kopfhörern kann die \
+                                 Echo-Unterdrückung aus, das spart 9 ms Verzögerung.",
+                            )
+                            .size(11.5)
+                            .color(tok.dim_text),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if widgets::button(
+                                ui,
+                                widgets::ButtonKind::Neutral,
+                                icon::SPEAKER_SLASH,
+                                "Ausschalten",
+                            )
+                            .clicked()
+                            {
+                                self.draft.audio.aec = false;
+                                self.aec_hint_dismissed = true;
+                            }
+                            if widgets::button(
+                                ui,
+                                widgets::ButtonKind::Neutral,
+                                icon::X,
+                                "Anlassen",
+                            )
+                            .clicked()
+                            {
+                                self.aec_hint_dismissed = true;
+                            }
+                        });
                     });
                 }
             }
