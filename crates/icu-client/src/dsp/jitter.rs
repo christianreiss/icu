@@ -171,9 +171,6 @@ pub struct JitterBuffer {
     /// Tallest spike of the previous half-window.
     spike_prev: Duration,
     target: Duration,
-    /// Lower clamp: one frame while the encoder is told about loss (FEC needs
-    /// n+1), otherwise 5 ms.
-    min_target: Duration,
     stats: JitterStats,
     last_ts: Option<u32>,
     last_end: bool,
@@ -211,7 +208,6 @@ impl JitterBuffer {
             spike_since: None,
             spike_prev: Duration::ZERO,
             target: frame * cfg.start_frames,
-            min_target: Duration::from_millis(5),
             stats: JitterStats::default(),
             last_ts: None,
             last_end: false,
@@ -249,17 +245,6 @@ impl JitterBuffer {
     /// Current target delay.
     pub fn target(&self) -> Duration {
         self.target
-    }
-
-    /// Whether the encoder side is told about loss; raises the floor to one
-    /// frame so FEC has its n+1 packet.
-    pub fn set_loss_hinted(&mut self, hinted: bool) {
-        self.min_target = if hinted {
-            self.frame_duration()
-        } else {
-            Duration::from_millis(5)
-        };
-        self.clamp_target();
     }
 
     /// Counters.
@@ -449,9 +434,13 @@ impl JitterBuffer {
         self.clamp_target();
     }
 
+    /// Lower clamp: one frame, always. Senders code in-band FEC at every
+    /// loss level (`dsp::opus::FEC_FLOOR_PERCENT`), and recovering frame n
+    /// needs packet n+1 already here when n is due.
     fn clamp_target(&mut self) {
-        if self.target < self.min_target {
-            self.target = self.min_target;
+        let floor = self.frame_duration();
+        if self.target < floor {
+            self.target = floor;
         }
         if self.target > self.cfg.max_delay {
             self.target = self.cfg.max_delay;
@@ -973,17 +962,14 @@ mod tests {
             "target {:?} should cover the observed jitter",
             jb.target()
         );
-        jb.set_loss_hinted(true);
         assert!(jb.target() >= ms(20));
     }
 
+    /// The floor is one frame so FEC always finds packet n+1.
     #[test]
-    fn min_target_follows_loss_hint() {
-        let mut jb = buffer();
-        jb.set_loss_hinted(true);
+    fn target_never_below_one_frame() {
+        let jb = buffer();
         assert!(jb.target() >= ms(20));
-        jb.set_loss_hinted(false);
-        assert!(jb.target() >= ms(5));
     }
 
     /// A packet 50 ms late runs the buffer dry: one frame is concealed

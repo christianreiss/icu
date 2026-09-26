@@ -197,12 +197,12 @@ Damit kippt Relay rechnerisch bei N > 20 (Server-Egress), bei PTT-Betrieb (T ≤
 | Application | **OPUS_APPLICATION_VOIP**, `OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE)` | Q4: Sprachoptimierung; Lookahead identisch zu AUDIO (Q8) |
 | Frame-Größe | **20 ms Default**, 10 ms als Client-Option ohne Protokolländerung; Empfänger liest die Frame-Dauer je Paket (`OPUS_GET_LAST_PACKET_DURATION`, Q6) für Jitter-Buffer-Arithmetik und `frame_size` bei PLC/FEC | Opus-Pakete sind über das TOC-Byte selbstbeschreibend (Q1 §3.1); 10 ms kostet +35 % Draht-Bandbreite und doppelte Paketrate, spart 10 ms; Entscheidung 10 vs. 20 wird in Step 3 gegen das Latenzbudget gemessen |
 | Bitrate | **48 kbit/s VBR (constrained, libopus-Default)**, konfigurierbar 32–64 | Über RFC-7587-Empfehlung 28–40 (Q2) als Qualitätsreserve; liegt unter der 64-kbit/s-Modusschwelle (Q8), also SILK/Hybrid mit LBRR-Fähigkeit; Draht-Kosten 73.6 kbit/s je Stream tragbar |
-| In-band FEC | `OPUS_SET_INBAND_FEC(1)`, `OPUS_SET_PACKET_LOSS_PERC` = max über die Verlustraten aller Empfänger (Relay: ein Encoder bedient N−1 Empfänger mit unterschiedlichem Downlink), Untergrenze = vom Server gemessener Uplink-Verlust; Start 0; **Protokollfolge: Verlust-Feedback-Nachricht (Empfänger → Server → Sender, Quantisierung 1 %) ist nötig — für `Research/protocol/` vormerken** | Bei 0 % Verlust erzeugt der Encoder keine LBRR-Bits (kein Overhead); Decoder nutzt `decode_fec=1`, wenn Paket n fehlt und n+1 schon im Jitter-Buffer liegt (Q5, Q1 §4.2.5) → Kopplung an Jitter-Buffer-Tiefe ≥ 1 Frame, siehe `latency-budget.md` |
-| PLC | Klassische libopus-PLC (`opus_decode(NULL, 0, …)`) | Q5; Deep PLC in v1 aus (Binary +1 MB, Build-Flag, Complexity ≥ 5 im Decoder), Kandidat für v2 |
+| In-band FEC | `OPUS_SET_INBAND_FEC(1)`, `OPUS_SET_PACKET_LOSS_PERC` = max über die Verlustraten aller Empfänger (Relay: ein Encoder bedient N−1 Empfänger mit unterschiedlichem Downlink), Untergrenze = vom Server gemessener Uplink-Verlust; Start 0 (**revidiert 2026-09-26: Untergrenze 3 %**, siehe Deep Dive); **Protokollfolge: Verlust-Feedback-Nachricht (Empfänger → Server → Sender, Quantisierung 1 %) ist nötig — für `Research/protocol/` vormerken** | Bei 0 % Verlust erzeugt der Encoder keine LBRR-Bits (kein Overhead); Decoder nutzt `decode_fec=1`, wenn Paket n fehlt und n+1 schon im Jitter-Buffer liegt (Q5, Q1 §4.2.5) → Kopplung an Jitter-Buffer-Tiefe ≥ 1 Frame, siehe `latency-budget.md` |
+| PLC | **Deep PLC** (Decoder-Complexity 5; revidiert 2026-09-26, vorher klassische PLC) | Q13, Deep Dive unten |
 | DRED | aus | Q13: nicht standardisiert, 12–32 kbit/s Overhead |
 | DTX | **aus** | PTT/VAD senden ohnehin nichts bei Stille; DTX nur LPC-Layer, leichte Qualitätseinbuße (Q2, Q3) |
 | Complexity | **10** (Encoder, explizit gesetzt) | Bereich 0–10 (Q3); Library-Default intern 9 (Q8), opus_demo-Default 10 (Q10); CPU-Kosten auf Desktop unkritisch (unbelegt, Step 3 misst) |
-| Crate | **`opus` 0.4.0** (auf `opusic-sys` 0.7.5, bundled libopus 1.6.1, cmake) | Aktiv, MIT/Apache-2.0, bündelt aktuelles libopus; `opusic-c` als Alternative, falls DRED/Deep-PLC-API gebraucht wird |
+| Crate | **`opusic-sys` 0.7.5 direkt** mit Feature `dred` (bundled libopus 1.6.1, cmake; bis 2026-09-26 `opus` 0.4.0 darüber) | Aktiv, MIT/Apache-2.0, bündelt aktuelles libopus; `opusic-c` als Alternative, falls DRED/Deep-PLC-API gebraucht wird |
 | Transport | QUIC DATAGRAM (RFC 9221) via quinn `send_datagram` | Unzuverlässig, ungeordnet, kein Flow-Control-Limit (Q16, Q21) |
 
 ## Verworfen, mit Grund
@@ -235,6 +235,28 @@ Damit kippt Relay rechnerisch bei N > 20 (Server-Egress), bei PTT-Betrieb (T ≤
 | C8 | QUIC-Header-Annahmen | quinn: tatsächliche DCID-Länge und PN-Länge im Wireshark-Trace prüfen; Overhead-Summe korrigieren |
 | C9 | `max_datagram_size()` | Wert bei MTU 1500 (erwartet ≥ 1 200); ein 160-B-Frame passt immer |
 | C10 | Verlust-Feedback | Format und Intervall der Feedback-Nachricht in `Research/protocol/` festlegen (offen); Step 3 misst, wie schnell `PACKET_LOSS_PERC` nach Beginn eines 5 %-Loss wirkt (Ziel ≤ 2 s) |
+
+## Deep Dive 2026-09-26: Deep PLC, FEC-Untergrenze, Bitrate
+
+Frage: das beste Sprachsignal (glasklar und latenzarm) bei unverändertem Protokoll. Geprüft an den Quellen von libopus 1.6.1 aus `opusic-sys` 0.7.5 und gemessen in `crates/icu-client/src/dsp/opus.rs` (Tests).
+
+| Befund | Beleg | Folge |
+| --- | --- | --- |
+| Deep PLC war nicht gebaut | `CMakeLists.txt:415-434`: `ENABLE_DEEP_PLC` nur mit `OPUS_DRED` oder `OPUS_OSCE`; `opusic-sys` baute ohne Feature. Ein eigenes `OPUS_DEEP_PLC` gibt es in CMake nicht (beantwortet C6). Die Gewichte liegen im Crate. | Feature `dred`. Mit DRED-Dauer 0 liefert `compute_dred_bitrate` 0 (`opus_encoder.c:714-723`), es gehen keine Bits verloren. `osce` zieht über `ENABLE_OSCE_BWE` zusätzlich die `bbwenet`-Gewichte (9,6 MB Quelltext) mit. |
+| Decoder-Complexity war 0 | `opus_decoder.c:161,443-450`: Default 0; Deep PLC ab 5, LACE ab 6, NoLACE ab 7. Das `opus`-Crate hat keinen Setter und keinen Zugriff auf den Zeiger. | Eigener Wrapper über `opusic-sys`, Decoder-Complexity 5. |
+| Deep PLC wirkt | Test `deep_plc_keeps_energy_over_a_burst`: über 60 ms Verlust in stimmhaften Passagen 38 % statt 28 % der Energie (klassische PLC klingt aus). Bench `decoder_complexity_bench` (Release): Decode 21 µs je Frame unverändert, Concealment 20 → 563 µs je Frame. | Kosten nur bei Verlust, ~2,8 % eines Kerns je gleichzeitig verdeckendem Sprecher. |
+| FEC war auf sauberen Netzen aus | `decide_fec` (`opus_encoder.c:943`) liefert 0 bei `PacketLoss_perc == 0`. Bis zur ersten `LossReport`-Runde (≥ 2 s, Schwelle 10 ‰) lief jeder erste Verlust auf PLC. | Untergrenze 3 %. Test `fec_floor_recovers_first_loss_without_hint`: Korrelation beim ersten Verlust 0,43 → 0,97; Paket 89 → 93 B im Mittel (~1,6 kbit/s aus dem Primärsignal). |
+| Jitter-Untergrenze | FEC braucht Paket n+1 im Puffer. Das Jitter-Ziel ist ohnehin p95 + 1 Frame; die alte 5-ms-Untergrenze griff praktisch nie. | Untergrenze immer 1 Frame. |
+| Bitrate bleibt 48 kbit/s | `mode_thresholds` (`opus_encoder.c:180-184`): Sprache mono ab 64 kbit/s CELT-only, dann weder LBRR noch SILK-basierte Deep PLC. | `AudioParams.max_bitrate = 64000` aus `Welcome` wird bewusst nicht übernommen (Drift zu „konfigurierbar 32–64“ oben). |
+
+Verworfen:
+
+| Option | Grund |
+| --- | --- |
+| DRED | Hilft nur, wenn ein *späteres* Paket im Puffer liegt, während frühere verdeckt werden; der flache Puffer (Start 40 ms) hat das selten. Dazu kommen DRED-Decoder und Jitter-Buffer-Anbindung. Neu prüfen, falls tiefere Puffer in Frage kommen. |
+| OSCE (LACE/NoLACE) | Laut Q13 nützlich bei 6–9 kbit/s; bei 48 kbit/s Hybrid ist die SILK-Schicht hochratig. Kostet CPU auf jedem Frame und +9,6 MB Quelltext Gewichte. Complexity 6/7 misst ohne OSCE-Build identisch zu 5. |
+| 10 ms als Default | Doppelte Paketrate und Overhead, LBRR weniger effizient; bleibt Option. |
+| RESTRICTED_LOWDELAY | Siehe oben: ohne SILK kein LBRR, keine Deep PLC. |
 
 ## Verified against
 

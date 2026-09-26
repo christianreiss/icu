@@ -146,7 +146,13 @@ async fn loss_hint_sets_packet_loss_perc() {
     let (engine, _dir) = server.engine("alice", Box::new(backend), true).await;
     let state = wait_connected(&engine).await;
     let speaker = state.me.unwrap().session;
-    assert_eq!(engine.packet_loss_perc(), 0);
+    // No hint yet: the encoder sits at its FEC floor.
+    let floor = icu_client::dsp::opus::FEC_FLOOR_PERCENT as i64;
+    assert!(
+        wait_until(SOON, || engine.packet_loss_perc() == floor).await,
+        "loss perc {}",
+        engine.packet_loss_perc()
+    );
 
     let mut bob = server.raw_client("bob").await;
     bob.send(&ControlMsg::LossReport {

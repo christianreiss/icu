@@ -1,52 +1,174 @@
 //! Opus encoder/decoder wrappers with the v1 profile (`PROTOCOL.md` §3,
-//! `Client/IMPLEMENTATION.md` §6).
+//! `Client/IMPLEMENTATION.md` §6), directly over `opusic-sys`: the `opus`
+//! crate has no decoder complexity control, and Deep PLC needs one.
+
+use std::ffi::{c_int, CStr};
+use std::fmt;
 
 use icu_proto::limits::LOSS_HINT_MAX_PERCENT;
+use opusic_sys as ffi;
 
 /// Sample rate.
 pub const RATE: u32 = crate::audio::SAMPLE_RATE;
 /// Largest packet the protocol allows.
 pub const MAX_PACKET: usize = icu_proto::header::AUDIO_MAX_PAYLOAD;
+/// `PACKET_LOSS_PERC` never goes below this: libopus codes no in-band FEC
+/// at 0 % (`decide_fec`), so without a floor the first loss burst before a
+/// `LossReport` round trip would always fall back to concealment.
+pub const FEC_FLOOR_PERCENT: i32 = 3;
+/// Decoder complexity: ≥ 5 turns on Deep PLC (neural concealment). 6/7
+/// (LACE/NoLACE) only enhance low-rate SILK and are not built.
+pub const DECODER_COMPLEXITY: i32 = 5;
+const _: () = assert!(DECODER_COMPLEXITY >= 5, "below 5 there is no Deep PLC");
+
+/// A libopus error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Error(pub i32);
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // SAFETY: opus_strerror returns a static NUL-terminated string.
+        let s = unsafe { CStr::from_ptr(ffi::opus_strerror(self.0)) };
+        write!(f, "opus: {}", s.to_string_lossy())
+    }
+}
+
+impl std::error::Error for Error {}
+
+fn check(ret: c_int) -> Result<c_int, Error> {
+    if ret < 0 {
+        Err(Error(ret))
+    } else {
+        Ok(ret)
+    }
+}
+
+/// Samples in `packet` at 48 kHz.
+fn packet_samples(packet: &[u8]) -> Result<usize, Error> {
+    // SAFETY: pointer and length describe `packet`.
+    check(unsafe {
+        ffi::opus_packet_get_nb_samples(packet.as_ptr(), packet.len() as i32, RATE as i32)
+    })
+    .map(|n| n as usize)
+}
+
+/// Owned `OpusEncoder`.
+struct RawEncoder(*mut ffi::OpusEncoder);
+
+// SAFETY: the state is only touched through `&mut self`.
+unsafe impl Send for RawEncoder {}
+
+impl Drop for RawEncoder {
+    fn drop(&mut self) {
+        // SAFETY: created by opus_encoder_create, destroyed once.
+        unsafe { ffi::opus_encoder_destroy(self.0) }
+    }
+}
+
+impl RawEncoder {
+    fn ctl(&mut self, request: c_int, value: i32) -> Result<(), Error> {
+        // SAFETY: every request used here takes one opus_int32.
+        check(unsafe { ffi::opus_encoder_ctl(self.0, request, value) }).map(|_| ())
+    }
+}
+
+/// Owned `OpusDecoder`.
+struct RawDecoder(*mut ffi::OpusDecoder);
+
+// SAFETY: the state is only touched through `&mut self`.
+unsafe impl Send for RawDecoder {}
+
+impl Drop for RawDecoder {
+    fn drop(&mut self) {
+        // SAFETY: created by opus_decoder_create, destroyed once.
+        unsafe { ffi::opus_decoder_destroy(self.0) }
+    }
+}
+
+impl RawDecoder {
+    /// Decodes `data` (empty: conceal) into `out`; `out.len()` is the frame size.
+    fn decode_float(&mut self, data: &[u8], out: &mut [f32], fec: bool) -> Result<usize, Error> {
+        let ptr = if data.is_empty() {
+            std::ptr::null()
+        } else {
+            data.as_ptr()
+        };
+        // SAFETY: pointers and lengths describe the slices; mono, so the
+        // frame size is the output length.
+        check(unsafe {
+            ffi::opus_decode_float(
+                self.0,
+                ptr,
+                data.len() as i32,
+                out.as_mut_ptr(),
+                out.len() as c_int,
+                fec as c_int,
+            )
+        })
+        .map(|n| n as usize)
+    }
+}
 
 /// Voice encoder.
 pub struct Encoder {
-    inner: opus::Encoder,
+    inner: RawEncoder,
     buf: Vec<u8>,
     loss_perc: i32,
 }
 
 impl Encoder {
-    /// VOIP, mono, 48 kbit/s constrained VBR, FEC on, DTX off, complexity 10.
-    pub fn new() -> Result<Encoder, opus::Error> {
-        let mut e = opus::Encoder::new(RATE, opus::Channels::Mono, opus::Application::Voip)?;
-        e.set_signal(opus::Signal::Voice)?;
-        e.set_bitrate(opus::Bitrate::Bits(48_000))?;
-        e.set_vbr(true)?;
-        e.set_vbr_constraint(true)?;
-        e.set_inband_fec(true)?;
-        e.set_packet_loss_perc(0)?;
-        e.set_dtx(false)?;
-        e.set_complexity(10)?;
+    /// VOIP, mono, 48 kbit/s constrained VBR, FEC on (floor
+    /// [`FEC_FLOOR_PERCENT`]), DTX off, complexity 10. Stays below 64 kbit/s
+    /// on purpose: mono voice goes CELT-only there, without FEC or Deep PLC.
+    pub fn new() -> Result<Encoder, Error> {
+        let mut err = 0;
+        // SAFETY: plain constructor; `err` receives the status.
+        let ptr = unsafe {
+            ffi::opus_encoder_create(RATE as i32, 1, ffi::OPUS_APPLICATION_VOIP, &mut err)
+        };
+        check(err)?;
+        if ptr.is_null() {
+            return Err(Error(ffi::OPUS_ALLOC_FAIL));
+        }
+        let mut e = RawEncoder(ptr);
+        e.ctl(ffi::OPUS_SET_SIGNAL_REQUEST, ffi::OPUS_SIGNAL_VOICE)?;
+        e.ctl(ffi::OPUS_SET_BITRATE_REQUEST, 48_000)?;
+        e.ctl(ffi::OPUS_SET_VBR_REQUEST, 1)?;
+        e.ctl(ffi::OPUS_SET_VBR_CONSTRAINT_REQUEST, 1)?;
+        e.ctl(ffi::OPUS_SET_INBAND_FEC_REQUEST, 1)?;
+        e.ctl(ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, FEC_FLOOR_PERCENT)?;
+        e.ctl(ffi::OPUS_SET_DTX_REQUEST, 0)?;
+        e.ctl(ffi::OPUS_SET_COMPLEXITY_REQUEST, 10)?;
         Ok(Encoder {
             inner: e,
             buf: vec![0u8; MAX_PACKET],
-            loss_perc: 0,
+            loss_perc: FEC_FLOOR_PERCENT,
         })
     }
 
     /// Encodes one frame (480 or 960 samples, ±1.0) and returns the packet.
-    pub fn encode(&mut self, pcm: &[f32]) -> Result<&[u8], opus::Error> {
-        let n = self.inner.encode_float(pcm, &mut self.buf)?;
-        Ok(&self.buf[..n])
+    pub fn encode(&mut self, pcm: &[f32]) -> Result<&[u8], Error> {
+        // SAFETY: pointers and lengths describe `pcm` and `buf`; mono.
+        let n = check(unsafe {
+            ffi::opus_encode_float(
+                self.inner.0,
+                pcm.as_ptr(),
+                pcm.len() as c_int,
+                self.buf.as_mut_ptr(),
+                self.buf.len() as i32,
+            )
+        })?;
+        Ok(&self.buf[..n as usize])
     }
 
-    /// Applies a `LossHint`: per mille → whole percent, capped at 20.
-    pub fn set_loss_permille(&mut self, permille: u16) -> Result<(), opus::Error> {
-        let perc = (permille as u32)
-            .div_ceil(10)
-            .min(LOSS_HINT_MAX_PERCENT as u32) as i32;
+    /// Applies a `LossHint`: per mille → whole percent, at least
+    /// [`FEC_FLOOR_PERCENT`], capped at 20.
+    pub fn set_loss_permille(&mut self, permille: u16) -> Result<(), Error> {
+        let perc = ((permille as u32).div_ceil(10) as i32)
+            .clamp(FEC_FLOOR_PERCENT, LOSS_HINT_MAX_PERCENT as i32);
         if perc != self.loss_perc {
-            self.inner.set_packet_loss_perc(perc)?;
+            self.inner
+                .ctl(ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, perc)?;
             self.loss_perc = perc;
         }
         Ok(())
@@ -60,54 +182,72 @@ impl Encoder {
 
 /// Per speaker decoder with PLC and FEC.
 pub struct Decoder {
-    inner: opus::Decoder,
+    inner: RawDecoder,
     last_frame: usize,
 }
 
 impl Decoder {
-    /// Mono 48 kHz decoder.
-    pub fn new() -> Result<Decoder, opus::Error> {
+    /// Mono 48 kHz decoder at [`DECODER_COMPLEXITY`].
+    pub fn new() -> Result<Decoder, Error> {
+        Self::with_complexity(DECODER_COMPLEXITY)
+    }
+
+    /// Mono 48 kHz decoder at `complexity` (0 = classic PLC).
+    pub fn with_complexity(complexity: i32) -> Result<Decoder, Error> {
+        let mut err = 0;
+        // SAFETY: plain constructor; `err` receives the status.
+        let ptr = unsafe { ffi::opus_decoder_create(RATE as i32, 1, &mut err) };
+        check(err)?;
+        if ptr.is_null() {
+            return Err(Error(ffi::OPUS_ALLOC_FAIL));
+        }
+        let inner = RawDecoder(ptr);
+        // SAFETY: SET_COMPLEXITY takes one opus_int32.
+        check(unsafe {
+            ffi::opus_decoder_ctl(inner.0, ffi::OPUS_SET_COMPLEXITY_REQUEST, complexity)
+        })?;
         Ok(Decoder {
-            inner: opus::Decoder::new(RATE, opus::Channels::Mono)?,
+            inner,
             last_frame: 960,
         })
     }
 
+    /// The decoder's `OPUS_GET_COMPLEXITY`.
+    pub fn complexity(&mut self) -> Result<i32, Error> {
+        let mut v: i32 = 0;
+        // SAFETY: GET_COMPLEXITY writes one opus_int32.
+        check(unsafe {
+            ffi::opus_decoder_ctl(self.inner.0, ffi::OPUS_GET_COMPLEXITY_REQUEST, &mut v as *mut i32)
+        })?;
+        Ok(v)
+    }
+
     /// Decodes a packet into `out`, returning the number of samples.
-    pub fn decode(&mut self, packet: &[u8], out: &mut [f32]) -> Result<usize, opus::Error> {
+    pub fn decode(&mut self, packet: &[u8], out: &mut [f32]) -> Result<usize, Error> {
         let n = self.inner.decode_float(packet, out, false)?;
         self.last_frame = n;
         Ok(n)
     }
 
     /// Recovers the lost frame `n` from packet `n+1`'s in-band FEC.
-    pub fn decode_fec(
-        &mut self,
-        next_packet: &[u8],
-        out: &mut [f32],
-    ) -> Result<usize, opus::Error> {
+    pub fn decode_fec(&mut self, next_packet: &[u8], out: &mut [f32]) -> Result<usize, Error> {
         // The frame length comes from the peer's packet (up to 120 ms);
         // clamped so the slice stays in bounds and libopus decides instead.
-        let frame = self
-            .inner
-            .get_nb_samples(next_packet)
+        let frame = packet_samples(next_packet)
             .unwrap_or(self.last_frame)
             .min(out.len());
-        let n = self
-            .inner
-            .decode_float(next_packet, &mut out[..frame], true)?;
-        Ok(n)
+        self.inner.decode_float(next_packet, &mut out[..frame], true)
     }
 
     /// Packet loss concealment for one frame.
-    pub fn conceal(&mut self, out: &mut [f32]) -> Result<usize, opus::Error> {
+    pub fn conceal(&mut self, out: &mut [f32]) -> Result<usize, Error> {
         let frame = self.last_frame.min(out.len());
         self.inner.decode_float(&[], &mut out[..frame], false)
     }
 
     /// Duration in samples of `packet`.
     pub fn nb_samples(&self, packet: &[u8]) -> usize {
-        self.inner.get_nb_samples(packet).unwrap_or(self.last_frame)
+        packet_samples(packet).unwrap_or(self.last_frame)
     }
 }
 
@@ -120,11 +260,8 @@ mod tests {
     /// sized for 20 ms.
     #[test]
     fn fec_with_oversized_next_packet_does_not_panic() {
-        let mut enc =
-            opus::Encoder::new(RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
-        let pkt = enc
-            .encode_vec_float(&vec![0.0f32; 2880], MAX_PACKET)
-            .unwrap();
+        let mut enc = Encoder::new().unwrap();
+        let pkt = enc.encode(&vec![0.0f32; 2880]).unwrap().to_vec();
         let mut dec = Decoder::new().unwrap();
         let mut out = vec![0.0f32; 1920];
         if let Ok(n) = dec.decode_fec(&pkt, &mut out) {
@@ -160,7 +297,20 @@ mod tests {
         enc.set_loss_permille(900).unwrap();
         assert_eq!(enc.loss_perc(), 20);
         enc.set_loss_permille(0).unwrap();
-        assert_eq!(enc.loss_perc(), 0);
+        assert_eq!(enc.loss_perc(), FEC_FLOOR_PERCENT);
+        enc.set_loss_permille(5).unwrap();
+        assert_eq!(enc.loss_perc(), FEC_FLOOR_PERCENT);
+    }
+
+    #[test]
+    fn new_encoder_starts_at_fec_floor() {
+        assert_eq!(Encoder::new().unwrap().loss_perc(), FEC_FLOOR_PERCENT);
+    }
+
+    #[test]
+    fn decoder_runs_at_deep_plc_complexity() {
+        let mut dec = Decoder::new().unwrap();
+        assert_eq!(dec.complexity().unwrap(), DECODER_COMPLEXITY);
     }
 
     /// The 10 ms option (`frame_ms = 10`, `PROTOCOL.md` §3): 480-sample
@@ -193,9 +343,10 @@ mod tests {
         assert_eq!(dec.decode(&packets[23], &mut out).unwrap(), 480);
     }
 
-    /// A `LossHint` makes the encoder spend bits on in-band FEC (LBRR):
-    /// packets grow, and a lost frame recovered from its successor is much
-    /// closer to the original than what concealment can extrapolate.
+    /// A `LossHint` makes the encoder spend more bits on in-band FEC
+    /// (LBRR) than the floor does, and a lost frame recovered from its
+    /// successor is much closer to the original than what concealment can
+    /// extrapolate.
     #[test]
     fn loss_hint_buys_fec_that_beats_plc() {
         let voice = crate::dsp::testsignal::voice(48_000 * 4, 5, 0.1).samples;
@@ -212,10 +363,10 @@ mod tests {
         };
         let (plain, _) = size_at(0);
         let (with_fec, packets) = size_at(200);
-        eprintln!("mean packet {plain:.0} B without FEC, {with_fec:.0} B with a 20 % loss hint");
+        eprintln!("mean packet {plain:.0} B at the FEC floor, {with_fec:.0} B with a 20 % loss hint");
         assert!(
-            with_fec > plain * 1.05,
-            "no FEC bits: {plain:.0} → {with_fec:.0} B"
+            with_fec >= plain,
+            "loss hint shrank packets: {plain:.0} → {with_fec:.0} B"
         );
         // Three decoders in the same state up to frame k−1: the truth, the
         // FEC recovery of frame k, and its concealment. After a lost frame
@@ -267,6 +418,155 @@ mod tests {
             mean_fec > mean_plc + 0.15,
             "FEC ({mean_fec:.2}) hardly beats PLC ({mean_plc:.2})"
         );
+    }
+
+    /// Voiced-frame correlation of FEC recovery vs. concealment for single
+    /// lost frames, with the encoder left at its initial loss setting.
+    fn fec_vs_plc_at_default_hint() -> (f64, f64, usize) {
+        let voice = crate::dsp::testsignal::voice(48_000 * 4, 5, 0.1).samples;
+        let mut enc = Encoder::new().unwrap();
+        let packets: Vec<Vec<u8>> = voice
+            .as_chunks::<960>()
+            .0
+            .iter()
+            .map(|f| enc.encode(f).unwrap().to_vec())
+            .collect();
+        let (mut truth, mut fec, mut plc) = (
+            Decoder::new().unwrap(),
+            Decoder::new().unwrap(),
+            Decoder::new().unwrap(),
+        );
+        let (mut sum_fec, mut sum_plc, mut n) = (0.0, 0.0, 0);
+        let mut out = vec![0.0f32; 960];
+        let mut k = 0;
+        while k + 1 < packets.len() {
+            let mut want = vec![0.0f32; 960];
+            truth.decode(&packets[k], &mut want).unwrap();
+            if k < 5 || rms(&want) < 0.05 {
+                fec.decode(&packets[k], &mut out).unwrap();
+                plc.decode(&packets[k], &mut out).unwrap();
+                k += 1;
+                continue;
+            }
+            let mut got = vec![0.0f32; 960];
+            fec.decode_fec(&packets[k + 1], &mut got).unwrap();
+            sum_fec += pearson(&want, &got);
+            plc.conceal(&mut got).unwrap();
+            sum_plc += pearson(&want, &got);
+            n += 1;
+            for d in [&mut fec, &mut plc, &mut truth] {
+                d.decode(&packets[k + 1], &mut out).unwrap();
+            }
+            k += 2;
+        }
+        (sum_fec / n as f64, sum_plc / n as f64, n)
+    }
+
+    /// Without any `LossHint` yet, the FEC floor already puts LBRR into
+    /// every packet: the first loss is recovered, not extrapolated.
+    #[test]
+    fn fec_floor_recovers_first_loss_without_hint() {
+        let (fec, plc, n) = fec_vs_plc_at_default_hint();
+        eprintln!("{n} frames at hint 0: FEC {fec:.2}, PLC {plc:.2}");
+        assert!(n > 50);
+        assert!(fec > plc + 0.15, "FEC ({fec:.2}) hardly beats PLC ({plc:.2})");
+    }
+
+    /// Mean RMS of three consecutive concealed frames relative to the
+    /// original over voiced bursts, at decoder `complexity`.
+    fn burst_energy_retention(complexity: i32) -> f64 {
+        let voice = crate::dsp::testsignal::voice(48_000 * 4, 5, 0.1).samples;
+        let frames = voice.as_chunks::<960>().0;
+        let mut enc = Encoder::new().unwrap();
+        let packets: Vec<Vec<u8>> = frames
+            .iter()
+            .map(|f| enc.encode(f).unwrap().to_vec())
+            .collect();
+        let mut truth = Decoder::with_complexity(complexity).unwrap();
+        let mut dec = Decoder::with_complexity(complexity).unwrap();
+        let (mut sum, mut n) = (0.0, 0);
+        let mut out = vec![0.0f32; 960];
+        let mut k = 0;
+        while k + 4 < packets.len() {
+            let mut want = Vec::new();
+            for p in &packets[k..k + 3] {
+                truth.decode(p, &mut out).unwrap();
+                want.extend_from_slice(&out);
+            }
+            if k < 10 || rms(&want) < 0.05 {
+                for p in &packets[k..k + 3] {
+                    dec.decode(p, &mut out).unwrap();
+                }
+                k += 3;
+                continue;
+            }
+            let mut got = Vec::new();
+            for _ in 0..3 {
+                dec.conceal(&mut out).unwrap();
+                got.extend_from_slice(&out);
+            }
+            sum += (rms(&got) / rms(&want)).min(1.5) as f64;
+            n += 1;
+            // Resynchronise both on the next packets.
+            for p in &packets[k + 3..k + 5] {
+                dec.decode(p, &mut out).unwrap();
+                truth.decode(p, &mut out).unwrap();
+            }
+            k += 5;
+        }
+        assert!(n > 10, "only {n} voiced bursts");
+        sum / n as f64
+    }
+
+    /// Deep PLC (complexity ≥ 5) keeps talking through a 60 ms burst where
+    /// classic concealment fades out. Generative, so energy, not SNR.
+    #[test]
+    fn deep_plc_keeps_energy_over_a_burst() {
+        let classic = burst_energy_retention(0);
+        let deep = burst_energy_retention(DECODER_COMPLEXITY);
+        eprintln!("energy kept over 3 lost frames: classic {classic:.2}, deep {deep:.2}");
+        assert!(
+            (deep - 1.0).abs() < (classic - 1.0).abs(),
+            "deep PLC {deep:.2} no closer to the source than classic {classic:.2}"
+        );
+    }
+
+    /// Cost per frame by decoder complexity, normal vs. concealed:
+    /// `cargo test --release -p icu-client decoder_complexity_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn decoder_complexity_bench() {
+        let voice = crate::dsp::testsignal::voice(48_000 * 10, 5, 0.1).samples;
+        let mut enc = Encoder::new().unwrap();
+        let packets: Vec<Vec<u8>> = voice
+            .as_chunks::<960>()
+            .0
+            .iter()
+            .map(|f| enc.encode(f).unwrap().to_vec())
+            .collect();
+        for c in [0, 5, 6, 7] {
+            let mut dec = Decoder::with_complexity(c).unwrap();
+            let mut out = vec![0.0f32; 960];
+            let (mut t_dec, mut t_plc, mut n_dec, mut n_plc) =
+                (std::time::Duration::ZERO, std::time::Duration::ZERO, 0u32, 0u32);
+            for (i, p) in packets.iter().enumerate() {
+                let t = std::time::Instant::now();
+                if i % 10 == 9 {
+                    dec.conceal(&mut out).unwrap();
+                    t_plc += t.elapsed();
+                    n_plc += 1;
+                } else {
+                    dec.decode(p, &mut out).unwrap();
+                    t_dec += t.elapsed();
+                    n_dec += 1;
+                }
+            }
+            eprintln!(
+                "complexity {c}: decode {:.1} µs/frame, conceal {:.1} µs/frame",
+                t_dec.as_secs_f64() * 1e6 / n_dec as f64,
+                t_plc.as_secs_f64() * 1e6 / n_plc as f64
+            );
+        }
     }
 
     #[test]

@@ -58,7 +58,7 @@ sha2.workspace = true
 time.workspace = true
 
 # Audio
-opus = "0.4.0"
+opusic-sys = { version = "0.7.5", features = ["bundled", "dred"] }
 nnnoiseless = { version = "0.5.2", default-features = false }
 webrtc-audio-processing = { version = "~2.1", features = ["bundled"], optional = true }
 webrtc-audio-processing-config = { version = "~2.1", optional = true }

@@ -540,7 +540,6 @@ struct Speaker {
     /// Loss accounting for `LossReport`: (played, lost) at the last report.
     report_base: (u64, u64),
     last_reported_permille: u16,
-    loss_hinted: bool,
     /// The frame last queued for this speaker was quiet (below
     /// [`QUIET_RMS`]): the jitter buffer may adjust its depth now without
     /// anyone hearing it (`JitterBuffer::pop_quiet`).
@@ -561,7 +560,7 @@ fn frame_quiet(samples: &[f32]) -> bool {
 }
 
 impl Speaker {
-    fn new(user_id: UserId, volume: f32, frame_samples: u32) -> Result<Speaker, ::opus::Error> {
+    fn new(user_id: UserId, volume: f32, frame_samples: u32) -> Result<Speaker, opus::Error> {
         Ok(Speaker {
             user_id,
             jitter: JitterBuffer::new(JitterConfig {
@@ -578,7 +577,6 @@ impl Speaker {
             concealed: 0,
             report_base: (0, 0),
             last_reported_permille: 0,
-            loss_hinted: false,
             quiet: true,
         })
     }
@@ -1237,6 +1235,9 @@ fn dsp_thread(
             return;
         }
     };
+    stats
+        .packet_loss_perc
+        .store(encoder.loss_perc() as i64, Ordering::Relaxed);
     let mut auto_threshold = vad_auto::AutoThreshold::new(Instant::now());
     let mut gate = Gate::new(
         mode_of(ctl.vad_mode.load(Ordering::Relaxed)),
@@ -3628,14 +3629,6 @@ fn collect_loss_reports(shared: &Arc<Shared>) -> (LossPerSpeaker, LossPerSpeaker
         if permille.abs_diff(sp.last_reported_permille) >= 10 {
             sp.last_reported_permille = permille;
             report.push((*session, permille));
-        }
-        // What we reported is what the server hints this speaker with, and
-        // the hint is what turns the speaker's FEC on: keep one frame in the
-        // buffer for packet n+1 exactly then (`JitterBuffer::set_loss_hinted`).
-        let hinted = sp.last_reported_permille > 0;
-        if sp.loss_hinted != hinted {
-            sp.loss_hinted = hinted;
-            sp.jitter.set_loss_hinted(hinted);
         }
     }
     (report, all)
