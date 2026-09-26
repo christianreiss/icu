@@ -30,7 +30,7 @@ were needed.
 | A recovered audio device left its old error banner visible. | Reopening replaces an audio error with the current outcome while preserving unrelated problems. |
 | A silent named-pipe client could block handoff; acknowledgement handling could lose or repeat requests. | Async I/O, eight active clients maximum, two-second request timeout, three-second handoff deadline, exclusive first pipe, receipt acknowledgement and no request replay after sending. Dropping the listener cancels pending I/O. |
 | Toast workers did not balance COM initialization. | Every successful initialization, including `S_FALSE`, is paired with `CoUninitialize`. |
-| Setup, settings and invitation windows could put their actions below the taskbar. | Windows windows are fitted to the usable monitor rectangle, with title-bar margins and capped minimum sizes. Subsequent growth respects available space. |
+| Main, setup, settings and invitation windows could extend below the taskbar. | Windows windows are fitted to the usable monitor rectangle, with title-bar margins and capped minimum sizes. Subsequent growth respects available space. |
 | Close-to-tray kept rendering an invisible Win32 window. | Hidden Windows windows are also minimized so eframe skips rendering; restore explicitly removes minimization. Connected hidden CPU fell from about two cores to near idle in the VM. |
 | Minimized enrollment did not process handoff/completion; an idle invitation repainted continuously. | Handoff and enrollment completion run in `App::logic`, with wake callbacks. Only pending registration needs periodic polling. Idle invitation CPU fell from several cores to near idle. |
 | Windows packaging could omit third-party notices and reuse Linux-only attribution. | Packaging requires `cargo deny` and generates notices for the actual Windows target/features, including native audio/video dependencies and the embedded Inter font. Missing notices fail the build. |
@@ -40,7 +40,8 @@ were needed.
 - Linux: `cargo test --workspace --locked` — **593 passed, 0 failed,
   5 ignored**, across 26 suites. Two playout continuity tests failed during
   a concurrent release build; the complete rerun without build load passed.
-  Their assertions and thresholds were not weakened.
+  Their assertions and thresholds were not weakened. The final Windows-only
+  main-window bounds change also passed all nine UI layout tests.
 - Windows: cross-built client library tests executed natively on the VM
   with `--test-threads=2` — **231 passed, 0 failed, 3 ignored**.
 - Strict Clippy: Linux workspace and Windows client, `--all-targets --
@@ -84,7 +85,7 @@ The portable package is
 executable:
 
 ```text
-33499bf520c789f16d976de54788ad5e99165cec9a18c2cc4b7ab7b1ad3bb53d
+15378d2514ac67a5a1a6533b121799ce13e90adcb85b6fa2ff8df34265f4698d
 ```
 
 The previous package is preserved at
@@ -93,6 +94,19 @@ The previous package is preserved at
 To roll back, quit ICU, copy that backup's files over the installed package,
 then launch ICU again. The existing user's identity and settings were not
 replaced. Test identities and settings were confined to `icu-gate`.
+The normal VM profile retains its existing identity and server at
+`10.2.0.10:4712` (display name `localhost`); parity tests used the separate
+LAN profile above. The
+isolated server/peers and temporary `ICU-Gate*` scheduled tasks were stopped
+or removed after testing; Audiosrv is running. Large test executables and
+intermediate ZIPs were removed; logs, the candidate and rollback copy remain.
+
+For hands-on review, the existing VM backend was restarted as the transient
+user service `icu-windows-vm-gate` on this Linux host, bound to
+`10.2.0.10:4712`. Its test CA/users remain in `/home/chris/icu-live-win/server`;
+the original configuration was preserved. The LAN-only configuration is
+`.scratch/windows-gate/vm-review-server.toml`. Stop it with
+`systemctl --user stop icu-windows-vm-gate`; it is not a production service.
 
 ## Remaining production checks
 

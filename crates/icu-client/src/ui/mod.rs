@@ -91,6 +91,20 @@ pub(crate) fn fit_window(size: [f32; 2], area: egui::Rect) -> (egui::Vec2, egui:
     (size, pos)
 }
 
+#[cfg(windows)]
+pub(crate) fn position_window(ctx: &egui::Context, size: [f32; 2], min: [f32; 2]) -> bool {
+    let Some(area) = work_area(ctx) else {
+        return false;
+    };
+    let (size, pos) = fit_window(size, area);
+    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
+        egui::vec2(min[0], min[1]).min(size),
+    ));
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+    true
+}
+
 /// Grows the window `ctx` draws into by `overflow` points so its content
 /// fits without a scroll bar, up to 90 % of the monitor. Never shrinks: a
 /// window the user resized, or one that grew for a taller page, stays.

@@ -185,6 +185,8 @@ struct App {
     title: String,
     /// The window has been sized to the list once since connecting.
     fitted: bool,
+    #[cfg(windows)]
+    positioned: bool,
     /// People in the list last frame; one more may grow the window.
     rows_seen: usize,
     quit_requested: bool,
@@ -224,6 +226,11 @@ impl App {
         let inner = ctx.content_rect();
         let monitor = ctx.input(|i| i.viewport().monitor_size);
         let max = monitor.map_or(f32::INFINITY, |m| m.y * 0.9);
+        #[cfg(windows)]
+        let max = super::work_area(ctx).map_or(max, |area| {
+            let top = ctx.input(|i| i.viewport().outer_rect.map(|r| r.top()));
+            max.min((area.bottom() - top.unwrap_or(area.top()) - 48.0).max(inner.height()))
+        });
         let height = (inner.height() + overflow).min(max).ceil();
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             inner.width(),
@@ -316,6 +323,8 @@ impl App {
             window_visible: !start_minimized,
             title: "ICU".into(),
             fitted: false,
+            #[cfg(windows)]
+            positioned: false,
             rows_seen: 0,
             quit_requested: false,
             #[cfg(feature = "tray")]
@@ -526,6 +535,10 @@ impl eframe::App for App {
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        #[cfg(windows)]
+        if !self.positioned {
+            self.positioned = super::position_window(&ctx, [400.0, 620.0], [360.0, 320.0]);
+        }
         ctx.request_repaint_after(Duration::from_millis(33));
 
         self.debug_window(&ctx);
@@ -2290,15 +2303,7 @@ impl eframe::App for EnrollApp {
         let ctx = root.ctx().clone();
         #[cfg(windows)]
         if !self.positioned {
-            if let Some(area) = super::work_area(&ctx) {
-                let (size, pos) = super::fit_window([560.0, 600.0], area);
-                ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(
-                    egui::vec2(480.0, 520.0).min(size),
-                ));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                self.positioned = true;
-            }
+            self.positioned = super::position_window(&ctx, [560.0, 600.0], [480.0, 520.0]);
         }
         let busy = self.pending.is_some();
         if !busy {
