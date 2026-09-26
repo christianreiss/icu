@@ -285,3 +285,114 @@ async fn a_startup_problem_is_the_first_banner() {
     engine.shutdown();
     server.handle.shutdown().await;
 }
+
+/// Goertzel power of `freq` Hz in `x` (48 kHz).
+fn tone_power(x: &[f32], freq: f32) -> f32 {
+    let coeff = 2.0 * (2.0 * std::f32::consts::PI * freq / 48_000.0).cos();
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    for &v in x {
+        let s0 = v + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    s1 * s1 + s2 * s2 - coeff * s1 * s2
+}
+
+fn peak(x: &[f32]) -> f32 {
+    x.iter().fold(0.0f32, |m, v| m.max(v.abs()))
+}
+
+/// An engine alone on the server, sending the test tone (its gate held
+/// open), with only the transmit cue among the cues switched as asked.
+async fn lone_sender(
+    server: &TestServer,
+    name: &str,
+    cue_tx: bool,
+) -> (
+    icu_client::engine::Engine,
+    icu_client::audio::fake::FakeProbe,
+    tempfile::TempDir,
+) {
+    let (identity, paths, dir) = server.enroll(name).await;
+    let mut settings = test_settings();
+    settings.audio.cue_tx = cue_tx;
+    settings.audio.cue_mute = false;
+    settings.audio.cue_join = false;
+    let (backend, probe) = FakeBackend::silent();
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, settings, paths);
+    cfg.server_addr = Some(server.addr());
+    cfg.test_tone = true;
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).expect("engine starts");
+    (engine, probe, dir)
+}
+
+/// „Senden beginnt oder endet“ (`audio.cue_tx`): a high tone when sending
+/// starts, a lower one when it ends — and nothing when the cue is off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_transmit_cue_marks_start_and_end_of_sending() {
+    let server = TestServer::start().await;
+
+    let (engine, probe, _dir) = lone_sender(&server, "alice", true).await;
+    wait_connected(&engine).await;
+    wait_for(&engine, SOON, |s| s.sending).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let start = probe.played();
+    assert!(peak(&start) > 0.05, "a start cue, peak {}", peak(&start));
+    assert!(
+        tone_power(&start, 1000.0) > 10.0 * tone_power(&start, 800.0),
+        "the start cue is the high one"
+    );
+    probe.clear();
+    engine.command(Command::SetMuted(true));
+    wait_for(&engine, SOON, |s| !s.sending).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let stop = probe.played();
+    assert!(peak(&stop) > 0.05, "a stop cue, peak {}", peak(&stop));
+    assert!(
+        tone_power(&stop, 800.0) > 10.0 * tone_power(&stop, 1000.0),
+        "the stop cue is the low one"
+    );
+    engine.shutdown();
+
+    let (quiet, probe, _dir) = lone_sender(&server, "bob", false).await;
+    wait_connected(&quiet).await;
+    wait_for(&quiet, SOON, |s| s.sending).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(peak(&probe.played()) < 1e-3, "no cue when it is off");
+    quiet.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// The speaking indicator follows the voice closely: it goes out within a
+/// few frames of the speaker falling silent, and stays out — the server's
+/// 500-ms flag and a 300-ms hold used to keep it lit, or light it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_speaking_indicator_goes_out_with_the_voice() {
+    let server = TestServer::start().await;
+    let (alice, _dir_a) = server
+        .engine("alice", Box::new(FakeBackend::silent().0), true)
+        .await;
+    let (bob, _dir_b) = server
+        .engine("bob", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&alice).await;
+    wait_for(&bob, SOON, |s| s.peers.iter().any(|p| p.speaking)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let t0 = std::time::Instant::now();
+    alice.command(Command::SetMuted(true));
+    wait_for(&bob, SOON, |s| s.peers.iter().all(|p| !p.speaking)).await;
+    let off = t0.elapsed();
+    assert!(off < Duration::from_millis(250), "went out after {off:?}");
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            bob.snapshot().peers.iter().all(|p| !p.speaking),
+            "lit again after going out"
+        );
+    }
+
+    alice.shutdown();
+    bob.shutdown();
+    server.handle.shutdown().await;
+}

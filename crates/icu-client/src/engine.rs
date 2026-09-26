@@ -178,7 +178,7 @@ pub struct AppState {
     pub ptt_down: bool,
     /// Gate open (audio is going out).
     pub sending: bool,
-    /// The voice detector heard speech in the last state push (~50 ms),
+    /// The voice detector heard speech in the last state push (~30 ms),
     /// muted or not: the main window warns about talking while muted.
     pub voice: bool,
     /// Microphone level after processing.
@@ -396,6 +396,8 @@ pub struct DspControl {
     reinit_aec: AtomicBool,
     stop: AtomicBool,
     test_tone: AtomicBool,
+    /// `audio.cue_tx`: a cue when sending starts and ends.
+    cue_tx: AtomicBool,
 }
 
 impl DspControl {
@@ -429,6 +431,7 @@ impl DspControl {
             reinit_aec: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             test_tone: AtomicBool::new(test_tone),
+            cue_tx: AtomicBool::new(false),
         };
         ctl.apply_settings(s);
         ctl
@@ -461,6 +464,7 @@ impl DspControl {
             if s.audio.frame_ms == 10 { 480 } else { 960 },
             Ordering::Relaxed,
         );
+        self.cue_tx.store(s.audio.cue_tx, Ordering::Relaxed);
     }
 
     /// Current level.
@@ -482,6 +486,11 @@ struct Speaker {
     volume: f32,
     /// Loudness normalization, ahead of `volume`.
     norm: Normalizer,
+    /// The last datagram carried `END`: the talk spurt is over.
+    ended: bool,
+    /// What the local path last said about this speaker talking
+    /// ([`local_indicator`]); `None` while the server's flag decides.
+    indicator: Option<bool>,
     /// Loss accounting for `LossReport`: (played, lost) at the last report.
     report_base: (u64, u64),
     last_reported_permille: u16,
@@ -499,6 +508,8 @@ impl Speaker {
             decoder: opus::Decoder::new()?,
             pending: VecDeque::with_capacity(4 * BLOCK),
             last_packet: None,
+            ended: false,
+            indicator: None,
             volume,
             norm: Normalizer::new(),
             report_base: (0, 0),
@@ -521,6 +532,10 @@ struct Shared {
     /// `audio.normalize_incoming`, read by the mixer.
     normalize_incoming: AtomicBool,
     cues: Mutex<VecDeque<f32>>,
+    /// A transmit cue the DSP thread asks the mixer to play
+    /// ([`TX_CUE_START`], [`TX_CUE_STOP`], 0 = none): the DSP thread neither
+    /// renders nor takes the cue lock.
+    pending_tx_cue: AtomicU8,
     /// The AEC reference stream is open.
     reference_open: AtomicBool,
     /// Push times of the capture and reference callbacks, so the DSP thread
@@ -722,7 +737,10 @@ impl Engine {
             deafened: AtomicBool::new(false),
             output_gain: AtomicF32::new(mixer::volume_gain(settings.audio.output_volume)),
             normalize_incoming: AtomicBool::new(settings.audio.normalize_incoming),
-            cues: Mutex::new(VecDeque::new()),
+            // Room for a second of cues, so queueing one in the mixer
+            // thread never allocates.
+            cues: Mutex::new(VecDeque::with_capacity(48_000)),
+            pending_tx_cue: AtomicU8::new(0),
             reference_open: AtomicBool::new(false),
             cycle: Arc::new(CycleClock::default()),
             keyframe_request: AtomicBool::new(false),
@@ -1374,6 +1392,11 @@ fn dsp_thread(
 
             let sending = decision != Decision::Silent && online;
             ctl.sending.store(sending, Ordering::Relaxed);
+            if ctl.cue_tx.load(Ordering::Relaxed) {
+                if let Some(cue) = tx_cue(prev_sent, sending, decision) {
+                    shared.pending_tx_cue.store(cue, Ordering::Relaxed);
+                }
+            }
             if sending {
                 // Pre-roll: the frame before the one RNNoise reacted to
                 // carries the onset; send it first with the seq/ts it would
@@ -1423,8 +1446,10 @@ fn dsp_thread(
 
         stats.dsp_block.lock().unwrap().record(t_block.elapsed());
 
-        // 5. Push level/sending into the UI state at ~20 Hz.
-        if last_state_push.elapsed() > Duration::from_millis(50) {
+        // 5. Push level/sending into the UI state at ~33 Hz (the meter
+        // wants ≥ 30 Hz): checked once per 10-ms block, so ≥ 25 ms means
+        // every third block.
+        if last_state_push.elapsed() >= Duration::from_millis(25) {
             last_state_push = Instant::now();
             let sending = ctl.sending.load(Ordering::Relaxed);
             let ptt = ctl.ptt_down.load(Ordering::Relaxed);
@@ -1462,6 +1487,25 @@ fn mode_of(vad: bool) -> Mode {
 /// after the hangover) is never sent twice.
 fn preroll_now(was_open: bool, prev_sent: bool, decision: Decision, mode: Mode) -> bool {
     !was_open && !prev_sent && decision != Decision::Silent && mode == Mode::Vad
+}
+
+/// [`Shared::pending_tx_cue`]: sending started.
+const TX_CUE_START: u8 = 1;
+/// [`Shared::pending_tx_cue`]: sending ended.
+const TX_CUE_STOP: u8 = 2;
+
+/// The transmit cue for one frame (`audio.cue_tx`): when sending starts,
+/// and when its last packet — the one with `END` — goes out. VAD flutter
+/// within the hangover or the PTT release delay keeps the gate open, so it
+/// makes no edge and no cue.
+fn tx_cue(was_sending: bool, sending: bool, decision: Decision) -> Option<u8> {
+    if !sending {
+        None
+    } else if !was_sending {
+        Some(TX_CUE_START)
+    } else {
+        (decision == Decision::SendEnd).then_some(TX_CUE_STOP)
+    }
 }
 
 /// Wraps one encoded frame in its header and hands it to the connection.
@@ -1512,7 +1556,13 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
     // this thread once every speaker has its buffer.
     let mut inputs: Vec<(Vec<f32>, f32)> = Vec::new();
     let mut cue_buf = vec![0.0f32; BLOCK];
-    let mut last_indicator = Instant::now();
+    // Rendered once: this thread must not allocate per block.
+    let tx_start = crate::cues::render(Cue::TxStart);
+    let tx_stop = crate::cues::render(Cue::TxStop);
+    // Speaking indicator changes of this block, published after the
+    // speakers lock is released; sized for `MAX_MAX_USERS` speakers.
+    let mut indicator_changes: Vec<(Session, Option<bool>)> =
+        Vec::with_capacity(pl::MAX_MAX_USERS as usize);
     let mut stalled_since: Option<Instant> = None;
     // 120 ms, the longest frame Opus allows: a peer picks its frame length.
     let mut fec_scratch = vec![0.0f32; 5760];
@@ -1553,7 +1603,15 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
         let mut n_inputs = 0;
         {
             let mut speakers = lock(&shared.speakers);
-            for sp in speakers.values_mut() {
+            for (session, sp) in speakers.iter_mut() {
+                // Speaking indicator from the local datagram path, every
+                // block: on within a block of the first packet, off two
+                // frames after the last or at once on `END`.
+                let local = local_indicator(sp.last_packet, sp.ended, now);
+                if local != sp.indicator {
+                    sp.indicator = local;
+                    indicator_changes.push((*session, local));
+                }
                 let before = sp.jitter.stats();
                 while sp.pending.len() < BLOCK {
                     match sp.jitter.pop(now) {
@@ -1614,6 +1672,11 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
         // Cues are heard even when deafened.
         let cue = {
             let mut cues = shared.cues.lock().unwrap();
+            match shared.pending_tx_cue.swap(0, Ordering::Relaxed) {
+                TX_CUE_START => cues.extend(tx_start.iter().copied()),
+                TX_CUE_STOP => cues.extend(tx_stop.iter().copied()),
+                _ => {}
+            }
             if cues.is_empty() {
                 None
             } else {
@@ -1635,41 +1698,45 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
             DebugStats::add(&stats.samples_played, n as u64);
         }
 
-        // Speaking indicator from the local datagram path, 10 Hz.
-        if last_indicator.elapsed() > Duration::from_millis(100) {
-            last_indicator = Instant::now();
-            let speaking: Vec<(Session, bool)> = {
-                let speakers = lock(&shared.speakers);
-                speakers
-                    .iter()
-                    .map(|(s, sp)| {
-                        (
-                            *s,
-                            sp.last_packet
-                                .map(|t| t.elapsed() < Duration::from_millis(300))
-                                .unwrap_or(false),
-                        )
-                    })
-                    .collect()
-            };
+        // Published only when the local path changed its mind, and outside
+        // the speakers lock: the window is not woken per block.
+        if !indicator_changes.is_empty() {
             shared.state.send_if_modified(|s| {
                 let mut changed = false;
                 for p in s.peers.iter_mut() {
-                    let local = speaking
+                    if let Some((_, local)) = indicator_changes
                         .iter()
-                        .find(|(sess, _)| *sess == p.info.session)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(false);
-                    let want = local || p.info.flags.speaking();
-                    if p.speaking != want {
-                        p.speaking = want;
-                        changed = true;
+                        .find(|(session, _)| *session == p.info.session)
+                    {
+                        let want = local.unwrap_or(p.info.flags.speaking());
+                        changed |= std::mem::replace(&mut p.speaking, want) != want;
                     }
                 }
                 changed
             });
+            indicator_changes.clear();
         }
     }
+}
+
+/// How long a speaker counts as talking after its last datagram: two
+/// 20-ms frames plus a little arrival jitter.
+const SPEAKING_HOLD: Duration = Duration::from_millis(60);
+
+/// How long after its last datagram the local path still decides a
+/// speaker's indicator; after that the server's `speaking` flag does
+/// (`Client/IMPLEMENTATION.md` §6: deafened, peer at volume 0, no audio).
+const LOCAL_AUTHORITY: Duration = Duration::from_secs(1);
+
+/// The speaking indicator as the local datagram path sees it: `None` when
+/// none of the speaker's audio arrived within [`LOCAL_AUTHORITY`] — the
+/// server's flag decides then — otherwise whether a datagram arrived within
+/// [`SPEAKING_HOLD`] and the last one did not end the talk spurt. Without
+/// the `None`, the server's flag, cleared only on `END` or after 500 ms
+/// without audio, kept every indicator lit long after the voice stopped.
+fn local_indicator(last_packet: Option<Instant>, ended: bool, now: Instant) -> Option<bool> {
+    let age = now.saturating_duration_since(last_packet?);
+    (age < LOCAL_AUTHORITY).then_some(!ended && age < SPEAKING_HOLD)
 }
 
 /// Queues `n` decoded samples from `scratch` for playout — or, when the
@@ -3118,10 +3185,15 @@ fn admit(shared: &Arc<Shared>, settings: &Settings, user: &UserInfo) -> Peer {
     let volume = settings.volume(user.user_id);
     let frame_samples = shared.dsp.frame_samples.load(Ordering::Relaxed);
     let mut speakers = lock(&shared.speakers);
+    let mut peer = Peer::new(user.clone(), volume);
     match speakers.get_mut(&user.session) {
         Some(sp) => {
             sp.user_id = user.user_id;
             sp.volume = volume;
+            // Its audio came before `UserJoined`: the local path decides.
+            if let Some(local) = sp.indicator {
+                peer.speaking = local;
+            }
         }
         None => {
             if let Ok(sp) = Speaker::new(user.user_id, volume, frame_samples) {
@@ -3129,7 +3201,7 @@ fn admit(shared: &Arc<Shared>, settings: &Settings, user: &UserInfo) -> Peer {
             }
         }
     }
-    Peer::new(user.clone(), volume)
+    peer
 }
 
 /// Handles commands while a connection is being established. Returns `Quit`
@@ -3242,6 +3314,7 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                     }
                 };
                 sp.last_packet = Some(now);
+                sp.ended = header.end();
                 // The TOC byte gives the peer's frame length (no decode).
                 let samples = sp.decoder.nb_samples(payload);
                 sp.jitter.set_frame_samples(samples as u32);
@@ -3373,6 +3446,11 @@ async fn handle_control(
                 .send_modify(|s| s.peers.retain(|p| p.info.session != session));
         }
         ControlMsg::UserState { session, flags } => {
+            // While its audio arrives, the local path decides the indicator
+            // (`local_indicator`); read before `send_modify`, never under it.
+            let local = lock(&shared.speakers)
+                .get(&session)
+                .and_then(|sp| sp.indicator);
             shared.state.send_modify(|s| {
                 if let Some(me) = s.me.as_mut() {
                     if me.session == session {
@@ -3382,7 +3460,7 @@ async fn handle_control(
                 for p in s.peers.iter_mut() {
                     if p.info.session == session {
                         p.info.flags = flags;
-                        p.speaking = flags.speaking();
+                        p.speaking = local.unwrap_or(flags.speaking());
                     }
                 }
             });
@@ -3856,6 +3934,44 @@ mod tests {
             inbound(Err(NetError::Connect("reset".into()))),
             Inbound::End
         ));
+    }
+
+    /// The transmit cue marks where sending starts and where its `END`
+    /// packet goes out, nothing in between.
+    #[test]
+    fn tx_cue_on_the_edges_only() {
+        assert_eq!(tx_cue(false, true, Decision::Send), Some(TX_CUE_START));
+        assert_eq!(
+            tx_cue(true, true, Decision::Send),
+            None,
+            "hangover or release"
+        );
+        assert_eq!(tx_cue(true, true, Decision::SendEnd), Some(TX_CUE_STOP));
+        assert_eq!(tx_cue(true, false, Decision::Silent), None);
+        assert_eq!(tx_cue(false, false, Decision::Silent), None);
+        assert_eq!(
+            tx_cue(false, false, Decision::Send),
+            None,
+            "offline: nothing goes out"
+        );
+    }
+
+    /// On within a block of the first datagram, off two frames after the
+    /// last or at once on `END`; after a second without audio the server's
+    /// flag decides again.
+    #[test]
+    fn the_local_indicator_follows_the_datagrams() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        assert_eq!(local_indicator(None, false, t0), None);
+        assert_eq!(local_indicator(Some(t0), false, t0), Some(true));
+        assert_eq!(local_indicator(Some(t0), false, at(59)), Some(true));
+        assert_eq!(local_indicator(Some(t0), false, at(60)), Some(false));
+        assert_eq!(local_indicator(Some(t0), true, at(1)), Some(false), "END");
+        assert_eq!(local_indicator(Some(t0), false, at(999)), Some(false));
+        assert_eq!(local_indicator(Some(t0), false, at(1000)), None);
+        // A datagram stamped after the mixer took `now`.
+        assert_eq!(local_indicator(Some(at(5)), false, t0), Some(true));
     }
 
     /// Whichever way `run_session` returns, its reader tasks end with it.
