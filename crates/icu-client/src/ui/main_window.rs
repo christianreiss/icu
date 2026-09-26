@@ -234,6 +234,10 @@ impl App {
         fonts::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, &theme_name);
         wake_on_change(state_rx.clone(), cc.egui_ctx.clone());
+        // A later start of ICU hands over here (`crate::instance`); woken,
+        // `logic` runs even while the window is hidden to the tray.
+        let ctx = cc.egui_ctx.clone();
+        crate::instance::set_waker(move || ctx.request_repaint());
         #[cfg(feature = "tray")]
         let tray = crate::tray::Tray::start(cmd.clone(), cc.egui_ctx.clone()).ok();
         #[cfg(feature = "overlay")]
@@ -353,6 +357,17 @@ impl eframe::App for App {
                 None => {}
             }
             tray.update(state);
+        }
+        // ICU started again: come to the front, like „Fenster anzeigen“. A
+        // handed-over invite or passport (`request.bundle`) is not taken
+        // over from here yet.
+        if let Some(request) = crate::instance::poll() {
+            self.hidden = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            if request.bundle.is_some() {
+                tracing::info!("a handed-over invite or passport is not taken over here");
+            }
         }
         #[cfg(feature = "camera")]
         if let Some(camera) = &mut self.camera {
@@ -1988,6 +2003,16 @@ impl eframe::App for EnrollApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(100));
+
+        // ICU started again (`crate::instance`): come to the front, with the
+        // invite or passport it was given, unless a join is under way.
+        if let Some(request) = crate::instance::poll() {
+            if let Some(text) = request.bundle.filter(|_| self.pending.is_none()) {
+                self.paste(text);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
 
         // Taken out of the slot first: holding the lock across the match
         // would keep `self.pending` borrowed while it is being cleared.

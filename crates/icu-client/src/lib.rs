@@ -11,6 +11,7 @@ pub mod cues;
 pub mod dsp;
 pub mod engine;
 pub mod hotkey;
+pub mod instance;
 pub mod net;
 pub mod netcond;
 #[cfg(feature = "overlay")]

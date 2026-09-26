@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ICU invitations (registration bundles) and passports: `*.icu` files, or
+     any file that starts with the passport armor (PROTOCOL.md §2.3.1).
+     Installed as /usr/share/mime/packages/icu.xml; a binary run from
+     elsewhere writes the same file to ~/.local/share/mime/packages
+     (crates/icu-client/src/uri.rs). -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-icu">
+    <comment>ICU invitation or passport</comment>
+    <comment xml:lang="de">ICU-Einladung oder -Passport</comment>
+    <sub-class-of type="text/plain"/>
+    <glob pattern="*.icu"/>
+    <magic priority="80">
+      <match type="string" offset="0" value="-----BEGIN ICU PASSPORT-----"/>
+    </magic>
+  </mime-type>
+</mime-info>

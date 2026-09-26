@@ -28,6 +28,9 @@ test "$(stat -c %a /etc/icu/server.toml)" = 640
 test "$(ldd /usr/bin/icu | grep -c "not found")" -eq 0
 systemd-analyze verify /usr/lib/systemd/system/icu-server.service
 test -f /usr/share/applications/icu.desktop
+grep -qx "MimeType=application/x-icu;" /usr/share/applications/icu.desktop
+test -f /usr/share/mime/packages/icu.xml
+if [ -f /usr/share/mime/globs2 ]; then grep -q ":application/x-icu:\*\.icu$" /usr/share/mime/globs2; fi
 test -f /usr/share/licenses/icu/THIRD-PARTY-LICENSES
 echo "# local edit" >> /etc/icu/server.toml
 $REINSTALL /pkgs/$SERVER_PKG

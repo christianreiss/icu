@@ -5,13 +5,20 @@
 
 mod common;
 
-use std::time::Duration;
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use common::*;
 use icu_client::{
     audio::fake::FakeBackend,
-    camera::{CameraHandle, SyntheticSource},
-    engine::Command,
+    camera::{CameraHandle, FrameSource, Opener, SyntheticSource},
+    engine::{AppState, Command},
+    problem::Problem,
     stats::DebugStats,
 };
 use icu_proto::ControlMsg;
@@ -161,5 +168,153 @@ async fn video_seq_advances_and_expires() {
 
     engine_a.shutdown();
     engine_b.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// Opens the test pattern for any device and counts how often it was asked.
+fn synthetic_opener(opened: Arc<AtomicUsize>) -> Opener {
+    Box::new(
+        move |_: Option<&str>| -> Result<Box<dyn FrameSource>, String> {
+            opened.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(SyntheticSource::new()))
+        },
+    )
+}
+
+/// The preview in Settings → Kamera captures without telling anyone:
+/// nothing is sent and `camera_on` stays off. Switching the camera on sends
+/// from the same capture; switching it off again goes back to preview only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_preview_captures_without_sending() {
+    let server = TestServer::start().await;
+    let (backend_a, _pa) = FakeBackend::silent();
+    let (engine_a, _da) = server.engine("alice", Box::new(backend_a), false).await;
+    let (backend_b, _pb) = FakeBackend::silent();
+    let (engine_b, _db) = server.engine("bob", Box::new(backend_b), false).await;
+    wait_connected(&engine_a).await;
+    wait_connected(&engine_b).await;
+    // Bob watches (no window counts as watching): sending is not paused
+    // for want of an audience.
+    wait_for(&engine_a, SOON, |s| {
+        s.peers.iter().any(|p| p.info.flags.viewing())
+    })
+    .await;
+
+    let opened = Arc::new(AtomicUsize::new(0));
+    let mut camera =
+        CameraHandle::with_opener(engine_a.camera_link(), synthetic_opener(opened.clone()));
+    let preview = camera.preview_source();
+    camera.set_preview(true);
+    camera.sync(&engine_a.snapshot());
+    assert!(
+        wait_until(SOON, || preview.seq.load(Ordering::Acquire) >= 5).await,
+        "the preview shows pictures"
+    );
+    assert_eq!(
+        DebugStats::get(&engine_a.stats().video_sent),
+        0,
+        "nothing sent"
+    );
+    assert!(!engine_a.snapshot().camera_on, "and nobody was told");
+
+    engine_a.command(Command::SetCamera(true));
+    let on = wait_for(&engine_a, SOON, |s| s.camera_on).await;
+    camera.sync(&on);
+    assert!(
+        wait_until(SOON, || DebugStats::get(&engine_a.stats().video_sent) > 0).await,
+        "sends once the camera is on"
+    );
+    assert_eq!(opened.load(Ordering::Relaxed), 1, "from the same capture");
+
+    engine_a.command(Command::SetCamera(false));
+    let off = wait_for(&engine_a, SOON, |s| !s.camera_on).await;
+    camera.sync(&off);
+    assert!(camera.running(), "the preview goes on");
+    let sent = DebugStats::get(&engine_a.stats().video_sent);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        DebugStats::get(&engine_a.stats().video_sent) <= sent + 1,
+        "at most the frame in flight"
+    );
+    camera.set_preview(false);
+    camera.sync(&off);
+    assert!(!camera.running(), "preview closed, camera off: stopped");
+
+    engine_a.shutdown();
+    engine_b.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// A camera that will not open is retried with backoff — not on every call
+/// (the window calls `sync` about 30 times a second).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_camera_that_will_not_open_is_retried_with_backoff() {
+    let server = TestServer::start().await;
+    let (backend, _probe) = FakeBackend::silent();
+    let (engine, _dir) = server.engine("alice", Box::new(backend), false).await;
+    wait_connected(&engine).await;
+    engine.command(Command::SetCamera(true));
+    let on = wait_for(&engine, SOON, |s| s.camera_on).await;
+
+    let tries = Arc::new(AtomicUsize::new(0));
+    let counted = tries.clone();
+    let mut camera = CameraHandle::with_opener(
+        engine.camera_link(),
+        Box::new(
+            move |_: Option<&str>| -> Result<Box<dyn FrameSource>, String> {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Err("no such camera".into())
+            },
+        ),
+    );
+    for _ in 0..30 {
+        camera.sync(&on);
+    }
+    assert_eq!(tries.load(Ordering::Relaxed), 1, "once, then back off");
+    assert_eq!(camera.failures(), 1);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    for _ in 0..30 {
+        camera.sync(&on);
+    }
+    assert_eq!(tries.load(Ordering::Relaxed), 2, "again after a second");
+    assert_eq!(camera.failures(), 2);
+
+    // Switched off and on again: a fresh start, no waiting.
+    let off = AppState {
+        camera_on: false,
+        ..on.clone()
+    };
+    camera.sync(&off);
+    camera.sync(&on);
+    assert_eq!(tries.load(Ordering::Relaxed), 3);
+    assert_eq!(camera.failures(), 1);
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// Given up: the camera goes off and the banner says why. The camera hotkey
+/// toggles it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_camera_is_switched_off_with_a_reason() {
+    let server = TestServer::start().await;
+    let (backend, _probe) = FakeBackend::silent();
+    let (engine, _dir) = server.engine("alice", Box::new(backend), false).await;
+    wait_connected(&engine).await;
+
+    engine.command(Command::ToggleCamera);
+    wait_for(&engine, SOON, |s| s.camera_on).await;
+    engine.command(Command::CameraFailed(Problem::plain(
+        "Die Kamera lässt sich nicht verwenden.",
+    )));
+    let off = wait_for(&engine, SOON, |s| !s.camera_on).await;
+    assert_eq!(
+        off.banner.map(|b| b.text).as_deref(),
+        Some("Die Kamera lässt sich nicht verwenden.")
+    );
+    engine.command(Command::ToggleCamera);
+    wait_for(&engine, SOON, |s| s.camera_on).await;
+
+    engine.shutdown();
     server.handle.shutdown().await;
 }

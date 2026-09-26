@@ -87,7 +87,13 @@ impl OverlayHandle {
                 thread: Some(thread),
             }),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err("overlay thread did not start".into()),
+            Err(_) => {
+                // No handle owns the thread now: tell it to end on its own
+                // once `setup` returns, instead of running on unseen. Not
+                // joined here — `setup` may be stuck for a while yet.
+                stop.store(true, Ordering::Relaxed);
+                Err("overlay thread did not start".into())
+            }
         }
     }
 }

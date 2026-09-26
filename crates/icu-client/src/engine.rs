@@ -251,6 +251,9 @@ pub struct AppState {
     pub hotkey_backend: String,
     /// Settings as the engine holds them.
     pub settings: Settings,
+    /// Bumped by `Command::RetryHotkeys`; the hotkey supervisor
+    /// (`crate::hotkey::supervise`) binds again whenever it changes.
+    pub hotkey_retries: u32,
 }
 
 /// Commands from UI, tray and hotkeys.
@@ -345,6 +348,15 @@ pub enum Command {
     ReopenStreams,
     /// Stop everything.
     Quit,
+    /// Bind the hotkeys again with the current settings, e.g. to have the
+    /// portal ask again after its dialog was turned down
+    /// (`hotkey_backend == "portal-declined"`).
+    RetryHotkeys,
+    /// Toggle the camera (hotkey).
+    ToggleCamera,
+    /// The camera would not start (`crate::camera::CameraHandle` gave up
+    /// after repeated failures): show why, and switch it off if it is on.
+    CameraFailed(Problem),
 }
 
 /// An `f32` the audio threads read every block without a lock.
@@ -663,6 +675,7 @@ impl Engine {
             camera_on: false,
             hotkey_backend: String::new(),
             settings: settings.clone(),
+            hotkey_retries: 0,
         };
         let (state_tx, state_rx) = watch::channel(initial);
         // Ring buffers between backend callbacks and the DSP/mixer threads.
@@ -2146,6 +2159,21 @@ impl LocalState {
             | Command::SetUserRestriction { .. }
             | Command::Reconnect
             | Command::Quit => {}
+            Command::RetryHotkeys => {
+                shared
+                    .state
+                    .send_modify(|s| s.hotkey_retries = s.hotkey_retries.wrapping_add(1));
+            }
+            Command::ToggleCamera => {
+                let on = !self.flags.camera_on();
+                return self.handle_local(Command::SetCamera(on), shared);
+            }
+            Command::CameraFailed(problem) => {
+                shared.state.send_modify(|s| s.banner = Some(problem));
+                if self.flags.camera_on() {
+                    return self.handle_local(Command::SetCamera(false), shared);
+                }
+            }
         }
         set_state
     }
@@ -3308,9 +3336,15 @@ impl From<NetError> for EngineError {
 pub struct CameraLink {
     shared: Arc<Shared>,
     runtime: tokio::runtime::Handle,
+    cmd: mpsc::UnboundedSender<Command>,
 }
 
 impl CameraLink {
+    /// Sends a command to the engine (the camera switching itself off).
+    pub fn command(&self, cmd: Command) {
+        let _ = self.cmd.send(cmd);
+    }
+
     /// Sends one encoded frame on the live connection; `Err` when not
     /// connected or when flow control dropped it.
     pub fn send_frame(&self, keyframe: bool, ts: u32, data: &[u8]) -> Result<(), String> {
@@ -3410,6 +3444,7 @@ impl Engine {
         CameraLink {
             shared: self.shared.clone(),
             runtime: self.runtime(),
+            cmd: self.cmd_tx.clone(),
         }
     }
 

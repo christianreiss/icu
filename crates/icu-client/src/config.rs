@@ -197,6 +197,9 @@ pub struct HotkeySettings {
     pub toggle_mode: KeyBinding,
     /// Backend selection.
     pub backend: HotkeyBackend,
+    /// Camera on/off toggle. Unset by default (and in files from before it
+    /// existed).
+    pub camera: KeyBinding,
 }
 
 impl Default for HotkeySettings {
@@ -210,6 +213,7 @@ impl Default for HotkeySettings {
             deafen: KeyBinding::default(),
             toggle_mode: KeyBinding::default(),
             backend: HotkeyBackend::Auto,
+            camera: KeyBinding::default(),
         }
     }
 }

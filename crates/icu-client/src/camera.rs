@@ -20,7 +20,8 @@ use openh264::{
 };
 
 use crate::{
-    engine::{AppState, CameraLink},
+    engine::{AppState, CameraLink, Command},
+    problem::Problem,
     video::VideoTier,
 };
 
@@ -34,6 +35,12 @@ pub const FPS: u32 = 15;
 /// IDR interval.
 pub const IDR_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Minimum spacing of the IDRs sent because a frame was lost: the same
+/// once per second the receivers may ask for one (`PROTOCOL.md` §2.2
+/// Nr. 13). An IDR is several P-frames' worth of bytes, and the loss was
+/// most likely congestion.
+const LOSS_IDR_INTERVAL: Duration = Duration::from_secs(1);
+
 /// One RGB8 picture.
 #[derive(Debug, Clone)]
 pub struct RgbFrame {
@@ -43,6 +50,101 @@ pub struct RgbFrame {
     pub height: usize,
     /// RGB8, row major.
     pub rgb: Vec<u8>,
+}
+
+impl RgbFrame {
+    /// A picture the encoder and the preview can take. `rgb` has to hold
+    /// exactly `width × height` pixels; an odd side loses its last column
+    /// or row, because openh264 encodes 4:2:0 and wants even sides. Anything
+    /// else is an error, never a panic: openh264's `RgbSliceU8::new` and
+    /// egui's `ColorImage::from_rgb` assert on the length, and a release
+    /// build aborts on a panic — one odd frame from a camera (an MJPEG frame
+    /// larger than negotiated, a YUYV row stride with padding, a virtual
+    /// camera's odd size) would end the whole client.
+    pub fn checked(width: usize, height: usize, mut rgb: Vec<u8>) -> Result<RgbFrame, String> {
+        if width.checked_mul(height).and_then(|n| n.checked_mul(3)) != Some(rgb.len()) {
+            return Err(format!(
+                "camera frame of {} bytes does not hold {width}×{height} RGB pixels",
+                rgb.len()
+            ));
+        }
+        let (w, h) = (width & !1, height & !1);
+        if w == 0 || h == 0 {
+            return Err(format!("camera frame too small: {width}×{height}"));
+        }
+        if w != width {
+            // Row by row towards the front: a row never moves past its old
+            // start, so nothing is overwritten before it is copied.
+            for y in 0..h {
+                rgb.copy_within(y * width * 3..(y * width + w) * 3, y * w * 3);
+            }
+        }
+        rgb.truncate(w * h * 3);
+        Ok(RgbFrame {
+            width: w,
+            height: h,
+            rgb,
+        })
+    }
+
+    /// Whether the encoder and the preview can take this picture as it is:
+    /// even, non-zero sides and exactly the bytes they promise. Checked once
+    /// more right before the asserting constructors, because any
+    /// [`FrameSource`] can hand in a picture.
+    pub fn is_valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.width.is_multiple_of(2)
+            && self.height.is_multiple_of(2)
+            && self
+                .width
+                .checked_mul(self.height)
+                .and_then(|n| n.checked_mul(3))
+                == Some(self.rgb.len())
+    }
+}
+
+/// Width and height from a JPEG's frame header (SOF*n*), `None` without one.
+/// nokhwa labels every decoded picture with the negotiated size, but decodes
+/// an MJPEG frame at the size the frame itself says.
+fn jpeg_size(data: &[u8]) -> Option<(usize, usize)> {
+    if !data.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut i = 2;
+    loop {
+        if *data.get(i)? != 0xFF {
+            return None;
+        }
+        let marker = *data.get(i + 1)?;
+        match marker {
+            // Fill byte before a marker.
+            0xFF => {
+                i += 1;
+                continue;
+            }
+            // Markers without a length.
+            0x01 | 0xD0..=0xD8 => {
+                i += 2;
+                continue;
+            }
+            // End of image, or the scan starts: no frame header before it.
+            0xD9 | 0xDA => return None,
+            _ => {}
+        }
+        let len = usize::from(u16::from_be_bytes([*data.get(i + 2)?, *data.get(i + 3)?]));
+        // SOF0–SOF15, except DHT (C4), JPG (C8) and DAC (CC): length,
+        // precision, height, width.
+        if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
+            let height = u16::from_be_bytes([*data.get(i + 5)?, *data.get(i + 6)?]);
+            let width = u16::from_be_bytes([*data.get(i + 7)?, *data.get(i + 8)?]);
+            return Some((usize::from(width), usize::from(height)));
+        }
+        if len < 2 {
+            return None;
+        }
+        i += 2 + len;
+    }
 }
 
 /// The capture thread's latest picture. `seq` counts frames, so a viewer
@@ -122,17 +224,26 @@ impl NokhwaSource {
 
 impl FrameSource for NokhwaSource {
     fn next_frame(&mut self) -> Result<RgbFrame, String> {
-        use nokhwa::pixel_format::RgbFormat;
+        use nokhwa::{pixel_format::RgbFormat, utils::FrameFormat};
         let buffer = self.camera.frame().map_err(|e| e.to_string())?;
-        let res = buffer.resolution();
         let img = buffer
             .decode_image::<RgbFormat>()
             .map_err(|e| e.to_string())?;
-        Ok(RgbFrame {
-            width: res.width() as usize,
-            height: res.height() as usize,
-            rgb: img.into_raw(),
-        })
+        let (mut width, mut height) = (img.width() as usize, img.height() as usize);
+        // `into_raw` hands back the whole decoded buffer, which is longer than
+        // the image's (negotiated) size when an MJPEG frame is larger: take
+        // the frame's own size when it explains the byte count.
+        let rgb = img.into_raw();
+        if buffer.source_frame_format() == FrameFormat::MJPEG
+            && width.saturating_mul(height).saturating_mul(3) != rgb.len()
+        {
+            if let Some((w, h)) = jpeg_size(buffer.buffer()) {
+                if w.saturating_mul(h).saturating_mul(3) == rgb.len() {
+                    (width, height) = (w, h);
+                }
+            }
+        }
+        RgbFrame::checked(width, height, rgb)
     }
 }
 
@@ -197,24 +308,46 @@ pub fn encoder(tier: VideoTier) -> Result<Encoder, String> {
     Encoder::with_api_config(OpenH264API::from_source(), cfg).map_err(|e| e.to_string())
 }
 
+/// Failed frames in a row after which the capture thread gives up (about
+/// 5 s at one attempt per 200 ms): the device stopped delivering — unplugged,
+/// or taken by another program — and is opened anew by
+/// [`CameraHandle::sync`], with backoff.
+const MAX_FAILED_FRAMES: u32 = 25;
+
+/// Failed starts in a row after which [`CameraHandle::sync`] stops trying
+/// and switches the camera off (`Command::CameraFailed`).
+const MAX_FAILURES: u32 = 5;
+
+/// The wait before the next start after `failures` failed ones: 1, 2, 4 …
+/// up to 30 s.
+fn backoff(failures: u32) -> Duration {
+    Duration::from_secs(1u64 << failures.saturating_sub(1).min(5)).min(Duration::from_secs(30))
+}
+
 /// Encoder thread loop: capture → encode → send. `preview` receives every
 /// captured picture for the settings preview, regardless of tier, so the
 /// settings preview keeps working even while video is paused for everyone
-/// else.
+/// else. While `live` is off the thread only captures for that preview —
+/// nothing is encoded or sent (`CameraHandle::set_preview`).
 ///
-/// The encoder is rebuilt whenever `link.send_tier()` changes: openh264's
-/// safe Rust binding exposes no runtime bitrate mutator, so a tier change
-/// means a fresh `Encoder`. That is cheap relative to how rarely
-/// `QualityController` actually steps (bounded by its own hysteresis), and a
-/// freshly built encoder's first frame is an IDR regardless of
-/// `force_intra_frame` (`encoder_emits_idr_on_request` below), so SPS/PPS
-/// ride along for free — no separate flush logic is needed.
+/// The encoder is rebuilt whenever the tier changes (`link.send_tier()`,
+/// or paused while not `live`): openh264's safe Rust binding exposes no
+/// runtime bitrate mutator, so a tier change means a fresh `Encoder`. That
+/// is cheap relative to how rarely `QualityController` actually steps
+/// (bounded by its own hysteresis), and a freshly built encoder's first
+/// frame is an IDR regardless of `force_intra_frame`
+/// (`encoder_emits_idr_on_request` below), so SPS/PPS ride along for free —
+/// no separate flush logic is needed.
+///
+/// Returns once `stop` is set, or with the last error after
+/// [`MAX_FAILED_FRAMES`] failed frames in a row.
 pub fn run_sender(
     mut source: Box<dyn FrameSource>,
     link: CameraLink,
     stop: Arc<AtomicBool>,
+    live: Arc<AtomicBool>,
     preview: Arc<PreviewSlot>,
-) {
+) -> Result<(), String> {
     // No encoder while paused: `run_sender` stops encoding rather than
     // building one with a zero bitrate.
     let build = |tier: VideoTier| -> Result<Option<Encoder>, String> {
@@ -224,34 +357,63 @@ pub fn run_sender(
             encoder(tier).map(Some)
         }
     };
-    let mut tier = link.send_tier();
-    let mut enc = match build(tier) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!(%e, "openh264 encoder");
-            return;
-        }
-    };
+    // Built with the first frame that is to go out.
+    let mut tier = VideoTier::T4;
+    let mut enc: Option<Encoder> = None;
     let start = Instant::now();
     let mut last_idr = Instant::now() - IDR_INTERVAL;
     let mut yuv: Option<YUVBuffer> = None;
     let mut frame_index: u32 = 0;
+    // Failed frames in a row: the first one is a warning, the rest of the
+    // streak only debug lines — a camera that sends nothing usable would
+    // otherwise log five warnings a second.
+    let mut failed: u32 = 0;
+    // A frame did not go out on a live connection: the next ones refer to
+    // it, so the receivers see a broken picture until the next IDR.
+    let mut lost = false;
     while !stop.load(Ordering::Relaxed) {
         let frame = match source.next_frame() {
-            Ok(f) => Arc::new(f),
-            Err(e) => {
-                tracing::warn!(%e, "camera frame");
+            Ok(f) if f.is_valid() => Arc::new(f),
+            result => {
+                let e = result.map_or_else(
+                    |e| e,
+                    |f| {
+                        format!(
+                            "unusable camera frame {}×{}, {} bytes",
+                            f.width,
+                            f.height,
+                            f.rgb.len()
+                        )
+                    },
+                );
+                failed += 1;
+                if failed >= MAX_FAILED_FRAMES {
+                    return Err(e);
+                }
+                if failed == 1 {
+                    tracing::warn!(%e, "camera frame");
+                } else {
+                    tracing::debug!(%e, failed, "camera frame");
+                }
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
         };
+        if failed > 0 {
+            tracing::info!(failed, "camera frames again");
+            failed = 0;
+        }
         preview.put(frame.clone());
 
-        let new_tier = link.send_tier();
+        let new_tier = if live.load(Ordering::Relaxed) {
+            link.send_tier()
+        } else {
+            VideoTier::T4
+        };
         if new_tier != tier {
             tier = new_tier;
             enc = build(tier).unwrap_or_else(|e| {
-                tracing::error!(%e, "openh264 encoder rebuild");
+                tracing::error!(%e, "openh264 encoder");
                 None
             });
             last_idr = Instant::now() - IDR_INTERVAL;
@@ -259,9 +421,9 @@ pub fn run_sender(
         }
 
         let Some(enc) = enc.as_mut() else {
-            // Paused: still drain keyframe requests so none is lost across
-            // the pause/resume boundary — the next encoder's first frame is
-            // an IDR anyway once video resumes.
+            // Paused or preview only: still drain keyframe requests so none
+            // is lost across the pause/resume boundary — the next encoder's
+            // first frame is an IDR anyway once video resumes.
             let _ = link.take_keyframe_request();
             continue;
         };
@@ -271,13 +433,16 @@ pub fn run_sender(
             continue; // thin the fixed-FPS capture down to this tier's rate
         }
 
+        // Asserts length and even sides: `frame.is_valid()` above.
         let src = RgbSliceU8::new(&frame.rgb, (frame.width, frame.height));
         match yuv.as_mut() {
             Some(buf) if dimensions_match(buf, frame.width, frame.height) => buf.read_rgb(src),
             _ => yuv = Some(YUVBuffer::from_rgb_source(src)),
         }
         let Some(buf) = yuv.as_ref() else { continue };
-        let want_idr = link.take_keyframe_request() || last_idr.elapsed() >= IDR_INTERVAL;
+        let want_idr = link.take_keyframe_request()
+            || last_idr.elapsed() >= IDR_INTERVAL
+            || (lost && last_idr.elapsed() >= LOSS_IDR_INTERVAL);
         if want_idr {
             enc.force_intra_frame();
         }
@@ -288,6 +453,7 @@ pub fn run_sender(
                 let keyframe = matches!(bs.frame_type(), FrameType::IDR | FrameType::I);
                 if keyframe {
                     last_idr = Instant::now();
+                    lost = false;
                 }
                 let data = bs.to_vec();
                 if data.is_empty() {
@@ -295,11 +461,14 @@ pub fn run_sender(
                 }
                 if let Err(e) = link.send_frame(keyframe, ts, &data) {
                     tracing::debug!(%e, "video frame not sent");
+                    // Not while offline: there is nobody to repair for.
+                    lost |= link.connected();
                 }
             }
             Err(e) => tracing::warn!(%e, "h264 encode"),
         }
     }
+    Ok(())
 }
 
 /// Whether `buf` is already the right size to be overwritten in place.
@@ -308,60 +477,137 @@ fn dimensions_match(buf: &YUVBuffer, w: usize, h: usize) -> bool {
     buf.dimensions() == (w, h)
 }
 
-/// Owns the camera thread; started/stopped from the UI according to
-/// `AppState::camera_on`.
+/// Opens the capture source for a device setting: an index (default 0), or
+/// `synthetic` for the test pattern.
+pub type Opener = Box<dyn FnMut(Option<&str>) -> Result<Box<dyn FrameSource>, String> + Send>;
+
+/// The real devices: nokhwa by index, or the test pattern.
+fn open_device(device: Option<&str>) -> Result<Box<dyn FrameSource>, String> {
+    Ok(match device {
+        Some("synthetic") => Box::new(SyntheticSource::new()),
+        Some(idx) => Box::new(NokhwaSource::open(
+            idx.parse()
+                .map_err(|_| "camera device must be an index".to_string())?,
+        )?),
+        None => Box::new(NokhwaSource::open(0)?),
+    })
+}
+
+/// A running capture thread.
+struct Capture {
+    thread: JoinHandle<Result<(), String>>,
+    stop: Arc<AtomicBool>,
+    /// Encode and send (`camera_on`); off captures for the preview only.
+    live: Arc<AtomicBool>,
+    /// The device setting it was opened for.
+    device: Option<String>,
+    /// `PreviewSlot::seq` when it started: if the thread fails after
+    /// that moved, the camera did work, and the failure streak starts over.
+    seq_at_start: u64,
+}
+
+/// Failed starts in a row and when the next one may run.
+#[derive(Debug, Default)]
+struct Retry {
+    failures: u32,
+    next: Option<Instant>,
+}
+
+impl Retry {
+    /// Whether a start may be tried at `now`.
+    fn may_try(&self, now: Instant) -> bool {
+        self.failures < MAX_FAILURES && self.next.is_none_or(|next| now >= next)
+    }
+
+    /// Books a failed start; `false` once it is time to give up.
+    fn failed(&mut self, now: Instant) -> bool {
+        self.failures += 1;
+        self.next = Some(now + backoff(self.failures));
+        self.failures < MAX_FAILURES
+    }
+
+    fn reset(&mut self) {
+        *self = Retry::default();
+    }
+}
+
+/// Owns the camera thread, following `AppState::camera_on` and the local
+/// preview through [`CameraHandle::sync`], which the window calls on every
+/// frame (and `--headless` on every state change).
+///
+/// A camera that will not start is retried with backoff (1, 2, 4 … 30 s),
+/// not on every call; after five failed starts in a row it is switched off
+/// and the reason shown (`Command::CameraFailed`). A device change, the
+/// camera or the preview switched on anew start over.
 pub struct CameraHandle {
     link: CameraLink,
-    thread: Option<(JoinHandle<()>, Arc<AtomicBool>)>,
+    thread: Option<Capture>,
     preview: Arc<PreviewSlot>,
-    device: Option<String>,
+    opener: Opener,
+    /// Capture for the local preview while the camera is off.
+    preview_wanted: bool,
+    retry: Retry,
+    /// `(camera_on, preview_wanted, device)` as of the last `sync`.
+    last: (bool, bool, Option<String>),
 }
 
 impl CameraHandle {
     /// New, camera off.
     pub fn new(link: CameraLink) -> CameraHandle {
+        CameraHandle::with_opener(link, Box::new(open_device))
+    }
+
+    /// New, with another way to open a device (tests).
+    pub fn with_opener(link: CameraLink, opener: Opener) -> CameraHandle {
         CameraHandle {
             link,
             thread: None,
             preview: Arc::new(PreviewSlot::default()),
-            device: None,
+            opener,
+            preview_wanted: false,
+            retry: Retry::default(),
+            last: (false, false, None),
         }
     }
 
-    /// Starts with an explicit source (tests).
+    /// Starts with an explicit source, sending (tests).
     pub fn start_with(&mut self, source: Box<dyn FrameSource>) {
-        self.stop();
-        let stop = Arc::new(AtomicBool::new(false));
-        let link = self.link.clone();
-        let preview = self.preview.clone();
-        let stop_t = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name("icu-camera".into())
-            .spawn(move || run_sender(source, link, stop_t, preview))
-            .expect("camera thread");
-        self.thread = Some((thread, stop));
+        self.spawn(source, None, true);
     }
 
-    /// Starts the real camera; `device` is an index (default 0) or
-    /// `synthetic`.
+    fn spawn(&mut self, source: Box<dyn FrameSource>, device: Option<String>, live: bool) {
+        self.stop();
+        let stop = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicBool::new(live));
+        let link = self.link.clone();
+        let preview = self.preview.clone();
+        let (stop_t, live_t) = (stop.clone(), live.clone());
+        let thread = std::thread::Builder::new()
+            .name("icu-camera".into())
+            .spawn(move || run_sender(source, link, stop_t, live_t, preview))
+            .expect("camera thread");
+        self.thread = Some(Capture {
+            thread,
+            stop,
+            live,
+            device,
+            seq_at_start: self.preview.seq.load(Ordering::Acquire),
+        });
+    }
+
+    /// Opens `device` (an index, default 0, or `synthetic`) and starts
+    /// sending from it.
     pub fn start(&mut self, device: Option<&str>) -> Result<(), String> {
-        let source: Box<dyn FrameSource> = match device {
-            Some("synthetic") => Box::new(SyntheticSource::new()),
-            Some(idx) => Box::new(NokhwaSource::open(
-                idx.parse()
-                    .map_err(|_| "camera device must be an index".to_string())?,
-            )?),
-            None => Box::new(NokhwaSource::open(0)?),
-        };
-        self.start_with(source);
+        let source = (self.opener)(device)?;
+        self.spawn(source, device.map(str::to_owned), true);
         Ok(())
     }
 
     /// Stops the thread.
     pub fn stop(&mut self) {
-        if let Some((thread, stop)) = self.thread.take() {
-            stop.store(true, Ordering::Relaxed);
-            let _ = thread.join();
+        if let Some(capture) = self.thread.take() {
+            capture.stop.store(true, Ordering::Relaxed);
+            let _ = capture.thread.join();
         }
         self.preview.clear();
     }
@@ -371,17 +617,102 @@ impl CameraHandle {
         self.thread.is_some()
     }
 
-    /// Follows the UI state.
+    /// Failed starts in a row; reset by a successful picture, a device
+    /// change or switching the camera on anew.
+    pub fn failures(&self) -> u32 {
+        self.retry.failures
+    }
+
+    /// Captures for the local preview even while the camera is off — „is
+    /// this the right camera, and is it pointing at me?“ before anyone sees
+    /// it. Nothing is encoded or sent and `CAMERA_ON` stays as it is; the
+    /// pictures go to [`CameraHandle::preview_source`]. The window turns it
+    /// on while Settings → Kamera is open. Takes effect with the next
+    /// [`CameraHandle::sync`].
+    pub fn set_preview(&mut self, on: bool) {
+        self.preview_wanted = on;
+    }
+
+    /// Follows the state: captures while the camera is on or the preview is
+    /// wanted, sends only while the camera is on.
     pub fn sync(&mut self, state: &AppState) {
+        let camera_on = state.camera_on;
         let device = state.settings.camera.device.clone();
-        if state.camera_on && (!self.running() || device != self.device) {
-            self.device = device.clone();
-            if let Err(e) = self.start(device.as_deref()) {
-                tracing::warn!(%e, "camera");
+        let wanted = camera_on || self.preview_wanted;
+        let (was_on, was_preview, was_device) = &self.last;
+        // Switched on anew, another device, or nothing wanted: a clean slate.
+        if (camera_on && !was_on)
+            || (self.preview_wanted && !was_preview)
+            || device != *was_device
+            || !wanted
+        {
+            self.retry.reset();
+        }
+        self.last = (camera_on, self.preview_wanted, device.clone());
+
+        // A thread that ended by itself: the camera stopped delivering.
+        if self.thread.as_ref().is_some_and(|c| c.thread.is_finished()) {
+            if let Some(capture) = self.thread.take() {
+                let delivered = self.preview.seq.load(Ordering::Acquire) != capture.seq_at_start;
+                self.preview.clear();
+                match capture.thread.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if delivered {
+                            self.retry.reset();
+                        }
+                        self.failed(e);
+                    }
+                    Err(_) => self.failed("camera thread panicked".into()),
+                }
             }
-        } else if !state.camera_on && self.running() {
+        }
+
+        if !wanted {
+            if self.running() {
+                self.stop();
+            }
+            return;
+        }
+        if self.thread.as_ref().is_some_and(|c| c.device != device) {
             self.stop();
         }
+        if !self.running() {
+            if !self.retry.may_try(Instant::now()) {
+                return;
+            }
+            match (self.opener)(device.as_deref()) {
+                Ok(source) => self.spawn(source, device, camera_on),
+                Err(e) => {
+                    self.failed(e);
+                    return;
+                }
+            }
+        }
+        if let Some(capture) = &self.thread {
+            capture.live.store(camera_on, Ordering::Relaxed);
+            // Pictures arrive: whatever failed before is over.
+            if self.retry.failures > 0
+                && self.preview.seq.load(Ordering::Acquire) != capture.seq_at_start
+            {
+                self.retry.reset();
+            }
+        }
+    }
+
+    /// Books a failed start: retry later, or give up — the engine switches
+    /// the camera off (if it is on) and shows why.
+    fn failed(&mut self, e: String) {
+        if self.retry.failed(Instant::now()) {
+            tracing::warn!(%e, retry_in = ?backoff(self.retry.failures), "camera");
+            return;
+        }
+        tracing::warn!(%e, failures = self.retry.failures, "camera given up");
+        self.link.command(Command::CameraFailed(Problem::new(
+            "Die Kamera lässt sich nicht verwenden. Ist sie angeschlossen und nicht gerade von \
+             einem anderen Programm belegt?",
+            e,
+        )));
     }
 
     /// The slot the capture thread writes every picture into, shared so a
@@ -432,6 +763,9 @@ impl CameraPreview {
             // the conversion below.
             let frame = self.slot.frame.lock().unwrap().clone();
             match frame {
+                // `ColorImage::from_rgb` asserts on the length; a picture
+                // that does not fit keeps the last one on screen.
+                Some(frame) if !frame.is_valid() => {}
                 Some(frame) => {
                     let image = egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
                     match &mut self.texture {
@@ -498,5 +832,138 @@ mod tests {
         );
         assert!(matches!(types[1].0, FrameType::P));
         assert!(types.iter().all(|(_, n)| *n > 0));
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_30_s() {
+        let secs: Vec<u64> = (1..=8).map(|n| backoff(n).as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(backoff(u32::MAX), Duration::from_secs(30));
+    }
+
+    /// Once per backoff, not once per window frame; given up after five.
+    #[test]
+    fn a_failing_start_waits_and_gives_up() {
+        let mut retry = Retry::default();
+        let t0 = Instant::now();
+        assert!(retry.may_try(t0));
+        assert!(retry.failed(t0));
+        assert!(!retry.may_try(t0 + Duration::from_millis(999)), "backoff");
+        assert!(retry.may_try(t0 + Duration::from_secs(1)));
+        let mut now = t0;
+        for n in 2..MAX_FAILURES {
+            now += backoff(n - 1);
+            assert!(retry.may_try(now));
+            assert!(retry.failed(now), "failure {n} is retried");
+        }
+        now += backoff(MAX_FAILURES - 1);
+        assert!(retry.may_try(now));
+        assert!(!retry.failed(now), "the fifth gives up");
+        assert!(
+            !retry.may_try(now + Duration::from_secs(3600)),
+            "until reset"
+        );
+        retry.reset();
+        assert!(retry.may_try(now));
+    }
+
+    /// A `w × h` picture whose every pixel says where it is: R = x, G = y.
+    fn pattern(w: usize, h: usize) -> Vec<u8> {
+        (0..h)
+            .flat_map(|y| (0..w).flat_map(move |x| [x as u8, y as u8, 7]))
+            .collect()
+    }
+
+    #[test]
+    fn checked_keeps_an_exact_frame() {
+        let f = RgbFrame::checked(4, 2, pattern(4, 2)).unwrap();
+        assert_eq!((f.width, f.height), (4, 2));
+        assert_eq!(f.rgb, pattern(4, 2));
+        assert!(f.is_valid());
+    }
+
+    /// A virtual camera's 5×3 becomes 4×2: the last column and row go, every
+    /// other pixel stays where it was.
+    #[test]
+    fn checked_crops_odd_sides() {
+        let f = RgbFrame::checked(5, 3, pattern(5, 3)).unwrap();
+        assert_eq!((f.width, f.height), (4, 2));
+        assert_eq!(f.rgb, pattern(4, 2));
+        assert!(f.is_valid());
+        let f = RgbFrame::checked(4, 3, pattern(4, 3)).unwrap();
+        assert_eq!((f.width, f.height, f.rgb), (4, 2, pattern(4, 2)));
+        let f = RgbFrame::checked(5, 2, pattern(5, 2)).unwrap();
+        assert_eq!((f.width, f.height, f.rgb), (4, 2, pattern(4, 2)));
+    }
+
+    /// A buffer that does not hold what the size says — the oversized MJPEG
+    /// frame, a padded YUYV stride — is rejected instead of reaching an
+    /// assert.
+    #[test]
+    fn checked_rejects_mismatched_buffers() {
+        let mut long = pattern(320, 240);
+        long.extend_from_slice(&[0; 320 * 3]); // one padded row too many
+        assert!(RgbFrame::checked(320, 240, long).is_err());
+        assert!(RgbFrame::checked(320, 240, pattern(320, 239)).is_err());
+        assert!(RgbFrame::checked(640, 480, pattern(320, 240)).is_err());
+        assert!(RgbFrame::checked(0, 0, Vec::new()).is_err());
+        assert!(
+            RgbFrame::checked(1, 1, pattern(1, 1)).is_err(),
+            "nothing left"
+        );
+        assert!(
+            RgbFrame::checked(usize::MAX, 3, Vec::new()).is_err(),
+            "overflow"
+        );
+        // And a hand-made frame is caught by the last check.
+        let bad = RgbFrame {
+            width: 5,
+            height: 3,
+            rgb: pattern(5, 3),
+        };
+        assert!(!bad.is_valid(), "odd sides");
+        let bad = RgbFrame {
+            width: 4,
+            height: 2,
+            rgb: pattern(4, 3),
+        };
+        assert!(!bad.is_valid(), "length");
+    }
+
+    /// What survives `checked` goes through the encoder's asserting
+    /// constructors without a panic.
+    #[test]
+    fn a_cropped_frame_encodes() {
+        let f = RgbFrame::checked(321, 241, pattern(321, 241)).unwrap();
+        let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(&f.rgb, (f.width, f.height)));
+        let mut enc = encoder(VideoTier::T0).unwrap();
+        let bs = enc.encode(&yuv).unwrap();
+        assert!(matches!(bs.frame_type(), FrameType::IDR));
+    }
+
+    #[test]
+    fn jpeg_size_reads_the_frame_header() {
+        // SOI, APP0 (JFIF, 16 bytes), DQT (a stub), then SOF0 640×480.
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        jpeg.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+        jpeg.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x04, 0x00, 0x00]);
+        let sof = [
+            0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0xE0, 0x02, 0x80, 0x03, 0x01, 0x22, 0x00, 0x02,
+            0x11, 0x01, 0x03, 0x11, 0x01,
+        ];
+        jpeg.extend_from_slice(&sof);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08]);
+        assert_eq!(jpeg_size(&jpeg), Some((640, 480)));
+        // Progressive (SOF2), with a fill byte before the marker.
+        let mut progressive = vec![0xFF, 0xD8, 0xFF];
+        progressive.extend_from_slice(&sof);
+        progressive[4] = 0xC2;
+        assert_eq!(jpeg_size(&progressive), Some((640, 480)));
+        // A DHT (C4) is not a frame header.
+        let dht = [0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x03, 0x00, 0xFF, 0xD9];
+        assert_eq!(jpeg_size(&dht), None);
+        assert_eq!(jpeg_size(b"not a jpeg"), None);
+        assert_eq!(jpeg_size(&jpeg[..jpeg.len() - 20]), None, "cut short");
+        assert_eq!(jpeg_size(&[0xFF, 0xD8, 0xFF, 0xDA]), None, "scan first");
     }
 }

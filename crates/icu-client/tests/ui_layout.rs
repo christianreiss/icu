@@ -332,6 +332,7 @@ fn state() -> AppState {
         camera_on: false,
         hotkey_backend: "portal".into(),
         settings,
+        hotkey_retries: 0,
     }
 }
 
