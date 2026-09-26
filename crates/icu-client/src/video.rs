@@ -222,6 +222,13 @@ pub trait VideoSink: Send + Sync + Clone + 'static {
     fn overflow(&self) {}
 }
 
+/// How far a frame's `seq` may lag behind the newest one and still count as
+/// merely late: the frames' streams complete out of order by a frame or
+/// two (the server keeps one per receiver in flight and one waiting). A
+/// step further back is a new stream on a reused session id, not a late
+/// frame of the old one.
+const REORDER_DEPTH: i16 = 32;
+
 /// Frames waiting for the decode thread. At 15 fps per speaker this is a
 /// few seconds' worth; past it the decoder is hopelessly behind and dropping
 /// (then waiting for the next IDR) beats growing the queue.
@@ -404,10 +411,11 @@ impl Receivers {
             // Modulo 2^16 (`PROTOCOL.md` §3): a step past half the range is
             // a step back.
             let step = seq.wrapping_sub(last) as i16;
-            if step <= 0 {
+            if step <= 0 && step > -REORDER_DEPTH {
                 return None;
             }
-            if step > 1 {
+            // A gap, or a new stream (`REORDER_DEPTH`): start over at an IDR.
+            if step != 1 {
                 r.got_keyframe = false;
             }
         }
@@ -745,6 +753,26 @@ mod tests {
         r.push(3, numbered(&frames[0], u16::MAX));
         r.push(3, numbered(&frames[1], 0));
         assert_eq!(pictures(&r), 2);
+    }
+
+    /// Session ids are reused. A frame of a peer that left can still land
+    /// after its `UserLeft` and recreate the receiver; the next peer with
+    /// that id starts its `seq` anew and must not be taken for a late
+    /// frame of the old stream.
+    #[cfg(feature = "camera")]
+    #[test]
+    fn a_new_stream_on_a_reused_session_starts_over() {
+        let frames = encoded(3, &[]);
+        let mut r = Receivers::default();
+        r.push(3, numbered(&frames[1], 30_001));
+        assert_eq!(pictures(&r), 0, "a straggler of the old stream");
+        r.push(3, numbered(&frames[0], 0));
+        r.push(3, numbered(&frames[1], 1));
+        assert_eq!(pictures(&r), 2, "the new stream from its IDR on");
+        assert!(
+            r.accept(3, &numbered(&frames[0], 0)).is_none(),
+            "late again"
+        );
     }
 
     /// A frame the decoder cannot read leaves it without a valid reference:
