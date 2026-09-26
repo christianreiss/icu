@@ -1,15 +1,18 @@
-# ICU server configuration. Adjust server_name and public_host, then:
+# ICU server configuration. Check server_name and public_host, then:
 #   sudo systemctl enable --now icu-server
-# Until then the server refuses to start and `icu-server invite` refuses to
-# issue anything: the names go into the CA and every certificate.
+# Unset, server_name is this host's FQDN (`hostname --fqdn`), but only if it
+# resolves to a routable (not loopback or link-local) address of this host;
+# otherwise the server refuses to start. Set both explicitly for a DNS alias or behind NAT: the
+# names go into the CA and every certificate.
 # Reference: /usr/share/doc/icu-server/README.md
 
 [server]
 listen = ["0.0.0.0:4711", "[::]:4711"]
 # DNS name (or IP) clients connect to; baked into every certificate.
-server_name = "icu.example.org"
-# host:port written into registration bundles.
-public_host = "icu.example.org:4711"
+# Default: the host's FQDN, confirmed by DNS (see above).
+#server_name = "icu.example.org"
+# host:port written into registration bundles. Default: server_name:4711.
+#public_host = "icu.example.org:4711"
 max_users = 16
 # Lowest client version; older clients are refused at Hello (VERSION_UNSUPPORTED).
 min_client = "0.1.0"

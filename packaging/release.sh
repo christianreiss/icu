@@ -59,8 +59,8 @@ ICU $VERSION
     sudo dnf install ./icu-server-$VERSION-*.x86_64.rpm     # Fedora, AlmaLinux/EL 10+
     sudo apt install ./icu-server_${VERSION}-*_amd64.deb     # Debian 12+
 
-then set \`server_name\`/\`public_host\` in \`/etc/icu/server.toml\` and
-\`sudo systemctl enable --now icu-server\`. Details: \`deploy/README.md\`.
+then check \`server_name\`/\`public_host\` in \`/etc/icu/server.toml\` (unset: the
+host's FQDN, if it resolves to this host) and \`sudo systemctl enable --now icu-server\`. Details: \`deploy/README.md\`.
 
 **Client** (\`icu\`), one package per distro:
 
