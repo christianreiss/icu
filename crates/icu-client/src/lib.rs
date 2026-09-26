@@ -19,6 +19,7 @@ pub mod notify;
 pub mod overlay;
 pub mod problem;
 pub mod quality;
+pub mod signals;
 pub mod stats;
 pub mod sync;
 #[cfg(feature = "tray")]

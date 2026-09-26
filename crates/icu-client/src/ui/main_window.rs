@@ -238,6 +238,9 @@ impl App {
         // `logic` runs even while the window is hidden to the tray.
         let ctx = cc.egui_ctx.clone();
         crate::instance::set_waker(move || ctx.request_repaint());
+        // So does a SIGTERM (`crate::signals`): quitting is `logic`'s job.
+        let ctx = cc.egui_ctx.clone();
+        crate::signals::set_waker(move || ctx.request_repaint());
         #[cfg(feature = "tray")]
         let tray = crate::tray::Tray::start(cmd.clone(), cc.egui_ctx.clone()).ok();
         #[cfg(feature = "overlay")]
@@ -341,6 +344,12 @@ impl eframe::App for App {
             allow(unused_variables)
         )]
         let state = &self.state;
+
+        // A SIGTERM or Ctrl+C quits like the tray's „Beenden“.
+        if crate::signals::requested() && !self.quit_requested {
+            self.quit_requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
 
         #[cfg(feature = "tray")]
         if let Some(tray) = &mut self.tray {

@@ -594,3 +594,50 @@ async fn the_mic_test_plays_the_own_voice_while_it_is_on() {
     engine.shutdown();
     server.handle.shutdown().await;
 }
+
+/// A desktop logging out ends ICU with SIGTERM: the process says goodbye,
+/// so the others see it leave at once instead of after the server's idle
+/// timeout (60 s).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_ends_the_session_with_a_goodbye() {
+    let server = TestServer::start().await;
+    let (_identity, _paths, dir) = server.enroll("alice").await;
+    let mut watcher = server.raw_client("bob").await;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_icu"))
+        .arg("--config-dir")
+        .arg(dir.path())
+        .args([
+            "--headless",
+            "--no-hotkeys",
+            "--no-uri-handler",
+            "--fake-audio",
+            "--server-addr",
+        ])
+        .arg(server.addr().to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("icu starts");
+    let joined = watcher
+        .recv_matching(SOON, |m| matches!(m, ControlMsg::UserJoined { .. }))
+        .await;
+    assert!(joined.is_some(), "the client joined");
+
+    // SAFETY: a plain kill(2) on our own child.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let left = watcher
+        .recv_matching(Duration::from_secs(3), |m| {
+            matches!(m, ControlMsg::UserLeft { .. })
+        })
+        .await;
+    let exited = wait_until(Duration::from_secs(6), || {
+        matches!(child.try_wait(), Ok(Some(_)))
+    })
+    .await;
+    if !exited {
+        let _ = child.kill();
+    }
+    assert!(left.is_some(), "the others see the client leave at once");
+    assert!(exited, "the client ends after SIGTERM");
+}

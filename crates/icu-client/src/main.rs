@@ -308,6 +308,9 @@ fn run(cli: Cli) -> Result<(), String> {
         cfg.test_tone = cli.test_tone;
         cfg.banner = settings_problem.take().or(problem);
         let engine = Engine::start(cfg, backend).map_err(|e| e.to_string())?;
+        // From here a SIGTERM (a desktop logging out) quits like „Beenden“,
+        // with a proper goodbye to the server.
+        icu_client::signals::listen();
 
         // Hotkeys come up in the background: the Portal may show a dialog and
         // the window must not wait for it. The supervisor lives on the
@@ -347,16 +350,11 @@ fn run_headless(engine: Engine, debug_stats: bool) -> Result<(), String> {
         }
         icu_client::camera::CameraHandle::new(engine.camera_link())
     };
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        let _ = ctrlc_handler(move || stop.store(true, std::sync::atomic::Ordering::Relaxed));
-    }
     let stats = engine.stats();
     let mut state = engine.state();
     let mut last_report = std::time::Instant::now();
     let mut last_conn = None;
-    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+    while !icu_client::signals::requested() {
         std::thread::sleep(Duration::from_millis(100));
         if state.has_changed().unwrap_or(true) {
             let s = state.borrow_and_update();
@@ -394,22 +392,4 @@ fn run_headless(engine: Engine, debug_stats: bool) -> Result<(), String> {
     camera.stop();
     engine.shutdown();
     Ok(())
-}
-
-fn ctrlc_handler(f: impl Fn() + Send + 'static) -> Result<(), String> {
-    // A tiny runtime just for the signal, so the main thread can poll.
-    std::thread::Builder::new()
-        .name("icu-signal".into())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("signal runtime");
-            rt.block_on(async {
-                let _ = tokio::signal::ctrl_c().await;
-                f();
-            });
-        })
-        .map(|_| ())
-        .map_err(|e| e.to_string())
 }
