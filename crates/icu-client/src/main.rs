@@ -95,6 +95,21 @@ fn confirm_import() -> Result<bool, String> {
     ))
 }
 
+/// The bundle argument as text: the armored text itself, or a file's
+/// contents. A passport is at most 8 KiB decoded; a much larger file is not
+/// one and is not read whole.
+fn read_bundle(arg: &str) -> Result<String, String> {
+    use std::io::Read;
+    if icu_proto::passport::Passport::looks_like(arg) {
+        return Ok(arg.to_owned());
+    }
+    let mut text = String::new();
+    std::fs::File::open(arg)
+        .and_then(|f| f.take(64 * 1024).read_to_string(&mut text))
+        .map_err(|e| format!("{arg}: {e}"))?;
+    Ok(text)
+}
+
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -113,13 +128,31 @@ fn run(cli: Cli) -> Result<(), String> {
     std::fs::create_dir_all(&paths.config_dir).map_err(|e| e.to_string())?;
     let settings = Settings::load(&paths).map_err(|e| e.to_string())?;
 
-    if let Some(bundle) = &cli.bundle {
-        let text = if icu_proto::passport::Passport::looks_like(bundle) {
-            bundle.clone()
-        } else {
-            std::fs::read_to_string(bundle).map_err(|e| format!("{bundle}: {e}"))?
+    // As text, read here: the running instance it may be handed to can sit
+    // in another working directory.
+    let bundle = cli.bundle.as_deref().map(read_bundle).transpose()?;
+
+    // One client per configuration directory: a second start brings the
+    // running one to the front and hands over what it was given, instead of
+    // knocking its session off the server (`icu_client::instance`).
+    #[cfg(feature = "gui")]
+    if !cli.headless {
+        use icu_client::instance::{self, Claim, Request};
+        let request = Request {
+            bundle: bundle.clone(),
         };
-        let mut identity = Identity::from_passport(&text)?;
+        match instance::claim(&paths, &request)? {
+            Claim::First(listener) => instance::install(listener),
+            Claim::Handed => {
+                eprintln!("icu: ICU läuft bereits; das Fenster wurde nach vorn geholt.");
+                return Ok(());
+            }
+            Claim::Unguarded(why) => tracing::info!(%why, "no single-instance guard"),
+        }
+    }
+
+    if let Some(text) = &bundle {
+        let mut identity = Identity::from_passport(text)?;
         // A passport brings its own CA and address: show where it leads
         // before anything is replaced (`PROTOCOL.md` §2.3.1).
         let current = Identity::load(&paths).ok().flatten();
