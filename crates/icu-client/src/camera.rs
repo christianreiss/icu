@@ -35,6 +35,12 @@ pub const FPS: u32 = 15;
 /// IDR interval.
 pub const IDR_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Minimum spacing of the IDRs sent because a frame was lost: the same
+/// once per second the receivers may ask for one (`PROTOCOL.md` §2.2
+/// Nr. 13). An IDR is several P-frames' worth of bytes, and the loss was
+/// most likely congestion.
+const LOSS_IDR_INTERVAL: Duration = Duration::from_secs(1);
+
 /// One RGB8 picture.
 #[derive(Debug, Clone)]
 pub struct RgbFrame {
@@ -362,6 +368,9 @@ pub fn run_sender(
     // streak only debug lines — a camera that sends nothing usable would
     // otherwise log five warnings a second.
     let mut failed: u32 = 0;
+    // A frame did not go out on a live connection: the next ones refer to
+    // it, so the receivers see a broken picture until the next IDR.
+    let mut lost = false;
     while !stop.load(Ordering::Relaxed) {
         let frame = match source.next_frame() {
             Ok(f) if f.is_valid() => Arc::new(f),
@@ -431,7 +440,9 @@ pub fn run_sender(
             _ => yuv = Some(YUVBuffer::from_rgb_source(src)),
         }
         let Some(buf) = yuv.as_ref() else { continue };
-        let want_idr = link.take_keyframe_request() || last_idr.elapsed() >= IDR_INTERVAL;
+        let want_idr = link.take_keyframe_request()
+            || last_idr.elapsed() >= IDR_INTERVAL
+            || (lost && last_idr.elapsed() >= LOSS_IDR_INTERVAL);
         if want_idr {
             enc.force_intra_frame();
         }
@@ -442,6 +453,7 @@ pub fn run_sender(
                 let keyframe = matches!(bs.frame_type(), FrameType::IDR | FrameType::I);
                 if keyframe {
                     last_idr = Instant::now();
+                    lost = false;
                 }
                 let data = bs.to_vec();
                 if data.is_empty() {
@@ -449,6 +461,8 @@ pub fn run_sender(
                 }
                 if let Err(e) = link.send_frame(keyframe, ts, &data) {
                     tracing::debug!(%e, "video frame not sent");
+                    // Not while offline: there is nobody to repair for.
+                    lost |= link.connected();
                 }
             }
             Err(e) => tracing::warn!(%e, "h264 encode"),

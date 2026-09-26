@@ -143,9 +143,32 @@ pub struct Frame {
     pub at: Instant,
 }
 
-/// The per-speaker H.264 decoder.
+/// The per-speaker H.264 decoder. Remembers when an access unit failed to
+/// decode — a lost or damaged reference — so the receiver waits for the
+/// next IDR and asks for one ([`Receivers::finish`]).
 #[cfg(feature = "camera")]
-pub use openh264::decoder::Decoder;
+pub struct Decoder {
+    inner: openh264::decoder::Decoder,
+    failed: bool,
+}
+
+#[cfg(feature = "camera")]
+impl Decoder {
+    /// A fresh decoder.
+    pub fn new() -> Result<Decoder, String> {
+        openh264::decoder::Decoder::new()
+            .map(|inner| Decoder {
+                inner,
+                failed: false,
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Whether a decode failed since the last call.
+    fn take_failed(&mut self) -> bool {
+        std::mem::take(&mut self.failed)
+    }
+}
 
 /// Stands in for the decoder in a build without `camera`: nothing is ever
 /// decoded, the frames are only counted.
@@ -153,12 +176,27 @@ pub use openh264::decoder::Decoder;
 #[derive(Debug)]
 pub struct Decoder;
 
+#[cfg(not(feature = "camera"))]
+impl Decoder {
+    /// Never fails: it never decodes.
+    fn take_failed(&mut self) -> bool {
+        false
+    }
+}
+
 /// Decodes one access unit to a picture, `None` when the decoder has
-/// nothing to show yet or cannot read it.
+/// nothing to show yet or cannot read it (then it remembers the failure).
 #[cfg(feature = "camera")]
 pub fn decode(decoder: &mut Decoder, data: &[u8]) -> Option<Frame> {
     use openh264::formats::YUVSource;
-    let yuv = decoder.decode(data).ok()??;
+    let yuv = match decoder.inner.decode(data) {
+        Ok(yuv) => yuv?,
+        Err(e) => {
+            tracing::debug!(%e, "h264 decode");
+            decoder.failed = true;
+            return None;
+        }
+    };
     let (w, h) = yuv.dimensions();
     let mut rgba = vec![0u8; w * h * 4];
     yuv.write_rgba8(&mut rgba);
@@ -294,7 +332,13 @@ struct Receiver {
     /// a viewer that already uploaded `seq` knows the pixels have not changed
     /// and can skip both the clone and the texture upload.
     seq: u64,
+    /// The decoder can take the next frame: an IDR arrived and nothing was
+    /// lost since. Cleared by a gap in `seq` or a failed decode; until the
+    /// next IDR the frames are dropped and one is asked for.
     got_keyframe: bool,
+    /// The `seq` of the newest frame seen. Anything not newer came in late
+    /// (the frames' streams complete in any order) and is dropped.
+    last_seq: Option<u16>,
     last_frame: Option<Instant>,
     last_request: Option<Instant>,
     frames: u64,
@@ -310,6 +354,7 @@ impl Receiver {
             latest: None,
             seq: 0,
             got_keyframe: false,
+            last_seq: None,
             last_frame: None,
             last_request: None,
             frames: 0,
@@ -342,12 +387,31 @@ impl Receivers {
     }
 
     /// Books a frame for `session` and, when it is decodable — H.264, after
-    /// the first IDR — lends out the session's decoder. Frames before the
-    /// first IDR are dropped and a `KeyframeRequest` is queued.
+    /// an IDR with nothing lost since — lends out the session's decoder.
+    /// Frames are decoded in `seq` order: one older than a frame already
+    /// seen is dropped, and after a gap (a frame the server or the sender's
+    /// flow control dropped) the following ones refer to a picture this
+    /// decoder never had, so everything up to the next IDR is dropped and a
+    /// `KeyframeRequest` is queued ([`Receivers::take_keyframe_requests`]).
+    /// Otherwise the picture stays corrupt until the sender's next periodic
+    /// IDR, up to 2 s later.
     pub fn accept(&mut self, session: Session, frame: &EncodedFrame) -> Option<Decoder> {
         let r = self.map.entry(session).or_insert_with(Receiver::new);
         r.frames += 1;
         r.last_frame = Some(Instant::now());
+        let seq = frame.header.seq;
+        if let Some(last) = r.last_seq {
+            // Modulo 2^16 (`PROTOCOL.md` §3): a step past half the range is
+            // a step back.
+            let step = seq.wrapping_sub(last) as i16;
+            if step <= 0 {
+                return None;
+            }
+            if step > 1 {
+                r.got_keyframe = false;
+            }
+        }
+        r.last_seq = Some(seq);
         if frame.header.keyframe() {
             r.got_keyframe = true;
         }
@@ -360,12 +424,17 @@ impl Receivers {
     /// Returns the decoder [`Receivers::accept`] lent out, with the picture
     /// it made of the frame. A session removed or reset in the meantime has
     /// a fresh decoder waiting for its IDR; the old one is dropped with it.
-    pub fn finish(&mut self, session: Session, decoder: Decoder, picture: Option<Frame>) {
+    /// A frame that failed to decode means a broken reference: wait for the
+    /// next IDR and ask for it.
+    pub fn finish(&mut self, session: Session, mut decoder: Decoder, picture: Option<Frame>) {
         let Some(r) = self.map.get_mut(&session) else {
             return;
         };
         if r.decoder.is_some() {
             return;
+        }
+        if decoder.take_failed() {
+            r.got_keyframe = false;
         }
         r.decoder = Some(decoder);
         if let Some(picture) = picture {
@@ -374,7 +443,8 @@ impl Receivers {
         }
     }
 
-    /// Sessions that need an IDR, rate limited to one request per second.
+    /// Sessions that need an IDR (none yet, or one lost since), rate limited
+    /// to one request per second and speaker (`PROTOCOL.md` §2.2 Nr. 13).
     pub fn take_keyframe_requests(&mut self) -> Vec<Session> {
         let now = Instant::now();
         let mut out = Vec::new();
@@ -438,7 +508,8 @@ impl Receivers {
         self.map.get(&session).map(|r| r.frames).unwrap_or(0)
     }
 
-    /// Whether the session has delivered decodable video.
+    /// Whether the session's video is decodable right now: an IDR arrived
+    /// and nothing was lost or failed since.
     pub fn has_keyframe(&self, session: Session) -> bool {
         self.map
             .get(&session)
@@ -559,18 +630,140 @@ mod tests {
         assert!(!VideoTier::T0.paused());
     }
 
+    /// Real access units: `n` pictures of a moving pattern, an IDR first and
+    /// wherever `idr` says, P-frames in between. `seq` counts from 0.
+    #[cfg(feature = "camera")]
+    fn encoded(n: usize, idr: &[usize]) -> Vec<EncodedFrame> {
+        use openh264::{
+            encoder::FrameType,
+            formats::{RgbSliceU8, YUVBuffer},
+        };
+        let mut enc = crate::camera::encoder(VideoTier::T0).unwrap();
+        (0..n)
+            .map(|i| {
+                let rgb: Vec<u8> = (0..240usize)
+                    .flat_map(|y| {
+                        (0..320usize).flat_map(move |x| [(x + 4 * i) as u8, y as u8, (x ^ y) as u8])
+                    })
+                    .collect();
+                let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(&rgb, (320, 240)));
+                if idr.contains(&i) {
+                    enc.force_intra_frame();
+                }
+                let bs = enc.encode(&yuv).unwrap();
+                let keyframe = matches!(bs.frame_type(), FrameType::IDR | FrameType::I);
+                EncodedFrame {
+                    header: VideoHeader {
+                        flags: u8::from(keyframe),
+                        speaker: 3,
+                        seq: i as u16,
+                        ts: 0,
+                        codec: VIDEO_CODEC_H264,
+                    },
+                    data: bs.to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    /// `frame` as the `seq`-th of its stream.
+    #[cfg(feature = "camera")]
+    fn numbered(frame: &EncodedFrame, seq: u16) -> EncodedFrame {
+        let mut frame = frame.clone();
+        frame.header.seq = seq;
+        frame
+    }
+
+    /// Decoded pictures so far for session 3.
+    #[cfg(feature = "camera")]
+    fn pictures(r: &Receivers) -> u64 {
+        r.map.get(&3).map_or(0, |r| r.seq)
+    }
+
+    #[cfg(feature = "camera")]
     #[test]
     fn keyframe_is_requested_until_an_idr_arrives() {
+        let frames = encoded(2, &[]);
+        assert!(frames[0].header.keyframe() && !frames[1].header.keyframe());
         let mut r = Receivers::default();
-        r.push(3, frame(false));
-        assert_eq!(r.take_keyframe_requests(), vec![3]);
+        r.push(3, numbered(&frames[1], 10));
+        assert_eq!(r.take_keyframe_requests(), vec![3], "a P-frame first");
         assert!(r.take_keyframe_requests().is_empty(), "rate limited");
-        r.push(3, frame(true));
+        r.push(3, numbered(&frames[0], 11));
         assert!(r.has_keyframe(3));
+        assert_eq!(pictures(&r), 1);
+        r.push(3, numbered(&frames[1], 12));
+        assert_eq!(pictures(&r), 2);
         assert!(r.take_keyframe_requests().is_empty());
-        assert_eq!(r.frames(3), 2);
+        assert_eq!(r.frames(3), 3);
         r.remove(3);
         assert_eq!(r.frames(3), 0);
+    }
+
+    /// A frame lost on the way (the server dropped it for a slow receiver,
+    /// or the sender's flow control did): the next P-frames refer to it, so
+    /// they wait for an IDR, which is asked for at once instead of up to
+    /// 2 s of broken picture until the periodic one.
+    #[cfg(feature = "camera")]
+    #[test]
+    fn a_gap_waits_for_a_requested_idr() {
+        let frames = encoded(7, &[5]);
+        let mut r = Receivers::default();
+        for f in &frames[..2] {
+            r.push(3, f.clone());
+        }
+        assert_eq!(pictures(&r), 2);
+        assert!(r.take_keyframe_requests().is_empty());
+        // Frame 2 never arrives.
+        r.push(3, frames[3].clone());
+        r.push(3, frames[4].clone());
+        assert_eq!(pictures(&r), 2, "not decoded against a missing reference");
+        assert!(!r.has_keyframe(3));
+        assert_eq!(r.take_keyframe_requests(), vec![3], "asked for an IDR");
+        r.push(3, frames[5].clone());
+        r.push(3, frames[6].clone());
+        assert_eq!(pictures(&r), 4, "decoding again from the IDR on");
+        assert!(r.has_keyframe(3));
+    }
+
+    /// The frames' streams complete in any order: a frame older than one
+    /// already decoded is dropped instead of being decoded out of order.
+    #[cfg(feature = "camera")]
+    #[test]
+    fn late_frames_are_dropped() {
+        let frames = encoded(3, &[]);
+        let mut r = Receivers::default();
+        for f in &frames {
+            r.push(3, f.clone());
+        }
+        assert_eq!(pictures(&r), 3);
+        assert!(r.accept(3, &frames[1]).is_none(), "older");
+        assert!(r.accept(3, &frames[2]).is_none(), "the same again");
+        assert!(r.has_keyframe(3), "late is not lost");
+        // `seq` wraps: 65535 → 0 is one step forward.
+        let mut r = Receivers::default();
+        r.push(3, numbered(&frames[0], u16::MAX));
+        r.push(3, numbered(&frames[1], 0));
+        assert_eq!(pictures(&r), 2);
+    }
+
+    /// A frame the decoder cannot read leaves it without a valid reference:
+    /// wait for the next IDR and ask for it.
+    #[cfg(feature = "camera")]
+    #[test]
+    fn a_decode_error_asks_for_an_idr() {
+        let frames = encoded(3, &[]);
+        let mut r = Receivers::default();
+        r.push(3, frames[0].clone());
+        assert_eq!(pictures(&r), 1);
+        let mut broken = frames[1].clone();
+        let keep = broken.data.len() / 2;
+        broken.data.truncate(keep);
+        r.push(3, broken);
+        assert!(!r.has_keyframe(3), "decode failed");
+        assert_eq!(r.take_keyframe_requests(), vec![3]);
+        r.push(3, frames[2].clone());
+        assert_eq!(pictures(&r), 1, "dropped until the IDR");
     }
 
     /// A session that delivered frames but nothing decodable is not offered
