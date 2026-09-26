@@ -162,19 +162,23 @@ Fehlerform einheitlich `{"ok":false,"error":"<kurzform>","detail":"<text>"}`.
 **Eine Verbindung pro Zertifikat** (2026-09-24, `PROTOCOL.md` §7): nach `authenticate` trägt `session::LiveCert` die Verbindung unter dem Leaf-Fingerprint in `Server.live_certs` ein, für normale und Registrierungssitzungen. Stand dort schon eine andere, wird sie mit `SESSION_REPLACED` geschlossen (über `Room::close_connection`, das den Code vor dem Schließen im Member vermerkt, damit `UserLeft` ihn trägt); der Eintrag wird beim Ende nur entfernt, wenn er noch dieser Verbindung gehört (`stable_id`).
 
 ```
-incoming = endpoint.accept()
-  if offene Verbindungen ≥ max_connections (256) → incoming.refuse()   // Handshake oder etabliert, alle Endpoints
-  if under_load (≥ 32 offene Verbindungen) → incoming.retry()      // Adressvalidierung, kostet kein Budget
+incoming = endpoint.accept()                  // endpoint::admit
+  if laufende Handshakes ≥ max_handshakes (256) → incoming.refuse()       // alle Endpoints
+  if nicht validiert && laufende Handshakes ≥ 32 → incoming.retry()      // Adressvalidierung, kostet kein Budget
+  if validiert && Quelle hält 4 Handshakes (IPv4 bzw. IPv6-/64; 16 je /48) → incoming.refuse()
   if limits.ip_bucket(/64 bzw. IPv4).exhausted || global_bucket.exhausted → incoming.refuse()
-  if IP-Tabelle voll (4096) → validiert: nur globales Budget, sonst retry()/refuse()
-connecting = incoming.accept()                // ab hier ≤ 10 s bis Handshake-Ende, sonst verworfen
+  if IP-Tabelle voll (4096) → validiert: nur globales Budget, sonst retry()
+connecting = incoming.accept()                // ab hier ≤ 5 s bis Handshake-Ende, sonst verworfen
 // handshake_data() nimmt &mut self und liefert Box<dyn Any>; Downcast auf quinn::crypto::rustls::HandshakeData
 alpn = connecting.handshake_data().await?
          .downcast::<quinn::crypto::rustls::HandshakeData>()?.protocol   // Spike 2b: vor Handshake-Ende lesbar
-conn = connecting.await
+conn = connecting.await                       // Handshake-Platz frei
+if etablierte Verbindungen ≥ max_connections (256) → close(SERVER_FULL)
 match alpn:
   icu/1        → session::handle(conn)
 ```
+
+Laufende Handshakes und etablierte Verbindungen sind getrennte Zähler (`Server.handshakes`, `Server.open_connections`, 2026-09-26). Vorher zählte eine gemeinsame Grenze beides: wer die Retry aus drei IPv4-Adressen (oder einem IPv6-/62) beantwortete und dann nicht weitermachte, hielt je Quelle rund 100 Plätze für 10 s und sperrte alle anderen aus, Reconnects und Logins eingeschlossen. Jetzt hält eine validierte Quelle höchstens 4 Handshakes zugleich (`IpLimits::handshake_slot_free`), gebucht erst nach der Adressvalidierung — ein unvalidierter Handshake kann eine gefälschte Absenderadresse tragen und darf deshalb keiner Quelle angerechnet werden; unvalidierte begrenzt die Retry-Schwelle von 32. Eine eben fertige Verbindung über `limits.max_connections` bekommt `SERVER_FULL` (nicht fatal); das ist nur eine Rückfallebene, weil Unbekannte über den Handshake hinaus keine Verbindung halten und jedes Zertifikat höchstens eine.
 
 ### 6.3 Registrierung (`registration.rs`, `session.rs`)
 
@@ -238,7 +242,7 @@ Video-Empfänger sind nur die anderen Teilnehmer mit `viewing` (`PROTOCOL.md` §
 
 ### 6.6 Limits (`limits.rs`)
 
-Token-Buckets pro Client (Control 50/s, Audio 110/s, Video 20/s und 400 kbit/s) und pro IP (Registrierungssitzungen 5/min, Handshakes 10/s; IPv6 zählt pro /64, weil ein Host meist ein ganzes /64 hält, IPv4-mapped als IPv4), dazu global (Handshakes 100/s, Registrierungen 20/min, höchstens 256 offene Verbindungen, Handshake ≤ 10 s). Konfigurierbar als `limits.handshakes_global_per_s`, `limits.max_connections` (mindestens `2 × max_users`) und `timing.handshake_timeout_ms`. Abgewiesene Verbindungen ohne Zertifikat (`AUTH_REQUIRED`) loggt der Server nur auf `debug`, damit Scanner das Journal nicht füllen. Überschreitung: Datagram/Frame verwerfen und zählen; bei Control `Error(RATE_LIMITED)` (nicht fatal, Verbindung bleibt), beim dritten Verstoß binnen 60 s `close(RATE_LIMITED_FATAL)` — ein eigener, fataler Code, damit der Client nicht in einen Reconnect-Loop läuft (`PROTOCOL.md` §5/§6).
+Token-Buckets pro Client (Control 50/s, Audio 110/s, Video 20/s und 400 kbit/s) und pro IP (Registrierungssitzungen 5/min, Handshakes 10/s; IPv6 zählt pro /64, weil ein Host meist ein ganzes /64 hält, IPv4-mapped als IPv4), dazu global (Handshakes 100/s, Registrierungen 20/min, höchstens 256 laufende Handshakes und 256 etablierte Verbindungen, Handshake ≤ 5 s) und je validierter Quelle höchstens 4 laufende Handshakes (16 je IPv6-/48, §6.2). Konfigurierbar als `limits.handshakes_global_per_s`, `limits.max_handshakes` (über der Retry-Schwelle 32), `limits.max_connections` (mindestens `2 × max_users`) und `timing.handshake_timeout_ms`. Abgewiesene Verbindungen ohne Zertifikat (`AUTH_REQUIRED`) loggt der Server nur auf `debug`, damit Scanner das Journal nicht füllen. Überschreitung: Datagram/Frame verwerfen und zählen; bei Control `Error(RATE_LIMITED)` (nicht fatal, Verbindung bleibt), beim dritten Verstoß binnen 60 s `close(RATE_LIMITED_FATAL)` — ein eigener, fataler Code, damit der Client nicht in einen Reconnect-Loop läuft (`PROTOCOL.md` §5/§6).
 
 ## 7. Logging und Metriken
 

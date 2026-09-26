@@ -236,7 +236,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | 0x02 | `VERSION_UNSUPPORTED` | ja | `Hello.minor` nicht bedienbar |
 | 0x03 | `AUTH_UNKNOWN_CERT` | ja | Cert gültig gegen CA, Fingerprint unbekannt |
 | 0x04 | `AUTH_REVOKED` | ja | Fingerprint revoked. Seit der CRL (§1) nur noch für Zertifikate ohne Seriennummer in `users.toml` und für ein Zertifikat, das zwischen Handshake und Anmeldung widerrufen wurde; sonst endet schon der Handshake mit `certificate_revoked` |
-| 0x05 | `SERVER_FULL` | nein | `max_users` erreicht; Client reconnectet mit Backoff |
+| 0x05 | `SERVER_FULL` | nein | `max_users` erreicht, oder `limits.max_connections` etablierte Verbindungen (§7); Client reconnectet mit Backoff |
 | 0x06 | `KICKED` | ja | Admin-Aktion: Rauswurf (`AdminKick`, Neuverbinden möglich) oder Revoke mit sofortigem Close |
 | 0x07 | `HELLO_TIMEOUT` | nein | kein `Hello` binnen 5 s; Client reconnectet mit Backoff |
 | 0x08 | `SHUTDOWN` | nein | Server fährt herunter; Client reconnectet |
@@ -270,8 +270,8 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | Users | `max_users` (Default 16, Obergrenze 64); beim Erreichen `close(SERVER_FULL)` |
 | Uni-Streams | `max_concurrent_uni_streams` = `2 × max_users + 4` je Richtung |
 | `Welcome`-Größe | Server validiert beim Start, dass `max_users` × 100 B + Reserve unter dem 16-KiB-Frame-Limit bleibt |
-| Handshakes | 10/s pro IP (IPv6: pro /64), 100/s global; ≤ 10 s je Handshake; ab 32 offenen Verbindungen Retry (Adressvalidierung) |
-| Verbindungen | ≤ 256 offen (Handshake oder etabliert, über alle Listen-Adressen), darüber `refuse` |
+| Handshakes | 10/s pro IP (IPv6: pro /64), 100/s global; ≤ 5 s je Handshake; ab 32 laufenden Handshakes Retry (Adressvalidierung) für jede Quelle, die ihre Adresse noch nicht bewiesen hat; je validierter Quelle (IPv4-Adresse, IPv6-/64) höchstens 4 gleichzeitig, je IPv6-/48 höchstens 16; höchstens 256 gleichzeitig über alle Listen-Adressen (`limits.max_handshakes`), darüber `refuse`. Unvalidierte Handshakes zählen nicht gegen ihre Quelle, weil ihre Adresse gefälscht sein kann; sie begrenzt die Retry-Schwelle. (revidiert 2026-09-26) |
+| Verbindungen | ≤ 256 etabliert (`limits.max_connections`, mindestens `2 × max_users`, über alle Listen-Adressen); darüber schließt der Server eine eben fertige Verbindung mit `SERVER_FULL`. Laufende Handshakes zählen nicht mit (2026-09-26): vorher teilten sie sich eine Grenze mit den etablierten, und wer aus drei IPv4-Adressen die Retry beantwortete und dann hängen blieb, sperrte alle anderen aus, auch Reconnects |
 | Verbindungen je Zertifikat | 1 (Fingerprint des Client-Leafs, Registrierungssitzungen eingeschlossen); die neueste gewinnt, die ältere endet mit `SESSION_REPLACED` (2026-09-24) |
 | CRL | ≤ `MAX_CONTROL_FRAME` als `CrlUpdate`, ~350 Einträge; abgelaufene Registrierungs- und Server-Zertifikate fallen heraus, widerrufene Client-Zertifikate bleiben |
 | Registrierung | 5/min pro IP (IPv6: pro /64), 20/min global; je Sitzung ≤ 10 `RenewRequest`, ≤ 120 s; Registrierungszertifikat ≤ 7 Tage |

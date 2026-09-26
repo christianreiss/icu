@@ -74,8 +74,11 @@ pub struct Server {
     pub ip_limits: std::sync::Mutex<IpLimits>,
     /// `LossReport` aggregation per speaker.
     pub loss: std::sync::Mutex<LossTracker>,
-    /// Connection tasks alive right now, handshaking or established, over
-    /// all endpoints (`limits.max_connections`).
+    /// Handshakes in flight right now, over all endpoints
+    /// (`limits.max_handshakes`).
+    pub handshakes: std::sync::atomic::AtomicUsize,
+    /// Established connections right now, over all endpoints
+    /// (`limits.max_connections`).
     pub open_connections: std::sync::atomic::AtomicUsize,
     /// The one live connection per client certificate fingerprint; a newer
     /// one replaces it (`PROTOCOL.md` §7).
@@ -138,6 +141,7 @@ impl Server {
             room: Room::new(config.server.max_users),
             ip_limits: std::sync::Mutex::new(IpLimits::new(&config.limits)),
             loss: std::sync::Mutex::new(LossTracker::default()),
+            handshakes: std::sync::atomic::AtomicUsize::new(0),
             open_connections: std::sync::atomic::AtomicUsize::new(0),
             live_certs: std::sync::Mutex::new(std::collections::HashMap::new()),
             endpoints,

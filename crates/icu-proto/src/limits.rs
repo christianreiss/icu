@@ -30,15 +30,25 @@ pub const HANDSHAKES_PER_IP_PER_S: u32 = 10;
 /// Handshakes per second, server wide. Caps what many source addresses
 /// together can make the server spend on TLS.
 pub const HANDSHAKES_GLOBAL_PER_S: u32 = 100;
-/// Open connections, handshaking or established, above which the server
-/// sends a Retry.
+/// Handshakes in flight from which on a source that has not proven its
+/// address gets a Retry instead of a handshake.
 pub const HANDSHAKES_IN_FLIGHT_RETRY: usize = 32;
-/// Open connections, handshaking or established, above which the server
+/// Handshakes in flight, over all listen addresses, above which the server
 /// refuses new ones outright.
+pub const MAX_HANDSHAKES: u32 = 256;
+/// Handshakes in flight per validated source (IPv4 address, IPv6 /64). A
+/// source that answers the Retry and then stalls holds at most this many.
+pub const HANDSHAKES_IN_FLIGHT_PER_IP: u32 = 4;
+/// Handshakes in flight per IPv6 /48 over all its /64s: a single customer
+/// usually holds a whole /48.
+pub const HANDSHAKES_IN_FLIGHT_PER_48: u32 = 16;
+/// Established connections above which a completed handshake is closed with
+/// `SERVER_FULL`. A backstop: outsiders cannot keep a connection past the
+/// handshake, and each certificate holds one at most.
 pub const MAX_CONNECTIONS: u32 = 256;
 /// Seconds a QUIC handshake may take before the server drops it. Without
 /// this, a half-open handshake lives for the whole idle timeout.
-pub const HANDSHAKE_TIMEOUT_S: u64 = 10;
+pub const HANDSHAKE_TIMEOUT_S: u64 = 5;
 /// IPv6 sources are rate limited per prefix of this length: a single host
 /// usually holds a whole /64, so per-address buckets would not limit it.
 pub const IPV6_LIMIT_PREFIX: u8 = 64;

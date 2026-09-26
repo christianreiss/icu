@@ -522,6 +522,18 @@ pub fn client_endpoint(
     identity: Option<Identity>,
     alpn: &[u8],
 ) -> Endpoint {
+    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");
+    endpoint.set_default_client_config(client_config(ca, identity, alpn));
+    endpoint
+}
+
+/// The client configuration of [`client_endpoint`], for an endpoint built
+/// some other way.
+pub fn client_config(
+    ca: CertificateDer<'static>,
+    identity: Option<Identity>,
+    alpn: &[u8],
+) -> ClientConfig {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca).expect("add ca");
     // Always build from an explicit provider: several servers and clients live
@@ -540,7 +552,6 @@ pub fn client_endpoint(
     };
     tls.alpn_protocols = vec![alpn.to_vec()];
 
-    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");
     let mut config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client config"),
     ));
@@ -559,8 +570,7 @@ pub fn client_endpoint(
         icu_proto::limits::max_uni_streams(icu_proto::limits::DEFAULT_MAX_USERS),
     ));
     config.transport_config(Arc::new(transport));
-    endpoint.set_default_client_config(config);
-    endpoint
+    config
 }
 
 /// Connects on ALPN `icu/1` and opens the control stream.

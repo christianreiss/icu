@@ -249,70 +249,133 @@ pub async fn accept_loop(server: Arc<Server>, endpoint: Endpoint) {
             },
             _ = server.shutdown_requested() => return,
         };
-
-        let remote = incoming.remote_address();
-        // Hard ceiling over all endpoints, handshaking or established (§6.2):
-        // whatever gets past the rate limits cannot pile up connection state.
-        let open = server.open_connections.load(Ordering::Relaxed);
-        if open >= server.config.limits.max_connections as usize {
-            tracing::debug!(%remote, open, "connection limit, refusing");
-            incoming.refuse();
-            continue;
-        }
-        // Address validation under load (§6.2) comes first: a Retry costs
-        // no budget, so spoofed Initials cannot spend somebody else's.
-        let incoming = if open >= pl::HANDSHAKES_IN_FLIGHT_RETRY && incoming.may_retry() {
-            match incoming.retry() {
-                Ok(()) => continue,
-                Err(e) => e.into_incoming(),
-            }
-        } else {
-            incoming
-        };
-        match lock(&server.ip_limits).allow_handshake(remote.ip()) {
-            Some(true) => {}
-            // The table is full of addresses nobody validated: a validated
-            // one passes on the server wide budget alone, anything else has
-            // to prove its address.
-            None if incoming.remote_address_validated() => {
-                if !lock(&server.ip_limits).allow_untracked_handshake() {
-                    tracing::debug!(%remote, "global handshake rate limit, refusing");
-                    incoming.refuse();
-                    continue;
+        if let Some(handshake) = admit(&server, incoming) {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let remote = handshake.remote;
+                if let Err(e) = dispatch(server, handshake).await {
+                    tracing::debug!(%remote, error = %e, "connection ended");
                 }
-            }
-            None if incoming.may_retry() => {
-                if let Err(e) = incoming.retry() {
-                    e.into_incoming().refuse();
-                }
-                continue;
-            }
-            Some(false) | None => {
-                tracing::debug!(%remote, "handshake rate limit, refusing");
-                incoming.refuse();
-                continue;
-            }
+            });
         }
-
-        let server = server.clone();
-        let guard = OpenConnection::new(&server);
-        tokio::spawn(async move {
-            let _guard = guard;
-            if let Err(e) = dispatch(server, incoming).await {
-                tracing::debug!(%remote, error = %e, "connection ended");
-            }
-        });
     }
 }
 
-/// Counts one connection task in [`Server::open_connections`] for as long as
-/// it lives, handshake included.
+/// Decides about one connection attempt (§6.2): refused, sent through a
+/// Retry, or booked as a handshake in flight. Only handshakes count against
+/// the ceiling — established connections are the business of
+/// `limits.max_connections` — so whatever stalls in the handshake cannot
+/// lock out a reconnect or a login.
+fn admit(server: &Arc<Server>, incoming: quinn::Incoming) -> Option<Handshake> {
+    let remote = incoming.remote_address();
+    let handshakes = server.handshakes.load(Ordering::Relaxed);
+    // Hard ceiling over all endpoints: whatever gets past the limits below
+    // cannot pile up handshake state.
+    if handshakes >= server.config.limits.max_handshakes as usize {
+        tracing::debug!(%remote, handshakes, "handshake limit, refusing");
+        incoming.refuse();
+        return None;
+    }
+    // Address validation under load comes first: a Retry costs no budget,
+    // so spoofed Initials cannot spend somebody else's. Without a validated
+    // address a Retry is always allowed.
+    let validated = incoming.remote_address_validated();
+    if !validated && handshakes >= pl::HANDSHAKES_IN_FLIGHT_RETRY {
+        retry(incoming);
+        return None;
+    }
+    let ip = remote.ip();
+    let mut limits = lock(&server.ip_limits);
+    // A validated source holds a few handshakes at a time, however fast its
+    // rate bucket refills. An unvalidated one is not counted: its address
+    // may be spoofed, and unvalidated handshakes are bounded by the Retry
+    // threshold above anyway.
+    if validated && !limits.handshake_slot_free(ip) {
+        tracing::debug!(%remote, "handshakes in flight from this source, refusing");
+        drop(limits);
+        incoming.refuse();
+        return None;
+    }
+    match limits.allow_handshake(ip) {
+        Some(true) => {}
+        // The table is full of addresses nobody validated: a validated one
+        // passes on the server wide budget alone, anything else has to prove
+        // its address.
+        None if validated => {
+            if !limits.allow_untracked_handshake() {
+                tracing::debug!(%remote, "global handshake rate limit, refusing");
+                drop(limits);
+                incoming.refuse();
+                return None;
+            }
+        }
+        None => {
+            drop(limits);
+            retry(incoming);
+            return None;
+        }
+        Some(false) => {
+            tracing::debug!(%remote, "handshake rate limit, refusing");
+            drop(limits);
+            incoming.refuse();
+            return None;
+        }
+    }
+    if validated {
+        limits.start_handshake(ip);
+    }
+    drop(limits);
+    server.handshakes.fetch_add(1, Ordering::Relaxed);
+    Some(Handshake {
+        server: server.clone(),
+        incoming: Some(incoming),
+        remote,
+        booked: validated,
+    })
+}
+
+/// Answers with a Retry; refuses when that is not allowed any more.
+fn retry(incoming: quinn::Incoming) {
+    if let Err(e) = incoming.retry() {
+        e.into_incoming().refuse();
+    }
+}
+
+/// One handshake in flight, counted in [`Server::handshakes`] and, when its
+/// address was validated, against its source in [`crate::limits::IpLimits`]
+/// until it completes, fails or times out.
+struct Handshake {
+    server: Arc<Server>,
+    incoming: Option<quinn::Incoming>,
+    remote: SocketAddr,
+    booked: bool,
+}
+
+impl Drop for Handshake {
+    fn drop(&mut self) {
+        self.server.handshakes.fetch_sub(1, Ordering::Relaxed);
+        if self.booked {
+            lock(&self.server.ip_limits).end_handshake(self.remote.ip());
+        }
+    }
+}
+
+/// Counts one established connection in [`Server::open_connections`] for as
+/// long as its task lives.
 struct OpenConnection(Arc<Server>);
 
 impl OpenConnection {
-    fn new(server: &Arc<Server>) -> OpenConnection {
-        server.open_connections.fetch_add(1, Ordering::Relaxed);
-        OpenConnection(server.clone())
+    /// A slot for one more established connection, `None` at
+    /// `limits.max_connections`.
+    fn claim(server: &Arc<Server>) -> Option<OpenConnection> {
+        let max = server.config.limits.max_connections as usize;
+        server
+            .open_connections
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| OpenConnection(server.clone()))
     }
 }
 
@@ -322,8 +385,11 @@ impl Drop for OpenConnection {
     }
 }
 
-async fn dispatch(server: Arc<Server>, incoming: quinn::Incoming) -> Result<()> {
-    let remote = incoming.remote_address();
+async fn dispatch(server: Arc<Server>, mut handshake: Handshake) -> Result<()> {
+    let remote = handshake.remote;
+    let Some(incoming) = handshake.incoming.take() else {
+        return Ok(());
+    };
     let mut connecting = incoming.accept()?;
 
     // One deadline for the whole handshake. Otherwise only the idle timeout
@@ -344,6 +410,14 @@ async fn dispatch(server: Arc<Server>, incoming: quinn::Incoming) -> Result<()> 
     let conn = tokio::time::timeout_at(deadline, connecting)
         .await
         .map_err(|_| too_slow())??;
+
+    // From here on this is an established connection, not a handshake.
+    drop(handshake);
+    let Some(_open) = OpenConnection::claim(&server) else {
+        tracing::debug!(%remote, "connection limit, closing");
+        crate::wire::close(&conn, icu_proto::error::SERVER_FULL);
+        return Ok(());
+    };
 
     match alpn.as_deref() {
         Some(p) if p == pl::ALPN_MAIN => crate::session::handle(server, conn).await,

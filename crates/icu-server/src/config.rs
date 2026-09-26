@@ -93,8 +93,12 @@ pub struct LimitsSection {
     pub handshakes_per_ip_per_s: u32,
     /// Handshakes per second, server wide.
     pub handshakes_global_per_s: u32,
-    /// Open connections, handshaking or established, before new ones are
-    /// refused.
+    /// Handshakes in flight, over all listen addresses, before new ones are
+    /// refused. Above `HANDSHAKES_IN_FLIGHT_RETRY` (32), or a flood of
+    /// unvalidated handshakes could take every slot before Retry sets in.
+    pub max_handshakes: u32,
+    /// Established connections before a completed handshake is closed with
+    /// `SERVER_FULL`; at least `2 x max_users`.
     pub max_connections: u32,
 }
 
@@ -110,6 +114,7 @@ impl Default for LimitsSection {
             enroll_global_per_min: pl::ENROLL_GLOBAL_PER_MIN,
             handshakes_per_ip_per_s: pl::HANDSHAKES_PER_IP_PER_S,
             handshakes_global_per_s: pl::HANDSHAKES_GLOBAL_PER_S,
+            max_handshakes: pl::MAX_HANDSHAKES,
             max_connections: pl::MAX_CONNECTIONS,
         }
     }
@@ -313,8 +318,17 @@ impl Config {
         }
         Version::parse(&self.server.min_client)
             .context("server.min_client is not a semver version")?;
-        // Room for everybody plus handshakes in flight, or a full server
-        // would turn away its own users.
+        // A ceiling at or below the Retry threshold would let unvalidated
+        // handshakes, which may come from spoofed addresses, take every slot.
+        if self.limits.max_handshakes as usize <= pl::HANDSHAKES_IN_FLIGHT_RETRY {
+            return Err(Error::msg(format!(
+                "limits.max_handshakes must be above {}, got {}",
+                pl::HANDSHAKES_IN_FLIGHT_RETRY,
+                self.limits.max_handshakes
+            )));
+        }
+        // Room for everybody plus connections that have not said `Hello`
+        // yet, or a full server would turn away its own users.
         if self.limits.max_connections < u32::from(self.server.max_users) * 2 {
             return Err(Error::msg(format!(
                 "limits.max_connections must be at least 2 x max_users = {}, got {}",
@@ -484,6 +498,12 @@ format = "text"
         let mut c = base();
         c.limits.max_connections = 31;
         assert!(c.validate().is_err(), "below 2 x max_users");
+
+        let mut c = base();
+        c.limits.max_handshakes = 32;
+        assert!(c.validate().is_err(), "not above the Retry threshold");
+        c.limits.max_handshakes = 33;
+        assert!(c.validate().is_ok());
 
         let mut c = base();
         c.log.format = "xml".into();

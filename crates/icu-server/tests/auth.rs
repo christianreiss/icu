@@ -53,11 +53,11 @@ async fn connect_without_a_certificate_is_auth_required() {
     server.shutdown().await;
 }
 
-/// `PROTOCOL.md` §7: past `max_connections` open connections — handshaking
-/// or established, `Hello` or not — the server refuses new ones outright
-/// instead of accumulating state.
+/// `PROTOCOL.md` §7: past `max_connections` established connections,
+/// `Hello` or not, a completed handshake is closed with the non-fatal
+/// `SERVER_FULL` instead of accumulating state.
 #[tokio::test]
-async fn connections_past_the_limit_are_refused() {
+async fn connections_past_the_limit_are_closed_with_server_full() {
     let server = TestServer::start_with(|config| {
         config.server.max_users = 1;
         config.limits.max_connections = 2;
@@ -87,9 +87,14 @@ async fn connections_past_the_limit_are_refused() {
     // replace the first instead of adding to it.
     let _a = server.connect(&alice).await.expect("first connection");
     let _b = server.connect(&bob).await.expect("second connection");
+    let third = server
+        .connect(&carol)
+        .await
+        .expect("the handshake itself completes");
+    assert_eq!(third.closed_code().await, Some(ec::SERVER_FULL));
     assert!(
-        server.connect(&carol).await.is_err(),
-        "the third is refused during the handshake"
+        !ec::is_fatal(ec::SERVER_FULL),
+        "the client tries again later"
     );
     server.shutdown().await;
 }

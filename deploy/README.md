@@ -139,10 +139,13 @@ gültiges Zertifikat der eigenen CA kommt niemand über den Handshake hinaus —
 die Angriffsfläche für Unbekannte ist genau dieser Handshake. Dafür gilt
 (`PROTOCOL.md` §7, Werte in `[limits]`/`[timing]` überschreibbar):
 
-* Handshakes 10/s pro Quell-IP, IPv6 pro /64, und 100/s global; ab 32 offenen
-  Verbindungen muss jede neue Quelle ihre Adresse per Retry beweisen.
-* Höchstens 256 offene Verbindungen (`limits.max_connections`), ein Handshake
-  darf höchstens 10 s dauern.
+* Handshakes 10/s pro Quell-IP, IPv6 pro /64, und 100/s global; ab 32
+  laufenden Handshakes muss jede neue Quelle ihre Adresse per Retry beweisen.
+* Eine Quelle, die das getan hat, hält höchstens 4 Handshakes zugleich (je
+  IPv6-/48 höchstens 16); insgesamt laufen höchstens 256
+  (`limits.max_handshakes`), jeder darf höchstens 5 s dauern. Etablierte
+  Verbindungen zählen getrennt davon (`limits.max_connections`, 256), damit
+  hängende Handshakes niemandem den Reconnect verbauen.
 * Verbindungen ohne Zertifikat loggt der Server nur auf `debug`.
 
 Der Admin-Socket ist ein Unix-Socket und nie im Netz. Die Unit begrenzt den
