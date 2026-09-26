@@ -32,6 +32,9 @@ const INVITE_TTLS: [(u64, &str); 4] = [
     (3 * 24 * 60 * 60, "3 Tage"),
     (icu_proto::limits::MAX_INVITE_TTL_S, "7 Tage"),
 ];
+/// Width of the camera preview beside the camera controls: enough to judge
+/// framing, small enough that the card stays a settings card.
+const PREVIEW_W: f32 = 176.0;
 /// Width of the settings sidebar.
 const NAV_W: f32 = 184.0;
 /// Content column cap: cards wider than this only put more empty space
@@ -50,6 +53,7 @@ const CORNER_PICKER_W: f32 = CORNER_SWATCH * 6.0 + CORNER_GAP * 6.0 + CORNER_SPL
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Audio,
+    Sound,
     Hotkeys,
     Camera,
     General,
@@ -156,6 +160,9 @@ pub struct SettingsOutput {
     pub debug_window_open: bool,
     /// The user confirmed logging out.
     pub logout: bool,
+    /// How much taller the page is than the window shows (negative:
+    /// shorter).
+    pub overflow: f32,
 }
 
 impl SettingsView {
@@ -178,7 +185,7 @@ impl SettingsView {
             invite_ttl_s: icu_proto::limits::INVITE_TTL_S,
             invite_status: None,
             seen_invite: None,
-            tab: Tab::General,
+            tab: Tab::Audio,
             expanded_bindings: std::collections::HashSet::new(),
             stats,
             paths,
@@ -230,15 +237,17 @@ impl SettingsView {
         }
         let tab_before = self.tab;
 
+        // The pages people come for first; Nutzer only for admins.
         let mut tabs = vec![
-            (Tab::General, icon::GEAR_FINE, "Allgemein"),
             (Tab::Audio, icon::MICROPHONE, "Audio"),
+            (Tab::Sound, icon::WAVEFORM, "Klang"),
             (Tab::Hotkeys, icon::COMMAND, "Tastenkürzel"),
             (Tab::Camera, icon::VIDEO_CAMERA, "Kamera"),
+            (Tab::General, icon::GEAR_FINE, "Allgemein"),
             (Tab::About, icon::QUESTION, "Über ICU"),
         ];
         if state.is_admin {
-            tabs.insert(4, (Tab::Users, icon::USERS_THREE, "Nutzer"));
+            tabs.insert(5, (Tab::Users, icon::USERS_THREE, "Nutzer"));
         }
 
         egui::Panel::left("settings_nav")
@@ -286,7 +295,7 @@ impl SettingsView {
             }
         }
 
-        egui::ScrollArea::vertical()
+        let page = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Frame::new()
@@ -300,6 +309,7 @@ impl SettingsView {
                         ui.set_max_width(ui.available_width().min(CONTENT_MAX_W));
                         match self.tab {
                             Tab::Audio => self.audio_tab(ui, state),
+                            Tab::Sound => self.sound_tab(ui, state),
                             Tab::Hotkeys => self.hotkeys_tab(ui, state),
                             Tab::Camera => self.camera_tab(ui, state),
                             Tab::General => self.general_tab(ui, state, &mut cmds),
@@ -313,10 +323,15 @@ impl SettingsView {
             self.applied.clone_from(&self.draft);
             cmds.push(Command::UpdateSettings(Box::new(self.draft.clone())));
         }
+        // A page taller than the window (expert rows, a long member list)
+        // grows the window instead of hiding its end behind a scroll bar.
+        let overflow = page.content_size.y - page.inner_rect.height();
+        super::grow_to_fit(ui.ctx(), overflow);
         SettingsOutput {
             cmds,
             debug_window_open: self.debug_window_open,
             logout: std::mem::take(&mut self.logout_requested),
+            overflow,
         }
     }
 
@@ -325,7 +340,7 @@ impl SettingsView {
         widgets::page_header(
             ui,
             "Audio",
-            "Mikrofon, Lautsprecher und wie deine Stimme bei den anderen ankommt.",
+            "Mikrofon, Lautsprecher und wann du zu hören bist.",
             |_| {},
         );
         let inputs: Vec<_> = state
@@ -378,7 +393,31 @@ impl SettingsView {
                     )
                 },
             );
-            if self.draft.audio.mode == ModeSetting::Vad {
+            if self.draft.audio.mode == ModeSetting::Ptt {
+                // The key is what people look for next to the mode, so it is
+                // shown here and changed with one click on its own page.
+                let key = super::ptt_key_label(&self.draft.hotkeys, &state.hotkey_backend);
+                widgets::setting_row(ui, true, "Taste", None, |ui| {
+                    let width = widgets::button_width(ui, icon::PENCIL_SIMPLE, "Ändern")
+                        + 8.0
+                        + widgets::chip_width(ui, std::slice::from_ref(&key));
+                    widgets::row_group(ui, width, |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        widgets::chip(ui, &key, 0.0);
+                        if widgets::button(
+                            ui,
+                            widgets::ButtonKind::Neutral,
+                            icon::PENCIL_SIMPLE,
+                            "Ändern",
+                        )
+                        .clicked()
+                        {
+                            self.tab = Tab::Hotkeys;
+                            self.expanded_bindings.insert("Push-to-Talk");
+                        }
+                    });
+                });
+            } else {
                 ui.add_enabled_ui(self.draft.audio.denoise, |ui| {
                     widgets::setting_row(
                         ui,
@@ -399,15 +438,6 @@ impl SettingsView {
                     );
                 }
             }
-            ui.add_enabled_ui(self.draft.audio.denoise, |ui| {
-                widgets::setting_row(
-                    ui,
-                    true,
-                    "Pegel automatisch",
-                    Some("Regelt dein Mikrofon selbst nach, wenn du zu leise oder zu laut bist. Braucht die Rauschunterdrückung."),
-                    |ui| widgets::toggle(ui, &mut self.draft.audio.auto_level),
-                )
-            });
             let auto_level = self.draft.audio.auto_level && self.draft.audio.denoise;
             if adv {
                 widgets::advanced_caption(ui);
@@ -443,7 +473,33 @@ impl SettingsView {
             }
         });
 
-        widgets::group_card(ui, "Klang", |ui| {
+        widgets::group_card(ui, "Hinweistöne", |ui| {
+            widgets::card_note(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                    let audio = &mut self.draft.audio;
+                    widgets::chip_toggle(ui, &mut audio.cue_join, "Jemand kommt oder geht")
+                        .on_hover_text("Ein kurzer Ton, wenn jemand den Raum betritt oder verlässt");
+                    widgets::chip_toggle(ui, &mut audio.cue_tx, "Senden beginnt oder endet")
+                        .on_hover_text("Ein Klick beim Drücken und Loslassen der Sprechtaste");
+                    widgets::chip_toggle(ui, &mut audio.cue_mute, "Stummschalten")
+                        .on_hover_text("Zwei Töne beim Stummschalten und wieder Einschalten");
+                });
+            });
+        });
+    }
+
+    /// What the voice goes through on the way out and in, and the cue
+    /// sounds: switches that are right by default and rarely touched.
+    fn sound_tab(&mut self, ui: &mut Ui, state: &AppState) {
+        let adv = self.draft.ui.show_advanced;
+        widgets::page_header(
+            ui,
+            "Klang",
+            "Wie deine Stimme aufbereitet wird und wie die anderen bei dir ankommen.",
+            |_| {},
+        );
+        widgets::group_card(ui, "Aufbereitung", |ui| {
             widgets::setting_row(
                 ui,
                 false,
@@ -451,19 +507,56 @@ impl SettingsView {
                 Some("Filtert Tastatur, Lüfter und Hintergrundgeräusche heraus."),
                 |ui| widgets::toggle(ui, &mut self.draft.audio.denoise),
             );
+            ui.add_enabled_ui(state.aec_available, |ui| {
+                widgets::setting_row(
+                    ui,
+                    true,
+                    "Echo-Unterdrückung",
+                    Some(if state.aec_available {
+                        "Damit die anderen sich nicht selbst hören, wenn du ohne Kopfhörer sprichst."
+                    } else {
+                        "Auf dieser Installation nicht verfügbar."
+                    }),
+                    |ui| widgets::toggle(ui, &mut self.draft.audio.aec),
+                )
+            });
+            let tok = theme::tokens(ui.visuals());
+            if state.aec_available && self.draft.audio.aec {
+                let problem = if !state.aec_reference {
+                    Some("Gerade wirkungslos: das Audiosystem liefert nicht, was du hörst.")
+                } else if state.aec_suspect {
+                    Some("Echo erkannt, wird aber nicht entfernt — Lautsprecher-Auswahl prüfen.")
+                } else {
+                    None
+                };
+                if let Some(problem) = problem {
+                    widgets::card_note(ui, |ui| {
+                        ui.colored_label(tok.connecting, RichText::new(problem).size(11.5));
+                    });
+                }
+            }
+            ui.add_enabled_ui(self.draft.audio.denoise, |ui| {
+                widgets::setting_row(
+                    ui,
+                    true,
+                    "Pegel automatisch",
+                    Some("Regelt dein Mikrofon nach, wenn du zu leise oder zu laut bist."),
+                    |ui| widgets::toggle(ui, &mut self.draft.audio.auto_level),
+                )
+            });
             widgets::setting_row(
                 ui,
                 true,
-                "Lautstärke angleichen",
-                Some("Bringt alle anderen auf eine ähnliche Lautstärke, leise wie laute."),
-                |ui| widgets::toggle(ui, &mut self.draft.audio.normalize_incoming),
+                "Selbst gleich laut ankommen",
+                Some("Du kommst bei den anderen immer ähnlich laut an."),
+                |ui| widgets::toggle(ui, &mut self.draft.audio.normalize_outgoing),
             );
             widgets::setting_row(
                 ui,
                 true,
-                "Eigene Lautstärke angleichen",
-                Some("Du kommst bei den anderen immer gleich laut an."),
-                |ui| widgets::toggle(ui, &mut self.draft.audio.normalize_outgoing),
+                "Andere gleich laut hören",
+                Some("Bringt alle auf eine ähnliche Lautstärke, leise wie laute."),
+                |ui| widgets::toggle(ui, &mut self.draft.audio.normalize_incoming),
             );
             widgets::setting_row(
                 ui,
@@ -484,43 +577,6 @@ impl SettingsView {
                         ],
                     )
                 });
-            }
-            ui.add_enabled_ui(state.aec_available, |ui| {
-                widgets::setting_row(
-                    ui,
-                    true,
-                    "Echo-Unterdrückung",
-                    Some(if state.aec_available {
-                        "Verhindert, dass die anderen sich selbst hören, wenn du ohne Kopfhörer sprichst."
-                    } else {
-                        "Auf dieser Installation nicht verfügbar."
-                    }),
-                    |ui| widgets::toggle(ui, &mut self.draft.audio.aec),
-                )
-            });
-            let tok = theme::tokens(ui.visuals());
-            if state.aec_available && self.draft.audio.aec {
-                if !state.aec_reference {
-                    widgets::card_note(ui, |ui| {
-                        ui.colored_label(
-                            tok.connecting,
-                            RichText::new(
-                                "Gerade wirkungslos: das Audiosystem liefert nicht, was du hörst.",
-                            )
-                            .size(11.5),
-                        );
-                    });
-                } else if state.aec_suspect {
-                    widgets::card_note(ui, |ui| {
-                        ui.colored_label(
-                            tok.connecting,
-                            RichText::new(
-                                "Echo erkannt, wird aber nicht entfernt — Lautsprecher-Auswahl prüfen.",
-                            )
-                            .size(11.5),
-                        );
-                    });
-                }
             }
             if adv {
                 widgets::advanced_caption(ui);
@@ -549,17 +605,6 @@ impl SettingsView {
             }
         });
 
-        widgets::group_card(ui, "Hinweistöne", |ui| {
-            widgets::setting_row(ui, false, "Jemand kommt oder geht", None, |ui| {
-                widgets::toggle(ui, &mut self.draft.audio.cue_join)
-            });
-            widgets::setting_row(ui, true, "Senden beginnt oder endet", None, |ui| {
-                widgets::toggle(ui, &mut self.draft.audio.cue_tx)
-            });
-            widgets::setting_row(ui, true, "Stummschalten", None, |ui| {
-                widgets::toggle(ui, &mut self.draft.audio.cue_mute)
-            });
-        });
     }
 
     /// Export and import of the whole identity (`PROTOCOL.md` §2.3.1).
@@ -567,9 +612,9 @@ impl SettingsView {
     /// The armored text is never rendered: it carries the private key in the
     /// clear, and a settings window is exactly the thing people have open
     /// during a screen share.
-    fn passport_card(&mut self, ui: &mut Ui, cmds: &mut Vec<Command>) {
-        widgets::group_card(ui, "Auf ein anderes Gerät mitnehmen", |ui| {
-            widgets::setting_row(ui, false, "Passport", None, |ui| {
+    fn device_card(&mut self, ui: &mut Ui, cmds: &mut Vec<Command>) {
+        widgets::group_card(ui, "Dieses Gerät", |ui| {
+            widgets::setting_row(ui, false, "Auf ein anderes Gerät mitnehmen", None, |ui| {
                 let width = widgets::button_width(ui, icon::COPY, "Kopieren")
                     + 6.0
                     + widgets::button_width(ui, icon::EXPORT, "Speichern");
@@ -610,23 +655,15 @@ impl SettingsView {
                 ui.colored_label(
                     tok.error,
                     RichText::new(
-                        "Enthält deinen privaten Schlüssel im Klartext — wer diesen Text hat, \
-                         kann sich als du anmelden.",
+                        "Der Passport enthält deinen privaten Schlüssel — nur über einen \
+                         sicheren Weg weitergeben.",
                     )
                     .size(11.5),
                 );
-                ui.label(
-                    RichText::new(
-                        "Nur über einen sicheren Kanal weitergeben, die Kopie danach löschen. \
-                         Auf dem anderen Gerät hier oder im Einladungsfeld einfügen.",
-                    )
-                    .size(11.5)
-                    .color(tok.dim_text),
-                );
             });
-
+            self.passport_status_note(ui);
+            self.logout_row(ui);
             if !self.draft.ui.show_advanced {
-                self.passport_status_note(ui);
                 return;
             }
             widgets::advanced_caption(ui);
@@ -704,7 +741,6 @@ impl SettingsView {
             if edited {
                 self.import_preview = None;
             }
-            self.passport_status_note(ui);
         });
     }
 
@@ -716,7 +752,7 @@ impl SettingsView {
     }
 
     /// Deletes this device's identity and goes back to the invite window.
-    fn logout_card(&mut self, ui: &mut Ui) {
+    fn logout_row(&mut self, ui: &mut Ui) {
         let confirming = self
             .confirm_logout
             .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
@@ -724,8 +760,12 @@ impl SettingsView {
             // Let the armed button fall back on its own after 3 s.
             ui.ctx().request_repaint_after(Duration::from_millis(250));
         }
-        widgets::group_card(ui, "Abmelden", |ui| {
-            widgets::setting_row(ui, false, "Von diesem Gerät abmelden", None, |ui| {
+        widgets::setting_row(
+            ui,
+            true,
+            "Abmelden",
+            Some("Löscht deine Zugangsdaten hier; zurück nur mit Passport oder Einladung."),
+            |ui| {
                 let label = if confirming { "Wirklich?" } else { "Abmelden" };
                 let width = widgets::button_width(ui, icon::SIGN_OUT, label);
                 widgets::row_group(ui, width, |ui| {
@@ -741,13 +781,8 @@ impl SettingsView {
                         }
                     }
                 });
-            });
-            widgets::help_note(
-                ui,
-                "Löscht Schlüssel und Zertifikat auf diesem Gerät. Zurück nur mit deinem \
-                 Passport oder einer neuen Einladung — sichere ihn vorher oben.",
-            );
-        });
+            },
+        );
     }
 
     /// The armored passport for the identity on disk. Disk, not `AppState`:
@@ -903,34 +938,46 @@ impl SettingsView {
             |_| {},
         );
         widgets::group_card(ui, "Kamera", |ui| {
-            widgets::setting_row(ui, false, "Beim Start einschalten", None, |ui| {
-                widgets::toggle(ui, &mut self.draft.camera.enabled)
-            });
-            #[cfg(feature = "camera")]
-            {
-                if self.cameras_stale {
-                    // Opens every `/dev/video*` in turn, so: once per visit
-                    // to this tab, never per frame.
-                    self.cameras_stale = false;
-                    self.cameras = crate::camera::list();
-                }
-                widgets::setting_row(ui, true, "Gerät", None, |ui| {
-                    camera_combo(ui, &mut self.draft.camera.device, &self.cameras)
-                });
-                ui.separator();
-                widgets::card_note(ui, |ui| {
-                    // Wide enough to judge framing, small enough that the
-                    // card stays a settings row and not a video window.
-                    let width = ui.available_width().min(240.0);
-                    let live = self
-                        .preview
-                        .as_mut()
-                        .is_some_and(|preview| preview.ui(ui, width));
-                    if !live {
-                        preview_placeholder(ui, width, state.camera_on);
+            // Controls on the left, the picture beside them: a preview
+            // underneath would cost the height of both rows again.
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let left = (ui.available_width() - PREVIEW_W - 24.0).max(200.0);
+                ui.vertical(|ui| {
+                    ui.set_width(left);
+                    #[cfg(feature = "camera")]
+                    {
+                        if self.cameras_stale {
+                            // Opens every `/dev/video*` in turn, so: once per
+                            // visit to this tab, never per frame.
+                            self.cameras_stale = false;
+                            self.cameras = crate::camera::list();
+                        }
+                        widgets::setting_row(ui, false, "Gerät", None, |ui| {
+                            camera_combo(ui, &mut self.draft.camera.device, &self.cameras)
+                        });
                     }
+                    widgets::setting_row(
+                        ui,
+                        cfg!(feature = "camera"),
+                        "Beim Start einschalten",
+                        None,
+                        |ui| widgets::toggle(ui, &mut self.draft.camera.enabled),
+                    );
                 });
-            }
+                #[cfg(feature = "camera")]
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        let live = self
+                            .preview
+                            .as_mut()
+                            .is_some_and(|preview| preview.ui(ui, PREVIEW_W));
+                        if !live {
+                            preview_placeholder(ui, PREVIEW_W, state.camera_on);
+                        }
+                    });
+            });
         });
 
         widgets::group_card(ui, "Video-Overlay", |ui| {
@@ -1022,12 +1069,12 @@ impl SettingsView {
         widgets::page_header(
             ui,
             "Allgemein",
-            "Dein Name, wie ICU aussieht und was beim Start passiert.",
+            "Dein Name, wie ICU aussieht und was dieses Gerät betrifft.",
             |_| {},
         );
-        widgets::group_card(ui, "Profil", |ui| {
+        widgets::group_card(ui, "Du und ICU", |ui| {
             let editable = state.me.is_some() && !state.rename_pending;
-            widgets::setting_row(ui, false, "Anzeigename", Some("So sehen dich die anderen."), |ui| {
+            widgets::setting_row(ui, false, "Anzeigename", None, |ui| {
                 let width = FIELD_W + 6.0 + widgets::button_width(ui, icon::CHECK, "");
                 widgets::row_group(ui, width, |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -1077,34 +1124,31 @@ impl SettingsView {
                     let id = state.me.as_ref().map(|m| m.user_id.to_string());
                     widgets::chip(ui, id.as_deref().unwrap_or("—"), 0.0)
                 });
+                ui.separator();
             }
-        });
-
-        widgets::group_card(ui, "Darstellung", |ui| {
-            widgets::card_note(ui, |ui| {
-                ui.add_space(3.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    for (value, label) in
-                        [("system", "System"), ("light", "Hell"), ("dark", "Dunkel")]
-                    {
-                        theme_swatch(ui, &mut self.draft.ui.theme, value, label);
-                    }
-                });
+            widgets::setting_row(ui, !adv, "Farben", None, |ui| {
+                let mut theme = match self.draft.ui.theme.as_str() {
+                    "light" => "light",
+                    "dark" => "dark",
+                    _ => "system",
+                };
+                let r = widgets::segmented(
+                    ui,
+                    &mut theme,
+                    &[
+                        ("system", "Wie das System"),
+                        ("light", "Hell"),
+                        ("dark", "Dunkel"),
+                    ],
+                );
+                if r.changed() {
+                    self.draft.ui.theme = theme.to_string();
+                }
+                r
             });
             widgets::setting_row(
                 ui,
                 true,
-                "Erweiterte Einstellungen",
-                Some("Zeigt überall zusätzlich die technischen Stellschrauben und die Diagnose."),
-                |ui| widgets::toggle(ui, &mut self.draft.ui.show_advanced),
-            );
-        });
-
-        widgets::group_card(ui, "Start", |ui| {
-            widgets::setting_row(
-                ui,
-                false,
                 "Minimiert starten",
                 Some("ICU startet unsichtbar im Infobereich der Taskleiste."),
                 |ui| widgets::toggle(ui, &mut self.draft.ui.start_minimized),
@@ -1112,14 +1156,13 @@ impl SettingsView {
             widgets::setting_row(
                 ui,
                 true,
-                "Einladungslinks mit ICU öffnen",
-                Some("Ein Klick auf einen icu://-Link öffnet direkt ICU."),
+                "Einladungen mit ICU öffnen",
+                Some("Ein Doppelklick auf eine Einladung oder einen Passport (.icu) öffnet ICU."),
                 |ui| widgets::toggle(ui, &mut self.draft.ui.register_uri_handler),
             );
         });
 
-        self.passport_card(ui, cmds);
-        self.logout_card(ui);
+        self.device_card(ui, cmds);
     }
 
     /// Admin-only "Nutzer" tab: inviting, and managing who is already in
@@ -1306,9 +1349,10 @@ impl SettingsView {
         }
     }
 
-    /// One person: avatar with presence dot, name with role badges, a quiet
-    /// status line, and everything you can do to them behind one "⋯" menu —
-    /// or, while a removal waits for its confirmation, that confirmation.
+    /// One person on one line: avatar with presence dot, name with role
+    /// badges, a quiet status on the right, and everything you can do to them
+    /// behind one "⋯" menu — or, while a removal waits for its confirmation,
+    /// that confirmation.
     fn member_row(
         &mut self,
         ui: &mut Ui,
@@ -1323,10 +1367,10 @@ impl SettingsView {
         let tok = theme::tokens(ui.visuals());
         let confirming = self.confirm_revoke == Some(user.user_id);
         let row = egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(12, 8))
+            .inner_margin(egui::Margin::symmetric(12, 5))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let avatar = widgets::avatar(ui, &user.name, user.user_id, false, 32.0, None);
+                    let avatar = widgets::avatar(ui, &user.name, user.user_id, false, 26.0, None);
                     if !user.pending {
                         let dot = if user.disabled {
                             tok.error
@@ -1338,49 +1382,46 @@ impl SettingsView {
                         widgets::presence_dot(ui, avatar.rect, dot);
                     }
                     ui.add_space(2.0);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.label(
-                                RichText::new(&user.name)
-                                    .font(egui::FontId::new(13.5, super::fonts::semibold()))
-                                    .color(ui.visuals().text_color()),
-                            );
-                            if is_self {
-                                widgets::badge(ui, "Du", widgets::BadgeKind::Neutral);
-                            }
-                            if user.is_admin {
-                                widgets::badge(ui, "Admin", widgets::BadgeKind::Accent)
-                                    .on_hover_text("Darf einladen und Mitglieder verwalten");
-                            }
-                            if user.disabled {
-                                widgets::badge(ui, "Gesperrt", widgets::BadgeKind::Danger)
-                                    .on_hover_text("Kann sich nicht verbinden, bis jemand entsperrt");
-                            }
-                            if user.muted {
-                                widgets::badge(ui, "Stumm", widgets::BadgeKind::Danger)
-                                    .on_hover_text("Von einem Admin stummgeschaltet");
-                            }
-                            if user.deafened {
-                                widgets::badge(ui, "Taub", widgets::BadgeKind::Danger)
-                                    .on_hover_text("Von einem Admin taubgeschaltet");
-                            }
-                        });
-                        let since = short_date(&user.created);
-                        let status = if user.pending {
-                            format!("Eingeladen am {since} · noch nicht eingelöst")
-                        } else if user.online {
-                            "Online".to_string()
-                        } else {
-                            format!("Offline · dabei seit {since}")
-                        };
-                        ui.label(RichText::new(status).size(11.5).color(tok.dim_text));
-                    });
-                    widgets::rtl(ui, 38.0, |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(
+                        RichText::new(&user.name)
+                            .font(egui::FontId::new(13.5, super::fonts::semibold()))
+                            .color(ui.visuals().text_color()),
+                    );
+                    if is_self {
+                        widgets::badge(ui, "Du", widgets::BadgeKind::Neutral);
+                    }
+                    if user.is_admin {
+                        widgets::badge(ui, "Admin", widgets::BadgeKind::Accent)
+                            .on_hover_text("Darf einladen und Mitglieder verwalten");
+                    }
+                    if user.disabled {
+                        widgets::badge(ui, "Gesperrt", widgets::BadgeKind::Danger)
+                            .on_hover_text("Kann sich nicht verbinden, bis jemand entsperrt");
+                    }
+                    if user.muted {
+                        widgets::badge(ui, "Stumm", widgets::BadgeKind::Danger)
+                            .on_hover_text("Von einem Admin stummgeschaltet");
+                    }
+                    if user.deafened {
+                        widgets::badge(ui, "Taub", widgets::BadgeKind::Danger)
+                            .on_hover_text("Von einem Admin taubgeschaltet");
+                    }
+                    let since = short_date(&user.created);
+                    let status = if user.pending {
+                        format!("eingeladen am {since}")
+                    } else if user.online {
+                        "online".to_string()
+                    } else {
+                        format!("offline · dabei seit {since}")
+                    };
+                    widgets::rtl(ui, 30.0, |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
+                        let status = |ui: &mut Ui| {
+                            ui.label(RichText::new(&status).size(11.5).color(tok.dim_text));
+                        };
                         if is_self {
+                            status(ui);
                             return;
                         }
                         if confirming {
@@ -1421,6 +1462,7 @@ impl SettingsView {
                             {
                                 self.confirm_revoke = Some(user.user_id);
                             }
+                            status(ui);
                             return;
                         }
                         let menu = widgets::more_button(ui).on_hover_text("Aktionen");
@@ -1495,6 +1537,7 @@ impl SettingsView {
                                     self.confirm_revoke = Some(user.user_id);
                                 }
                             });
+                        status(ui);
                     });
                 });
             });
@@ -1925,52 +1968,6 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
                 egui::Rect::from_min_size(pos, tile)
             });
         }
-    });
-}
-
-/// A small preview-swatch theme picker, replacing the old `selectable_label`
-/// row. Swatch colors are fixed representative values for each theme (not
-/// `theme::tokens`, which only knows the *current* theme's palette).
-fn theme_swatch(ui: &mut Ui, current: &mut String, value: &str, label: &str) {
-    let selected = current == value;
-    let dark = value == "dark" || (value == "system" && ui.visuals().dark_mode);
-    let (panel, accent) = if dark {
-        (
-            egui::Color32::from_rgb(0x0e, 0x0f, 0x13),
-            egui::Color32::from_rgb(0x2e, 0x9b, 0xff),
-        )
-    } else {
-        (
-            egui::Color32::from_rgb(0xf4, 0xf6, 0xf9),
-            egui::Color32::from_rgb(0x16, 0x68, 0xc7),
-        )
-    };
-    ui.vertical(|ui| {
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(64.0, 44.0), egui::Sense::click());
-        if ui.is_rect_visible(rect) {
-            let painter = ui.painter();
-            painter.rect_filled(rect, egui::CornerRadius::same(theme::R_CTRL), panel);
-            let border = if selected {
-                egui::Stroke::new(2.0, accent)
-            } else {
-                egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color)
-            };
-            painter.rect_stroke(
-                rect,
-                egui::CornerRadius::same(theme::R_CTRL),
-                border,
-                egui::StrokeKind::Inside,
-            );
-            let dot = egui::Rect::from_min_size(
-                rect.left_top() + egui::vec2(6.0, 6.0),
-                egui::vec2(10.0, 10.0),
-            );
-            painter.rect_filled(dot, 5.0, accent);
-        }
-        if resp.clicked() {
-            *current = value.to_string();
-        }
-        ui.label(RichText::new(label).size(11.5));
     });
 }
 

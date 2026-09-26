@@ -48,6 +48,14 @@ type Toggle = (
     Option<Command>,
 );
 
+/// What the settings window opens with: every page fits without a scroll
+/// bar at this size unless expert rows or a long member list make it grow
+/// (`tests/ui_layout.rs`).
+pub const SETTINGS_SIZE: [f32; 2] = [820.0, 640.0];
+/// What the Verbindung window opens with: its first page fits; the longer
+/// ones grow it.
+pub const CONNECTION_SIZE: [f32; 2] = [720.0, 780.0];
+
 /// Above this round-trip time a row's ping turns amber.
 const SLOW_RTT_MS: u16 = 150;
 
@@ -128,8 +136,8 @@ struct App {
     last_stats: Instant,
     stats_text: String,
     stats: Arc<crate::stats::DebugStats>,
-    expanded: Option<icu_proto::UserId>,
-    ptt_held: bool,
+    /// Header, people and control dock.
+    view: MainView,
     #[cfg(feature = "tray")]
     tray: Option<crate::tray::Tray>,
     #[cfg(feature = "overlay")]
@@ -185,8 +193,8 @@ impl App {
             self.fitted |= !self.hidden;
             return;
         }
-        // `content_rect`, not `viewport().inner_rect`: the latter needs the
-        // window position, which Wayland never reports, so it stays `None`.
+        // Shrinking is only right once, right after connecting; afterwards
+        // the window only grows (`super::grow_to_fit`).
         let inner = ctx.content_rect();
         let monitor = ctx.input(|i| i.viewport().monitor_size);
         let max = monitor.map_or(f32::INFINITY, |m| m.y * 0.9);
@@ -258,8 +266,7 @@ impl App {
             last_stats: Instant::now(),
             stats_text: String::new(),
             stats,
-            expanded: None,
-            ptt_held: false,
+            view: MainView::default(),
             #[cfg(feature = "tray")]
             tray,
             #[cfg(feature = "overlay")]
@@ -357,13 +364,6 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(33));
-        // A local sender, not `self.send`: a closure that calls a `&self`
-        // method captures the *whole* `self` and would collide with the
-        // `&mut self.settings` / `&mut self.expanded` these panels need.
-        let cmd = self.cmd.clone();
-        let send = |c: Command| {
-            let _ = cmd.send(c);
-        };
 
         self.debug_window(&ctx);
         self.settings_window(&ctx);
@@ -385,8 +385,274 @@ impl eframe::App for App {
         #[cfg(not(feature = "camera"))]
         let self_video = None;
 
+        let videos = &self.videos;
+        let env = MainEnv {
+            cmd: &self.cmd,
+            video_tier: VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8),
+            video: &|session| videos.get(session),
+            self_video,
+            settings_open: self.settings.is_some(),
+        };
+        let out = self.view.ui(root, &self.state, &env);
+
+        if out.toggle_settings {
+            self.settings = match self.settings.take() {
+                Some(_) => None,
+                None => {
+                    let paths = self
+                        .engine
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|e| e.paths())
+                        .unwrap_or_else(|| Paths::new(None));
+                    #[cfg_attr(not(feature = "camera"), allow(unused_mut))]
+                    let mut view = SettingsView::new(&self.state, self.stats.clone(), paths);
+                    #[cfg(feature = "camera")]
+                    if let Some(camera) = &self.camera {
+                        view = view.with_preview(camera.preview_source());
+                    }
+                    Some(view)
+                }
+            };
+        }
+        if out.toggle_connection {
+            self.connection = match self.connection.take() {
+                Some(_) => None,
+                None => Some(ConnectionView::new(self.stats.clone())),
+            };
+        }
+        self.fit_to_list(&ctx, out.list_overflow);
+
+        if let Some(next) = out.theme {
+            self.theme = next.to_string();
+            theme::apply(&ctx, next);
+            let mut settings = self.state.settings.clone();
+            settings.ui.theme = next.to_string();
+            if let Some(view) = &mut self.settings {
+                view.set_theme(next);
+            }
+            let _ = self.cmd.send(Command::UpdateSettings(Box::new(settings)));
+        }
+    }
+
+    fn on_exit(&mut self) {
+        #[cfg(feature = "camera")]
+        {
+            self.camera = None;
+        }
+        #[cfg(feature = "overlay")]
+        {
+            self.overlay = None;
+        }
+        if let Some(engine) = self.engine.lock().unwrap().take() {
+            engine.shutdown();
+        }
+    }
+}
+
+impl App {
+    /// The `--debug-stats` window: a monospace dump, refreshed every 2s.
+    fn debug_window(&mut self, ctx: &egui::Context) {
+        if (self.debug_stats || self.debug_window_open)
+            && self.last_stats.elapsed() > Duration::from_secs(2)
+        {
+            self.last_stats = Instant::now();
+            self.stats_text = self.stats.report();
+            if self.debug_stats {
+                eprintln!("{}", self.stats_text);
+            }
+        }
+        if !self.debug_window_open {
+            return;
+        }
+        let stats_text = &self.stats_text;
+        self.debug_window_open = immediate_window(
+            ctx,
+            "icu-debug",
+            "ICU — Debug",
+            [540.0, 440.0],
+            None,
+            |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.label(RichText::new(stats_text).monospace().small());
+                });
+            },
+        );
+    }
+
+    /// The Verbindung window, drawn into its own immediate viewport.
+    /// Simpler than [`Self::settings_window`]: the view is read-only, so
+    /// there are no commands to drain and no theme change to react to.
+    fn connection_window(&mut self, ctx: &egui::Context) {
+        if self.connection.is_none() {
+            return;
+        }
+        // Plain locals, not `self` fields — the closure would otherwise
+        // capture the whole of `self` and collide `&self.state` against
+        // `&mut self.connection` (see `settings_window`).
         let state = &self.state;
-        let mut new_theme: Option<&'static str> = None;
+        let view = &mut self.connection;
+        let still_open = immediate_window(
+            ctx,
+            "icu-connection",
+            "ICU — Verbindung",
+            CONNECTION_SIZE,
+            Some([560.0, 420.0]),
+            |ui| {
+                view.as_mut().expect("checked above").ui(ui, state);
+            },
+        );
+        if !still_open {
+            self.connection = None;
+        }
+    }
+
+    /// The settings window, drawn into its own immediate viewport.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if self.settings.is_none() {
+            return;
+        }
+        // Plain locals, not `self` fields — read/write freely inside the
+        // closure with no borrow conflict against `self.settings`.
+        let debug_open = self.debug_window_open;
+        let state = &self.state;
+        let settings = &mut self.settings;
+        let mut out = None;
+        let still_open = immediate_window(
+            ctx,
+            "icu-settings",
+            "ICU — Einstellungen",
+            SETTINGS_SIZE,
+            Some([640.0, 480.0]),
+            |ui| {
+                out = Some(
+                    settings
+                        .as_mut()
+                        .expect("checked above")
+                        .ui(ui, state, debug_open),
+                );
+            },
+        );
+        let Some(out) = out else {
+            return;
+        };
+        for c in out.cmds {
+            if let Command::UpdateSettings(s) = &c {
+                // A slider drag emits this every frame it moves; only a real
+                // theme change is worth rebuilding all styles for.
+                if s.ui.theme != self.theme {
+                    self.theme.clone_from(&s.ui.theme);
+                    theme::apply(ctx, &self.theme);
+                }
+            }
+            let _ = self.cmd.send(c);
+        }
+        if out.logout {
+            self.logged_out.store(true, Ordering::Relaxed);
+            self.settings = None;
+            self.quit_requested = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if !still_open {
+            self.settings = None;
+        }
+        if out.debug_window_open != self.debug_window_open {
+            self.debug_window_open = out.debug_window_open;
+            if self.debug_window_open {
+                self.stats_text = self.stats.report();
+                self.last_stats = Instant::now();
+            }
+        }
+    }
+}
+
+/// One of the app's secondary windows, drawn into its own immediate
+/// viewport with `body` as its central panel. `min_size` makes it
+/// resizable. Returns `false` once the user closed it.
+fn immediate_window(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    size: [f32; 2],
+    min_size: Option<[f32; 2]>,
+    body: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut builder = egui::ViewportBuilder::default()
+        .with_title(title)
+        .with_inner_size(size);
+    if let Some(min) = min_size {
+        builder = builder.with_min_inner_size(min).with_resizable(true);
+    }
+    let mut still_open = true;
+    // The viewport callback is `FnMut`; `body` runs once per call.
+    let mut body = Some(body);
+    ctx.show_viewport_immediate(
+        egui::ViewportId::from_hash_of(id),
+        builder,
+        |vctx, _class| {
+            if let Some(body) = body.take() {
+                egui::CentralPanel::default().show(vctx, body);
+            }
+            if vctx.input(|i| i.viewport().close_requested()) {
+                still_open = false;
+            }
+        },
+    );
+    still_open
+}
+
+// ---------------------------------------------------------------------------
+// Main view
+// ---------------------------------------------------------------------------
+
+/// The main window's content — header, people, control dock — drawn from
+/// an [`AppState`] and a few handles, so it renders without a running app
+/// (`tests/ui_layout.rs`). The windows, tray, overlay and camera around it
+/// stay in `App`.
+#[derive(Default)]
+pub struct MainView {
+    /// The participant row whose details are unfolded.
+    expanded: Option<icu_proto::UserId>,
+    /// The on-screen speak button is being held.
+    ptt_held: bool,
+}
+
+/// What [`MainView::ui`] needs besides the state.
+pub struct MainEnv<'a> {
+    /// Where the view's commands go.
+    pub cmd: &'a tokio::sync::mpsc::UnboundedSender<Command>,
+    /// The own camera's current quality tier (`crate::quality`).
+    pub video_tier: VideoTier,
+    /// Somebody's live picture, by session; `None` draws the initials.
+    pub video: &'a dyn Fn(icu_proto::Session) -> Option<egui::load::SizedTexture>,
+    /// The own camera's preview, while it is on.
+    pub self_video: Option<egui::load::SizedTexture>,
+    /// The settings window is open, which the gear shows.
+    pub settings_open: bool,
+}
+
+/// What one frame of the main view asks of the app around it.
+#[derive(Debug, Default)]
+pub struct MainOutput {
+    /// The gear was clicked: open or close the settings.
+    pub toggle_settings: bool,
+    /// The connection status was clicked: open or close its window.
+    pub toggle_connection: bool,
+    /// The header's theme button picked this theme.
+    pub theme: Option<&'static str>,
+    /// How much taller the people list is than the room it got; negative
+    /// when it is shorter. The window grows by it (`App::fit_to_list`).
+    pub list_overflow: f32,
+}
+
+impl MainView {
+    /// Draws the whole window into `root`.
+    pub fn ui(&mut self, root: &mut egui::Ui, state: &AppState, env: &MainEnv<'_>) -> MainOutput {
+        let mut out = MainOutput::default();
+        let send = |c: Command| {
+            let _ = env.cmd.send(c);
+        };
+
         egui::Panel::top("status")
             .show_separator_line(false)
             .show(root, |ui| {
@@ -433,10 +699,7 @@ impl eframe::App for App {
                             })
                             .clicked()
                         {
-                            self.connection = match self.connection.take() {
-                                Some(_) => None,
-                                None => Some(ConnectionView::new(self.stats.clone())),
-                            };
+                            out.toggle_connection = true;
                         }
 
                         // Own outgoing video quality tier, set by
@@ -445,9 +708,7 @@ impl eframe::App for App {
                         // against exposing adaptive behavior as a dial) — but
                         // shown, since a tier-down is visible to other people as
                         // this client's video degrading.
-                        let tier =
-                            VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8);
-                        let hint = match tier {
+                        let hint = match env.video_tier {
                             VideoTier::T0 => None,
                             VideoTier::T4 => {
                                 Some("Video pausiert — das Netz trägt es gerade nicht.")
@@ -469,31 +730,12 @@ impl eframe::App for App {
                                 ui,
                                 icon::GEAR_FINE,
                                 HEADER,
-                                self.settings.is_some(),
+                                env.settings_open,
                             )
                             .on_hover_text("Einstellungen")
                             .clicked()
                             {
-                                self.settings = match self.settings.take() {
-                                    Some(_) => None,
-                                    None => {
-                                        let paths = self
-                                            .engine
-                                            .lock()
-                                            .unwrap()
-                                            .as_ref()
-                                            .map(|e| e.paths())
-                                            .unwrap_or_else(|| Paths::new(None));
-                                        #[cfg_attr(not(feature = "camera"), allow(unused_mut))]
-                                        let mut view =
-                                            SettingsView::new(state, self.stats.clone(), paths);
-                                        #[cfg(feature = "camera")]
-                                        if let Some(camera) = &self.camera {
-                                            view = view.with_preview(camera.preview_source());
-                                        }
-                                        Some(view)
-                                    }
-                                };
+                                out.toggle_settings = true;
                             }
                             // Flips whatever is on screen right now, so from
                             // `system` it always does something visible.
@@ -507,7 +749,7 @@ impl eframe::App for App {
                                 .on_hover_text(hint)
                                 .clicked()
                             {
-                                new_theme = Some(next);
+                                out.theme = Some(next);
                             }
                         });
                     },
@@ -599,7 +841,7 @@ impl eframe::App for App {
                     state.camera_on,
                     state.conn == ConnStatus::Connected,
                     &state.peers,
-                    VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8),
+                    env.video_tier,
                 );
                 let toggles: [Toggle; 4] = [
                     (
@@ -699,7 +941,6 @@ impl eframe::App for App {
             });
 
         let expanded = &mut self.expanded;
-        let videos = &self.videos;
         // `UserFlags::VIEWING` only says the window or overlay is up; someone
         // actually watches video only while another person's camera is on.
         let cameras = usize::from(state.camera_on)
@@ -751,7 +992,7 @@ impl eframe::App for App {
                                         client_rtt_ms: state.rtt_ms.map(|ms| ms.round() as u16),
                                         loss_permille: None,
                                         session: me.session,
-                                        video: self_video,
+                                        video: env.self_video,
                                         moderation: None,
                                     },
                                     &columns,
@@ -799,7 +1040,7 @@ impl eframe::App for App {
                                             .info
                                             .flags
                                             .camera_on()
-                                            .then(|| videos.get(p.info.session))
+                                            .then(|| (env.video)(p.info.session))
                                             .flatten(),
                                     },
                                     &columns,
@@ -814,184 +1055,9 @@ impl eframe::App for App {
                 })
                 .inner
         });
-        self.fit_to_list(
-            &ctx,
-            list.inner.content_size.y - list.inner.inner_rect.height(),
-        );
-
-        if let Some(next) = new_theme {
-            self.theme = next.to_string();
-            theme::apply(&ctx, next);
-            let mut settings = self.state.settings.clone();
-            settings.ui.theme = next.to_string();
-            if let Some(view) = &mut self.settings {
-                view.set_theme(next);
-            }
-            send(Command::UpdateSettings(Box::new(settings)));
-        }
+        out.list_overflow = list.inner.content_size.y - list.inner.inner_rect.height();
+        out
     }
-
-    fn on_exit(&mut self) {
-        #[cfg(feature = "camera")]
-        {
-            self.camera = None;
-        }
-        #[cfg(feature = "overlay")]
-        {
-            self.overlay = None;
-        }
-        if let Some(engine) = self.engine.lock().unwrap().take() {
-            engine.shutdown();
-        }
-    }
-}
-
-impl App {
-    /// The `--debug-stats` window: a monospace dump, refreshed every 2s.
-    fn debug_window(&mut self, ctx: &egui::Context) {
-        if (self.debug_stats || self.debug_window_open)
-            && self.last_stats.elapsed() > Duration::from_secs(2)
-        {
-            self.last_stats = Instant::now();
-            self.stats_text = self.stats.report();
-            if self.debug_stats {
-                eprintln!("{}", self.stats_text);
-            }
-        }
-        if !self.debug_window_open {
-            return;
-        }
-        let stats_text = &self.stats_text;
-        self.debug_window_open = immediate_window(
-            ctx,
-            "icu-debug",
-            "ICU — Debug",
-            [540.0, 440.0],
-            None,
-            |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.label(RichText::new(stats_text).monospace().small());
-                });
-            },
-        );
-    }
-
-    /// The Verbindung window, drawn into its own immediate viewport.
-    /// Simpler than [`Self::settings_window`]: the view is read-only, so
-    /// there are no commands to drain and no theme change to react to.
-    fn connection_window(&mut self, ctx: &egui::Context) {
-        if self.connection.is_none() {
-            return;
-        }
-        // Plain locals, not `self` fields — the closure would otherwise
-        // capture the whole of `self` and collide `&self.state` against
-        // `&mut self.connection` (see `settings_window`).
-        let state = &self.state;
-        let view = &mut self.connection;
-        let still_open = immediate_window(
-            ctx,
-            "icu-connection",
-            "ICU — Verbindung",
-            [700.0, 560.0],
-            Some([560.0, 380.0]),
-            |ui| view.as_mut().expect("checked above").ui(ui, state),
-        );
-        if !still_open {
-            self.connection = None;
-        }
-    }
-
-    /// The settings window, drawn into its own immediate viewport.
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        if self.settings.is_none() {
-            return;
-        }
-        // Plain locals, not `self` fields — read/write freely inside the
-        // closure with no borrow conflict against `self.settings`.
-        let debug_open = self.debug_window_open;
-        let state = &self.state;
-        let settings = &mut self.settings;
-        let mut out = None;
-        let still_open = immediate_window(
-            ctx,
-            "icu-settings",
-            "ICU — Einstellungen",
-            [820.0, 640.0],
-            Some([640.0, 480.0]),
-            |ui| {
-                out = Some(
-                    settings
-                        .as_mut()
-                        .expect("checked above")
-                        .ui(ui, state, debug_open),
-                );
-            },
-        );
-        let Some(out) = out else {
-            return;
-        };
-        for c in out.cmds {
-            if let Command::UpdateSettings(s) = &c {
-                // A slider drag emits this every frame it moves; only a real
-                // theme change is worth rebuilding all styles for.
-                if s.ui.theme != self.theme {
-                    self.theme.clone_from(&s.ui.theme);
-                    theme::apply(ctx, &self.theme);
-                }
-            }
-            let _ = self.cmd.send(c);
-        }
-        if out.logout {
-            self.logged_out.store(true, Ordering::Relaxed);
-            self.settings = None;
-            self.quit_requested = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if !still_open {
-            self.settings = None;
-        }
-        if out.debug_window_open != self.debug_window_open {
-            self.debug_window_open = out.debug_window_open;
-            if self.debug_window_open {
-                self.stats_text = self.stats.report();
-                self.last_stats = Instant::now();
-            }
-        }
-    }
-}
-
-/// One of the app's secondary windows, drawn into its own immediate
-/// viewport with `body` as its central panel. `min_size` makes it
-/// resizable. Returns `false` once the user closed it.
-fn immediate_window(
-    ctx: &egui::Context,
-    id: &str,
-    title: &str,
-    size: [f32; 2],
-    min_size: Option<[f32; 2]>,
-    body: impl FnOnce(&mut egui::Ui),
-) -> bool {
-    let mut builder = egui::ViewportBuilder::default()
-        .with_title(title)
-        .with_inner_size(size);
-    if let Some(min) = min_size {
-        builder = builder.with_min_inner_size(min).with_resizable(true);
-    }
-    let mut still_open = true;
-    // The viewport callback is `FnMut`; `body` runs once per call.
-    let mut body = Some(body);
-    ctx.show_viewport_immediate(
-        egui::ViewportId::from_hash_of(id),
-        builder,
-        |vctx, _class| {
-            if let Some(body) = body.take() {
-                egui::CentralPanel::default().show(vctx, body);
-            }
-            if vctx.input(|i| i.viewport().close_requested()) {
-                still_open = false;
-            }
-        },
-    );
-    still_open
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,24 +1089,6 @@ fn conn_status(state: &AppState, tok: &theme::Tokens) -> (Color32, String, Strin
 // Bottom bar
 // ---------------------------------------------------------------------------
 
-/// The push-to-talk binding as a person would say it: `KEY_RIGHTCTRL`
-/// becomes `RIGHTCTRL`, and the Portal backend shows its own trigger
-/// (`CTRL+SHIFT+F12`) because that is what it actually bound.
-fn hotkey_label(state: &AppState) -> String {
-    let binding = &state.settings.hotkeys.ptt;
-    if state.hotkey_backend.contains("portal") {
-        if let Some(trigger) = &binding.trigger {
-            return trigger.clone();
-        }
-    }
-    binding
-        .key
-        .strip_prefix("KEY_")
-        .or_else(|| binding.key.strip_prefix("BTN_"))
-        .unwrap_or(&binding.key)
-        .to_string()
-}
-
 /// The speak surface plus the PTT/VAD tile beside it, `tile_w` wide. Returns the
 /// surface's response only in push-to-talk mode — in voice activation there
 /// is nothing to press, so it is a readout instead of a button that would do
@@ -1054,7 +1102,7 @@ fn speak_row(
     let ptt = Mode::from(state.settings.audio.mode) == Mode::Ptt;
     let offline = state.conn != ConnStatus::Connected;
     let open = !offline && if ptt { state.ptt_down } else { state.sending };
-    let key = hotkey_label(state);
+    let key = super::ptt_key_label(&state.settings.hotkeys, &state.hotkey_backend);
     let speak = widgets::Speak {
         ptt,
         open,
@@ -1648,18 +1696,7 @@ pub fn run_enroll(
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx, &enroll_theme);
-            Ok(Box::new(EnrollApp {
-                paths,
-                server_addr,
-                link: String::new(),
-                name: String::new(),
-                status: None,
-                step: EnrollStep::Paste,
-                focus_name: false,
-                was_valid: false,
-                pending: None,
-                result: result_app,
-            }))
+            Ok(Box::new(EnrollApp::new(paths, server_addr, result_app)))
         }),
     )
     .map_err(|e| e.to_string())?;
@@ -1692,7 +1729,9 @@ enum EnrollStep {
     Confirm,
 }
 
-struct EnrollApp {
+/// The first-start window: paste an invite (or a passport), check where it
+/// leads, pick a name, join. `pub` for `tests/ui_layout.rs`.
+pub struct EnrollApp {
     paths: Paths,
     server_addr: Option<SocketAddr>,
     link: String,
@@ -1711,9 +1750,39 @@ struct EnrollApp {
     /// with a bundle the first one is already spending.
     pending: Option<EnrollSlot>,
     result: Arc<Mutex<Option<Identity>>>,
+    /// How much taller the last frame's content was than the window.
+    overflow: f32,
 }
 
 impl EnrollApp {
+    /// An empty window; a joined identity is saved to `paths` and put into
+    /// `result` before the window closes itself.
+    pub fn new(
+        paths: Paths,
+        server_addr: Option<SocketAddr>,
+        result: Arc<Mutex<Option<Identity>>>,
+    ) -> EnrollApp {
+        EnrollApp {
+            paths,
+            server_addr,
+            link: String::new(),
+            name: String::new(),
+            status: None,
+            step: EnrollStep::Paste,
+            focus_name: false,
+            was_valid: false,
+            pending: None,
+            result,
+            overflow: 0.0,
+        }
+    }
+
+    /// How much taller the last frame's content was than the window
+    /// (negative: shorter). The window grows by it itself; tests read it.
+    pub fn overflow(&self) -> f32 {
+        self.overflow
+    }
+
     /// Reads the pasted text and either takes it as it is (a passport) or
     /// starts the registration thread (a registration bundle).
     fn submit(&mut self) {
@@ -2050,15 +2119,9 @@ impl eframe::App for EnrollApp {
                 // Past the paste field the content has a natural height: grow
                 // the window to show all of it instead of a scroll bar.
                 let overflow = out.content_size.y - out.inner_rect.height();
-                if step != EnrollStep::Paste && overflow > 1.0 {
-                    // Not `viewport().inner_rect`: `None` on Wayland.
-                    {
-                        let r = ctx.content_rect();
-                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                            r.width(),
-                            (r.height() + overflow).ceil(),
-                        )));
-                    }
+                self.overflow = overflow;
+                if step != EnrollStep::Paste {
+                    super::grow_to_fit(&ctx, overflow);
                 }
             });
 

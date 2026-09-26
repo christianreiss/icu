@@ -96,3 +96,11 @@ tray-icon = { version = "0.25.1", optional = true }
 [dev-dependencies]
 icu-server = { path = "../icu-server" }
 tempfile.workspace = true
+# Headless rendering of every window for `tests/ui_layout.rs`; `wgpu` only
+# for the optional screenshots (`ICU_UI_SHOTS=<dir>`).
+egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[test]]
+name = "ui_layout"
+required-features = ["gui"]
