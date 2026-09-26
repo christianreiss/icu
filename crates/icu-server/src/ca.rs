@@ -225,7 +225,7 @@ impl Ca {
         }];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.use_authority_key_identifier_extension = true;
-        set_validity(&mut params, tls.server_validity_days);
+        set_validity(&mut params, tls.server_validity_days)?;
         params.serial_number = Some(random_serial());
 
         // rcgen 0.14: the direct form takes the public key AND the issuer
@@ -254,7 +254,7 @@ impl Ca {
         if cn.is_empty() {
             return Err(Error::msg("ca.crt has no readable CN"));
         }
-        let cert = ca_params(&cn, tls.ca_validity_days).self_signed(self.issuer.key())?;
+        let cert = ca_params(&cn, tls.ca_validity_days)?.self_signed(self.issuer.key())?;
         store::write_atomic(&self.dir.join(CA_CRT), &cert.pem())?;
         self.ca_der = cert.der().clone();
         self.issuer = issuer(&self.ca_der, &self.ca_key_pem)?;
@@ -301,7 +301,7 @@ impl Ca {
         csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         csr.params.use_authority_key_identifier_extension = true;
         match lifetime.into() {
-            Lifetime::Days(days) => set_validity(&mut csr.params, days),
+            Lifetime::Days(days) => set_validity(&mut csr.params, days)?,
             Lifetime::Keep {
                 not_before,
                 not_after,
@@ -648,7 +648,7 @@ fn create_ca(
     let cert = ca_params(
         &format!("{CA_COMMON_NAME} {server_name}"),
         tls.ca_validity_days,
-    )
+    )?
     .self_signed(&key)?;
     let key_pem = key.serialize_pem();
     // Key first: a crash in between leaves a key without a certificate,
@@ -661,7 +661,7 @@ fn create_ca(
 
 /// Parameters of the self-signed CA certificate: new, and re-issued under the
 /// same key by [`Ca::renew_ca_cert`].
-fn ca_params(common_name: &str, days: u32) -> CertificateParams {
+fn ca_params(common_name: &str, days: u32) -> Result<CertificateParams> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
@@ -669,15 +669,20 @@ fn ca_params(common_name: &str, days: u32) -> CertificateParams {
     params
         .distinguished_name
         .push(DnType::CommonName, common_name);
-    set_validity(&mut params, days);
+    set_validity(&mut params, days)?;
     params.serial_number = Some(random_serial());
-    params
+    Ok(params)
 }
 
-fn set_validity(params: &mut CertificateParams, days: u32) {
+/// From an hour ago (clock slack) for `days` days. Checked: an absurd
+/// lifetime is an error here, not a panic in the date arithmetic.
+fn set_validity(params: &mut CertificateParams, days: u32) -> Result<()> {
     let now = store::now();
     params.not_before = now - time::Duration::hours(1);
-    params.not_after = now + time::Duration::days(i64::from(days));
+    params.not_after = now
+        .checked_add(time::Duration::days(i64::from(days)))
+        .ok_or_else(|| Error::msg(format!("a validity of {days} days is out of range")))?;
+    Ok(())
 }
 
 /// Big-endian bytes of `n` without leading zeros (at least one byte).
@@ -1172,6 +1177,22 @@ mod tests {
             "nothing to put on a CRL"
         );
         client_accepts(ca.ca_der(), &ca).expect("a working leaf");
+    }
+
+    /// A lifetime the date arithmetic cannot represent is an error, not a
+    /// panic that takes the server down on the next registration.
+    #[test]
+    fn an_absurd_validity_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let absurd = TlsSection {
+            server_validity_days: u32::MAX,
+            ..tls()
+        };
+        assert!(Ca::load_or_create(dir.path(), &absurd, "localhost").is_err());
+        let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        let (_key, csr) = csr_with_cn("alice");
+        let err = ca.sign_client_csr(&csr, u32::MAX, HOST).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
     }
 
     #[test]

@@ -262,6 +262,14 @@ impl TimingSection {
     }
 }
 
+/// Longest certificate lifetime a configuration may ask for: 100 years. The
+/// date arithmetic behind a larger one overflows.
+pub const MAX_VALIDITY_DAYS: u32 = 36_500;
+
+/// Longest value any `[timing]` entry may have: an hour. Every one of them
+/// is added to a clock reading, which overflows for an absurd value.
+pub const MAX_TIMING_MS: u64 = 3_600_000;
+
 impl Config {
     /// Loads and validates a configuration file.
     pub fn load(path: &Path) -> Result<Config> {
@@ -295,6 +303,44 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.server.listen.is_empty() {
             return Err(Error::msg("server.listen is empty"));
+        }
+        // Upper bounds, before anything computes with them: an absurd
+        // lifetime or timeout overflows date or clock arithmetic, which is a
+        // panic, not an error.
+        for (key, days) in [
+            ("tls.ca_validity_days", self.tls.ca_validity_days),
+            ("tls.client_validity_days", self.tls.client_validity_days),
+            ("tls.server_validity_days", self.tls.server_validity_days),
+        ] {
+            if days > MAX_VALIDITY_DAYS {
+                return Err(Error::msg(format!(
+                    "{key} must be at most {MAX_VALIDITY_DAYS}, got {days}"
+                )));
+            }
+        }
+        let t = &self.timing;
+        for (key, ms) in [
+            ("timing.hello_timeout_ms", t.hello_timeout_ms),
+            ("timing.speaking_silence_ms", t.speaking_silence_ms),
+            ("timing.loss_report_ttl_ms", t.loss_report_ttl_ms),
+            (
+                "timing.keyframe_min_interval_ms",
+                t.keyframe_min_interval_ms,
+            ),
+            (
+                "timing.rate_violation_window_ms",
+                t.rate_violation_window_ms,
+            ),
+            ("timing.shutdown_grace_ms", t.shutdown_grace_ms),
+            ("timing.max_idle_timeout_ms", t.max_idle_timeout_ms),
+            ("timing.handshake_timeout_ms", t.handshake_timeout_ms),
+            ("timing.video_frame_timeout_ms", t.video_frame_timeout_ms),
+        ] {
+            if ms > MAX_TIMING_MS {
+                return Err(Error::msg(format!(
+                    "{key} must be at most {MAX_TIMING_MS}, got {ms}"
+                )));
+            }
         }
         let server_name = self.server.server_name.trim();
         if server_name.is_empty() {
@@ -535,6 +581,27 @@ format = "text"
 
         let mut c = base();
         c.log.format = "xml".into();
+        assert!(c.validate().is_err());
+
+        // Upper bounds: absurd values would overflow date or clock
+        // arithmetic, a panic rather than an error.
+        let mut c = base();
+        c.tls.client_validity_days = MAX_VALIDITY_DAYS;
+        assert!(c.validate().is_ok());
+        c.tls.client_validity_days = u32::MAX;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("tls.client_validity_days"), "{err}");
+        let mut c = base();
+        c.tls.ca_validity_days = MAX_VALIDITY_DAYS + 1;
+        assert!(c.validate().is_err());
+        let mut c = base();
+        c.timing.handshake_timeout_ms = MAX_TIMING_MS;
+        assert!(c.validate().is_ok());
+        c.timing.handshake_timeout_ms = u64::MAX;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("timing.handshake_timeout_ms"), "{err}");
+        let mut c = base();
+        c.timing.hello_timeout_ms = MAX_TIMING_MS + 1;
         assert!(c.validate().is_err());
 
         // `public_host` goes into client certificates as `icu://host:port`.
