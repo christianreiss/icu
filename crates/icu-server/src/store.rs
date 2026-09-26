@@ -353,6 +353,14 @@ impl Store {
         self.users.users.is_empty()
     }
 
+    /// Whether the state has never been used: no user, no CRL issued (every
+    /// start issues one), no server leaf revoked. Only then may a missing CA
+    /// be created anew; otherwise its files were lost, and a new CA would
+    /// lock out everyone registered so far.
+    pub fn is_fresh(&self) -> bool {
+        self.is_empty() && self.users.crl_number == 0 && self.users.revoked_server.is_empty()
+    }
+
     /// Resolves a certificate fingerprint to its user and certificate.
     pub fn by_fingerprint(&self, fp: &str) -> Option<(UserId, &UserRecord, &CertRecord)> {
         for (id, user) in self.users() {

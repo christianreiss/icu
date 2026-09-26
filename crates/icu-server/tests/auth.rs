@@ -1125,6 +1125,37 @@ async fn a_server_key_that_does_not_match_is_repaired_at_startup() {
     server.shutdown().await;
 }
 
+/// CA files that went missing while `users.toml` knows users — a partial
+/// restore, a migration that forgot them — are a startup error naming them,
+/// for the server and the offline CLI alike. A new CA, as before, would have
+/// locked out every registered user; only a state that never saw a user
+/// gets one.
+#[tokio::test]
+async fn a_lost_ca_is_not_replaced_while_users_are_on_record() {
+    let server = TestServer::start().await;
+    server.enroll("alice").await;
+    let TestServer { dir, handle } = server;
+    handle.shutdown().await;
+    for name in ["ca.crt", "ca.key"] {
+        std::fs::remove_file(dir.path().join(name)).expect("remove");
+    }
+
+    let config = icu_server::config::Config::for_test(dir.path());
+    let started = icu_server::run(config.clone()).await.err();
+    let offline = icu_server::Server::offline(config).err();
+    for error in [started, offline] {
+        let error = error.expect("no new CA").to_string();
+        assert!(
+            error.contains("ca.crt") && error.contains("ca.key"),
+            "names the files: {error}"
+        );
+        assert!(error.contains("README"), "points to the runbook: {error}");
+    }
+    for name in ["ca.crt", "ca.key"] {
+        assert!(!dir.path().join(name).exists(), "{name} was not created");
+    }
+}
+
 /// A server leaf close to expiry is rotated by the server itself, right at
 /// startup: served live, the old one on the CRL, and `status` reports it.
 #[tokio::test]

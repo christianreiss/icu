@@ -96,6 +96,19 @@ impl Ca {
     /// one found is kept for the CRL ([`Ca::take_retired_leaves`]), as is
     /// every leaf `server.crt.retired` lists, except the one in use.
     pub fn load_or_create(dir: &Path, tls: &TlsSection, server_name: &str) -> Result<Ca> {
+        Ca::load_or_create_if(dir, tls, server_name, || Ok(()))
+    }
+
+    /// [`Ca::load_or_create`], asking `may_create` first where it would
+    /// create a new CA; its error is returned instead. What a new CA needs
+    /// beyond the two files missing — a state that never saw a user — is the
+    /// caller's to know.
+    pub fn load_or_create_if(
+        dir: &Path,
+        tls: &TlsSection,
+        server_name: &str,
+        may_create: impl FnOnce() -> Result<()>,
+    ) -> Result<Ca> {
         use std::io::ErrorKind::NotFound;
         std::fs::create_dir_all(dir)?;
         let (ca_der, ca_key_pem) = match (
@@ -104,6 +117,7 @@ impl Ca {
         ) {
             (Ok(crt), Ok(key)) => (read_cert_pem(&crt).context("ca.crt")?, key),
             (Err(crt), Err(key)) if crt.kind() == NotFound && key.kind() == NotFound => {
+                may_create()?;
                 tracing::warn!(
                     dir = %dir.display(),
                     "no CA in the state directory, creating a new one"
@@ -115,7 +129,8 @@ impl Ca {
                     "cannot load the CA from {} ({}; {}). Refusing to create a new \
                      one: it would invalidate every certificate and bundle issued so \
                      far. Restore ca.crt and ca.key together, readable for the \
-                     server, or remove both to start over with a new CA",
+                     server, or move the state directory aside to start over with a \
+                     new CA",
                     dir.display(),
                     file_state(CA_CRT, &crt),
                     file_state(CA_KEY, &key)

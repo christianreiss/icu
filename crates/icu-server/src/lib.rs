@@ -128,11 +128,7 @@ impl Server {
     pub fn offline(config: Config) -> Result<Arc<Server>> {
         config.validate()?;
         let mut store = Store::open(&config.paths.state_dir)?;
-        let mut ca = Ca::load_or_create(
-            &config.paths.state_dir,
-            &config.tls,
-            &config.server.server_name,
-        )?;
+        let mut ca = open_ca(&config, &store)?;
         admin::record_retired_leaves(&mut store, &mut ca)?;
         Ok(Arc::new(Server::new(
             config,
@@ -277,11 +273,7 @@ pub async fn run(config: Config) -> Result<Handle> {
     if purged > 0 {
         tracing::info!(purged, "dropped expired registrations");
     }
-    let mut ca = Ca::load_or_create(
-        &config.paths.state_dir,
-        &config.tls,
-        &config.server.server_name,
-    )?;
+    let mut ca = open_ca(&config, &store)?;
     // A server leaf replaced while loading, or left in server.crt.retired
     // by a rotation whose CRL entry failed, goes on the CRL built below.
     admin::record_retired_leaves(&mut store, &mut ca)?;
@@ -341,6 +333,29 @@ pub async fn run(config: Config) -> Result<Handle> {
         addrs,
         tasks,
         admin_socket,
+    })
+}
+
+/// Loads the CA for [`run`] and [`Server::offline`], creating one only for a
+/// state that has never been used ([`Store::is_fresh`]): with `ca.crt` and
+/// `ca.key` both gone but users on record — a partial restore, a migration
+/// that forgot them — a new CA would lock every one of them out.
+fn open_ca(config: &Config, store: &Store) -> Result<Ca> {
+    let dir = &config.paths.state_dir;
+    Ca::load_or_create_if(dir, &config.tls, &config.server.server_name, || {
+        if store.is_fresh() {
+            return Ok(());
+        }
+        Err(Error::msg(format!(
+            "no CA in {}: ca.crt and ca.key are both missing, but {users} has been \
+             in use (users or CRLs on record). Refusing to create a new CA, it would \
+             lock out everyone registered so far. Restore ca.crt and ca.key from the \
+             backup {users} comes from (runbook \"Backup und Restore\" in \
+             /usr/share/doc/icu-server/README.md, deploy/README.md in the sources); \
+             to start over with a new CA, move the state directory aside",
+            dir.display(),
+            users = store::USERS_FILE,
+        )))
     })
 }
 

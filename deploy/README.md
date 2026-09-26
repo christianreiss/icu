@@ -126,15 +126,26 @@ der Server deshalb nicht, und `icu-server invite` stellt nichts aus.
 und `state.lock`. **`ca.key` ist das einzige Geheimnis, das zählt** — geht es
 verloren, müssen sich alle Nutzer neu registrieren. Ein Backup von
 `/var/lib/icu/` gehört zur Inbetriebnahme. Eine neue CA legt der Server nur an,
-wenn `ca.crt` und `ca.key` beide fehlen; fehlt nur eine, ist eine nicht lesbar
-(etwa nach einem Restore mit falschem Besitzer) oder passen sie nicht
-zusammen, startet er nicht und sagt, welche Datei es ist. `server.crt` und
+wenn `ca.crt` und `ca.key` beide fehlen und `users.toml` noch nie benutzt wurde
+(keine Nutzer, keine CRL); fehlt nur eine, ist eine nicht lesbar (etwa nach
+einem Restore mit falschem Besitzer), passen sie nicht zusammen oder fehlen
+beide neben einer benutzten `users.toml`, startet er nicht und sagt, welche
+Datei es ist. `server.crt` und
 `server.key` sind dagegen entbehrlich: passen sie nicht, stellt der Server beim
 Start selbst ein neues Leaf aus. `server.crt.retired` gibt es nur, solange ein
 ersetztes Server-Leaf noch nicht auf der CRL steht (etwa weil `users.toml` bei
 der Rotation nicht geschrieben werden konnte); der nächste Start trägt es nach
 und löscht die Datei. Nicht von Hand löschen, sonst bleibt das alte Leaf
 gültig.
+
+**Backup und Restore.** `ca.crt`, `ca.key` und `users.toml` gehören zusammen
+und kommen aus demselben Backup zurück, lesbar für den Dienst. Meldet der
+Start `no CA in …: ca.crt and ca.key are both missing, but users.toml has been
+in use`, fehlt die CA neben einem benutzten Nutzerbestand — ein unvollständiger
+Restore, eine Migration ohne die CA: beide Dateien aus dem Backup zurückholen.
+Eine neue CA sperrte jeden registrierten Nutzer aus, deshalb legt der Server
+dann keine an. Wer wirklich neu anfangen will (neue CA, alle registrieren sich
+neu), schiebt das ganze State-Verzeichnis beiseite.
 
 **Nach dem Zurückspielen eines Backups** `icu-server rotate-server-cert`
 ausführen. Lag zwischen Backup und Restore eine Rotation, präsentiert der Server
