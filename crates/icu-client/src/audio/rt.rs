@@ -26,6 +26,33 @@
 /// 20 through RTKit on a stock desktop), so the graph always wins over us.
 pub const PRIORITY: i32 = 15;
 
+/// Keeps the Windows MMCSS registration until the worker has finished.
+/// Not Send: Windows requires release on the registering thread. On other
+/// platforms scheduling already lasts for the thread lifetime.
+#[derive(Default)]
+#[must_use = "keep the guard alive for the audio worker's lifetime"]
+pub struct PriorityGuard {
+    #[cfg(target_os = "windows")]
+    task: Option<windows::Win32::Foundation::HANDLE>,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for PriorityGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.task {
+            // SAFETY: the guard cannot move to another thread and owns this
+            // registration. Drop runs before the worker exits, outside TLS
+            // teardown and the Windows loader lock.
+            if let Err(error) =
+                unsafe { windows::Win32::System::Threading::AvRevertMmThreadCharacteristics(task) }
+            {
+                tracing::warn!(%error, "could not release MMCSS registration");
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use std::{
@@ -117,6 +144,7 @@ mod imp {
 /// as long as the thread.
 #[cfg(target_os = "windows")]
 mod imp {
+    use super::PriorityGuard;
     use windows::{
         core::w,
         Win32::System::Threading::{
@@ -125,16 +153,20 @@ mod imp {
         },
     };
 
-    pub fn promote(_priority: i32) -> Result<(), String> {
+    pub fn promote(_priority: i32) -> Result<PriorityGuard, String> {
         let mut index = 0u32;
         // SAFETY: plain Win32 calls on the calling thread.
         unsafe {
             match AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut index) {
                 Ok(task) => {
                     let _ = AvSetMmThreadPriority(task, AVRT_PRIORITY_HIGH);
-                    Ok(())
+                    Ok(PriorityGuard {
+                        task: Some(task),
+                        ..PriorityGuard::default()
+                    })
                 }
                 Err(mmcss) => SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)
+                    .map(|()| PriorityGuard::default())
                     .map_err(|e| format!("MMCSS: {mmcss}; SetThreadPriority: {e}")),
             }
         }
@@ -157,17 +189,24 @@ pub fn register_context(context: *mut std::ffi::c_void) {
 
 /// Asks for real-time priority for the calling thread and logs the outcome.
 /// Never fails the caller.
-pub fn promote_current_thread(name: &str) {
-    match imp::promote(PRIORITY) {
-        Ok(()) => tracing::info!(
-            thread = name,
-            priority = PRIORITY,
-            "real-time priority acquired"
-        ),
-        Err(error) => tracing::info!(
-            thread = name,
-            %error,
-            "no real-time priority (module-rt/RTKit); running best effort"
-        ),
+pub fn promote_current_thread(name: &str) -> PriorityGuard {
+    #[cfg(target_os = "windows")]
+    let result = imp::promote(PRIORITY);
+    #[cfg(not(target_os = "windows"))]
+    let result = imp::promote(PRIORITY).map(|()| PriorityGuard::default());
+    match result {
+        Ok(guard) => {
+            tracing::info!(
+                thread = name,
+                priority = PRIORITY,
+                "real-time priority acquired"
+            );
+            guard
+        }
+        Err(error) => {
+            tracing::info!(thread = name, %error,
+                "no real-time priority (module-rt/RTKit); running best effort");
+            PriorityGuard::default()
+        }
     }
 }

@@ -1234,7 +1234,7 @@ fn dsp_thread(
     mut mic_test: HeapProd<f32>,
     test_tone: bool,
 ) {
-    crate::audio::rt::promote_current_thread("icu-dsp");
+    let _priority = crate::audio::rt::promote_current_thread("icu-dsp");
     let ctl = shared.dsp.clone();
     let stats = shared.stats.clone();
     // Since when the mic test is on, for its time limit.
@@ -1713,7 +1713,7 @@ fn send_audio(
 // ---------------------------------------------------------------------------
 
 fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: HeapCons<f32>) {
-    crate::audio::rt::promote_current_thread("icu-mixer");
+    let _priority = crate::audio::rt::promote_current_thread("icu-mixer");
     let stats = shared.stats.clone();
     let mut out = vec![0.0f32; BLOCK];
     let mut mic_buf = vec![0.0f32; BLOCK];
