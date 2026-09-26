@@ -22,7 +22,7 @@ pub use main_window::Exit;
 /// (`CTRL+SHIFT+F12`) because that is what it actually bound.
 pub(crate) fn ptt_key_label(hotkeys: &crate::config::HotkeySettings, backend: &str) -> String {
     let binding = &hotkeys.ptt;
-    if backend.contains("portal") {
+    if backend == "portal" {
         if let Some(trigger) = &binding.trigger {
             return trigger.clone();
         }

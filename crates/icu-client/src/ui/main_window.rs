@@ -359,18 +359,28 @@ impl eframe::App for App {
             tray.update(state);
         }
         // ICU started again: come to the front, like „Fenster anzeigen“. A
-        // handed-over invite or passport (`request.bundle`) is not taken
-        // over from here yet.
+        // handed-over invite or passport (a double-click on an `.icu` file)
+        // opens in Einstellungen → Allgemein, checked and ready to take.
         if let Some(request) = crate::instance::poll() {
             self.hidden = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            if request.bundle.is_some() {
-                tracing::info!("a handed-over invite or passport is not taken over here");
+            if let Some(text) = request.bundle {
+                if self.settings.is_none() {
+                    self.settings = Some(self.new_settings_view());
+                }
+                if let Some(view) = &mut self.settings {
+                    view.import_text(text);
+                }
             }
         }
         #[cfg(feature = "camera")]
         if let Some(camera) = &mut self.camera {
+            // The preview belongs to the settings' Kamera page; closed
+            // settings, no preview.
+            if self.settings.is_none() {
+                camera.set_preview(false);
+            }
             camera.sync(state);
         }
 
@@ -613,6 +623,10 @@ impl App {
                 }
             }
             let _ = self.cmd.send(c);
+        }
+        #[cfg(feature = "camera")]
+        if let Some(camera) = &mut self.camera {
+            camera.set_preview(out.camera_preview && still_open);
         }
         if out.logout {
             self.logged_out.store(true, Ordering::Relaxed);
@@ -1894,6 +1908,9 @@ pub struct EnrollApp {
     /// with a bundle the first one is already spending.
     pending: Option<EnrollSlot>,
     result: Arc<Mutex<Option<Identity>>>,
+    /// The identity in force, if any: joining replaces it, and a different
+    /// CA means a different server, which the join page says.
+    current: Option<Identity>,
     /// How much taller the last frame's content was than the window.
     overflow: f32,
 }
@@ -1906,7 +1923,9 @@ impl EnrollApp {
         server_addr: Option<SocketAddr>,
         result: Arc<Mutex<Option<Identity>>>,
     ) -> EnrollApp {
+        let current = Identity::load(&paths).ok().flatten();
         EnrollApp {
+            current,
             paths,
             server_addr,
             link: String::new(),
@@ -2052,7 +2071,7 @@ impl eframe::App for EnrollApp {
         // own CA and address (`PROTOCOL.md` §2.3.1).
         let summary = parsed
             .as_ref()
-            .map(|id| crate::config::ImportSummary::of(id, None));
+            .map(|id| crate::config::ImportSummary::of(id, self.current.as_ref()));
         // The CA the client will hold the server to: the one thing in the
         // pasted text worth checking with whoever sent it.
         let ca = parsed
@@ -2203,6 +2222,17 @@ impl eframe::App for EnrollApp {
                                 }
                                 let title = if needs_name { "Einladung" } else { "Passport" };
                                 enroll_card(ui, &tok, title, &rows, Some(JOIN_NOTE));
+                                if summary.ca_changed {
+                                    widgets::banner(
+                                        ui,
+                                        widgets::BannerKind::Warning,
+                                        "Anderer Server als bisher",
+                                        "Beitreten ersetzt die Zugangsdaten, die dieses Gerät \
+                                         jetzt hat.",
+                                        None::<fn()>,
+                                    );
+                                    ui.add_space(10.0);
+                                }
                             }
                             if needs_name {
                                 ui.label(theme::caps_text("Dein Name"));

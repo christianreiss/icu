@@ -168,6 +168,13 @@ pub struct SettingsView {
     /// „Kein Echo feststellbar" was answered; it is not offered again while
     /// this window lives.
     aec_hint_dismissed: bool,
+    /// A running „Aufnehmen" on the Tastenkürzel page.
+    capture: Option<Capture>,
+    /// Why the last „Aufnehmen" failed, shown under the bindings.
+    capture_error: Option<String>,
+    /// The local camera preview (capture without sending) is requested
+    /// while the Kamera page is on screen.
+    camera_preview: bool,
 }
 
 /// What one frame of the settings window asks the main window to do.
@@ -179,6 +186,10 @@ pub struct SettingsOutput {
     pub debug_window_open: bool,
     /// The user confirmed logging out.
     pub logout: bool,
+    /// The camera should capture for the preview without sending
+    /// (`CameraHandle::set_preview`): the Kamera page is on screen and the
+    /// user asked for it.
+    pub camera_preview: bool,
     /// How much taller the page is than the window shows (negative:
     /// shorter).
     pub overflow: f32,
@@ -230,6 +241,9 @@ impl SettingsView {
             cameras_stale: true,
             overlay_available: cfg!(feature = "overlay"),
             aec_hint_dismissed: false,
+            capture: None,
+            capture_error: None,
+            camera_preview: false,
         }
     }
 
@@ -239,6 +253,16 @@ impl SettingsView {
         self.tab = Tab::General;
         self.import_open = true;
         self.focus_import = true;
+    }
+
+    /// Opens Allgemein with `text` (a passport or invite handed over by a
+    /// second start, `crate::instance`) already in the field and checked:
+    /// one click on „Übernehmen" takes it.
+    pub fn import_text(&mut self, text: String) {
+        self.open_import();
+        self.focus_import = false;
+        self.passport_import = text;
+        self.preview_passport();
     }
 
     /// Whether the overlay could start on this desktop.
@@ -369,7 +393,7 @@ impl SettingsView {
                         match self.tab {
                             Tab::Audio => self.audio_tab(ui, state),
                             Tab::Sound => self.sound_tab(ui, state),
-                            Tab::Hotkeys => self.hotkeys_tab(ui, state),
+                            Tab::Hotkeys => self.hotkeys_tab(ui, state, &mut cmds),
                             Tab::Camera => self.camera_tab(ui, state),
                             Tab::General => self.general_tab(ui, state, &mut cmds),
                             Tab::Users => self.users_tab(ui, state, &mut cmds),
@@ -394,6 +418,7 @@ impl SettingsView {
             cmds,
             debug_window_open: self.debug_window_open,
             logout: std::mem::take(&mut self.logout_requested),
+            camera_preview: self.tab == Tab::Camera && self.camera_preview,
             overflow,
         }
     }
@@ -943,67 +968,135 @@ impl SettingsView {
         }
     }
 
-    fn hotkeys_tab(&mut self, ui: &mut Ui, state: &AppState) {
+    fn hotkeys_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         let adv = self.draft.ui.show_advanced;
         widgets::page_header(
             ui,
             "Tastenkürzel",
-            "Sprechen und Stummschalten per Taste – auch wenn ICU im Hintergrund läuft.",
+            "Sprechen, Stummschalten und mehr per Taste – auch wenn ICU im Hintergrund läuft. \
+             Änderungen gelten sofort.",
             |_| {},
         );
-        // `crate::hotkey::start` reports "portal", "evdev (n devices)" or
-        // "none"; the empty string means it was never started
-        // (`--no-hotkeys`).
+        // `crate::hotkey` reports "portal", "evdev (n devices)",
+        // "portal-declined" or "none"; the empty string means it was never
+        // started (`--no-hotkeys`).
         let backend = state.hotkey_backend.as_str();
-        let banner = match backend {
-            "" => Some((
-                widgets::BannerKind::Warning,
-                "Tastenkürzel sind abgeschaltet",
-                "ICU wurde ohne Tastenkürzel gestartet. Bedienen geht weiter über das Hauptfenster.",
-            )),
-            "none" => Some((
-                widgets::BannerKind::Error,
-                "Tastenkürzel funktionieren gerade nicht",
-                "Das System hat keinen Weg angeboten, Tasten im Hintergrund zu lesen. \
-                 Unter „Erweitert“ lässt sich ein anderer Weg wählen.",
-            )),
-            _ => None,
-        };
-        if let Some((kind, title, body)) = banner {
-            widgets::banner(ui, kind, title, body, None::<fn()>);
-            ui.add_space(14.0);
+        match backend {
+            "" => {
+                widgets::banner(
+                    ui,
+                    widgets::BannerKind::Warning,
+                    "Tastenkürzel sind abgeschaltet",
+                    "ICU wurde ohne Tastenkürzel gestartet. Bedienen geht weiter über das \
+                     Hauptfenster.",
+                    None::<fn()>,
+                );
+                ui.add_space(12.0);
+            }
+            crate::hotkey::BACKEND_PORTAL_DECLINED => {
+                widgets::banner(
+                    ui,
+                    widgets::BannerKind::Warning,
+                    "Tastenkürzel wurden abgelehnt",
+                    "Der Dialog der Arbeitsumgebung wurde abgebrochen oder ohne Taste bestätigt. \
+                     ICU kann erneut fragen oder die Tasten selbst lesen.",
+                    None::<fn()>,
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if widgets::button(
+                        ui,
+                        widgets::ButtonKind::Primary,
+                        icon::ARROW_CLOCKWISE,
+                        "Erneut fragen",
+                    )
+                    .clicked()
+                    {
+                        cmds.push(Command::RetryHotkeys);
+                    }
+                    if widgets::button(
+                        ui,
+                        widgets::ButtonKind::Neutral,
+                        icon::COMMAND,
+                        "Tasten direkt lesen (evdev)",
+                    )
+                    .on_hover_text("Liest jeden Tastendruck mit; braucht die Gruppe input")
+                    .clicked()
+                    {
+                        self.draft.hotkeys.backend = HotkeyBackend::Evdev;
+                    }
+                });
+                ui.add_space(12.0);
+            }
+            crate::hotkey::BACKEND_NONE => {
+                widgets::banner(
+                    ui,
+                    widgets::BannerKind::Error,
+                    "Tastenkürzel funktionieren gerade nicht",
+                    "Das System bietet keinen Weg an, Tasten im Hintergrund zu lesen, und ICU \
+                     darf sie nicht selbst lesen (Gruppe input). Bedienen geht weiter über das \
+                     Hauptfenster.",
+                    None::<fn()>,
+                );
+                ui.add_space(12.0);
+            }
+            _ => {}
         }
 
+        let portal = backend == "portal";
+        let capture = self.poll_capture(ui);
         widgets::group_card(ui, "Belegung", |ui| {
-            binding_row(
-                ui,
-                false,
-                &mut self.expanded_bindings,
-                "Push-to-Talk",
-                &mut self.draft.hotkeys.ptt,
-            );
-            binding_row(
-                ui,
-                true,
-                &mut self.expanded_bindings,
-                "Stummschalten",
-                &mut self.draft.hotkeys.mute,
-            );
-            binding_row(
-                ui,
-                true,
-                &mut self.expanded_bindings,
-                "Ton aus",
-                &mut self.draft.hotkeys.deafen,
-            );
-            binding_row(
-                ui,
-                true,
-                &mut self.expanded_bindings,
-                "Modus wechseln",
-                &mut self.draft.hotkeys.toggle_mode,
-            );
-            widgets::help_note(ui, "Änderungen gelten ab dem nächsten Start von ICU.");
+            let hotkeys = &mut self.draft.hotkeys;
+            let rows: [(&'static str, &mut crate::config::KeyBinding); 5] = [
+                ("Push-to-Talk", &mut hotkeys.ptt),
+                ("Stummschalten", &mut hotkeys.mute),
+                ("Ton aus", &mut hotkeys.deafen),
+                ("Modus wechseln", &mut hotkeys.toggle_mode),
+                ("Kamera", &mut hotkeys.camera),
+            ];
+            for (i, (label, binding)) in rows.into_iter().enumerate() {
+                let capturing = self.capture.as_ref().is_some_and(|c| c.label == label);
+                if capturing {
+                    if let Some(Ok(result)) = &capture {
+                        result.apply(binding);
+                    }
+                }
+                let action = binding_row(
+                    ui,
+                    i > 0,
+                    label,
+                    binding,
+                    portal,
+                    capturing,
+                    adv,
+                    &mut self.expanded_bindings,
+                );
+                match action {
+                    BindingAction::None => {}
+                    BindingAction::Record => self.capture = Some(Capture::start(label)),
+                    BindingAction::Cancel => self.capture = None,
+                    BindingAction::Clear => {
+                        *binding = crate::config::KeyBinding::default();
+                    }
+                }
+            }
+            match &capture {
+                Some(Ok(_)) => self.capture = None,
+                Some(Err(e)) => {
+                    self.capture = None;
+                    self.capture_error = Some(e.clone());
+                }
+                None => {}
+            }
+            if let Some(err) = &self.capture_error {
+                widgets::card_note(ui, |ui| {
+                    ui.colored_label(
+                        theme::tokens(ui.visuals()).connecting,
+                        RichText::new(err).size(11.5),
+                    );
+                });
+            }
         });
 
         if adv {
@@ -1023,7 +1116,8 @@ impl SettingsView {
                     let tok = theme::tokens(ui.visuals());
                     let (color, text) = match backend {
                         "" => (tok.connecting, "abgeschaltet"),
-                        "none" => (tok.error, "keiner"),
+                        crate::hotkey::BACKEND_NONE => (tok.error, "keiner"),
+                        crate::hotkey::BACKEND_PORTAL_DECLINED => (tok.connecting, "abgelehnt"),
                         backend => (tok.connected, backend),
                     };
                     widgets::status_pill(ui, color, text)
@@ -1045,6 +1139,39 @@ impl SettingsView {
                 None::<fn()>,
             );
         }
+    }
+
+    /// The running „Aufnehmen", if its answer is in: the key read straight
+    /// from the input devices (exact, also Right Ctrl or a mouse side
+    /// button), or — when ICU may not read them — a key pressed while this
+    /// window has the focus. Keeps the window repainting while it waits.
+    fn poll_capture(&mut self, ui: &Ui) -> Option<Result<Captured, String>> {
+        let capture = self.capture.as_mut()?;
+        ui.ctx().request_repaint_after(Duration::from_millis(50));
+        let evdev = capture.slot.lock().ok().and_then(|mut s| s.take());
+        if let Some(Ok(key)) = evdev {
+            return Some(Ok(Captured::from_evdev(key)));
+        }
+        if let Some(Err(e)) = evdev {
+            capture.evdev_failed = Some(e);
+        }
+        if capture.window.is_none() {
+            capture.window = window_key(ui).map(|k| (k, Instant::now()));
+        }
+        // A key seen by the window waits a moment for the exact one from
+        // the devices, which knows left from right Ctrl.
+        if let Some((key, at)) = &capture.window {
+            if capture.evdev_failed.is_some() || at.elapsed() > Duration::from_millis(250) {
+                return Some(Ok(key.clone()));
+            }
+        }
+        if capture.started.elapsed() > Duration::from_secs(10) {
+            return Some(Err(capture
+                .evdev_failed
+                .clone()
+                .unwrap_or_else(|| "Keine Taste gedrückt.".to_string())));
+        }
+        None
     }
 
     #[cfg_attr(not(feature = "camera"), allow(unused_variables))]
@@ -1088,13 +1215,41 @@ impl SettingsView {
                 egui::Frame::new()
                     .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
-                        let live = self
-                            .preview
-                            .as_mut()
-                            .is_some_and(|preview| preview.ui(ui, PREVIEW_W));
-                        if !live {
-                            preview_placeholder(ui, PREVIEW_W, state.camera_on);
-                        }
+                        // One column: the picture, the button under it.
+                        ui.vertical(|ui| {
+                            let live = self
+                                .preview
+                                .as_mut()
+                                .is_some_and(|preview| preview.ui(ui, PREVIEW_W));
+                            if !live {
+                                preview_placeholder(
+                                    ui,
+                                    PREVIEW_W,
+                                    state.camera_on || self.camera_preview,
+                                );
+                            }
+                            // Checking the picture before anyone sees it: the
+                            // preview captures without sending
+                            // (`CameraHandle::set_preview`), and ends with the
+                            // page.
+                            if !state.camera_on {
+                                ui.add_space(6.0);
+                                let (glyph, label) = if self.camera_preview {
+                                    (icon::X, "Vorschau beenden")
+                                } else {
+                                    (icon::EYE, "Vorschau")
+                                };
+                                let r = ui.add_sized(
+                                    [PREVIEW_W, 28.0],
+                                    egui::Button::new(format!("{glyph}  {label}")),
+                                );
+                                if r.on_hover_text("Nur du siehst das Bild; gesendet wird nichts")
+                                    .clicked()
+                                {
+                                    self.camera_preview = !self.camera_preview;
+                                }
+                            }
+                        });
                     });
             });
         });
@@ -2170,51 +2325,332 @@ fn device_combo(
     });
 }
 
-/// Label column of a [`binding_row`], wide enough for "Modus wechseln".
+/// A running „Aufnehmen" for one binding row.
+struct Capture {
+    /// Which row (its label).
+    label: &'static str,
+    started: Instant,
+    /// Where the device reader drops its answer
+    /// (`crate::hotkey::evdev::capture_next_key`).
+    slot: Arc<std::sync::Mutex<Option<Result<String, String>>>>,
+    /// Why the device reader could not help (not in group `input`); the
+    /// window's own key events are then the only source.
+    evdev_failed: Option<String>,
+    /// A key this window saw, and when.
+    window: Option<(Captured, Instant)>,
+}
+
+impl Capture {
+    /// Starts reading the input devices on a thread of its own: the UI
+    /// thread has no runtime, and opening `/dev/input/*` blocks.
+    fn start(label: &'static str) -> Capture {
+        let slot: Arc<std::sync::Mutex<Option<Result<String, String>>>> = Arc::default();
+        let out = slot.clone();
+        let spawned = std::thread::Builder::new()
+            .name("icu-key-capture".into())
+            .spawn(move || {
+                let result = match tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .enable_io()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(crate::hotkey::evdev::capture_next_key(
+                        Duration::from_secs(10),
+                    )),
+                    Err(e) => Err(e.to_string()),
+                };
+                if let Ok(mut s) = out.lock() {
+                    *s = Some(result);
+                }
+            });
+        if let Err(e) = spawned {
+            *slot.lock().unwrap() = Some(Err(e.to_string()));
+        }
+        Capture {
+            label,
+            started: Instant::now(),
+            slot,
+            evdev_failed: None,
+            window: None,
+        }
+    }
+}
+
+/// A captured key: its evdev name, and the portal trigger when one can be
+/// written for it (`CTRL+SHIFT+F12`; a lone Right Ctrl or a mouse side
+/// button has none).
+#[derive(Debug, Clone, PartialEq)]
+struct Captured {
+    key: String,
+    trigger: Option<String>,
+}
+
+impl Captured {
+    fn from_evdev(key: String) -> Captured {
+        let trigger = key
+            .strip_prefix("KEY_")
+            .filter(|k| {
+                // Letters, digits and F-keys read the same as portal triggers.
+                (k.len() == 1 && k.chars().all(|c| c.is_ascii_alphanumeric()))
+                    || (k.starts_with('F') && k[1..].parse::<u8>().is_ok())
+            })
+            .map(str::to_string);
+        Captured { key, trigger }
+    }
+
+    /// Writes itself into `binding`. A trigger is only replaced when there
+    /// is a new one: evdev and portal bindings live side by side.
+    fn apply(&self, binding: &mut crate::config::KeyBinding) {
+        binding.key.clone_from(&self.key);
+        if let Some(t) = &self.trigger {
+            binding.trigger = Some(t.clone());
+        }
+    }
+}
+
+/// The first key or mouse side button pressed in this window this frame,
+/// with its modifiers — the fallback when the devices cannot be read.
+fn window_key(ui: &Ui) -> Option<Captured> {
+    ui.input(|i| {
+        i.events.iter().find_map(|e| match e {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } => {
+                let name = egui_key_name(*key)?;
+                let mut trigger = String::new();
+                for (on, m) in [
+                    (modifiers.ctrl, "CTRL+"),
+                    (modifiers.alt, "ALT+"),
+                    (modifiers.shift, "SHIFT+"),
+                    (modifiers.mac_cmd, "LOGO+"),
+                ] {
+                    if on {
+                        trigger.push_str(m);
+                    }
+                }
+                trigger.push_str(name);
+                Some(Captured {
+                    key: format!("KEY_{name}"),
+                    trigger: Some(trigger),
+                })
+            }
+            egui::Event::PointerButton {
+                button,
+                pressed: true,
+                ..
+            } => {
+                let key = match button {
+                    egui::PointerButton::Extra1 => "BTN_SIDE",
+                    egui::PointerButton::Extra2 => "BTN_EXTRA",
+                    _ => return None,
+                };
+                Some(Captured {
+                    key: key.into(),
+                    trigger: None,
+                })
+            }
+            _ => None,
+        })
+    })
+}
+
+/// evdev's name (without `KEY_`) for the keys a push-to-talk or toggle is
+/// usually put on; `None` for the rest.
+fn egui_key_name(key: egui::Key) -> Option<&'static str> {
+    use egui::Key as K;
+    Some(match key {
+        K::A => "A",
+        K::B => "B",
+        K::C => "C",
+        K::D => "D",
+        K::E => "E",
+        K::F => "F",
+        K::G => "G",
+        K::H => "H",
+        K::I => "I",
+        K::J => "J",
+        K::K => "K",
+        K::L => "L",
+        K::M => "M",
+        K::N => "N",
+        K::O => "O",
+        K::P => "P",
+        K::Q => "Q",
+        K::R => "R",
+        K::S => "S",
+        K::T => "T",
+        K::U => "U",
+        K::V => "V",
+        K::W => "W",
+        K::X => "X",
+        K::Y => "Y",
+        K::Z => "Z",
+        K::Num0 => "0",
+        K::Num1 => "1",
+        K::Num2 => "2",
+        K::Num3 => "3",
+        K::Num4 => "4",
+        K::Num5 => "5",
+        K::Num6 => "6",
+        K::Num7 => "7",
+        K::Num8 => "8",
+        K::Num9 => "9",
+        K::F1 => "F1",
+        K::F2 => "F2",
+        K::F3 => "F3",
+        K::F4 => "F4",
+        K::F5 => "F5",
+        K::F6 => "F6",
+        K::F7 => "F7",
+        K::F8 => "F8",
+        K::F9 => "F9",
+        K::F10 => "F10",
+        K::F11 => "F11",
+        K::F12 => "F12",
+        K::F13 => "F13",
+        K::F14 => "F14",
+        K::F15 => "F15",
+        K::F16 => "F16",
+        K::F17 => "F17",
+        K::F18 => "F18",
+        K::F19 => "F19",
+        K::F20 => "F20",
+        K::F21 => "F21",
+        K::F22 => "F22",
+        K::F23 => "F23",
+        K::F24 => "F24",
+        K::Space => "SPACE",
+        K::Tab => "TAB",
+        K::Insert => "INSERT",
+        K::Delete => "DELETE",
+        K::Home => "HOME",
+        K::End => "END",
+        K::PageUp => "PAGEUP",
+        K::PageDown => "PAGEDOWN",
+        K::ArrowUp => "UP",
+        K::ArrowDown => "DOWN",
+        K::ArrowLeft => "LEFT",
+        K::ArrowRight => "RIGHT",
+        _ => return None,
+    })
+}
+
+/// What a click in a [`binding_row`] asks for.
+enum BindingAction {
+    None,
+    /// Start „Aufnehmen" for this row.
+    Record,
+    /// Stop a running „Aufnehmen".
+    Cancel,
+    /// Remove the binding.
+    Clear,
+}
+
+/// Label column of a [`binding_row`], wide enough for „Modus wechseln".
 const BINDING_LABEL_W: f32 = 124.0;
 
-/// A hotkey binding row: two read-only `kbd` chips plus an "Ändern" button
-/// that reveals the editable evdev/Portal text fields.
+/// One binding: the key as a chip (the portal's trigger while the portal
+/// reads the keys, else the evdev key), „Aufnehmen" to take the next key
+/// pressed, and for experts the raw text fields behind the pencil.
+#[allow(clippy::too_many_arguments)]
 fn binding_row(
     ui: &mut Ui,
     divider: bool,
-    expanded: &mut std::collections::HashSet<&'static str>,
     label: &'static str,
     binding: &mut crate::config::KeyBinding,
-) {
+    portal: bool,
+    capturing: bool,
+    advanced: bool,
+    expanded: &mut std::collections::HashSet<&'static str>,
+) -> BindingAction {
     if divider {
         ui.separator();
     }
+    let mut action = BindingAction::None;
     egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(12, 11))
+        .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 widgets::label_column(ui, BINDING_LABEL_W, 30.0, label);
-                // An unset binding shows one dash, not two empty boxes.
-                let key = if binding.key.is_empty() {
-                    "—"
-                } else {
-                    &binding.key
+                let shown = match (portal, binding.trigger.as_deref()) {
+                    (true, Some(t)) => t.to_string(),
+                    _ if binding.key.is_empty() => "—".to_string(),
+                    _ => binding
+                        .key
+                        .strip_prefix("KEY_")
+                        .unwrap_or(&binding.key)
+                        .to_string(),
                 };
-                widgets::chip(ui, key, 0.0).on_hover_text("evdev-Taste");
-                if let Some(trigger) = binding.trigger.as_deref() {
-                    widgets::chip(ui, trigger, 0.0).on_hover_text("Portal-Trigger");
+                if capturing {
+                    let tok = theme::tokens(ui.visuals());
+                    ui.label(
+                        RichText::new("Taste drücken …")
+                            .size(12.5)
+                            .color(tok.accent),
+                    );
+                } else {
+                    widgets::chip(ui, &shown, 0.0).on_hover_text(if portal {
+                        "Über die Arbeitsumgebung (Portal)"
+                    } else {
+                        "Direkt gelesen (evdev)"
+                    });
                 }
                 widgets::rtl(ui, 30.0, |ui| {
-                    let is_open = expanded.contains(label);
-                    if widgets::icon_button(ui, icon::PENCIL_SIMPLE, 30.0, is_open)
-                        .on_hover_text(if is_open { "Fertig" } else { "Ändern" })
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if advanced {
+                        let is_open = expanded.contains(label);
+                        if widgets::icon_button(ui, icon::PENCIL_SIMPLE, 30.0, is_open)
+                            .on_hover_text(if is_open {
+                                "Fertig"
+                            } else {
+                                "Von Hand eintragen"
+                            })
+                            .clicked()
+                        {
+                            if is_open {
+                                expanded.remove(label);
+                            } else {
+                                expanded.insert(label);
+                            }
+                        }
+                    }
+                    if capturing {
+                        if widgets::button(ui, widgets::ButtonKind::Neutral, icon::X, "Abbrechen")
+                            .clicked()
+                        {
+                            action = BindingAction::Cancel;
+                        }
+                    } else {
+                        // The slot stays when there is nothing to remove, so
+                        // „Aufnehmen" lines up in every row.
+                        let bound = !binding.key.is_empty() || binding.trigger.is_some();
+                        if !bound {
+                            ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+                        } else if widgets::icon_button(ui, icon::TRASH, 30.0, false)
+                            .on_hover_text("Belegung entfernen")
+                            .clicked()
+                        {
+                            action = BindingAction::Clear;
+                        }
+                        if widgets::button(
+                            ui,
+                            widgets::ButtonKind::Neutral,
+                            icon::RECORD,
+                            "Aufnehmen",
+                        )
+                        .on_hover_text("Die nächste gedrückte Taste oder Maustaste übernehmen")
                         .clicked()
-                    {
-                        if is_open {
-                            expanded.remove(label);
-                        } else {
-                            expanded.insert(label);
+                        {
+                            action = BindingAction::Record;
                         }
                     }
                 });
             });
-            if expanded.contains(label) {
+            if advanced && expanded.contains(label) {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.add_space(BINDING_LABEL_W);
@@ -2241,4 +2677,54 @@ fn binding_row(
                 });
             }
         });
+    action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A key read from the devices gets a portal trigger where one reads the
+    /// same (letters, digits, F-keys); a lone modifier or a mouse button
+    /// keeps the trigger that is there.
+    #[test]
+    fn captured_keys_carry_a_trigger_where_one_exists() {
+        let f12 = Captured::from_evdev("KEY_F12".into());
+        assert_eq!(f12.trigger.as_deref(), Some("F12"));
+        assert_eq!(
+            Captured::from_evdev("KEY_P".into()).trigger.as_deref(),
+            Some("P")
+        );
+        for key in ["KEY_RIGHTCTRL", "BTN_SIDE", "code:700", "KEY_FN"] {
+            assert_eq!(Captured::from_evdev(key.into()).trigger, None, "{key}");
+        }
+        let mut binding = crate::config::KeyBinding {
+            key: "KEY_F12".into(),
+            trigger: Some("CTRL+SHIFT+F12".into()),
+        };
+        Captured::from_evdev("BTN_SIDE".into()).apply(&mut binding);
+        assert_eq!(binding.key, "BTN_SIDE");
+        assert_eq!(binding.trigger.as_deref(), Some("CTRL+SHIFT+F12"));
+    }
+
+    /// The window's own key names match what the evdev backend parses.
+    #[test]
+    fn window_keys_are_evdev_names() {
+        for (key, name) in [
+            (egui::Key::A, "KEY_A"),
+            (egui::Key::Num7, "KEY_7"),
+            (egui::Key::F9, "KEY_F9"),
+            (egui::Key::Space, "KEY_SPACE"),
+            (egui::Key::PageDown, "KEY_PAGEDOWN"),
+        ] {
+            let evdev = format!("KEY_{}", egui_key_name(key).expect("mapped"));
+            assert_eq!(evdev, name);
+            #[cfg(target_os = "linux")]
+            assert!(
+                crate::hotkey::evdev::parse_key(&evdev).is_some(),
+                "{evdev} is not a name the evdev backend reads"
+            );
+        }
+        assert_eq!(egui_key_name(egui::Key::Escape), None);
+    }
 }
