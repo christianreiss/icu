@@ -1,6 +1,6 @@
 //! Host through cpal: the emergency path on Linux (ALSA under PipeWire,
-//! feature `cpal-fallback`) and the only one on Windows until the WASAPI
-//! backend (M3) exists (cpal's WASAPI host, shared mode). No AEC reference;
+//! feature `cpal-fallback`) and on Windows when the WASAPI backend cannot
+//! start (cpal's WASAPI host, shared mode). No AEC reference;
 //! the block size is whatever the host delivers (Spike 3: `BufferSize::Fixed`
 //! is ignored, set `PIPEWIRE_LATENCY=240/48000` in the environment).
 

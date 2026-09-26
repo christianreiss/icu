@@ -1,8 +1,9 @@
 //! Global hotkeys: Portal (Linux, primary), evdev (Linux, opt-in/fallback),
-//! Raw Input (Windows, M3 stub).
+//! Raw Input (Windows).
 
 #[cfg(target_os = "linux")]
 pub mod evdev;
+pub mod keys;
 #[cfg(target_os = "linux")]
 pub mod portal;
 #[cfg(target_os = "windows")]
@@ -125,6 +126,24 @@ pub const BACKEND_NONE: &str = "none";
 /// the portal is there, and asking again may well work.
 pub const BACKEND_PORTAL_DECLINED: &str = "portal-declined";
 
+/// `Hotkeys::backend` of the Windows backend.
+pub const BACKEND_RAWINPUT: &str = "Raw Input";
+
+/// Waits for the next key or button press on any keyboard or mouse and
+/// returns its binding name (`KEY_F12`, `BTN_SIDE`, `code:<n>`) — for the
+/// settings' „Taste drücken“. Errors as text for the window.
+pub async fn capture_next_key(timeout: Duration) -> Result<String, String> {
+    #[cfg(target_os = "linux")]
+    return evdev::capture_next_key(timeout).await;
+    #[cfg(target_os = "windows")]
+    return rawinput::capture_next_key(timeout).await;
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = timeout;
+        Err("Tasten lesen geht auf diesem System nicht.".into())
+    }
+}
+
 /// `AppState::hotkey_backend` from the moment the supervisor is started
 /// until the first backend reports: the portal's dialog may be waiting for
 /// an answer. The empty string stays for „never started“ (`--no-hotkeys`).
@@ -214,8 +233,17 @@ pub async fn start(settings: &HotkeySettings, cmd: UnboundedSender<Command>) -> 
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = (settings, cmd);
-        Hotkeys::idle("Unsupported (M3)")
+        match rawinput::start(settings, cmd).await {
+            Ok(guard) => Hotkeys {
+                backend: BACKEND_RAWINPUT.into(),
+                _guard: Some(Box::new(guard)),
+                ended: None,
+            },
+            Err(e) => {
+                tracing::warn!(%e, "raw input hotkeys unavailable");
+                Hotkeys::idle(BACKEND_NONE)
+            }
+        }
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {

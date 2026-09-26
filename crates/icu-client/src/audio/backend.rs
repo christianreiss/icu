@@ -86,7 +86,7 @@ impl From<&str> for BackendError {
 }
 
 /// The backend contract. Implemented by PipeWire (Linux), the cpal fallback,
-/// the test double and — as `Unsupported` stubs — Windows.
+/// the test double and WASAPI (Windows).
 pub trait AudioBackend: Send {
     /// Short backend name for the UI ("pipewire", "cpal", "fake").
     fn name(&self) -> &'static str;
@@ -122,4 +122,12 @@ pub trait AudioBackend: Send {
 
     /// Takes the event receiver. Only the first call returns `Some`.
     fn take_events(&mut self) -> Option<std::sync::mpsc::Receiver<BackendEvent>>;
+
+    /// How late the AEC reference may arrive behind the microphone before
+    /// the engine counts it as missing. Zero where both run in one graph
+    /// cycle (PipeWire); a backend with free-running streams names its
+    /// scheduling jitter.
+    fn reference_slack(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
 }

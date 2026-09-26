@@ -1168,18 +1168,21 @@ impl SettingsView {
 
         if adv {
             widgets::group_card(ui, "Tasten lesen über", |ui| {
-                widgets::setting_row(ui, false, "Methode", None, |ui| {
-                    widgets::segmented(
-                        ui,
-                        &mut self.draft.hotkeys.backend,
-                        &[
-                            (HotkeyBackend::Auto, "Automatisch"),
-                            (HotkeyBackend::Portal, "Portal"),
-                            (HotkeyBackend::Evdev, "evdev"),
-                        ],
-                    )
-                });
-                widgets::setting_row(ui, true, "Aktiv", None, |ui| {
+                let linux = cfg!(target_os = "linux");
+                if linux {
+                    widgets::setting_row(ui, false, "Methode", None, |ui| {
+                        widgets::segmented(
+                            ui,
+                            &mut self.draft.hotkeys.backend,
+                            &[
+                                (HotkeyBackend::Auto, "Automatisch"),
+                                (HotkeyBackend::Portal, "Portal"),
+                                (HotkeyBackend::Evdev, "evdev"),
+                            ],
+                        )
+                    });
+                }
+                widgets::setting_row(ui, linux, "Aktiv", None, |ui| {
                     let tok = theme::tokens(ui.visuals());
                     let (color, text) = match backend {
                         "" => (tok.connecting, "abgeschaltet"),
@@ -1192,13 +1195,22 @@ impl SettingsView {
                 });
                 widgets::help_note(
                     ui,
-                    "Tastennamen: evdev wie KEY_RIGHTCTRL, BTN_SIDE oder code:97; \
-                     Portal-Trigger wie CTRL+SHIFT+F12.",
+                    if linux {
+                        "Tastennamen: evdev wie KEY_RIGHTCTRL, BTN_SIDE oder code:97; \
+                         Portal-Trigger wie CTRL+SHIFT+F12."
+                    } else {
+                        "Tastennamen wie KEY_RIGHTCTRL, BTN_SIDE (Maus-Seitentaste) oder \
+                         code:97."
+                    },
                 );
             });
         }
-        if adv || self.draft.hotkeys.backend == HotkeyBackend::Evdev {
+        if cfg!(target_os = "linux") && (adv || self.draft.hotkeys.backend == HotkeyBackend::Evdev)
+        {
             evdev_notice(ui);
+        }
+        if cfg!(target_os = "windows") {
+            elevated_notice(ui);
         }
     }
 
@@ -2397,8 +2409,12 @@ pub(super) fn hotkey_notice(
                 ui,
                 widgets::BannerKind::Warning,
                 "Tastenkürzel werden eingerichtet",
-                "Fragt die Arbeitsumgebung in einem eigenen Dialog nach, dort bestätigen — \
-                 danach wirken die Tasten.",
+                if cfg!(target_os = "linux") {
+                    "Fragt die Arbeitsumgebung in einem eigenen Dialog nach, dort bestätigen — \
+                     danach wirken die Tasten."
+                } else {
+                    "Einen Moment, danach wirken die Tasten."
+                },
                 None::<fn()>,
             );
             ui.add_space(12.0);
@@ -2455,15 +2471,31 @@ pub(super) fn hotkey_notice(
                 ui,
                 widgets::BannerKind::Error,
                 "Tastenkürzel funktionieren gerade nicht",
-                "Das System bietet keinen Weg an, Tasten im Hintergrund zu lesen, und ICU \
-                 darf sie nicht selbst lesen (Gruppe input). Bedienen geht weiter über das \
-                 Hauptfenster.",
+                if cfg!(target_os = "linux") {
+                    "Das System bietet keinen Weg an, Tasten im Hintergrund zu lesen, und ICU \
+                     darf sie nicht selbst lesen (Gruppe input). Bedienen geht weiter über das \
+                     Hauptfenster."
+                } else {
+                    "ICU kann Tastatur und Maus gerade nicht lesen, oder es ist keine Taste \
+                     belegt. Bedienen geht weiter über das Hauptfenster."
+                },
                 None::<fn()>,
             );
             ui.add_space(12.0);
         }
         _ => {}
     }
+}
+
+/// Windows keeps keys pressed in a program run as administrator from
+/// every normal one (UIPI): push-to-talk goes deaf while such a game has
+/// the focus.
+pub(super) fn elevated_notice(ui: &mut Ui) {
+    widgets::help_note(
+        ui,
+        "Läuft ein Spiel als Administrator, sieht ICU dessen Tasten nicht, solange es im \
+         Vordergrund ist — dann ICU ebenfalls als Administrator starten.",
+    );
 }
 
 /// What choosing evdev costs, wherever it can be chosen.
@@ -2556,7 +2588,7 @@ pub(super) struct Capture {
     pub(super) label: &'static str,
     started: Instant,
     /// Where the device reader drops its answer
-    /// (`crate::hotkey::evdev::capture_next_key`).
+    /// (`crate::hotkey::capture_next_key`).
     slot: Arc<std::sync::Mutex<Option<Result<String, String>>>>,
     /// Why the device reader could not help (not in group `input`); the
     /// window's own key events are then the only source.
@@ -2579,9 +2611,7 @@ impl Capture {
                     .enable_io()
                     .build()
                 {
-                    Ok(rt) => rt.block_on(crate::hotkey::evdev::capture_next_key(
-                        Duration::from_secs(10),
-                    )),
+                    Ok(rt) => rt.block_on(crate::hotkey::capture_next_key(Duration::from_secs(10))),
                     Err(e) => Err(e.to_string()),
                 };
                 if let Ok(mut s) = out.lock() {
@@ -2858,6 +2888,8 @@ pub(super) fn binding_row(
                 } else {
                     widgets::chip(ui, &shown, 0.0).on_hover_text(if portal {
                         "Über die Arbeitsumgebung (Portal)"
+                    } else if cfg!(target_os = "windows") {
+                        "Direkt gelesen (Raw Input)"
                     } else {
                         "Direkt gelesen (evdev)"
                     });
@@ -2920,7 +2952,11 @@ pub(super) fn binding_row(
                     ui.add(
                         egui::TextEdit::singleline(&mut binding.key)
                             .desired_width(120.0)
-                            .hint_text("evdev"),
+                            .hint_text(if cfg!(target_os = "windows") {
+                                "Taste"
+                            } else {
+                                "evdev"
+                            }),
                     );
                     let mut trigger = binding.trigger.clone().unwrap_or_default();
                     if ui

@@ -3,3 +3,5 @@ target/
 .scratch/
 dist/
 .claude/
+# Windows cross-build copy (build/win-static/README.md)
+build/win-static/libstdc++.a

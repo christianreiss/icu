@@ -18,8 +18,8 @@ use egui_phosphor::regular as icon;
 use super::{
     main_window::CLIP_DB,
     settings::{
-        binding_row, device_combo, evdev_notice, hotkey_notice, mic_test_button, BindingAction,
-        Capture, DraftSync,
+        binding_row, device_combo, elevated_notice, evdev_notice, hotkey_notice, mic_test_button,
+        BindingAction, Capture, DraftSync,
     },
     theme, widgets,
 };
@@ -415,7 +415,7 @@ impl SetupView {
     fn key_card(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         let backend = state.hotkey_backend.as_str();
         hotkey_notice(ui, backend, &mut self.draft.hotkeys.backend, cmds);
-        if self.draft.hotkeys.backend == HotkeyBackend::Evdev {
+        if cfg!(target_os = "linux") && self.draft.hotkeys.backend == HotkeyBackend::Evdev {
             evdev_notice(ui);
             ui.add_space(12.0);
         }
@@ -484,6 +484,9 @@ impl SetupView {
                     "Bei einer neuen Taste fragt die Arbeitsumgebung nach, ob ICU sie benutzen \
                      darf.",
                 );
+            }
+            if cfg!(target_os = "windows") {
+                elevated_notice(ui);
             }
         });
     }

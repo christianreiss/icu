@@ -28,5 +28,7 @@ pub mod tray;
 pub mod ui;
 pub mod uri;
 pub mod video;
+#[cfg(windows)]
+pub mod winreg;
 
 pub use engine::{AppState, Command, ConnStatus, Engine, EngineConfig, Peer};

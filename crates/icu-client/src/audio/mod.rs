@@ -32,8 +32,8 @@ pub fn native_backend() -> Result<Box<dyn AudioBackend>, BackendError> {
             }
         }
     }
-    // Until the WASAPI backend (M3) exists, cpal's WASAPI host (shared mode,
-    // no AEC reference) is what Windows plays and records with.
+    // cpal's WASAPI host (no AEC reference, no hot-plug) only when the
+    // audio service cannot even be asked for devices.
     #[cfg(target_os = "windows")]
     {
         match wasapi::WasapiBackend::new() {

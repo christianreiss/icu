@@ -6,6 +6,13 @@
 //! `--headless` runs without a window,
 //! `--debug-stats` prints latency histograms to stderr every 2 s,
 //! `--test-tone` replaces the microphone with a synthetic voice.
+//!
+//! On Windows `icu.exe` is a GUI program: a double-click opens no console.
+//! Started from a terminal it writes to that terminal (`AttachConsole`);
+//! otherwise the log goes to `%LOCALAPPDATA%\icu\data\icu.log`.
+
+// A desktop start must not open a console window next to ICU's own.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
@@ -39,7 +46,8 @@ struct Cli {
     /// carries replace this device's, except devices and camera.
     #[arg(long)]
     skip_settings: bool,
-    /// Configuration directory (default `$XDG_CONFIG_HOME/icu`).
+    /// Configuration directory (default `$XDG_CONFIG_HOME/icu`, on Windows
+    /// `%APPDATA%\icu\config`).
     #[arg(long)]
     config_dir: Option<PathBuf>,
     /// Run without a window.
@@ -52,7 +60,7 @@ struct Cli {
     /// always open (integration checks without a microphone).
     #[arg(long)]
     test_tone: bool,
-    /// Use the silent fake audio backend (no PipeWire needed).
+    /// Use the silent fake audio backend (no sound system needed).
     #[arg(long)]
     fake_audio: bool,
     /// Override the server address (tests: `127.0.0.1:port`).
@@ -72,7 +80,28 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    let console = attach_console();
+    // Toasts and the taskbar button go by ICU's app id (`notify`).
+    #[cfg(windows)]
+    // SAFETY: a plain Win32 call, before any window exists.
+    let _ = unsafe {
+        windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
+            &windows::core::HSTRING::from(icu_client::winreg::APP_ID),
+        )
+    };
     let cli = Cli::parse();
+    #[cfg(windows)]
+    if !console {
+        if let Some(log) = windows_log_file() {
+            init_tracing_to(log);
+        } else {
+            init_tracing();
+        }
+    } else {
+        init_tracing();
+    }
+    #[cfg(not(windows))]
     init_tracing();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -187,6 +216,48 @@ fn import_in_terminal(cli: &Cli, paths: &Paths, text: &str) -> Result<(), String
         paths.identity_dir().display()
     );
     Ok(())
+}
+
+/// Joins the console of the terminal ICU was started from, if any, so
+/// `--help`, the import questions and the log reach it.
+#[cfg(windows)]
+fn attach_console() -> bool {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: a plain Win32 call; fails harmlessly without a parent console.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok()
+}
+
+/// `%LOCALAPPDATA%\icu\data\icu.log`, appended to: a second start (which
+/// hands over to the running ICU and ends) must not cut the running one's
+/// log. Over 1 MiB it moves to `icu.log.1` first.
+#[cfg(windows)]
+fn windows_log_file() -> Option<std::fs::File> {
+    let dir = directories::ProjectDirs::from("", "", "icu")?
+        .data_local_dir()
+        .to_path_buf();
+    std::fs::create_dir_all(&dir).ok()?;
+    let log = dir.join("icu.log");
+    if std::fs::metadata(&log).is_ok_and(|m| m.len() > 1 << 20) {
+        let _ = std::fs::rename(&log, dir.join("icu.log.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .ok()
+}
+
+#[cfg(windows)]
+fn init_tracing_to(file: std::fs::File) {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing::subscriber::set_global_default(
+        fmt::Subscriber::builder()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .finish(),
+    );
 }
 
 fn init_tracing() {

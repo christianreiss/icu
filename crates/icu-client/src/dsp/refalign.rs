@@ -103,6 +103,8 @@ pub struct CycleClock {
     cap_ns: AtomicU64,
     ref_ns: AtomicU64,
     cap_len: AtomicU64,
+    /// The backend's `reference_slack`, in ns.
+    slack_ns: AtomicU64,
 }
 
 impl Default for CycleClock {
@@ -112,6 +114,7 @@ impl Default for CycleClock {
             cap_ns: AtomicU64::new(0),
             ref_ns: AtomicU64::new(u64::MAX / 2),
             cap_len: AtomicU64::new(0),
+            slack_ns: AtomicU64::new(0),
         }
     }
 }
@@ -144,10 +147,20 @@ impl CycleClock {
         Duration::from_nanos(c.abs_diff(r))
     }
 
-    /// [`STALL_WAIT`], stretched to 1.5 graph cycles for large quanta.
+    /// [`STALL_WAIT`], stretched to 1.5 graph cycles for large quanta,
+    /// and at least the backend's reference slack.
     pub fn stall_wait(&self) -> Duration {
         let cycle_ns = self.cap_len.load(Ordering::Relaxed) * 1_000_000_000 / 48_000;
-        STALL_WAIT.max(Duration::from_nanos(cycle_ns * 3 / 2))
+        let slack = Duration::from_nanos(self.slack_ns.load(Ordering::Relaxed));
+        STALL_WAIT
+            .max(Duration::from_nanos(cycle_ns * 3 / 2))
+            .max(slack)
+    }
+
+    /// Sets how late the reference may run (`AudioBackend::reference_slack`).
+    pub fn set_slack(&self, slack: Duration) {
+        self.slack_ns
+            .store(slack.as_nanos() as u64, Ordering::Relaxed);
     }
 }
 

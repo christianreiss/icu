@@ -38,11 +38,11 @@ Fedora, AlmaLinux 10+ (`.rpm`) und Debian 12+ (`.deb`) (Einrichtung:
 | `PROTOCOL.md` | Normatives Wire-Protokoll v1 |
 | `Server/IMPLEMENTATION.md` | Server-Spezifikation, später Implementierung |
 | `Client/IMPLEMENTATION.md` | Client-Spezifikation, später Implementierung |
-| `packaging/` | rpm/deb-Bau (nfpm, podman) und GitHub-Release |
+| `packaging/` | rpm/deb-Bau (nfpm, podman), Windows-ZIP (`packaging/windows/`) und GitHub-Release |
 
 ## Status
 
-Phase: Pre-Release-Gate 2026-09-26 (`Research/review-2026-09-26.md`). Research und Spezifikation abgeschlossen (2026-09-20); Server (`crates/icu-server`), Protokoll (`crates/icu-proto`) und Linux-Client (`crates/icu-client`) implementiert. Der Server ist fürs offene Internet gehärtet (`Research/review-2026-09-24.md`, `deploy/README.md` „Im offenen Internet“), der Linux-Client ist Release-Kandidat; Windows ist nicht Teil dieses Releases. Offene Review-Befunde: `Research/review-2026-09-23.md`, `Research/review-2026-09-24.md`.
+Phase: Pre-Release-Gate 2026-09-26 (`Research/review-2026-09-26.md`). Research und Spezifikation abgeschlossen (2026-09-20); Server (`crates/icu-server`), Protokoll (`crates/icu-proto`) und Linux-Client (`crates/icu-client`) implementiert. Der Server ist fürs offene Internet gehärtet (`Research/review-2026-09-24.md`, `deploy/README.md` „Im offenen Internet“), der Linux-Client ist Release-Kandidat. Der Windows-Client ist implementiert und baut als portables ZIP (`packaging/windows/build.sh`, 2026-09-26), ist aber auf echtem Windows ungetestet und nicht veröffentlicht (`Client/LIVETEST.md` §7). Offene Review-Befunde: `Research/review-2026-09-23.md`, `Research/review-2026-09-24.md`.
 
 Stack (belegt in `Research/`, verifiziert in `Research/verification.md`): Rust; QUIC (quinn + rustls/ring) mit Datagrams für Audio; mutual TLS mit server-eigener CA und Registrierung per Einladungs-Bundle (`.icu`-Datei); Opus 48 kHz mono 20 ms; Server als reiner Relay; Client mit PipeWire (Linux) bzw. WASAPI IAudioClient3 (Windows), WebRTC AEC3, RNNoise, adaptivem Jitter-Buffer, egui-UI, Portal/evdev bzw. Raw-Input-Hotkeys, Layer-Shell bzw. Layered-Window-Overlay, H.264 über openh264.
 
