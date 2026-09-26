@@ -327,6 +327,8 @@ fn state() -> AppState {
         aec_stats: Default::default(),
         aec_reference: true,
         aec_suspect: false,
+        aec_no_echo: false,
+        aec_reference_silent: false,
         camera_on: false,
         hotkey_backend: "portal".into(),
         settings,

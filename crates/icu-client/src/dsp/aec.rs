@@ -21,6 +21,190 @@ pub struct AecStats {
     pub residual_echo_likelihood: Option<f64>,
 }
 
+/// AEC3 reports the echo return loss as `−10·log10(capture / render
+/// power)`, starting from its `kMaxErl = 1000` — exactly −30 dB — until a
+/// filter has converged on an echo path, and doubling back towards it once
+/// the path is gone (`aec3/erl_estimator.cc`). A value at that floor
+/// therefore means "no echo path", a positive one "the mic hears the
+/// loudspeaker" (measured: 7–20 dB with a room, −30 dB throughout on a
+/// headset scene).
+pub const ERL_NO_PATH_DB: f64 = -29.0;
+/// With an echo path, less than this much cancellation is "not removed":
+/// under a quarter of the echo power gone. A wrong reference (game audio
+/// missing from it) measures 0–8 dB, a working one 16–28 dB.
+pub const ERLE_POOR_DB: f64 = 6.0;
+/// Reports come every 2 s: 10 s of poor cancellation, 30 s without a path.
+pub const POOR_REPORTS: u32 = 5;
+pub const NO_PATH_REPORTS: u32 = 15;
+
+/// What the statistics say to the user (`Client/IMPLEMENTATION.md` §6,
+/// `Research/aec.md` "Laufende Selbstdiagnose").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Verdict {
+    /// Echo detected but not removed: check the reference device.
+    pub suspect: bool,
+    /// No echo path in 30 s of far-end sound: the canceller may be
+    /// switched off.
+    pub no_echo: bool,
+    /// The far end is heard on the loudspeaker but the reference stream
+    /// stays silent: it is not capturing what is played.
+    pub reference_silent: bool,
+}
+
+/// Folds the periodic statistics into a [`Verdict`]. Reports without
+/// far-end sound carry no information and leave the streaks as they are.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Diagnosis {
+    poor: u32,
+    no_path: u32,
+    silent: u32,
+}
+
+impl Diagnosis {
+    /// One report: `far_active` — the reference carried sound since the
+    /// last one; `played` — the mixer put sound on the loudspeaker.
+    pub fn report(&mut self, far_active: bool, played: bool, stats: &AecStats) -> Verdict {
+        if far_active {
+            match (stats.erl_db, stats.erle_db) {
+                (Some(erl), Some(erle)) if erl > ERL_NO_PATH_DB => {
+                    self.no_path = 0;
+                    self.poor = if erle < ERLE_POOR_DB {
+                        self.poor + 1
+                    } else {
+                        0
+                    };
+                }
+                (Some(_), _) => {
+                    self.no_path += 1;
+                    self.poor = 0;
+                }
+                _ => {}
+            }
+        }
+        self.silent = if played && !far_active {
+            self.silent + 1
+        } else {
+            0
+        };
+        Verdict {
+            suspect: self.poor >= POOR_REPORTS,
+            no_echo: self.no_path >= NO_PATH_REPORTS,
+            reference_silent: self.silent >= POOR_REPORTS,
+        }
+    }
+
+    /// Forgets everything (the canceller was reset or switched).
+    pub fn reset(&mut self) {
+        *self = Diagnosis::default();
+    }
+}
+
+#[cfg(test)]
+mod diagnosis_tests {
+    use super::*;
+
+    fn stats(erl: f64, erle: f64) -> AecStats {
+        AecStats {
+            erl_db: Some(erl),
+            erle_db: Some(erle),
+            delay_ms: Some(72),
+            residual_echo_likelihood: Some(0.2),
+        }
+    }
+
+    #[test]
+    fn headset_reads_as_no_echo_after_30_s() {
+        let mut d = Diagnosis::default();
+        for i in 1..=NO_PATH_REPORTS {
+            let v = d.report(true, true, &stats(-30.0, 0.18));
+            assert_eq!(v.no_echo, i == NO_PATH_REPORTS, "report {i}: {v:?}");
+            assert!(!v.suspect, "a headset is never 'echo not removed'");
+        }
+    }
+
+    #[test]
+    fn wrong_reference_reads_as_suspect_after_10_s() {
+        let mut d = Diagnosis::default();
+        for i in 1..=POOR_REPORTS {
+            let v = d.report(true, true, &stats(12.0, 4.5));
+            assert_eq!(v.suspect, i == POOR_REPORTS, "report {i}: {v:?}");
+            assert!(!v.no_echo);
+        }
+    }
+
+    #[test]
+    fn working_canceller_reads_as_neither() {
+        let mut d = Diagnosis::default();
+        for _ in 0..40 {
+            assert_eq!(d.report(true, true, &stats(18.0, 25.0)), Verdict::default());
+        }
+    }
+
+    #[test]
+    fn double_talk_dips_do_not_add_up() {
+        // Near-end speech pulls the ERLE estimate down for a report or two
+        // at a time; only a run of poor reports counts.
+        let mut d = Diagnosis::default();
+        for i in 0..40 {
+            let erle = if i % 3 == 0 { 2.0 } else { 20.0 };
+            assert!(!d.report(true, true, &stats(15.0, erle)).suspect);
+        }
+    }
+
+    #[test]
+    fn far_end_pauses_hold_the_streaks() {
+        let mut d = Diagnosis::default();
+        for _ in 0..NO_PATH_REPORTS - 1 {
+            d.report(true, true, &stats(-30.0, 0.18));
+        }
+        for _ in 0..10 {
+            assert!(!d.report(false, false, &stats(-30.0, 0.18)).no_echo);
+        }
+        assert!(d.report(true, true, &stats(-30.0, 0.18)).no_echo);
+    }
+
+    #[test]
+    fn echo_path_found_resets_the_no_echo_count() {
+        let mut d = Diagnosis::default();
+        for _ in 0..NO_PATH_REPORTS - 1 {
+            d.report(true, true, &stats(-30.0, 0.18));
+        }
+        d.report(true, true, &stats(10.0, 20.0));
+        for _ in 0..NO_PATH_REPORTS - 1 {
+            assert!(!d.report(true, true, &stats(-30.0, 0.18)).no_echo);
+        }
+    }
+
+    #[test]
+    fn silent_reference_while_playing_is_flagged() {
+        let mut d = Diagnosis::default();
+        for i in 1..=POOR_REPORTS {
+            let v = d.report(false, true, &AecStats::default());
+            assert_eq!(v.reference_silent, i == POOR_REPORTS, "report {i}");
+        }
+        assert!(!d.report(true, true, &stats(-30.0, 0.18)).reference_silent);
+        // Nothing played, nothing to see.
+        let mut d = Diagnosis::default();
+        for _ in 0..20 {
+            assert!(
+                !d.report(false, false, &AecStats::default())
+                    .reference_silent
+            );
+        }
+    }
+
+    #[test]
+    fn missing_statistics_change_nothing() {
+        let mut d = Diagnosis::default();
+        for _ in 0..40 {
+            assert_eq!(
+                d.report(true, true, &AecStats::default()),
+                Verdict::default()
+            );
+        }
+    }
+}
+
 #[cfg(feature = "aec")]
 mod real {
     use super::{AecStats, FRAME};
@@ -222,8 +406,10 @@ mod tests {
     /// residual after AEC3 goes through RNNoise like the live pipeline, and
     /// its voice probability with only the far end speaking has to stay
     /// under the default threshold on nearly every block once the filter
-    /// has converged. The far end is the harmonic test voice here, the only
-    /// synthetic signal RNNoise reads as speech (the coloured-noise
+    /// has converged — also with the mic leveler's full +15 dB held from a
+    /// quiet user's own voice on it (`dsp::chain`: the leveler sits between
+    /// AEC and RNNoise). The far end is the harmonic test voice here, the
+    /// only synthetic signal RNNoise reads as speech (the coloured-noise
     /// `speechlike` scores 0.15 on average); without the AEC its echo
     /// reads as speech on a good third of the blocks — that is the speaker
     /// user's own voice coming back at them through a VAD-mode peer.
@@ -239,18 +425,22 @@ mod tests {
             mic,
             near: vec![0.0; N],
         };
-        let prob_of = |signal: &[f32]| -> Vec<f32> {
+        let prob_of = |signal: &[f32], gain: f32| -> Vec<f32> {
             let mut dn = crate::dsp::denoise::Denoiser::new();
             let mut cap = vec![0.0f32; FRAME];
             (0..N / FRAME)
                 .map(|k| {
-                    cap.copy_from_slice(&signal[k * FRAME..(k + 1) * FRAME]);
+                    for (d, s) in cap.iter_mut().zip(&signal[k * FRAME..(k + 1) * FRAME]) {
+                        *d = s * gain;
+                    }
                     dn.process(&mut cap)
                 })
                 .collect()
         };
-        let cleaned = prob_of(&run(&scene));
-        let raw = prob_of(&scene.mic);
+        let out = run(&scene);
+        let cleaned = prob_of(&out, 1.0);
+        let boosted = prob_of(&out, crate::dsp::meter::from_db(15.0));
+        let raw = prob_of(&scene.mic, 1.0);
         // Blocks after 1 s of convergence where the far end is audible.
         let active: Vec<usize> = (100..N / FRAME)
             .filter(|&k| rms(&scene.far[k * FRAME..(k + 1) * FRAME]) > 0.02)
@@ -258,10 +448,11 @@ mod tests {
         let share = |p: &[f32]| {
             active.iter().filter(|&&k| p[k] >= 0.5).count() as f64 / active.len() as f64
         };
-        let (with_aec, without) = (share(&cleaned), share(&raw));
+        let (with_aec, with_boost, without) = (share(&cleaned), share(&boosted), share(&raw));
         eprintln!(
-            "blocks read as voice: {:.1} % with AEC, {:.1} % without ({} active blocks)",
+            "blocks read as voice: {:.1} % with AEC, {:.1} % with AEC and +15 dB, {:.1} % without ({} active blocks)",
             100.0 * with_aec,
+            100.0 * with_boost,
             100.0 * without,
             active.len()
         );
@@ -274,6 +465,87 @@ mod tests {
             with_aec < 0.05,
             "residual echo opens the gate: {with_aec:.2}"
         );
+        assert!(
+            with_boost < 0.05,
+            "residual echo behind a +15 dB leveler opens the gate: {with_boost:.2}"
+        );
+    }
+
+    /// The self-diagnosis on the statistics the APM really reports over
+    /// 30 s: a headset (no echo path) ends in "no echo", a reference that
+    /// misses the game audio in "echo not removed", a working canceller in
+    /// neither.
+    #[test]
+    fn diagnosis_matches_the_scenes() {
+        let secs = 30;
+        let n = SR * secs;
+        let far = speechlike(n, 0xC0FFEE, 3.3, 0.0, 0.1);
+        let game = speechlike(n, 0xBADC0DE, 5.1, 0.4, 0.1);
+        let ir = room_ir(80.0, 0.5, 80.0, 0xBEEF);
+        let near = speechlike(n, 0x5EED_1234, 2.7, 1.1, 0.05);
+        let noise = |seed: u64| {
+            let mut rng = Rng::new(seed);
+            let g = MIC_NOISE_RMS * 3f32.sqrt();
+            (0..n).map(move |_| rng.uniform() * g)
+        };
+        let echo_of = |played: &[f32]| convolve(played, &ir);
+        let with_game: Vec<f32> = far.iter().zip(&game).map(|(a, b)| a + b).collect();
+        let scenes: [(&str, Vec<f32>, Verdict); 3] = [
+            (
+                "headset",
+                near.iter().zip(noise(1)).map(|(a, b)| a + b).collect(),
+                Verdict {
+                    no_echo: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "wrong reference",
+                echo_of(&with_game)
+                    .iter()
+                    .zip(noise(2))
+                    .map(|(a, b)| a + b)
+                    .collect(),
+                Verdict {
+                    suspect: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "working",
+                echo_of(&far)
+                    .iter()
+                    .zip(noise(3))
+                    .map(|(a, b)| a + b)
+                    .collect(),
+                Verdict::default(),
+            ),
+        ];
+        for (name, mic, expected) in scenes {
+            let mut aec = Aec::new().expect("apm");
+            let mut diagnosis = Diagnosis::default();
+            let mut cap = vec![0.0f32; FRAME];
+            let mut ever = Verdict::default();
+            let mut last = Verdict::default();
+            for k in 0..n / FRAME {
+                let a = k * FRAME;
+                cap.copy_from_slice(&mic[a..a + FRAME]);
+                aec.process(&far[a..a + FRAME], &mut cap);
+                if (k + 1) % 200 == 0 {
+                    last = diagnosis.report(true, true, &aec.stats());
+                    ever.suspect |= last.suspect;
+                    ever.no_echo |= last.no_echo;
+                    ever.reference_silent |= last.reference_silent;
+                }
+            }
+            eprintln!(
+                "{name}: last {last:?}, ever {ever:?}, stats {:?}",
+                aec.stats()
+            );
+            assert_eq!(ever.suspect, expected.suspect, "{name}: suspect");
+            assert_eq!(ever.no_echo, expected.no_echo, "{name}: no echo");
+            assert!(!ever.reference_silent, "{name}");
+        }
     }
 
     /// (b) ERLE ≥ 22 dB in the near-end pauses during double talk

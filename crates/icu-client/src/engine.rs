@@ -34,16 +34,16 @@ use crate::{
     config::{Identity, Paths, Settings},
     dsp::{
         aec::{Aec, AecStats},
-        denoise::Denoiser,
+        chain::{Analysis, SendChain, SendSettings},
         gate::{Decision, Gate, Mode},
         jitter::{JitterBuffer, JitterConfig, Packet, Pop},
         meter::{self, Level},
         mixer,
-        normalize::{Normalizer, Profile},
+        normalize::Normalizer,
         opus,
         refalign::{self, CycleClock},
         vad, vad_auto,
-        voice::{Limiter, VoiceChain, VoiceStrength},
+        voice::VoiceStrength,
     },
     net::{
         conn::{self, ConnectError},
@@ -236,8 +236,15 @@ pub struct AppState {
     /// The AEC reference stream is open (false on backends without one).
     pub aec_reference: bool,
     /// Echo is audible in the far-end signal but the AEC removes almost
-    /// none of it for 10 s: the reference is probably the wrong device.
+    /// none of it for 10 s: the reference is probably the wrong device
+    /// (`dsp::aec::Diagnosis`).
     pub aec_suspect: bool,
+    /// 30 s of far-end sound without any echo path: the canceller does
+    /// nothing here (a headset) and may be switched off to save 9 ms.
+    pub aec_no_echo: bool,
+    /// The mixer plays sound but the reference stream stays silent for
+    /// 10 s: it is not capturing what is played.
+    pub aec_reference_silent: bool,
     /// Camera state.
     pub camera_on: bool,
     /// Hotkey backend in use.
@@ -477,6 +484,9 @@ struct Speaker {
     volume: f32,
     /// Loudness normalization, ahead of `volume`.
     norm: Normalizer,
+    /// Queued samples up to the end of the last concealed or FEC-recovered
+    /// frame; `norm` holds while they play.
+    concealed: usize,
     /// Loss accounting for `LossReport`: (played, lost) at the last report.
     report_base: (u64, u64),
     last_reported_permille: u16,
@@ -496,6 +506,7 @@ impl Speaker {
             last_packet: None,
             volume,
             norm: Normalizer::new(),
+            concealed: 0,
             report_base: (0, 0),
             last_reported_permille: 0,
             loss_hinted: false,
@@ -515,6 +526,10 @@ struct Shared {
     output_gain: AtomicF32,
     /// `audio.normalize_incoming`, read by the mixer.
     normalize_incoming: AtomicBool,
+    /// Peak of the mixer's output since the DSP thread last took it (bits
+    /// of a non-negative `f32`, which order like the value): whether the
+    /// loudspeaker plays something the AEC reference should carry.
+    play_peak: AtomicU32,
     cues: Mutex<VecDeque<f32>>,
     /// The AEC reference stream is open.
     reference_open: AtomicBool,
@@ -625,6 +640,8 @@ impl Engine {
             aec_stats: AecStats::default(),
             aec_reference: false,
             aec_suspect: false,
+            aec_no_echo: false,
+            aec_reference_silent: false,
             camera_on: false,
             hotkey_backend: String::new(),
             settings: settings.clone(),
@@ -647,6 +664,7 @@ impl Engine {
             deafened: AtomicBool::new(false),
             output_gain: AtomicF32::new(mixer::volume_gain(settings.audio.output_volume)),
             normalize_incoming: AtomicBool::new(settings.audio.normalize_incoming),
+            play_peak: AtomicU32::new(0),
             cues: Mutex::new(VecDeque::new()),
             reference_open: AtomicBool::new(false),
             cycle: Arc::new(CycleClock::default()),
@@ -971,18 +989,8 @@ fn dsp_thread(
             None
         }
     };
-    let mut denoiser = Denoiser::new();
-    let mut voice_strength = VoiceStrength::from_u32(ctl.voice_strength.load(Ordering::Relaxed));
-    let mut voice_chain = VoiceChain::new(voice_strength);
-    let mut voice_on = false;
-    let mut leveler = Normalizer::with(Profile::MIC_LEVEL);
-    let mut level_on = false;
-    // The previous block's VAD decision steers the leveler, which runs
-    // ahead of the VAD.
-    let mut prev_voice = false;
-    let mut out_norm = Normalizer::with(Profile::OUTBOUND);
-    let mut out_limiter = Limiter::new();
-    let mut out_norm_on = false;
+    // Everything between the AEC and the encoder (`dsp::chain`).
+    let mut chain = SendChain::new();
     let mut encoder = match opus::Encoder::new() {
         Ok(e) => e,
         Err(e) => {
@@ -1018,11 +1026,12 @@ fn dsp_thread(
     // Speech heard since the last push into the UI state.
     let mut voice_since_push = false;
     let mut last_aec_stats = Instant::now();
-    // Reference energy since the last stats push, and how many pushes in a
-    // row looked like "echo present, not removed".
+    // Reference energy since the last stats push, folded with the
+    // statistics into the user hints (`dsp::aec::Diagnosis`).
     let mut ref_energy = 0.0f64;
     let mut ref_samples = 0usize;
-    let mut suspect_streak = 0u32;
+    let mut diagnosis = crate::dsp::aec::Diagnosis::default();
+    let mut aec_was_on = false;
     let mut loss_applied = 0u32;
     let start = Instant::now();
     let mut tone_ticks: u64 = 0;
@@ -1061,7 +1070,7 @@ fn dsp_thread(
                 if let Some(a) = aec.as_mut() {
                     a.reinitialize();
                 }
-                voice_chain.reset();
+                chain.restart();
             }
             // Bound the backlog: after a stall of this thread, everything
             // older than 100 ms is stale — sending it late only adds latency
@@ -1135,6 +1144,20 @@ fn dsp_thread(
         let aec_on =
             ctl.aec.load(Ordering::Relaxed) && shared.reference_open.load(Ordering::Relaxed);
         if let Some(a) = aec.as_mut() {
+            if aec_on != aec_was_on {
+                aec_was_on = aec_on;
+                // Switched on again: the render timeline has a gap the
+                // filter must not carry. Switched off: the hints are stale.
+                if aec_on {
+                    a.reinitialize();
+                }
+                diagnosis.reset();
+                shared.state.send_modify(|s| {
+                    s.aec_suspect = false;
+                    s.aec_no_echo = false;
+                    s.aec_reference_silent = false;
+                });
+            }
             if aec_on {
                 if window_start.elapsed() > Duration::from_secs(10) {
                     if ref_underruns_window > 5 {
@@ -1158,48 +1181,44 @@ fn dsp_thread(
                     let ref_db = 10.0 * (ref_energy / ref_samples.max(1) as f64 + 1e-12).log10();
                     ref_energy = 0.0;
                     ref_samples = 0;
-                    // Self-diagnosis (`Research/aec.md`): the far end plays,
-                    // the mic hears it loudly (low ERL), yet ERLE stays
-                    // below 6 dB for 10 s.
-                    let suspect = ref_db > -50.0
-                        && matches!((st.erl_db, st.erle_db), (Some(erl), Some(erle)) if erl < 15.0 && erle < 6.0);
-                    suspect_streak = if suspect { suspect_streak + 1 } else { 0 };
-                    let flag = suspect_streak >= 5;
+                    // Self-diagnosis (`Research/aec.md`): what the far end
+                    // and the loudspeaker did since the last report, and
+                    // what the canceller made of it.
+                    let played = f32::from_bits(shared.play_peak.swap(0, Ordering::Relaxed));
+                    let verdict =
+                        diagnosis.report(ref_db > -50.0, meter::to_db(played) > -40.0, &st);
                     shared.state.send_modify(|s| {
                         s.aec_stats = st;
-                        s.aec_suspect = flag;
+                        s.aec_suspect = verdict.suspect;
+                        s.aec_no_echo = verdict.no_echo;
+                        s.aec_reference_silent = verdict.reference_silent;
                     });
                 }
             }
         }
 
-        // 3. Gain, auto level, denoise, VAD.
-        let gain = ctl.gain.load();
-        if gain != 1.0 {
-            for s in block.iter_mut() {
-                *s *= gain;
-            }
-        }
-        let on = ctl.auto_level.load(Ordering::Relaxed);
-        if on && !level_on {
-            leveler.reset();
-        }
-        level_on = on;
-        if on {
-            leveler.process_hinted(&mut block, Some(prev_voice));
-        }
-        let prob = if ctl.denoise.load(Ordering::Relaxed) {
-            Some(denoiser.process(&mut block))
-        } else {
-            None
+        // 3. Gain, auto level, denoise, VAD (`dsp::chain`).
+        let send = SendSettings {
+            gain: ctl.gain.load(),
+            auto_level: ctl.auto_level.load(Ordering::Relaxed),
+            denoise: ctl.denoise.load(Ordering::Relaxed),
+            voice_opt: ctl.voice_opt.load(Ordering::Relaxed),
+            voice_strength: VoiceStrength::from_u32(ctl.voice_strength.load(Ordering::Relaxed)),
+            normalize_outgoing: ctl.normalize_outgoing.load(Ordering::Relaxed),
         };
-        let level = meter::measure(&block);
+        let Analysis { prob, level } = chain.analyze(&mut block, &send);
         ctl.level_peak.store(level.peak_db);
         ctl.level_rms.store(level.rms_db);
         ctl.vad_prob.store(prob.unwrap_or(0.0));
         let threshold = if ctl.vad_auto.load(Ordering::Relaxed) {
             if let Some(p) = prob {
-                auto_threshold.update(t_block, gate.is_open(), p);
+                let speaking = floor_sample_is_speech(
+                    gate.mode(),
+                    gate.is_open(),
+                    p,
+                    auto_threshold.threshold(),
+                );
+                auto_threshold.update(t_block, speaking, p);
             }
             auto_threshold.threshold()
         } else {
@@ -1207,40 +1226,10 @@ fn dsp_thread(
         };
         ctl.vad_effective_threshold.store(threshold);
         let voice = vad::is_voice(threshold, prob, level);
-        prev_voice = voice;
         voice_in_frame |= voice;
         voice_since_push |= voice;
-
-        // Voice optimizer: nonlinear, so after AEC; after the meter and VAD,
-        // so its makeup gain does not move the thresholds.
-        let strength = VoiceStrength::from_u32(ctl.voice_strength.load(Ordering::Relaxed));
-        if strength != voice_strength {
-            voice_strength = strength;
-            voice_chain.set_strength(strength);
-        }
-        let on = ctl.voice_opt.load(Ordering::Relaxed);
-        if on && !voice_on {
-            voice_chain.reset();
-        }
-        voice_on = on;
-        if on {
-            voice_chain.process(&mut block);
-        }
-
-        // Outbound normalization, last before the encoder so it also
-        // evens out the optimizer's makeup; its limiter catches the boost.
-        let on = ctl.normalize_outgoing.load(Ordering::Relaxed);
-        if on && !out_norm_on {
-            out_norm.reset();
-            out_limiter.reset();
-        }
-        out_norm_on = on;
-        if on {
-            out_norm.process_hinted(&mut block, Some(voice));
-            for s in block.iter_mut() {
-                *s = out_limiter.process(*s);
-            }
-        }
+        // Voice optimizer, outbound normalization and limiter.
+        chain.finish(&mut block, voice, &send);
 
         // 4. Accumulate to an Opus frame.
         frame_acc.extend_from_slice(&block);
@@ -1341,6 +1330,17 @@ fn dsp_thread(
             });
         }
     }
+}
+
+/// Whether this block is speech as far as the VAD's noise-floor tracker
+/// (`dsp::vad_auto`) is concerned, so it is not absorbed into the floor. In
+/// VAD mode the gate says so. In PTT mode the gate only says whether the
+/// key is down: the user talking to the room with the key up would feed
+/// the floor with speech, drive the threshold up within a second and leave
+/// the VAD — and with it the leveler — blind when the key goes down. So
+/// there a block that clears the current threshold is speech too.
+fn floor_sample_is_speech(mode: Mode, gate_open: bool, prob: f32, threshold: f32) -> bool {
+    gate_open || (mode == Mode::Ptt && prob >= threshold)
 }
 
 /// The gate mode the `vad_mode` atomic encodes.
@@ -1463,7 +1463,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                             }
                             let n = sp.decoder.decode(&p.payload, &mut fec_scratch).unwrap_or(0);
                             DebugStats::inc(&stats.frames_decoded);
-                            queue_decoded(sp, n, &fec_scratch);
+                            queue_decoded(sp, n, &fec_scratch, false);
                         }
                         Pop::Lost { fec_source, .. } => {
                             let n = match fec_source {
@@ -1478,7 +1478,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                                     sp.decoder.conceal(&mut fec_scratch).unwrap_or(0)
                                 }
                             };
-                            queue_decoded(sp, n, &fec_scratch);
+                            queue_decoded(sp, n, &fec_scratch, true);
                         }
                         Pop::Silence => {
                             sp.pending.extend(std::iter::repeat_n(0.0, BLOCK));
@@ -1499,8 +1499,12 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                     *dst = src;
                 }
                 buf[have..].fill(0.0);
+                // A concealed or FEC-recovered frame says nothing about how
+                // loud the speaker is: the normalizer holds on it.
+                let hint = if sp.concealed > 0 { Some(false) } else { None };
+                sp.concealed = sp.concealed.saturating_sub(have);
                 if normalize {
-                    sp.norm.process(buf);
+                    sp.norm.process_hinted(buf, hint);
                 } else {
                     sp.norm.reset();
                 }
@@ -1530,6 +1534,10 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
                 .chain(cue),
             &mut out,
         );
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        shared
+            .play_peak
+            .fetch_max(peak.to_bits(), Ordering::Relaxed);
         if play.occupied_len() < lead {
             let n = play.push_slice(&out);
             DebugStats::add(&stats.samples_played, n as u64);
@@ -1574,13 +1582,17 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>) {
 
 /// Queues `n` decoded samples from `scratch` for playout — or, when the
 /// decoder produced nothing, the speaker's frame length of silence, so its
-/// timeline keeps its shape rather than gaining a block.
-fn queue_decoded(sp: &mut Speaker, n: usize, scratch: &[f32]) {
+/// timeline keeps its shape rather than gaining a block. `concealed`
+/// marks PLC/FEC output, which the normalizer must not learn from.
+fn queue_decoded(sp: &mut Speaker, n: usize, scratch: &[f32], concealed: bool) {
     if n == 0 {
         sp.pending
             .extend(std::iter::repeat_n(0.0, sp.jitter.frame_samples() as usize));
     } else {
         sp.pending.extend(scratch[..n].iter().copied());
+    }
+    if concealed {
+        sp.concealed = sp.pending.len();
     }
 }
 
@@ -3370,6 +3382,19 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ptt_users_off_air_speech_does_not_feed_the_noise_floor() {
+        use super::{floor_sample_is_speech, Mode};
+        // VAD mode: the gate decides.
+        assert!(floor_sample_is_speech(Mode::Vad, true, 0.1, 0.3));
+        assert!(!floor_sample_is_speech(Mode::Vad, false, 0.9, 0.3));
+        // PTT mode, key up: a block over the threshold is speech all the
+        // same; a quiet one feeds the floor.
+        assert!(floor_sample_is_speech(Mode::Ptt, false, 0.9, 0.3));
+        assert!(!floor_sample_is_speech(Mode::Ptt, false, 0.1, 0.3));
+        assert!(floor_sample_is_speech(Mode::Ptt, true, 0.1, 0.3));
+    }
+
     #[test]
     fn preroll_only_when_a_vad_spurt_opens() {
         use super::{preroll_now, Decision, Mode};
