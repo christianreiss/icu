@@ -169,7 +169,9 @@ selbst.
 
 Alle Kommandos außer `run` sprechen über `/run/icu/admin.sock` mit dem
 laufenden Server; eine Änderung wirkt damit sofort und nicht erst nach einem
-Neustart. Sie brauchen root oder Mitgliedschaft in der Socket-Gruppe.
+Neustart. Sie brauchen root oder Mitgliedschaft in der Gruppe `icu`: die Unit
+läuft mit `Group=icu`, damit gehören `/run/icu` (0750) und der Socket (0660)
+dieser Gruppe. `server.admin_socket_group` bleibt deshalb `icu`.
 
 ```bash
 icu-server invite --ttl 24h --out bob.txt  # Registrierungs-Bundle, einmalig, 24 h gültig

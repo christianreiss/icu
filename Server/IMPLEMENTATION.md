@@ -124,7 +124,7 @@ Einladen geht auch über die authentifizierte `icu/1`-Verbindung (`CreateInviteR
 
 **Wer schreibt den State.** Ein laufender Server ist der alleinige Schreiber von `users.toml`. Jedes CLI-Kommando außer `run` geht deshalb über den Admin-Socket; der Server führt die Änderung aus, persistiert sie und wendet sie sofort auf offene Verbindungen an. Nur wenn kein Server läuft (Socket nicht vorhanden oder `ECONNREFUSED`), schreibt die CLI selbst und hält dabei `flock(/var/lib/icu/state.lock)`. Damit wirkt ein frisch ausgestelltes Bundle sofort statt erst nach dem nächsten Neustart, und CLI und Server können einander keine Änderung überschreiben.
 
-Admin-Socket: `/run/icu/admin.sock` (`RuntimeDirectory=icu`, `RuntimeDirectoryMode=0750`, Gruppe aus `admin_socket_group`), JSON-Zeilenprotokoll, ein Request pro Zeile, eine Response pro Zeile, dann Close. Kein Netzwerk-Admin, keine Authentifizierung außer den Dateirechten des Sockets.
+Admin-Socket: `/run/icu/admin.sock` (`RuntimeDirectory=icu`, `RuntimeDirectoryMode=0750`, Gruppe aus `admin_socket_group`; unter der Unit gehört `/run/icu` per `Group=icu` derselben Gruppe, `admin_socket_group` ist dort also `icu`), JSON-Zeilenprotokoll, ein Request pro Zeile, eine Response pro Zeile, dann Close. Kein Netzwerk-Admin, keine Authentifizierung außer den Dateirechten des Sockets.
 
 | Kommando | Request | Response |
 | --- | --- | --- |
@@ -259,8 +259,10 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/bin/icu-server run --config /etc/icu/server.toml
 DynamicUser=yes
+Group=icu
 StateDirectory=icu
 RuntimeDirectory=icu
+RuntimeDirectoryMode=0750
 ConfigurationDirectory=icu
 ProtectSystem=strict
 ProtectHome=yes
@@ -279,7 +281,7 @@ RestartSec=2
 WantedBy=multi-user.target
 ```
 
-CLI-Aufrufe als root oder als Mitglied der Gruppe, der der Admin-Socket gehört (`RuntimeDirectoryMode=0750`, Socket-Gruppe per Config).
+Auszug; vollständig mit Härtung in `deploy/icu-server.service`. CLI-Aufrufe als root oder als Mitglied der Gruppe `icu`: `Group=icu` macht die statische Gruppe (sysusers) zur primären Gruppe des dynamischen Nutzers, damit gehört `/run/icu` `icu-server:icu` (0750) und der Socket (0660) der Gruppe `icu`. Ohne `Group=` gehörte `/run/icu` der dynamischen Gruppe, und Gruppenmitglieder — Admins, der Checkmk-Agent — kamen nicht an den Socket; die CLI fiel dann auf den State zurück und scheiterte am Lock (2026-09-26, in einem systemd-Container nachgeprüft). Der State bleibt privat: `/var/lib/private` ist 0700 root.
 
 ## 9. Abhängigkeiten (gepinnt, Lizenz aus `Research/packaging-licensing.md`)
 

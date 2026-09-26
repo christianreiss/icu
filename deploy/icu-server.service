@@ -6,11 +6,13 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/bin/icu-server run --config /etc/icu/server.toml
 DynamicUser=yes
-# The admin socket is chgrp'ed to `server.admin_socket_group`. Changing only
-# the group of a file one owns needs no capability as long as the process is a
-# member of the target group, which is what SupplementaryGroups provides — the
-# empty CapabilityBoundingSet below rules out CAP_CHOWN.
-SupplementaryGroups=icu
+# The static group `icu` (sysusers) as the service's primary group, with a
+# dynamic user: /run/icu then belongs to icu-server:icu, so members of `icu`
+# (admins, the Checkmk agent) can reach /run/icu/admin.sock (0660, group
+# `server.admin_socket_group` = icu). Without it RuntimeDirectory belonged to
+# the dynamic group and nobody else got through the 0750 directory. The state
+# stays private: systemd keeps it under /var/lib/private (0700 root).
+Group=icu
 StateDirectory=icu
 RuntimeDirectory=icu
 RuntimeDirectoryMode=0750
