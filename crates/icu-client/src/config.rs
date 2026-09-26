@@ -713,7 +713,7 @@ impl Identity {
     /// an interrupted `save` go first, or `load` would read `identity.old/`.
     /// Saved invitations go too: each is a live registration key
     /// (`save_invite`) of the account logging out. An exported
-    /// `icu-passport.txt` stays: it is the way back in.
+    /// `icu-passport.icu` stays: it is the way back in.
     pub fn remove(paths: &Paths) -> Result<(), ConfigError> {
         let _files = crate::sync::lock(&IDENTITY_FILES);
         let dir = paths.identity_dir();
