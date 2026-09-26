@@ -1041,6 +1041,53 @@ async fn a_failed_rotation_leaves_the_live_server_certificate_alone() {
     server.shutdown().await;
 }
 
+/// A rotation whose store write fails — no CRL entry, no CRL number for the
+/// reload — says what is in force, and the replaced leaf is not forgotten:
+/// the next start puts it on the CRL. It used to be kept in memory only, so a
+/// restart lost the revocation of a leaf that may have been rotated because
+/// its key leaked.
+#[tokio::test]
+async fn a_replaced_server_certificate_is_revoked_at_the_next_start_when_the_store_failed() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let old = server_leaf(&server.connect(&alice).await.expect("connect").conn);
+
+    // Every write of users.toml fails: its temp file cannot be created.
+    let blocker = server.dir.path().join(".users.toml.tmp");
+    std::fs::create_dir(&blocker).expect("block users.toml");
+    let response = server.handle.admin(AdminRequest::RotateServerCert).await;
+    let AdminResponse::Error { error, detail } = response else {
+        panic!("the rotation must report the failure, got {response:?}");
+    };
+    assert_eq!(error, "ROTATE_FAILED");
+    assert!(detail.contains("not in use"), "{detail}");
+    assert!(detail.contains("server.crt.retired"), "{detail}");
+    assert_eq!(
+        server_leaf(&server.connect(&alice).await.expect("connect").conn),
+        old,
+        "as reported: the new leaf is not in use yet"
+    );
+    std::fs::remove_dir(&blocker).expect("unblock");
+
+    let server = server.restart_with(|_| {}).await;
+    let mut client = server.connect(&alice).await.expect("connect");
+    let new = server_leaf(&client.conn);
+    assert_ne!(new, old);
+    client.hello("alice").await;
+    client.expect_silence().await;
+    let serials = crl_serials(client.crl.as_ref().expect("CrlUpdate"), &server.ca());
+    assert!(
+        serials.contains(&serial_of(&old)),
+        "the replaced leaf is revoked"
+    );
+    assert!(!serials.contains(&serial_of(&new)));
+    assert!(
+        !server.dir.path().join("server.crt.retired").exists(),
+        "recorded, so no longer listed"
+    );
+    server.shutdown().await;
+}
+
 /// A crash between the two writes of a rotation leaves a server key that
 /// does not match the certificate. The next start issues a new leaf instead
 /// of failing forever, and the one it found is on the CRL.

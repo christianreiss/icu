@@ -282,7 +282,8 @@ pub async fn run(config: Config) -> Result<Handle> {
         &config.tls,
         &config.server.server_name,
     )?;
-    // A server leaf replaced while loading goes on the CRL built below.
+    // A server leaf replaced while loading, or left in server.crt.retired
+    // by a rotation whose CRL entry failed, goes on the CRL built below.
     admin::record_retired_leaves(&mut store, &mut ca)?;
 
     // 5–7: TLS, QUIC, one endpoint per listen address.

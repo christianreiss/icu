@@ -130,7 +130,11 @@ wenn `ca.crt` und `ca.key` beide fehlen; fehlt nur eine, ist eine nicht lesbar
 (etwa nach einem Restore mit falschem Besitzer) oder passen sie nicht
 zusammen, startet er nicht und sagt, welche Datei es ist. `server.crt` und
 `server.key` sind dagegen entbehrlich: passen sie nicht, stellt der Server beim
-Start selbst ein neues Leaf aus.
+Start selbst ein neues Leaf aus. `server.crt.retired` gibt es nur, solange ein
+ersetztes Server-Leaf noch nicht auf der CRL steht (etwa weil `users.toml` bei
+der Rotation nicht geschrieben werden konnte); der nächste Start trägt es nach
+und löscht die Datei. Nicht von Hand löschen, sonst bleibt das alte Leaf
+gültig.
 
 **Nach dem Zurückspielen eines Backups** `icu-server rotate-server-cert`
 ausführen. Lag zwischen Backup und Restore eine Rotation, präsentiert der Server
