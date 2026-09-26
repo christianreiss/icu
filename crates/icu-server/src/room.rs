@@ -459,7 +459,13 @@ impl Room {
             .members
             .values()
             .map(|m| {
-                let ms = m.conn.stats().path.rtt.as_millis().min(u128::from(u16::MAX));
+                let ms = m
+                    .conn
+                    .stats()
+                    .path
+                    .rtt
+                    .as_millis()
+                    .min(u128::from(u16::MAX));
                 (m.session, ms as u16)
             })
             .collect()

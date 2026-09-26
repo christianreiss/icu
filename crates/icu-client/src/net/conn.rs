@@ -130,9 +130,7 @@ pub fn client_config_with_crl(
             )])
             .only_check_end_entity_revocation();
     }
-    let webpki_verifier = builder
-    .build()
-    .map_err(|e| NetError::Tls(e.to_string()))?;
+    let webpki_verifier = builder.build().map_err(|e| NetError::Tls(e.to_string()))?;
     let cert_failure = CertFailure::default();
     let verifier = Arc::new(ReportingVerifier {
         inner: webpki_verifier,

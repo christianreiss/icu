@@ -726,14 +726,9 @@ impl MainView {
 
                         widgets::rtl(ui, HEADER, |ui| {
                             ui.spacing_mut().item_spacing.x = 2.0;
-                            if widgets::icon_button(
-                                ui,
-                                icon::GEAR_FINE,
-                                HEADER,
-                                env.settings_open,
-                            )
-                            .on_hover_text("Einstellungen")
-                            .clicked()
+                            if widgets::icon_button(ui, icon::GEAR_FINE, HEADER, env.settings_open)
+                                .on_hover_text("Einstellungen")
+                                .clicked()
                             {
                                 out.toggle_settings = true;
                             }
@@ -1455,16 +1450,22 @@ fn participant_row(
                         } else {
                             (icon::WAVEFORM, "Sprachaktivierung")
                         };
-                        slot(ui, Some(RichText::new(mode_glyph).size(15.0).color(tok.dim_text)))
-                            .on_hover_text(mode_hint);
+                        slot(
+                            ui,
+                            Some(RichText::new(mode_glyph).size(15.0).color(tok.dim_text)),
+                        )
+                        .on_hover_text(mode_hint);
                         for &badge in columns {
                             let (on, color, glyph, hint) = match badge {
                                 Badge::Deafened => {
                                     (p.deafened, tok.error, icon::SPEAKER_SLASH, "hört nicht zu")
                                 }
-                                Badge::Muted => {
-                                    (p.muted, tok.error, icon::MICROPHONE_SLASH, "stummgeschaltet")
-                                }
+                                Badge::Muted => (
+                                    p.muted,
+                                    tok.error,
+                                    icon::MICROPHONE_SLASH,
+                                    "stummgeschaltet",
+                                ),
                                 Badge::Camera => {
                                     (p.camera, tok.dim_text, icon::VIDEO_CAMERA, "Kamera an")
                                 }

@@ -246,7 +246,9 @@ async fn promoting_a_peer_broadcasts_the_admin_bit_to_everyone() {
 
     // ...and alice, who is not the target, also sees Bob's UserState flip.
     let state = alice
-        .recv_matching(|m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob.session))
+        .recv_matching(
+            |m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob.session),
+        )
         .await;
     let Some(ControlMsg::UserState { flags, .. }) = state else {
         panic!("expected UserState, got {state:?}");
@@ -328,7 +330,10 @@ async fn admin_kick_closes_with_kicked_and_the_user_may_come_back() {
 
     // Nothing in the store changed: the same certificate gets back in.
     let mut again = server.connect(&identity).await.expect("reconnect");
-    assert!(matches!(again.hello("bob").await, ControlMsg::Welcome { .. }));
+    assert!(matches!(
+        again.hello("bob").await,
+        ControlMsg::Welcome { .. }
+    ));
     server.shutdown().await;
 }
 
@@ -377,7 +382,9 @@ async fn admin_restriction_is_enforced_persisted_and_lifted() {
         .await;
     // The `UserState` broadcast goes out before the ack.
     let seen = alice
-        .recv_matching(|m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob.session))
+        .recv_matching(
+            |m| matches!(m, ControlMsg::UserState { session, .. } if *session == bob.session),
+        )
         .await;
     let Some(ControlMsg::UserState { flags, .. }) = seen else {
         panic!("{seen:?}")
@@ -407,7 +414,10 @@ async fn admin_restriction_is_enforced_persisted_and_lifted() {
 
     // Muted: nothing relayed to alice.
     bob.send_audio(1, 960, &[0xF8, 1, 2, 3]);
-    assert!(alice.recv_audio(std::time::Duration::from_millis(300)).await.is_none());
+    assert!(alice
+        .recv_audio(std::time::Duration::from_millis(300))
+        .await
+        .is_none());
 
     // Survives a reconnect, announced right after `Welcome`.
     bob.conn.close(0u32.into(), b"");

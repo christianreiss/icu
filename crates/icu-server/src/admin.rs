@@ -204,7 +204,8 @@ impl AdminResponse {
                 json!({"ok": true, "user_id": user_id, "closed": closed})
             }
             AdminResponse::Ok => json!({"ok": true}),
-            AdminResponse::Disable { user_id, closed } | AdminResponse::Kick { user_id, closed } => {
+            AdminResponse::Disable { user_id, closed }
+            | AdminResponse::Kick { user_id, closed } => {
                 json!({"ok": true, "user_id": user_id, "closed": closed})
             }
             AdminResponse::Status(value) => {
@@ -365,11 +366,7 @@ pub async fn rotate_server_cert(server: &Arc<Server>) -> Result<()> {
 /// expires (`housekeeping`). Clients keep their stored CA certificate: the
 /// trust anchor is subject and key, not the dates (`Ca::renew_ca_cert`).
 pub async fn renew_ca(server: &Arc<Server>) -> Result<()> {
-    server
-        .ca
-        .write()
-        .await
-        .renew_ca_cert(&server.config.tls)?;
+    server.ca.write().await.renew_ca_cert(&server.config.tls)?;
     crate::endpoint::reload_tls(server).await
 }
 

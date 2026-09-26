@@ -473,7 +473,8 @@ pub fn status_link(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
     );
     let size = egui::vec2(galley.size().x + 26.0, 24.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), text));
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), text));
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if response.hovered() {
@@ -503,7 +504,9 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
         *on = !*on;
         response.mark_changed();
     }
-    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, ""));
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "")
+    });
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(response.id, *on);
         let tok = theme::tokens(ui.visuals());
@@ -1037,7 +1040,12 @@ pub fn rail_button(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool 
     let text_color = if active { tok.accent } else { tok.muted_text };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(64.0, 38.0), egui::Sense::click());
     resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), active, label)
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            active,
+            label,
+        )
     });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
@@ -1084,7 +1092,12 @@ pub fn nav_item(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), NAV_H), Sense::click());
     resp.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), active, label)
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            active,
+            label,
+        )
     });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
@@ -1227,7 +1240,9 @@ pub fn badge(ui: &mut Ui, text: &str, kind: BadgeKind) -> egui::Response {
 pub fn more_button(ui: &mut Ui) -> egui::Response {
     let tok = theme::tokens(ui.visuals());
     let (rect, response) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::click());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Aktionen"));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), "Aktionen")
+    });
     if ui.is_rect_visible(rect) {
         let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
         let (fill, color) = if open {

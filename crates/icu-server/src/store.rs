@@ -979,7 +979,13 @@ mod tests {
         let bob = s.add_user(named_cert("bb", "bob"), false).unwrap();
         assert_eq!((alice, bob), (1, 2));
 
-        s.add_cert(alice, named_cert("cc", &s.user(alice).unwrap().name.clone()), None, true).unwrap();
+        s.add_cert(
+            alice,
+            named_cert("cc", &s.user(alice).unwrap().name.clone()),
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(s.user(alice).unwrap().certs.len(), 2);
         assert_eq!(s.by_fingerprint("cc").unwrap().0, alice, "same user_id");
         assert_eq!(s.by_fingerprint("aa").unwrap().0, alice, "old cert stays");
@@ -996,7 +1002,13 @@ mod tests {
     fn revoke_marks_every_certificate_and_persists() {
         let (dir, mut s) = store();
         let alice = s.add_user(named_cert("aa", "alice"), false).unwrap();
-        s.add_cert(alice, named_cert("bb", &s.user(alice).unwrap().name.clone()), None, true).unwrap();
+        s.add_cert(
+            alice,
+            named_cert("bb", &s.user(alice).unwrap().name.clone()),
+            None,
+            true,
+        )
+        .unwrap();
         assert!(s.revoke(alice).unwrap());
         assert!(!s.revoke(alice).unwrap(), "second revoke changes nothing");
         drop(s);
@@ -1165,7 +1177,10 @@ mod tests {
         // A renewal keeping a name that now collides still goes through.
         let mut renewed = named_cert("cc", "\u{0421}\u{04BB}ris");
         renewed.expires = rfc3339(now() + Duration::from_secs(86400));
-        assert!(!s.add_cert(9, renewed, None, true).unwrap(), "name unchanged");
+        assert!(
+            !s.add_cert(9, renewed, None, true).unwrap(),
+            "name unchanged"
+        );
     }
 
     #[test]
@@ -1198,8 +1213,10 @@ mod tests {
     fn a_login_retires_every_earlier_certificate_and_they_leave_once_expired() {
         let (_dir, mut s) = store();
         let alice = s.add_user(named_cert("aa", "alice"), false).unwrap();
-        s.add_cert(alice, named_cert("bb", "alice"), None, true).unwrap();
-        s.add_cert(alice, named_cert("cc", "alice"), None, true).unwrap();
+        s.add_cert(alice, named_cert("bb", "alice"), None, true)
+            .unwrap();
+        s.add_cert(alice, named_cert("cc", "alice"), None, true)
+            .unwrap();
 
         // The middle one logging in retires only what came before it.
         assert_eq!(s.retire_predecessors(alice, "bb").unwrap(), ["aa"]);
@@ -1217,7 +1234,8 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        s.add_cert(alice, named_cert("dd", "alice"), None, true).unwrap();
+        s.add_cert(alice, named_cert("dd", "alice"), None, true)
+            .unwrap();
         let user = s.user(alice).unwrap();
         let fps: Vec<_> = user.certs.iter().map(|c| c.fingerprint.as_str()).collect();
         assert_eq!(fps, ["bb", "cc", "dd"]);
@@ -1325,7 +1343,9 @@ mod tests {
         let (second, admin) = s.add_registration(named_cert("bb", "neu-0002")).unwrap();
         assert!(!admin);
         assert!(!s.is_admin(second));
-        let err = s.add_registration(named_cert("cc", "NEU-0001")).unwrap_err();
+        let err = s
+            .add_registration(named_cert("cc", "NEU-0001"))
+            .unwrap_err();
         assert_eq!(err.code(), Some(ec::NAME_TAKEN));
     }
 
@@ -1470,7 +1490,10 @@ mod tests {
         assert!(s.user(used).is_some(), "a registered user stays");
         assert!(s.user(lost).is_none(), "an unconfirmed redeem is no ghost");
         assert!(!s.name_taken("dave", None), "its name is free again");
-        assert!(!s.name_taken("neu-0001", None), "the placeholder is free again");
+        assert!(
+            !s.name_taken("neu-0001", None),
+            "the placeholder is free again"
+        );
     }
 
     #[test]

@@ -55,7 +55,10 @@ pub struct PassportV2 {
 impl std::fmt::Debug for PassportV2 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PassportV2")
-            .field("key_der", &format_args!("<redacted, {} bytes>", self.key_der.len()))
+            .field(
+                "key_der",
+                &format_args!("<redacted, {} bytes>", self.key_der.len()),
+            )
             .field("leaf_der", &format_args!("{} bytes", self.leaf_der.len()))
             .field("ca_der", &format_args!("{} bytes", self.ca_der.len()))
             .finish()
@@ -114,7 +117,10 @@ impl PassportV2 {
     /// The full armored block, ready to copy or write to a file. Ends with a
     /// newline so concatenating one into a file needs no fixup.
     pub fn encode(&self) -> String {
-        armor(PASSPORT_VERSION, &postcard::to_stdvec(self).unwrap_or_default())
+        armor(
+            PASSPORT_VERSION,
+            &postcard::to_stdvec(self).unwrap_or_default(),
+        )
     }
 }
 
@@ -148,7 +154,10 @@ impl std::fmt::Debug for PassportV1 {
             .field("port", &self.port)
             .field("server_name", &self.server_name)
             .field("name", &self.name)
-            .field("key_der", &format_args!("<redacted, {} bytes>", self.key_der.len()))
+            .field(
+                "key_der",
+                &format_args!("<redacted, {} bytes>", self.key_der.len()),
+            )
             .field("leaf_der", &format_args!("{} bytes", self.leaf_der.len()))
             .field("ca_der", &format_args!("{} bytes", self.ca_der.len()))
             .finish()

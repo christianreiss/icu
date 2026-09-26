@@ -302,12 +302,10 @@ impl Config {
         // client splits it at the last colon.
         let public_host = self.public_host();
         // An IPv6 literal needs brackets, or the split lands inside it.
-        let port_ok = public_host
-            .rsplit_once(':')
-            .is_some_and(|(host, port)| {
-                let bare_v6 = host.contains(':') && !(host.starts_with('[') && host.ends_with(']'));
-                !host.is_empty() && !bare_v6 && port.parse::<u16>().is_ok()
-            });
+        let port_ok = public_host.rsplit_once(':').is_some_and(|(host, port)| {
+            let bare_v6 = host.contains(':') && !(host.starts_with('[') && host.ends_with(']'));
+            !host.is_empty() && !bare_v6 && port.parse::<u16>().is_ok()
+        });
         if !public_host.is_ascii() || public_host.contains(char::is_whitespace) || !port_ok {
             return Err(Error::msg(format!(
                 "server.public_host {public_host:?} must be ASCII host:port"

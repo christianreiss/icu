@@ -968,7 +968,10 @@ mod tests {
         assert_eq!(summary.server_name, "icu.example.org");
         assert_eq!(summary.address, "icu.example.org:4711");
         assert!(!summary.registration);
-        assert!(!summary.ca_changed, "nothing to compare with on first import");
+        assert!(
+            !summary.ca_changed,
+            "nothing to compare with on first import"
+        );
         assert_eq!(summary.lines().len(), 3);
         assert!(!ImportSummary::of(&incoming, Some(&incoming)).ca_changed);
 
@@ -984,7 +987,10 @@ mod tests {
                 name: "alice".into(),
             },
         };
-        assert_eq!(ImportSummary::of(&current, None).address, "[2001:db8::1]:4711");
+        assert_eq!(
+            ImportSummary::of(&current, None).address,
+            "[2001:db8::1]:4711"
+        );
         let changed = ImportSummary::of(&incoming, Some(&current));
         assert!(changed.ca_changed);
         assert!(changed.lines().last().unwrap().contains("anderer Server"));

@@ -9,7 +9,12 @@
 use crate::{cli, config::Config, error::Result, AdminRequest};
 
 /// Issues a registration bundle and prints it, or writes it to `out`.
-pub async fn run(config: &Config, name: Option<&str>, ttl: &str, out: Option<&std::path::Path>) -> Result<()> {
+pub async fn run(
+    config: &Config,
+    name: Option<&str>,
+    ttl: &str,
+    out: Option<&std::path::Path>,
+) -> Result<()> {
     let request = AdminRequest::Invite {
         name: name.unwrap_or_default().to_string(),
         ttl_s: Some(parse_duration(ttl)?),

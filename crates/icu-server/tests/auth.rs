@@ -787,7 +787,9 @@ async fn a_second_connection_with_the_same_certificate_replaces_the_first() {
     // The replacement works normally.
     second.send_msg(&ControlMsg::Ping { nonce: 7 }).await;
     assert!(matches!(
-        second.recv_matching(|m| matches!(m, ControlMsg::Pong { .. })).await,
+        second
+            .recv_matching(|m| matches!(m, ControlMsg::Pong { .. }))
+            .await,
         Some(ControlMsg::Pong { nonce: 7, .. })
     ));
     server.shutdown().await;
@@ -850,9 +852,15 @@ async fn rotating_the_server_certificate_revokes_the_old_one_live() {
     let response = server.handle.admin(AdminRequest::RotateServerCert).await;
     assert!(matches!(response, AdminResponse::Ok), "{response:?}");
 
-    let mut after = server.connect(&alice).await.expect("connect after rotation");
+    let mut after = server
+        .connect(&alice)
+        .await
+        .expect("connect after rotation");
     let new_leaf = server_leaf(&after.conn);
-    assert_ne!(new_leaf, old_leaf, "the new leaf is served without a restart");
+    assert_ne!(
+        new_leaf, old_leaf,
+        "the new leaf is served without a restart"
+    );
     after.hello("alice").await;
     after.expect_silence().await;
     let crl = after.crl.clone().expect("CrlUpdate after Welcome");
@@ -882,7 +890,10 @@ async fn an_expiring_server_certificate_is_rotated_automatically() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(rotated.is_some(), "the old leaf is on the CRL, the new one served");
+    assert!(
+        rotated.is_some(),
+        "the old leaf is on the CRL, the new one served"
+    );
 
     let AdminResponse::Status(status) = server.handle.admin(AdminRequest::Status).await else {
         panic!("status");
@@ -918,7 +929,11 @@ async fn a_name_from_before_the_strict_rules_still_renews() {
     assert!(icu_proto::validate_name(legacy).is_err());
     let users = dir.path().join("users.toml");
     let text = std::fs::read_to_string(&users).unwrap();
-    std::fs::write(&users, text.replace("name = \"alice\"", &format!("name = \"{legacy}\""))).unwrap();
+    std::fs::write(
+        &users,
+        text.replace("name = \"alice\"", &format!("name = \"{legacy}\"")),
+    )
+    .unwrap();
     let mut config = icu_server::config::Config::for_test(dir.path());
     config.tls.client_validity_days = 20;
     let server = TestServer {
@@ -938,7 +953,12 @@ async fn a_name_from_before_the_strict_rules_still_renews() {
     let (key, request) = renew();
     client.send_msg(&request).await;
     let answer = client
-        .recv_matching(|m| matches!(m, ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }))
+        .recv_matching(|m| {
+            matches!(
+                m,
+                ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }
+            )
+        })
         .await;
     let Some(ControlMsg::RenewResponse { leaf_der }) = answer else {
         panic!("catch-up with the stored name must work, got {answer:?}");
@@ -956,7 +976,12 @@ async fn a_name_from_before_the_strict_rules_still_renews() {
     let (_, request) = renew();
     client.send_msg(&request).await;
     let answer = client
-        .recv_matching(|m| matches!(m, ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }))
+        .recv_matching(|m| {
+            matches!(
+                m,
+                ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }
+            )
+        })
         .await;
     assert!(
         matches!(answer, Some(ControlMsg::RenewResponse { .. })),
@@ -965,7 +990,9 @@ async fn a_name_from_before_the_strict_rules_still_renews() {
 
     // A rename to a name that breaks today's rules is still refused.
     let (_, csr) = common::csr_with_cn("Chri\u{0455}");
-    client.send_msg(&ControlMsg::RenewRequest { csr_der: csr }).await;
+    client
+        .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
+        .await;
     let answer = client
         .recv_matching(|m| matches!(m, ControlMsg::Error { .. }))
         .await;
@@ -1004,7 +1031,9 @@ async fn a_failed_store_write_does_not_lock_out_the_first_login() {
     let welcome = client.hello("bob").await;
     set_mode(0o700).expect("chmod back");
     match welcome {
-        ControlMsg::Welcome { you, registration, .. } => {
+        ControlMsg::Welcome {
+            you, registration, ..
+        } => {
             assert_eq!(you.name, "bob");
             assert!(!registration);
         }

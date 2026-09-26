@@ -180,7 +180,10 @@ mod tests {
             split_host_port("icu.example.org:4711").unwrap(),
             ("icu.example.org".to_string(), 4711)
         );
-        assert_eq!(split_host_port("[::1]:5000").unwrap(), ("::1".to_string(), 5000));
+        assert_eq!(
+            split_host_port("[::1]:5000").unwrap(),
+            ("::1".to_string(), 5000)
+        );
         assert_eq!(split_host_port("[::1]").unwrap(), ("::1".to_string(), 4711));
         assert_eq!(split_host_port("host").unwrap(), ("host".to_string(), 4711));
         assert!(split_host_port("host:port").is_err());

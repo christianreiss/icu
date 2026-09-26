@@ -40,7 +40,11 @@ fn run_case_voice(
         if use_aec {
             aec.process(&reference[a..a + FRAME], &mut cap);
         }
-        let p = if use_denoise { dn.process(&mut cap) } else { 0.0 };
+        let p = if use_denoise {
+            dn.process(&mut cap)
+        } else {
+            0.0
+        };
         if let Some(c) = chain.as_mut() {
             c.process(&mut cap);
         }
@@ -52,7 +56,8 @@ fn run_case_voice(
     let rms_in = rms(&near[skip..]);
     let rms_out = rms(&out[skip..]);
     let db = 20.0 * (rms_out.max(1e-9) / rms_in.max(1e-9)).log10();
-    let mean_prob: f32 = probs[skip / FRAME..].iter().sum::<f32>() / probs[skip / FRAME..].len() as f32;
+    let mean_prob: f32 =
+        probs[skip / FRAME..].iter().sum::<f32>() / probs[skip / FRAME..].len() as f32;
     let frac_above_thr = probs[skip / FRAME..].iter().filter(|&&p| p >= 0.5).count() as f32
         / probs[skip / FRAME..].len() as f32;
     println!(
@@ -71,9 +76,27 @@ fn main() {
     let near = harmonic_voice(N, 0.05);
     let zeros = vec![0.0f32; N];
 
-    run_case("(0) raw near-end, no AEC, no denoise", &near, &zeros, false, false);
-    run_case("(1) near-end through DENOISE only", &near, &zeros, false, true);
-    run_case("(a) near-end through AEC only, zero reference", &near, &zeros, true, false);
+    run_case(
+        "(0) raw near-end, no AEC, no denoise",
+        &near,
+        &zeros,
+        false,
+        false,
+    );
+    run_case(
+        "(1) near-end through DENOISE only",
+        &near,
+        &zeros,
+        false,
+        true,
+    );
+    run_case(
+        "(a) near-end through AEC only, zero reference",
+        &near,
+        &zeros,
+        true,
+        false,
+    );
     run_case(
         "(a2) near-end through AEC+denoise, zero reference",
         &near,
@@ -126,7 +149,13 @@ fn main() {
 
     // (e) Far-end only: residual echo after AEC+denoise, without and with
     // the optimizer. The optimizer may lift it by at most its makeup gain.
-    run_case("(e) far-end only (echo), AEC+denoise", &echo, &far, true, true);
+    run_case(
+        "(e) far-end only (echo), AEC+denoise",
+        &echo,
+        &far,
+        true,
+        true,
+    );
     for strength in [VoiceStrength::Medium, VoiceStrength::Strong] {
         run_case_voice(
             &format!("(e) far-end only + voice optimizer {strength:?}"),

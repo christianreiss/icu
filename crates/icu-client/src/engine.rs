@@ -723,7 +723,9 @@ impl Engine {
                                 // A device came or went shortly after an
                                 // error: most likely the one that failed
                                 // (USB re-plug); try right away.
-                                if last_error.is_some_and(|t| t.elapsed() < Duration::from_secs(300)) {
+                                if last_error
+                                    .is_some_and(|t| t.elapsed() < Duration::from_secs(300))
+                                {
                                     schedule_reopen(Duration::from_secs(1));
                                 }
                             }
@@ -1943,9 +1945,9 @@ impl LocalState {
             .as_ref()
             .is_some_and(|p| p.reason == RenewReason::UserRename);
         self.pending_renew = pending;
-        shared
-            .state
-            .send_if_modified(|s| std::mem::replace(&mut s.rename_pending, user_rename) != user_rename);
+        shared.state.send_if_modified(|s| {
+            std::mem::replace(&mut s.rename_pending, user_rename) != user_rename
+        });
     }
 
     /// Takes the renewal in flight, clearing the window's flag with it.
@@ -2980,8 +2982,7 @@ async fn handle_control(
             });
         }
         ControlMsg::UserLeft { session, .. } => {
-            lock(&shared.speakers)
-                .remove(&session);
+            lock(&shared.speakers).remove(&session);
             shared.video.lock().unwrap().remove(session);
             local.cue(shared, Cue::Leave);
             shared
@@ -3092,8 +3093,7 @@ async fn handle_control(
                 .dsp
                 .loss_permille
                 .store(loss_permille as u32, Ordering::Relaxed);
-            lock(&shared.net)
-                .set_audio_loss_hint(loss_permille);
+            lock(&shared.net).set_audio_loss_hint(loss_permille);
             // This hint is about *our* outgoing audio (the encoder above);
             // the incoming buffers' FEC floor follows what we reported for
             // each speaker (`collect_loss_reports`).
@@ -3102,8 +3102,7 @@ async fn handle_control(
             shared.keyframe_request.store(true, Ordering::Relaxed);
         }
         ControlMsg::VideoCongestionHint { drop_permille } => {
-            lock(&shared.net)
-                .set_video_drop_hint(drop_permille);
+            lock(&shared.net).set_video_drop_hint(drop_permille);
         }
         ControlMsg::UserRenamed { session, name } => {
             let me_session = shared.state.borrow().me.as_ref().map(|m| m.session);
@@ -3366,9 +3365,18 @@ mod tests {
     fn preroll_only_when_a_vad_spurt_opens() {
         use super::{preroll_now, Decision, Mode};
         assert!(preroll_now(false, false, Decision::Send, Mode::Vad));
-        assert!(!preroll_now(true, false, Decision::Send, Mode::Vad), "already open");
-        assert!(!preroll_now(false, false, Decision::Silent, Mode::Vad), "still closed");
-        assert!(!preroll_now(false, false, Decision::Send, Mode::Ptt), "PTT: no pre-roll");
+        assert!(
+            !preroll_now(true, false, Decision::Send, Mode::Vad),
+            "already open"
+        );
+        assert!(
+            !preroll_now(false, false, Decision::Silent, Mode::Vad),
+            "still closed"
+        );
+        assert!(
+            !preroll_now(false, false, Decision::Send, Mode::Ptt),
+            "PTT: no pre-roll"
+        );
         assert!(
             !preroll_now(false, true, Decision::Send, Mode::Vad),
             "the previous frame was the END packet: never send it twice"

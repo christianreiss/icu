@@ -104,7 +104,12 @@ async fn a_stale_certificate_catches_up_on_the_next_start() {
     let paths_b = Paths::new(Some(dir_b.path().to_path_buf()));
     stale.save(&paths_b).expect("seed device b");
     let engine_b = server
-        .engine_from(stale, paths_b.clone(), Box::new(FakeBackend::silent().0), false)
+        .engine_from(
+            stale,
+            paths_b.clone(),
+            Box::new(FakeBackend::silent().0),
+            false,
+        )
         .expect("engine b");
 
     let state = wait_for(&engine_b, SOON, |s| {
@@ -148,12 +153,7 @@ async fn a_passport_moves_an_identity_to_a_second_installation() {
     assert_eq!(leaf_cn(&paths_b), leaf_cn(&paths_a));
 
     let engine = server
-        .engine_from(
-            imported,
-            paths_b,
-            Box::new(FakeBackend::silent().0),
-            false,
-        )
+        .engine_from(imported, paths_b, Box::new(FakeBackend::silent().0), false)
         .expect("engine on the imported identity");
     let state = wait_connected(&engine).await;
     assert_eq!(state.me.unwrap().name, "alice");

@@ -117,15 +117,24 @@ impl Overflows {
 
     /// A window that grows itself: after settling it must show everything,
     /// and it may have grown only if `may_grow`, and then only so far.
-    fn check_window<S>(&mut self, what: &str, h: &Harness<'_, S>, open: [f32; 2], may_grow: bool, overflow: f32) {
+    fn check_window<S>(
+        &mut self,
+        what: &str,
+        h: &Harness<'_, S>,
+        open: [f32; 2],
+        may_grow: bool,
+        overflow: f32,
+    ) {
         let height = h.ctx.content_rect().height();
         let grew = height - open[1];
         eprintln!("{what:<44} overflow {overflow:>7.1} px, grew {grew:>6.1} px");
         if overflow > 0.5 {
-            self.0.push(format!("{what}: still {overflow:.0} px too tall"));
+            self.0
+                .push(format!("{what}: still {overflow:.0} px too tall"));
         }
         if grew > 0.5 && !may_grow {
-            self.0.push(format!("{what}: grew the window by {grew:.0} px"));
+            self.0
+                .push(format!("{what}: grew the window by {grew:.0} px"));
         }
         if height > MAX_HEIGHT {
             self.0.push(format!("{what}: {height:.0} px tall"));
@@ -191,7 +200,12 @@ fn state() -> AppState {
     let mut settings = Settings::default();
     settings.audio.mode = ModeSetting::Ptt;
     let peers = vec![
-        peer(2, "Anna", UserFlags::SPEAKING | UserFlags::PTT | UserFlags::VIEWING, 18),
+        peer(
+            2,
+            "Anna",
+            UserFlags::SPEAKING | UserFlags::PTT | UserFlags::VIEWING,
+            18,
+        ),
         peer(3, "Bernd", UserFlags::MUTED, 34),
         peer(4, "Carla", UserFlags::CAMERA_ON | UserFlags::VIEWING, 61),
         peer(5, "Dennis", UserFlags::DEAFENED | UserFlags::MUTED, 170),
@@ -316,7 +330,10 @@ fn state() -> AppState {
     }
 }
 
-fn main_window(state: AppState, theme_name: &'static str) -> (Harness<'static, impl eframe::App>, Rc<RefCell<f32>>) {
+fn main_window(
+    state: AppState,
+    theme_name: &'static str,
+) -> (Harness<'static, impl eframe::App>, Rc<RefCell<f32>>) {
     let overflow = Rc::new(RefCell::new(0.0));
     let out = overflow.clone();
     let (cmd, _rx) = tokio::sync::mpsc::unbounded_channel::<Command>();

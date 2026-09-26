@@ -184,7 +184,11 @@ impl TestServer {
     /// Connects with `identity` and returns the code the connection ends
     /// with, handshake alert or application close, whichever comes.
     pub async fn rejection(&self, identity: &Identity) -> Option<u32> {
-        let endpoint = client_endpoint(self.ca(), Some(identity.clone()), icu_proto::limits::ALPN_MAIN);
+        let endpoint = client_endpoint(
+            self.ca(),
+            Some(identity.clone()),
+            icu_proto::limits::ALPN_MAIN,
+        );
         let conn = match endpoint.connect(self.addr(), "localhost").ok()?.await {
             Ok(conn) => conn,
             Err(e) => return code_of(&e),
@@ -363,13 +367,11 @@ impl Client {
     pub async fn recv_timeout(&mut self, timeout: Duration) -> Option<ControlMsg> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let body = tokio::time::timeout_at(
-                deadline,
-                read_frame(&mut self.recv, MAX_CONTROL_FRAME),
-            )
-            .await
-            .ok()?
-            .ok()?;
+            let body =
+                tokio::time::timeout_at(deadline, read_frame(&mut self.recv, MAX_CONTROL_FRAME))
+                    .await
+                    .ok()?
+                    .ok()?;
             match ControlMsg::decode(&body).ok()? {
                 ControlMsg::CrlUpdate { crl_der } => self.crl = Some(crl_der),
                 msg => return Some(msg),

@@ -355,7 +355,13 @@ impl SettingsView {
             .collect();
 
         widgets::group_card(ui, "Geräte", |ui| {
-            device_combo(ui, false, "Mikrofon", &mut self.draft.audio.input_device, &inputs);
+            device_combo(
+                ui,
+                false,
+                "Mikrofon",
+                &mut self.draft.audio.input_device,
+                &inputs,
+            );
             device_combo(
                 ui,
                 true,
@@ -459,14 +465,28 @@ impl SettingsView {
                     );
                 }
                 let mut release = self.draft.audio.release_ms as f32;
-                if widgets::slider_row(ui, divider(), "PTT-Nachlauf", &mut release, 0.0..=1000.0, " ms")
-                    .changed()
+                if widgets::slider_row(
+                    ui,
+                    divider(),
+                    "PTT-Nachlauf",
+                    &mut release,
+                    0.0..=1000.0,
+                    " ms",
+                )
+                .changed()
                 {
                     self.draft.audio.release_ms = release as u32;
                 }
                 let mut hangover = self.draft.audio.hangover_ms as f32;
-                if widgets::slider_row(ui, divider(), "VAD-Nachlauf", &mut hangover, 0.0..=3000.0, " ms")
-                    .changed()
+                if widgets::slider_row(
+                    ui,
+                    divider(),
+                    "VAD-Nachlauf",
+                    &mut hangover,
+                    0.0..=3000.0,
+                    " ms",
+                )
+                .changed()
                 {
                     self.draft.audio.hangover_ms = hangover as u32;
                 }
@@ -479,7 +499,9 @@ impl SettingsView {
                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                     let audio = &mut self.draft.audio;
                     widgets::chip_toggle(ui, &mut audio.cue_join, "Jemand kommt oder geht")
-                        .on_hover_text("Ein kurzer Ton, wenn jemand den Raum betritt oder verlässt");
+                        .on_hover_text(
+                            "Ein kurzer Ton, wenn jemand den Raum betritt oder verlässt",
+                        );
                     widgets::chip_toggle(ui, &mut audio.cue_tx, "Senden beginnt oder endet")
                         .on_hover_text("Ein Klick beim Drücken und Loslassen der Sprechtaste");
                     widgets::chip_toggle(ui, &mut audio.cue_mute, "Stummschalten")
@@ -599,12 +621,15 @@ impl SettingsView {
                             .aec_stats
                             .delay_ms
                             .map_or(String::new(), |d| format!(" · {d} ms"));
-                        widgets::chip(ui, &format!("ERL {erl:.0} dB · ERLE {erle:.0} dB{delay}"), 0.0)
+                        widgets::chip(
+                            ui,
+                            &format!("ERL {erl:.0} dB · ERLE {erle:.0} dB{delay}"),
+                            0.0,
+                        )
                     });
                 }
             }
         });
-
     }
 
     /// Export and import of the whole identity (`PROTOCOL.md` §2.3.1).
@@ -672,7 +697,8 @@ impl SettingsView {
                 widgets::row_group(ui, width, |ui| {
                     let clicked = ui
                         .add_enabled_ui(
-                            !self.passport_import.trim().is_empty() && self.import_preview.is_none(),
+                            !self.passport_import.trim().is_empty()
+                                && self.import_preview.is_none(),
                             |ui| {
                                 widgets::button(
                                     ui,
@@ -710,9 +736,16 @@ impl SettingsView {
                         + widgets::button_width(ui, icon::X, "Abbrechen");
                     widgets::row_group(ui, width, |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        if widgets::button(ui, widgets::ButtonKind::Danger, icon::CHECK, "Übernehmen")
-                            .on_hover_text("Ersetzt Schlüssel, Zertifikat und Serverdaten dieses Geräts")
-                            .clicked()
+                        if widgets::button(
+                            ui,
+                            widgets::ButtonKind::Danger,
+                            icon::CHECK,
+                            "Übernehmen",
+                        )
+                        .on_hover_text(
+                            "Ersetzt Schlüssel, Zertifikat und Serverdaten dieses Geräts",
+                        )
+                        .clicked()
                         {
                             self.import_passport(cmds);
                         }
@@ -1089,7 +1122,8 @@ impl SettingsView {
                         .inner;
                     let entered =
                         field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    let changed = icu_proto::normalize_name(&self.name) != state.me.as_ref().map_or("", |m| &m.name);
+                    let changed = icu_proto::normalize_name(&self.name)
+                        != state.me.as_ref().map_or("", |m| &m.name);
                     let apply = ui
                         .add_enabled_ui(editable && changed, |ui| {
                             widgets::button(ui, widgets::ButtonKind::Primary, icon::CHECK, "")
@@ -1101,7 +1135,9 @@ impl SettingsView {
                             "Namen übernehmen"
                         });
                     if editable && (apply.clicked() || entered) && changed {
-                        cmds.push(Command::RequestRename(icu_proto::normalize_name(&self.name)));
+                        cmds.push(Command::RequestRename(icu_proto::normalize_name(
+                            &self.name,
+                        )));
                     }
                 });
             });
@@ -1203,7 +1239,8 @@ impl SettingsView {
         let (removed, rest): (Vec<_>, Vec<_>) = state.user_list.iter().partition(|u| u.revoked);
         let (mut pending, rest): (Vec<_>, Vec<_>) = rest.into_iter().partition(|u| u.pending);
         // The ban list: blocked, but not removed for good.
-        let (mut banned, mut members): (Vec<_>, Vec<_>) = rest.into_iter().partition(|u| u.disabled);
+        let (mut banned, mut members): (Vec<_>, Vec<_>) =
+            rest.into_iter().partition(|u| u.disabled);
         banned.sort_by_cached_key(|u| u.name.to_lowercase());
         // You first, then admins, then everyone else, each by name.
         members.sort_by_cached_key(|u| (Some(u.user_id) != me, !u.is_admin, u.name.to_lowercase()));
@@ -1292,11 +1329,15 @@ impl SettingsView {
         }
 
         if !pending.is_empty() {
-            widgets::group_card(ui, &format!("Offene Einladungen · {}", pending.len()), |ui| {
-                for (i, user) in pending.iter().enumerate() {
-                    self.member_row(ui, i > 0, user, false, cmds);
-                }
-            });
+            widgets::group_card(
+                ui,
+                &format!("Offene Einladungen · {}", pending.len()),
+                |ui| {
+                    for (i, user) in pending.iter().enumerate() {
+                        self.member_row(ui, i > 0, user, false, cmds);
+                    }
+                },
+            );
         }
 
         if !removed.is_empty() {
@@ -1564,7 +1605,11 @@ impl SettingsView {
                     .inner_margin(egui::Margin::symmetric(12, 12))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new(icon::CHECK_CIRCLE).size(22.0).color(tok.connected));
+                            ui.label(
+                                RichText::new(icon::CHECK_CIRCLE)
+                                    .size(22.0)
+                                    .color(tok.connected),
+                            );
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 2.0;
                                 ui.label(theme::strong_text("Einladung erstellt"));
@@ -1846,7 +1891,11 @@ impl SettingsView {
 
 /// `2026-09-24T…` → `24.09.2026`; anything unexpected comes back as is.
 fn short_date(rfc3339: &str) -> String {
-    match rfc3339.get(..10).map(|d| d.split('-').collect::<Vec<_>>()).as_deref() {
+    match rfc3339
+        .get(..10)
+        .map(|d| d.split('-').collect::<Vec<_>>())
+        .as_deref()
+    {
         Some([y, m, d]) => format!("{d}.{m}.{y}"),
         _ => rfc3339.to_string(),
     }

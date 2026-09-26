@@ -52,7 +52,10 @@ async fn an_expired_certificate_renews_and_the_new_one_logs_in() {
     assert_eq!(you.name, "alice");
     assert!(matches!(
         client.recv_msg().await,
-        ControlMsg::Error { code: ec::RENEW_REQUIRED, .. }
+        ControlMsg::Error {
+            code: ec::RENEW_REQUIRED,
+            ..
+        }
     ));
 
     // Nothing but renewing.
@@ -63,7 +66,10 @@ async fn an_expired_certificate_renews_and_the_new_one_logs_in() {
         .await;
     assert!(matches!(
         client.recv_msg().await,
-        ControlMsg::Error { code: ec::RENEW_REQUIRED, .. }
+        ControlMsg::Error {
+            code: ec::RENEW_REQUIRED,
+            ..
+        }
     ));
 
     client
@@ -115,14 +121,20 @@ async fn an_expired_certificate_cannot_rename_or_renew_twice_in_an_hour() {
         .await;
     assert!(matches!(
         client.recv_msg().await,
-        ControlMsg::Error { code: ec::RENEW_REJECTED, .. }
+        ControlMsg::Error {
+            code: ec::RENEW_REJECTED,
+            ..
+        }
     ));
     client
         .send_msg(&ControlMsg::RenewRequest {
             csr_der: renewal_csr(&alice, "alice"),
         })
         .await;
-    assert!(matches!(client.recv_msg().await, ControlMsg::RenewResponse { .. }));
+    assert!(matches!(
+        client.recv_msg().await,
+        ControlMsg::RenewResponse { .. }
+    ));
     client.conn.close(quinn::VarInt::from_u32(0), b"");
 
     let mut again = server.connect(&alice).await.expect("connect");
@@ -135,7 +147,10 @@ async fn an_expired_certificate_cannot_rename_or_renew_twice_in_an_hour() {
         .await;
     assert!(matches!(
         again.recv_msg().await,
-        ControlMsg::Error { code: ec::RENEW_REJECTED, .. }
+        ControlMsg::Error {
+            code: ec::RENEW_REJECTED,
+            ..
+        }
     ));
     server.shutdown().await;
 }
@@ -200,7 +215,12 @@ async fn rename(server: &TestServer, identity: &Identity, old: &str, name: &str)
         })
         .await;
     let answer = client
-        .recv_matching(|m| matches!(m, ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }))
+        .recv_matching(|m| {
+            matches!(
+                m,
+                ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }
+            )
+        })
         .await;
     let Some(ControlMsg::RenewResponse { leaf_der }) = answer else {
         panic!("rename must work, got {answer:?}");
@@ -236,6 +256,10 @@ async fn a_rename_inside_the_window_gets_a_fresh_lifetime() {
     let alice = server.enroll("alice").await;
     let server = server.restart_with(|_| {}).await;
     let leaf = rename(&server, &alice, "alice", "alicia").await;
-    assert!(days_left(&leaf) > 360, "fresh lifetime, got {}", days_left(&leaf));
+    assert!(
+        days_left(&leaf) > 360,
+        "fresh lifetime, got {}",
+        days_left(&leaf)
+    );
     server.shutdown().await;
 }

@@ -227,7 +227,11 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
     };
     drop(store);
     if !retired.is_empty() {
-        tracing::info!(user_id, count = retired.len(), "replaced certificates revoked");
+        tracing::info!(
+            user_id,
+            count = retired.len(),
+            "replaced certificates revoked"
+        );
         close_retired(server, &retired);
     }
     if consumed || !retired.is_empty() {
@@ -250,10 +254,16 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
 fn close_retired(server: &Arc<Server>, fingerprints: &[String]) {
     let live: Vec<quinn::Connection> = {
         let live = lock(&server.live_certs);
-        fingerprints.iter().filter_map(|fp| live.get(fp).cloned()).collect()
+        fingerprints
+            .iter()
+            .filter_map(|fp| live.get(fp).cloned())
+            .collect()
     };
     for conn in live {
-        if !server.room.close_connection(conn.stable_id(), ec::AUTH_REVOKED) {
+        if !server
+            .room
+            .close_connection(conn.stable_id(), ec::AUTH_REVOKED)
+        {
             wire::close(&conn, ec::AUTH_REVOKED);
         }
     }
@@ -590,24 +600,24 @@ async fn recovery_exchange(
                 }
                 continue;
             }
-            ControlMsg::RenewRequest { csr_der } => match renew_leaf(server, identity, &csr_der)
-                .await
-            {
-                Ok(renewed) => {
-                    let response = ControlMsg::RenewResponse {
-                        leaf_der: renewed.leaf,
-                    };
-                    write_msg(&mut send, &response).await?;
-                    let _ = send.finish();
-                    // The client closes once it has stored the leaf; a close
-                    // from here could overtake the response.
-                    let _ = tokio::time::timeout(REGISTRATION_LINGER, conn.closed()).await;
-                    return Ok(());
+            ControlMsg::RenewRequest { csr_der } => {
+                match renew_leaf(server, identity, &csr_der).await {
+                    Ok(renewed) => {
+                        let response = ControlMsg::RenewResponse {
+                            leaf_der: renewed.leaf,
+                        };
+                        write_msg(&mut send, &response).await?;
+                        let _ = send.finish();
+                        // The client closes once it has stored the leaf; a close
+                        // from here could overtake the response.
+                        let _ = tokio::time::timeout(REGISTRATION_LINGER, conn.closed()).await;
+                        return Ok(());
+                    }
+                    Err((code, detail)) => {
+                        write_msg(&mut send, &ControlMsg::Error { code, detail }).await?;
+                    }
                 }
-                Err((code, detail)) => {
-                    write_msg(&mut send, &ControlMsg::Error { code, detail }).await?;
-                }
-            },
+            }
             _ => write_msg(&mut send, &required).await?,
         }
         attempts += 1;
@@ -1106,9 +1116,15 @@ async fn renew_leaf(
         // An hour for an expired certificate: a renewal whose answer got lost
         // must not strand its holder for a day.
         let (bound, detail) = if identity.expired {
-            (time::Duration::hours(1), "this certificate was renewed within the hour")
+            (
+                time::Duration::hours(1),
+                "this certificate was renewed within the hour",
+            )
         } else {
-            (time::Duration::days(1), "this certificate already caught up today")
+            (
+                time::Duration::days(1),
+                "this certificate already caught up today",
+            )
         };
         if let Some(last) = store.cert_renewed(user_id, &identity.cert_fp) {
             if now() - last < bound {
@@ -1133,8 +1149,8 @@ async fn renew_leaf(
         let expires_at = parse_rfc3339(expires).ok()?;
         Some((expires_at, renew_window(issued, expires)))
     });
-    let in_window = identity.expired
-        || window.is_none_or(|(expires, window)| expires - now() <= window);
+    let in_window =
+        identity.expired || window.is_none_or(|(expires, window)| expires - now() <= window);
     if !in_window && !rename && !catch_up {
         let days = window.map(|(_, w)| w.whole_days()).unwrap_or_default();
         return Err((
@@ -1188,12 +1204,7 @@ async fn renew_leaf(
 
 /// `RenewRequest` in the room: [`renew_leaf`], the answer, and a rename
 /// pushed to every session of the user.
-async fn handle_renew(
-    server: &Arc<Server>,
-    session: Session,
-    identity: &Identity,
-    csr_der: &[u8],
-) {
+async fn handle_renew(server: &Arc<Server>, session: Session, identity: &Identity, csr_der: &[u8]) {
     let renewed = match renew_leaf(server, identity, csr_der).await {
         Ok(renewed) => renewed,
         Err((code, detail)) => {
@@ -1242,7 +1253,11 @@ async fn handle_create_invite(
     // client already shows next to the invite field.
     match crate::registration::issue(server, name, ttl_s).await {
         Ok(issued) => {
-            tracing::info!(user_id, invited = issued.user_id, "registration bundle minted");
+            tracing::info!(
+                user_id,
+                invited = issued.user_id,
+                "registration bundle minted"
+            );
             server.room.send_to(
                 session,
                 &ControlMsg::CreateInviteResponse {

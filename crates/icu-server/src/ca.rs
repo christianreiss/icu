@@ -339,15 +339,13 @@ pub fn csr_common_name(csr_der: &[u8]) -> Result<String> {
             format!("csr is {} bytes, limit is 2 KiB", csr_der.len()),
         ));
     }
-    let (_, csr) =
-        x509_parser::certification_request::X509CertificationRequest::from_der(csr_der).map_err(
-            |e| {
-                Error::coded(
-                    icu_proto::error::ENROLL_BAD_CSR,
-                    format!("csr not parsable: {e}"),
-                )
-            },
-        )?;
+    let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(csr_der)
+        .map_err(|e| {
+            Error::coded(
+                icu_proto::error::ENROLL_BAD_CSR,
+                format!("csr not parsable: {e}"),
+            )
+        })?;
     let mut cns = csr.certification_request_info.subject.iter_common_name();
     let Some(cn) = cns.next() else {
         return Err(Error::coded(
@@ -524,8 +522,11 @@ fn create_ca(
     server_name: &str,
 ) -> Result<(CertificateDer<'static>, String)> {
     let key = KeyPair::generate()?; // P-256 by default (Spike 2b)
-    let cert = ca_params(&format!("{CA_COMMON_NAME} {server_name}"), tls.ca_validity_days)
-        .self_signed(&key)?;
+    let cert = ca_params(
+        &format!("{CA_COMMON_NAME} {server_name}"),
+        tls.ca_validity_days,
+    )
+    .self_signed(&key)?;
     let key_pem = key.serialize_pem();
     store::write_atomic(&dir.join(CA_CRT), &cert.pem())?;
     store::write_private(&dir.join(CA_KEY), &key_pem)?;
@@ -684,7 +685,9 @@ mod tests {
         params
             .distinguished_name
             .push(DnType::CommonName, "admin-impersonator");
-        params.distinguished_name.push(DnType::OrganizationName, "evil corp");
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "evil corp");
         params.subject_alt_names = vec![SanType::DnsName("icu.example.org".try_into().unwrap())];
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
@@ -756,7 +759,10 @@ mod tests {
         assert_eq!(lifetime, 3600 + 3600, "ttl plus the hour of clock slack");
 
         let key = KeyPair::try_from(key_der.as_slice()).unwrap();
-        assert_eq!(leaf_public_key(&leaf), rcgen::PublicKeyData::subject_public_key_info(&key));
+        assert_eq!(
+            leaf_public_key(&leaf),
+            rcgen::PublicKeyData::subject_public_key_info(&key)
+        );
         assert!(ca
             .issue_registration("bad\nname", Duration::from_secs(60), HOST)
             .is_err());
@@ -765,7 +771,10 @@ mod tests {
     #[test]
     fn csr_public_key_matches_the_signing_key() {
         let (key, csr) = csr_with_cn("alice");
-        assert_eq!(csr_public_key(&csr).unwrap(), rcgen::PublicKeyData::subject_public_key_info(&key));
+        assert_eq!(
+            csr_public_key(&csr).unwrap(),
+            rcgen::PublicKeyData::subject_public_key_info(&key)
+        );
         assert!(csr_public_key(b"junk").is_err());
         assert!(leaf_public_key(b"junk").is_empty());
     }
@@ -978,7 +987,10 @@ mod tests {
         let new = ca.ca_der().clone();
         assert!(!leaf_expired(&new));
         assert!(leaf_days_left(&new) > 3600);
-        assert_eq!(parse(&new).subject().as_raw(), parse(&old).subject().as_raw());
+        assert_eq!(
+            parse(&new).subject().as_raw(),
+            parse(&old).subject().as_raw()
+        );
         assert_eq!(leaf_public_key(&new), leaf_public_key(&old));
         assert_ne!(leaf_serial(&new), leaf_serial(&old));
         client_accepts(&new, &ca).expect("renewed anchor, old leaf");

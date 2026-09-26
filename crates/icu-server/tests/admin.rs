@@ -25,7 +25,10 @@ async fn an_invite_over_the_socket_works_without_a_restart() {
     .expect("admin request");
     assert_eq!(response["ok"], serde_json::json!(true));
     let bundle = response["bundle"].as_str().expect("bundle").to_string();
-    assert!(icu_proto::passport::Passport::looks_like(&bundle), "{bundle}");
+    assert!(
+        icu_proto::passport::Passport::looks_like(&bundle),
+        "{bundle}"
+    );
     assert_eq!(response["name"], serde_json::json!("bob"));
     assert_eq!(response["user_id"], serde_json::json!(1));
     assert_eq!(response["is_admin"], serde_json::json!(true), "first user");

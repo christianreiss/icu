@@ -138,10 +138,7 @@ async fn video_seq_advances_and_expires() {
     // `>=`, not `==`: the two calls take the lock separately, so a decode
     // may land between them.
     assert!(
-        frames
-            .seqs()
-            .iter()
-            .any(|(s, q)| *s == alice && *q >= seq),
+        frames.seqs().iter().any(|(s, q)| *s == alice && *q >= seq),
         "`seqs` and `picture` report the same counter"
     );
     assert!(

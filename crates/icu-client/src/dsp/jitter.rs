@@ -416,8 +416,8 @@ impl JitterBuffer {
         } else {
             0
         };
-        let shed = (self.grown > 0 && queued > self.target + 2 * frame)
-            || self.excess_pops >= EXCESS_POPS;
+        let shed =
+            (self.grown > 0 && queued > self.target + 2 * frame) || self.excess_pops >= EXCESS_POPS;
         if shed && self.queue.remove(&next).is_some() {
             self.grown = self.grown.saturating_sub(1);
             self.excess_pops = 0;
@@ -629,7 +629,11 @@ mod tests {
         // Packet 2 turns up now, reordered behind the END packet. Before the
         // high-water mark it prefilled and played as a 20 ms spurt of its own.
         jb.push(pkt(2, 2 * 960, false), t0 + ms(130));
-        assert_eq!(jb.pop(t0 + ms(140)), Pop::Silence, "straggler must stay silent");
+        assert_eq!(
+            jb.pop(t0 + ms(140)),
+            Pop::Silence,
+            "straggler must stay silent"
+        );
         assert_eq!(jb.pop(t0 + ms(400)), Pop::Silence);
         let st = jb.stats();
         assert_eq!((st.late, st.spurts, st.played), (1, 1, 3));
@@ -673,7 +677,11 @@ mod tests {
             after + ms(15) < before,
             "delay should have dropped by a frame: {before:?} → {after:?}"
         );
-        assert!(after <= jb.target() + ms(25), "{after:?} vs target {:?}", jb.target());
+        assert!(
+            after <= jb.target() + ms(25),
+            "{after:?} vs target {:?}",
+            jb.target()
+        );
     }
 
     #[test]

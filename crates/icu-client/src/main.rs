@@ -78,7 +78,9 @@ fn main() -> ExitCode {
 fn confirm_import() -> Result<bool, String> {
     use std::io::{BufRead, IsTerminal, Write};
     if !std::io::stdin().is_terminal() {
-        return Err("no terminal to confirm the import on; check the lines above and pass --yes".into());
+        return Err(
+            "no terminal to confirm the import on; check the lines above and pass --yes".into(),
+        );
     }
     eprint!("icu: Diesen Server übernehmen? [j/N] ");
     let _ = std::io::stderr().flush();
@@ -178,10 +180,12 @@ fn run(cli: Cli) -> Result<(), String> {
                 match enrolled {
                     Some(id) => id,
                     None if logged_out => return Ok(()),
-                    None => return Err(format!(
+                    None => {
+                        return Err(format!(
                         "not registered: run `icu <bundle> --name <name>` first (config dir {})",
                         paths.config_dir.display()
-                    )),
+                    ))
+                    }
                 }
             }
         };
