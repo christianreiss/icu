@@ -2482,6 +2482,7 @@ dependencies = [
 name = "icu-client"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "ashpd",
  "calloop 0.14.4",
  "calloop-wayland-source 0.4.1",

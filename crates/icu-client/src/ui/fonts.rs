@@ -4,7 +4,9 @@
 //! settings change and must not rebuild the atlas.
 
 const INTER_REGULAR: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Regular.ttf");
-const INTER_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-SemiBold.ttf");
+/// Also rasterizes the names in the overlay (`crate::overlay`).
+pub(crate) const INTER_SEMIBOLD: &[u8] =
+    include_bytes!("../../assets/fonts/inter/Inter-SemiBold.ttf");
 
 /// Font family used for headings and button labels (semibold weight).
 pub fn semibold() -> egui::FontFamily {

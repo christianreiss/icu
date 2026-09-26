@@ -1070,7 +1070,7 @@ impl SettingsView {
                 ui,
                 false,
                 "Anzeigen",
-                Some("Zeigt die Kameras der anderen als kleine Kacheln über allen Fenstern."),
+                Some("Zeigt über allen Fenstern die Kameras der anderen, mit Namen."),
                 |ui| widgets::toggle(ui, &mut self.draft.overlay.enabled),
             );
             ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {
@@ -1090,15 +1090,19 @@ impl SettingsView {
                         ],
                     )
                 });
-                widgets::setting_row(ui, true, "Sprechende Person umranden", None, |ui| {
-                    widgets::toggle(ui, &mut self.draft.overlay.speaking_frame)
-                });
+                widgets::setting_row(ui, true, "Wer ohne Kamera spricht", None, |ui| {
+                    widgets::toggle(ui, &mut self.draft.overlay.voice_plates)
+                })
+                .on_hover_text("Solange jemand ohne Kamera spricht, steht der Name im Overlay");
                 if !adv {
                     return;
                 }
                 widgets::advanced_caption(ui);
+                widgets::setting_row(ui, false, "Sprechende Person umranden", None, |ui| {
+                    widgets::toggle(ui, &mut self.draft.overlay.speaking_frame)
+                });
                 let edge = matches!(self.draft.overlay.corner, Corner::Top | Corner::Bottom);
-                widgets::setting_row(ui, false, "Anordnung", None, |ui| {
+                widgets::setting_row(ui, true, "Anordnung", None, |ui| {
                     ui.add_enabled_ui(!edge, |ui| {
                         widgets::segmented(
                             ui,
