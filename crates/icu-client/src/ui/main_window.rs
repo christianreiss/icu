@@ -1965,11 +1965,14 @@ impl EnrollApp {
     /// Takes a file dropped onto the window: an `.icu` invite or passport,
     /// read as text. Anything unreadable is left for the field's verdict.
     fn take_dropped(&mut self, ctx: &egui::Context) {
+        // A passport decodes to at most 8 KiB; anything much larger is not
+        // one and is not read into memory.
+        const MAX_DROP: u64 = 64 * 1024;
         let dropped = ctx.input(|i| {
             i.raw.dropped_files.iter().find_map(|f| {
-                std::fs::read_to_string(f.path())
-                    .ok()
-                    .or_else(|| f.bytes().ok().and_then(|b| String::from_utf8(b).ok()))
+                let path = f.path();
+                let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= MAX_DROP);
+                small.then(|| std::fs::read_to_string(path).ok()).flatten()
             })
         });
         if let Some(text) = dropped {

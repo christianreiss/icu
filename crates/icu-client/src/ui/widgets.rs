@@ -376,12 +376,13 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
     if s.talking_muted {
         let time = ui.input(|i| i.time);
         let pulse = ((time * 3.0).sin() as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
+        // No repaint request of its own: the main window repaints every
+        // 33 ms anyway, which is plenty for this pulse.
         painter.rect_filled(
             rect,
             R_ROW,
             tok.error_tint.gamma_multiply(0.6 + 0.4 * pulse),
         );
-        ui.ctx().request_repaint();
     }
     if s.ptt && !s.offline && response.hovered() {
         painter.rect_filled(rect, R_ROW, tok.hover_overlay);
