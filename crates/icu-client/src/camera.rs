@@ -45,6 +45,101 @@ pub struct RgbFrame {
     pub rgb: Vec<u8>,
 }
 
+impl RgbFrame {
+    /// A picture the encoder and the preview can take. `rgb` has to hold
+    /// exactly `width × height` pixels; an odd side loses its last column
+    /// or row, because openh264 encodes 4:2:0 and wants even sides. Anything
+    /// else is an error, never a panic: openh264's `RgbSliceU8::new` and
+    /// egui's `ColorImage::from_rgb` assert on the length, and a release
+    /// build aborts on a panic — one odd frame from a camera (an MJPEG frame
+    /// larger than negotiated, a YUYV row stride with padding, a virtual
+    /// camera's odd size) would end the whole client.
+    pub fn checked(width: usize, height: usize, mut rgb: Vec<u8>) -> Result<RgbFrame, String> {
+        if width.checked_mul(height).and_then(|n| n.checked_mul(3)) != Some(rgb.len()) {
+            return Err(format!(
+                "camera frame of {} bytes does not hold {width}×{height} RGB pixels",
+                rgb.len()
+            ));
+        }
+        let (w, h) = (width & !1, height & !1);
+        if w == 0 || h == 0 {
+            return Err(format!("camera frame too small: {width}×{height}"));
+        }
+        if w != width {
+            // Row by row towards the front: a row never moves past its old
+            // start, so nothing is overwritten before it is copied.
+            for y in 0..h {
+                rgb.copy_within(y * width * 3..(y * width + w) * 3, y * w * 3);
+            }
+        }
+        rgb.truncate(w * h * 3);
+        Ok(RgbFrame {
+            width: w,
+            height: h,
+            rgb,
+        })
+    }
+
+    /// Whether the encoder and the preview can take this picture as it is:
+    /// even, non-zero sides and exactly the bytes they promise. Checked once
+    /// more right before the asserting constructors, because any
+    /// [`FrameSource`] can hand in a picture.
+    pub fn is_valid(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.width.is_multiple_of(2)
+            && self.height.is_multiple_of(2)
+            && self
+                .width
+                .checked_mul(self.height)
+                .and_then(|n| n.checked_mul(3))
+                == Some(self.rgb.len())
+    }
+}
+
+/// Width and height from a JPEG's frame header (SOF*n*), `None` without one.
+/// nokhwa labels every decoded picture with the negotiated size, but decodes
+/// an MJPEG frame at the size the frame itself says.
+fn jpeg_size(data: &[u8]) -> Option<(usize, usize)> {
+    if !data.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut i = 2;
+    loop {
+        if *data.get(i)? != 0xFF {
+            return None;
+        }
+        let marker = *data.get(i + 1)?;
+        match marker {
+            // Fill byte before a marker.
+            0xFF => {
+                i += 1;
+                continue;
+            }
+            // Markers without a length.
+            0x01 | 0xD0..=0xD8 => {
+                i += 2;
+                continue;
+            }
+            // End of image, or the scan starts: no frame header before it.
+            0xD9 | 0xDA => return None,
+            _ => {}
+        }
+        let len = usize::from(u16::from_be_bytes([*data.get(i + 2)?, *data.get(i + 3)?]));
+        // SOF0–SOF15, except DHT (C4), JPG (C8) and DAC (CC): length,
+        // precision, height, width.
+        if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
+            let height = u16::from_be_bytes([*data.get(i + 5)?, *data.get(i + 6)?]);
+            let width = u16::from_be_bytes([*data.get(i + 7)?, *data.get(i + 8)?]);
+            return Some((usize::from(width), usize::from(height)));
+        }
+        if len < 2 {
+            return None;
+        }
+        i += 2 + len;
+    }
+}
+
 /// The capture thread's latest picture. `seq` counts frames, so a viewer
 /// can tell a new picture from a repaint of the one it already uploaded —
 /// the preview is drawn at the window's frame rate, the camera delivers at
@@ -122,17 +217,26 @@ impl NokhwaSource {
 
 impl FrameSource for NokhwaSource {
     fn next_frame(&mut self) -> Result<RgbFrame, String> {
-        use nokhwa::pixel_format::RgbFormat;
+        use nokhwa::{pixel_format::RgbFormat, utils::FrameFormat};
         let buffer = self.camera.frame().map_err(|e| e.to_string())?;
-        let res = buffer.resolution();
         let img = buffer
             .decode_image::<RgbFormat>()
             .map_err(|e| e.to_string())?;
-        Ok(RgbFrame {
-            width: res.width() as usize,
-            height: res.height() as usize,
-            rgb: img.into_raw(),
-        })
+        let (mut width, mut height) = (img.width() as usize, img.height() as usize);
+        // `into_raw` hands back the whole decoded buffer, which is longer than
+        // the image's (negotiated) size when an MJPEG frame is larger: take
+        // the frame's own size when it explains the byte count.
+        let rgb = img.into_raw();
+        if buffer.source_frame_format() == FrameFormat::MJPEG
+            && width.saturating_mul(height).saturating_mul(3) != rgb.len()
+        {
+            if let Some((w, h)) = jpeg_size(buffer.buffer()) {
+                if w.saturating_mul(h).saturating_mul(3) == rgb.len() {
+                    (width, height) = (w, h);
+                }
+            }
+        }
+        RgbFrame::checked(width, height, rgb)
     }
 }
 
@@ -236,15 +340,39 @@ pub fn run_sender(
     let mut last_idr = Instant::now() - IDR_INTERVAL;
     let mut yuv: Option<YUVBuffer> = None;
     let mut frame_index: u32 = 0;
+    // Failed frames in a row: the first one is a warning, the rest of the
+    // streak only debug lines — a camera that sends nothing usable would
+    // otherwise log five warnings a second.
+    let mut failed: u32 = 0;
     while !stop.load(Ordering::Relaxed) {
         let frame = match source.next_frame() {
-            Ok(f) => Arc::new(f),
-            Err(e) => {
-                tracing::warn!(%e, "camera frame");
+            Ok(f) if f.is_valid() => Arc::new(f),
+            result => {
+                let e = result.map_or_else(
+                    |e| e,
+                    |f| {
+                        format!(
+                            "unusable camera frame {}×{}, {} bytes",
+                            f.width,
+                            f.height,
+                            f.rgb.len()
+                        )
+                    },
+                );
+                failed += 1;
+                if failed == 1 {
+                    tracing::warn!(%e, "camera frame");
+                } else {
+                    tracing::debug!(%e, failed, "camera frame");
+                }
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
         };
+        if failed > 0 {
+            tracing::info!(failed, "camera frames again");
+            failed = 0;
+        }
         preview.put(frame.clone());
 
         let new_tier = link.send_tier();
@@ -271,6 +399,7 @@ pub fn run_sender(
             continue; // thin the fixed-FPS capture down to this tier's rate
         }
 
+        // Asserts length and even sides: `frame.is_valid()` above.
         let src = RgbSliceU8::new(&frame.rgb, (frame.width, frame.height));
         match yuv.as_mut() {
             Some(buf) if dimensions_match(buf, frame.width, frame.height) => buf.read_rgb(src),
@@ -432,6 +561,9 @@ impl CameraPreview {
             // the conversion below.
             let frame = self.slot.frame.lock().unwrap().clone();
             match frame {
+                // `ColorImage::from_rgb` asserts on the length; a picture
+                // that does not fit keeps the last one on screen.
+                Some(frame) if !frame.is_valid() => {}
                 Some(frame) => {
                     let image = egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
                     match &mut self.texture {
@@ -498,5 +630,105 @@ mod tests {
         );
         assert!(matches!(types[1].0, FrameType::P));
         assert!(types.iter().all(|(_, n)| *n > 0));
+    }
+
+    /// A `w × h` picture whose every pixel says where it is: R = x, G = y.
+    fn pattern(w: usize, h: usize) -> Vec<u8> {
+        (0..h)
+            .flat_map(|y| (0..w).flat_map(move |x| [x as u8, y as u8, 7]))
+            .collect()
+    }
+
+    #[test]
+    fn checked_keeps_an_exact_frame() {
+        let f = RgbFrame::checked(4, 2, pattern(4, 2)).unwrap();
+        assert_eq!((f.width, f.height), (4, 2));
+        assert_eq!(f.rgb, pattern(4, 2));
+        assert!(f.is_valid());
+    }
+
+    /// A virtual camera's 5×3 becomes 4×2: the last column and row go, every
+    /// other pixel stays where it was.
+    #[test]
+    fn checked_crops_odd_sides() {
+        let f = RgbFrame::checked(5, 3, pattern(5, 3)).unwrap();
+        assert_eq!((f.width, f.height), (4, 2));
+        assert_eq!(f.rgb, pattern(4, 2));
+        assert!(f.is_valid());
+        let f = RgbFrame::checked(4, 3, pattern(4, 3)).unwrap();
+        assert_eq!((f.width, f.height, f.rgb), (4, 2, pattern(4, 2)));
+        let f = RgbFrame::checked(5, 2, pattern(5, 2)).unwrap();
+        assert_eq!((f.width, f.height, f.rgb), (4, 2, pattern(4, 2)));
+    }
+
+    /// A buffer that does not hold what the size says — the oversized MJPEG
+    /// frame, a padded YUYV stride — is rejected instead of reaching an
+    /// assert.
+    #[test]
+    fn checked_rejects_mismatched_buffers() {
+        let mut long = pattern(320, 240);
+        long.extend_from_slice(&[0; 320 * 3]); // one padded row too many
+        assert!(RgbFrame::checked(320, 240, long).is_err());
+        assert!(RgbFrame::checked(320, 240, pattern(320, 239)).is_err());
+        assert!(RgbFrame::checked(640, 480, pattern(320, 240)).is_err());
+        assert!(RgbFrame::checked(0, 0, Vec::new()).is_err());
+        assert!(
+            RgbFrame::checked(1, 1, pattern(1, 1)).is_err(),
+            "nothing left"
+        );
+        assert!(
+            RgbFrame::checked(usize::MAX, 3, Vec::new()).is_err(),
+            "overflow"
+        );
+        // And a hand-made frame is caught by the last check.
+        let bad = RgbFrame {
+            width: 5,
+            height: 3,
+            rgb: pattern(5, 3),
+        };
+        assert!(!bad.is_valid(), "odd sides");
+        let bad = RgbFrame {
+            width: 4,
+            height: 2,
+            rgb: pattern(4, 3),
+        };
+        assert!(!bad.is_valid(), "length");
+    }
+
+    /// What survives `checked` goes through the encoder's asserting
+    /// constructors without a panic.
+    #[test]
+    fn a_cropped_frame_encodes() {
+        let f = RgbFrame::checked(321, 241, pattern(321, 241)).unwrap();
+        let yuv = YUVBuffer::from_rgb_source(RgbSliceU8::new(&f.rgb, (f.width, f.height)));
+        let mut enc = encoder(VideoTier::T0).unwrap();
+        let bs = enc.encode(&yuv).unwrap();
+        assert!(matches!(bs.frame_type(), FrameType::IDR));
+    }
+
+    #[test]
+    fn jpeg_size_reads_the_frame_header() {
+        // SOI, APP0 (JFIF, 16 bytes), DQT (a stub), then SOF0 640×480.
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        jpeg.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+        jpeg.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x04, 0x00, 0x00]);
+        let sof = [
+            0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0xE0, 0x02, 0x80, 0x03, 0x01, 0x22, 0x00, 0x02,
+            0x11, 0x01, 0x03, 0x11, 0x01,
+        ];
+        jpeg.extend_from_slice(&sof);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08]);
+        assert_eq!(jpeg_size(&jpeg), Some((640, 480)));
+        // Progressive (SOF2), with a fill byte before the marker.
+        let mut progressive = vec![0xFF, 0xD8, 0xFF];
+        progressive.extend_from_slice(&sof);
+        progressive[4] = 0xC2;
+        assert_eq!(jpeg_size(&progressive), Some((640, 480)));
+        // A DHT (C4) is not a frame header.
+        let dht = [0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x03, 0x00, 0xFF, 0xD9];
+        assert_eq!(jpeg_size(&dht), None);
+        assert_eq!(jpeg_size(b"not a jpeg"), None);
+        assert_eq!(jpeg_size(&jpeg[..jpeg.len() - 20]), None, "cut short");
+        assert_eq!(jpeg_size(&[0xFF, 0xD8, 0xFF, 0xDA]), None, "scan first");
     }
 }
