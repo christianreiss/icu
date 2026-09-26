@@ -1608,6 +1608,7 @@ async fn net_task(
         invite_pending: false,
         renew_attempted_at: None,
         window_visible: !cfg.settings.ui.start_minimized,
+        muted_before_deafen: false,
     };
     local.update_viewing();
     let mut attempt: u32 = 0;
@@ -1804,6 +1805,8 @@ struct LocalState {
     /// Whether the main window is on screen. Starts from
     /// `start_minimized`, so a client without a window (tests) views.
     window_visible: bool,
+    /// The mute from before deafening, restored by undeafening.
+    muted_before_deafen: bool,
 }
 
 /// A renewal in flight: which name it asks for, and why it was sent.
@@ -1975,12 +1978,24 @@ impl LocalState {
     fn handle_local(&mut self, cmd: Command, shared: &Arc<Shared>) -> bool {
         let mut set_state = false;
         match cmd {
-            Command::SetMuted(false) if shared.state.borrow().restricted_muted => {}
+            // An enforced deafen keeps the microphone off as well: deafen
+            // implies mute, whoever set it.
+            Command::SetMuted(false)
+                if {
+                    let s = shared.state.borrow();
+                    s.restricted_muted || s.restricted_deafened
+                } => {}
             Command::SetDeafened(false) if shared.state.borrow().restricted_deafened => {}
             Command::SetMuted(m) => {
-                self.flags = self.flags.with_bit(UserFlags::MUTED, m);
-                shared.dsp.muted.store(m, Ordering::Relaxed);
-                shared.state.send_modify(|s| s.muted = m);
+                let deafened = self.flags.deafened();
+                if deafened && m {
+                    // Stays deafened; undeafening keeps the microphone off.
+                    self.muted_before_deafen = true;
+                }
+                // Deafen implies mute, so unmuting while deafened undeafens
+                // as well (as in Mumble), instead of sending into a room one
+                // cannot hear.
+                self.apply_mute_deafen(m, deafened && m, shared);
                 self.cue(shared, if m { Cue::Mute } else { Cue::Unmute });
                 set_state = true;
             }
@@ -1989,18 +2004,20 @@ impl LocalState {
                 return self.handle_local(Command::SetMuted(m), shared);
             }
             Command::SetDeafened(d) => {
-                self.flags = self.flags.with_bit(UserFlags::DEAFENED, d);
-                if d {
-                    self.flags = self.flags.with_bit(UserFlags::MUTED, true);
-                    shared.dsp.muted.store(true, Ordering::Relaxed);
+                let was = self.flags.deafened();
+                if d && !was {
+                    self.muted_before_deafen = self.flags.muted();
                 }
-                shared.deafened.store(d, Ordering::Relaxed);
-                shared.state.send_modify(|s| {
-                    s.deafened = d;
-                    if d {
-                        s.muted = true;
-                    }
-                });
+                // Undeafening restores the mute from before deafening
+                // (`Research/feature-freeze.md`), unless an admin enforces it.
+                let muted = if d {
+                    true
+                } else if was {
+                    self.muted_before_deafen || shared.state.borrow().restricted_muted
+                } else {
+                    self.flags.muted()
+                };
+                self.apply_mute_deafen(muted, d, shared);
                 self.cue(shared, if d { Cue::Mute } else { Cue::Unmute });
                 set_state = true;
             }
@@ -2103,6 +2120,22 @@ impl LocalState {
             | Command::Quit => {}
         }
         set_state
+    }
+
+    /// Takes mute and deafen into the flags, the send gate, the mixer and the
+    /// window. Deafen implies mute.
+    fn apply_mute_deafen(&mut self, muted: bool, deafened: bool, shared: &Arc<Shared>) {
+        let muted = muted || deafened;
+        self.flags = self
+            .flags
+            .with_bit(UserFlags::MUTED, muted)
+            .with_bit(UserFlags::DEAFENED, deafened);
+        shared.dsp.muted.store(muted, Ordering::Relaxed);
+        shared.deafened.store(deafened, Ordering::Relaxed);
+        shared.state.send_modify(|s| {
+            s.muted = muted;
+            s.deafened = deafened;
+        });
     }
 
     /// Takes a changed `self.settings` into effect. Everything that follows
@@ -2467,14 +2500,18 @@ async fn run_session(
     // Compare only the client-settable bits: `welcome.you.flags` may carry
     // server-authoritative `SPEAKING`/`ADMIN` bits `local.flags` never has,
     // which would otherwise trigger a spurious `SetState` on every connect.
-    let settable = UserFlags::CLIENT_SETTABLE;
-    if local.flags.sanitized().0 & settable != welcome.you.flags.0 & settable {
-        let msg = ControlMsg::SetState {
-            flags: local.flags.sanitized(),
-        };
-        if conn::write_msg(&mut send, &msg).await.is_err() {
-            return send_failed(&connection);
-        }
+    let mut sent_flags = welcome.you.flags;
+    let mut set_state_budget = SetStateBudget::new(Instant::now());
+    if flush_state(
+        &mut send,
+        local.flags,
+        &mut sent_flags,
+        &mut set_state_budget,
+    )
+    .await
+    .is_err()
+    {
+        return send_failed(&connection);
     }
 
     // Pick up a rename that happened on another device, or renew a
@@ -2525,9 +2562,12 @@ async fn run_session(
     // load; the rate must divide by what actually elapsed, not by the
     // nominal period.
     let mut prev_tick = Instant::now();
-    let mut set_state_budget = RateBudget::new(pl::SET_STATE_PER_S, Duration::from_secs(1));
 
     let end = loop {
+        // A flag change the budget could not send yet goes out as soon as the
+        // next token is there.
+        let state_due = (!same_settable(local.flags, sent_flags))
+            .then(|| set_state_budget.ready_at(Instant::now()));
         tokio::select! {
             msg = ctrl_rx.recv() => {
                 let msg = match msg {
@@ -2621,16 +2661,13 @@ async fn run_session(
                         }
                     }
                     cmd => {
-                        let send_state = local.handle_local(cmd, shared);
-                        if send_state && set_state_budget.take() {
-                            let msg = ControlMsg::SetState { flags: local.flags.sanitized() };
-                            if conn::write_msg(&mut send, &msg).await.is_err() {
-                                break send_failed(&connection);
-                            }
-                        }
+                        local.handle_local(cmd, shared);
                     }
                 }
             }
+            _ = tokio::time::sleep_until(
+                state_due.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()
+            ), if state_due.is_some() => {}
             _ = renew_tick.tick() => {
                 let stored = local.name.clone();
                 if maybe_auto_renew(&mut send, local, shared, &stored).await.is_err() {
@@ -2744,6 +2781,19 @@ async fn run_session(
             reason = connection.closed() => {
                 break reason.into();
             }
+        }
+        // Whatever the arm changed — a command, a restriction, the viewing
+        // bit — reaches the server here, within the budget.
+        if flush_state(
+            &mut send,
+            local.flags,
+            &mut sent_flags,
+            &mut set_state_budget,
+        )
+        .await
+        .is_err()
+        {
+            break send_failed(&connection);
         }
     };
 
@@ -3221,8 +3271,10 @@ async fn handle_control(
                 s.restricted_muted = muted;
                 s.restricted_deafened = deafened;
             });
-            // The server already holds the bits; this brings the local
-            // pipeline and buttons in line, so no `SetState` is needed.
+            // Brings the local pipeline and buttons in line; the changed
+            // flags go out as `SetState` like any other change (the session
+            // loop compares them with what the server holds from us), so a
+            // deafen-only restriction mutes on the server too.
             if deafened && !local.flags.deafened() {
                 local.handle_local(Command::SetDeafened(true), shared);
             }
@@ -3258,35 +3310,87 @@ async fn handle_control(
     None
 }
 
-/// A token bucket for `SetState` (≤ 20/s).
-struct RateBudget {
-    max: u32,
-    window: Duration,
-    count: u32,
-    start: Instant,
+/// The `SetState` budget: a token bucket like the server's (`PROTOCOL.md`
+/// §2.2 Nr. 5, 20 per second, burst 20), at three quarters of its size, so
+/// the client never sends what the server would answer with `RATE_LIMITED`
+/// and drop — three of those within 60 s would even be `RATE_LIMITED_FATAL`.
+/// Exactly the server's figures are not enough: its bucket refills from
+/// when it *processed* a burst, which trails the client's clock by the
+/// transit and the processing of that burst, so a 21st message sent on the
+/// client's schedule arrived to an empty bucket (measured: the test
+/// `a_burst_of_mute_changes_ends_on_the_last_one` got `RATE_LIMITED`).
+#[derive(Debug)]
+struct SetStateBudget {
+    tokens: f64,
+    last: Instant,
 }
 
-impl RateBudget {
-    fn new(max: u32, window: Duration) -> RateBudget {
-        RateBudget {
-            max,
-            window,
-            count: 0,
-            start: Instant::now(),
+impl SetStateBudget {
+    /// Tokens per second and burst.
+    const PER_S: f64 = pl::SET_STATE_PER_S as f64 * 0.75;
+
+    fn new(now: Instant) -> SetStateBudget {
+        SetStateBudget {
+            tokens: Self::PER_S,
+            last: now,
         }
     }
-    fn take(&mut self) -> bool {
-        if self.start.elapsed() > self.window {
-            self.start = Instant::now();
-            self.count = 0;
-        }
-        if self.count < self.max {
-            self.count += 1;
+
+    fn refill(&mut self, now: Instant) {
+        let earned = now.saturating_duration_since(self.last).as_secs_f64() * Self::PER_S;
+        self.tokens = (self.tokens + earned).min(Self::PER_S);
+        self.last = now;
+    }
+
+    /// Takes a token if there is one.
+    fn take_at(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
             true
         } else {
             false
         }
     }
+
+    /// When the next token is there (a millisecond late rather than early,
+    /// so the wake-up never finds the bucket a hair short).
+    fn ready_at(&mut self, now: Instant) -> Instant {
+        self.refill(now);
+        if self.tokens >= 1.0 {
+            now
+        } else {
+            now + Duration::from_secs_f64((1.0 - self.tokens) / Self::PER_S)
+                + Duration::from_millis(1)
+        }
+    }
+}
+
+/// Whether `a` and `b` agree on everything a client may set.
+fn same_settable(a: UserFlags, b: UserFlags) -> bool {
+    (a.0 ^ b.0) & UserFlags::CLIENT_SETTABLE == 0
+}
+
+/// Sends the newest flags as `SetState` when they differ from what the
+/// server holds from us (`sent`) and the budget has a token. Without one the
+/// change waits — coalesced with whatever follows — instead of being
+/// dropped: a lost final unmute would leave the server discarding the
+/// user's audio. `Err` only when the control stream broke.
+async fn flush_state(
+    send: &mut quinn::SendStream,
+    flags: UserFlags,
+    sent: &mut UserFlags,
+    budget: &mut SetStateBudget,
+) -> Result<(), ()> {
+    let flags = flags.sanitized();
+    if same_settable(flags, *sent) || !budget.take_at(Instant::now()) {
+        return Ok(());
+    }
+    conn::write_msg(send, &ControlMsg::SetState { flags })
+        .await
+        .map_err(|_| ())?;
+    *sent = flags;
+    Ok(())
 }
 
 impl From<NetError> for EngineError {
@@ -3472,6 +3576,39 @@ mod tests {
         assert!(matches!(
             inbound(Err(NetError::Connect("reset".into()))),
             Inbound::End
+        ));
+    }
+
+    /// The client's `SetState` budget stays under the server's bucket (20
+    /// per second, burst 20): a burst of 15, then one every 67 ms — and it
+    /// says when the next token is there.
+    #[test]
+    fn set_state_budget_stays_under_the_server() {
+        assert!(SetStateBudget::PER_S < f64::from(pl::SET_STATE_PER_S));
+        let t0 = Instant::now();
+        let mut b = SetStateBudget::new(t0);
+        for i in 0..15 {
+            assert!(b.take_at(t0), "burst token {i}");
+        }
+        assert!(!b.take_at(t0), "the 16th in the same instant");
+        let ready = b.ready_at(t0);
+        assert!(ready >= t0 + Duration::from_millis(66));
+        assert!(ready <= t0 + Duration::from_millis(69));
+        assert!(!b.take_at(t0 + Duration::from_millis(50)));
+        assert!(b.take_at(ready));
+        // A long rest refills the whole burst, and no more.
+        let later = ready + Duration::from_secs(5);
+        for _ in 0..15 {
+            assert!(b.take_at(later));
+        }
+        assert!(!b.take_at(later));
+        assert!(same_settable(
+            UserFlags(UserFlags::MUTED | UserFlags::SPEAKING),
+            UserFlags(UserFlags::MUTED | UserFlags::ADMIN)
+        ));
+        assert!(!same_settable(
+            UserFlags(UserFlags::MUTED),
+            UserFlags(UserFlags::DEAFENED)
         ));
     }
 
