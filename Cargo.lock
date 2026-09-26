@@ -2547,6 +2547,7 @@ dependencies = [
  "bytes",
  "clap",
  "icu-proto",
+ "pem",
  "postcard",
  "quinn",
  "rand 0.9.5",

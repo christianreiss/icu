@@ -806,27 +806,10 @@ fn write_retired(dir: &Path, leaves: &[CertificateDer<'static>]) -> Result<()> {
 /// rcgen armors only what it signed itself, and a leaf read back from disk
 /// is plain DER.
 fn cert_pem(der: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut base64 = Vec::with_capacity(der.len().div_ceil(3) * 4);
-    for chunk in der.chunks(3) {
-        let bits = chunk.iter().enumerate().fold(0u32, |bits, (i, byte)| {
-            bits | (u32::from(*byte) << (16 - 8 * i))
-        });
-        for i in 0..4 {
-            base64.push(if i <= chunk.len() {
-                ALPHABET[((bits >> (18 - 6 * i)) & 0x3f) as usize]
-            } else {
-                b'='
-            });
-        }
-    }
-    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
-    for line in base64.chunks(64) {
-        pem.extend(line.iter().copied().map(char::from));
-        pem.push('\n');
-    }
-    pem.push_str("-----END CERTIFICATE-----\n");
-    pem
+    pem::encode_config(
+        &pem::Pem::new("CERTIFICATE", der.to_vec()),
+        pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),
+    )
 }
 
 #[cfg(test)]

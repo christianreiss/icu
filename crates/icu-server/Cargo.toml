@@ -26,6 +26,7 @@ quinn.workspace = true
 rustls.workspace = true
 ring.workspace = true
 rcgen.workspace = true
+pem.workspace = true
 x509-parser.workspace = true
 tokio.workspace = true
 bytes.workspace = true
