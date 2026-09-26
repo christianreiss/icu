@@ -51,6 +51,9 @@ Der Server wird mit dem Profil `release-server` gebaut (`Cargo.toml`): das
 Verbindung beendet dann nur diese — der Server protokolliert ihn, nimmt die
 Sitzung aus dem Raum und alle anderen Gespräche laufen weiter —, statt den
 Prozess und damit jedes Gespräch zu beenden. Der Client bleibt bei `abort`.
+Ein mit schlichtem `--release` gebauter Server läuft auch, warnt aber beim
+Start (`built with panic = "abort"`): bei ihm beendet ein Panic in einer
+Sitzung den ganzen Server.
 
 ### Statisches musl-Binary (Auslieferung)
 
@@ -117,20 +120,37 @@ sudo systemctl enable --now icu-server
 
 `server_name` und `public_host` landen in der CA und in jedem Zertifikat;
 später ändern heißt neue CA und alle registrieren sich neu. Mit den Namen aus
-dem Beispiel (`example.org`, `.example`, `.invalid`, `.test`, RFC 2606) startet
-der Server deshalb nicht, und `icu-server invite` stellt nichts aus.
-`localhost` und IP-Adressen gehen.
+dem Beispiel (`example.org`, `.example`, `.invalid`, `.test`, RFC 2606) legt
+der Server deshalb keine CA an — der erste Start scheitert —, und die erste
+Einladung eines Servers ohne Nutzer stellt `icu-server invite` nicht aus.
+Eine bestehende Installation, deren CA einen solchen Namen schon trägt,
+startet weiter und warnt im Journal. `localhost` und IP-Adressen gehen.
 
 `StateDirectory=icu` legt `/var/lib/icu/` an; beim ersten Start entstehen dort
 `ca.key` (0600), `ca.crt`, `server.key` (0600), `server.crt`, `users.toml`
 und `state.lock`. **`ca.key` ist das einzige Geheimnis, das zählt** — geht es
 verloren, müssen sich alle Nutzer neu registrieren. Ein Backup von
 `/var/lib/icu/` gehört zur Inbetriebnahme. Eine neue CA legt der Server nur an,
-wenn `ca.crt` und `ca.key` beide fehlen; fehlt nur eine, ist eine nicht lesbar
-(etwa nach einem Restore mit falschem Besitzer) oder passen sie nicht
-zusammen, startet er nicht und sagt, welche Datei es ist. `server.crt` und
+wenn `ca.crt` und `ca.key` beide fehlen und `users.toml` noch nie benutzt wurde
+(keine Nutzer, keine CRL); fehlt nur eine, ist eine nicht lesbar (etwa nach
+einem Restore mit falschem Besitzer), passen sie nicht zusammen oder fehlen
+beide neben einer benutzten `users.toml`, startet er nicht und sagt, welche
+Datei es ist. `server.crt` und
 `server.key` sind dagegen entbehrlich: passen sie nicht, stellt der Server beim
-Start selbst ein neues Leaf aus.
+Start selbst ein neues Leaf aus. `server.crt.retired` gibt es nur, solange ein
+ersetztes Server-Leaf noch nicht auf der CRL steht (etwa weil `users.toml` bei
+der Rotation nicht geschrieben werden konnte); der nächste Start trägt es nach
+und löscht die Datei. Nicht von Hand löschen, sonst bleibt das alte Leaf
+gültig.
+
+**Backup und Restore.** `ca.crt`, `ca.key` und `users.toml` gehören zusammen
+und kommen aus demselben Backup zurück, lesbar für den Dienst. Meldet der
+Start `no CA in …: ca.crt and ca.key are both missing, but users.toml has been
+in use`, fehlt die CA neben einem benutzten Nutzerbestand — ein unvollständiger
+Restore, eine Migration ohne die CA: beide Dateien aus dem Backup zurückholen.
+Eine neue CA sperrte jeden registrierten Nutzer aus, deshalb legt der Server
+dann keine an. Wer wirklich neu anfangen will (neue CA, alle registrieren sich
+neu), schiebt das ganze State-Verzeichnis beiseite.
 
 **Nach dem Zurückspielen eines Backups** `icu-server rotate-server-cert`
 ausführen. Lag zwischen Backup und Restore eine Rotation, präsentiert der Server

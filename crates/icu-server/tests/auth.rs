@@ -886,6 +886,76 @@ async fn sessions_outside_the_room_are_capped() {
     server.shutdown().await;
 }
 
+/// A registration turned away because the sessions outside the room are
+/// full has not paid for it. `SERVER_FULL` is not fatal and the client comes
+/// back; each attempt used to cost a token of the enrollment budget first,
+/// until the fatal `ENROLL_RATE_LIMITED` ended the registration for good.
+#[tokio::test]
+async fn a_registration_turned_away_as_full_keeps_its_budget() {
+    use icu_proto::limits::MAX_ROOMLESS_SESSIONS;
+    let server = TestServer::start_with(|c| {
+        c.limits.handshakes_per_ip_per_s = 1000;
+        // Enough for the sessions that fill the table and one more.
+        c.limits.enroll_per_ip_per_min = MAX_ROOMLESS_SESSIONS as u32 + 1;
+        c.limits.enroll_global_per_min = 1000;
+    })
+    .await;
+    let registration = |bundle: &str| common::identity_from_bundle(bundle);
+
+    let mut open = Vec::new();
+    for _ in 0..MAX_ROOMLESS_SESSIONS {
+        let bundle = server.invite("").await;
+        let mut client = server
+            .connect(&registration(&bundle))
+            .await
+            .expect("connect");
+        assert!(matches!(
+            client.hello("").await,
+            ControlMsg::Welcome {
+                registration: true,
+                ..
+            }
+        ));
+        open.push(client);
+    }
+    let bundle = server.invite("").await;
+    for _ in 0..3 {
+        let refused = server
+            .connect(&registration(&bundle))
+            .await
+            .expect("the handshake completes");
+        assert_eq!(refused.closed_code().await, Some(ec::SERVER_FULL));
+    }
+
+    open.pop().expect("a session").conn.close(0u32.into(), b"");
+    let roomless = &server.handle.server().roomless;
+    for _ in 0..200 {
+        if roomless.lock().unwrap().len() < MAX_ROOMLESS_SESSIONS {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut again = server
+        .connect(&registration(&bundle))
+        .await
+        .expect("connect");
+    let welcome = again
+        .hello_with("", icu_proto::MINOR, icu_proto::UserFlags::NONE)
+        .await;
+    assert!(
+        matches!(
+            welcome,
+            Some(ControlMsg::Welcome {
+                registration: true,
+                ..
+            })
+        ),
+        "the budget is still there: {:?}",
+        again.conn.close_reason()
+    );
+    server.shutdown().await;
+}
+
 /// `PROTOCOL.md` §1/§2.2: a revoke is in force in the handshake at once,
 /// without a restart. The CRL clients get follows `Welcome` and lists only
 /// replaced server leaves — a revoked client certificate is none of their
@@ -1041,6 +1111,53 @@ async fn a_failed_rotation_leaves_the_live_server_certificate_alone() {
     server.shutdown().await;
 }
 
+/// A rotation whose store write fails — no CRL entry, no CRL number for the
+/// reload — says what is in force, and the replaced leaf is not forgotten:
+/// the next start puts it on the CRL. It used to be kept in memory only, so a
+/// restart lost the revocation of a leaf that may have been rotated because
+/// its key leaked.
+#[tokio::test]
+async fn a_replaced_server_certificate_is_revoked_at_the_next_start_when_the_store_failed() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let old = server_leaf(&server.connect(&alice).await.expect("connect").conn);
+
+    // Every write of users.toml fails: its temp file cannot be created.
+    let blocker = server.dir.path().join(".users.toml.tmp");
+    std::fs::create_dir(&blocker).expect("block users.toml");
+    let response = server.handle.admin(AdminRequest::RotateServerCert).await;
+    let AdminResponse::Error { error, detail } = response else {
+        panic!("the rotation must report the failure, got {response:?}");
+    };
+    assert_eq!(error, "ROTATE_FAILED");
+    assert!(detail.contains("not in use"), "{detail}");
+    assert!(detail.contains("server.crt.retired"), "{detail}");
+    assert_eq!(
+        server_leaf(&server.connect(&alice).await.expect("connect").conn),
+        old,
+        "as reported: the new leaf is not in use yet"
+    );
+    std::fs::remove_dir(&blocker).expect("unblock");
+
+    let server = server.restart_with(|_| {}).await;
+    let mut client = server.connect(&alice).await.expect("connect");
+    let new = server_leaf(&client.conn);
+    assert_ne!(new, old);
+    client.hello("alice").await;
+    client.expect_silence().await;
+    let serials = crl_serials(client.crl.as_ref().expect("CrlUpdate"), &server.ca());
+    assert!(
+        serials.contains(&serial_of(&old)),
+        "the replaced leaf is revoked"
+    );
+    assert!(!serials.contains(&serial_of(&new)));
+    assert!(
+        !server.dir.path().join("server.crt.retired").exists(),
+        "recorded, so no longer listed"
+    );
+    server.shutdown().await;
+}
+
 /// A crash between the two writes of a rotation leaves a server key that
 /// does not match the certificate. The next start issues a new leaf instead
 /// of failing forever, and the one it found is on the CRL.
@@ -1076,6 +1193,37 @@ async fn a_server_key_that_does_not_match_is_repaired_at_startup() {
     );
     assert!(!serials.contains(&serial_of(&new)));
     server.shutdown().await;
+}
+
+/// CA files that went missing while `users.toml` knows users — a partial
+/// restore, a migration that forgot them — are a startup error naming them,
+/// for the server and the offline CLI alike. A new CA, as before, would have
+/// locked out every registered user; only a state that never saw a user
+/// gets one.
+#[tokio::test]
+async fn a_lost_ca_is_not_replaced_while_users_are_on_record() {
+    let server = TestServer::start().await;
+    server.enroll("alice").await;
+    let TestServer { dir, handle } = server;
+    handle.shutdown().await;
+    for name in ["ca.crt", "ca.key"] {
+        std::fs::remove_file(dir.path().join(name)).expect("remove");
+    }
+
+    let config = icu_server::config::Config::for_test(dir.path());
+    let started = icu_server::run(config.clone()).await.err();
+    let offline = icu_server::Server::offline(config).err();
+    for error in [started, offline] {
+        let error = error.expect("no new CA").to_string();
+        assert!(
+            error.contains("ca.crt") && error.contains("ca.key"),
+            "names the files: {error}"
+        );
+        assert!(error.contains("README"), "points to the runbook: {error}");
+    }
+    for name in ["ca.crt", "ca.key"] {
+        assert!(!dir.path().join(name).exists(), "{name} was not created");
+    }
 }
 
 /// A server leaf close to expiry is rotated by the server itself, right at

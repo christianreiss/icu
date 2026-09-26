@@ -62,17 +62,6 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
         conn.set_max_concurrent_bi_streams(quinn::VarInt::from_u32(0));
     }
 
-    // The registration budget comes before the slot: a refused attempt must
-    // not first close a registration of the same bundle that is in progress.
-    if identity.registration {
-        if let Err(e) = enroll_budget(&server, &conn) {
-            tracing::info!(%remote, user_id = identity.user_id, error = %e, "rejected");
-            let code = ec::ENROLL_RATE_LIMITED;
-            wire::close(&conn, code);
-            return Err(e);
-        }
-    }
-
     // One live connection per certificate: this one wins (`PROTOCOL.md` §7).
     // A renew-only session has a table of its own: it must not kick a room
     // session still running on the same certificate.
@@ -81,17 +70,25 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
     } else {
         Slots::Room
     };
-    let Some(_live) = LiveCert::claim(&server, slots, &identity, &conn) else {
-        tracing::info!(
-            %remote,
-            user_id = identity.user_id,
-            "too many sessions outside the room, refusing"
-        );
-        wire::close(&conn, ec::SERVER_FULL);
-        return Err(Error::coded(
-            ec::SERVER_FULL,
-            "too many registration and renew-only sessions",
-        ));
+    // A registration pays its budget once there is room for it and before it
+    // takes the slot. Turned away as full — not fatal, the client comes back
+    // — it has spent nothing, or its retries would end in the fatal
+    // `ENROLL_RATE_LIMITED`; refused by the budget, it has not first closed
+    // a registration of the same bundle that is in progress.
+    let charge = || {
+        if identity.registration {
+            enroll_budget(&server, &conn)
+        } else {
+            Ok(())
+        }
+    };
+    let _live = match LiveCert::claim(&server, slots, &identity, &conn, charge) {
+        Ok(live) => live,
+        Err(e) => {
+            tracing::info!(%remote, user_id = identity.user_id, error = %e, "rejected");
+            wire::close(&conn, e.code().unwrap_or(ec::SERVER_FULL));
+            return Err(e);
+        }
     };
 
     let served = if identity.registration {
@@ -147,15 +144,18 @@ struct LiveCert {
 }
 
 impl LiveCert {
-    /// Takes the slot of `identity`'s certificate for `conn`. `None` when the
-    /// roomless table is full and `conn` would not replace an entry in it;
-    /// a replacement always gets in, the connection it replaces leaves.
+    /// Takes the slot of `identity`'s certificate for `conn`. `SERVER_FULL`
+    /// when the roomless table is full and `conn` would not replace an entry
+    /// in it; a replacement always gets in, the connection it replaces
+    /// leaves. With room, `charge` runs first, under the table's lock, and
+    /// its refusal is returned as it is.
     fn claim(
         server: &Arc<Server>,
         slots: Slots,
         identity: &Identity,
         conn: &quinn::Connection,
-    ) -> Option<LiveCert> {
+        charge: impl FnOnce() -> Result<()>,
+    ) -> Result<LiveCert> {
         let fp = identity.cert_fp.clone();
         let old = {
             let mut table = lock(slots.table(server));
@@ -163,8 +163,14 @@ impl LiveCert {
                 && table.len() >= pl::MAX_ROOMLESS_SESSIONS
                 && !table.contains_key(&fp)
             {
-                return None;
+                return Err(Error::coded(
+                    ec::SERVER_FULL,
+                    "too many registration and renew-only sessions",
+                ));
             }
+            // Lock order: the slot table, then `ip_limits` in `charge`;
+            // nothing takes them the other way round.
+            charge()?;
             table.insert(fp.clone(), (identity.user_id, conn.clone()))
         };
         if let Some((_, old)) = old.filter(|(_, old)| old.stable_id() != conn.stable_id()) {
@@ -176,7 +182,7 @@ impl LiveCert {
                 "certificate connected again, older connection replaced"
             );
         }
-        Some(LiveCert {
+        Ok(LiveCert {
             server: server.clone(),
             slots,
             fp,
@@ -1458,8 +1464,16 @@ async fn handle_create_invite(
     }
     // `issue` codes its refusals (`NAME_TAKEN` for a malformed or taken
     // label, `RATE_LIMITED`); anything uncoded is the server's own trouble,
-    // a failed write, and must not read as a taken name.
-    match crate::registration::issue(server, name, ttl_s).await {
+    // a failed write, and must not read as a taken name. Refused, it minted
+    // nothing: the token goes back, or a taken name, a full server or a disk
+    // problem would use up the admin's hour.
+    let issued = crate::registration::issue(server, name, ttl_s).await;
+    if issued.is_err() {
+        if let Some(bucket) = lock(&server.invite_budget).get_mut(&user_id) {
+            bucket.refund_one();
+        }
+    }
+    match issued {
         Ok(issued) => {
             tracing::info!(
                 user_id,

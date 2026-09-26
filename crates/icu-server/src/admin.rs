@@ -358,40 +358,62 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
 /// Rotation first, the CRL entry after: a rotation that fails must leave
 /// the live leaf alone — on the CRL, every client would refuse the server
 /// until the next rotation succeeded. When the CRL entry cannot be written,
-/// the new leaf is in use anyway and the old one stays pending
+/// the old leaf stays pending in the CA and in `server.crt.retired`
 /// ([`Ca::keep_retired_leaves`](crate::ca::Ca::keep_retired_leaves)) for
-/// the next rotation or restart.
+/// the next rotation or start. The error says which of the two halves is in
+/// force: the new leaf serves only once the TLS config is rebuilt, which
+/// needs a store write for the CRL number as well.
 pub async fn rotate_server_cert(server: &Arc<Server>) -> Result<()> {
     let recorded = {
         let mut store = server.store.lock().await;
         let mut ca = server.ca.write().await;
-        ca.rotate_server_cert(&server.config.tls, &server.config.server.server_name)?;
+        ca.rotate_server_cert(&server.config.tls, &server.config.server.server_name)
+            .context("no new server certificate, the current one stays in use")?;
         record_retired_leaves(&mut store, &mut ca)
     };
     // The new leaf and the CRL go live without a restart.
     let reloaded = crate::endpoint::reload_tls(server).await;
-    recorded.context(
-        "the new server certificate is in use, but the old one is not on the CRL yet \
-         (retried with the next rotation or restart)",
-    )?;
-    reloaded
+    const PENDING: &str = "the old one is not on the CRL yet (kept in server.crt.retired, \
+                           recorded with the next rotation or restart)";
+    match (recorded, reloaded) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) => Err(e.context(format!(
+            "the new server certificate is in use, but {PENDING}"
+        ))),
+        (Ok(()), Err(e)) => Err(e.context(
+            "the new server certificate is issued and the old one recorded for the CRL, \
+             but neither is in force before the next successful reload or restart",
+        )),
+        (Err(e), Err(_)) => Err(e.context(format!(
+            "the new server certificate is issued, but not in use before the next \
+             successful reload or restart, and {PENDING}"
+        ))),
+    }
 }
 
-/// Puts the server leaves the CA retired on the CRL, in one store write;
-/// keeps them pending in the CA when that fails.
+/// Puts the server leaves the CA retired on the CRL, in one store write, and
+/// then clears them from `server.crt.retired`; keeps them pending in the CA
+/// and in that file when the write fails.
 pub fn record_retired_leaves(store: &mut Store, ca: &mut crate::ca::Ca) -> Result<()> {
     let retired = ca.take_retired_leaves();
-    if retired.is_empty() {
-        return Ok(());
+    if !retired.is_empty() {
+        let entries: Vec<(String, String)> = retired
+            .iter()
+            .map(|der| (crate::ca::leaf_serial(der), crate::ca::leaf_not_after(der)))
+            .filter(|(serial, _)| !serial.is_empty())
+            .collect();
+        if let Err(e) = store.revoke_server_certs(&entries) {
+            ca.keep_retired_leaves(retired);
+            return Err(e);
+        }
     }
-    let entries: Vec<(String, String)> = retired
-        .iter()
-        .map(|der| (crate::ca::leaf_serial(der), crate::ca::leaf_not_after(der)))
-        .filter(|(serial, _)| !serial.is_empty())
-        .collect();
-    store.revoke_server_certs(&entries).inspect_err(|_| {
-        ca.keep_retired_leaves(retired);
-    })
+    // Also with nothing taken: a file still listing the leaf in use, from a
+    // rotation that failed, goes. One that cannot be removed only gets its
+    // leaves recorded once more at the next start.
+    if let Err(e) = ca.retired_recorded() {
+        tracing::warn!(error = %e, "cannot clear server.crt.retired");
+    }
+    Ok(())
 }
 
 /// Re-issues the CA certificate with the same key and subject, live without

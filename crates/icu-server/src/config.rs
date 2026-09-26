@@ -371,17 +371,9 @@ impl Config {
                 "server.server_name {server_name:?} is not a valid DNS name or IP address"
             )));
         }
-        // The shipped example must not end up in the CA and every
-        // certificate: fixing that later means a new CA, and every user
-        // registering again.
-        if reserved_name(server_name) {
-            return Err(Error::msg(format!(
-                "server.server_name {server_name:?} is a name reserved for examples \
-                 (RFC 2606); set it to the DNS name or IP address clients connect to, \
-                 before the first start or invite: it goes into the CA and every \
-                 certificate"
-            )));
-        }
+        // A name reserved for examples is not refused here but where it would
+        // be baked in anew (`Config::reserved_names`): an existing install
+        // already carrying one has to keep starting.
         if self.server.max_users < 1 || self.server.max_users > pl::MAX_MAX_USERS {
             return Err(Error::msg(format!(
                 "server.max_users must be 1..={}, got {}",
@@ -400,16 +392,6 @@ impl Config {
         if !public_host.is_ascii() || public_host.contains(char::is_whitespace) || !port_ok {
             return Err(Error::msg(format!(
                 "server.public_host {public_host:?} must be ASCII host:port"
-            )));
-        }
-        let host = public_host
-            .rsplit_once(':')
-            .map_or(public_host.as_str(), |(host, _)| host);
-        if reserved_name(host.trim_start_matches('[').trim_end_matches(']')) {
-            return Err(Error::msg(format!(
-                "server.public_host {public_host:?} names a host reserved for examples \
-                 (RFC 2606); set it to the host:port clients dial, it goes into every \
-                 client certificate"
             )));
         }
         Version::parse(&self.server.min_client)
@@ -471,6 +453,46 @@ impl Config {
         } else {
             format!("{host}:{port}")
         }
+    }
+
+    /// The names reserved for examples ([`reserved_name`]) among
+    /// `server_name` and the host of `public_host`, `server_name` first, each
+    /// as the message refusing it. The shipped example must not end up in the
+    /// CA and every certificate: fixing that later means a new CA, and every
+    /// user registering again. So they are refused where a name is baked in
+    /// for the first time — a new CA (`crate::open_ca`), the first invitation
+    /// (`registration::issue`) — and only warned about otherwise: an install
+    /// whose CA and certificates already carry one must keep starting.
+    pub fn reserved_names(&self) -> Vec<String> {
+        let server_name = self.server.server_name.trim();
+        let server_name = reserved_name(server_name).then(|| {
+            format!(
+                "server.server_name {server_name:?} is a name reserved for examples \
+                 (RFC 2606); set it to the DNS name or IP address clients connect to, \
+                 before the first start or invite: it goes into the CA and every \
+                 certificate"
+            )
+        });
+        server_name
+            .into_iter()
+            .chain(self.reserved_public_host())
+            .collect()
+    }
+
+    /// The part of [`Config::reserved_names`] about `public_host`, which goes
+    /// into every client certificate.
+    pub fn reserved_public_host(&self) -> Option<String> {
+        let public_host = self.public_host();
+        let host = public_host
+            .rsplit_once(':')
+            .map_or(public_host.as_str(), |(host, _)| host);
+        reserved_name(host.trim_start_matches('[').trim_end_matches(']')).then(|| {
+            format!(
+                "server.public_host {public_host:?} names a host reserved for examples \
+                 (RFC 2606); set it to the host:port clients dial, it goes into every \
+                 client certificate"
+            )
+        })
     }
 
     /// How many invitations may be open (issued, not confirmed) at once:
@@ -556,13 +578,16 @@ format = "text"
 "#;
         let mut config: Config = toml::from_str(text).unwrap();
         // The example names are placeholders: taken as they are, they would
-        // end up in the CA and every certificate.
-        let err = config.validate().unwrap_err().to_string();
+        // end up in a new CA and every certificate, which refuses them. An
+        // install whose CA already carries them still loads its config.
+        config.validate().unwrap();
+        let err = &config.reserved_names()[0];
         assert!(err.contains("server.server_name"), "{err}");
         config.server.server_name = "icu.home.arpa".into();
-        let err = config.validate().unwrap_err().to_string();
+        let err = &config.reserved_names()[0];
         assert!(err.contains("server.public_host"), "{err}");
         config.server.public_host = "icu.home.arpa:4711".into();
+        assert!(config.reserved_names().is_empty());
         config.validate().unwrap();
         assert_eq!(config.server.listen.len(), 2);
         assert_eq!(config.server.max_users, 16);
@@ -592,15 +617,26 @@ format = "text"
         let mut c = base();
         c.server.server_name = "icu.example.org".into();
         c.server.public_host = "localhost:4711".into();
-        let err = c.validate().unwrap_err().to_string();
+        let err = c.reserved_names().join("; ");
         assert!(err.contains("server.server_name"), "{err}");
+        assert!(!err.contains("server.public_host"), "{err}");
+        assert!(
+            c.validate().is_ok(),
+            "refused for a new CA, not in the config"
+        );
         let mut c = base();
         c.server.public_host = "icu.test:4711".into();
-        let err = c.validate().unwrap_err().to_string();
+        let err = c.reserved_names().join("; ");
         assert!(err.contains("server.public_host"), "{err}");
+        assert_eq!(c.reserved_public_host().as_ref(), Some(&err));
         let mut c = base();
         c.server.public_host = String::new();
-        assert!(c.validate().is_ok(), "falls back to localhost");
+        assert!(c.reserved_names().is_empty(), "falls back to localhost");
+        c.server.server_name = "icu.example.org".into();
+        assert!(
+            c.reserved_public_host().is_some(),
+            "the fallback carries the reserved server_name"
+        );
     }
 
     #[test]

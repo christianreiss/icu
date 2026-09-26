@@ -255,3 +255,69 @@ async fn in_band_invitations_are_rate_limited_per_admin() {
     let _ = server.invite("").await;
     server.shutdown().await;
 }
+
+/// Revoking an invitation nobody used frees its place under
+/// `limits.max_pending_invites` right away; it used to hold the place until
+/// it expired, up to a week.
+#[tokio::test]
+async fn a_revoked_invitation_frees_its_place() {
+    use icu_server::{AdminRequest, AdminResponse};
+    let server = TestServer::start_with(|c| c.limits.max_pending_invites = Some(1)).await;
+    // A confirmed admin first: the first bundle of an empty server is marked
+    // admin, and the last admin cannot be revoked.
+    server.enroll("admin").await;
+    let invite = |name: &str| {
+        server.handle.admin(AdminRequest::Invite {
+            name: name.to_string(),
+            ttl_s: None,
+        })
+    };
+    let first = invite("guest").await;
+    assert!(matches!(first, AdminResponse::Invite { .. }), "{first:?}");
+    let full = invite("guest2").await;
+    assert!(
+        matches!(&full, AdminResponse::Error { error, .. } if error == "RATE_LIMITED"),
+        "{full:?}"
+    );
+
+    let revoked = server
+        .handle
+        .admin(AdminRequest::Revoke {
+            user: "guest".into(),
+        })
+        .await;
+    assert!(
+        matches!(revoked, AdminResponse::Revoke { .. }),
+        "{revoked:?}"
+    );
+    let again = invite("guest2").await;
+    assert!(matches!(again, AdminResponse::Invite { .. }), "{again:?}");
+    server.shutdown().await;
+}
+
+/// A refused `CreateInviteRequest` — a taken name here — minted nothing and
+/// costs nothing of the admin's hourly budget; the token used to be taken
+/// before the bundle was issued, and refusals ate the hour.
+#[tokio::test]
+async fn a_refused_in_band_invitation_keeps_the_hourly_budget() {
+    let server = TestServer::start_with(|c| c.limits.invites_per_admin_per_hour = 1).await;
+    let mut admin = admin_client(&server).await;
+    for _ in 0..2 {
+        admin
+            .send_msg(&ControlMsg::CreateInviteRequest {
+                name: "ADMIN".into(),
+                ttl_s: 0,
+            })
+            .await;
+        match admin
+            .recv_matching(|m| matches!(m, ControlMsg::Error { .. }))
+            .await
+        {
+            Some(ControlMsg::Error { code, .. }) => assert_eq!(code, ec::NAME_TAKEN),
+            other => panic!("expected NAME_TAKEN, got {other:?}"),
+        }
+    }
+    assert_eq!(invite_code(&mut admin).await, None, "the hour's one bundle");
+    assert_eq!(invite_code(&mut admin).await, Some(ec::RATE_LIMITED));
+    server.shutdown().await;
+}
