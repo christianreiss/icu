@@ -15,9 +15,10 @@ Minimales Voice-System für eine feste Gruppe. Ein Server, ein Raum, keine Chann
 
 ## Installation
 
-Pakete für Fedora 42/43 (`.rpm`) und Debian 13 (`.deb`) unter
-https://github.com/christianreiss/icu/releases — `icu` ist der Client,
-`icu-server` der Server (Einrichtung: `deploy/README.md` §0).
+Pakete unter https://github.com/christianreiss/icu/releases: der Client `icu`
+für Fedora 42/43 (`.rpm`) und Debian 13 (`.deb`), der Server `icu-server` für
+Fedora, AlmaLinux 10+ (`.rpm`) und Debian 12+ (`.deb`) (Einrichtung:
+`deploy/README.md` §0).
 
 ## Nicht-Ziele
 

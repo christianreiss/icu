@@ -10,12 +10,12 @@ TOML-Dateien.
 ## 0. Pakete (rpm/deb)
 
 Fertige Pakete liegen unter https://github.com/christianreiss/icu/releases:
-`icu-server` (ein statisches Binary, dasselbe für Fedora und Debian) und der
-Client `icu` je Distro (Fedora 42, Fedora 43, Debian 13).
+`icu-server` (ein statisches Binary, dasselbe Paket für Fedora, AlmaLinux 10+
+und Debian 12+) und der Client `icu` je Distro (Fedora 42, Fedora 43, Debian 13).
 
 ```bash
-sudo dnf install ./icu-server-<ver>-1.x86_64.rpm        # Fedora
-sudo apt install ./icu-server_<ver>-1_amd64.deb          # Debian
+sudo dnf install ./icu-server-<ver>-1.x86_64.rpm        # Fedora, AlmaLinux 10+
+sudo apt install ./icu-server_<ver>-1_amd64.deb          # Debian 12+
 sudoedit /etc/icu/server.toml                            # server_name, public_host
 sudo systemctl enable --now icu-server
 sudo firewall-cmd --permanent --add-service=icu && sudo firewall-cmd --reload

@@ -54,10 +54,10 @@ mkdir -p target/pkg
 cat > "$notes" <<EOF
 ICU $VERSION
 
-**Server** (static binary, same package for Fedora and Debian):
+**Server** (static binary, one package for Fedora, AlmaLinux 10+ and Debian 12+):
 
-    sudo dnf install ./icu-server-$VERSION-*.x86_64.rpm     # Fedora
-    sudo apt install ./icu-server_${VERSION}-*_amd64.deb     # Debian
+    sudo dnf install ./icu-server-$VERSION-*.x86_64.rpm     # Fedora, AlmaLinux/EL 10+
+    sudo apt install ./icu-server_${VERSION}-*_amd64.deb     # Debian 12+
 
 then set \`server_name\`/\`public_host\` in \`/etc/icu/server.toml\` and
 \`sudo systemctl enable --now icu-server\`. Details: \`deploy/README.md\`.

@@ -6,7 +6,8 @@
 #
 # Environment:
 #   RELEASE=1          package release (iteration)
-#   DISTS="fc42 fc43 debian13"
+#   DISTS="fc42 fc43 debian13"        client distros (smoke-tested with the server)
+#   SERVER_DISTS="debian12 alma10"    smoke-tested with the server package only
 #   SKIP_TESTS=1       skip `cargo test --workspace` on the host
 #   SKIP_SMOKE=1       skip packaging/smoke.sh
 #   ALLOW_DIRTY=1      build from a dirty working tree (never for a release)
@@ -156,7 +157,8 @@ done
 (cd "$OUT" && rm -f SHA256SUMS && sha256sum -- *.rpm *.deb > SHA256SUMS)
 
 if [ "${SKIP_SMOKE:-0}" != 1 ]; then
-    VERSION=$VERSION RELEASE=$RELEASE DISTS=$DISTS packaging/smoke.sh
+    VERSION=$VERSION RELEASE=$RELEASE DISTS=$DISTS SERVER_DISTS=${SERVER_DISTS-"debian12 alma10"} \
+        packaging/smoke.sh
 fi
 
 log "done: $OUT"
