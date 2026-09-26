@@ -241,17 +241,14 @@ fn run(cli: Cli) -> Result<(), String> {
 }
 
 fn run_headless(engine: Engine, debug_stats: bool) -> Result<(), String> {
+    // The camera follows `camera_on` like in the window (a hotkey may switch
+    // it), retried with backoff when it will not start.
     #[cfg(feature = "camera")]
     let mut camera = {
-        let snapshot = engine.snapshot();
-        let mut handle = icu_client::camera::CameraHandle::new(engine.camera_link());
-        if snapshot.settings.camera.enabled {
+        if engine.snapshot().settings.camera.enabled {
             engine.command(icu_client::engine::Command::SetCamera(true));
-            if let Err(e) = handle.start(snapshot.settings.camera.device.as_deref()) {
-                tracing::warn!(%e, "camera");
-            }
         }
-        handle
+        icu_client::camera::CameraHandle::new(engine.camera_link())
     };
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
@@ -270,6 +267,13 @@ fn run_headless(engine: Engine, debug_stats: bool) -> Result<(), String> {
                 eprintln!("icu: connection {:?}, {} peers", s.conn, s.peers.len());
                 last_conn = Some(s.conn.clone());
             }
+        }
+        // On a copy: opening a camera takes a while, and a held borrow
+        // would block the engine's next state update.
+        #[cfg(feature = "camera")]
+        {
+            let snapshot = state.borrow().clone();
+            camera.sync(&snapshot);
         }
         if debug_stats && last_report.elapsed() >= Duration::from_secs(2) {
             last_report = std::time::Instant::now();

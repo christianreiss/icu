@@ -20,7 +20,8 @@ use openh264::{
 };
 
 use crate::{
-    engine::{AppState, CameraLink},
+    engine::{AppState, CameraLink, Command},
+    problem::Problem,
     video::VideoTier,
 };
 
@@ -301,24 +302,46 @@ pub fn encoder(tier: VideoTier) -> Result<Encoder, String> {
     Encoder::with_api_config(OpenH264API::from_source(), cfg).map_err(|e| e.to_string())
 }
 
+/// Failed frames in a row after which the capture thread gives up (about
+/// 5 s at one attempt per 200 ms): the device stopped delivering — unplugged,
+/// or taken by another program — and is opened anew by
+/// [`CameraHandle::sync`], with backoff.
+const MAX_FAILED_FRAMES: u32 = 25;
+
+/// Failed starts in a row after which [`CameraHandle::sync`] stops trying
+/// and switches the camera off (`Command::CameraFailed`).
+const MAX_FAILURES: u32 = 5;
+
+/// The wait before the next start after `failures` failed ones: 1, 2, 4 …
+/// up to 30 s.
+fn backoff(failures: u32) -> Duration {
+    Duration::from_secs(1u64 << failures.saturating_sub(1).min(5)).min(Duration::from_secs(30))
+}
+
 /// Encoder thread loop: capture → encode → send. `preview` receives every
 /// captured picture for the settings preview, regardless of tier, so the
 /// settings preview keeps working even while video is paused for everyone
-/// else.
+/// else. While `live` is off the thread only captures for that preview —
+/// nothing is encoded or sent (`CameraHandle::set_preview`).
 ///
-/// The encoder is rebuilt whenever `link.send_tier()` changes: openh264's
-/// safe Rust binding exposes no runtime bitrate mutator, so a tier change
-/// means a fresh `Encoder`. That is cheap relative to how rarely
-/// `QualityController` actually steps (bounded by its own hysteresis), and a
-/// freshly built encoder's first frame is an IDR regardless of
-/// `force_intra_frame` (`encoder_emits_idr_on_request` below), so SPS/PPS
-/// ride along for free — no separate flush logic is needed.
+/// The encoder is rebuilt whenever the tier changes (`link.send_tier()`,
+/// or paused while not `live`): openh264's safe Rust binding exposes no
+/// runtime bitrate mutator, so a tier change means a fresh `Encoder`. That
+/// is cheap relative to how rarely `QualityController` actually steps
+/// (bounded by its own hysteresis), and a freshly built encoder's first
+/// frame is an IDR regardless of `force_intra_frame`
+/// (`encoder_emits_idr_on_request` below), so SPS/PPS ride along for free —
+/// no separate flush logic is needed.
+///
+/// Returns once `stop` is set, or with the last error after
+/// [`MAX_FAILED_FRAMES`] failed frames in a row.
 pub fn run_sender(
     mut source: Box<dyn FrameSource>,
     link: CameraLink,
     stop: Arc<AtomicBool>,
+    live: Arc<AtomicBool>,
     preview: Arc<PreviewSlot>,
-) {
+) -> Result<(), String> {
     // No encoder while paused: `run_sender` stops encoding rather than
     // building one with a zero bitrate.
     let build = |tier: VideoTier| -> Result<Option<Encoder>, String> {
@@ -328,14 +351,9 @@ pub fn run_sender(
             encoder(tier).map(Some)
         }
     };
-    let mut tier = link.send_tier();
-    let mut enc = match build(tier) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!(%e, "openh264 encoder");
-            return;
-        }
-    };
+    // Built with the first frame that is to go out.
+    let mut tier = VideoTier::T4;
+    let mut enc: Option<Encoder> = None;
     let start = Instant::now();
     let mut last_idr = Instant::now() - IDR_INTERVAL;
     let mut yuv: Option<YUVBuffer> = None;
@@ -360,6 +378,9 @@ pub fn run_sender(
                     },
                 );
                 failed += 1;
+                if failed >= MAX_FAILED_FRAMES {
+                    return Err(e);
+                }
                 if failed == 1 {
                     tracing::warn!(%e, "camera frame");
                 } else {
@@ -375,11 +396,15 @@ pub fn run_sender(
         }
         preview.put(frame.clone());
 
-        let new_tier = link.send_tier();
+        let new_tier = if live.load(Ordering::Relaxed) {
+            link.send_tier()
+        } else {
+            VideoTier::T4
+        };
         if new_tier != tier {
             tier = new_tier;
             enc = build(tier).unwrap_or_else(|e| {
-                tracing::error!(%e, "openh264 encoder rebuild");
+                tracing::error!(%e, "openh264 encoder");
                 None
             });
             last_idr = Instant::now() - IDR_INTERVAL;
@@ -387,9 +412,9 @@ pub fn run_sender(
         }
 
         let Some(enc) = enc.as_mut() else {
-            // Paused: still drain keyframe requests so none is lost across
-            // the pause/resume boundary — the next encoder's first frame is
-            // an IDR anyway once video resumes.
+            // Paused or preview only: still drain keyframe requests so none
+            // is lost across the pause/resume boundary — the next encoder's
+            // first frame is an IDR anyway once video resumes.
             let _ = link.take_keyframe_request();
             continue;
         };
@@ -429,6 +454,7 @@ pub fn run_sender(
             Err(e) => tracing::warn!(%e, "h264 encode"),
         }
     }
+    Ok(())
 }
 
 /// Whether `buf` is already the right size to be overwritten in place.
@@ -437,60 +463,137 @@ fn dimensions_match(buf: &YUVBuffer, w: usize, h: usize) -> bool {
     buf.dimensions() == (w, h)
 }
 
-/// Owns the camera thread; started/stopped from the UI according to
-/// `AppState::camera_on`.
+/// Opens the capture source for a device setting: an index (default 0), or
+/// `synthetic` for the test pattern.
+pub type Opener = Box<dyn FnMut(Option<&str>) -> Result<Box<dyn FrameSource>, String> + Send>;
+
+/// The real devices: nokhwa by index, or the test pattern.
+fn open_device(device: Option<&str>) -> Result<Box<dyn FrameSource>, String> {
+    Ok(match device {
+        Some("synthetic") => Box::new(SyntheticSource::new()),
+        Some(idx) => Box::new(NokhwaSource::open(
+            idx.parse()
+                .map_err(|_| "camera device must be an index".to_string())?,
+        )?),
+        None => Box::new(NokhwaSource::open(0)?),
+    })
+}
+
+/// A running capture thread.
+struct Capture {
+    thread: JoinHandle<Result<(), String>>,
+    stop: Arc<AtomicBool>,
+    /// Encode and send (`camera_on`); off captures for the preview only.
+    live: Arc<AtomicBool>,
+    /// The device setting it was opened for.
+    device: Option<String>,
+    /// `PreviewSlot::seq` when it started: if the thread fails after
+    /// that moved, the camera did work, and the failure streak starts over.
+    seq_at_start: u64,
+}
+
+/// Failed starts in a row and when the next one may run.
+#[derive(Debug, Default)]
+struct Retry {
+    failures: u32,
+    next: Option<Instant>,
+}
+
+impl Retry {
+    /// Whether a start may be tried at `now`.
+    fn may_try(&self, now: Instant) -> bool {
+        self.failures < MAX_FAILURES && self.next.is_none_or(|next| now >= next)
+    }
+
+    /// Books a failed start; `false` once it is time to give up.
+    fn failed(&mut self, now: Instant) -> bool {
+        self.failures += 1;
+        self.next = Some(now + backoff(self.failures));
+        self.failures < MAX_FAILURES
+    }
+
+    fn reset(&mut self) {
+        *self = Retry::default();
+    }
+}
+
+/// Owns the camera thread, following `AppState::camera_on` and the local
+/// preview through [`CameraHandle::sync`], which the window calls on every
+/// frame (and `--headless` on every state change).
+///
+/// A camera that will not start is retried with backoff (1, 2, 4 … 30 s),
+/// not on every call; after five failed starts in a row it is switched off
+/// and the reason shown (`Command::CameraFailed`). A device change, the
+/// camera or the preview switched on anew start over.
 pub struct CameraHandle {
     link: CameraLink,
-    thread: Option<(JoinHandle<()>, Arc<AtomicBool>)>,
+    thread: Option<Capture>,
     preview: Arc<PreviewSlot>,
-    device: Option<String>,
+    opener: Opener,
+    /// Capture for the local preview while the camera is off.
+    preview_wanted: bool,
+    retry: Retry,
+    /// `(camera_on, preview_wanted, device)` as of the last `sync`.
+    last: (bool, bool, Option<String>),
 }
 
 impl CameraHandle {
     /// New, camera off.
     pub fn new(link: CameraLink) -> CameraHandle {
+        CameraHandle::with_opener(link, Box::new(open_device))
+    }
+
+    /// New, with another way to open a device (tests).
+    pub fn with_opener(link: CameraLink, opener: Opener) -> CameraHandle {
         CameraHandle {
             link,
             thread: None,
             preview: Arc::new(PreviewSlot::default()),
-            device: None,
+            opener,
+            preview_wanted: false,
+            retry: Retry::default(),
+            last: (false, false, None),
         }
     }
 
-    /// Starts with an explicit source (tests).
+    /// Starts with an explicit source, sending (tests).
     pub fn start_with(&mut self, source: Box<dyn FrameSource>) {
-        self.stop();
-        let stop = Arc::new(AtomicBool::new(false));
-        let link = self.link.clone();
-        let preview = self.preview.clone();
-        let stop_t = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name("icu-camera".into())
-            .spawn(move || run_sender(source, link, stop_t, preview))
-            .expect("camera thread");
-        self.thread = Some((thread, stop));
+        self.spawn(source, None, true);
     }
 
-    /// Starts the real camera; `device` is an index (default 0) or
-    /// `synthetic`.
+    fn spawn(&mut self, source: Box<dyn FrameSource>, device: Option<String>, live: bool) {
+        self.stop();
+        let stop = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicBool::new(live));
+        let link = self.link.clone();
+        let preview = self.preview.clone();
+        let (stop_t, live_t) = (stop.clone(), live.clone());
+        let thread = std::thread::Builder::new()
+            .name("icu-camera".into())
+            .spawn(move || run_sender(source, link, stop_t, live_t, preview))
+            .expect("camera thread");
+        self.thread = Some(Capture {
+            thread,
+            stop,
+            live,
+            device,
+            seq_at_start: self.preview.seq.load(Ordering::Acquire),
+        });
+    }
+
+    /// Opens `device` (an index, default 0, or `synthetic`) and starts
+    /// sending from it.
     pub fn start(&mut self, device: Option<&str>) -> Result<(), String> {
-        let source: Box<dyn FrameSource> = match device {
-            Some("synthetic") => Box::new(SyntheticSource::new()),
-            Some(idx) => Box::new(NokhwaSource::open(
-                idx.parse()
-                    .map_err(|_| "camera device must be an index".to_string())?,
-            )?),
-            None => Box::new(NokhwaSource::open(0)?),
-        };
-        self.start_with(source);
+        let source = (self.opener)(device)?;
+        self.spawn(source, device.map(str::to_owned), true);
         Ok(())
     }
 
     /// Stops the thread.
     pub fn stop(&mut self) {
-        if let Some((thread, stop)) = self.thread.take() {
-            stop.store(true, Ordering::Relaxed);
-            let _ = thread.join();
+        if let Some(capture) = self.thread.take() {
+            capture.stop.store(true, Ordering::Relaxed);
+            let _ = capture.thread.join();
         }
         self.preview.clear();
     }
@@ -500,17 +603,102 @@ impl CameraHandle {
         self.thread.is_some()
     }
 
-    /// Follows the UI state.
+    /// Failed starts in a row; reset by a successful picture, a device
+    /// change or switching the camera on anew.
+    pub fn failures(&self) -> u32 {
+        self.retry.failures
+    }
+
+    /// Captures for the local preview even while the camera is off — „is
+    /// this the right camera, and is it pointing at me?“ before anyone sees
+    /// it. Nothing is encoded or sent and `CAMERA_ON` stays as it is; the
+    /// pictures go to [`CameraHandle::preview_source`]. The window turns it
+    /// on while Settings → Kamera is open. Takes effect with the next
+    /// [`CameraHandle::sync`].
+    pub fn set_preview(&mut self, on: bool) {
+        self.preview_wanted = on;
+    }
+
+    /// Follows the state: captures while the camera is on or the preview is
+    /// wanted, sends only while the camera is on.
     pub fn sync(&mut self, state: &AppState) {
+        let camera_on = state.camera_on;
         let device = state.settings.camera.device.clone();
-        if state.camera_on && (!self.running() || device != self.device) {
-            self.device = device.clone();
-            if let Err(e) = self.start(device.as_deref()) {
-                tracing::warn!(%e, "camera");
+        let wanted = camera_on || self.preview_wanted;
+        let (was_on, was_preview, was_device) = &self.last;
+        // Switched on anew, another device, or nothing wanted: a clean slate.
+        if (camera_on && !was_on)
+            || (self.preview_wanted && !was_preview)
+            || device != *was_device
+            || !wanted
+        {
+            self.retry.reset();
+        }
+        self.last = (camera_on, self.preview_wanted, device.clone());
+
+        // A thread that ended by itself: the camera stopped delivering.
+        if self.thread.as_ref().is_some_and(|c| c.thread.is_finished()) {
+            if let Some(capture) = self.thread.take() {
+                let delivered = self.preview.seq.load(Ordering::Acquire) != capture.seq_at_start;
+                self.preview.clear();
+                match capture.thread.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if delivered {
+                            self.retry.reset();
+                        }
+                        self.failed(e);
+                    }
+                    Err(_) => self.failed("camera thread panicked".into()),
+                }
             }
-        } else if !state.camera_on && self.running() {
+        }
+
+        if !wanted {
+            if self.running() {
+                self.stop();
+            }
+            return;
+        }
+        if self.thread.as_ref().is_some_and(|c| c.device != device) {
             self.stop();
         }
+        if !self.running() {
+            if !self.retry.may_try(Instant::now()) {
+                return;
+            }
+            match (self.opener)(device.as_deref()) {
+                Ok(source) => self.spawn(source, device, camera_on),
+                Err(e) => {
+                    self.failed(e);
+                    return;
+                }
+            }
+        }
+        if let Some(capture) = &self.thread {
+            capture.live.store(camera_on, Ordering::Relaxed);
+            // Pictures arrive: whatever failed before is over.
+            if self.retry.failures > 0
+                && self.preview.seq.load(Ordering::Acquire) != capture.seq_at_start
+            {
+                self.retry.reset();
+            }
+        }
+    }
+
+    /// Books a failed start: retry later, or give up — the engine switches
+    /// the camera off (if it is on) and shows why.
+    fn failed(&mut self, e: String) {
+        if self.retry.failed(Instant::now()) {
+            tracing::warn!(%e, retry_in = ?backoff(self.retry.failures), "camera");
+            return;
+        }
+        tracing::warn!(%e, failures = self.retry.failures, "camera given up");
+        self.link.command(Command::CameraFailed(Problem::new(
+            "Die Kamera lässt sich nicht verwenden. Ist sie angeschlossen und nicht gerade von \
+             einem anderen Programm belegt?",
+            e,
+        )));
     }
 
     /// The slot the capture thread writes every picture into, shared so a
@@ -630,6 +818,39 @@ mod tests {
         );
         assert!(matches!(types[1].0, FrameType::P));
         assert!(types.iter().all(|(_, n)| *n > 0));
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_30_s() {
+        let secs: Vec<u64> = (1..=8).map(|n| backoff(n).as_secs()).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(backoff(u32::MAX), Duration::from_secs(30));
+    }
+
+    /// Once per backoff, not once per window frame; given up after five.
+    #[test]
+    fn a_failing_start_waits_and_gives_up() {
+        let mut retry = Retry::default();
+        let t0 = Instant::now();
+        assert!(retry.may_try(t0));
+        assert!(retry.failed(t0));
+        assert!(!retry.may_try(t0 + Duration::from_millis(999)), "backoff");
+        assert!(retry.may_try(t0 + Duration::from_secs(1)));
+        let mut now = t0;
+        for n in 2..MAX_FAILURES {
+            now += backoff(n - 1);
+            assert!(retry.may_try(now));
+            assert!(retry.failed(now), "failure {n} is retried");
+        }
+        now += backoff(MAX_FAILURES - 1);
+        assert!(retry.may_try(now));
+        assert!(!retry.failed(now), "the fifth gives up");
+        assert!(
+            !retry.may_try(now + Duration::from_secs(3600)),
+            "until reset"
+        );
+        retry.reset();
+        assert!(retry.may_try(now));
     }
 
     /// A `w × h` picture whose every pixel says where it is: R = x, G = y.

@@ -347,6 +347,9 @@ pub enum Command {
     RetryHotkeys,
     /// Toggle the camera (hotkey).
     ToggleCamera,
+    /// The camera would not start (`crate::camera::CameraHandle` gave up
+    /// after repeated failures): show why, and switch it off if it is on.
+    CameraFailed(Problem),
 }
 
 /// An `f32` the audio threads read every block without a lock.
@@ -2118,6 +2121,12 @@ impl LocalState {
                 let on = !self.flags.camera_on();
                 return self.handle_local(Command::SetCamera(on), shared);
             }
+            Command::CameraFailed(problem) => {
+                shared.state.send_modify(|s| s.banner = Some(problem));
+                if self.flags.camera_on() {
+                    return self.handle_local(Command::SetCamera(false), shared);
+                }
+            }
         }
         set_state
     }
@@ -3274,9 +3283,15 @@ impl From<NetError> for EngineError {
 pub struct CameraLink {
     shared: Arc<Shared>,
     runtime: tokio::runtime::Handle,
+    cmd: mpsc::UnboundedSender<Command>,
 }
 
 impl CameraLink {
+    /// Sends a command to the engine (the camera switching itself off).
+    pub fn command(&self, cmd: Command) {
+        let _ = self.cmd.send(cmd);
+    }
+
     /// Sends one encoded frame on the live connection; `Err` when not
     /// connected or when flow control dropped it.
     pub fn send_frame(&self, keyframe: bool, ts: u32, data: &[u8]) -> Result<(), String> {
@@ -3376,6 +3391,7 @@ impl Engine {
         CameraLink {
             shared: self.shared.clone(),
             runtime: self.runtime(),
+            cmd: self.cmd_tx.clone(),
         }
     }
 
