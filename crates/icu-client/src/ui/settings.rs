@@ -2888,6 +2888,8 @@ pub(super) fn binding_row(
                 } else {
                     widgets::chip(ui, &shown, 0.0).on_hover_text(if portal {
                         "Über die Arbeitsumgebung (Portal)"
+                    } else if cfg!(target_os = "windows") {
+                        "Direkt gelesen (Raw Input)"
                     } else {
                         "Direkt gelesen (evdev)"
                     });
@@ -2950,7 +2952,11 @@ pub(super) fn binding_row(
                     ui.add(
                         egui::TextEdit::singleline(&mut binding.key)
                             .desired_width(120.0)
-                            .hint_text("evdev"),
+                            .hint_text(if cfg!(target_os = "windows") {
+                                "Taste"
+                            } else {
+                                "evdev"
+                            }),
                     );
                     let mut trigger = binding.trigger.clone().unwrap_or_default();
                     if ui

@@ -86,7 +86,7 @@ impl From<&str> for BackendError {
 }
 
 /// The backend contract. Implemented by PipeWire (Linux), the cpal fallback,
-/// the test double and — as `Unsupported` stubs — Windows.
+/// the test double and WASAPI (Windows).
 pub trait AudioBackend: Send {
     /// Short backend name for the UI ("pipewire", "cpal", "fake").
     fn name(&self) -> &'static str;

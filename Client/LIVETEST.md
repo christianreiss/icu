@@ -156,3 +156,11 @@ Stand 2026-09-26: der Windows-Client ist gebaut (`packaging/windows/build.sh` �
 - [ ] **Tray** (offen): Icon-Varianten, Menü, Doppelklick, „Beim Schließen“ Infobereich/Minimieren/Beenden.
 - [ ] **Kamera** (offen): MediaFoundation-Kamera, Vorschau, Bild beim Gegenüber.
 - [ ] **Beenden** (offen): Abmelden/Herunterfahren mit laufendem ICU → sauberes Ende (letzte Einstellung gespeichert), kein „Diese App verhindert das Herunterfahren“; Strg+C in der Konsole.
+
+Bekannte Abweichungen von Linux (Paritäts-Audit 2026-09-26), gezielt prüfen:
+
+- [ ] **AEC-Paarung** (offen, Hardware): `dsp::refalign` erwartet Mikrofon und Referenz im selben Graph-Zyklus (PipeWire `node.group`); unter WASAPI laufen Capture (Event) und Loopback (5-ms-Abfrage) unabhängig. ERLE und Verzögerung messen, auch direkt nach einem Wechsel des Standardgeräts (der Stream öffnet sich im Backend neu, ohne dass die Engine den AEC neu startet).
+- [ ] **Loopback ohne Wiedergabe** (offen): schlägt nur der Lautsprecher beim Öffnen fehl und spielt sonst nichts, liefert Loopback nichts, und die DSP wartet pro Block auf die Referenz.
+- [ ] **Tastenkombinationen**: Windows bindet nur `key`, keine Portal-`trigger`; ein Linux-Passport mit reinem Portal-Trigger kommt ohne PTT-Taste an.
+- [ ] **Standardgerät**: gefolgt wird der Rolle „Standardgerät“ (eConsole), nicht „Standardkommunikationsgerät“.
+- [ ] **Abmelden**: `WM_ENDSESSION` hält bis zu 5 s ohne `ShutdownBlockReasonCreate`.

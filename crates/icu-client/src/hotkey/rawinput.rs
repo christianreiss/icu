@@ -20,7 +20,7 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc as std_mpsc, Arc, Mutex, OnceLock,
+        mpsc as std_mpsc, Arc, Mutex,
     },
     time::Duration,
 };
@@ -110,11 +110,18 @@ impl Hub {
     }
 }
 
-/// The reader, started on first use; its error if it could not be.
-static READER: OnceLock<Result<Arc<Hub>, String>> = OnceLock::new();
+static READER: Mutex<Option<Arc<Hub>>> = Mutex::new(None);
 
+/// The running reader, started on first use; a start that failed is tried
+/// again on the next use („Erneut versuchen“, a new binding).
 fn hub() -> Result<Arc<Hub>, String> {
-    READER.get_or_init(start_reader).clone()
+    let mut reader = READER.lock().unwrap();
+    if let Some(hub) = &*reader {
+        return Ok(hub.clone());
+    }
+    let hub = start_reader()?;
+    *reader = Some(hub.clone());
+    Ok(hub)
 }
 
 /// The hub the window procedure feeds, and the keys held down (to drop
@@ -253,6 +260,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Err(e) = register(hwnd) {
                     tracing::warn!(%e, "raw input");
                 }
+                // A release that went to the other window is lost: let go
+                // of every key held, or push-to-talk would stay open and
+                // the next press be taken for auto-repeat.
+                release_all();
             }
             return LRESULT(0);
         }
@@ -334,6 +345,21 @@ fn transitions(input: &RAWINPUT) -> Vec<(u16, bool)> {
         .collect();
     }
     Vec::new()
+}
+
+/// Releases every key held (after the keys were someone else's).
+fn release_all() {
+    let released = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let s = s.as_mut()?;
+        let held: Vec<u16> = s.held.drain().collect();
+        Some((s.hub.clone(), held))
+    });
+    if let Some((hub, held)) = released {
+        for code in held {
+            hub.emit(code, false);
+        }
+    }
 }
 
 /// Passes a transition on, without the auto-repeat a held key sends.
