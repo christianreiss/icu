@@ -51,6 +51,9 @@ Der Server wird mit dem Profil `release-server` gebaut (`Cargo.toml`): das
 Verbindung beendet dann nur diese — der Server protokolliert ihn, nimmt die
 Sitzung aus dem Raum und alle anderen Gespräche laufen weiter —, statt den
 Prozess und damit jedes Gespräch zu beenden. Der Client bleibt bei `abort`.
+Ein mit schlichtem `--release` gebauter Server läuft auch, warnt aber beim
+Start (`built with panic = "abort"`): bei ihm beendet ein Panic in einer
+Sitzung den ganzen Server.
 
 ### Statisches musl-Binary (Auslieferung)
 

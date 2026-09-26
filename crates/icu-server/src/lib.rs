@@ -322,6 +322,15 @@ pub async fn run(config: Config) -> Result<Handle> {
         }
     };
 
+    // Built with plain `--release`, the containment of `spawn_logged` and
+    // `session::Seat` is gone: a panic aborts the process.
+    if cfg!(panic = "abort") {
+        tracing::warn!(
+            "built with panic = \"abort\": a panic in one session ends the whole \
+             server and every call on it; build it with `cargo build --profile \
+             release-server`"
+        );
+    }
     tracing::info!(
         addrs = ?addrs,
         max_users = server.config.server.max_users,
@@ -473,8 +482,9 @@ fn renewal_due(days_left: Option<i64>, validity_days: u32, cap_days: i64) -> boo
 /// Spawns `task` and watches its `JoinHandle` instead of dropping it, so a
 /// panic in it is logged with `what` rather than lost. With the server's
 /// `panic = "unwind"` (`[profile.release-server]`) a panic ends only this
-/// task; the process and every other connection keep running. Returns the
-/// handle to abort the task with.
+/// task; the process and every other connection keep running. Built with
+/// `panic = "abort"` it ends the process, which [`run`] warns about. Returns
+/// the handle to abort the task with.
 pub(crate) fn spawn_logged<F>(what: impl std::fmt::Display + Send + 'static, task: F) -> AbortHandle
 where
     F: std::future::Future<Output = ()> + Send + 'static,
