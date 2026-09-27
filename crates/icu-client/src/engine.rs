@@ -668,8 +668,9 @@ struct Shared {
     cap_prod: Arc<Mutex<HeapProd<f32>>>,
     ref_prod: Arc<Mutex<HeapProd<f32>>>,
     play_cons: Arc<Mutex<HeapCons<f32>>>,
-    /// Largest block the playback callback has asked for; the mixer keeps
-    /// at least that much plus a block queued, whatever the graph quantum.
+    /// Largest block the playback callback has asked for since the mixer
+    /// last took it ([`RecentRequest`]); the mixer keeps at least that much
+    /// plus a block queued, whatever the graph quantum.
     play_request: Arc<AtomicUsize>,
     /// The streams the last open could not open (`FAILED_CAPTURE` …); the
     /// audio events thread has them retried alone ([`StreamRetry`]).
@@ -2009,6 +2010,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
     let mut indicator_changes: Vec<(Session, Option<bool>)> =
         Vec::with_capacity(pl::MAX_MAX_USERS as usize);
     let mut stalled_since: Option<Instant> = None;
+    let mut request = RecentRequest::new(Instant::now());
     // 120 ms, the longest frame Opus allows: a peer picks its frame length.
     let mut fec_scratch = vec![0.0f32; 5760];
     loop {
@@ -2018,7 +2020,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
         // Keep two blocks (20 ms) ahead of the playback callback, or one
         // callback plus a block when the graph quantum is larger than that.
         let lead = (2 * BLOCK)
-            .max(shared.play_request.load(Ordering::Relaxed) + BLOCK)
+            .max(request.get(&shared.play_request, Instant::now()) + BLOCK)
             .min(play.capacity().get() - BLOCK);
         if play.occupied_len() >= lead {
             // If nobody consumes (no playback stream), keep the jitter buffers
@@ -2197,6 +2199,36 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
             });
             indicator_changes.clear();
         }
+    }
+}
+
+/// How long a playback request sets the mixer's lead ([`RecentRequest`]).
+const PLAY_REQUEST_WINDOW: Duration = Duration::from_secs(2);
+
+/// The largest playback request of the current and the previous
+/// [`PLAY_REQUEST_WINDOW`]: the callback raises [`Shared::play_request`],
+/// the mixer takes it every window. A graph quantum that grew for a while —
+/// another client asking for 8192 samples — used to hold the lead at ~190 ms
+/// until the next reopen; now it follows the quantum back within 2–4 s.
+struct RecentRequest {
+    prev: usize,
+    since: Instant,
+}
+
+impl RecentRequest {
+    fn new(now: Instant) -> RecentRequest {
+        RecentRequest {
+            prev: 0,
+            since: now,
+        }
+    }
+
+    fn get(&mut self, current: &AtomicUsize, now: Instant) -> usize {
+        if now.saturating_duration_since(self.since) >= PLAY_REQUEST_WINDOW {
+            self.prev = current.swap(0, Ordering::Relaxed);
+            self.since = now;
+        }
+        self.prev.max(current.load(Ordering::Relaxed))
     }
 }
 
@@ -4880,6 +4912,24 @@ mod tests {
         assert!(!r.due(at(120), false), "open now");
         assert!(!r.due(at(121), true));
         assert!(r.due(at(122), true), "the next failure starts at 1 s again");
+    }
+
+    /// The mixer's lead follows a graph quantum back down once the large
+    /// requests have stopped for two windows.
+    #[test]
+    fn the_playback_lead_follows_the_quantum_down() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let callback = AtomicUsize::new(0);
+        let mut r = RecentRequest::new(t0);
+        callback.fetch_max(8192, Ordering::Relaxed);
+        assert_eq!(r.get(&callback, at(10)), 8192);
+        callback.fetch_max(256, Ordering::Relaxed);
+        assert_eq!(r.get(&callback, at(2100)), 8192, "the last window's");
+        callback.fetch_max(256, Ordering::Relaxed);
+        assert_eq!(r.get(&callback, at(4200)), 256, "followed it down");
+        callback.fetch_max(1024, Ordering::Relaxed);
+        assert_eq!(r.get(&callback, at(4300)), 1024, "up again at once");
     }
 
     /// Audio of a session nobody announced plays at 0 % until `admit`
