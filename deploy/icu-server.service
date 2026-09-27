@@ -6,6 +6,8 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/bin/icu-server run --config /etc/icu/server.toml
 DynamicUser=yes
+# Private by default, including temporary files created during key rotation.
+UMask=0077
 # The static group `icu` (sysusers) as the service's primary group, with a
 # dynamic user: /run/icu then belongs to icu-server:icu, so members of `icu`
 # (admins, the Checkmk agent) can reach /run/icu/admin.sock (0660, group

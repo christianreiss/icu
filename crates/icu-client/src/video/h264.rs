@@ -178,7 +178,11 @@ mod tests {
             let mut out: Vec<u8> = self
                 .bits
                 .chunks(8)
-                .map(|c| c.iter().enumerate().fold(0, |a, (i, &b)| a | (u8::from(b) << (7 - i))))
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .fold(0, |a, (i, &b)| a | (u8::from(b) << (7 - i)))
+                })
                 .collect();
             out.push(0x80); // rbsp stop bit
             out
@@ -241,10 +245,7 @@ mod tests {
     #[test]
     fn high_profiles_and_extensions_are_refused() {
         assert_eq!(check(&sps(100, 20, 15, 1)), Err(Reject::Profile(100)));
-        assert_eq!(
-            check(&[0, 0, 0, 1, 0x6f, 0x42]),
-            Err(Reject::Extension(15))
-        );
+        assert_eq!(check(&[0, 0, 0, 1, 0x6f, 0x42]), Err(Reject::Extension(15)));
         assert_eq!(check(&[0, 0, 1, 0x74, 0]), Err(Reject::Extension(20)));
     }
 
@@ -257,7 +258,10 @@ mod tests {
 
     #[test]
     fn emulation_prevention_is_removed() {
-        assert_eq!(unescape(&[1, 0, 0, 3, 0, 0, 0, 3, 1]), vec![1, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(
+            unescape(&[1, 0, 0, 3, 0, 0, 0, 3, 1]),
+            vec![1, 0, 0, 0, 0, 0, 1]
+        );
         // Zero constraint flags and level put `00 00` after the profile.
         assert_eq!(check(&sps(66, 1, 1, 0)), Ok(()));
     }

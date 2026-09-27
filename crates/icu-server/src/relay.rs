@@ -278,6 +278,14 @@ impl Slot {
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
     }
+
+    /// Only the forwarder waits on this notification. Offers wake it too;
+    /// the latest offered frame stays in `waiting` until this write ends.
+    async fn closed(&self) {
+        while !self.is_closed() {
+            self.notify.notified().await;
+        }
+    }
 }
 
 /// Relays one incoming video frame (`PROTOCOL.md` §4).
@@ -353,14 +361,14 @@ pub async fn video(
         budget.bitrate.charge(VIDEO_HEADER_LEN as f64);
     }
 
-    let mut payload = Vec::new();
+    let mut frame = Vec::from(header);
     let read = tokio::time::timeout_at(deadline, async {
         while let Some(chunk) = recv.read_chunk(usize::MAX, true).await? {
             lock(&budget).bitrate.charge(chunk.bytes.len() as f64);
-            if payload.len() + chunk.bytes.len() > VIDEO_MAX_FRAME {
+            if frame.len() + chunk.bytes.len() > VIDEO_HEADER_LEN + VIDEO_MAX_FRAME {
                 return Ok(false);
             }
-            payload.extend_from_slice(&chunk.bytes);
+            frame.extend_from_slice(&chunk.bytes);
         }
         Ok::<_, quinn::ReadError>(true)
     })
@@ -381,14 +389,22 @@ pub async fn video(
             return;
         }
     }
-    let mut frame = Vec::with_capacity(VIDEO_HEADER_LEN + payload.len());
-    frame.extend_from_slice(&header);
-    frame.extend_from_slice(&payload);
+    // Permission may have changed while the payload was arriving.
+    if !server.room.flags(sender).is_some_and(|f| f.camera_on()) {
+        Counters::inc(&server.counters.video_dropped_not_allowed);
+        return;
+    }
 
     let receivers = server.room.video_receivers(sender);
     if receivers.is_empty() {
-        // Nobody is listening. The stream has already been drained by
-        // `read_to_end`, so the sender's flow control keeps moving (§6.5).
+        // Retire forwarders even when the last viewer stopped watching.
+        // The incoming stream is already drained, so flow control advances.
+        let mut state = lock(&state);
+        for slot in state.slots.values() {
+            slot.close();
+        }
+        state.slots.clear();
+        state.congestion.clear();
         Counters::inc(&server.counters.video_dropped_no_receiver);
         return;
     }
@@ -473,25 +489,46 @@ async fn forward_frames(
                 }
             }
         };
-        let mut send = match conn.open_uni().await {
-            Ok(send) => send,
-            Err(e) => {
-                tracing::debug!(session, error = %e, "cannot open a video stream");
-                return;
-            }
+        // Cover both stream credit and write flow control. A peer can keep
+        // control/audio alive while refusing video indefinitely; closing a
+        // slot must also cancel a forwarder blocked in either operation.
+        let deadline = tokio::time::Instant::now() + server.config.timing.video_frame_timeout();
+        let mut send = tokio::select! {
+            biased;
+            _ = slot.closed() => return,
+            _ = &mut shutdown => return,
+            opened = tokio::time::timeout_at(deadline, conn.open_uni()) => match opened {
+                Ok(Ok(send)) => send,
+                Ok(Err(e)) => {
+                    tracing::debug!(session, error = %e, "cannot open a video stream");
+                    return;
+                }
+                Err(_) => {
+                    Counters::inc(&server.counters.video_dropped_slow_receiver);
+                    continue;
+                }
+            },
         };
-        // Video is the lowest priority stream (`PROTOCOL.md` §4). The frame
-        // is shared with every other receiver; handing it over as a chunk
-        // spares quinn a copy.
         let _ = send.set_priority(-1);
-        if send.write_chunk(frame).await.is_err() {
+        let written = tokio::select! {
+            biased;
+            _ = slot.closed() => false,
+            _ = &mut shutdown => false,
+            result = tokio::time::timeout_at(deadline, send.write_chunk(frame)) => {
+                matches!(result, Ok(Ok(())))
+            },
+        };
+        if !written {
             Counters::inc(&server.counters.video_dropped_slow_receiver);
             let _ = send.reset(quinn::VarInt::from_u32(icu_proto::error::RATE_LIMITED));
+            if slot.is_closed() {
+                return;
+            }
             continue;
         }
-        // `finish()` is synchronous in quinn 0.11 (A5).
-        let _ = send.finish();
-        Counters::inc(&server.counters.video_frames_out);
+        if send.finish().is_ok() {
+            Counters::inc(&server.counters.video_frames_out);
+        }
     }
 }
 

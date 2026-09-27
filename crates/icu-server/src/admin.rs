@@ -525,7 +525,12 @@ pub async fn set_role(
                 .broadcast(&ControlMsg::UserState { session: s, flags });
         }
     }
-    tracing::info!(actor = actor.map(|a| a.user_id), target, is_admin, "admin role changed");
+    tracing::info!(
+        actor = actor.map(|a| a.user_id),
+        target,
+        is_admin,
+        "admin role changed"
+    );
     Ok(())
 }
 
@@ -548,7 +553,13 @@ pub async fn set_disabled(
     } else {
         0
     };
-    tracing::info!(actor = actor.map(|a| a.user_id), target, disabled, closed, "disabled state changed");
+    tracing::info!(
+        actor = actor.map(|a| a.user_id),
+        target,
+        disabled,
+        closed,
+        "disabled state changed"
+    );
     Ok(closed)
 }
 
@@ -596,7 +607,13 @@ pub async fn set_restriction(
         Ok((muted, deafened))
     })
     .await?;
-    tracing::info!(actor = actor.map(|a| a.user_id), target, muted, deafened, "restriction changed");
+    tracing::info!(
+        actor = actor.map(|a| a.user_id),
+        target,
+        muted,
+        deafened,
+        "restriction changed"
+    );
     Ok((muted, deafened))
 }
 

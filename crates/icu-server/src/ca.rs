@@ -1377,10 +1377,13 @@ mod tests {
         let live = ca.server_der().clone();
 
         // A rotation whose write fails.
-        let blocker = dir.path().join(".server.key.tmp");
+        let blocker = dir.path().join("server.key");
+        let backup = dir.path().join("server.key.backup");
+        std::fs::rename(&blocker, &backup).unwrap();
         std::fs::create_dir(&blocker).unwrap();
         assert!(ca.rotate_server_cert(&tls(), "localhost").is_err());
         std::fs::remove_dir(&blocker).unwrap();
+        std::fs::rename(&backup, &blocker).unwrap();
         assert_eq!(ca.server_der(), &live);
         assert!(ca.take_retired_leaves().is_empty());
         assert!(!dir.path().join(SERVER_RETIRED).exists(), "off the list");

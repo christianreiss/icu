@@ -141,6 +141,7 @@ async fn datagram_load() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     for reader in readers {
         reader.abort();
+        let _ = reader.await;
     }
 
     let counters = &server.handle.server().counters;
@@ -195,6 +196,14 @@ async fn datagram_load() {
         cpu_used / seconds as f64 * 100.0
     );
 
+    assert_eq!(
+        datagrams_in, sent_total,
+        "every sent packet reaches the relay"
+    );
+    assert_eq!(
+        got, datagrams_out,
+        "every relayed packet reaches a receiver"
+    );
     assert_eq!(dropped_rate, 0, "50/s is well below the 110/s limit");
     assert_eq!(dropped_malformed, 0);
     assert_eq!(send_errors, 0, "no send errors on loopback");
@@ -263,6 +272,10 @@ async fn netem() {
     assert_eq!(
         datagrams_in, datagrams_out,
         "the relay itself loses nothing; only the link does"
+    );
+    assert!(
+        got > u32::from(count) * 8 / 10,
+        "clients still receive media under 2% link loss"
     );
 
     if cleanup {

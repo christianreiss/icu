@@ -587,8 +587,10 @@ async fn a_failed_write_is_a_server_error_not_a_refusal() {
     let mut alice = server.client("alice").await; // sole bootstrap admin
     let bob = server.client("bob").await;
 
-    // A directory where the atomic write puts its temp file.
-    let blocker = server.dir.path().join(".users.toml.tmp");
+    // A directory at the destination prevents an atomic rename.
+    let blocker = server.dir.path().join("users.toml");
+    let backup = server.dir.path().join("users.toml.backup");
+    std::fs::rename(&blocker, &backup).unwrap();
     std::fs::create_dir(&blocker).expect("block the write");
     alice
         .send_msg(&ControlMsg::AdminSetRole {
@@ -628,6 +630,7 @@ async fn a_failed_write_is_a_server_error_not_a_refusal() {
     );
     assert!(!ec::is_fatal(ec::SERVER_ERROR));
     std::fs::remove_dir(&blocker).expect("unblock");
+    std::fs::rename(&backup, &blocker).unwrap();
 
     alice
         .send_msg(&ControlMsg::AdminSetRole {
@@ -807,7 +810,13 @@ async fn an_invitation_is_not_issued_for_a_demoted_actor() {
         store.set_admin(bob.user_id, true).unwrap();
         let user = store.user(alice.user_id).unwrap();
         // The session's leaf; the registration certificate is revoked.
-        let fp = user.certs.iter().find(|c| !c.revoked).unwrap().fingerprint.clone();
+        let fp = user
+            .certs
+            .iter()
+            .find(|c| !c.revoked)
+            .unwrap()
+            .fingerprint
+            .clone();
         icu_server::admin::Actor {
             user_id: alice.user_id,
             cert_fp: fp,
@@ -823,8 +832,11 @@ async fn an_invitation_is_not_issued_for_a_demoted_actor() {
         .unwrap();
     let refused = icu_server::registration::issue(srv, Some(&actor), "", 0).await;
     assert_eq!(refused.err().and_then(|e| e.code()), Some(ec::NOT_ADMIN));
-    assert!(icu_server::registration::issue(srv, None, "", 0)
-        .await
-        .is_ok(), "the socket has no actor");
+    assert!(
+        icu_server::registration::issue(srv, None, "", 0)
+            .await
+            .is_ok(),
+        "the socket has no actor"
+    );
     server.shutdown().await;
 }

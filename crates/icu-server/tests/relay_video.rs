@@ -440,7 +440,10 @@ async fn a_sender_in_debt_is_stopped_before_its_frame_is_read() {
     let session = alice.session;
     camera_on(&mut alice, session).await;
 
-    assert_eq!(stop_code(&mut send_frame(&alice, 0, 10_000, true).await, SOON).await, None);
+    assert_eq!(
+        stop_code(&mut send_frame(&alice, 0, 10_000, true).await, SOON).await,
+        None
+    );
     assert!(bob.recv_video(SOON).await.is_some(), "the big frame passes");
 
     let mut refused = send_frame(&alice, 1, 100, false).await;
@@ -463,7 +466,10 @@ async fn a_reconnect_does_not_refill_the_video_budget() {
     let bob = viewer(&server, "bob").await;
     let session = alice.session;
     camera_on(&mut alice, session).await;
-    assert_eq!(stop_code(&mut send_frame(&alice, 0, 10_000, true).await, SOON).await, None);
+    assert_eq!(
+        stop_code(&mut send_frame(&alice, 0, 10_000, true).await, SOON).await,
+        None
+    );
     assert!(bob.recv_video(SOON).await.is_some());
 
     let mut again = connect_as(&server, &identity, "alice").await;
@@ -476,5 +482,198 @@ async fn a_reconnect_does_not_refill_the_video_budget() {
         Some(ec::RATE_LIMITED)
     );
     assert!(bob.recv_video(BRIEFLY).await.is_none());
+    server.shutdown().await;
+}
+
+/// A viewer can withhold all stream credit while keeping control/audio alive.
+async fn blocked_viewer(server: &TestServer) -> common::Client {
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_uni_streams(0u32.into());
+    viewer_with_transport(server, transport).await
+}
+
+async fn viewer_with_transport(
+    server: &TestServer,
+    transport: quinn::TransportConfig,
+) -> common::Client {
+    let identity = server.enroll("blocked").await;
+    let mut config =
+        common::client_config(server.ca(), Some(identity), icu_proto::limits::ALPN_MAIN);
+    config.transport_config(std::sync::Arc::new(transport));
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(config);
+    let conn = endpoint
+        .connect(server.addr(), "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let (send, recv) = conn.open_bi().await.unwrap();
+    let mut client = common::Client {
+        endpoint,
+        conn,
+        send,
+        recv,
+        session: 0,
+        user_id: 0,
+        crl: None,
+    };
+    client
+        .hello_with("blocked", icu_proto::MINOR, UserFlags(UserFlags::VIEWING))
+        .await
+        .expect("Welcome");
+    client
+}
+
+#[tokio::test]
+async fn a_departed_sender_cancels_a_forwarder_waiting_for_stream_credit() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let mut bob = blocked_viewer(&server).await;
+    let session = alice.session;
+    camera_on(&mut alice, session).await;
+    alice.send_video(1, 0, true, &[0x42; 200]).await;
+    tokio::time::sleep(BRIEFLY).await;
+    alice.conn.close(ec::SHUTDOWN.into(), b"");
+    bob.recv_matching(|m| matches!(m, ControlMsg::UserLeft { session: s, .. } if *s == session))
+        .await
+        .expect("sender left");
+    tokio::time::sleep(BRIEFLY).await;
+    bob.conn.set_max_concurrent_uni_streams(1u32.into());
+    assert!(
+        bob.recv_video(BRIEFLY).await.is_none(),
+        "no stale frame after the sender left"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_receiver_without_stream_credit_has_a_bounded_frame_wait() {
+    let server = TestServer::start_with(|c| c.timing.video_frame_timeout_ms = 100).await;
+    let mut alice = server.client("alice").await;
+    let bob = blocked_viewer(&server).await;
+    let session = alice.session;
+    camera_on(&mut alice, session).await;
+    alice.send_video(1, 0, true, &[0x42; 200]).await;
+    tokio::time::timeout(SOON, async {
+        while Counters::get(&server.handle.server().counters.video_dropped_slow_receiver) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("blocked forwarding expires");
+    bob.conn.set_max_concurrent_uni_streams(1u32.into());
+    assert!(
+        bob.recv_video(BRIEFLY).await.is_none(),
+        "expired frame is discarded"
+    );
+    alice.send_video(2, 3200, false, &[0x43; 200]).await;
+    assert_eq!(
+        bob.recv_video(SOON).await.expect("viewer recovers").0.seq,
+        2
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn camera_off_during_an_incoming_frame_prevents_forwarding() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let bob = viewer(&server, "bob").await;
+    let session = alice.session;
+    camera_on(&mut alice, session).await;
+    let mut frame = send_frame(&alice, 1, 200, false).await;
+    tokio::time::sleep(BRIEFLY).await;
+    alice
+        .send_msg(&ControlMsg::SetState {
+            flags: UserFlags::NONE,
+        })
+        .await;
+    alice.recv_matching(|m| matches!(m, ControlMsg::UserState { session: s, flags } if *s == session && !flags.camera_on()))
+        .await.expect("camera off");
+    frame.finish().unwrap();
+    assert!(
+        bob.recv_video(BRIEFLY).await.is_none(),
+        "camera permission is checked after reading too"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_receiver_that_does_not_read_has_a_bounded_write_wait() {
+    let server = TestServer::start_with(|c| {
+        c.timing.video_frame_timeout_ms = 500;
+        c.limits.video_kbit_s = 100_000;
+    })
+    .await;
+    let mut alice = server.client("alice").await;
+    let mut transport = quinn::TransportConfig::default();
+    transport.stream_receive_window(64u32.into());
+    transport.receive_window(128u32.into());
+    let _bob = viewer_with_transport(&server, transport).await;
+    let session = alice.session;
+    camera_on(&mut alice, session).await;
+    // More data than the server's 1 MiB send window. Bob acknowledges only
+    // 128 bytes and never reads, so a forwarder eventually blocks in write.
+    for seq in 0..3 {
+        alice
+            .send_video(seq, 0, true, &vec![0x42; VIDEO_MAX_FRAME])
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::timeout(SOON, async {
+        while Counters::get(&server.handle.server().counters.video_dropped_slow_receiver) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("blocked write expires without disconnecting its receiver");
+    assert!(_bob.conn.close_reason().is_none());
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_last_viewer_stopping_retires_its_blocked_slot() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let mut bob = blocked_viewer(&server).await;
+    let session = alice.session;
+    camera_on(&mut alice, session).await;
+    alice.send_video(1, 0, true, &[0x42; 200]).await;
+    tokio::time::sleep(BRIEFLY).await;
+    let viewer_session = bob.session;
+    bob.send_msg(&ControlMsg::SetState {
+        flags: UserFlags::NONE,
+    })
+    .await;
+    bob.recv_matching(|m| matches!(m, ControlMsg::UserState { session, flags } if *session == viewer_session && !flags.viewing()))
+        .await.expect("viewing off");
+    alice.send_video(2, 3200, false, &[0x43; 200]).await;
+    tokio::time::timeout(SOON, async {
+        while Counters::get(&server.handle.server().counters.video_dropped_no_receiver) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the frame without viewers was processed");
+    bob.conn.set_max_concurrent_uni_streams(1u32.into());
+    assert!(
+        bob.recv_video(BRIEFLY).await.is_none(),
+        "no queued frame after the last viewer stopped"
+    );
+    bob.send_msg(&ControlMsg::SetState {
+        flags: UserFlags(UserFlags::VIEWING),
+    })
+    .await;
+    bob.recv_matching(|m| matches!(m, ControlMsg::UserState { session, flags } if *session == viewer_session && flags.viewing()))
+        .await.expect("viewing on");
+    alice.send_video(3, 6400, false, &[0x44; 200]).await;
+    assert_eq!(
+        bob.recv_video(SOON)
+            .await
+            .expect("a fresh slot forwards again")
+            .0
+            .seq,
+        3
+    );
     server.shutdown().await;
 }
