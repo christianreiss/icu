@@ -190,7 +190,7 @@ sudo firewall-cmd --permanent --add-port=4711/udp && sudo firewall-cmd --reload
 Freigeben muss man nur den einen UDP-Port; der Server braucht keinen
 Reverse-Proxy und kein TLS davor, er terminiert QUIC/TLS 1.3 selbst.
 
-**Der Port schweigt ohne Com-Schlüssel** (2026-09-27, wie OpenVPN `tls-auth`,
+**Der Port schweigt ohne Com-Schlüssel** (2026-09-27, nach dem Vorbild von OpenVPN `tls-auth`, ohne dessen Replay-Schutz,
 `PROTOCOL.md` §1): jedes Datagramm trägt ein 16-Byte-HMAC-Tag aus `com.key`,
 und was keins trägt, verwirft der Server, bevor QUIC es sieht — kein
 Handshake, keine Version Negotiation, kein Stateless Reset. Ein Portscan
