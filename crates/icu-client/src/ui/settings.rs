@@ -2674,6 +2674,14 @@ pub(super) struct Captured {
 
 impl Captured {
     fn from_evdev(key: String) -> Captured {
+        // Raw Input records a combination as a trigger (`CTRL+F12`): bound
+        // as one, without a key, which would win (`hotkey::chord`).
+        if key.contains('+') {
+            return Captured {
+                key: String::new(),
+                trigger: Some(key),
+            };
+        }
         let trigger = key
             .strip_prefix("KEY_")
             .filter(|k| {
@@ -2940,7 +2948,12 @@ pub(super) fn binding_row(
                             icon::RECORD,
                             "Aufnehmen",
                         )
-                        .on_hover_text("Die nächste gedrückte Taste oder Maustaste übernehmen")
+                        .on_hover_text(if cfg!(windows) {
+                            "Die nächste gedrückte Taste, Tastenkombination oder Maustaste \
+                             übernehmen"
+                        } else {
+                            "Die nächste gedrückte Taste oder Maustaste übernehmen"
+                        })
                         .clicked()
                         {
                             action = BindingAction::Record;
@@ -3011,6 +3024,11 @@ mod tests {
         Captured::from_evdev("BTN_SIDE".into()).apply(&mut binding);
         assert_eq!(binding.key, "BTN_SIDE");
         assert_eq!(binding.trigger.as_deref(), Some("CTRL+SHIFT+F12"));
+        // A combination recorded by Raw Input replaces the key, which
+        // would otherwise win over it.
+        Captured::from_evdev("CTRL+ALT+P".into()).apply(&mut binding);
+        assert_eq!(binding.key, "");
+        assert_eq!(binding.trigger.as_deref(), Some("CTRL+ALT+P"));
     }
 
     /// The window's own key names match what the evdev backend parses.
