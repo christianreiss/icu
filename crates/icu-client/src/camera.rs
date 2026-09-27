@@ -313,7 +313,7 @@ fn fit_capture(frame: RgbFrame) -> RgbFrame {
             let mut sum = [0u32; 3];
             for y in ya..yb {
                 let row = &frame.rgb[(y * w + xa) * 3..(y * w + xb) * 3];
-                for px in row.chunks_exact(3) {
+                for px in row.as_chunks::<3>().0 {
                     for c in 0..3 {
                         sum[c] += u32::from(px[c]);
                     }
