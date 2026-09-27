@@ -2491,9 +2491,12 @@ impl eframe::App for EnrollApp {
         // needs a name, which the user types in: the placeholder is the
         // inviter's, not theirs.
         // Nothing pasted yet: nothing to decode, and no log line per frame.
-        let parsed = (!self.link.trim().is_empty())
-            .then(|| Identity::from_passport_with_settings(&self.link).ok())
-            .flatten();
+        let read = (!self.link.trim().is_empty())
+            .then(|| Identity::from_passport_with_settings(&self.link));
+        // Why the text is refused — an expired invitation, a passport from
+        // an older ICU — rather than a bare „not valid“.
+        let refused = read.as_ref().and_then(|r| r.as_ref().err().cloned());
+        let parsed = read.and_then(Result::ok);
         let carries_settings = parsed.as_ref().is_some_and(|(_, s)| s.is_some());
         let parsed = parsed.map(|(identity, _)| identity);
         // Where the pasted text leads, shown before joining: it brings its
@@ -2638,7 +2641,9 @@ impl eframe::App for EnrollApp {
                     ui.add_space(16.0);
 
                     match step {
-                        EnrollStep::Paste => self.paste_step(ui, &tok, busy, valid, needs_name),
+                        EnrollStep::Paste => {
+                            self.paste_step(ui, &tok, busy, valid, needs_name, refused.as_deref())
+                        }
                         EnrollStep::Join => {
                             if let Some(summary) = &summary {
                                 let mut rows = vec![
@@ -2793,6 +2798,7 @@ impl EnrollApp {
         busy: bool,
         valid: bool,
         needs_name: bool,
+        refused: Option<&str>,
     ) {
         let has_text = !self.link.trim().is_empty();
         ui.label(theme::caps_text("Einladung"));
@@ -2801,7 +2807,25 @@ impl EnrollApp {
         // verdict line under it and the well's own margins; a pasted bundle
         // (~20 armored lines) scrolls inside it.
         const VERDICT_H: f32 = 32.0;
-        let height = (ui.clip_rect().bottom() - ui.cursor().top() - VERDICT_H - 20.0).max(120.0);
+        // A refusal says why, and may take more than the one line reserved.
+        let verdict_h = match refused.filter(|_| has_text) {
+            Some(text) => {
+                let lines = |text: String| {
+                    ui.painter()
+                        .layout(
+                            text,
+                            egui::FontId::proportional(12.0),
+                            tok.error,
+                            ui.available_width(),
+                        )
+                        .size()
+                        .y
+                };
+                VERDICT_H + lines(format!("{}  {text}", icon::WARNING_CIRCLE)) - lines("x".into())
+            }
+            None => VERDICT_H,
+        };
+        let height = (ui.clip_rect().bottom() - ui.cursor().top() - verdict_h - 20.0).max(120.0);
         let well = egui::Frame::new()
             .fill(ui.visuals().extreme_bg_color)
             .corner_radius(egui::CornerRadius::same(theme::R_ROW))
@@ -2863,7 +2887,7 @@ impl EnrollApp {
         } else if has_text {
             (
                 icon::WARNING_CIRCLE,
-                "Das ist keine gültige ICU-Einladung.",
+                refused.unwrap_or("Das ist keine gültige ICU-Einladung."),
                 tok.error,
             )
         } else {

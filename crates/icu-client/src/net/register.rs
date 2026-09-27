@@ -159,7 +159,9 @@ async fn exchange(
         match ControlMsg::decode(&body).map_err(|e| NetError::Protocol(e.to_string()))? {
             ControlMsg::RenewResponse { leaf_der } => {
                 let key_der = key.serialize_der();
-                if let Err(detail) = crate::conninfo::check_issued_leaf(&leaf_der, name, &key_der) {
+                if let Err(detail) =
+                    crate::conninfo::check_issued_leaf(&leaf_der, name, &key_der, &bundle.ca_der)
+                {
                     return Err(NetError::User(crate::problem::Problem::new(
                         "Der Server hat die Anmeldung falsch beantwortet. Bitte noch einmal \
                          versuchen.",

@@ -2815,6 +2815,7 @@ impl LocalState {
             &leaf_der,
             &pending.cn,
             &self.identity.key_der,
+            &self.identity.ca_der,
         ) {
             Ok(info) => info,
             Err(detail) => {

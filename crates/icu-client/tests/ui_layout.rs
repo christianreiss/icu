@@ -534,6 +534,15 @@ fn enroll_window_fits() {
             ("paste", None),
             ("invite", Some(bundle.clone())),
             ("passport", Some(passport.clone())),
+            // The longest refusal the verdict line under the field shows.
+            (
+                "refused",
+                Some(format!(
+                    "{}\nAAAA\n{}\n",
+                    icu_proto::passport::ARMOR_BEGIN,
+                    icu_proto::passport::ARMOR_END
+                )),
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let paths = Paths::new(Some(dir.path().to_path_buf()));
