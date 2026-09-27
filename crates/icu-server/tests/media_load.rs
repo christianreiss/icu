@@ -167,6 +167,35 @@ async fn soak(blocked_video: bool) {
             (index, u64::from(a), u64::from(v), conn)
         }));
     }
+    // ICU_MEDIA_JUNK_PPS: datagrams without the com key's tag at the
+    // server's port for the whole soak, rounded up to whole packets per
+    // millisecond. The filter in front of quinn drops them; the room must not
+    // notice.
+    let junk_pps: u64 = std::env::var("ICU_MEDIA_JUNK_PPS")
+        .ok()
+        .map(|s| s.parse().expect("packets per second"))
+        .unwrap_or(0);
+    let junk = (junk_pps > 0).then(|| {
+        let target = server.addr();
+        tokio::spawn(async move {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut tick = tokio::time::interval(Duration::from_millis(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // A QUIC long header, then a counter: never the same datagram twice.
+            let mut packet = [0u8; 1200];
+            packet[0] = 0xc0;
+            let mut sent = 0u64;
+            while tokio::time::Instant::now() < deadline {
+                tick.tick().await;
+                for _ in 0..junk_pps.div_ceil(1000) {
+                    packet[1..9].copy_from_slice(&sent.to_le_bytes());
+                    let _ = socket.send_to(&packet, target).await;
+                    sent += 1;
+                }
+            }
+            sent
+        })
+    });
     let (mut sent_audio, mut expected_video) = (0, 0);
     let mut connections = Vec::new();
     for task in senders {
@@ -180,8 +209,21 @@ async fn soak(blocked_video: bool) {
         expected_video += video * receivers as u64;
         connections.push(conn);
     }
+    let junk_sent = match junk {
+        Some(task) => task.await.expect("junk task"),
+        None => 0,
+    };
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(connections.iter().all(|c| c.close_reason().is_none()));
+    let com_dropped = server
+        .handle
+        .server()
+        .com_dropped
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        junk_sent == 0 || com_dropped > 0,
+        "the junk reached the filter"
+    );
     let c = &server.handle.server().counters;
     assert_eq!(Counters::get(&c.datagrams_in), sent_audio);
     assert_eq!(
@@ -217,7 +259,7 @@ async fn soak(blocked_video: bool) {
     }
     latencies.sort_unstable();
     let p99_ms = latencies[latencies.len() * 99 / 100] as f64 / 1_000_000.0;
-    println!("{seconds}s, {CLIENTS} clients, blocked_video={blocked_video}: audio {audio}, video {video}, expected_video {expected_video}, audio p99 {p99_ms:.3}ms");
+    println!("{seconds}s, {CLIENTS} clients, blocked_video={blocked_video}: audio {audio}, video {video}, expected_video {expected_video}, audio p99 {p99_ms:.3}ms, junk sent {junk_sent}, com_dropped {com_dropped}");
     assert_eq!(
         audio,
         sent_audio * (CLIENTS as u64 - 1),
