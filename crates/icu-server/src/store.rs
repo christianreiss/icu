@@ -282,7 +282,7 @@ impl Store {
     /// Opens the state directory, takes the exclusive lock and loads the user
     /// database. A missing file means an empty one only in a state directory
     /// that has never been used, and is written straight away; beside a CA,
-    /// server certificate or com key it is an error ([`first_users`]).
+    /// server certificate or com key it is an error (`first_users`).
     ///
     /// Fails with a clear error when another process holds the lock, which is
     /// exactly the "CLI while the server runs" case (§5).
