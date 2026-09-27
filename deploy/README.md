@@ -166,7 +166,11 @@ unvollständiger Restore, eine Migration ohne die CA: beide Dateien aus dem
 Backup zurückholen. Eine neue CA sperrte jeden registrierten Nutzer aus,
 deshalb legt der Server dann keine an. Dasselbe gilt für `no com key in …`:
 `com.key` aus dem Backup zurückholen; einen neuen Schlüssel legt der Server nur
-in einem nie benutzten State an. Wer wirklich neu anfangen will (neue CA, alle registrieren sich
+in einem nie benutzten State an. Umgekehrt ebenso: meldet der Start `no
+users.toml in …, but ca.crt, ca.key, … are there`, fehlt der Nutzerbestand
+neben CA und Com-Schlüssel — `users.toml` aus demselben Backup zurückholen.
+Ein leerer Bestand an seiner Stelle kennte keinen Nutzer und keinen Widerruf
+mehr, deshalb legt der Server dann keinen an (2026-09-27). Wer wirklich neu anfangen will (neue CA, alle registrieren sich
 neu), schiebt das ganze State-Verzeichnis beiseite.
 
 **Nach dem Zurückspielen eines Backups** `icu-server rotate-server-cert`

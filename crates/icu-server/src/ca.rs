@@ -52,6 +52,9 @@ const SERVER_KEY: &str = "server.key";
 /// Replaced server leaves that are not on the CRL yet, PEM one after the
 /// other. Gone again once the store has them ([`Ca::retired_recorded`]).
 const SERVER_RETIRED: &str = "server.crt.retired";
+/// All of the above: any one of them means the state directory has been
+/// used ([`Store::open`](crate::store::Store::open)).
+pub(crate) const FILES: [&str; 5] = [CA_CRT, CA_KEY, SERVER_CRT, SERVER_KEY, SERVER_RETIRED];
 
 /// CA and server certificate material.
 pub struct Ca {

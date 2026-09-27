@@ -280,7 +280,9 @@ pub struct Store {
 
 impl Store {
     /// Opens the state directory, takes the exclusive lock and loads the user
-    /// database. A missing file means an empty one.
+    /// database. A missing file means an empty one only in a state directory
+    /// that has never been used, and is written straight away; beside a CA,
+    /// server certificate or com key it is an error ([`first_users`]).
     ///
     /// Fails with a clear error when another process holds the lock, which is
     /// exactly the "CLI while the server runs" case (§5).
@@ -304,7 +306,10 @@ impl Store {
             lock_path.display()
         ))?;
 
-        let users: UsersFile = load_or_default(&dir.join(USERS_FILE))?;
+        let users = match load(&dir.join(USERS_FILE))? {
+            Some(users) => users,
+            None => first_users(dir)?,
+        };
         if users.schema != SCHEMA {
             return Err(Error::msg(format!(
                 "{USERS_FILE}: schema {} is not supported (expected {SCHEMA})",
@@ -950,12 +955,56 @@ fn user_entry(users: &mut UsersFile, id: UserId) -> Result<&mut UserRecord> {
         .ok_or_else(|| Error::msg(format!("unknown user_id {id}")))
 }
 
-fn load_or_default<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T> {
+/// The parsed file, `None` if there is none.
+fn load<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
     match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).context(format!("cannot parse {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+        Ok(text) => toml::from_str(&text)
+            .map(Some)
+            .context(format!("cannot parse {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(Error::from(e).context(format!("cannot read {}", path.display()))),
     }
+}
+
+/// The user database of a state directory without `users.toml`: an empty
+/// one, written at once, but only where nothing else has been either.
+/// Beside a CA, a server certificate or the com key, the file was lost — a
+/// restore without it, a migration that forgot it — and an empty database
+/// in its place would forget every user and every revocation while the
+/// keys carry on (external review 2026-09-27). Writing it before any of
+/// those can exist is what makes that tell reliable: `open_ca` and
+/// `open_com_key` run after this, the offline CLI included.
+fn first_users(dir: &Path) -> Result<UsersFile> {
+    let mut present = Vec::new();
+    for name in crate::ca::FILES.into_iter().chain([COM_KEY_FILE]) {
+        let path = dir.join(name);
+        if path
+            .try_exists()
+            .context(format!("cannot check {}", path.display()))?
+        {
+            present.push(name);
+        }
+    }
+    if !present.is_empty() {
+        return Err(Error::msg(format!(
+            "no {USERS_FILE} in {}, but {} {}: this state has been in use, and \
+             {USERS_FILE} was lost. Refusing to start with an empty one, it would \
+             forget every user and every revocation. Restore {USERS_FILE} from the \
+             backup the other files come from (runbook \"Backup und Restore\" in \
+             /usr/share/doc/icu-server/README.md, deploy/README.md in the sources); \
+             to start over, move the state directory aside",
+            dir.display(),
+            present.join(", "),
+            if present.len() == 1 {
+                "is there"
+            } else {
+                "are there"
+            },
+        )));
+    }
+    let users = UsersFile::default();
+    write_atomic(&dir.join(USERS_FILE), &toml::to_string(&users)?)?;
+    Ok(users)
 }
 
 /// Writes `contents` atomically: temp file in the same directory, fsync,

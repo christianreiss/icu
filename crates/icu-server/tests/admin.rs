@@ -614,6 +614,9 @@ async fn a_stale_socket_file_means_no_server() {
 async fn a_server_name_other_than_the_cas_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = icu_server::Config::for_test(dir.path());
+    // In the order of a first start: the user database comes first, or the
+    // CA beside none would read as a restore that lost it.
+    drop(icu_server::store::Store::open(dir.path()).unwrap());
     icu_server::ca::Ca::load_or_create(dir.path(), &config.tls, "icu.home.arpa").unwrap();
     let leaf = std::fs::read(dir.path().join("server.crt")).unwrap();
     // A leaf that needs repair would be the first thing issued.
