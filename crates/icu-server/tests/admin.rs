@@ -456,6 +456,21 @@ async fn reserved_example_names_are_refused_only_where_they_are_new() {
         ),
     )
     .unwrap();
+    // A state in use never gets a new com key: every passport carries the
+    // old one (`PROTOCOL.md` §1).
+    let err = icu_server::run(config.clone())
+        .await
+        .err()
+        .expect("no start without the com key");
+    assert!(err.to_string().contains("no com key"), "{err}");
+    std::fs::write(
+        dir.path().join(icu_server::store::COM_KEY_FILE),
+        format!(
+            "{}\n",
+            icu_proto::com::ComKey::generate().unwrap().to_base64()
+        ),
+    )
+    .unwrap();
     let handle = icu_server::run(config).await.expect("starts");
     let later = handle.admin(invite()).await;
     assert!(matches!(later, AdminResponse::Invite { .. }), "{later:?}");

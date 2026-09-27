@@ -91,7 +91,7 @@ async fn narrow_downlink(server: SocketAddr) -> SocketAddr {
 /// A viewer connected to the server through `addr`.
 async fn viewer_via(server: &TestServer, addr: SocketAddr, name: &str) -> Client {
     let identity = server.enroll(name).await;
-    let mut client = common::connect_with(addr, server.ca(), Some(identity))
+    let mut client = common::connect_with(addr, server.ca(), &server.com_key(), Some(identity))
         .await
         .expect("connect");
     client

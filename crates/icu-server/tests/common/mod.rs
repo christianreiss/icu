@@ -8,6 +8,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use icu_proto::{
+    com::{ComKey, Side},
     error as ec, framing,
     header::{VIDEO_HEADER_LEN, VIDEO_MAX_FRAME},
     AudioHeader, ControlMsg, Session, UserFlags, UserId, VideoHeader, MAX_CONTROL_FRAME,
@@ -50,6 +51,11 @@ impl TestServer {
     /// The CA certificate.
     pub fn ca(&self) -> CertificateDer<'static> {
         CertificateDer::from(self.handle.ca_der())
+    }
+
+    /// The com key every datagram to this server must carry.
+    pub fn com_key(&self) -> ComKey {
+        self.handle.server().com_key.clone()
     }
 
     /// The admin socket path.
@@ -193,7 +199,13 @@ impl TestServer {
 
     /// Connects with an existing identity, without saying `Hello`.
     pub async fn connect(&self, identity: &Identity) -> Result<Client, String> {
-        connect_with(self.addr(), self.ca(), Some(identity.clone())).await
+        connect_with(
+            self.addr(),
+            self.ca(),
+            &self.com_key(),
+            Some(identity.clone()),
+        )
+        .await
     }
 
     /// Connects with `identity` and returns the code the connection ends
@@ -201,6 +213,7 @@ impl TestServer {
     pub async fn rejection(&self, identity: &Identity) -> Option<u32> {
         let endpoint = client_endpoint(
             self.ca(),
+            &self.com_key(),
             Some(identity.clone()),
             icu_proto::limits::ALPN_MAIN,
         );
@@ -215,7 +228,7 @@ impl TestServer {
 
     /// Connects without a client certificate.
     pub async fn connect_anonymous(&self) -> Result<Client, String> {
-        connect_with(self.addr(), self.ca(), None).await
+        connect_with(self.addr(), self.ca(), &self.com_key(), None).await
     }
 
     /// Shuts the server down.
@@ -283,9 +296,7 @@ impl EnrollFail {
 
 /// The identity inside a registration bundle.
 pub fn identity_from_bundle(bundle: &str) -> Identity {
-    let parts = icu_proto::passport::Passport::decode(bundle)
-        .expect("bundle decodes")
-        .into_parts();
+    let parts = icu_proto::passport::Passport::decode(bundle).expect("bundle decodes");
     let key = rcgen::KeyPair::try_from(parts.key_der.as_slice()).expect("bundle key");
     Identity {
         cert: CertificateDer::from(parts.leaf_der),
@@ -548,15 +559,25 @@ fn close_code_from(text: &str) -> Option<u32> {
         .ok()
 }
 
-/// Builds a client endpoint that trusts exactly `ca`.
+/// Builds a client endpoint that trusts exactly `ca` and tags its datagrams
+/// with `com_key`.
 pub fn client_endpoint(
     ca: CertificateDer<'static>,
+    com_key: &ComKey,
     identity: Option<Identity>,
     alpn: &[u8],
 ) -> Endpoint {
-    let mut endpoint = Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");
+    let mut endpoint = bare_endpoint(com_key);
     endpoint.set_default_client_config(client_config(ca, identity, alpn));
     endpoint
+}
+
+/// A client endpoint on `127.0.0.1` without a default configuration,
+/// speaking with `com_key`'s tag (`PROTOCOL.md` §1).
+pub fn bare_endpoint(com_key: &ComKey) -> Endpoint {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind 127.0.0.1");
+    icu_proto::com::endpoint(socket, com_key, Side::Client, None, Arc::default())
+        .expect("client endpoint")
 }
 
 /// The client configuration of [`client_endpoint`], for an endpoint built
@@ -623,9 +644,10 @@ pub fn client_config_with_chain(
 pub async fn connect_with(
     addr: SocketAddr,
     ca: CertificateDer<'static>,
+    com_key: &ComKey,
     identity: Option<Identity>,
 ) -> Result<Client, String> {
-    let endpoint = client_endpoint(ca, identity, icu_proto::limits::ALPN_MAIN);
+    let endpoint = client_endpoint(ca, com_key, identity, icu_proto::limits::ALPN_MAIN);
     let conn = endpoint
         .connect(addr, "localhost")
         .map_err(|e| e.to_string())?

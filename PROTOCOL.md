@@ -8,6 +8,7 @@ Stand 2026-09-20. Abgeleitet aus `Research/transport.md`, `Research/protocol/wir
 | --- | --- |
 | Transport | QUIC (RFC 9000/9001) mit Unreliable Datagrams (RFC 9221). Implementierung quinn 0.11 + rustls 0.23, Crypto-Provider ring. |
 | Port | Ein UDP-Port, Default 4711. Server bindet IPv4 und IPv6 getrennt (quinn-Dual-Stack-Hinweis). |
+| Com-Schlüssel | Wie OpenVPN `tls-auth` (2026-09-27). Jeder Server hat einen zufälligen 32-Byte-Schlüssel (`com.key` im State), jeder Passport trägt ihn (§2.3.1). Jedes UDP-Datagramm, in beide Richtungen, ist `QUIC-Datagramm ++ tag` mit `tag = HMAC-SHA256(k_dir, QUIC-Datagramm)[..16]`, `k_c2s = HMAC-SHA256(com_key, "icu com c2s")`, `k_s2c = HMAC-SHA256(com_key, "icu com s2c")`; eigene Schlüssel je Richtung, damit ein zurückgespiegeltes Datagramm nicht verifiziert. Der Empfänger prüft das Tag in konstanter Zeit, bevor quinn das Datagramm sieht, und verwirft still, was kürzer als 17 Byte ist oder nicht verifiziert (`icu_proto::com::ComSocket`, bei GRO je Segment). Ohne Schlüssel bleibt der Port stumm: kein Handshake, keine Version Negotiation, kein Stateless Reset, kein Retry. Der Server zählt die Verwürfe (`status`: `com_dropped`). **Kein Zulassungsmerkmal:** ein Gruppengeheimnis, das jeder Passport-Inhaber kennt, auch ein widerrufener; zugelassen wird weiter über mTLS. **Kein Replay-Schutz:** ein mitgeschnittenes, wieder eingespieltes Initial kostet höchstens einen Handshake-Slot, den die Handshake-Grenzen (§7) deckeln; etablierte Verbindungen schützt QUIC selbst. **Keine Rotation:** ein neuer Schlüssel heißt neue Passports für alle. Ein Client mit einem anderen Schlüssel bekommt keine Antwort und sieht dasselbe wie bei einem abgeschalteten Server (§5). Das Initial des Clients (1200 B QUIC) ist mit Tag 1216 B und passt damit unter die 1232 B eines IPv6-Pfads mit Mindest-MTU; die Obergrenze der MTU-Discovery ist auf beiden Seiten 1452 − 16 = 1436 B (`icu_proto::com::mtu_discovery`), damit eine Probe samt Tag in 1500 B passt. |
 | TLS | TLS 1.3, Server-Cert und Client-Cert von der ICU-CA des Servers. Client vertraut nur dieser CA. |
 | ALPN | `icu/1`. ALPN ist das Major-Versions-Gate. Das frühere `icu-enroll/1` gibt es nicht mehr (revidiert 2026-09-24, §2.3). |
 | Client-Auth | Server: `WebPkiClientVerifier` mit `allow_unauthenticated()`; die Pflicht erzwingt die Anwendung und schließt ohne Cert mit `AUTH_REQUIRED` statt eines nackten TLS-Alerts (Spike 2b: `peer_identity()` ohne Cert = `None`). Der Client schickt nur sein Leaf, die CA stellt direkt aus; eine Kette mit weiteren Zertifikaten scheitert im Handshake mit dem TLS-Alert `access_denied`, bevor der Server irgendeine Signatur prüft (2026-09-26: vorher waren das bis zu ~100 Signaturprüfungen je Handshake für einen unauthentifizierten Peer). |
@@ -18,7 +19,7 @@ Stand 2026-09-20. Abgeleitet aus `Research/transport.md`, `Research/protocol/wir
 | Datagram-Puffer | `datagram_receive_buffer_size` = 64 KiB auf beiden Seiten; `datagram_send_buffer_size` Server 64 KiB (die Sendewarteschlange trägt die Audio aller Sprecher an einen Empfänger), Client **8 KiB** (2026-09-24; nur die eigene Audio, 20–50 Pakete = 0,4–1 s). `send_datagram` verwirft bei vollem Puffer das älteste Datagram: 64 KiB wären beim Client 3–8 s Audio gewesen, die nach einem Netzhänger verspätet ankämen, der Jitter-Buffer des Empfängers (Klemme 200 ms, `drain_backlog`) sowieso verwirft und die als Burst das Ratenlimit des Servers (110/s) reißen. |
 | Streams | Client eröffnet genau einen bidirektionalen Control-Stream (der Server lässt nur einen zu, `max_concurrent_bidi_streams` = 1). Video: ein unidirektionaler Stream pro Frame, in beide Richtungen. `max_concurrent_uni_streams` = `2 × max_users + 4` pro Richtung: der Server setzt ihn aus seiner Config (bei `max_users` = 16 also 36), der Client mit der Obergrenze 64, also 132 — beim Handshake kennt er `max_users` noch nicht (2026-09-27 an den Code angeglichen). Server→Client-Uni-Streams trägt nur Video, und der Server hält je Sender und Empfänger höchstens `VIDEO_UNACKED_PER_PAIR` (2) Frames unbestätigt (§4); mehr als 2 × (Sender) Streams braucht ein Empfänger also nur kurz, bis er gelesene Streams freigibt. Das Protokoll deckelt die Zahl gleichzeitig aktiver Kameras nicht. |
 | Flusskontrolle | Server: `stream_receive_window` 64 KiB, `receive_window` 1 MiB je Verbindung, `send_window` 1 MiB (2026-09-26; quinns Defaults waren 1,25 MB je Stream und unbegrenzt je Verbindung, ein Teilnehmer konnte mit 36 Video-Streams ~47 MB Serverspeicher binden). Das ist Flusskontrolle, keine Größengrenze: ein Video-Frame von 512 KiB fließt fensterweise. Streams, die der Server nie liest (renew-only- und Registrierungssitzungen, §2.3), zählen gegen das Verbindungsfenster. |
-| Datagram-Größe | Laufzeitwert `max_datagram_size()` (Spike 2: 1162 B nach Handshake, 1414 B nach MTU-Discovery). Audio-Datagrams sind ≤ 410 B. |
+| Datagram-Größe | Laufzeitwert `max_datagram_size()` (Spike 2: 1162 B nach Handshake, 1414 B nach MTU-Discovery; mit dem Com-Tag endet die MTU-Discovery 16 B früher, also bei 1398 B, 2026-09-27). Audio-Datagrams sind ≤ 410 B. |
 
 **Verbunden heißt `Welcome` empfangen.** Auf Client-Seite liefert `connect().await` auch dann `Ok`, wenn der Server das Client-Cert gleich darauf ablehnt (Spike 2). Der Client darf vor `Welcome` weder Audio senden noch „verbunden“ anzeigen.
 
@@ -120,7 +121,7 @@ Capability-Bits (`caps`), v1 alle 0; reserviert für spätere Erweiterungen. v1-
 
 Es gibt kein Einladungs-Token, keinen Link, keinen Blob und kein eigenes Enrollment-Protokoll mehr. Eine Einladung **ist** ein Zertifikat:
 
-1. Ein Admin (CLI `icu-server invite`, Admin-Socket oder `CreateInviteRequest`) erhält ein **Registrierungs-Bundle**: einen frisch erzeugten P-256-Schlüssel, ein kurzlebiges **Registrierungszertifikat** darauf und die CA — als Passport armiert (§2.3.1). Der Server legt dabei sofort einen Nutzer mit Platzhalternamen an (der mitgegebene Name, sonst `neu-` + 4 Hex-Ziffern; er muss frei sein wie jeder Name) und merkt sich das Zertifikat mit `registration = true`. Den Schlüssel behält er nicht.
+1. Ein Admin (CLI `icu-server invite`, Admin-Socket oder `CreateInviteRequest`) erhält ein **Registrierungs-Bundle**: einen frisch erzeugten P-256-Schlüssel, ein kurzlebiges **Registrierungszertifikat** darauf, die CA und den Com-Schlüssel (§1) — als Passport armiert (§2.3.1). Der Server legt dabei sofort einen Nutzer mit Platzhalternamen an (der mitgegebene Name, sonst `neu-` + 4 Hex-Ziffern; er muss frei sein wie jeder Name) und merkt sich das Zertifikat mit `registration = true`. Den Schlüssel behält er nicht.
 2. Der Eingeladene verbindet sich damit ganz normal über `icu/1`. Er vertraut der CA aus dem Bundle; Adresse und SNI stehen in den Zertifikaten (unten). Nichts wird gepinnt, nichts ist TOFU.
 3. Der Server antwortet auf `Hello` mit `Welcome { registration: true, users: [], … }`. Die Sitzung tritt dem Raum nicht bei.
 4. Der Client erzeugt einen **eigenen** Schlüssel und sendet `RenewRequest` mit einer CSR, deren CN der gewählte Name ist.
@@ -141,31 +142,23 @@ Eine Registrierungssitzung darf außer `Ping` und `RenewRequest` nichts senden (
 
 ### 2.3.1 Passport `-----BEGIN ICU PASSPORT-----`
 
-Die ganze Identität eines Clients in einem ASCII-armierten Block, damit ein Nutzer sie auf ein zweites Gerät mitnehmen kann, seit 2026-09-26 samt seinen Einstellungen. Dasselbe Format transportiert das Registrierungs-Bundle (§2.3) — das ist der einzige Fall, in dem der Server einen Passport erzeugt, immer als Version 2; er liest nie einen. Ein wieder eingespielter Passport verbindet sofort mit dem ursprünglichen Server: CA und Adresse reisen mit.
+Die ganze Identität eines Clients in einem ASCII-armierten Block, damit ein Nutzer sie auf ein zweites Gerät mitnehmen kann, seit 2026-09-26 samt seinen Einstellungen, seit 2026-09-27 samt dem Com-Schlüssel des Servers (§1). Dasselbe Format transportiert das Registrierungs-Bundle (§2.3) — das ist der einzige Fall, in dem der Server einen Passport erzeugt, dann ohne Einstellungen; er liest nie einen. Ein wieder eingespielter Passport verbindet sofort mit dem ursprünglichen Server: CA, Adresse und Com-Schlüssel reisen mit.
 
 ```
-PassportV3 {                 // Version 3 (2026-09-26), nur vom Client geschrieben
-    key_der: Vec<u8>,    // wie Version 2
-    leaf_der: Vec<u8>,
-    ca_der: Vec<u8>,
-    settings: String,    // TOML: die übertragbaren Einstellungen des exportierenden Clients
-}
-
-PassportV2 {                 // Version 2: Registrierungs-Bundle, Identität ohne Einstellungen
+Passport {                   // Version 4 (2026-09-27), die einzige
     key_der: Vec<u8>,    // privater Schlüssel, PKCS#8 DER
     leaf_der: Vec<u8>,   // Client-Zertifikat, DER — trägt die Serveradresse als URI-SAN
     ca_der: Vec<u8>,     // CA des Servers, DER — trägt das SNI im CN
-}
-
-PassportV1 {                 // Version 1, nur noch gelesen
-    host: String, port: u16, server_name: String, name: String,
-    key_der: Vec<u8>, leaf_der: Vec<u8>, ca_der: Vec<u8>,
+    com_key: [u8; 32],   // Com-Schlüssel des Servers (§1)
+    settings: String,    // TOML: die übertragbaren Einstellungen des exportierenden Clients, leer im Registrierungs-Bundle
 }
 ```
 
-Armor: `-----BEGIN ICU PASSPORT-----`, Base64 (Standard-Alphabet mit Padding) auf 64 Spalten umbrochen, `-----END ICU PASSPORT-----`. Body = `[Version-Byte] ++ postcard(PassportV<n>)`, ≤ 8192 Byte dekodiert. Das Versionsbyte steht **außerhalb** des postcard-Bodys, weil postcard nicht selbstbeschreibend ist: eine andere Version würde sonst als plausibler Müll durchgehen statt abgelehnt zu werden. Beim Dekodieren wird jeder Whitespace ignoriert, damit ein neu umbrochener oder eingerückter Block aus einem Chat-Client weiter lesbar ist.
+Die Versionen 1–3 (ohne Com-Schlüssel) erreichen keinen Server mehr und werden als unbekannte Version abgelehnt; der Client sagt dazu, dass der Passport neu exportiert oder eine neue Einladung angefordert werden muss (2026-09-27).
 
-Der Client exportiert Version 3, wenn sein Zertifikat die Adresse trägt, sonst Version 1 mit ausgeschriebener Adresse (ein Zertifikat von vor 2026-09-24, bis zum nächsten Renewal) — Version 1 hat keinen Platz für Einstellungen, der Export sagt dann „ohne Einstellungen“. Ebenso ohne Einstellungen (Version 2) geht er, falls sie die 8192 Byte sprengen würden. Beim Import von Version 2 oder 3 ohne Adresse im Zertifikat lehnt er ab.
+Armor: `-----BEGIN ICU PASSPORT-----`, Base64 (Standard-Alphabet mit Padding) auf 64 Spalten umbrochen, `-----END ICU PASSPORT-----`. Body = `[Version-Byte] ++ postcard(Passport)`, ≤ 8192 Byte dekodiert. Das Versionsbyte steht **außerhalb** des postcard-Bodys, weil postcard nicht selbstbeschreibend ist: eine andere Version würde sonst als plausibler Müll durchgehen statt abgelehnt zu werden. Beim Dekodieren wird jeder Whitespace ignoriert, damit ein neu umbrochener oder eingerückter Block aus einem Chat-Client weiter lesbar ist.
+
+Der Client exportiert ohne Einstellungen, falls sie die 8192 Byte sprengen würden; der Export sagt dann „ohne Einstellungen“. Einen Passport ohne Adresse im Zertifikat lehnt er beim Import ab.
 
 **Einstellungen** (2026-09-26): `settings` ist `settings.toml` des exportierenden Clients (Client/IMPLEMENTATION.md §11) als TOML-Text, für das Protokoll undurchsichtig. TOML statt postcard, weil ein neuerer Client Einstellungen hinzufügt und ein älterer welche nicht kennt: unbekannte Schlüssel werden ignoriert, fehlende nehmen ihren Standard. Mit reisen alle Einstellungen außer denen, die zum Rechner gehören: Mikrofon, Lautsprecher, `[camera]`, das Hotkey-Backend, die Dateizuordnung und ob die Einrichtung hier schon lief — der Export lässt sie auf dem Standard, der Import behält die eigenen. Die Lautstärken je `user_id` reisen mit; sie gelten auf dem Server des Passports. Übernommen werden die Einstellungen nur mit der Identität und nur nach der Bestätigung unten, abwählbar (Standard: übernehmen); Zahlen landen dabei in den Bereichen, die das Einstellungsfenster anbietet. Lassen sie sich nicht lesen, kommt die Identität allein.
 
@@ -234,7 +227,7 @@ Incoming ─accept─▶ Handshaking ─ALPN icu/1, TLS ok─▶ Authenticating 
                                                                 close(AUTH_*)                  Registering ─RenewResponse, Close REGISTRATION_STORED─▶ Closed
 ```
 
-Client-Sicht: `Connecting → Handshaking → SendHello → AwaitWelcome → Active → Closed`. Reconnect bei jedem nicht-fatalen Close und bei Netzfehlern: Backoff 1, 2, 4, 8, 15 s, dann 15 s, unbegrenzt; lokaler Zustand (Mute, Deafen, Lautstärken) bleibt. Fatal (kein Reconnect, UI-Hinweis) sind genau die in §6 mit „ja“ markierten Codes: PROTOCOL_VIOLATION, VERSION_UNSUPPORTED, AUTH_*, KICKED, RATE_LIMITED_FATAL, ENROLL_*. Alle anderen → Reconnect mit Backoff. Ein Server-Zertifikat, das die Prüfung nicht besteht, ist fatal, außer es ist abgelaufen oder widerrufen (§1).
+Client-Sicht: `Connecting → Handshaking → SendHello → AwaitWelcome → Active → Closed`. Trägt der Passport einen anderen Com-Schlüssel als der Server (§1), bekommt der Client keine einzige Antwort: der Handshake läuft in sein Timeout, und er versucht es mit Backoff weiter wie bei einem abgeschalteten Server. Unterscheiden lässt sich das von außen nicht, das gehört zu `tls-auth`; auf dem Server steigt dabei `com_dropped` (2026-09-27). Reconnect bei jedem nicht-fatalen Close und bei Netzfehlern: Backoff 1, 2, 4, 8, 15 s, dann 15 s, unbegrenzt; lokaler Zustand (Mute, Deafen, Lautstärken) bleibt. Fatal (kein Reconnect, UI-Hinweis) sind genau die in §6 mit „ja“ markierten Codes: PROTOCOL_VIOLATION, VERSION_UNSUPPORTED, AUTH_*, KICKED, RATE_LIMITED_FATAL, ENROLL_*. Alle anderen → Reconnect mit Backoff. Ein Server-Zertifikat, das die Prüfung nicht besteht, ist fatal, außer es ist abgelaufen oder widerrufen (§1).
 
 **Zustand beim Reconnect:** jedes `Welcome` ersetzt den vollständigen Peer-Zustand. Session-IDs gelten nur innerhalb einer Verbindung; der Client verwirft bei jedem Reconnect Jitter-Buffer, Decoder, Video-Kacheln und alle Session-Zuordnungen. Dauerhaft je Peer gespeicherte Daten (Lautstärken) hängen an `user_id`, nie an `session`.
 

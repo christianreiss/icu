@@ -447,9 +447,7 @@ async fn a_rate_limited_attempt_leaves_the_live_registration_alone() {
 async fn registering_with_the_bundle_key_is_rejected() {
     let server = TestServer::start().await;
     let bundle = server.invite("").await;
-    let parts = icu_proto::passport::Passport::decode(&bundle)
-        .unwrap()
-        .into_parts();
+    let parts = icu_proto::passport::Passport::decode(&bundle).unwrap();
     let key = rcgen::KeyPair::try_from(parts.key_der.as_slice()).unwrap();
     let mut params = rcgen::CertificateParams::default();
     params

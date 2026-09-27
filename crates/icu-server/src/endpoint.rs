@@ -103,6 +103,8 @@ pub fn server_config(
     transport.stream_receive_window(VarInt::from_u32(pl::STREAM_RECEIVE_WINDOW));
     transport.receive_window(VarInt::from_u32(pl::CONNECTION_RECEIVE_WINDOW));
     transport.send_window(pl::SEND_WINDOW);
+    // The com tag rides on every datagram (`PROTOCOL.md` §1).
+    transport.mtu_discovery_config(Some(icu_proto::com::mtu_discovery()));
     quic.transport_config(Arc::new(transport));
 
     Ok(quic)
@@ -256,12 +258,18 @@ pub async fn reload_tls_logged(server: &Arc<Server>) {
     }
 }
 
-/// Binds one endpoint.
+/// Binds one endpoint. It speaks only with the com tag of `com_key`
+/// (`PROTOCOL.md` §1) and counts what it drops for it in `com_dropped`.
 ///
 /// IPv6 addresses are bound `IPV6_V6ONLY`, so that the spec's default
 /// `listen = ["0.0.0.0:4711", "[::]:4711"]` does not collide on Linux, where
 /// a v6 socket would otherwise also claim the v4 port.
-pub fn bind(addr: SocketAddr, config: quinn::ServerConfig) -> Result<Endpoint> {
+pub fn bind(
+    addr: SocketAddr,
+    config: quinn::ServerConfig,
+    com_key: &icu_proto::com::ComKey,
+    com_dropped: &Arc<std::sync::atomic::AtomicU64>,
+) -> Result<Endpoint> {
     let domain = match addr {
         SocketAddr::V4(_) => socket2::Domain::IPV4,
         SocketAddr::V6(_) => socket2::Domain::IPV6,
@@ -274,13 +282,12 @@ pub fn bind(addr: SocketAddr, config: quinn::ServerConfig) -> Result<Endpoint> {
     socket
         .bind(&addr.into())
         .context(format!("cannot bind {addr}"))?;
-    let runtime =
-        quinn::default_runtime().ok_or_else(|| Error::msg("no async runtime found for quinn"))?;
-    Endpoint::new(
-        quinn::EndpointConfig::default(),
-        Some(config),
+    icu_proto::com::endpoint(
         socket.into(),
-        runtime,
+        com_key,
+        icu_proto::com::Side::Server,
+        Some(config),
+        com_dropped.clone(),
     )
     .context(format!("cannot create an endpoint on {addr}"))
 }

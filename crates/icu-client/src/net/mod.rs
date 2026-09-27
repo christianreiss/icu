@@ -115,14 +115,28 @@ pub async fn resolve(host: &str, port: u16) -> Result<SocketAddr, NetError> {
         .ok_or_else(|| NetError::Resolve(format!("{host}: no address")))
 }
 
-/// Binds a client endpoint in the address family of `remote`.
-pub fn bind_endpoint(remote: SocketAddr) -> Result<quinn::Endpoint, NetError> {
+/// Binds a client endpoint in the address family of `remote` that tags every
+/// datagram with `com_key` and hears only datagrams tagged with it
+/// (`PROTOCOL.md` §1).
+pub fn bind_endpoint(
+    remote: SocketAddr,
+    com_key: &icu_proto::com::ComKey,
+) -> Result<quinn::Endpoint, NetError> {
     let bind: SocketAddr = if remote.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
         "[::]:0".parse().unwrap()
     };
-    quinn::Endpoint::client(bind).map_err(|e| NetError::Connect(format!("bind: {e}")))
+    let socket =
+        std::net::UdpSocket::bind(bind).map_err(|e| NetError::Connect(format!("bind: {e}")))?;
+    icu_proto::com::endpoint(
+        socket,
+        com_key,
+        icu_proto::com::Side::Client,
+        None,
+        Default::default(),
+    )
+    .map_err(|e| NetError::Connect(format!("bind: {e}")))
 }
 
 /// Reads one length prefixed frame (`PROTOCOL.md` §2).

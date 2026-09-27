@@ -236,6 +236,12 @@ pub fn passport_text(e: &PassportError) -> String {
                 .into()
         }
         PassportError::TooLarge => "Die Datei ist zu groß für eine ICU-Einladung.".into(),
+        PassportError::UnsupportedVersion(v) if *v < icu_proto::passport::PASSPORT_VERSION => {
+            "Dieser Passport stammt von einer älteren ICU-Version und kann den Server nicht mehr \
+             erreichen. Bitte auf dem anderen Gerät neu exportieren oder eine neue Einladung \
+             anfordern."
+                .into()
+        }
         PassportError::UnsupportedVersion(_) => {
             "Diese Einladung stammt von einer neueren ICU-Version. Bitte ICU aktualisieren.".into()
         }

@@ -139,10 +139,12 @@ Eine bestehende Installation, deren CA einen solchen Namen schon trägt,
 startet weiter und warnt im Journal. `localhost` und IP-Adressen gehen.
 
 `StateDirectory=icu` legt `/var/lib/icu/` an; beim ersten Start entstehen dort
-`ca.key` (0600), `ca.crt`, `server.key` (0600), `server.crt`, `users.toml`
-und `state.lock`. **`ca.key` ist das einzige Geheimnis, das zählt** — geht es
-verloren, müssen sich alle Nutzer neu registrieren. Ein Backup von
-`/var/lib/icu/` gehört zur Inbetriebnahme. Eine neue CA legt der Server nur an,
+`ca.key` (0600), `ca.crt`, `com.key` (0600), `server.key` (0600), `server.crt`,
+`users.toml` und `state.lock`. **`ca.key` und `com.key` sind die Geheimnisse,
+die zählen** — geht eines verloren, müssen sich alle Nutzer neu registrieren.
+`com.key` ist der Com-Schlüssel (2026-09-27, `PROTOCOL.md` §1): jedes
+UDP-Datagramm trägt ein Tag daraus, und jeder Passport trägt ihn. Ein Backup
+von `/var/lib/icu/` gehört zur Inbetriebnahme. Eine neue CA legt der Server nur an,
 wenn `ca.crt` und `ca.key` beide fehlen und `users.toml` noch nie benutzt wurde
 (keine Nutzer, keine CRL); fehlt nur eine, ist eine nicht lesbar (etwa nach
 einem Restore mit falschem Besitzer), passen sie nicht zusammen oder fehlen
@@ -155,13 +157,15 @@ der Rotation nicht geschrieben werden konnte); der nächste Start trägt es nach
 und löscht die Datei. Nicht von Hand löschen, sonst bleibt das alte Leaf
 gültig.
 
-**Backup und Restore.** `ca.crt`, `ca.key` und `users.toml` gehören zusammen
-und kommen aus demselben Backup zurück, lesbar für den Dienst. Meldet der
-Start `no CA in …: ca.crt and ca.key are both missing, but users.toml has been
-in use`, fehlt die CA neben einem benutzten Nutzerbestand — ein unvollständiger
-Restore, eine Migration ohne die CA: beide Dateien aus dem Backup zurückholen.
-Eine neue CA sperrte jeden registrierten Nutzer aus, deshalb legt der Server
-dann keine an. Wer wirklich neu anfangen will (neue CA, alle registrieren sich
+**Backup und Restore.** `ca.crt`, `ca.key`, `com.key` und `users.toml` gehören
+zusammen und kommen aus demselben Backup zurück, lesbar für den Dienst. Meldet
+der Start `no CA in …: ca.crt and ca.key are both missing, but users.toml has
+been in use`, fehlt die CA neben einem benutzten Nutzerbestand — ein
+unvollständiger Restore, eine Migration ohne die CA: beide Dateien aus dem
+Backup zurückholen. Eine neue CA sperrte jeden registrierten Nutzer aus,
+deshalb legt der Server dann keine an. Dasselbe gilt für `no com key in …`:
+`com.key` aus dem Backup zurückholen; einen neuen Schlüssel legt der Server nur
+in einem nie benutzten State an. Wer wirklich neu anfangen will (neue CA, alle registrieren sich
 neu), schiebt das ganze State-Verzeichnis beiseite.
 
 **Nach dem Zurückspielen eines Backups** `icu-server rotate-server-cert`
@@ -183,7 +187,19 @@ sudo firewall-cmd --permanent --add-port=4711/udp && sudo firewall-cmd --reload
 ### Im offenen Internet
 
 Freigeben muss man nur den einen UDP-Port; der Server braucht keinen
-Reverse-Proxy und kein TLS davor, er terminiert QUIC/TLS 1.3 selbst. Ohne gültiges Zertifikat der eigenen CA gibt es weder Raumzugang noch Medien.
+Reverse-Proxy und kein TLS davor, er terminiert QUIC/TLS 1.3 selbst.
+
+**Der Port schweigt ohne Com-Schlüssel** (2026-09-27, wie OpenVPN `tls-auth`,
+`PROTOCOL.md` §1): jedes Datagramm trägt ein 16-Byte-HMAC-Tag aus `com.key`,
+und was keins trägt, verwirft der Server, bevor QUIC es sieht — kein
+Handshake, keine Version Negotiation, kein Stateless Reset. Ein Portscan
+bekommt keine Antwort (nmap: `open|filtered`, nicht `closed`). `icu-server status` zählt die verworfenen
+Datagramme (`com_dropped`). Der Schlüssel ist ein Gruppengeheimnis, keine
+Zulassung: er steht in jedem Passport, auch ein widerrufener Nutzer kennt ihn
+noch. Ein Client, dessen Passport einen anderen Schlüssel trägt, bekommt keine
+Antwort und sieht dasselbe wie bei einem abgeschalteten Server.
+
+Ohne gültiges Zertifikat der eigenen CA gibt es weder Raumzugang noch Medien.
 Unbekannte Zertifikate scheitern an TLS; ohne Zertifikat darf TLS für die
 lesbare Fehlermeldung `AUTH_REQUIRED` abschließen, danach wird sofort getrennt.
 Dafür gilt

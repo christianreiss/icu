@@ -49,12 +49,14 @@ async fn wrong_server_name_is_a_fatal_certificate_error() {
 
 /// A client whose credentials come from another CA — the server was set up
 /// anew since — is told in plain words to ask for a new invitation, with
-/// the raw TLS error kept only as technical detail.
+/// the raw TLS error kept only as technical detail. The new server keeps the
+/// old com key: with a new one the client would hear nothing at all
+/// (`PROTOCOL.md` §1, §5) and never learn about the CA.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn credentials_from_another_ca_read_as_a_plain_request_for_an_invite() {
     let old_server = TestServer::start().await;
     let (identity, paths, dir) = old_server.enroll("alice").await;
-    let new_server = TestServer::start().await;
+    let new_server = TestServer::start_with_com_key(Some(&identity.com_key)).await;
 
     let (backend, _probe) = FakeBackend::silent();
     let engine = new_server
@@ -141,7 +143,8 @@ async fn a_server_leaf_on_the_crl_is_refused() {
     };
     let (config, cert_failure) =
         icu_client::net::conn::client_config_with_crl(&identity, Some(&crl)).expect("config");
-    let endpoint = icu_client::net::bind_endpoint(server.addr()).expect("endpoint");
+    let endpoint =
+        icu_client::net::bind_endpoint(server.addr(), &identity.com_key).expect("endpoint");
     let err = icu_client::net::conn::connect(
         &endpoint,
         config,
@@ -186,7 +189,7 @@ async fn handshake_error(
     addr: std::net::SocketAddr,
 ) -> icu_client::net::conn::ConnectError {
     let (config, cert_failure) = icu_client::net::conn::client_config(identity).expect("config");
-    let endpoint = icu_client::net::bind_endpoint(addr).expect("endpoint");
+    let endpoint = icu_client::net::bind_endpoint(addr, &identity.com_key).expect("endpoint");
     icu_client::net::conn::connect(
         &endpoint,
         config,
@@ -257,7 +260,16 @@ async fn an_alert_before_server_authentication_is_retried() {
     let quic = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("quic"),
     ));
-    let other = quinn::Endpoint::server(quic, "127.0.0.1:0".parse().unwrap()).expect("bind");
+    // It speaks with the client's com key: otherwise the client would hear
+    // nothing at all, and the alert under test would never arrive.
+    let other = icu_proto::com::endpoint(
+        std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"),
+        &identity.com_key,
+        icu_proto::com::Side::Server,
+        Some(quic),
+        Default::default(),
+    )
+    .expect("bind");
     let addr = other.local_addr().unwrap();
     let accept = tokio::spawn(async move {
         if let Some(incoming) = other.accept().await {

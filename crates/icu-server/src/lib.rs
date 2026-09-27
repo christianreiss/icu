@@ -108,6 +108,11 @@ pub struct Server {
     /// The QUIC endpoints, so a new CRL or server leaf reaches the TLS
     /// config without a restart (`endpoint::reload_tls`). Empty offline.
     pub endpoints: Vec<quinn::Endpoint>,
+    /// The com key (`PROTOCOL.md` §1): every datagram carries its tag, and
+    /// every registration bundle carries the key.
+    pub com_key: icu_proto::com::ComKey,
+    /// Datagrams the endpoints dropped for a missing or wrong com tag.
+    pub com_dropped: Arc<std::sync::atomic::AtomicU64>,
     /// The current CRL for clients — replaced server leaves only — DER, as
     /// last sent to them (`CrlUpdate`).
     pub crl: std::sync::RwLock<Vec<u8>>,
@@ -137,11 +142,14 @@ impl Server {
         config.validate()?;
         let mut store = Store::open(&config.paths.state_dir)?;
         let mut ca = open_ca(&config, &store)?;
+        let com_key = open_com_key(&config, &store)?;
         admin::record_retired_leaves(&mut store, &mut ca)?;
         Ok(Arc::new(Server::new(
             config,
             store,
             ca,
+            com_key,
+            Arc::default(),
             Vec::new(),
             Vec::new(),
         )))
@@ -153,6 +161,8 @@ impl Server {
         config: Config,
         store: Store,
         ca: Ca,
+        com_key: icu_proto::com::ComKey,
+        com_dropped: Arc<std::sync::atomic::AtomicU64>,
         endpoints: Vec<quinn::Endpoint>,
         crl: Vec<u8>,
     ) -> Server {
@@ -168,6 +178,8 @@ impl Server {
             live_certs: std::sync::Mutex::new(CertSlots::new()),
             roomless: std::sync::Mutex::new(CertSlots::new()),
             endpoints,
+            com_key,
+            com_dropped,
             crl: std::sync::RwLock::new(crl),
             counters: Counters::default(),
             ca: tokio::sync::RwLock::new(ca),
@@ -283,6 +295,7 @@ pub async fn run(config: Config) -> Result<Handle> {
         tracing::info!(purged, "dropped expired registrations");
     }
     let mut ca = open_ca(&config, &store)?;
+    let com_key = open_com_key(&config, &store)?;
     // A server leaf replaced while loading, or left in server.crt.retired
     // by a rotation whose CRL entry failed, goes on the CRL built below.
     admin::record_retired_leaves(&mut store, &mut ca)?;
@@ -293,10 +306,11 @@ pub async fn run(config: Config) -> Result<Handle> {
     // handshake.
     let crls = endpoint::build_crls(&mut store, &ca)?;
     let quic_config = endpoint::server_config(&config, &ca, &crls.handshake)?;
+    let com_dropped = Arc::<std::sync::atomic::AtomicU64>::default();
     let mut endpoints = Vec::new();
     let mut addrs = Vec::new();
     for addr in &config.server.listen {
-        let endpoint = endpoint::bind(*addr, quic_config.clone())?;
+        let endpoint = endpoint::bind(*addr, quic_config.clone(), &com_key, &com_dropped)?;
         addrs.push(endpoint.local_addr()?);
         endpoints.push(endpoint);
     }
@@ -305,6 +319,8 @@ pub async fn run(config: Config) -> Result<Handle> {
         config,
         store,
         ca,
+        com_key,
+        com_dropped,
         endpoints,
         crls.clients.to_vec(),
     ));
@@ -414,6 +430,40 @@ fn open_ca(config: &Config, store: &Store) -> Result<Ca> {
         );
     }
     Ok(ca)
+}
+
+/// Loads the com key (`PROTOCOL.md` §1), or creates it for a state that has
+/// never been used. Like the CA it is never replaced silently: every passport
+/// carries it, and a new one would lock every client out.
+fn open_com_key(config: &Config, store: &Store) -> Result<icu_proto::com::ComKey> {
+    let path = config.paths.state_dir.join(store::COM_KEY_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => icu_proto::com::ComKey::from_base64(&text).ok_or_else(|| {
+            Error::msg(format!(
+                "{} is not a com key (base64 of {} bytes); restore it from the backup",
+                path.display(),
+                icu_proto::com::COM_KEY_LEN,
+            ))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && store.is_fresh() => {
+            let key = icu_proto::com::ComKey::generate()
+                .map_err(|_| Error::msg("no randomness for the com key"))?;
+            store::write_private(&path, &format!("{}\n", key.to_base64()))?;
+            tracing::info!(path = %path.display(), "created the com key");
+            Ok(key)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::msg(format!(
+            "no com key in {}, but {users} has been in use (users or CRLs on record). \
+             Refusing to create a new one: every passport carries the key, a new one \
+             would lock out everyone registered so far. Restore {file} from the backup \
+             {users} comes from (runbook \"Backup und Restore\" in \
+             /usr/share/doc/icu-server/README.md, deploy/README.md in the sources)",
+            config.paths.state_dir.display(),
+            users = store::USERS_FILE,
+            file = store::COM_KEY_FILE,
+        ))),
+        Err(e) => Err(Error::msg(format!("cannot read {}: {e}", path.display()))),
+    }
 }
 
 /// Periodic work: expiring talk spurts, expiring `LossReport`s, pruning IP

@@ -2889,7 +2889,7 @@ async fn run_session(
             Ok(c) => c,
             Err(e) => return SessionEnd::Fatal(e.problem()),
         };
-    let endpoint = match crate::net::bind_endpoint(addr) {
+    let endpoint = match crate::net::bind_endpoint(addr, &local.identity.com_key) {
         Ok(e) => e,
         Err(e) => return SessionEnd::Retry(e.problem()),
     };

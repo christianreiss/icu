@@ -12,7 +12,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use icu_proto::{error as ec, limits as pl, passport::PassportV2, UserId};
+use icu_proto::{error as ec, limits as pl, passport::Passport, UserId};
 use rand::RngCore;
 
 use crate::{
@@ -113,10 +113,12 @@ pub async fn issue(
     drop(store);
 
     tracing::info!(user_id, name = %name, is_admin, %expires, "registration issued");
-    let bundle = PassportV2 {
+    let bundle = Passport {
         key_der,
         leaf_der: leaf.to_vec(),
         ca_der,
+        com_key: server.com_key.clone(),
+        settings: String::new(),
     }
     .encode();
     Ok(Issued {

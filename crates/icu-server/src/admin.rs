@@ -723,6 +723,9 @@ fn status(server: &Arc<Server>) -> serde_json::Value {
         "connections": Counters::get(&c.connections),
         "open_connections": server.open_connections.load(Relaxed),
         "handshakes": server.handshakes.load(Relaxed),
+        // Datagrams without a valid com tag (`PROTOCOL.md` §1): port noise,
+        // or a client whose passport belongs to another key.
+        "com_dropped": server.com_dropped.load(Relaxed),
         "roomless_sessions": crate::lock(&server.roomless).len(),
         "tls": tls_status(server),
         "relay": {
