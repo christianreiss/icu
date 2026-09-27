@@ -29,12 +29,20 @@ git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || die "tag $TAG missing"
 (cd "$OUT" && sha256sum -c --quiet SHA256SUMS) || die "checksums in $OUT do not match"
 
 log "secret scan of the full history"
-# Known false positives (test fixtures) are listed in .gitleaksignore.
+# The default rules plus ICU passports (.gitleaks.toml). Known false
+# positives (test fixtures) are listed in .gitleaksignore.
 podman run --rm --security-opt label=disable -v "$PWD":/repo:ro "$GITLEAKS_IMAGE" \
-    git --no-banner --redact --gitleaks-ignore-path /repo/.gitleaksignore /repo \
+    git --no-banner --redact --config /repo/.gitleaks.toml \
+    --gitleaks-ignore-path /repo/.gitleaksignore /repo \
     || die "gitleaks found something; check before publishing"
 if git log -p --all | grep -q 'BEGIN [A-Z ]*PRIVATE KEY'; then
     die "a PEM private key appears in the history"
+fi
+# A passport or registration bundle carries a private key too. The armor
+# line alone is in docs and tests; a base64 body right after it is not.
+if git log -p --all | grep -A1 -e '-----BEGIN ICU PASSPORT-----' \
+        | grep -qE '[A-Za-z0-9+/=]{40,}'; then
+    die "an ICU passport (private key) appears in the history"
 fi
 
 log "GitHub repository $GH_REPO"

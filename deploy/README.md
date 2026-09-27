@@ -19,7 +19,7 @@ sudo apt install ./icu-server_<ver>-1_amd64.deb          # Debian 12+
 sudoedit /etc/icu/server.toml                            # server_name, public_host (optional)
 sudo systemctl enable --now icu-server
 sudo firewall-cmd --permanent --add-service=icu && sudo firewall-cmd --reload
-sudo icu-server invite --out admin.txt                   # zuerst sich selbst (§3 „Erster Admin“)
+sudo icu-server invite --out /root/icu-admin.icu         # zuerst sich selbst (§3 „Erster Admin“)
 ```
 
 Das Paket legt die Gruppe `icu` an (`/usr/lib/sysusers.d/icu-server.conf`),
@@ -333,7 +333,7 @@ State unter `/var/lib/private` bleibt root vorbehalten). Wer nicht an den
 Socket darf, bekommt das als Fehler mit Pfad und Ursache.
 
 ```bash
-icu-server invite --ttl 24h --out bob.txt  # Registrierungs-Bundle, einmalig, 24 h gültig
+icu-server invite --ttl 24h --out ~/bob.icu  # Registrierungs-Bundle, einmalig, 24 h gültig
 icu-server users                           # Tabelle mit user_id, Cert, online
 icu-server revoke alice                    # alle Certs sperren, sofort kicken
 icu-server revoke id:7                     # ausdrücklich die user_id (name:… für den Namen)
@@ -349,10 +349,15 @@ icu-server restore latest                  # Snapshot zurück, nur bei gestoppte
 **Erster Admin:** Admin wird, wer als Erster eine Registrierung abschließt
 (quittiert), solange es noch keinen bestätigten Admin gibt — nicht das zuerst
 ausgestellte Bundle (`PROTOCOL.md` §2.3). Direkt nach der Installation also
-`icu-server invite --out admin.txt` (geht auch ohne laufenden Server), die Datei
-auf den eigenen Rechner bringen und dort `icu admin.txt --name <name>` ausführen
-oder den Inhalt ins Erststart-Fenster einfügen — bevor weitere Einladungen
-hinausgehen. Solange es keinen bestätigten Admin gibt, weist `invite` darauf
+`sudo icu-server invite --out /root/icu-admin.icu` (geht auch ohne laufenden
+Server), die Datei auf den eigenen Rechner bringen und dort
+`icu icu-admin.icu --name <name>` ausführen oder den Inhalt ins
+Erststart-Fenster einfügen — bevor weitere Einladungen hinausgehen — und
+danach auf beiden Rechnern löschen. Ein Bundle gehört an einen privaten Ort
+(`/root`, das eigene Home), nicht ins aktuelle Verzeichnis: das ist schnell
+ein Git-Checkout oder ein geteilter Ordner, und mit ihm wandert der
+Schlüssel in einen Commit oder ein Archiv (`.gitignore` schließt `*.icu`
+aus, andere Werkzeuge nicht). Solange es keinen bestätigten Admin gibt, weist `invite` darauf
 hin. Das Bundle enthält einen privaten Schlüssel und gilt, bis es
 eingelöst oder abgelaufen ist; es gehört nicht in einen Chat, den andere lesen.
 Weitere Bundles stellt ein Admin auch im Client aus (⚙ → Allgemein →
