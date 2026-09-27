@@ -299,6 +299,17 @@ fn import_in_terminal(cli: &Cli, paths: &Paths, text: &str) -> Result<(), String
             }
         );
     }
+    // What decides when this device can be heard is spelled out.
+    if let Some(incoming) = settings.as_ref().filter(|_| !cli.skip_settings) {
+        let here = icu_client::config::Settings::load(paths).unwrap_or_default();
+        let changes = here.send_changes(incoming);
+        if !changes.is_empty() {
+            eprintln!("icu: Ändert, wann und wie du zu hören bist:");
+            for line in changes {
+                eprintln!("icu:   {line}");
+            }
+        }
+    }
     if !cli.yes && !confirm_import()? {
         return Err("import cancelled".into());
     }

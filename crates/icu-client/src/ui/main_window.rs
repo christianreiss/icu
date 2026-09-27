@@ -2307,6 +2307,8 @@ pub struct EnrollApp {
     /// The settings of the passport being joined, stored once its identity
     /// is (`config::import_settings`).
     pending_settings: Option<crate::config::Settings>,
+    /// This installation's settings, which a passport's would change.
+    settings: crate::config::Settings,
     /// How much taller the last frame's content was than the window.
     overflow: f32,
 }
@@ -2320,6 +2322,7 @@ impl EnrollApp {
         result: Arc<Mutex<Option<Identity>>>,
     ) -> EnrollApp {
         let current = Identity::load(&paths).ok().flatten();
+        let settings = crate::config::Settings::load(&paths).unwrap_or_default();
         EnrollApp {
             window_restore: WindowRestore::default(),
             #[cfg(windows)]
@@ -2338,6 +2341,7 @@ impl EnrollApp {
             result,
             take_settings: true,
             pending_settings: None,
+            settings,
             overflow: 0.0,
         }
     }
@@ -2498,6 +2502,12 @@ impl eframe::App for EnrollApp {
         let refused = read.as_ref().and_then(|r| r.as_ref().err().cloned());
         let parsed = read.and_then(Result::ok);
         let carries_settings = parsed.as_ref().is_some_and(|(_, s)| s.is_some());
+        // What they change about when this device can be heard (C-3).
+        let changes = parsed
+            .as_ref()
+            .and_then(|(_, s)| s.as_ref())
+            .map(|incoming| self.settings.send_changes(incoming))
+            .unwrap_or_default();
         let parsed = parsed.map(|(identity, _)| identity);
         // Where the pasted text leads, shown before joining: it brings its
         // own CA and address (`PROTOCOL.md` §2.3.1).
@@ -2721,6 +2731,14 @@ impl eframe::App for EnrollApp {
                                             .size(11.5)
                                             .color(tok.dim_text),
                                     );
+                                    if self.take_settings && !changes.is_empty() {
+                                        ui.label(
+                                            RichText::new("Ändert, wann und wie du zu hören bist:")
+                                                .size(11.5)
+                                                .color(tok.connecting),
+                                        );
+                                        ui.label(RichText::new(changes.join("\n")).size(11.5));
+                                    }
                                 }
                                 if join_ok && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                     join = true;

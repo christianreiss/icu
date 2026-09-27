@@ -487,6 +487,69 @@ impl Settings {
         *self = taken;
     }
 
+    /// What taking `incoming` over ([`Settings::take_portable`]) would
+    /// change about when and how this device can be heard, one line each in
+    /// the words of the settings window: sending mode, threshold, gain,
+    /// noise suppression, VAD hangover, the three cues and „Minimiert
+    /// starten“. The import confirmation shows them next to the switch
+    /// that takes the settings along: a passport from somebody else could
+    /// otherwise switch to voice activation at threshold 0 with +20 dB, no
+    /// cues, started into the tray, and nothing would show it (review
+    /// 2026-09-27, C-3). Empty when none of them changes.
+    pub fn send_changes(&self, incoming: &Settings) -> Vec<String> {
+        let mut after = self.clone();
+        after.take_portable(incoming.clone());
+        let (was, will) = (&self.audio, &after.audio);
+        let mut lines = Vec::new();
+        let mut differs = |what: &str, now: String, before: String| {
+            if now != before {
+                lines.push(format!("{what}: {now} (bisher {before})"));
+            }
+        };
+        let mode = |a: &AudioSettings| match a.mode {
+            ModeSetting::Ptt => "Taste halten".to_string(),
+            ModeSetting::Vad => "Automatisch".to_string(),
+        };
+        let threshold = |a: &AudioSettings| {
+            if a.vad_auto {
+                "automatisch".to_string()
+            } else {
+                format!("{:.0} %", a.vad_threshold * 100.0)
+            }
+        };
+        let on = |b: bool| if b { "an" } else { "aus" }.to_string();
+        differs("Senden", mode(will), mode(was));
+        differs("Schwelle", threshold(will), threshold(was));
+        differs(
+            "Verstärkung",
+            format!("{:+.0} dB", will.gain_db),
+            format!("{:+.0} dB", was.gain_db),
+        );
+        differs("Rauschunterdrückung", on(will.denoise), on(was.denoise));
+        differs(
+            "VAD-Nachlauf",
+            format!("{} ms", will.hangover_ms),
+            format!("{} ms", was.hangover_ms),
+        );
+        differs(
+            "Ton „Jemand kommt oder geht“",
+            on(will.cue_join),
+            on(was.cue_join),
+        );
+        differs(
+            "Ton „Senden beginnt oder endet“",
+            on(will.cue_tx),
+            on(was.cue_tx),
+        );
+        differs("Ton „Stummschalten“", on(will.cue_mute), on(was.cue_mute));
+        differs(
+            "Minimiert starten",
+            on(after.ui.start_minimized),
+            on(self.ui.start_minimized),
+        );
+        lines
+    }
+
     /// The ranges of the settings window's sliders and choices.
     fn clamp_numbers(&mut self) {
         let defaults = AudioSettings::default();
@@ -976,6 +1039,10 @@ pub struct ImportSummary {
     pub name: String,
     /// A registration bundle (invite) rather than a passport.
     pub registration: bool,
+    /// SHA-256 of the CA the client will hold the server to, as
+    /// `conninfo::CertInfo::fingerprint` prints it: the one thing worth
+    /// comparing with whoever sent the passport.
+    pub ca_fingerprint: String,
     /// An identity exists and trusts a different CA: another server.
     pub ca_changed: bool,
 }
@@ -994,12 +1061,17 @@ impl ImportSummary {
             address,
             name: crate::conninfo::CertInfo::from_der(&identity.leaf_der).subject,
             registration: identity.is_registration(),
-            ca_changed: current.is_some_and(|c| c.ca_der != identity.ca_der),
+            ca_fingerprint: crate::conninfo::CertInfo::from_der(&identity.ca_der).fingerprint,
+            ca_changed: current.is_some_and(|c| !same_ca(&c.ca_der, &identity.ca_der)),
         }
     }
 
-    /// The summary as lines of text, for the CLI and the windows.
+    /// The summary as lines of text, for the CLI and the settings window.
+    /// The fingerprint takes two lines of 16 pairs, so it can be read out
+    /// in halves.
     pub fn lines(&self) -> Vec<String> {
+        let pairs: Vec<&str> = self.ca_fingerprint.split(':').collect();
+        let (first, second) = pairs.split_at(pairs.len().min(16));
         let mut lines = vec![
             format!("Server:  {}", self.server_name),
             format!("Adresse: {}", self.address),
@@ -1008,7 +1080,11 @@ impl ImportSummary {
             } else {
                 format!("Name:    {}", self.name)
             },
+            format!("CA:      {}", first.join(":")),
         ];
+        if !second.is_empty() {
+            lines.push(format!("         {}", second.join(":")));
+        }
         if self.ca_changed {
             lines.push(
                 "Achtung: anderer Server als bisher — nur übernehmen, wenn du das erwartest."
@@ -1016,6 +1092,23 @@ impl ImportSummary {
             );
         }
         lines
+    }
+}
+
+/// Whether two CA certificates are the same CA: the same subject on the same
+/// key. `icu-server renew-ca` issues a new certificate — new DER — for both,
+/// and a passport from before it is no other server (review 2026-09-27,
+/// C-5). Certificates that do not parse count as the same only when their
+/// bytes are.
+fn same_ca(a: &[u8], b: &[u8]) -> bool {
+    match (
+        x509_parser::parse_x509_certificate(a),
+        x509_parser::parse_x509_certificate(b),
+    ) {
+        (Ok((_, a)), Ok((_, b))) => {
+            a.subject().as_raw() == b.subject().as_raw() && a.public_key().raw == b.public_key().raw
+        }
+        _ => a == b,
     }
 }
 
@@ -1511,7 +1604,14 @@ mod tests {
             !summary.ca_changed,
             "nothing to compare with on first import"
         );
-        assert_eq!(summary.lines().len(), 3);
+        let lines = summary.lines();
+        assert_eq!(lines.len(), 5);
+        // The fingerprint, in halves of 16 pairs.
+        assert_eq!(
+            format!("{}:{}", &lines[3][9..], lines[4].trim()),
+            summary.ca_fingerprint
+        );
+        assert_eq!(summary.ca_fingerprint.split(':').count(), 32);
         assert!(!ImportSummary::of(&incoming, Some(&incoming)).ca_changed);
 
         let (leaf, ca, key) = issued(Some("icu://[2001:db8::1]:4711"), "ICU CA other");
@@ -1534,6 +1634,51 @@ mod tests {
         let changed = ImportSummary::of(&incoming, Some(&current));
         assert!(changed.ca_changed);
         assert!(changed.lines().last().unwrap().contains("anderer Server"));
+    }
+
+    /// A CA certificate renewed on the same key and subject
+    /// (`icu-server renew-ca`) is the same server; another key or another
+    /// name is not (review 2026-09-27, C-5).
+    #[test]
+    fn a_renewed_ca_is_not_another_server() {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+        let ca = |key: &KeyPair, cn: &str, year: i32| {
+            let mut params = CertificateParams::default();
+            params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            params.distinguished_name.push(DnType::CommonName, cn);
+            params.not_after = rcgen::date_time_ymd(year, 1, 1);
+            params.self_signed(key).unwrap().der().to_vec()
+        };
+        let key = KeyPair::generate().unwrap();
+        let before = ca(&key, "ICU CA icu.example.org", 2030);
+        let renewed = ca(&key, "ICU CA icu.example.org", 2040);
+        assert_ne!(before, renewed, "a new certificate");
+        assert!(same_ca(&before, &renewed));
+        let other_key = ca(
+            &KeyPair::generate().unwrap(),
+            "ICU CA icu.example.org",
+            2030,
+        );
+        assert!(!same_ca(&before, &other_key));
+        let other_name = ca(&key, "ICU CA other.example.org", 2030);
+        assert!(!same_ca(&before, &other_name));
+        assert!(same_ca(b"junk", b"junk"));
+        assert!(!same_ca(b"junk", &before));
+
+        let identity = |ca_der: Vec<u8>| {
+            let (leaf, _, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA x");
+            Identity {
+                server: ServerInfo::from_certs(&leaf, &ca_der).unwrap(),
+                key_der: key,
+                leaf_der: leaf,
+                ca_der,
+                com_key: com(),
+            }
+        };
+        let (old, new) = (identity(before.clone()), identity(renewed));
+        assert!(!ImportSummary::of(&new, Some(&old)).ca_changed);
+        assert!(ImportSummary::of(&identity(other_key), Some(&old)).ca_changed);
     }
 
     /// A passport reads back to the same identity, com key included; the
@@ -1843,6 +1988,52 @@ mod tests {
     }
 
     /// Imported numbers land in the ranges the settings window offers.
+    /// The import confirmation names every change to when this device can
+    /// be heard — here a passport that makes the microphone hot — and
+    /// nothing when those settings stay (review 2026-09-27, C-3).
+    #[test]
+    fn the_import_names_what_changes_about_sending() {
+        let here = Settings::default();
+        assert!(here.send_changes(&here).is_empty());
+        let mut hot = Settings::default();
+        hot.audio.vad_auto = false;
+        hot.audio.vad_threshold = 0.0;
+        hot.audio.gain_db = 20.0;
+        hot.audio.denoise = false;
+        hot.audio.hangover_ms = 3000;
+        hot.audio.cue_join = false;
+        hot.audio.cue_mute = false;
+        hot.ui.start_minimized = true;
+        // Nothing about sending: not listed.
+        hot.ui.theme = "dark".into();
+        let lines = here.send_changes(&hot);
+        assert_eq!(
+            lines,
+            [
+                "Schwelle: 0 % (bisher automatisch)",
+                "Verstärkung: +20 dB (bisher +0 dB)",
+                "Rauschunterdrückung: aus (bisher an)",
+                "VAD-Nachlauf: 3000 ms (bisher 1000 ms)",
+                "Ton „Jemand kommt oder geht“: aus (bisher an)",
+                "Ton „Stummschalten“: aus (bisher an)",
+                "Minimiert starten: an (bisher aus)",
+            ]
+        );
+        let mut ptt = Settings::default();
+        ptt.audio.mode = ModeSetting::Ptt;
+        assert_eq!(
+            hot.send_changes(&ptt)[0],
+            "Senden: Taste halten (bisher Automatisch)"
+        );
+        // What is out of range is shown as it will be taken: clamped.
+        let mut loud = Settings::default();
+        loud.audio.gain_db = 99.0;
+        assert_eq!(
+            here.send_changes(&loud),
+            ["Verstärkung: +20 dB (bisher +0 dB)"]
+        );
+    }
+
     #[test]
     fn imported_numbers_are_clamped() {
         let mut incoming = Settings::default();

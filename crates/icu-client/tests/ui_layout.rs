@@ -520,13 +520,19 @@ fn enroll_window_fits() {
     use icu_client::ui::main_window::EnrollApp;
     use std::sync::Mutex;
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (bundle, passport) = rt.block_on(async {
+    let (bundle, passport, sending) = rt.block_on(async {
         let server = common::TestServer::start().await;
         let bundle = server.invite_bundle("neu-3fa2").await;
         let (identity, _paths, _dir) = server.enroll("Chris").await;
         let (passport, with_settings) = identity.to_passport_with_settings(&Settings::default());
         assert!(with_settings, "the join page shows the import option");
-        (bundle, passport)
+        // Settings that change when this device can be heard: listed.
+        let mut there = Settings::default();
+        there.audio.mode = ModeSetting::Ptt;
+        there.audio.cue_tx = true;
+        there.ui.start_minimized = true;
+        let sending = identity.to_passport_with_settings(&there).0;
+        (bundle, passport, sending)
     });
     let mut overflows = Overflows::default();
     for theme_name in THEMES {
@@ -534,6 +540,7 @@ fn enroll_window_fits() {
             ("paste", None),
             ("invite", Some(bundle.clone())),
             ("passport", Some(passport.clone())),
+            ("sending", Some(sending.clone())),
             // The longest refusal the verdict line under the field shows.
             (
                 "refused",
@@ -565,6 +572,9 @@ fn enroll_window_fits() {
             let what = format!("enroll/{case}/{theme_name}");
             overflows.check_window(&what, &h, ENROLL, false, h.state().overflow());
             shot(&mut h, &what.replace('/', "-"));
+            if case == "sending" {
+                h.get_by_label_contains("Senden: Taste halten (bisher Automatisch)");
+            }
             if case == "invite" {
                 // One page: where it leads, the name, one button.
                 h.get_by_role_and_label(
@@ -633,19 +643,30 @@ fn settings_window_keeps_outside_changes() {
 }
 
 /// ⚙ → Allgemein: a pasted passport that carries settings offers to take
-/// them along, on by default; switched off, „Übernehmen“ sends the identity
-/// alone.
+/// them along, on by default, and names what they change about sending;
+/// switched off, „Übernehmen“ sends the identity alone. The CA's
+/// fingerprint is on the confirmation (review 2026-09-27, C-3, C-4).
 #[cfg(unix)]
 #[test]
 fn settings_import_takes_the_settings_unless_switched_off() {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let passport = rt.block_on(async {
+    let (passport, ca_der) = rt.block_on(async {
         let server = common::TestServer::start().await;
         let (identity, _paths, _dir) = server.enroll("Chris").await;
         let mut there = Settings::default();
         there.audio.mode = ModeSetting::Ptt;
-        identity.to_passport_with_settings(&there).0
+        there.ui.start_minimized = true;
+        (
+            identity.to_passport_with_settings(&there).0,
+            identity.ca_der,
+        )
     });
+    let fingerprint = icu_client::conninfo::CertInfo::from_der(&ca_der).fingerprint;
+    let first_half = fingerprint
+        .split(':')
+        .take(16)
+        .collect::<Vec<_>>()
+        .join(":");
     for take in [true, false] {
         let s = state();
         let dir = tempfile::tempdir().unwrap();
@@ -661,11 +682,18 @@ fn settings_import_takes_the_settings_unless_switched_off() {
             cmds_out.borrow_mut().extend(view.ui(ui, &s, false).cmds);
         });
         shot(&mut h, &format!("settings-import-{take}"));
+        h.get_by_label_contains(&first_half);
+        h.get_by_label("Minimiert starten: an (bisher aus)");
         // The switch carries the name of its row.
         if !take {
             h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Einstellungen übernehmen")
                 .click_accesskit();
             h.run();
+            assert!(
+                h.query_by_label("Minimiert starten: an (bisher aus)")
+                    .is_none(),
+                "nothing changes without the settings"
+            );
         }
         h.get_by_role_and_label(
             egui::accesskit::Role::Button,
@@ -689,6 +717,56 @@ fn settings_import_takes_the_settings_unless_switched_off() {
             None => assert!(!take, "the settings were left behind"),
         }
     }
+}
+
+/// An invitation imported in ⚙ → Allgemein never brings settings, even
+/// one that carries some: the command line and the first-start window
+/// leave them behind too (review 2026-09-27, C-3).
+#[cfg(unix)]
+#[test]
+fn settings_import_of_an_invitation_takes_no_settings() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let bundle = rt.block_on(async {
+        let server = common::TestServer::start().await;
+        server.invite_bundle("").await
+    });
+    let mut forged = icu_proto::passport::Passport::decode(&bundle).unwrap();
+    let mut hot = Settings::default();
+    hot.audio.vad_auto = false;
+    hot.audio.vad_threshold = 0.0;
+    forged.settings = toml::to_string(&hot).unwrap();
+    let s = state();
+    let dir = tempfile::tempdir().unwrap();
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(dir.path().to_path_buf())),
+    );
+    view.import_text(forged.encode());
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let cmds_out = cmds.clone();
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        cmds_out.borrow_mut().extend(view.ui(ui, &s, false).cmds);
+    });
+    assert!(h.query_by_label("Einstellungen übernehmen").is_none());
+    h.get_by_role_and_label(
+        egui::accesskit::Role::Button,
+        &format!("{}  Übernehmen", egui_phosphor::regular::CHECK),
+    )
+    .click_accesskit();
+    h.run();
+    let settings = cmds
+        .borrow()
+        .iter()
+        .find_map(|c| match c {
+            Command::ReplaceIdentity(identity, settings) => {
+                assert!(identity.is_registration());
+                Some(settings.clone())
+            }
+            _ => None,
+        })
+        .expect("a ReplaceIdentity");
+    assert!(settings.is_none(), "an invitation brought settings");
 }
 
 /// Switches and sliders carry the name of their row for a screen reader,

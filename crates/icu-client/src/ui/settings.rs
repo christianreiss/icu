@@ -1000,6 +1000,10 @@ impl SettingsView {
         let lines = summary.lines();
         let warn = summary.ca_changed;
         let carries_settings = settings.is_some();
+        let changes = settings
+            .as_ref()
+            .map(|incoming| self.draft.send_changes(incoming))
+            .unwrap_or_default();
         widgets::card_note(ui, |ui| {
             let tok = theme::tokens(ui.visuals());
             for (i, line) in lines.iter().enumerate() {
@@ -1023,6 +1027,21 @@ impl SettingsView {
                     widgets::named_toggle(ui, &mut self.import_settings, "Einstellungen übernehmen")
                 },
             );
+        }
+        // What decides when this device can be heard is spelled out, not
+        // hidden in „Einstellungen“ (review 2026-09-27, C-3).
+        if self.import_settings && !changes.is_empty() {
+            widgets::card_note(ui, |ui| {
+                let tok = theme::tokens(ui.visuals());
+                ui.label(
+                    RichText::new("Ändert, wann und wie du zu hören bist:")
+                        .size(11.5)
+                        .color(tok.connecting),
+                );
+                for line in &changes {
+                    ui.label(RichText::new(line).size(11.5));
+                }
+            });
         }
         let replaces = if carries_settings && self.import_settings {
             "Ersetzt Schlüssel, Zertifikat, Serverdaten und Einstellungen dieses Geräts"
@@ -1095,11 +1114,16 @@ impl SettingsView {
 
     /// Reads the pasted text and shows what it would switch to.
     fn preview_passport(&mut self) {
-        // `from_passport` also checks the key: a passport whose key does not
-        // parse would brick the next connection. A registration bundle is
-        // taken as well; the engine registers it under its placeholder name.
+        // `from_passport` also checks key, certificate and names: a passport
+        // that cannot work would replace the one that does. A registration
+        // bundle is taken as well; the engine registers it under its
+        // placeholder name.
         match Identity::from_passport_with_settings(&self.passport_import) {
             Ok((identity, settings)) => {
+                // An invitation brings no settings: whatever one carries
+                // stays behind, as on the command line and in the
+                // first-start window (review 2026-09-27, C-3).
+                let settings = settings.filter(|_| !identity.is_registration());
                 let current = Identity::load(&self.paths).ok().flatten();
                 let summary = config::ImportSummary::of(&identity, current.as_ref());
                 self.import_preview = Some((Box::new(identity), settings.map(Box::new), summary));
