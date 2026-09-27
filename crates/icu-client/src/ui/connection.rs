@@ -1304,7 +1304,7 @@ fn fmt_updown_kbps(tx: f32, rx: f32) -> String {
 }
 
 /// „2 h 14 min“, keeping only the two largest units that carry information.
-fn fmt_uptime(d: Duration) -> String {
+pub(crate) fn fmt_uptime(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {
         format!("{s} s")
