@@ -239,6 +239,10 @@ struct Scene {
     frames: VideoFrames,
     width: u32,
     height: u32,
+    /// Pixels per layout pixel. The Windows window is sized in physical
+    /// pixels and sets this from the monitor's DPI each frame; a Wayland
+    /// compositor scales the surface itself (1).
+    scale: f32,
 }
 
 /// What [`Scene::update`] found.
@@ -265,24 +269,27 @@ impl Scene {
             frames,
             width: 0,
             height: 0,
+            scale: 1.0,
         }
     }
 
     fn tile_dims(&self) -> (u32, u32) {
-        match self.settings.size {
+        let (w, h) = match self.settings.size {
             TileSize::Small => (160, 120),
             TileSize::Medium => (320, 240),
             TileSize::Large => (480, 360),
-        }
+        };
+        (scaled(w, self.scale), scaled(h, self.scale))
     }
 
     /// Height of a name plate, and the name's pixel size, per tile size.
     fn plate_dims(&self) -> (u32, u32) {
-        match self.settings.size {
+        let (h, px) = match self.settings.size {
             TileSize::Small => (26, 12),
             TileSize::Medium => (34, 15),
             TileSize::Large => (42, 18),
-        }
+        };
+        (scaled(h, self.scale), scaled(px, self.scale))
     }
 
     /// Inner height of a tile.
@@ -409,6 +416,22 @@ impl Scene {
             frame_color: self.settings.frame_color,
         };
         compose(canvas, &geometry, &self.tiles, self.labels.as_mut());
+    }
+}
+
+/// `px` layout pixels at `scale` physical pixels each.
+fn scaled(px: u32, scale: f32) -> u32 {
+    (px as f32 * scale).round() as u32
+}
+
+/// Physical pixels per layout pixel at `dpi` (Windows: 96 = 100 %); an
+/// unknown DPI (0) counts as 100 %.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn dpi_scale(dpi: u32) -> f32 {
+    if dpi == 0 {
+        1.0
+    } else {
+        dpi as f32 / 96.0
     }
 }
 
@@ -598,6 +621,21 @@ mod tests {
                 dim: false,
             },
         ]
+    }
+
+    /// At 150 % and 200 % display scaling the tiles, plates and names are
+    /// as large on screen as at 100 %, not ⅔ or ½ of it.
+    #[test]
+    fn sizes_follow_the_display_scaling() {
+        assert_eq!(dpi_scale(96), 1.0);
+        assert_eq!(dpi_scale(144), 1.5);
+        assert_eq!(dpi_scale(192), 2.0);
+        assert_eq!(dpi_scale(0), 1.0);
+        let at = |scale| [160, 120, 26, 12, 20].map(|px| scaled(px, scale));
+        assert_eq!(at(1.0), [160, 120, 26, 12, 20]);
+        assert_eq!(at(1.5), [240, 180, 39, 18, 30]);
+        assert_eq!(at(2.0), [320, 240, 52, 24, 40]);
+        assert_eq!(scaled(15, 1.25), 19);
     }
 
     /// Camera tile and plate both carry their name, a long one cut with

@@ -9,16 +9,11 @@
 //! ICU_UI_SHOTS=/tmp/icu-shots cargo test -p icu-client --test ui_layout -- --nocapture
 //! ```
 //!
-//! Unix only: the in-process server (`common`) is.
-#![cfg(unix)]
+//! The two tests that need a real invite and passport run on Unix only:
+//! the in-process server (`common`) does. The rest renders on Windows too
+//! (its pages differ: Tastenkürzel, window fitting).
 
-use std::{
-    cell::RefCell,
-    net::SocketAddr,
-    rc::Rc,
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{cell::RefCell, net::SocketAddr, rc::Rc, sync::Arc, time::Instant};
 
 use egui_kittest::{kittest::Queryable, Harness};
 use icu_client::{
@@ -31,7 +26,7 @@ use icu_client::{
     ui::{
         connection::ConnectionView,
         fonts,
-        main_window::{EnrollApp, MainEnv, MainView},
+        main_window::{MainEnv, MainView},
         settings::SettingsView,
         setup::{SetupView, Step},
         theme,
@@ -39,6 +34,7 @@ use icu_client::{
 };
 use icu_proto::{AudioParams, UserFlags, UserInfo, UserSummary};
 
+#[cfg(unix)]
 mod common;
 
 /// What the windows open with (`ui::main_window`).
@@ -46,6 +42,7 @@ const MAIN: [f32; 2] = icu_client::ui::main_window::MAIN_SIZE;
 const SETTINGS: [f32; 2] = icu_client::ui::main_window::SETTINGS_SIZE;
 const CONNECTION: [f32; 2] = icu_client::ui::main_window::CONNECTION_SIZE;
 const SETUP: [f32; 2] = icu_client::ui::main_window::SETUP_SIZE;
+#[cfg(unix)]
 const ENROLL: [f32; 2] = [560.0, 600.0];
 
 const THEMES: [&str; 2] = ["light", "dark"];
@@ -517,8 +514,11 @@ fn connection_pages_fit() {
 /// The first-start window: empty, with an invite (asks for the name) and
 /// with a passport (does not, but offers to take its settings along), each
 /// checked where it leads before joining.
+#[cfg(unix)]
 #[test]
 fn enroll_window_fits() {
+    use icu_client::ui::main_window::EnrollApp;
+    use std::sync::Mutex;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (bundle, passport) = rt.block_on(async {
         let server = common::TestServer::start().await;
@@ -626,6 +626,7 @@ fn settings_window_keeps_outside_changes() {
 /// ⚙ → Allgemein: a pasted passport that carries settings offers to take
 /// them along, on by default; switched off, „Übernehmen“ sends the identity
 /// alone.
+#[cfg(unix)]
 #[test]
 fn settings_import_takes_the_settings_unless_switched_off() {
     let rt = tokio::runtime::Runtime::new().unwrap();

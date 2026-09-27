@@ -91,16 +91,15 @@ pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String
     // the task bar/dock instead of on screen.
     let start_minimized_to_dock = start_minimized && !start_hidden_possible();
     let start_minimized = start_minimized && !start_minimized_to_dock;
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    let options = super::native_options(
+        egui::ViewportBuilder::default()
             .with_title("ICU")
             .with_app_id("icu")
             .with_inner_size(MAIN_SIZE)
             .with_min_inner_size(MAIN_MIN_SIZE)
             .with_resizable(true)
             .with_visible(!start_minimized),
-        ..Default::default()
-    };
+    );
     let paths = engine.paths();
     let engine = Arc::new(Mutex::new(Some(engine)));
     let engine_for_app = engine.clone();
@@ -2205,14 +2204,13 @@ pub fn run_enroll(
     let enroll_theme = crate::config::Settings::load(&paths)
         .map(|s| s.ui.theme)
         .unwrap_or_else(|_| "system".to_string());
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    let options = super::native_options(
+        egui::ViewportBuilder::default()
             .with_title("ICU — Einladung")
             .with_app_id("icu")
             .with_inner_size([560.0, 600.0])
             .with_min_inner_size([480.0, 520.0]),
-        ..Default::default()
-    };
+    );
     eframe::run_native(
         "ICU",
         options,

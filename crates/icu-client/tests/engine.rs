@@ -608,6 +608,9 @@ async fn sigterm_ends_the_session_with_a_goodbye() {
     let (_identity, _paths, dir) = server.enroll("alice").await;
     let mut watcher = server.raw_client("bob").await;
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_icu"))
+        // Without a terminal ICU also logs to a file: keep it in the test's
+        // directory, not in the user's `~/.local/state/icu`.
+        .env("XDG_STATE_HOME", dir.path())
         .arg("--config-dir")
         .arg(dir.path())
         .args([

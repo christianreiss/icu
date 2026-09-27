@@ -6,7 +6,9 @@
 //! hides it, as any window.
 //!
 //! Placed in the work area of the primary monitor (taskbar left out), at
-//! the configured corner or edge plus offset, in physical pixels.
+//! the configured corner or edge plus offset. The window is sized in
+//! physical pixels: tiles, names and offset are scaled by the monitor's
+//! DPI (`Scene::scale`), so at 150 % the overlay is as large as elsewhere.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -24,6 +26,7 @@ use windows::{
             MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
         },
         System::LibraryLoader::GetModuleHandleW,
+        UI::HiDpi::GetDpiForWindow,
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
             RegisterClassExW, SetWindowPos, ShowWindow, HWND_TOPMOST, MSG, PM_REMOVE,
@@ -34,7 +37,7 @@ use windows::{
     },
 };
 
-use super::{Scene, TICK};
+use super::{dpi_scale, scaled, Scene, TICK};
 use crate::config::Corner;
 
 /// Runs the overlay until `stop`; reports on `ready` whether it came up.
@@ -59,6 +62,9 @@ pub(super) fn run(
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
             unsafe { DispatchMessageW(&msg) };
         }
+        // The window sits on the primary monitor; per-monitor DPI aware,
+        // Windows reports that monitor's scaling (it may change at any time).
+        scene.scale = dpi_scale(unsafe { GetDpiForWindow(hwnd) });
         let update = scene.update();
         if !update.shown {
             if visible {
@@ -177,14 +183,19 @@ fn position(scene: &Scene, w: u32, h: u32) -> POINT {
     place(
         scene.settings.corner,
         scene.settings.offset,
+        scene.scale,
         work_area(),
         w,
         h,
     )
 }
 
-fn place(corner: Corner, offset: [u32; 2], area: RECT, w: u32, h: u32) -> POINT {
-    let (ox, oy) = (offset[0] as i32, offset[1] as i32);
+/// `offset` is in layout pixels, `area`, `w` and `h` in physical ones.
+fn place(corner: Corner, offset: [u32; 2], scale: f32, area: RECT, w: u32, h: u32) -> POINT {
+    let (ox, oy) = (
+        scaled(offset[0], scale) as i32,
+        scaled(offset[1], scale) as i32,
+    );
     let (w, h) = (w as i32, h as i32);
     let left = area.left + ox;
     let right = area.right - w - ox;
@@ -316,7 +327,7 @@ mod tests {
             right: 1920,
             bottom: 1040,
         };
-        let p = |c| place(c, [40, 20], area, 166, 100);
+        let p = |c| place(c, [40, 20], 1.0, area, 166, 100);
         assert_eq!((p(Corner::TopLeft).x, p(Corner::TopLeft).y), (40, 20));
         assert_eq!((p(Corner::TopRight).x, p(Corner::TopRight).y), (1714, 20));
         assert_eq!(
@@ -325,5 +336,8 @@ mod tests {
         );
         assert_eq!(p(Corner::Top).x, 877);
         assert_eq!(p(Corner::Bottom).y, 920);
+        // At 150 % the offset from the edge is 60×30 physical pixels.
+        let p = place(Corner::BottomRight, [40, 20], 1.5, area, 249, 150);
+        assert_eq!((p.x, p.y), (1920 - 249 - 60, 1040 - 150 - 30));
     }
 }

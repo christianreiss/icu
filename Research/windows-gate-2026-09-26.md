@@ -53,8 +53,13 @@ The MMCSS cleanup follows the [Windows task-lifetime contract](https://learn.mic
 - Linux: `cargo test --workspace --locked` — **594 passed, 0 failed,
   5 ignored**, across 27 suites in the final rerun. Two playout continuity tests failed during
   a concurrent release build; the complete rerun without build load passed.
-  Their assertions and thresholds were not weakened. The final Windows-only
-  main-window bounds change also passed all nine UI layout tests.
+  Their assertions and thresholds were not weakened. *Correction
+  2026-09-27:* the nine UI layout tests ran on Linux only
+  (`tests/ui_layout.rs` was `#![cfg(unix)]`), so they never rendered the
+  Windows-only window fitting (`cfg(windows)`); only its pure helper
+  `ui::fit_window` has a unit test. Since then only the two layout tests
+  that need the in-process server are Unix-only; the rest build for
+  Windows but have not run natively yet.
 - Windows: cross-built client library tests executed natively on the VM
   with `--test-threads=2` — **232 passed, 0 failed, 4 ignored** after
   the tray follow-up. The added opt-in stopped-stream test passed separately

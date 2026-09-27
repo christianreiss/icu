@@ -1,6 +1,8 @@
 //! Audio backends and the capture/playback glue.
 
 pub mod backend;
+#[cfg(any(target_os = "windows", test))]
+mod channels;
 #[cfg(any(feature = "cpal-fallback", target_os = "windows"))]
 pub mod cpal_fallback;
 pub mod fake;
