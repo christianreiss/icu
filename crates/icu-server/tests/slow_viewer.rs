@@ -376,3 +376,95 @@ async fn frames_in_flight_are_reset_when_the_forwarder_ends() {
     );
     server.shutdown().await;
 }
+
+/// A viewer connected through `addr` that grants the server only
+/// `streams` video streams at a time.
+async fn viewer_with_streams(
+    server: &TestServer,
+    addr: SocketAddr,
+    name: &str,
+    streams: u32,
+) -> Client {
+    let identity = server.enroll(name).await;
+    let mut config =
+        common::client_config(server.ca(), Some(identity), icu_proto::limits::ALPN_MAIN);
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(Duration::from_secs(
+        icu_proto::limits::KEEP_ALIVE_INTERVAL_S,
+    )));
+    transport.max_concurrent_uni_streams(streams.into());
+    config.transport_config(std::sync::Arc::new(transport));
+    let mut endpoint = common::bare_endpoint(&server.com_key());
+    endpoint.set_default_client_config(config);
+    let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    let (send, recv) = conn.open_bi().await.unwrap();
+    let mut client = Client {
+        endpoint,
+        conn,
+        send,
+        recv,
+        session: 0,
+        user_id: 0,
+        crl: None,
+    };
+    client
+        .hello_with(name, icu_proto::MINOR, UserFlags(UserFlags::VIEWING))
+        .await
+        .expect("Welcome");
+    client
+}
+
+/// A frame in flight is given up at its own deadline while the next frame
+/// is still waiting for a stream (external review 2026-09-27, second
+/// round). Bob grants one video stream at a time and hears nothing: frame 1
+/// holds that stream unacknowledged, frame 2 waits for a second one. Before,
+/// nothing watched frame 1 during that wait; it was given up only once
+/// frame 2's own deadline had run out, and both drops showed at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frame_in_flight_is_given_up_while_the_next_waits_for_a_stream() {
+    const TIMEOUT: Duration = Duration::from_millis(2_000);
+    const GAP: Duration = Duration::from_millis(1_000);
+    let server =
+        TestServer::start_with(|c| c.timing.video_frame_timeout_ms = TIMEOUT.as_millis() as u64)
+            .await;
+    let mut alice = server.client("alice").await;
+    let (link, cut) = cuttable_downlink(server.addr()).await;
+    let bob = viewer_with_streams(&server, link, "bob", 1).await;
+    camera_on(&mut alice).await;
+    let counters = &server.handle.server().counters;
+    let dropped = || Counters::get(&counters.video_dropped_slow_receiver);
+
+    cut.send_replace(true);
+    alice.send_video(1, 0, true, &[0x41; 1_000]).await;
+    tokio::time::timeout(SOON, async {
+        while Counters::get(&counters.video_frames_out) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("frame 1 is handed to quinn");
+    // Frame 1's deadline is at most TIMEOUT from here, frame 2's a GAP later.
+    let first = tokio::time::Instant::now();
+    tokio::time::sleep(GAP).await;
+    alice.send_video(2, 6000, true, &[0x42; 1_000]).await;
+
+    tokio::time::timeout_at(first + TIMEOUT + GAP / 2, async {
+        while dropped() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("frame 1 is given up at its deadline, not at frame 2's");
+    assert_eq!(dropped(), 1, "frame 1 alone");
+    tokio::time::sleep_until(first + GAP + TIMEOUT - GAP / 4).await;
+    assert_eq!(dropped(), 1, "frame 2 keeps its own deadline");
+    tokio::time::timeout(SOON, async {
+        while dropped() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("frame 2 is given up at its deadline");
+    assert!(bob.conn.close_reason().is_none(), "no disconnect");
+    server.shutdown().await;
+}
