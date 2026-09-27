@@ -38,6 +38,9 @@ const QUEUING_DELAY_ELEVATED_MS: f32 = 30.0;
 const AUDIO_LOSS_STEP_DOWN_PERMILLE: u16 = 30;
 /// Own-audio loss severe enough to jump straight to paused video.
 const LOSS_PAUSE_PERMILLE: u16 = 150;
+/// Share of our frames the server drops for the slowest viewer
+/// (`VideoCongestionHint`) that counts as a step-down trigger.
+const VIDEO_DROP_STEP_DOWN_PERMILLE: u16 = 50;
 
 /// Local `open_uni` timeouts within [`LOCAL_DROP_WINDOW`] that count as a
 /// burst — a direct, immediate signal that leads the smoothed remote
@@ -113,7 +116,14 @@ impl QualityController {
         let rtt_bad = cond.rtt_ms - baseline > RTT_STEP_DOWN_MS;
         let queuing_bad = cond.queuing_delay_ms > QUEUING_DELAY_ELEVATED_MS;
         let loss_bad = cond.audio_loss_hint_permille >= AUDIO_LOSS_STEP_DOWN_PERMILLE;
-        let bad = rtt_bad || queuing_bad || loss_bad;
+        // A viewer whose downlink cannot keep up makes the server drop our
+        // frames for them. That steps down too, but never into the pause:
+        // the server measures the drop rate on the frames it forwards, so
+        // with nothing sent the hint could never clear. At the last tier
+        // that still sends it only holds the tier.
+        let viewer_bad = cond.video_drop_hint_permille >= VIDEO_DROP_STEP_DOWN_PERMILLE;
+        let viewer_steps = viewer_bad && !self.tier.step_down().paused();
+        let bad = rtt_bad || queuing_bad || loss_bad || viewer_steps;
 
         // Jump straight to pause: severe loss, or a local drop-burst
         // repeating in a second consecutive window.
@@ -145,6 +155,10 @@ impl QualityController {
                     }
                 }
             }
+        } else if viewer_bad && !self.tier.paused() {
+            // The viewer still struggles at the lowest sending tier: hold.
+            self.bad_ticks = 0;
+            self.good_ticks = 0;
         } else {
             self.bad_ticks = 0;
             self.seen_local_burst = false;
@@ -204,6 +218,70 @@ mod tests {
         assert_eq!(after_one, VideoTier::T0, "one bad tick is not enough");
         let after_two = qc.tick(&bad, 0, t0 + Duration::from_secs(2));
         assert_eq!(after_two, VideoTier::T1);
+    }
+
+    /// A viewer the server drops our frames for (`VideoCongestionHint`)
+    /// steps the tier down like our own loss does, but only to the last tier
+    /// that still sends: paused, no frame would ever refresh the hint. There
+    /// it holds until the hint clears.
+    #[test]
+    fn a_struggling_viewer_steps_down_but_never_pauses() {
+        let t0 = Instant::now();
+        let mut qc = QualityController::new(t0);
+        let mut now = t0;
+        let mut tick = |qc: &mut QualityController, cond: &NetworkCondition| {
+            now += Duration::from_secs(2);
+            qc.tick(cond, 0, now)
+        };
+        let below = NetworkCondition {
+            video_drop_hint_permille: 40,
+            ..calm()
+        };
+        for _ in 0..4 {
+            assert_eq!(tick(&mut qc, &below), VideoTier::T0, "under 50 ‰");
+        }
+        let dropping = NetworkCondition {
+            video_drop_hint_permille: 80,
+            ..calm()
+        };
+        tick(&mut qc, &dropping);
+        assert_eq!(tick(&mut qc, &dropping), VideoTier::T1);
+        for _ in 0..30 {
+            assert_ne!(tick(&mut qc, &dropping), VideoTier::T4, "never paused");
+        }
+        assert_eq!(qc.tier(), VideoTier::T3);
+        for _ in 0..5 {
+            assert_eq!(tick(&mut qc, &calm()), VideoTier::T3);
+        }
+        assert_eq!(tick(&mut qc, &calm()), VideoTier::T2, "recovers once clear");
+    }
+
+    /// Paused for another reason, a drop hint left over from before cannot
+    /// keep the video paused: nothing is sent that could clear it.
+    #[test]
+    fn a_stale_drop_hint_does_not_hold_the_pause() {
+        let t0 = Instant::now();
+        let mut qc = QualityController::new(t0);
+        let severe = NetworkCondition {
+            audio_loss_hint_permille: 200,
+            video_drop_hint_permille: 80,
+            ..calm()
+        };
+        assert_eq!(qc.tick(&severe, 0, t0), VideoTier::T4);
+        let stale = NetworkCondition {
+            video_drop_hint_permille: 80,
+            ..calm()
+        };
+        let mut now = t0;
+        for _ in 0..6 {
+            now += Duration::from_secs(2);
+            qc.tick(&stale, 0, now);
+        }
+        assert_eq!(
+            qc.tier(),
+            VideoTier::T3,
+            "sends again, so the hint can clear"
+        );
     }
 
     #[test]

@@ -2174,6 +2174,18 @@ fn send_failed(connection: &quinn::Connection) -> SessionEnd {
     closed_end(connection).unwrap_or_else(|| connection_lost("send failed"))
 }
 
+/// Forgets what the previous connection learned about the network: the
+/// `LossHint` the encoder's FEC follows, and the tracker's hints and
+/// transport history the video tier follows. They describe a connection
+/// that ended — often a bad one — and a clean network sends nothing to
+/// replace them: receivers report only a change of ≥ 10 ‰, the server's
+/// congestion hint only a change of ≥ 20 ‰. Left standing, a `LossHint` of
+/// ≥ 30 ‰ held the FEC high and walked the video down to paused for good.
+fn forget_network_feedback(shared: &Shared) {
+    shared.dsp.loss_permille.store(0, Ordering::Relaxed);
+    *lock(&shared.net) = NetworkTracker::new();
+}
+
 /// Forgets everything scoped to one session: the connection the DSP thread
 /// sends on, the speakers, the received video, and what the window shows
 /// about the connection and the people on it.
@@ -3008,6 +3020,7 @@ async fn run_session(
     // deliver queued frames, which the new generation drops.
     lock(&shared.speakers).clear();
     let video_generation = lock(&shared.video).reset();
+    forget_network_feedback(shared);
     let peers: Vec<Peer> = welcome
         .users
         .iter()
