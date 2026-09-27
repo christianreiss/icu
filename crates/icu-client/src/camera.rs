@@ -203,22 +203,130 @@ pub struct NokhwaSource {
 
 impl NokhwaSource {
     /// Opens camera `index` (Spike 5: pick the capture node explicitly) at
-    /// the closest format to 320×240 MJPEG 15 fps.
+    /// the closest format to 320×240 MJPEG 15 fps, or else the best one
+    /// [`choose_format`] finds among what the camera offers.
     pub fn open(index: u32) -> Result<NokhwaSource, String> {
         use nokhwa::{
             pixel_format::RgbFormat,
             utils::{
-                CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
-                Resolution,
+                frame_formats, CameraFormat, CameraIndex, FrameFormat, RequestedFormat,
+                RequestedFormatType, Resolution,
             },
         };
         let want = CameraFormat::new(Resolution::new(WIDTH, HEIGHT), FrameFormat::MJPEG, FPS);
         let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(want));
-        let mut camera =
-            nokhwa::Camera::new(CameraIndex::Index(index), req).map_err(|e| e.to_string())?;
+        let mut camera = match nokhwa::Camera::new(CameraIndex::Index(index), req) {
+            Ok(camera) => camera,
+            // nokhwa's `Closest` keeps only MJPEG and takes frame rates only
+            // from an exact 320×240: a YUYV-only camera, or one without that
+            // MJPEG mode, fails here. Open it with whatever it offers first,
+            // then pick among its formats.
+            Err(closest) => {
+                let any = RequestedFormat::with_formats(RequestedFormatType::None, frame_formats());
+                let mut camera = nokhwa::Camera::new(CameraIndex::Index(index), any)
+                    .map_err(|_| closest.to_string())?;
+                let offered = camera
+                    .compatible_camera_formats()
+                    .map_err(|e| e.to_string())?;
+                let format = choose_format(&offered).ok_or_else(|| {
+                    let mut fourccs: Vec<String> =
+                        offered.iter().map(|f| f.format().to_string()).collect();
+                    fourccs.dedup();
+                    format!("{NO_USABLE_FORMAT}: {}", fourccs.join(", "))
+                })?;
+                camera
+                    .set_camera_requset(RequestedFormat::new::<RgbFormat>(
+                        RequestedFormatType::Exact(format),
+                    ))
+                    .map_err(|e| e.to_string())?;
+                camera
+            }
+        };
         camera.open_stream().map_err(|e| e.to_string())?;
         tracing::info!(format = ?camera.camera_format(), "camera opened");
         Ok(NokhwaSource { camera })
+    }
+}
+
+/// How an error from [`NokhwaSource::open`] starts when the camera works but
+/// offers no picture format ICU can decode; [`CameraHandle`] shows its own
+/// text for it and does not retry.
+pub const NO_USABLE_FORMAT: &str = "no usable camera format";
+
+/// The capture format among `offered`: MJPEG first (small over USB), then
+/// YUYV, then any other format the RGB decoder takes; within that format
+/// the smallest resolution of at least 320×240 (else the largest below),
+/// and for it the frame rate closest to 15 fps, the faster one on a tie.
+/// `None` when nothing is decodable (a grey-only camera, say).
+fn choose_format(offered: &[nokhwa::utils::CameraFormat]) -> Option<nokhwa::utils::CameraFormat> {
+    use nokhwa::utils::{CameraFormat, FrameFormat};
+    const PREFERENCE: [FrameFormat; 5] = [
+        FrameFormat::MJPEG,
+        FrameFormat::YUYV,
+        FrameFormat::NV12,
+        FrameFormat::RAWRGB,
+        FrameFormat::RAWBGR,
+    ];
+    PREFERENCE.into_iter().find_map(|fourcc| {
+        let same = || offered.iter().filter(move |f| f.format() == fourcc);
+        let resolution = same().map(|f| f.resolution()).min_by_key(|r| {
+            let area = u64::from(r.width()) * u64::from(r.height());
+            if r.width() >= WIDTH && r.height() >= HEIGHT {
+                (0, area)
+            } else {
+                (1, u64::MAX - area)
+            }
+        })?;
+        let rate = same()
+            .filter(|f| f.resolution() == resolution)
+            .map(|f| f.frame_rate())
+            .min_by_key(|&fps| (fps.abs_diff(FPS), std::cmp::Reverse(fps)))?;
+        Some(CameraFormat::new(resolution, fourcc, rate))
+    })
+}
+
+/// Brings a picture larger than 320×240 down to it: the centre cut to 4:3,
+/// then each output pixel the average of the input pixels it covers. The
+/// encoder's tiers, the receivers' limits (640×480) and the tiles all
+/// assume 320×240; a camera without that mode delivers more. A picture
+/// that fits already is returned as it is.
+fn fit_capture(frame: RgbFrame) -> RgbFrame {
+    let (w, h) = (frame.width, frame.height);
+    if w <= WIDTH as usize && h <= HEIGHT as usize {
+        return frame;
+    }
+    // The 4:3 centre.
+    let (cw, ch) = if w * 3 > h * 4 {
+        (h * 4 / 3, h)
+    } else {
+        (w, w * 3 / 4)
+    };
+    let (x0, y0) = ((w - cw) / 2, (h - ch) / 2);
+    // Even sides, as the encoder wants; never more than the cut, so every
+    // output pixel covers at least one input pixel.
+    let (tw, th) = (cw.min(WIDTH as usize) & !1, ch.min(HEIGHT as usize) & !1);
+    let mut rgb = Vec::with_capacity(tw * th * 3);
+    for ty in 0..th {
+        let (ya, yb) = (y0 + ty * ch / th, y0 + (ty + 1) * ch / th);
+        for tx in 0..tw {
+            let (xa, xb) = (x0 + tx * cw / tw, x0 + (tx + 1) * cw / tw);
+            let mut sum = [0u32; 3];
+            for y in ya..yb {
+                let row = &frame.rgb[(y * w + xa) * 3..(y * w + xb) * 3];
+                for px in row.chunks_exact(3) {
+                    for c in 0..3 {
+                        sum[c] += u32::from(px[c]);
+                    }
+                }
+            }
+            let n = ((yb - ya) * (xb - xa)) as u32;
+            rgb.extend(sum.map(|v| ((v + n / 2) / n) as u8));
+        }
+    }
+    RgbFrame {
+        width: tw,
+        height: th,
+        rgb,
     }
 }
 
@@ -243,7 +351,7 @@ impl FrameSource for NokhwaSource {
                 }
             }
         }
-        RgbFrame::checked(width, height, rgb)
+        RgbFrame::checked(width, height, rgb).map(fit_capture)
     }
 }
 
@@ -719,16 +827,24 @@ impl CameraHandle {
     /// Books a failed start: retry later, or give up — the engine switches
     /// the camera off (if it is on) and shows why.
     fn failed(&mut self, e: String) {
-        if self.retry.failed(Instant::now()) {
+        // A camera without a usable format will not grow one: no retries.
+        let unusable = e.starts_with(NO_USABLE_FORMAT);
+        if unusable {
+            self.retry.failures = MAX_FAILURES;
+        } else if self.retry.failed(Instant::now()) {
             tracing::warn!(%e, retry_in = ?backoff(self.retry.failures), "camera");
             return;
         }
         tracing::warn!(%e, failures = self.retry.failures, "camera given up");
-        self.link.command(Command::CameraFailed(Problem::new(
+        let text = if unusable {
+            "Die Kamera liefert kein Bildformat, das ICU lesen kann (MJPEG, YUYV, NV12 oder \
+             RGB). Eine andere Kamera wählen."
+        } else {
             "Die Kamera lässt sich nicht verwenden. Ist sie angeschlossen und nicht gerade von \
-             einem anderen Programm belegt?",
-            e,
-        )));
+             einem anderen Programm belegt?"
+        };
+        self.link
+            .command(Command::CameraFailed(Problem::new(text, e)));
     }
 
     /// The slot the capture thread writes every picture into, shared so a
@@ -903,6 +1019,102 @@ mod tests {
             );
         }
         assert_eq!(frame_rate(VideoTier::T4), 0.0);
+    }
+
+    /// MJPEG at the size and rate closest to 320×240 @ 15 fps, where
+    /// nokhwa's own `Closest` found nothing (no exact 320×240 MJPEG); then
+    /// YUYV, then anything decodable; a grey-only camera gets nothing.
+    #[test]
+    fn the_capture_format_falls_back_where_nokhwa_gives_up() {
+        use nokhwa::utils::{CameraFormat, FrameFormat};
+        let f = |w, h, fourcc, fps| CameraFormat::new_from(w, h, fourcc, fps);
+        let (mjpeg, yuyv) = (FrameFormat::MJPEG, FrameFormat::YUYV);
+
+        let exact = [
+            f(640, 480, mjpeg, 30),
+            f(320, 240, mjpeg, 30),
+            f(320, 240, mjpeg, 15),
+        ];
+        assert_eq!(choose_format(&exact), Some(f(320, 240, mjpeg, 15)));
+
+        // No 320×240: the smallest above it, at the rate closest to 15.
+        let bigger = [
+            f(1280, 720, mjpeg, 30),
+            f(640, 480, mjpeg, 30),
+            f(640, 480, mjpeg, 10),
+            f(160, 120, mjpeg, 15),
+        ];
+        assert_eq!(choose_format(&bigger), Some(f(640, 480, mjpeg, 10)));
+        // Only smaller ones: the largest of them; 20 beats 10 on the tie.
+        let smaller = [
+            f(160, 120, yuyv, 15),
+            f(176, 144, yuyv, 20),
+            f(176, 144, yuyv, 10),
+        ];
+        assert_eq!(choose_format(&smaller), Some(f(176, 144, yuyv, 20)));
+
+        let yuyv_only = [f(640, 480, yuyv, 30), f(320, 240, yuyv, 30)];
+        assert_eq!(choose_format(&yuyv_only), Some(f(320, 240, yuyv, 30)));
+        let both = [f(320, 240, yuyv, 15), f(1280, 720, mjpeg, 30)];
+        assert_eq!(
+            choose_format(&both),
+            Some(f(1280, 720, mjpeg, 30)),
+            "MJPEG first"
+        );
+
+        let nv12 = [
+            f(640, 480, FrameFormat::GRAY, 15),
+            f(640, 480, FrameFormat::NV12, 15),
+        ];
+        assert_eq!(
+            choose_format(&nv12),
+            Some(f(640, 480, FrameFormat::NV12, 15))
+        );
+        assert_eq!(choose_format(&[f(320, 240, FrameFormat::GRAY, 15)]), None);
+        assert_eq!(choose_format(&[]), None);
+    }
+
+    /// A larger picture comes down to 320×240 from its 4:3 centre, each
+    /// output pixel the mean of what it covers; a smaller one stays.
+    #[test]
+    fn a_larger_capture_is_cut_to_4_3_and_scaled_down() {
+        let solid = |w: usize, h: usize, v: u8| RgbFrame {
+            width: w,
+            height: h,
+            rgb: vec![v; w * h * 3],
+        };
+        let small = fit_capture(solid(160, 120, 9));
+        assert_eq!((small.width, small.height), (160, 120));
+
+        // 640×480, left half 0, right half 200: halved, the edge stays sharp.
+        let mut half = solid(640, 480, 0);
+        for y in 0..480 {
+            for x in 320..640 {
+                half.rgb[(y * 640 + x) * 3..][..3].fill(200);
+            }
+        }
+        let out = fit_capture(half);
+        assert_eq!((out.width, out.height), (320, 240));
+        assert!(out.is_valid());
+        let px = |f: &RgbFrame, x: usize, y: usize| f.rgb[(y * f.width + x) * 3];
+        assert_eq!(px(&out, 159, 100), 0);
+        assert_eq!(px(&out, 160, 100), 200);
+
+        // 16:9: the bars left and right go, the middle 4:3 is kept.
+        let mut wide = solid(1280, 720, 50);
+        for y in 0..720 {
+            for x in (0..160).chain(1120..1280) {
+                wide.rgb[(y * 1280 + x) * 3..][..3].fill(255);
+            }
+        }
+        let out = fit_capture(wide);
+        assert_eq!((out.width, out.height), (320, 240));
+        assert!(out.rgb.iter().all(|&v| v == 50), "no bar survives the cut");
+
+        // CIF (11:9) loses rows, not columns.
+        let cif = fit_capture(solid(352, 288, 77));
+        assert_eq!((cif.width, cif.height), (320, 240));
+        assert!(cif.is_valid());
     }
 
     #[test]
