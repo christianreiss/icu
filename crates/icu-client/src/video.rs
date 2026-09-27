@@ -481,12 +481,21 @@ impl Receivers {
     }
 
     /// Sessions that need an IDR (none yet, or one lost since), rate limited
-    /// to one request per second and speaker (`PROTOCOL.md` §2.2 Nr. 13).
+    /// to one request per second and speaker (`PROTOCOL.md` §2.2 Nr. 13) —
+    /// as long as their frames still arrive: a sender that stopped (camera
+    /// off, stalled) was asked every second for the rest of the session.
     pub fn take_keyframe_requests(&mut self) -> Vec<Session> {
-        let now = Instant::now();
+        self.take_keyframe_requests_at(Instant::now())
+    }
+
+    /// [`Receivers::take_keyframe_requests`] at `now`.
+    fn take_keyframe_requests_at(&mut self, now: Instant) -> Vec<Session> {
         let mut out = Vec::new();
         for (session, r) in self.map.iter_mut() {
-            if r.got_keyframe || r.frames == 0 {
+            if r.got_keyframe
+                || r.last_frame
+                    .is_none_or(|t| now.saturating_duration_since(t) > FRESH)
+            {
                 continue;
             }
             let due = r
@@ -847,6 +856,26 @@ mod tests {
 
         let ok = encoded(1, &[]);
         assert_eq!(h264::check(&ok[0].data), Ok(()), "the own encoder passes");
+    }
+
+    /// An IDR is asked for while the sender's frames arrive, and no longer
+    /// once they have stopped.
+    #[test]
+    fn a_sender_that_stopped_is_not_asked_for_an_idr() {
+        let mut r = Receivers::default();
+        let t0 = Instant::now();
+        r.push(3, frame(false));
+        assert_eq!(r.take_keyframe_requests_at(t0), vec![3], "a P-frame first");
+        assert_eq!(
+            r.take_keyframe_requests_at(t0 + Duration::from_secs(2)),
+            vec![3],
+            "still sending"
+        );
+        assert!(
+            r.take_keyframe_requests_at(t0 + FRESH + Duration::from_secs(2))
+                .is_empty(),
+            "stopped"
+        );
     }
 
     /// Nothing empty and nothing above the ceiling reaches a texture.
