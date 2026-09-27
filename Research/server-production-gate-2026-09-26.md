@@ -9,14 +9,28 @@
 > follow-up (test suite, Clippy, media soak with junk traffic) on `fa26a64`
 > (on top of `8568d82`) — tests only, no smoke, service or Checkmk run.
 >
-> **Not gated yet:** the wire and state changes of 2026-09-27 — the com key in
-> the state and `ComSocket` tagging every datagram (`75a4bb2`, merged
-> `d9c9986`), passport version 4 (same commit), the video slot and deadline
-> rework (`8568d82`, `a0a3101`) and the automatic state backup (`c540f2d`) —
-> have not been through `packaging/smoke.sh`, the systemd service gate or
-> Checkmk against a real service. “No state schema or wire change” further
-> down holds for `c449264` only. Re-run those gates on the commit to be tagged
-> and update this note.
+> **Re-run on `f42a792`** (2026-09-27, after the third round of the external
+> review; covers the com key with `ComSocket`, passport version 4, the video
+> slot rework and the state backup): `packaging/build.sh` end to end —
+> `cargo deny`/`cargo about` first, static musl server, clients fc42, fc43 and
+> debian13, nfpm, `packaging/smoke.sh` on fc42, fc43, debian13 and
+> server-only on debian12 and alma10 — passed; `BUILDINFO.linux` names
+> `f42a792`. Workspace tests 749 passed, 0 failed, 8 ignored; Clippy
+> `-D warnings`, fmt and `cargo deny` clean. Service test on biest.eulie.de
+> with the shipped unit, isolated as `icu-server-gate-test` on
+> 127.0.0.1/[::1]:14711: `systemd-analyze verify` clean, `systemd-analyze
+> security` 1.4 OK; two headless clients registered with version-4 bundles
+> (both over IPv4) and relayed audio, 998 of 998 datagrams, no drops, no
+> com-tag drops; the shipped Checkmk plugin reported ICU_Server, ICU_Video,
+> both certificates and ICU_Backup OK; with the service stopped, `revoke`
+> through the offline CLI as root under umask 027 left `users.toml` at 0644
+> and owned like the state directory, and the service started again (review
+> S-2); the revoked client ended fatally after the server's proof, the other
+> reconnected; automatic backups were written; after SIGKILL systemd
+> restarted the service (`NRestarts=1`). Unit, configuration and state were
+> removed afterwards. Not repeated on `f42a792`: the manual backup/restore
+> drill, the media soak and the load tests. “No state schema or wire change”
+> further down holds for `c449264` only.
 
 ## Decision
 

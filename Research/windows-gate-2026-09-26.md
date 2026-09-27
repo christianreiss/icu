@@ -10,13 +10,16 @@
 > readiness fixes (`feba687`: library, `ui_layout`, `windows_console`;
 > `Client/IMPLEMENTATION.md` §14).
 >
-> **Not gated yet:** no native Windows run at all covers the com key and
-> `ComSocket` with passport version 4 (`d9c9986`), the video slot rework
-> (`8568d82`) or anything later, and no Windows client has enrolled with a
-> version-4 passport; the desktop checks (enrollment, tray, SmartScreen, Raw
-> Input) have not been repeated since `41d4b50`. Re-run one Windows v4
-> enrollment and the unit suites on the commit to be tagged and update this
-> note.
+> **Re-run on `f42a792`** (2026-09-27, after the third round of the external
+> review): `packaging/windows/build.sh` built the ZIP from `f42a792`
+> (`BUILDINFO.windows`, SHA-256 `45072bdd…16d7fbe7`, same hash on the VM).
+> On icu-win11-gate it registered headless with a version-4 bundle against a
+> static `f42a792` server on the libvirt bridge and sent test-tone audio to a
+> headless Linux client: 1225 datagrams relayed and decoded, none bad. The
+> native library suite ran on the same VM for the Raw Input fail-closed
+> change on its branch (`7174656`: 263 passed, 0 failed, 4 ignored). **Not
+> repeated since `41d4b50`:** the desktop checks — enrollment in the window,
+> tray, SmartScreen, Raw Input at a real desktop (`Client/LIVETEST.md` §7).
 
 ## Scope and verdict
 
