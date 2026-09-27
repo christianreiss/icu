@@ -907,6 +907,38 @@ fn setup_finish_marks_done_and_unmutes() {
     );
 }
 
+/// Quitting ICU with the setup open lifts the setup's own mute
+/// (`App::on_exit`): the engine keeps a mute for the next start, and that
+/// must be the user's, not the setup's.
+#[test]
+fn quitting_with_the_setup_open_lifts_its_mute() {
+    let shared = Rc::new(RefCell::new(state()));
+    shared.borrow_mut().settings.ui.setup_done = false;
+    let view = Rc::new(RefCell::new(SetupView::new(&shared.borrow())));
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let (state_in, view_in, cmds_out) = (shared.clone(), view.clone(), cmds.clone());
+    let mut h = harness(SETUP, "light", true, move |ui| {
+        let out = view_in.borrow_mut().ui(ui, &state_in.borrow());
+        cmds_out.borrow_mut().extend(out.cmds);
+    });
+    assert!(matches!(
+        cmds.borrow().first(),
+        Some(Command::SetMuted(true))
+    ));
+    shared.borrow_mut().muted = true;
+    h.run();
+    drop(h);
+    let state = shared.borrow();
+    assert!(matches!(
+        view.borrow_mut().release_mute(&state),
+        Some(Command::SetMuted(false))
+    ));
+    assert!(
+        view.borrow_mut().release_mute(&state).is_none(),
+        "only once"
+    );
+}
+
 /// „Überspringen“ on the first step ends the setup for good without
 /// touching anything else; a user who was muted already stays muted.
 #[test]

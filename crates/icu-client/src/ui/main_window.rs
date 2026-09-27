@@ -711,6 +711,15 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        // Ahead of the engine's `Quit` on the same channel, so the kept
+        // mute is the user's, not the open setup's.
+        if let Some(unmute) = self
+            .setup
+            .as_mut()
+            .and_then(|v| v.release_mute(&self.state))
+        {
+            let _ = self.cmd.send(unmute);
+        }
         #[cfg(feature = "camera")]
         {
             self.camera = None;

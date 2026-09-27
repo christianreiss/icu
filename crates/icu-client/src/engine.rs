@@ -474,7 +474,9 @@ impl DspControl {
     /// through [`DspControl::apply_settings`], so the two never drift.
     fn from_settings(s: &Settings, test_tone: bool) -> DspControl {
         let ctl = DspControl {
-            muted: AtomicBool::new(false),
+            // The one settings-driven field `apply_settings` leaves alone:
+            // after the start only the mute commands move it.
+            muted: AtomicBool::new(s.audio.muted),
             ptt_down: AtomicBool::new(false),
             online: AtomicBool::new(false),
             audience: AtomicBool::new(false),
@@ -790,7 +792,8 @@ impl Engine {
             server_name: cfg.identity.server.server_name.clone(),
             me: None,
             peers: Vec::new(),
-            muted: false,
+            // A mute kept from the last run shows from the first frame.
+            muted: settings.audio.muted,
             deafened: false,
             ptt_down: false,
             sending: false,
@@ -2240,7 +2243,8 @@ async fn net_task(
     let (settings_tx, settings_rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(settings_writer(cfg.paths.clone(), settings_rx));
     let mut local = LocalState {
-        flags: UserFlags::NONE,
+        // `Hello` carries a mute kept from the last run.
+        flags: UserFlags::NONE.with_bit(UserFlags::MUTED, cfg.settings.audio.muted),
         settings: cfg.settings.clone(),
         settings_tx,
         paths: cfg.paths.clone(),
@@ -2924,7 +2928,8 @@ impl LocalState {
     }
 
     /// Takes mute and deafen into the flags, the send gate, the mixer and the
-    /// window. Deafen implies mute.
+    /// window. Deafen implies mute. The user's own mute is kept for the next
+    /// start (`AudioSettings::muted`).
     fn apply_mute_deafen(&mut self, muted: bool, deafened: bool, shared: &Arc<Shared>) {
         let muted = muted || deafened;
         self.flags = self
@@ -2933,10 +2938,30 @@ impl LocalState {
             .with_bit(UserFlags::DEAFENED, deafened);
         shared.dsp.muted.store(muted, Ordering::Relaxed);
         shared.deafened.store(deafened, Ordering::Relaxed);
+        let own = self.own_mute();
+        let kept = (self.settings.audio.muted != own).then(|| {
+            self.settings.audio.muted = own;
+            let _ = self.settings_tx.send(self.settings.clone());
+            self.settings.clone()
+        });
         shared.state.send_modify(|s| {
             s.muted = muted;
             s.deafened = deafened;
+            if let Some(settings) = kept {
+                s.settings = settings;
+            }
         });
+    }
+
+    /// The mute the next start begins with: the current one — or, while
+    /// deafened, the one from before deafening, since a restart undeafens
+    /// and undeafening restores that one.
+    fn own_mute(&self) -> bool {
+        if self.flags.deafened() {
+            self.muted_before_deafen
+        } else {
+            self.flags.muted()
+        }
     }
 
     /// Takes a changed `self.settings` into effect. Everything that follows
@@ -2946,6 +2971,9 @@ impl LocalState {
     /// here, in one place, so none of them can drift from the settings. Returns whether `SetState` is due:
     /// the overlay switch is part of `VIEWING`.
     fn commit_settings(&mut self, shared: &Arc<Shared>, reopen: bool) -> bool {
+        // The mute is the engine's: a settings window's copy taken before a
+        // mute hotkey, or a passport's, must not undo it on disk.
+        self.settings.audio.muted = self.own_mute();
         shared.dsp.apply_settings(&self.settings);
         shared
             .output_gain

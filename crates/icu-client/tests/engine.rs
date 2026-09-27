@@ -985,3 +985,67 @@ async fn a_large_graph_quantum_is_not_trimmed() {
     engine.shutdown();
     server.handle.shutdown().await;
 }
+
+/// A mute survives a restart, as in Mumble: the next engine starts muted —
+/// in the window from its first state, at the server from `Hello` on. A
+/// deafen does not: a restart undeafens, back to the mute from before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mute_survives_a_restart() {
+    use icu_client::config::Settings;
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let start = |settings: Settings| {
+        let mut cfg =
+            icu_client::engine::EngineConfig::new(identity.clone(), settings, paths.clone());
+        cfg.server_addr = Some(server.addr());
+        icu_client::engine::Engine::start(cfg, Box::new(FakeBackend::silent().0)).unwrap()
+    };
+
+    let engine = start(test_settings());
+    assert!(!engine.snapshot().muted);
+    wait_connected(&engine).await;
+    engine.command(Command::SetMuted(true));
+    wait_for(&engine, SOON, |s| s.muted).await;
+    engine.shutdown();
+    let saved = Settings::load(&paths).unwrap();
+    assert!(saved.audio.muted, "the mute is kept");
+
+    let engine = start(saved);
+    assert!(engine.snapshot().muted, "muted from the first state");
+    let me = wait_connected(&engine).await.me.unwrap();
+    assert!(me.flags.muted(), "the server knew it from Hello");
+    engine.command(Command::SetMuted(false));
+    wait_for(&engine, SOON, |s| !s.muted).await;
+    engine.command(Command::SetDeafened(true));
+    wait_for(&engine, SOON, |s| s.deafened && s.muted).await;
+    engine.shutdown();
+    assert!(
+        !Settings::load(&paths).unwrap().audio.muted,
+        "deafened from unmuted: the restart undeafens to unmuted"
+    );
+    server.handle.shutdown().await;
+}
+
+/// A settings copy taken before a mute (the settings window, a passport)
+/// does not undo it when it is applied, neither in the engine nor on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_settings_copy_keeps_the_mute() {
+    let server = TestServer::start().await;
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+    let mut stale = engine.snapshot().settings;
+    assert!(!stale.audio.muted);
+    engine.command(Command::SetMuted(true));
+    wait_for(&engine, SOON, |s| s.muted && s.settings.audio.muted).await;
+    stale.audio.output_volume = 42.0;
+    engine.command(Command::UpdateSettings(Box::new(stale)));
+    let s = wait_for(&engine, SOON, |s| s.settings.audio.output_volume == 42.0).await;
+    assert!(s.muted && s.settings.audio.muted);
+    engine.shutdown();
+    let saved = icu_client::config::Settings::load(&paths).unwrap();
+    assert_eq!(saved.audio.output_volume, 42.0);
+    assert!(saved.audio.muted, "the stale copy did not unmute the file");
+    server.handle.shutdown().await;
+}
