@@ -601,6 +601,37 @@ impl Drop for InFlightFrames {
     }
 }
 
+impl InFlightFrames {
+    /// Drives `op` — opening or writing the next frame's stream — to its end
+    /// while the frames already in flight go on settling: one whose deadline
+    /// passes meanwhile is given up then, not only once `op` is through
+    /// (external review 2026-09-27, second round). `op` is polled in place
+    /// and never started again; `write_chunk` is not cancellation-safe.
+    /// `None` if the connection is gone.
+    async fn settling<T>(&mut self, op: impl Future<Output = T>, lost: impl Fn()) -> Option<T> {
+        tokio::pin!(op);
+        loop {
+            let oldest = async {
+                match self.0.front_mut() {
+                    Some(oldest) => oldest.settle().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let settled = tokio::select! {
+                biased;
+                out = &mut op => return Some(out),
+                settled = oldest => settled,
+            };
+            match settled {
+                Settled::Acked => {}
+                Settled::Late => lost(),
+                Settled::Gone => return None,
+            }
+            self.0.pop_front();
+        }
+    }
+}
+
 /// Writes whatever is in the slot to one receiver, one stream per frame.
 ///
 /// `finish()` only queues a frame; quinn delivers it later. Counting frames
@@ -611,8 +642,10 @@ impl Drop for InFlightFrames {
 /// frames stay unacknowledged; the next one waits in the slot, where newer
 /// frames replace or drop it. One not acknowledged by its deadline is reset
 /// and the pair waits for a keyframe — also the last one before a pause,
-/// with fewer than the limit in flight. Frames still in flight when the
-/// forwarder ends are reset without being counted ([`InFlightFrames`]).
+/// with fewer than the limit in flight, and one whose deadline passes while
+/// the next frame's stream is being opened or written. Frames still in
+/// flight when the forwarder ends are reset without being counted
+/// ([`InFlightFrames`]).
 async fn forward_frames(
     server: Arc<Server>,
     conn: quinn::Connection,
@@ -668,31 +701,44 @@ async fn forward_frames(
         // Cover both stream credit and write flow control. A peer can keep
         // control/audio alive while refusing video indefinitely; closing a
         // slot must also cancel a forwarder blocked in either operation.
+        // The frames already in flight keep their own deadlines meanwhile
+        // ([`InFlightFrames::settling`]).
         let deadline = tokio::time::Instant::now() + server.config.timing.video_frame_timeout();
-        let mut send = tokio::select! {
-            biased;
-            _ = slot.closed() => return,
-            _ = &mut shutdown => return,
-            opened = tokio::time::timeout_at(deadline, conn.open_uni()) => match opened {
-                Ok(Ok(send)) => send,
-                Ok(Err(e)) => {
-                    tracing::debug!(session, error = %e, "cannot open a video stream");
-                    return;
-                }
-                Err(_) => {
-                    lost(&slot);
-                    continue;
-                }
-            },
+        let open = async {
+            tokio::select! {
+                biased;
+                _ = slot.closed() => None,
+                _ = &mut shutdown => None,
+                opened = tokio::time::timeout_at(deadline, conn.open_uni()) => Some(opened),
+            }
+        };
+        let Some(Some(opened)) = in_flight.settling(open, || lost(&slot)).await else {
+            return;
+        };
+        let mut send = match opened {
+            Ok(Ok(send)) => send,
+            Ok(Err(e)) => {
+                tracing::debug!(session, error = %e, "cannot open a video stream");
+                return;
+            }
+            Err(_) => {
+                lost(&slot);
+                continue;
+            }
         };
         let _ = send.set_priority(-1);
-        let written = tokio::select! {
-            biased;
-            _ = slot.closed() => false,
-            _ = &mut shutdown => false,
-            result = tokio::time::timeout_at(deadline, send.write_chunk(frame)) => {
-                matches!(result, Ok(Ok(())))
-            },
+        let write = async {
+            tokio::select! {
+                biased;
+                _ = slot.closed() => false,
+                _ = &mut shutdown => false,
+                result = tokio::time::timeout_at(deadline, send.write_chunk(frame)) => {
+                    matches!(result, Ok(Ok(())))
+                },
+            }
+        };
+        let Some(written) = in_flight.settling(write, || lost(&slot)).await else {
+            return;
         };
         if !written {
             let _ = send.reset(quinn::VarInt::from_u32(icu_proto::error::RATE_LIMITED));

@@ -1238,6 +1238,50 @@ async fn a_lost_ca_is_not_replaced_while_users_are_on_record() {
     }
 }
 
+/// The other way round: `users.toml` lost beside the CA and the com key is a
+/// startup error too, for the server and the offline CLI alike, and nothing
+/// is written in its place (external review 2026-09-27). Before, an empty
+/// user database took its place: every user unknown, every revocation
+/// forgotten, while the keys carried on.
+#[tokio::test]
+async fn a_lost_user_database_is_not_replaced_beside_the_keys() {
+    let server = TestServer::start().await;
+    server.enroll("alice").await;
+    let TestServer { dir, handle } = server;
+    handle.shutdown().await;
+    let users = dir.path().join("users.toml");
+    std::fs::remove_file(&users).expect("remove");
+
+    let config = icu_server::config::Config::for_test(dir.path());
+    let started = icu_server::run(config.clone()).await.err();
+    let offline = icu_server::Server::offline(config).err();
+    for error in [started, offline] {
+        let error = error.expect("no empty user database").to_string();
+        assert!(
+            error.contains("users.toml") && error.contains("ca.key") && error.contains("com.key"),
+            "names what is missing and what is there: {error}"
+        );
+        assert!(error.contains("README"), "points to the runbook: {error}");
+    }
+    assert!(!users.exists(), "users.toml was not created");
+}
+
+/// A state directory that has never been used gets its `users.toml` before
+/// the CA and the com key, and on the first start: even when an offline CLI
+/// command comes first, key material without `users.toml` stays a sign of a
+/// lost file, never of a new installation.
+#[tokio::test]
+async fn a_new_state_gets_its_user_database_first() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = icu_server::config::Config::for_test(dir.path());
+    drop(icu_server::Server::offline(config.clone()).expect("offline CLI on a new state"));
+    for name in ["users.toml", "ca.key", "com.key"] {
+        assert!(dir.path().join(name).exists(), "{name} is there");
+    }
+    let handle = icu_server::run(config).await.expect("the first start");
+    handle.shutdown().await;
+}
+
 /// A server leaf close to expiry is rotated by the server itself, right at
 /// startup: served live, the old one on the CRL, and `status` reports it.
 #[tokio::test]

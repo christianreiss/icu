@@ -82,6 +82,44 @@ cargo test --locked -p icu-server --test media_load -- --ignored --nocapture --t
 # For longer runs (10–600 seconds): prefix ICU_MEDIA_SECONDS=300
 ```
 
+### External review follow-up, second round — 27 September
+
+Code at `fa26a64` (branch `fix/review-2026-09-27-round2`, on top of `8568d82`):
+
+- **Lost `users.toml` beside the keys** (`9de7922`): `Store::open` creates an
+  empty user database only in a state directory with no CA, server leaf or
+  com key, and writes it at once; beside any of them a missing `users.toml`
+  is a startup error naming the files found, and nothing is written.
+  `a_lost_user_database_is_not_replaced_beside_the_keys` (start, enroll,
+  stop, delete only `users.toml`: `run` and the offline CLI both fail, no
+  file appears) and `a_new_state_gets_its_user_database_first` (offline CLI
+  first, then the first start) in `tests/auth.rs`.
+- **In-flight deadlines during the next open/write** (`a0a3101`):
+  `a_frame_in_flight_is_given_up_while_the_next_waits_for_a_stream` in
+  `tests/slow_viewer.rs` (one stream of credit, downlink cut, frame 2 waiting
+  for a stream while frame 1 is in flight). It **fails against the forwarder of
+  `8568d82`** (frame 1 given up only at frame 2's deadline) and passes now.
+- **Junk metering** (`fa26a64`): only datagrams the socket accepted count as
+  sent; the soak prints the sent and filtered rates and checks the filter
+  drops no more than arrived.
+
+| Check | Result |
+|---|---|
+| `cargo test --locked --workspace --no-fail-fast` | **663 passed**, 0 failed, 8 ignored (the opt-in soaks, load, netem, idle and client-only exclusions). |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings`; `cargo fmt --all -- --check`; `git diff --check` | Passed. |
+| Media soak, 16 clients, 30 s, no junk | All receivers healthy: **360,000/360,000 audio, 108,000/108,000 video**, audio p99 8.472 ms. Zero-credit viewer: **360,000 audio, 101,250/101,250 video** to healthy receivers, p99 7.666 ms. |
+| Same, `ICU_MEDIA_JUNK_PPS=10000` | All healthy: **299,960 junk datagrams sent (9,998/s), 299,960 dropped by the com filter (9,998/s)**; 360,000/360,000 audio, 108,000/108,000 video, p99 7.875 ms. Zero-credit viewer: **300,010 sent, 300,010 filtered (10,000/s)**; 360,000 audio, 101,250/101,250 video, p99 7.548 ms. No disconnects, no rate or stall drops. |
+
+The p99 values are higher than in the follow-up above (4.9 ms) with and
+without junk alike: this is a debug build on a shared workstation, and the
+junk runs are not slower than the baseline of the same session. Loopback
+only; this says nothing about a WAN path. Log:
+`target/gate/evidence/icu-server-media-load-2026-09-27-round2.log`.
+
+```sh
+ICU_MEDIA_JUNK_PPS=10000 cargo test --locked -p icu-server --test media_load -- --ignored --nocapture --test-threads=1
+```
+
 ### Service test on biest.eulie.de
 
 An isolated unit, `icu-server-gate-test.service`, used the shipped security

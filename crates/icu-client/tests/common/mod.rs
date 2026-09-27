@@ -50,6 +50,13 @@ impl TestServer {
         }
         let dir = tempfile::tempdir().expect("tempdir");
         if let Some(key) = com_key {
+            // With a user database that has never been used: `com.key`
+            // alone would read as a restore that lost it.
+            std::fs::write(
+                dir.path().join(icu_server::store::USERS_FILE),
+                format!("schema = {}\nnext_user_id = 1\n", icu_server::store::SCHEMA),
+            )
+            .expect("users.toml");
             std::fs::write(
                 dir.path().join(icu_server::store::COM_KEY_FILE),
                 format!("{}\n", key.to_base64()),
