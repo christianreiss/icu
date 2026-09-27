@@ -191,16 +191,19 @@ impl Decoder {
 /// nothing to show yet or cannot read it (then it remembers the failure).
 #[cfg(feature = "camera")]
 pub fn decode(decoder: &mut Decoder, data: &[u8]) -> Option<Frame> {
-    use icu_proto::header::{VIDEO_MAX_HEIGHT, VIDEO_MAX_WIDTH};
     use openh264::formats::YUVSource;
     // The sender's encoder is not ours to trust: the size is checked
-    // before the decoder allocates for it (`h264`).
-    if let Err(e) = h264::check(data) {
-        tracing::debug!(?e, "h264 refused before decode");
-        decoder.failed = true;
-        return None;
-    }
-    let yuv = match decoder.inner.decode(data) {
+    // before the decoder allocates for it, and the decoder reads exactly
+    // what was checked (`h264`).
+    let au = match h264::sanitize(data) {
+        Ok(au) => au,
+        Err(e) => {
+            tracing::debug!(?e, "h264 refused before decode");
+            decoder.failed = true;
+            return None;
+        }
+    };
+    let yuv = match decoder.inner.decode(&au) {
         Ok(yuv) => yuv?,
         Err(e) => {
             tracing::debug!(%e, "h264 decode");
@@ -209,8 +212,8 @@ pub fn decode(decoder: &mut Decoder, data: &[u8]) -> Option<Frame> {
         }
     };
     let (w, h) = yuv.dimensions();
-    if w > VIDEO_MAX_WIDTH || h > VIDEO_MAX_HEIGHT {
-        tracing::debug!(w, h, "h264 picture above the ceiling");
+    if !picture_size_ok(w, h) {
+        tracing::debug!(w, h, "h264 picture empty or above the ceiling");
         decoder.failed = true;
         return None;
     }
@@ -222,6 +225,16 @@ pub fn decode(decoder: &mut Decoder, data: &[u8]) -> Option<Frame> {
         rgba: Arc::new(rgba),
         at: Instant::now(),
     })
+}
+
+/// Whether a decoded picture may go on screen: within the receiver
+/// ceiling, and not empty — a texture of zero width or height is a wgpu
+/// validation error, which panics, and the release build aborts on a panic.
+/// The SPS check alone cannot promise either: cropping happens after it.
+#[cfg_attr(not(feature = "camera"), allow(dead_code))]
+fn picture_size_ok(w: usize, h: usize) -> bool {
+    use icu_proto::header::{VIDEO_MAX_HEIGHT, VIDEO_MAX_WIDTH};
+    (1..=VIDEO_MAX_WIDTH).contains(&w) && (1..=VIDEO_MAX_HEIGHT).contains(&h)
 }
 
 /// See the `camera` version; without the feature there is no picture.
@@ -834,6 +847,17 @@ mod tests {
 
         let ok = encoded(1, &[]);
         assert_eq!(h264::check(&ok[0].data), Ok(()), "the own encoder passes");
+    }
+
+    /// Nothing empty and nothing above the ceiling reaches a texture.
+    #[test]
+    fn empty_and_oversize_pictures_are_refused() {
+        assert!(picture_size_ok(320, 240));
+        assert!(picture_size_ok(640, 480));
+        assert!(picture_size_ok(1, 1));
+        for (w, h) in [(0, 240), (320, 0), (0, 0), (641, 480), (640, 481)] {
+            assert!(!picture_size_ok(w, h), "{w}×{h}");
+        }
     }
 
     /// A session that delivered frames but nothing decodable is not offered

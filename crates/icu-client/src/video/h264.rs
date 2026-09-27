@@ -5,6 +5,14 @@
 //! tens of MB and a stalled decode thread. Only the fields up to
 //! `frame_mbs_only_flag` are read — enough for the picture size and the
 //! reference count.
+//!
+//! The check only binds if the decoder reads the same bytes: openh264 splits
+//! and unescapes the access unit itself, and not quite like the check does —
+//! `00 00 03` followed by a byte above 3 (not a valid escape) loses all three
+//! bytes there, only the `03` here, so an SPS could read 320×240 here and
+//! 4096×2304 there. The decoder therefore gets the access unit rebuilt from
+//! exactly the NAL units checked ([`sanitize`]): canonical start codes and
+//! canonical escaping of the payload the check read.
 
 use icu_proto::header::{VIDEO_MAX_HEIGHT, VIDEO_MAX_REF_FRAMES, VIDEO_MAX_WIDTH};
 
@@ -25,17 +33,36 @@ pub enum Reject {
 }
 
 /// `Ok` when every SPS in the Annex-B access unit `data` stays within the
-/// receiver ceiling and no NAL needs an extension decoder.
+/// receiver ceiling and no NAL needs an extension decoder (tests; the
+/// decoder takes [`sanitize`]).
+#[cfg(test)]
 pub fn check(data: &[u8]) -> Result<(), Reject> {
+    sanitize(data).map(|_| ())
+}
+
+/// [`check`], and the access unit to hand the decoder: every NAL unit the
+/// check read, after a `00 00 00 01`, escaped the canonical way from the
+/// payload the check read — so the decoder's splitter and unescaping land
+/// on the same bytes. Bytes before the first start code and trailing zero
+/// bytes (`trailing_zero_8bits`, `cabac_zero_word`) are left out; neither
+/// carries picture data.
+pub fn sanitize(data: &[u8]) -> Result<Vec<u8>, Reject> {
+    let mut out = Vec::with_capacity(data.len() + 16);
     for nal in nal_units(data) {
-        let Some(&first) = nal.first() else { continue };
+        let mut rbsp = unescape(nal);
+        while rbsp.last() == Some(&0) {
+            rbsp.pop();
+        }
+        let Some(&first) = rbsp.first() else { continue };
         match first & 0x1f {
             t @ (14 | 15 | 20) => return Err(Reject::Extension(t)),
-            7 => check_sps(&unescape(&nal[1..]))?,
+            7 => check_sps(&rbsp[1..])?,
             _ => {}
         }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        escape(&rbsp, &mut out);
     }
-    Ok(())
+    Ok(out)
 }
 
 /// The NAL units between Annex-B start codes (`00 00 01`, also as the tail
@@ -77,6 +104,21 @@ fn unescape(nal: &[u8]) -> Vec<u8> {
         out.push(b);
     }
     out
+}
+
+/// The NAL unit of payload `rbsp`, appended to `out`: `03` inserted after
+/// every two zero bytes that a byte of 0–3 follows, and nothing else
+/// (H.264 §7.4.1).
+fn escape(rbsp: &[u8], out: &mut Vec<u8>) {
+    let mut zeros = 0;
+    for &b in rbsp {
+        if zeros >= 2 && b <= 3 {
+            out.push(3);
+            zeros = 0;
+        }
+        zeros = if b == 0 { zeros + 1 } else { 0 };
+        out.push(b);
+    }
 }
 
 fn check_sps(rbsp: &[u8]) -> Result<(), Reject> {
@@ -264,6 +306,192 @@ mod tests {
         );
         // Zero constraint flags and level put `00 00` after the profile.
         assert_eq!(check(&sps(66, 1, 1, 0)), Ok(()));
+    }
+
+    /// The NAL units openh264's decoder reads out of `au`, header byte
+    /// first, unescaped its way: a port of the splitting loop in
+    /// `WelsDecodeBs` and `DetectStartCodePrefix` (openh264 2.6,
+    /// `decoder/core/src/decoder.cpp`, `au_parser.cpp`). A unit is read
+    /// when the next start code or the end is reached; a bitstream error
+    /// ends the access unit, the units read before it count.
+    fn openh264_units(au: &[u8]) -> Vec<Vec<u8>> {
+        // DetectStartCodePrefix: a 01 after at least two zero bytes.
+        let mut start = None;
+        let mut zeros = 0;
+        for (i, &b) in au.iter().enumerate() {
+            if b == 0 {
+                zeros += 1;
+            } else if b == 1 && zeros >= 2 {
+                start = Some(i + 1);
+                break;
+            } else {
+                zeros = 0;
+            }
+        }
+        let Some(start) = start else {
+            return Vec::new();
+        };
+        let src = &au[start..];
+        let (mut units, mut dst) = (Vec::new(), Vec::new());
+        let mut i = 0;
+        let mut start_bytes = false;
+        while i < src.len() {
+            if i + 2 < src.len() && src[i] == 0 && src[i + 1] == 0 && src[i + 2] <= 3 {
+                let third = src[i + 2];
+                if start_bytes && third > 1 {
+                    return units;
+                }
+                match third {
+                    2 => return units,
+                    0 => {
+                        dst.push(0);
+                        i += 1;
+                        start_bytes = true;
+                    }
+                    3 => {
+                        if !(i + 3 < src.len() && src[i + 3] > 3) {
+                            dst.extend_from_slice(&[0, 0]);
+                        }
+                        i += 3;
+                    }
+                    _ => {
+                        start_bytes = false;
+                        units.push(std::mem::take(&mut dst));
+                        i += 3;
+                    }
+                }
+                continue;
+            }
+            dst.push(src[i]);
+            i += 1;
+        }
+        units.push(dst);
+        units
+    }
+
+    /// Whether openh264 would read an SPS out of `au` that the check
+    /// refuses.
+    fn decoder_sees_a_refused_sps(au: &[u8]) -> bool {
+        openh264_units(au)
+            .iter()
+            .any(|u| u.first().is_some_and(|h| h & 0x1f == 7) && check_sps(&u[1..]).is_err())
+    }
+
+    /// A random access unit: start codes of three and four bytes, SPSs with
+    /// random fields — within the ceiling or far above it —, escapes both
+    /// canonical and not (`00 00 03` before a byte above 3), zero runs,
+    /// random bytes and other NAL types.
+    fn random_au(rng: &mut crate::dsp::testsignal::Rng) -> Vec<u8> {
+        let mut pick = |n: u64| (rng.next_u64() % n) as usize;
+        let mut au = Vec::new();
+        if pick(4) == 0 {
+            au.push(pick(256) as u8);
+        }
+        for _ in 0..1 + pick(3) {
+            au.extend_from_slice(if pick(2) == 0 {
+                &[0, 0, 1]
+            } else {
+                &[0, 0, 0, 1]
+            });
+            match pick(4) {
+                0 => {
+                    let (w, h) = if pick(2) == 0 {
+                        (1 + pick(40) as u64, 1 + pick(30) as u64)
+                    } else {
+                        (1 + pick(300) as u64, 1 + pick(200) as u64)
+                    };
+                    let refs = pick(8) as u64;
+                    let mut sps = sps(if pick(2) == 0 { 66 } else { 77 }, w, h, refs);
+                    // The unit alone, without the test helper's start code
+                    // and slice.
+                    sps.truncate(sps.len() - 5);
+                    au.extend_from_slice(&sps[4..]);
+                }
+                1 => {
+                    // An SPS header, profile 66, zero constraint flags and
+                    // level, an invalid escape, then noise.
+                    au.extend_from_slice(&[0x67, 0x42, 0, 0, 3, 4 + pick(252) as u8]);
+                    for _ in 0..pick(12) {
+                        au.push(pick(256) as u8);
+                    }
+                }
+                2 => {
+                    au.push([0x68, 0x65, 0x41, 0x06][pick(4)]);
+                    for _ in 0..pick(20) {
+                        au.push(pick(256) as u8);
+                    }
+                }
+                _ => {
+                    for _ in 0..pick(24) {
+                        au.push(match pick(6) {
+                            0..=2 => 0,
+                            3 => 3,
+                            _ => pick(256) as u8,
+                        });
+                    }
+                }
+            }
+            for _ in 0..pick(3) {
+                // Random bytes, sometimes an invalid escape, in the tail.
+                match pick(4) {
+                    0 => au.extend_from_slice(&[0, 0, 3, pick(256) as u8]),
+                    1 => au.push(0),
+                    _ => au.push(pick(256) as u8),
+                }
+            }
+        }
+        au
+    }
+
+    /// Nothing the check lets through makes the decoder read an SPS the
+    /// check would refuse (V-1). The same inputs handed over as they came
+    /// did — the generator finds the invalid escape — which is why the
+    /// decoder gets the rebuilt unit.
+    #[test]
+    fn the_decoder_reads_only_what_was_checked() {
+        let mut rng = crate::dsp::testsignal::Rng::new(0x1c0_5ee5);
+        let (mut accepted, mut smuggled) = (0, 0);
+        for _ in 0..200_000 {
+            let raw = random_au(&mut rng);
+            let Ok(au) = sanitize(&raw) else { continue };
+            accepted += 1;
+            assert!(
+                !decoder_sees_a_refused_sps(&au),
+                "{raw:02x?} rebuilt as {au:02x?}"
+            );
+            assert_eq!(sanitize(&au).as_ref(), Ok(&au), "rebuilding is stable");
+            smuggled += usize::from(decoder_sees_a_refused_sps(&raw));
+        }
+        assert!(accepted > 10_000, "{accepted} accepted");
+        assert!(smuggled > 0, "the generator never found the gap");
+    }
+
+    /// The gap itself: an SPS the check reads as 320×240 through an invalid
+    /// escape, which the decoder unescaped its own way would read as much
+    /// larger. Rebuilt, both read the same.
+    #[test]
+    fn an_invalid_escape_cannot_hide_the_size() {
+        let mut rng = crate::dsp::testsignal::Rng::new(7);
+        let found = (0..1_000_000).find_map(|_| {
+            let mut au = vec![0, 0, 0, 1, 0x67, 0x42, 0, 0, 3];
+            for _ in 0..10 {
+                au.push((rng.next_u64() % 256) as u8);
+            }
+            (au[9] > 3 && check(&au).is_ok() && decoder_sees_a_refused_sps(&au)).then_some(au)
+        });
+        let au = found.expect("an SPS that reads differently");
+        let rebuilt = sanitize(&au).unwrap();
+        assert!(!decoder_sees_a_refused_sps(&rebuilt));
+    }
+
+    /// A real encoder's access unit comes out as it went in, but for
+    /// four-byte start codes throughout.
+    #[test]
+    fn a_canonical_unit_is_rebuilt_unchanged() {
+        let au = sps(66, 20, 15, 1);
+        let mut want = au[..au.len() - 5].to_vec();
+        want.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88]);
+        assert_eq!(sanitize(&au), Ok(want));
     }
 
     #[test]
