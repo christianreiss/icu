@@ -253,6 +253,22 @@ pub fn storage(what: &str, e: &dyn std::fmt::Display) -> Problem {
     )
 }
 
+/// No audio system to talk to (PipeWire or the Windows audio service): ICU
+/// runs on the silent fallback, hearing and sending nothing. Not an audio
+/// device problem: reopening streams on the fallback must not clear it.
+pub fn no_audio_system(e: &dyn std::fmt::Display) -> Problem {
+    Problem::new(
+        if cfg!(target_os = "windows") {
+            "ICU erreicht die Audiowiedergabe von Windows nicht und läuft ohne Mikrofon und \
+             Lautsprecher. Windows neu starten, dann ICU."
+        } else {
+            "ICU erreicht das Audiosystem (PipeWire) nicht und läuft ohne Mikrofon und \
+             Lautsprecher. PipeWire starten (oder neu anmelden), dann ICU neu starten."
+        },
+        e.to_string(),
+    )
+}
+
 /// An audio device that would not open or broke down.
 pub fn audio(device: &str, e: &dyn std::fmt::Display) -> Problem {
     let mut problem = Problem::new(
@@ -340,6 +356,24 @@ pub(crate) mod tests {
         let window = from_code(codes::RENEW_REJECTED, "renewal opens 30 days before expiry");
         assert!(window.text.contains("noch lange gültig"));
         assert_readable(&from_code(codes::RENEW_REJECTED, "something new"));
+    }
+
+    /// Running on the silent fallback is said in the window, in plain
+    /// words, and survives the streams opening on the fallback.
+    #[test]
+    fn no_audio_system_is_a_readable_lasting_banner() {
+        let p = no_audio_system(&"pipewire: connect: Host is down");
+        assert_readable(&p);
+        assert!(
+            p.text.contains("ohne Mikrofon und Lautsprecher"),
+            "{}",
+            p.text
+        );
+        assert!(!p.is_audio(), "reopening streams must not clear it");
+        assert_eq!(
+            p.technical.as_deref(),
+            Some("pipewire: connect: Host is down")
+        );
     }
 
     #[test]

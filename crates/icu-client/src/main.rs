@@ -410,6 +410,9 @@ fn run(cli: Cli) -> Result<(), String> {
             }
         };
 
+        // Without an audio system ICU still runs, silent — and says so in the
+        // window, not only in the log.
+        let mut audio_problem = None;
         let backend: Box<dyn icu_client::audio::AudioBackend> = if cli.fake_audio {
             Box::new(icu_client::audio::fake::FakeBackend::silent().0)
         } else {
@@ -417,6 +420,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!(%e, "no audio backend, using the silent fake backend");
+                    audio_problem = Some(icu_client::problem::no_audio_system(&e));
                     Box::new(icu_client::audio::fake::FakeBackend::silent().0)
                 }
             }
@@ -431,7 +435,9 @@ fn run(cli: Cli) -> Result<(), String> {
         let mut cfg = EngineConfig::new(identity, settings.clone(), paths.clone());
         cfg.server_addr = cli.server_addr;
         cfg.test_tone = cli.test_tone;
-        cfg.banner = settings_problem.take().or(problem);
+        cfg.banner = audio_problem
+            .or_else(|| settings_problem.take())
+            .or(problem);
         let engine = Engine::start(cfg, backend).map_err(|e| e.to_string())?;
         // From here a SIGTERM (a desktop logging out) quits like „Beenden“,
         // with a proper goodbye to the server.

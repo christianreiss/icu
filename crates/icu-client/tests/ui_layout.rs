@@ -651,12 +651,9 @@ fn settings_import_takes_the_settings_unless_switched_off() {
             cmds_out.borrow_mut().extend(view.ui(ui, &s, false).cmds);
         });
         shot(&mut h, &format!("settings-import-{take}"));
-        // The switch sits in the row its label names.
-        let row = h.get_by_label("Einstellungen übernehmen").rect();
+        // The switch carries the name of its row.
         if !take {
-            h.query_all_by_role(egui::accesskit::Role::CheckBox)
-                .find(|n| (n.rect().center().y - row.center().y).abs() < 16.0)
-                .expect("the import option's switch")
+            h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Einstellungen übernehmen")
                 .click_accesskit();
             h.run();
         }
@@ -682,6 +679,122 @@ fn settings_import_takes_the_settings_unless_switched_off() {
             None => assert!(!take, "the settings were left behind"),
         }
     }
+}
+
+/// Switches and sliders carry the name of their row for a screen reader,
+/// and a focused slider moves with the arrow keys.
+#[test]
+fn switches_and_sliders_are_named_and_keyboard_driven() {
+    let s = state();
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let cmds_out = cmds.clone();
+    let state_in = s.clone();
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        cmds_out
+            .borrow_mut()
+            .extend(view.ui(ui, &state_in, false).cmds);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Klang")
+        .click();
+    h.run();
+    for name in [
+        "Rauschunterdrückung",
+        "Echo-Unterdrückung",
+        "Pegel automatisch",
+        "Selbst gleich laut ankommen",
+        "Andere gleich laut hören",
+        "Stimmoptimierung",
+    ] {
+        h.get_by_role_and_label(egui::accesskit::Role::CheckBox, name);
+    }
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Audio")
+        .click();
+    h.run();
+    let before = s.settings.audio.output_volume;
+    let volume = h.get_by_role_and_label(egui::accesskit::Role::Slider, "Lautstärke");
+    volume.focus();
+    h.run();
+    h.key_press(egui::Key::ArrowRight);
+    h.key_press(egui::Key::ArrowRight);
+    h.run();
+    let after = last_update(&cmds.borrow()).audio.output_volume;
+    assert!(after > before, "volume {before} → {after}");
+    h.key_press(egui::Key::ArrowLeft);
+    h.run();
+    let back = last_update(&cmds.borrow()).audio.output_volume;
+    assert!(back < after && back > before, "one step back: {back}");
+}
+
+/// No way to read keys: the banner says what to do and switches to voice
+/// activation with one click, on the Tastenkürzel page and in the setup.
+#[test]
+fn no_hotkey_backend_offers_voice_activation() {
+    let switch = format!(
+        "{}  Stattdessen automatisch senden",
+        egui_phosphor::regular::WAVEFORM
+    );
+    let mut s = state();
+    s.hotkey_backend = "none".into();
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let (cmds_out, state_in) = (cmds.clone(), s.clone());
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        cmds_out
+            .borrow_mut()
+            .extend(view.ui(ui, &state_in, false).cmds);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Tastenkürzel")
+        .click();
+    h.run();
+    if cfg!(target_os = "linux") {
+        h.get_by_label_contains("sudo usermod -aG input $USER");
+    }
+    h.get_by_role_and_label(egui::accesskit::Role::Button, &switch)
+        .click();
+    h.run();
+    assert_eq!(last_update(&cmds.borrow()).audio.mode, ModeSetting::Vad);
+
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let cmds_out = cmds.clone();
+    s.settings.ui.setup_done = false;
+    let mut view = SetupView::new(&s);
+    let mut h = harness(SETUP, "light", true, move |ui| {
+        cmds_out.borrow_mut().extend(view.ui(ui, &s).cmds);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, &next_label())
+        .click();
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, &switch)
+        .click();
+    h.run();
+    assert_eq!(last_update(&cmds.borrow()).audio.mode, ModeSetting::Vad);
+}
+
+/// The passport's warning names the clipboard, which „Kopieren“ uses.
+#[test]
+fn the_passport_warning_names_the_clipboard() {
+    let s = state();
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        view.ui(ui, &s, false);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Allgemein")
+        .click();
+    h.run();
+    h.get_by_label_contains("Zwischenablage-Verlauf");
 }
 
 /// „Weiter“ in the setup's bottom bar.

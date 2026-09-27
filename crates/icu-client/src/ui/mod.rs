@@ -19,10 +19,21 @@ use crate::{
 pub use main_window::Exit;
 
 /// The push-to-talk binding as a person would say it: `KEY_RIGHTCTRL`
-/// becomes `RIGHTCTRL`, and the Portal backend shows its own trigger
-/// (`CTRL+SHIFT+F12`) because that is what it actually bound.
+/// becomes `RIGHTCTRL`. Through the Portal it is the key the desktop
+/// assigned (its dialog may take another than the one proposed), else the
+/// proposed trigger (`CTRL+SHIFT+F12`).
 pub(crate) fn ptt_key_label(hotkeys: &crate::config::HotkeySettings, backend: &str) -> String {
     let binding = &hotkeys.ptt;
+    if backend == "portal" {
+        if let Some(assigned) = crate::hotkey::portal_trigger(crate::hotkey::Action::Ptt) {
+            // Left blank in the dialog: no key works, whatever was proposed.
+            return if assigned.is_empty() {
+                "—".to_string()
+            } else {
+                assigned
+            };
+        }
+    }
     if backend == "portal"
         || (backend == crate::hotkey::BACKEND_RAWINPUT && binding.key.trim().is_empty())
     {
@@ -39,6 +50,20 @@ pub(crate) fn ptt_key_label(hotkeys: &crate::config::HotkeySettings, backend: &s
         .or_else(|| binding.key.strip_prefix("BTN_"))
         .unwrap_or(&binding.key)
         .to_string()
+}
+
+/// Whether a file dropped onto a window arrives: winit 0.30 delivers
+/// `DroppedFile` on X11 and Windows, not on Wayland — which it uses
+/// whenever `WAYLAND_DISPLAY` is set, unless `WINIT_UNIX_BACKEND=x11`
+/// forces X11. The first-start window promises drag & drop only where it
+/// works.
+pub(crate) fn file_drop_works() -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|v| v == "x11");
+    !wayland || forced_x11
 }
 
 /// Work area in egui screen coordinates, including the taskbar exclusion.

@@ -533,8 +533,15 @@ pub fn status_link(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
 // Stateful controls
 // ---------------------------------------------------------------------------
 
-/// A pill-shaped on/off switch, 40x23.
+/// A pill-shaped on/off switch, 40x23, that a screen reader announces
+/// without a name; [`named_toggle`] where there is one.
 pub fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
+    named_toggle(ui, on, "")
+}
+
+/// A pill-shaped on/off switch, 40x23. `name` is what a screen reader
+/// announces for it: the label of the row it sits in.
+pub fn named_toggle(ui: &mut Ui, on: &mut bool, name: &str) -> egui::Response {
     let size = egui::vec2(40.0, 23.0);
     let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
     if response.clicked() {
@@ -542,7 +549,7 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
         response.mark_changed();
     }
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "")
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, name)
     });
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(response.id, *on);
@@ -708,10 +715,24 @@ pub fn chip_toggle(ui: &mut Ui, on: &mut bool, label: &str) -> egui::Response {
     response
 }
 
+/// A slider that a screen reader announces without a name; [`named_slider`]
+/// where there is one.
+pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui::Response {
+    named_slider(ui, value, range, "")
+}
+
 /// A slider drawn in the same hand as [`toggle`]: a thin recessed track, an
 /// accent trail up to the value, a light knob. Fills the available width and
-/// takes a click or a drag anywhere along the row.
-pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui::Response {
+/// takes a click or a drag anywhere along the row; focused, the arrow keys
+/// (and a screen reader's increment/decrement) move it by a hundredth of
+/// the range. `name` is what a screen reader announces for it.
+pub fn named_slider(
+    ui: &mut Ui,
+    value: &mut f32,
+    range: RangeInclusive<f32>,
+    name: &str,
+) -> egui::Response {
+    use egui::accesskit::Action;
     const HEIGHT: f32 = 22.0;
     const KNOB: f32 = 8.0;
     const TRACK: f32 = 5.0;
@@ -719,8 +740,6 @@ pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui:
     let width = ui.available_width().max(KNOB * 4.0);
     let (rect, mut response) =
         ui.allocate_exact_size(egui::vec2(width, HEIGHT), Sense::click_and_drag());
-    let shown = f64::from(*value);
-    response.widget_info(|| egui::WidgetInfo::slider(ui.is_enabled(), shown, ""));
     // The knob centre never leaves the track, so the value stays reachable
     // at both ends without the knob hanging over the edge.
     let span = (rect.left() + KNOB)..=(rect.right() - KNOB);
@@ -732,6 +751,45 @@ pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui:
             response.mark_changed();
         }
     }
+    let focused = response.has_focus();
+    if focused {
+        // Left and right move the knob instead of the focus.
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    ..Default::default()
+                },
+            )
+        });
+    }
+    let steps = ui.input(|i| {
+        let keys = if focused {
+            i.num_presses(egui::Key::ArrowRight) as i32 - i.num_presses(egui::Key::ArrowLeft) as i32
+        } else {
+            0
+        };
+        keys + i.num_accesskit_action_requests(response.id, Action::Increment) as i32
+            - i.num_accesskit_action_requests(response.id, Action::Decrement) as i32
+    });
+    let step = (range.end() - range.start()) / 100.0;
+    if steps != 0 {
+        let moved = (*value + steps as f32 * step).clamp(*range.start(), *range.end());
+        if moved != *value {
+            *value = moved;
+            response.mark_changed();
+        }
+    }
+    let shown = f64::from(*value);
+    response.widget_info(|| egui::WidgetInfo::slider(ui.is_enabled(), shown, name));
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_min_numeric_value(f64::from(*range.start()));
+        node.set_max_numeric_value(f64::from(*range.end()));
+        node.set_numeric_value_step(f64::from(step));
+        node.add_action(Action::Increment);
+        node.add_action(Action::Decrement);
+    });
     if ui.is_rect_visible(rect) {
         let tok = theme::tokens(ui.visuals());
         let t = egui::remap_clamp(*value, range, 0.0..=1.0);
@@ -748,7 +806,7 @@ pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui:
         let mut trail = track;
         trail.max.x = cx;
         painter.rect_filled(trail, TRACK / 2.0, tok.accent);
-        let hot = response.hovered() || response.dragged();
+        let hot = response.hovered() || response.dragged() || focused;
         painter.circle(
             egui::pos2(cx, rect.center().y),
             if hot { KNOB + 1.0 } else { KNOB },
@@ -1444,7 +1502,7 @@ pub fn slider_row(
                 label_column(ui, LABEL_W, 22.0, label);
                 rtl(ui, 22.0, |ui| {
                     chip(ui, &format(*value), reserve);
-                    slider(ui, value, range)
+                    named_slider(ui, value, range, label)
                 })
             })
             .inner

@@ -16,7 +16,7 @@ use std::{
 use openh264::{
     encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, RateControlMode, UsageType},
     formats::{RgbSliceU8, YUVBuffer},
-    OpenH264API,
+    OpenH264API, Timestamp,
 };
 
 use crate::{
@@ -203,22 +203,130 @@ pub struct NokhwaSource {
 
 impl NokhwaSource {
     /// Opens camera `index` (Spike 5: pick the capture node explicitly) at
-    /// the closest format to 320×240 MJPEG 15 fps.
+    /// the closest format to 320×240 MJPEG 15 fps, or else the best one
+    /// [`choose_format`] finds among what the camera offers.
     pub fn open(index: u32) -> Result<NokhwaSource, String> {
         use nokhwa::{
             pixel_format::RgbFormat,
             utils::{
-                CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType,
-                Resolution,
+                frame_formats, CameraFormat, CameraIndex, FrameFormat, RequestedFormat,
+                RequestedFormatType, Resolution,
             },
         };
         let want = CameraFormat::new(Resolution::new(WIDTH, HEIGHT), FrameFormat::MJPEG, FPS);
         let req = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Closest(want));
-        let mut camera =
-            nokhwa::Camera::new(CameraIndex::Index(index), req).map_err(|e| e.to_string())?;
+        let mut camera = match nokhwa::Camera::new(CameraIndex::Index(index), req) {
+            Ok(camera) => camera,
+            // nokhwa's `Closest` keeps only MJPEG and takes frame rates only
+            // from an exact 320×240: a YUYV-only camera, or one without that
+            // MJPEG mode, fails here. Open it with whatever it offers first,
+            // then pick among its formats.
+            Err(closest) => {
+                let any = RequestedFormat::with_formats(RequestedFormatType::None, frame_formats());
+                let mut camera = nokhwa::Camera::new(CameraIndex::Index(index), any)
+                    .map_err(|_| closest.to_string())?;
+                let offered = camera
+                    .compatible_camera_formats()
+                    .map_err(|e| e.to_string())?;
+                let format = choose_format(&offered).ok_or_else(|| {
+                    let mut fourccs: Vec<String> =
+                        offered.iter().map(|f| f.format().to_string()).collect();
+                    fourccs.dedup();
+                    format!("{NO_USABLE_FORMAT}: {}", fourccs.join(", "))
+                })?;
+                camera
+                    .set_camera_requset(RequestedFormat::new::<RgbFormat>(
+                        RequestedFormatType::Exact(format),
+                    ))
+                    .map_err(|e| e.to_string())?;
+                camera
+            }
+        };
         camera.open_stream().map_err(|e| e.to_string())?;
         tracing::info!(format = ?camera.camera_format(), "camera opened");
         Ok(NokhwaSource { camera })
+    }
+}
+
+/// How an error from [`NokhwaSource::open`] starts when the camera works but
+/// offers no picture format ICU can decode; [`CameraHandle`] shows its own
+/// text for it and does not retry.
+pub const NO_USABLE_FORMAT: &str = "no usable camera format";
+
+/// The capture format among `offered`: MJPEG first (small over USB), then
+/// YUYV, then any other format the RGB decoder takes; within that format
+/// the smallest resolution of at least 320×240 (else the largest below),
+/// and for it the frame rate closest to 15 fps, the faster one on a tie.
+/// `None` when nothing is decodable (a grey-only camera, say).
+fn choose_format(offered: &[nokhwa::utils::CameraFormat]) -> Option<nokhwa::utils::CameraFormat> {
+    use nokhwa::utils::{CameraFormat, FrameFormat};
+    const PREFERENCE: [FrameFormat; 5] = [
+        FrameFormat::MJPEG,
+        FrameFormat::YUYV,
+        FrameFormat::NV12,
+        FrameFormat::RAWRGB,
+        FrameFormat::RAWBGR,
+    ];
+    PREFERENCE.into_iter().find_map(|fourcc| {
+        let same = || offered.iter().filter(move |f| f.format() == fourcc);
+        let resolution = same().map(|f| f.resolution()).min_by_key(|r| {
+            let area = u64::from(r.width()) * u64::from(r.height());
+            if r.width() >= WIDTH && r.height() >= HEIGHT {
+                (0, area)
+            } else {
+                (1, u64::MAX - area)
+            }
+        })?;
+        let rate = same()
+            .filter(|f| f.resolution() == resolution)
+            .map(|f| f.frame_rate())
+            .min_by_key(|&fps| (fps.abs_diff(FPS), std::cmp::Reverse(fps)))?;
+        Some(CameraFormat::new(resolution, fourcc, rate))
+    })
+}
+
+/// Brings a picture larger than 320×240 down to it: the centre cut to 4:3,
+/// then each output pixel the average of the input pixels it covers. The
+/// encoder's tiers, the receivers' limits (640×480) and the tiles all
+/// assume 320×240; a camera without that mode delivers more. A picture
+/// that fits already is returned as it is.
+fn fit_capture(frame: RgbFrame) -> RgbFrame {
+    let (w, h) = (frame.width, frame.height);
+    if w <= WIDTH as usize && h <= HEIGHT as usize {
+        return frame;
+    }
+    // The 4:3 centre.
+    let (cw, ch) = if w * 3 > h * 4 {
+        (h * 4 / 3, h)
+    } else {
+        (w, w * 3 / 4)
+    };
+    let (x0, y0) = ((w - cw) / 2, (h - ch) / 2);
+    // Even sides, as the encoder wants; never more than the cut, so every
+    // output pixel covers at least one input pixel.
+    let (tw, th) = (cw.min(WIDTH as usize) & !1, ch.min(HEIGHT as usize) & !1);
+    let mut rgb = Vec::with_capacity(tw * th * 3);
+    for ty in 0..th {
+        let (ya, yb) = (y0 + ty * ch / th, y0 + (ty + 1) * ch / th);
+        for tx in 0..tw {
+            let (xa, xb) = (x0 + tx * cw / tw, x0 + (tx + 1) * cw / tw);
+            let mut sum = [0u32; 3];
+            for y in ya..yb {
+                let row = &frame.rgb[(y * w + xa) * 3..(y * w + xb) * 3];
+                for px in row.as_chunks::<3>().0 {
+                    for c in 0..3 {
+                        sum[c] += u32::from(px[c]);
+                    }
+                }
+            }
+            let n = ((yb - ya) * (xb - xa)) as u32;
+            rgb.extend(sum.map(|v| ((v + n / 2) / n) as u8));
+        }
+    }
+    RgbFrame {
+        width: tw,
+        height: th,
+        rgb,
     }
 }
 
@@ -243,7 +351,7 @@ impl FrameSource for NokhwaSource {
                 }
             }
         }
-        RgbFrame::checked(width, height, rgb)
+        RgbFrame::checked(width, height, rgb).map(fit_capture)
     }
 }
 
@@ -296,16 +404,71 @@ impl FrameSource for SyntheticSource {
     }
 }
 
+/// Frames per second `tier` encodes: the capture rate thinned by its
+/// [`VideoTier::frame_divisor`]; 0 at `T4`.
+pub fn frame_rate(tier: VideoTier) -> f32 {
+    match tier.frame_divisor() {
+        0 => 0.0,
+        n => FPS as f32 / n as f32,
+    }
+}
+
 /// The encoder configuration for one [`VideoTier`]. Never called for `T4`
 /// (paused): `run_sender` simply stops encoding instead of building an
 /// encoder with a zero bitrate.
+///
+/// The frame rate is the tier's own, not the capture rate: openh264's rate
+/// control budgets every frame as bitrate ÷ configured frame rate, so an
+/// encoder told 15 fps and fed a third of that spent a third of the tier's
+/// bitrate (T1 ≈ 50 instead of 100 kbit/s, T3 ≈ 8 instead of 40).
 pub fn encoder(tier: VideoTier) -> Result<Encoder, String> {
     let cfg = EncoderConfig::new()
         .bitrate(BitRate::from_bps(tier.bitrate()))
-        .max_frame_rate(FrameRate::from_hz(FPS as f32))
+        .max_frame_rate(FrameRate::from_hz(frame_rate(tier)))
         .usage_type(UsageType::CameraVideoRealTime)
         .rate_control_mode(RateControlMode::Bitrate);
     Encoder::with_api_config(OpenH264API::from_source(), cfg).map_err(|e| e.to_string())
+}
+
+/// Thins the capture to a tier's frame rate by capture time, not by count.
+/// Counting assumed a 15 fps camera; one that runs faster — a mode offered
+/// only at 30 fps — multiplied the bitrate, since openh264 budgets every
+/// frame for the configured rate and its frame skipping does not catch up
+/// (measured: 30 fps into T0 gave 298 instead of 150 kbit/s). A slower one
+/// (low light) has every picture encoded.
+#[derive(Debug, Default)]
+struct Pacer {
+    /// When the next picture is due; `None` before the first.
+    due: Option<Duration>,
+    /// The previous picture's capture time.
+    last: Option<Duration>,
+    /// Smoothed spacing of the pictures; half of it is the tolerance a
+    /// picture may come early and still count as due.
+    spacing: Duration,
+}
+
+impl Pacer {
+    /// Whether the picture captured at `at` is encoded at `rate` fps.
+    fn take(&mut self, at: Duration, rate: f32) -> bool {
+        if let Some(last) = self.last {
+            let d = at.saturating_sub(last);
+            self.spacing = if self.spacing.is_zero() {
+                d
+            } else {
+                (self.spacing * 7 + d) / 8
+            };
+        }
+        self.last = Some(at);
+        if self.due.is_some_and(|due| at + self.spacing / 2 < due) {
+            return false;
+        }
+        // One interval on from when it was due — the rate stays exact
+        // whatever the jitter — but never behind the picture itself, or a
+        // slow stretch would be caught up in a burst.
+        let interval = Duration::from_secs_f32(1.0 / rate);
+        self.due = Some((self.due.unwrap_or(at) + interval).max(at));
+        true
+    }
 }
 
 /// Failed frames in a row after which the capture thread gives up (about
@@ -363,7 +526,7 @@ pub fn run_sender(
     let start = Instant::now();
     let mut last_idr = Instant::now() - IDR_INTERVAL;
     let mut yuv: Option<YUVBuffer> = None;
-    let mut frame_index: u32 = 0;
+    let mut pacer = Pacer::default();
     // Failed frames in a row: the first one is a warning, the rest of the
     // streak only debug lines — a camera that sends nothing usable would
     // otherwise log five warnings a second.
@@ -399,6 +562,9 @@ pub fn run_sender(
                 continue;
             }
         };
+        // When the picture arrived: the wire timestamp, and what openh264's
+        // rate control measures the real frame spacing with.
+        let captured = start.elapsed();
         if failed > 0 {
             tracing::info!(failed, "camera frames again");
             failed = 0;
@@ -417,7 +583,7 @@ pub fn run_sender(
                 None
             });
             last_idr = Instant::now() - IDR_INTERVAL;
-            frame_index = 0;
+            pacer = Pacer::default();
         }
 
         let Some(enc) = enc.as_mut() else {
@@ -428,9 +594,8 @@ pub fn run_sender(
             continue;
         };
 
-        frame_index += 1;
-        if !frame_index.is_multiple_of(tier.frame_divisor()) {
-            continue; // thin the fixed-FPS capture down to this tier's rate
+        if !pacer.take(captured, frame_rate(tier)) {
+            continue; // thin the capture down to this tier's rate
         }
 
         // Asserts length and even sides: `frame.is_valid()` above.
@@ -446,9 +611,8 @@ pub fn run_sender(
         if want_idr {
             enc.force_intra_frame();
         }
-        let ts =
-            (start.elapsed().as_secs_f64() * f64::from(crate::audio::SAMPLE_RATE)) as u64 as u32;
-        match enc.encode(buf) {
+        let ts = (captured.as_secs_f64() * f64::from(crate::audio::SAMPLE_RATE)) as u64 as u32;
+        match enc.encode_at(buf, Timestamp::from_millis(captured.as_millis() as u64)) {
             Ok(bs) => {
                 let keyframe = matches!(bs.frame_type(), FrameType::IDR | FrameType::I);
                 if keyframe {
@@ -703,16 +867,24 @@ impl CameraHandle {
     /// Books a failed start: retry later, or give up — the engine switches
     /// the camera off (if it is on) and shows why.
     fn failed(&mut self, e: String) {
-        if self.retry.failed(Instant::now()) {
+        // A camera without a usable format will not grow one: no retries.
+        let unusable = e.starts_with(NO_USABLE_FORMAT);
+        if unusable {
+            self.retry.failures = MAX_FAILURES;
+        } else if self.retry.failed(Instant::now()) {
             tracing::warn!(%e, retry_in = ?backoff(self.retry.failures), "camera");
             return;
         }
         tracing::warn!(%e, failures = self.retry.failures, "camera given up");
-        self.link.command(Command::CameraFailed(Problem::new(
+        let text = if unusable {
+            "Die Kamera liefert kein Bildformat, das ICU lesen kann (MJPEG, YUYV, NV12 oder \
+             RGB). Eine andere Kamera wählen."
+        } else {
             "Die Kamera lässt sich nicht verwenden. Ist sie angeschlossen und nicht gerade von \
-             einem anderen Programm belegt?",
-            e,
-        )));
+             einem anderen Programm belegt?"
+        };
+        self.link
+            .command(Command::CameraFailed(Problem::new(text, e)));
     }
 
     /// The slot the capture thread writes every picture into, shared so a
@@ -832,6 +1004,203 @@ mod tests {
         );
         assert!(matches!(types[1].0, FrameType::P));
         assert!(types.iter().all(|(_, n)| *n > 0));
+    }
+
+    /// A picture that keeps the rate control busy: a moving gradient under
+    /// fresh noise every frame, so no tier can sit far below its budget.
+    fn busy_frame(i: u32, seed: &mut u32) -> YUVBuffer {
+        let (w, h) = (WIDTH as usize, HEIGHT as usize);
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 17;
+                *seed ^= *seed << 5;
+                let noise = (*seed % 48) as i32 - 24;
+                let base = ((x + y + i as usize * 3) % 200) as i32 + 28;
+                let i = (y * w + x) * 3;
+                for c in 0..3 {
+                    rgb[i + c] = (base + noise + c as i32 * 10).clamp(0, 255) as u8;
+                }
+            }
+        }
+        YUVBuffer::from_rgb_source(RgbSliceU8::new(&rgb, (w, h)))
+    }
+
+    /// kbit/s `enc` spends on 20 s of busy pictures at `fps`, stamped with
+    /// their capture time.
+    fn spent_kbps(enc: &mut Encoder, fps: f32) -> f64 {
+        const SECONDS: f32 = 20.0;
+        let mut seed = 0x9e37_79b9;
+        let mut bytes = 0usize;
+        let frames = (SECONDS * fps) as u32;
+        for i in 0..frames {
+            let yuv = busy_frame(i, &mut seed);
+            let at = Timestamp::from_millis(((i as f32 * 1000.0) / fps) as u64);
+            bytes += enc.encode_at(&yuv, at).unwrap().to_vec().len();
+        }
+        bytes as f64 * 8.0 / SECONDS as f64 / 1000.0
+    }
+
+    /// Every tier spends its own bitrate at its own frame rate. With the
+    /// capture rate configured for all of them, openh264 budgeted each frame
+    /// for 15 fps and the thinned tiers got ½ to ⅕ of theirs (measured with
+    /// this test: T1 50, T2 20, T3 8 kbit/s).
+    #[test]
+    fn each_tier_spends_its_bitrate() {
+        for tier in [VideoTier::T0, VideoTier::T1, VideoTier::T2, VideoTier::T3] {
+            let fps = frame_rate(tier);
+            assert_eq!(fps * tier.frame_divisor() as f32, FPS as f32);
+            let kbps = spent_kbps(&mut encoder(tier).unwrap(), fps);
+            let target = f64::from(tier.bitrate()) / 1000.0;
+            assert!(
+                (0.8 * target..=1.2 * target).contains(&kbps),
+                "{tier:?}: {kbps:.1} kbit/s for a target of {target}"
+            );
+        }
+        assert_eq!(frame_rate(VideoTier::T4), 0.0);
+    }
+
+    /// MJPEG at the size and rate closest to 320×240 @ 15 fps, where
+    /// nokhwa's own `Closest` found nothing (no exact 320×240 MJPEG); then
+    /// YUYV, then anything decodable; a grey-only camera gets nothing.
+    #[test]
+    fn the_capture_format_falls_back_where_nokhwa_gives_up() {
+        use nokhwa::utils::{CameraFormat, FrameFormat};
+        let f = |w, h, fourcc, fps| CameraFormat::new_from(w, h, fourcc, fps);
+        let (mjpeg, yuyv) = (FrameFormat::MJPEG, FrameFormat::YUYV);
+
+        let exact = [
+            f(640, 480, mjpeg, 30),
+            f(320, 240, mjpeg, 30),
+            f(320, 240, mjpeg, 15),
+        ];
+        assert_eq!(choose_format(&exact), Some(f(320, 240, mjpeg, 15)));
+
+        // No 320×240: the smallest above it, at the rate closest to 15.
+        let bigger = [
+            f(1280, 720, mjpeg, 30),
+            f(640, 480, mjpeg, 30),
+            f(640, 480, mjpeg, 10),
+            f(160, 120, mjpeg, 15),
+        ];
+        assert_eq!(choose_format(&bigger), Some(f(640, 480, mjpeg, 10)));
+        // Only smaller ones: the largest of them; 20 beats 10 on the tie.
+        let smaller = [
+            f(160, 120, yuyv, 15),
+            f(176, 144, yuyv, 20),
+            f(176, 144, yuyv, 10),
+        ];
+        assert_eq!(choose_format(&smaller), Some(f(176, 144, yuyv, 20)));
+
+        let yuyv_only = [f(640, 480, yuyv, 30), f(320, 240, yuyv, 30)];
+        assert_eq!(choose_format(&yuyv_only), Some(f(320, 240, yuyv, 30)));
+        let both = [f(320, 240, yuyv, 15), f(1280, 720, mjpeg, 30)];
+        assert_eq!(
+            choose_format(&both),
+            Some(f(1280, 720, mjpeg, 30)),
+            "MJPEG first"
+        );
+
+        let nv12 = [
+            f(640, 480, FrameFormat::GRAY, 15),
+            f(640, 480, FrameFormat::NV12, 15),
+        ];
+        assert_eq!(
+            choose_format(&nv12),
+            Some(f(640, 480, FrameFormat::NV12, 15))
+        );
+        assert_eq!(choose_format(&[f(320, 240, FrameFormat::GRAY, 15)]), None);
+        assert_eq!(choose_format(&[]), None);
+    }
+
+    /// A larger picture comes down to 320×240 from its 4:3 centre, each
+    /// output pixel the mean of what it covers; a smaller one stays.
+    #[test]
+    fn a_larger_capture_is_cut_to_4_3_and_scaled_down() {
+        let solid = |w: usize, h: usize, v: u8| RgbFrame {
+            width: w,
+            height: h,
+            rgb: vec![v; w * h * 3],
+        };
+        let small = fit_capture(solid(160, 120, 9));
+        assert_eq!((small.width, small.height), (160, 120));
+
+        // 640×480, left half 0, right half 200: halved, the edge stays sharp.
+        let mut half = solid(640, 480, 0);
+        for y in 0..480 {
+            for x in 320..640 {
+                half.rgb[(y * 640 + x) * 3..][..3].fill(200);
+            }
+        }
+        let out = fit_capture(half);
+        assert_eq!((out.width, out.height), (320, 240));
+        assert!(out.is_valid());
+        let px = |f: &RgbFrame, x: usize, y: usize| f.rgb[(y * f.width + x) * 3];
+        assert_eq!(px(&out, 159, 100), 0);
+        assert_eq!(px(&out, 160, 100), 200);
+
+        // 16:9: the bars left and right go, the middle 4:3 is kept.
+        let mut wide = solid(1280, 720, 50);
+        for y in 0..720 {
+            for x in (0..160).chain(1120..1280) {
+                wide.rgb[(y * 1280 + x) * 3..][..3].fill(255);
+            }
+        }
+        let out = fit_capture(wide);
+        assert_eq!((out.width, out.height), (320, 240));
+        assert!(out.rgb.iter().all(|&v| v == 50), "no bar survives the cut");
+
+        // CIF (11:9) loses rows, not columns.
+        let cif = fit_capture(solid(352, 288, 77));
+        assert_eq!((cif.width, cif.height), (320, 240));
+        assert!(cif.is_valid());
+    }
+
+    /// How many of `seconds` of pictures at `fps` (± `jitter_ms`) the pacer
+    /// encodes at `rate`.
+    fn paced(fps: f32, jitter_ms: f32, rate: f32, seconds: f32) -> usize {
+        let mut pacer = Pacer::default();
+        (0..(seconds * fps) as u32)
+            .filter(|&i| {
+                let wobble = if i % 2 == 0 { jitter_ms } else { -jitter_ms };
+                let ms = (i as f32 * 1000.0 / fps + wobble).max(0.0);
+                pacer.take(Duration::from_secs_f32(ms / 1000.0), rate)
+            })
+            .count()
+    }
+
+    /// Each tier gets its own rate from a 15 fps camera, jitter or not; a
+    /// faster camera does not raise it, a slower one has every picture sent.
+    #[test]
+    fn the_pacer_holds_each_tier_to_its_rate() {
+        for tier in [VideoTier::T0, VideoTier::T1, VideoTier::T2, VideoTier::T3] {
+            let rate = frame_rate(tier);
+            let want = (rate * 20.0) as usize;
+            for (fps, jitter) in [(15.0, 0.0), (15.0, 12.0), (30.0, 0.0), (30.0, 6.0)] {
+                let got = paced(fps, jitter, rate, 20.0);
+                assert!(
+                    got.abs_diff(want) <= 1,
+                    "{tier:?} from {fps} fps ±{jitter} ms: {got} frames, want {want}"
+                );
+            }
+        }
+        assert_eq!(paced(5.0, 0.0, frame_rate(VideoTier::T0), 20.0), 100);
+        // 30 fps into T0 now spends T0's bitrate, not twice it.
+        let mut enc = encoder(VideoTier::T0).unwrap();
+        let mut pacer = Pacer::default();
+        let mut seed = 0x9e37_79b9;
+        let mut bytes = 0usize;
+        for i in 0..600u32 {
+            let at = Duration::from_millis(u64::from(i) * 1000 / 30);
+            let yuv = busy_frame(i, &mut seed);
+            if pacer.take(at, frame_rate(VideoTier::T0)) {
+                let ts = Timestamp::from_millis(at.as_millis() as u64);
+                bytes += enc.encode_at(&yuv, ts).unwrap().to_vec().len();
+            }
+        }
+        let kbps = bytes as f64 * 8.0 / 20.0 / 1000.0;
+        assert!((120.0..=180.0).contains(&kbps), "{kbps:.1} kbit/s");
     }
 
     #[test]

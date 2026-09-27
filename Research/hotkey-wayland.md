@@ -152,7 +152,7 @@ Nicht abrufbar (nichts daraus zitiert): `https://api.kde.org/frameworks/kglobala
 Linux (KDE Plasma Wayland, primäres Ziel)
 
 1. **Primär: Portal GlobalShortcuts über ashpd 0.13.13** für Tastatur-PTT. Begründung: liefert `Activated` und `Deactivated` [P1], KDE emittiert beides [P3], Version 2 lokal vorhanden, der Nutzer sieht und ändert die Belegung in den Systemeinstellungen, keine Sonderrechte, keine Eingriffe in `/dev/input`, funktioniert auch unter GNOME 48+ [P6] und in einem späteren Flatpak.
-2. **Zweites Backend, opt-in: evdev 0.13.2** für Maus-Seitentasten und für Compositoren ohne GlobalShortcuts-Backend. Ohne `grab()`. Aktivierung erst nach expliziter Wahl in den Settings; die UI erklärt die `input`-Gruppe und den Keylogger-Aspekt, ICU ändert keine Gruppen oder udev-Regeln selbst. Begründung: Portal und Spec können keine Maustasten [P2][P4]; evdev kann es kernelseitig und compositor-unabhängig [C3][C4].
+2. **Zweites Backend, opt-in: evdev 0.13.2** für Maus-Seitentasten und für Compositoren ohne GlobalShortcuts-Backend. Ohne `grab()`. Aktivierung erst nach expliziter Wahl in den Settings; die UI erklärt die `input`-Gruppe und den Keylogger-Aspekt, ICU ändert keine Gruppen oder udev-Regeln selbst. (**So nicht gebaut**, Stand 2026-09-27: unter „Automatisch“ springt evdev ein, wenn das Portal fehlt oder scheitert — Punkt 3 —, nur nach einem abgelehnten Portal-Dialog nicht; `Client/IMPLEMENTATION.md` §7.) Begründung: Portal und Spec können keine Maustasten [P2][P4]; evdev kann es kernelseitig und compositor-unabhängig [C3][C4].
 3. Backend-Auswahl zur Laufzeit: Portal verfügbar (`version() >= 1` und `bind_shortcuts` erfolgreich) → Portal; sonst evdev, falls `/dev/input` lesbar; sonst Fehlermeldung mit Anleitung.
 
 Windows
@@ -195,7 +195,7 @@ Auf Windows (später):
   - Spike 4a **bestätigt** evdev: alle 21 `/dev/input/event*` als uid 1000 (Gruppe `input`) lesbar, Tastatur und Maus mit `BTN_SIDE` erkannt, kein root nötig.
   - Spike 4a **offen** für das Portal: `CreateSession` ok, `BindShortcuts` (ashpd 0.11.1, `preferred_trigger CTRL+SHIFT+F12`) kam in der unbeaufsichtigten Session sofort mit `Cancelled` zurück. Punkt 1–3 der Step-3-Liste müssen interaktiv von Chris ausgeführt werden (Quelle: `Research/spikes/spike-wayland/`, `cargo run --bin hotkey`).
   - **Korrektur**: die lokale Portal-Version ist **1**, nicht 2 (`busctl --user get-property … GlobalShortcuts version` → `u 1`, geprüft 2026-09-20). `ConfigureShortcuts` steht damit lokal nicht zur Verfügung; für PTT irrelevant.
-  - Entscheidung bleibt: Portal primär, evdev opt-in; die Backend-Auswahl zur Laufzeit muss `Cancelled` als „Portal nicht nutzbar“ werten und auf evdev fallen, wenn `/dev/input` lesbar ist.
+  - Entscheidung bleibt: Portal primär, evdev opt-in; die Backend-Auswahl zur Laufzeit muss `Cancelled` als „Portal nicht nutzbar“ werten und auf evdev fallen, wenn `/dev/input` lesbar ist. (Revidiert 2026-09-26: ein abgelehnter Dialog ist die Entscheidung des Nutzers, kein evdev-Rückfall; evdev springt unter „Automatisch“ nur ein, wenn das Portal fehlt oder scheitert — `Client/IMPLEMENTATION.md` §7.)
 
 Mit WebFetch tatsächlich gelesen (2026-09-20):
 

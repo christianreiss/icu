@@ -2572,9 +2572,14 @@ impl eframe::App for EnrollApp {
         }
 
         let subtitle = match step {
-            EnrollStep::Paste => {
+            EnrollStep::Paste if super::file_drop_works() => {
                 "Füge die Einladung ein, die du bekommen hast, oder zieh die Datei hierher — \
                  auch ein Passport von einem anderen Gerät geht."
+            }
+            // Wayland delivers no dropped files to winit windows.
+            EnrollStep::Paste => {
+                "Füge die Einladung ein, die du bekommen hast, oder öffne die .icu-Datei per \
+                 Doppelklick — auch ein Passport von einem anderen Gerät geht."
             }
             EnrollStep::Join if needs_name => {
                 "Prüfe, wohin die Einladung führt, und wähle deinen Namen."
@@ -2800,10 +2805,13 @@ impl EnrollApp {
                                 .min_size(egui::vec2(0.0, height))
                                 .font(egui::FontId::new(12.0, egui::FontFamily::Monospace))
                                 .hint_text(
-                                    RichText::new(
+                                    RichText::new(if super::file_drop_works() {
                                         "Einladung hier einfügen (Strg+V) oder die .icu-Datei \
-                                         hierher ziehen",
-                                    )
+                                         hierher ziehen"
+                                    } else {
+                                        "Einladung hier einfügen (Strg+V) oder die .icu-Datei \
+                                         doppelklicken"
+                                    })
                                     .size(13.0)
                                     .color(tok.dim_text),
                                 ),
