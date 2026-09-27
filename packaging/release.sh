@@ -53,7 +53,8 @@ for info in "$OUT"/BUILDINFO.*; do
     fi
 done
 [ -f "$OUT/SHA256SUMS" ] || die "$OUT/SHA256SUMS missing, run packaging/build.sh"
-mapfile -t files < <(packaging/checksums.sh --list "$OUT")
+list=$(packaging/checksums.sh --list "$OUT") || die "packaging/checksums.sh --list $OUT failed"
+mapfile -t files <<< "$list"
 [ "$(awk '{print $2}' "$OUT/SHA256SUMS" | LC_ALL=C sort)" = "$(printf '%s\n' "${files[@]}")" ] \
     || die "SHA256SUMS does not cover exactly the BUILDINFO files and their artifacts (packaging/checksums.sh $OUT)"
 (cd "$OUT" && sha256sum -c --quiet SHA256SUMS) || die "checksums in $OUT do not match"
