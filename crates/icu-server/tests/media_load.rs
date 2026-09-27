@@ -182,15 +182,18 @@ async fn soak(blocked_video: bool) {
             let mut tick = tokio::time::interval(Duration::from_millis(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // A QUIC long header, then a counter: never the same datagram twice.
+            // Only datagrams the socket took count as sent.
             let mut packet = [0u8; 1200];
             packet[0] = 0xc0;
-            let mut sent = 0u64;
+            let (mut seq, mut sent) = (0u64, 0u64);
             while tokio::time::Instant::now() < deadline {
                 tick.tick().await;
                 for _ in 0..junk_pps.div_ceil(1000) {
-                    packet[1..9].copy_from_slice(&sent.to_le_bytes());
-                    let _ = socket.send_to(&packet, target).await;
-                    sent += 1;
+                    packet[1..9].copy_from_slice(&seq.to_le_bytes());
+                    seq += 1;
+                    if socket.send_to(&packet, target).await.is_ok() {
+                        sent += 1;
+                    }
                 }
             }
             sent
@@ -223,6 +226,11 @@ async fn soak(blocked_video: bool) {
     assert!(
         junk_sent == 0 || com_dropped > 0,
         "the junk reached the filter"
+    );
+    // Every client tags its datagrams, so the filter drops only junk.
+    assert!(
+        com_dropped <= junk_sent,
+        "the filter dropped tagged traffic"
     );
     let c = &server.handle.server().counters;
     assert_eq!(Counters::get(&c.datagrams_in), sent_audio);
@@ -259,7 +267,10 @@ async fn soak(blocked_video: bool) {
     }
     latencies.sort_unstable();
     let p99_ms = latencies[latencies.len() * 99 / 100] as f64 / 1_000_000.0;
-    println!("{seconds}s, {CLIENTS} clients, blocked_video={blocked_video}: audio {audio}, video {video}, expected_video {expected_video}, audio p99 {p99_ms:.3}ms, junk sent {junk_sent}, com_dropped {com_dropped}");
+    // Junk the socket took, and what the filter in front of quinn saw of
+    // it: the rate the room was actually under.
+    let (junk_rate, dropped_rate) = (junk_sent / seconds, com_dropped / seconds);
+    println!("{seconds}s, {CLIENTS} clients, blocked_video={blocked_video}: audio {audio}, video {video}, expected_video {expected_video}, audio p99 {p99_ms:.3}ms, junk sent {junk_sent} ({junk_rate}/s), com_dropped {com_dropped} ({dropped_rate}/s)");
     assert_eq!(
         audio,
         sent_audio * (CLIENTS as u64 - 1),
