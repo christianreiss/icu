@@ -122,9 +122,9 @@ pub struct Tray {
     _events: EventRegistration,
     menu_rx: mpsc::Receiver<MenuId>,
     tray_rx: mpsc::Receiver<TrayIconEvent>,
-    /// `(connected, muted, deafened)` the icon and menu were last drawn
-    /// for; anything else in the state is not shown here.
-    last: Option<(bool, bool, bool)>,
+    /// What icon, tooltip and menu were last drawn as; anything else in the
+    /// state is not shown here.
+    last: Option<Look>,
     /// A StatusNotifier host shows the icon (`host_present`), refreshed by
     /// a watch thread: plasmashell restarts, a GNOME extension comes later.
     host: Arc<AtomicBool>,
@@ -209,45 +209,64 @@ impl Tray {
 
     /// Updates icon and check marks from the state.
     pub fn update(&mut self, state: &AppState) {
-        let key = (
-            state.conn == ConnStatus::Connected,
-            state.muted,
-            state.deafened,
-        );
-        if self.last == Some(key) {
+        let look = Look::of(&state.conn, state.muted, state.deafened);
+        if self.last.as_ref() == Some(&look) {
             return;
         }
-        self.last = Some(key);
-        self.mute.set_checked(state.muted);
-        self.deafen.set_checked(state.deafened);
-        let color = if !key.0 {
+        self.mute.set_checked(look.muted);
+        self.deafen.set_checked(look.deafened);
+        let _ = self
+            .icon
+            .set_icon(Some(render_icon(look.color, look.muted || look.deafened)));
+        let _ = self.icon.set_tooltip(Some(look.tooltip.clone()));
+        self.last = Some(look);
+    }
+}
+
+/// Everything the tray shows. Compared as a whole before redrawing: a key of
+/// only `connected` kept „verbinde…“ in the tooltip after the connection
+/// failed for good.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Look {
+    color: [u8; 3],
+    tooltip: String,
+    muted: bool,
+    deafened: bool,
+}
+
+impl Look {
+    fn of(conn: &ConnStatus, muted: bool, deafened: bool) -> Look {
+        let color = if *conn != ConnStatus::Connected {
             [0x9e, 0x9e, 0x9e]
-        } else if state.deafened {
+        } else if deafened {
             [0xf4, 0x43, 0x36]
-        } else if state.muted {
+        } else if muted {
             [0xff, 0x98, 0x00]
         } else {
             [0x4c, 0xaf, 0x50]
         };
-        let _ = self
-            .icon
-            .set_icon(Some(render_icon(color, state.muted || state.deafened)));
-        let _ = self.icon.set_tooltip(Some(format!(
+        let tooltip = format!(
             "ICU — {}{}",
-            match &state.conn {
+            match conn {
                 ConnStatus::Connected => "verbunden",
                 ConnStatus::Connecting => "verbinde…",
                 ConnStatus::Disconnected { .. } => "getrennt",
                 ConnStatus::Fatal(_) => "Fehler",
             },
-            if state.deafened {
+            if deafened {
                 ", taub"
-            } else if state.muted {
+            } else if muted {
                 ", stumm"
             } else {
                 ""
             }
-        )));
+        );
+        Look {
+            color,
+            tooltip,
+            muted,
+            deafened,
+        }
     }
 }
 
@@ -395,6 +414,25 @@ mod tests {
             MouseButtonState::Up
         )));
         assert!(!shows_window(&double(MouseButton::Right)));
+    }
+
+    /// A connection attempt that ends for good changes the tooltip from
+    /// „verbinde…“ to „Fehler“, although the icon stays grey.
+    #[test]
+    fn a_fatal_error_reaches_the_tooltip() {
+        let connecting = Look::of(&ConnStatus::Connecting, false, false);
+        let fatal = Look::of(
+            &ConnStatus::Fatal(crate::problem::Problem::plain("weg")),
+            false,
+            false,
+        );
+        assert_eq!(connecting.color, fatal.color);
+        assert_ne!(connecting, fatal, "redrawn");
+        assert_eq!(fatal.tooltip, "ICU — Fehler");
+        assert_eq!(
+            Look::of(&ConnStatus::Connected, true, false).tooltip,
+            "ICU — verbunden, stumm"
+        );
     }
 
     #[test]
