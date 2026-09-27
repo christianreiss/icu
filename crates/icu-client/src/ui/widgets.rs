@@ -333,6 +333,9 @@ pub struct Speak<'a> {
     /// No connection: nothing can leave this client, whatever the gate or
     /// the key says, so the surface never lights up.
     pub offline: bool,
+    /// Connected, but no one else is in the room: nothing is sent, so the
+    /// surface stays dark like offline and says why.
+    pub alone: bool,
     /// 0…1: the microphone level in PTT mode, the speech probability in
     /// voice activation — whatever decides whether the gate opens.
     pub level: f32,
@@ -370,7 +373,7 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
     let painter = ui.painter();
     let open = ui
         .ctx()
-        .animate_bool_with_time(response.id, s.open && !s.offline, 0.08);
+        .animate_bool_with_time(response.id, s.open && !s.offline && !s.alone, 0.08);
     let hot = open > 0.5;
     painter.rect_filled(rect, R_ROW, lerp_color(tok.surface_hi, tok.accent, open));
     if s.talking_muted {
@@ -384,7 +387,7 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
             tok.error_tint.gamma_multiply(0.6 + 0.4 * pulse),
         );
     }
-    if s.ptt && !s.offline && response.hovered() {
+    if s.ptt && !s.offline && !s.alone && response.hovered() {
         painter.rect_filled(rect, R_ROW, tok.hover_overlay);
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -443,6 +446,8 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         (icon::MICROPHONE_SLASH, "Stumm", tok.error)
     } else if s.offline {
         (icon::PLUGS, "Getrennt", tok.muted_text)
+    } else if s.alone {
+        (icon::USERS, "Allein", tok.muted_text)
     } else if hot {
         (icon::MICROPHONE, "Sendet", tok.on_accent)
     } else if s.ptt {
@@ -455,13 +460,16 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         FontId::new(14.0, super::fonts::semibold()),
         color,
     );
-    let key = s.key.filter(|_| !hot && !s.muted && !s.offline).map(|k| {
-        painter.layout_no_wrap(
-            k.to_string(),
-            FontId::new(10.5, egui::FontFamily::Monospace),
-            tok.dim_text,
-        )
-    });
+    let key = s
+        .key
+        .filter(|_| !hot && !s.muted && !s.offline && !s.alone)
+        .map(|k| {
+            painter.layout_no_wrap(
+                k.to_string(),
+                FontId::new(10.5, egui::FontFamily::Monospace),
+                tok.dim_text,
+            )
+        });
     const KEY_PAD: egui::Vec2 = egui::vec2(6.0, 2.0);
     const KEY_GAP: f32 = 8.0;
     let key_w = key

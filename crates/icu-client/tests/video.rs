@@ -38,6 +38,13 @@ async fn keyframe_request_produces_an_idr() {
     wait_for(&engine, SOON, |s| s.camera_on).await;
     let mut camera = CameraHandle::new(engine.camera_link());
     camera.start_with(Box::new(SyntheticSource::new()));
+    // Alone, the camera captures for the self-view but sends nothing.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        DebugStats::get(&engine.stats().video_sent),
+        0,
+        "no video while alone"
+    );
 
     let bob = server.raw_client("bob").await;
     // Bob joined after the camera started. Until then nobody was viewing and

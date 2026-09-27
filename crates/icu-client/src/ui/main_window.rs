@@ -1560,13 +1560,16 @@ fn speak_row(
 ) -> Option<egui::Response> {
     let ptt = Mode::from(state.settings.audio.mode) == Mode::Ptt;
     let offline = state.conn != ConnStatus::Connected;
-    let open = !offline && if ptt { state.ptt_down } else { state.sending };
+    // Alone in the room the engine sends nothing (`DspControl::audience`).
+    let alone = !offline && state.peers.is_empty();
+    let open = !offline && !alone && if ptt { state.ptt_down } else { state.sending };
     let key = super::ptt_key_label(&state.settings.hotkeys, &state.hotkey_backend);
     let speak = widgets::Speak {
         ptt,
         open,
         muted: state.muted,
         offline,
+        alone,
         level: if ptt {
             theme::meter_fraction(state.level.rms_db)
         } else {
@@ -1588,6 +1591,11 @@ fn speak_row(
         ui.label(if offline {
             format!(
                 "Nicht verbunden — es wird nichts gesendet\nPegel {:.0} dBFS",
+                state.level.rms_db
+            )
+        } else if alone {
+            format!(
+                "Allein im Raum — es wird nichts gesendet\nPegel {:.0} dBFS",
                 state.level.rms_db
             )
         } else if ptt {

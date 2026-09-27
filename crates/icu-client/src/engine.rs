@@ -411,6 +411,10 @@ pub struct DspControl {
     /// A connection is up; without one the gate stays shut, so nothing is
     /// encoded and the UI never claims to be sending into the void.
     online: AtomicBool,
+    /// Someone else is in the room. Alone, nothing is encoded or sent — no
+    /// one would hear it; the gate itself still follows PTT/VAD, so the
+    /// VAD's noise floor and the pre-roll stay true for when someone joins.
+    audience: AtomicBool,
     vad_mode: AtomicBool,
     denoise: AtomicBool,
     aec: AtomicBool,
@@ -450,6 +454,7 @@ impl DspControl {
             muted: AtomicBool::new(false),
             ptt_down: AtomicBool::new(false),
             online: AtomicBool::new(false),
+            audience: AtomicBool::new(false),
             vad_mode: AtomicBool::new(false),
             denoise: AtomicBool::new(false),
             aec: AtomicBool::new(false),
@@ -1547,7 +1552,8 @@ fn dsp_thread(
                     .store(encoder.loss_perc() as i64, Ordering::Relaxed);
             }
 
-            let sending = decision != Decision::Silent && online;
+            let audience = ctl.audience.load(Ordering::Relaxed);
+            let sending = decision != Decision::Silent && online && audience;
             ctl.sending.store(sending, Ordering::Relaxed);
             if ctl.cue_tx.load(Ordering::Relaxed) {
                 if let Some(cue) = tx_cue(prev_sent, sending, decision) {
@@ -2222,6 +2228,7 @@ fn end_session(shared: &Arc<Shared>) {
     *lock(&shared.video_tx) = None;
     *lock(&shared.conn) = None;
     shared.dsp.online.store(false, Ordering::Relaxed);
+    shared.dsp.audience.store(false, Ordering::Relaxed);
     lock(&shared.speakers).clear();
     lock(&shared.video).reset();
     shared.state.send_modify(|s| {
@@ -3081,6 +3088,10 @@ async fn run_session(
             s.conn = ConnStatus::Connected;
             s.me = Some(me);
             s.peers = peers;
+            shared
+                .dsp
+                .audience
+                .store(!s.peers.is_empty(), Ordering::Relaxed);
             s.update_required = update_required;
             s.is_admin = welcome.is_admin;
             s.conn_info = Some(info);
@@ -3419,6 +3430,7 @@ async fn run_session(
     *shared.video_tx.lock().unwrap() = None;
     *lock(&shared.conn) = None;
     shared.dsp.online.store(false, Ordering::Relaxed);
+    shared.dsp.audience.store(false, Ordering::Relaxed);
     if matches!(end, SessionEnd::Quit) {
         connection.close(quinn::VarInt::from_u32(codes::NO_ERROR), b"bye");
     }
@@ -3739,6 +3751,7 @@ async fn handle_control(
             shared.state.send_modify(|s| {
                 s.peers.retain(|p| p.info.session != user.session);
                 s.peers.push(peer);
+                shared.dsp.audience.store(true, Ordering::Relaxed);
                 tracing::info!(peers = s.peers.len(), "user joined: peer list updated");
             });
         }
@@ -3758,9 +3771,13 @@ async fn handle_control(
                     local.notifier.show(crate::notify::Note::left(&name));
                 }
             }
-            shared
-                .state
-                .send_modify(|s| s.peers.retain(|p| p.info.session != session));
+            shared.state.send_modify(|s| {
+                s.peers.retain(|p| p.info.session != session);
+                shared
+                    .dsp
+                    .audience
+                    .store(!s.peers.is_empty(), Ordering::Relaxed);
+            });
         }
         ControlMsg::UserState { session, flags } => {
             // While its audio arrives, the local path decides the indicator
