@@ -22,3 +22,13 @@ admin_socket_group = "icu"
 [log]
 level = "info"
 format = "text"
+
+# State backups: a snapshot of /var/lib/icu after every change, in
+# /var/lib/icu/backups (root only). Copy that directory off the host too
+# (rsync, borg, restic): a snapshot on the same disk does not survive the disk.
+# Restore with the server stopped: icu-server restore latest. See the README.
+[backup]
+# Snapshots kept, oldest go first; 0 turns the automatic ones off.
+keep = 30
+# Elsewhere, e.g. NFS: the unit needs ReadWritePaths= for it (README).
+#dir = "/srv/icu-backups"

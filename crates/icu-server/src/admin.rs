@@ -105,6 +105,8 @@ pub enum AdminRequest {
     RotateServerCert,
     /// Re-issue the CA certificate under the same key with a fresh validity.
     RenewCa,
+    /// Take a snapshot of the state now (`crate::backup`).
+    Backup,
 }
 
 /// The answer to an [`AdminRequest`].
@@ -167,6 +169,12 @@ pub enum AdminResponse {
     },
     /// `status`
     Status(serde_json::Value),
+    /// `backup`: where the snapshot went. Only the path: the socket's group
+    /// may run the server, but not read its keys.
+    Backup {
+        /// The snapshot directory.
+        path: String,
+    },
     /// Any failure.
     Error {
         /// Short form, e.g. `NAME_TAKEN`.
@@ -259,6 +267,7 @@ impl AdminResponse {
                 }
                 out
             }
+            AdminResponse::Backup { path } => json!({"ok": true, "path": path}),
             AdminResponse::Error { error, detail } => {
                 json!({"ok": false, "error": error, "detail": detail})
             }
@@ -395,6 +404,15 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
             Ok(()) => AdminResponse::Ok,
             Err(e) => AdminResponse::err("RENEW_CA_FAILED", e),
         },
+        AdminRequest::Backup => {
+            match crate::backup::snapshot(server, crate::backup::Reason::Manual).await {
+                Ok(Some(path)) => AdminResponse::Backup {
+                    path: path.display().to_string(),
+                },
+                Ok(None) => AdminResponse::err("BACKUP_FAILED", "no snapshot taken"),
+                Err(e) => AdminResponse::err("BACKUP_FAILED", e),
+            }
+        }
     }
 }
 
@@ -728,6 +746,7 @@ fn status(server: &Arc<Server>) -> serde_json::Value {
         "com_dropped": server.com_dropped.load(Relaxed),
         "roomless_sessions": crate::lock(&server.roomless).len(),
         "tls": tls_status(server),
+        "backup": crate::backup::status_json(server),
         "relay": {
             "datagrams_in": Counters::get(&c.datagrams_in),
             "datagrams_out": Counters::get(&c.datagrams_out),
@@ -961,6 +980,10 @@ mod tests {
             serde_json::from_str::<AdminRequest>(r#"{"cmd":"renew-ca"}"#).unwrap(),
             AdminRequest::RenewCa
         ));
+        assert!(matches!(
+            serde_json::from_str::<AdminRequest>(r#"{"cmd":"backup"}"#).unwrap(),
+            AdminRequest::Backup
+        ));
         // An invite without a ttl is allowed and means the default.
         assert!(matches!(
             serde_json::from_str::<AdminRequest>(r#"{"cmd":"invite","name":"bob"}"#).unwrap(),
@@ -994,6 +1017,15 @@ mod tests {
         }
         .to_json();
         assert_eq!(promote, json!({"ok": true, "user_id": 2, "name": "1"}));
+
+        let backup = AdminResponse::Backup {
+            path: "/var/lib/icu/backups/20260927T120000Z".into(),
+        }
+        .to_json();
+        assert_eq!(
+            backup,
+            json!({"ok": true, "path": "/var/lib/icu/backups/20260927T120000Z"})
+        );
 
         let status = AdminResponse::Status(json!({"uptime_s": 3600, "online": 3})).to_json();
         assert_eq!(status["ok"], json!(true));

@@ -149,3 +149,45 @@ fn gauges_rates_and_a_lasting_slow_viewer() {
     let lines = check(dir.path(), &status(160, 16, 4000, 1400, 100));
     assert!(!line(&lines, "ICU_Server").contains("_per_s"), "{lines:?}");
 }
+
+/// A failed state backup is a WARN with the reason; backups turned off are
+/// said so; a server from before the backups gets no line.
+#[test]
+fn a_failed_backup_warns() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("icu-server");
+    std::fs::write(&bin, "#!/bin/sh\ncat \"$ICU_TEST_STATUS\"\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(dir.path().join("admin.sock")).unwrap();
+    let with_backup = |backup: serde_json::Value| {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&status(100, 10, 1000, 500, 0)).unwrap();
+        value["backup"] = backup;
+        value.to_string()
+    };
+
+    let lines = check(dir.path(), &status(100, 10, 1000, 500, 0));
+    assert!(!lines.iter().any(|l| l.contains("ICU_Backup")), "{lines:?}");
+
+    let ok = serde_json::json!({"keep": 30, "failed": 0, "last_ok_unix": now(), "error": ""});
+    let lines = check(dir.path(), &with_backup(ok));
+    assert!(line(&lines, "ICU_Backup").starts_with("0 "), "{lines:?}");
+
+    let failed = serde_json::json!({
+        "keep": 30,
+        "failed": 1,
+        "last_ok_unix": 0,
+        "error": "cannot create /srv/icu-backups: Permission denied",
+    });
+    let lines = check(dir.path(), &with_backup(failed));
+    let backup = line(&lines, "ICU_Backup");
+    assert!(
+        backup.starts_with("1 ICU_Backup - ") && backup.contains("Permission denied"),
+        "{backup}"
+    );
+
+    let off = serde_json::json!({"keep": 0, "failed": 0, "last_ok_unix": 0, "error": ""});
+    let lines = check(dir.path(), &with_backup(off));
+    assert!(line(&lines, "ICU_Backup").contains("off"), "{lines:?}");
+}

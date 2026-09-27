@@ -72,6 +72,9 @@ pub struct Ca {
     /// from before the rotation replaces anything until they are recorded,
     /// so a crash or a failed store write in between loses no revocation.
     retired: Vec<CertificateDer<'static>>,
+    /// Counts the writes of the certificate files, for the backup task
+    /// ([`Ca::changes`]).
+    changed: tokio::sync::watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for Ca {
@@ -158,6 +161,7 @@ impl Ca {
             server_der: CertificateDer::from(Vec::new()),
             server_key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(Vec::new())),
             retired: read_retired(dir)?,
+            changed: tokio::sync::watch::channel(0).0,
         };
 
         match (
@@ -236,7 +240,19 @@ impl Ca {
     /// [`Ca::take_retired_leaves`] are on the CRL: it keeps only what is
     /// still pending, normally nothing, and then the file goes.
     pub fn retired_recorded(&self) -> Result<()> {
-        write_retired(&self.dir, &self.retired)
+        write_retired(&self.dir, &self.retired)?;
+        self.touched();
+        Ok(())
+    }
+
+    /// Ticks after every write of a certificate file: what the backup task
+    /// waits for (`crate::backup`).
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    fn touched(&self) {
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// Issues a fresh server leaf from the same CA. Clients need no change
@@ -291,6 +307,7 @@ impl Ca {
         self.server_der = cert.der().clone();
         self.server_key = pkcs8(&key);
         self.retired = retired;
+        self.touched();
         Ok(())
     }
 
@@ -311,6 +328,7 @@ impl Ca {
         store::write_atomic(&self.dir.join(CA_CRT), &cert.pem())?;
         self.ca_der = cert.der().clone();
         self.issuer = issuer(&self.ca_der, &self.ca_key_pem)?;
+        self.touched();
         Ok(())
     }
 

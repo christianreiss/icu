@@ -110,6 +110,19 @@ enum Command {
     RotateServerCert,
     /// Re-issue the CA certificate under the same key with a fresh validity.
     RenewCa,
+    /// Take a snapshot of the state now. The server also takes one after
+    /// every change by itself (`[backup]` in the config).
+    Backup {
+        /// List the snapshots instead.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Put a snapshot back while the server is stopped, then issue a new
+    /// server certificate. The state it replaces is kept as a snapshot.
+    Restore {
+        /// Snapshot directory, or `latest` for the newest one.
+        snapshot: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -209,6 +222,10 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Command::Backup { list } => cli::backup::run(&config, list).await,
+        // Never through the socket or the offline server: that would open,
+        // and could write, the very state being replaced.
+        Command::Restore { snapshot } => cli::backup::restore(&config, &snapshot).await,
     }
 }
 

@@ -176,3 +176,22 @@ cert_line() {
 }
 cert_line ICU_Server_Certificate "$LEAF_DAYS" "server certificate"
 cert_line ICU_CA_Certificate "$CA_DAYS" "CA certificate"
+
+# State backups (`[backup]`, 2026-09-27): WARN when the last attempt failed —
+# the snapshot after a change, or the one at the start. The reason is in the
+# journal and in `icu-server status --json`. A server from before the
+# backups reports none, and gets no line.
+case "$JSON" in
+*'"backup":{'*)
+    BK_FAILED=$(nested backup failed)
+    BK_KEEP=$(nested backup keep)
+    if [ "$BK_FAILED" -ne 0 ]; then
+        WHY=$(echo "$JSON" | sed -n 's/.*"backup":{[^}]*"error":"\([^"]*\)".*/\1/p' | head -1)
+        echo "1 ICU_Backup - the last state backup failed: ${WHY:-see the journal}"
+    elif [ "$BK_KEEP" -eq 0 ]; then
+        echo "0 ICU_Backup - automatic state backups are off (backup.keep = 0)"
+    else
+        echo "0 ICU_Backup - state backed up after every change, the newest $BK_KEEP kept"
+    fi
+    ;;
+esac
