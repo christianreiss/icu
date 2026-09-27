@@ -61,8 +61,28 @@ use crate::{
 pub const BLOCK: usize = 480;
 /// Capture samples the DSP thread may fall behind (100 ms) before it skips
 /// to the newest two blocks: bounds send latency after a stall of the thread
-/// and keeps its catch-up burst far below an RTTIME limit.
+/// and keeps its catch-up burst far below an RTTIME limit. A graph cycle
+/// larger than that raises it ([`capture_backlog_limit`]).
 pub const MAX_CAPTURE_BACKLOG: usize = 10 * BLOCK;
+
+/// The capture backlog the DSP thread tolerates with the backend delivering
+/// `cycle` samples at a time: [`MAX_CAPTURE_BACKLOG`], or a whole cycle and
+/// two blocks. A quantum above 4320 samples (forced, pro audio) arrives in
+/// one piece; held to the fixed cap, every cycle was trimmed to two blocks
+/// and most of the microphone thrown away.
+fn capture_backlog_limit(cycle: usize) -> usize {
+    MAX_CAPTURE_BACKLOG.max(cycle + 2 * BLOCK)
+}
+
+/// `skipped` capture samples were thrown away ahead of the frame being
+/// collected: that frame is dropped too, and `ts` moves past both, so the
+/// sample clock stays true and receivers see a pause — they start a new
+/// spurt — instead of a delay spike, which their jitter buffers remember
+/// for 20–40 s.
+fn skip_capture(acc: &mut Vec<f32>, ts: &mut u32, skipped: usize) {
+    *ts = ts.wrapping_add((acc.len() + skipped) as u32);
+    acc.clear();
+}
 
 /// How the engine is started.
 #[derive(Debug, Clone)]
@@ -1549,11 +1569,13 @@ fn dsp_thread(
             // the reference lag `dsp::refalign` reads off their occupancy
             // difference stays valid.
             let backlog = cap.occupied_len();
-            if backlog > MAX_CAPTURE_BACKLOG {
+            if backlog > capture_backlog_limit(shared.cycle.capture_len()) {
                 let excess = backlog - 2 * BLOCK;
                 cap.skip(excess);
                 reference.skip(excess);
                 DebugStats::add(&stats.capture_backlog_dropped, excess as u64);
+                skip_capture(&mut frame_acc, &mut ts, excess);
+                prev_frame_valid = false;
             }
             let mut waited = 0u32;
             let mut ready_since: Option<Instant> = None;
@@ -4646,6 +4668,19 @@ mod tests {
             [0, 1440, 1920, 2400, 2880, 3360, 3840],
             "the dropped half moves ts on"
         );
+    }
+
+    /// A large graph quantum arrives in one piece and is not trimmed; a
+    /// stall's backlog is, and the skipped time moves `ts` on.
+    #[test]
+    fn the_capture_backlog_follows_the_quantum() {
+        assert_eq!(capture_backlog_limit(240), MAX_CAPTURE_BACKLOG);
+        assert_eq!(capture_backlog_limit(8192), 8192 + 2 * BLOCK);
+        let mut acc = vec![0.0; BLOCK];
+        let mut ts = 1000u32;
+        skip_capture(&mut acc, &mut ts, 3 * BLOCK);
+        assert!(acc.is_empty());
+        assert_eq!(ts, 1000 + 4 * BLOCK as u32);
     }
 
     /// Whichever way `run_session` returns, its reader tasks end with it.

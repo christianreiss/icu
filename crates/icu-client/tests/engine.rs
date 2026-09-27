@@ -956,3 +956,32 @@ async fn a_reference_error_blames_no_microphone() {
     );
     drop(engine);
 }
+
+/// A graph quantum of 8192 samples (forced, pro audio) arrives in one piece
+/// every 170 ms. The DSP thread takes all of it; held to the fixed 100-ms
+/// backlog cap it kept only the newest two blocks of every cycle and threw
+/// the rest of the microphone away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_large_graph_quantum_is_not_trimmed() {
+    let server = TestServer::start().await;
+    let (backend, _probe) = FakeBackend::with_block(
+        Box::new(|start, out| {
+            for (i, s) in out.iter_mut().enumerate() {
+                let t = (start + i as u64) as f32 / 48_000.0;
+                *s = 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            }
+        }),
+        false,
+        8192,
+    );
+    let (engine, _dir) = server.engine("alice", Box::new(backend), false).await;
+    wait_connected(&engine).await;
+    let stats = engine.stats();
+    let before = DebugStats::get(&stats.dsp_blocks);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let blocks = DebugStats::get(&stats.dsp_blocks) - before;
+    assert_eq!(DebugStats::get(&stats.capture_backlog_dropped), 0);
+    assert!(blocks > 120, "{blocks} blocks in 1.5 s");
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
