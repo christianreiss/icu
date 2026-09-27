@@ -199,6 +199,8 @@ Regeln: Server verwirft Datagrams < 11 B oder > 410 B; Empfänger unterscheidet 
 
 Server-Relay pro Datagram: Länge/`kind` prüfen → Absender `Active` und nicht `muted` → Rate ≤ 110/s → `speaker` setzen → `send_datagram` an alle anderen `Active`, nicht `deafened`; Sendefehler pro Empfänger zählen, nie blockieren.
 
+Allein im Raum (die `Welcome`-Liste leer und seither kein `UserJoined`, oder der letzte andere per `UserLeft` gegangen) sendet ein Client keine Audio-Datagramme und, wie in §2.1 bit5, kein Video (2026-09-27). Reines Client-Verhalten, kein Wire-Wechsel; der Server bleibt tolerant und verwirft, was ohne Empfänger ankommt.
+
 ## 4. Video-Frame (unidirektionaler Stream)
 
 Header 12 Byte, dann Frame-Bytes bis Stream-FIN. Empfänger `read_to_end(512 KiB)`. Der Server gibt einem Frame 5 s für Header und Nutzlast zusammen und stoppt den Stream danach mit `stop(RATE_LIMITED)`; je Sender nimmt er höchstens 4 Frames gleichzeitig an, einen weiteren Stream stoppt er sofort ungelesen mit `stop(RATE_LIMITED)` (2026-09-26).

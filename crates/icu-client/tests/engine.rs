@@ -10,7 +10,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
-use icu_client::{audio::fake::FakeBackend, engine::Command};
+use icu_client::{audio::fake::FakeBackend, engine::Command, stats::DebugStats};
 use icu_proto::{ControlMsg, Session};
 
 /// Every `UserState` bob receives for `session` until the stream has been
@@ -305,9 +305,10 @@ fn peak(x: &[f32]) -> f32 {
     x.iter().fold(0.0f32, |m, v| m.max(v.abs()))
 }
 
-/// An engine alone on the server, sending the test tone (its gate held
-/// open), with only the transmit cue among the cues switched as asked.
-async fn lone_sender(
+/// An engine sending the test tone (its gate held open), with only the
+/// transmit cue among the cues switched as asked. It sends only while
+/// someone else is in the room.
+async fn tone_sender(
     server: &TestServer,
     name: &str,
     cue_tx: bool,
@@ -334,8 +335,10 @@ async fn lone_sender(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_transmit_cue_marks_start_and_end_of_sending() {
     let server = TestServer::start().await;
+    // Someone to talk to, for alice and then bob: alone, nothing is sent.
+    let _carol = server.raw_client("carol").await;
 
-    let (engine, probe, _dir) = lone_sender(&server, "alice", true).await;
+    let (engine, probe, _dir) = tone_sender(&server, "alice", true).await;
     wait_connected(&engine).await;
     wait_for(&engine, SOON, |s| s.sending).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -357,12 +360,50 @@ async fn the_transmit_cue_marks_start_and_end_of_sending() {
     );
     engine.shutdown();
 
-    let (quiet, probe, _dir) = lone_sender(&server, "bob", false).await;
+    let (quiet, probe, _dir) = tone_sender(&server, "bob", false).await;
     wait_connected(&quiet).await;
     wait_for(&quiet, SOON, |s| s.sending).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(peak(&probe.played()) < 1e-3, "no cue when it is off");
     quiet.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// Alone in the room nothing goes to the server: the test tone holds the
+/// gate open, yet not one datagram leaves until someone joins, and none
+/// once they have left again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lone_engine_sends_nothing_until_someone_joins() {
+    let server = TestServer::start().await;
+    let (engine, _probe, _dir) = tone_sender(&server, "alice", false).await;
+    wait_connected(&engine).await;
+    let stats = engine.stats();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !engine.snapshot().sending,
+        "alone, the engine is not sending"
+    );
+    assert_eq!(DebugStats::get(&stats.datagrams_sent), 0, "no audio alone");
+
+    let bob = server.raw_client("bob").await;
+    wait_for(&engine, SOON, |s| s.sending).await;
+    assert!(
+        wait_until(SOON, || DebugStats::get(&stats.datagrams_sent) > 0).await,
+        "audio goes out once bob is in"
+    );
+
+    bob.session.conn.close(0u32.into(), b"bye");
+    // `sending` is pushed by the DSP thread after the frame it decided on,
+    // so once it reads false, no later frame goes out while alone.
+    wait_for(&engine, SOON, |s| s.peers.is_empty() && !s.sending).await;
+    let sent = DebugStats::get(&stats.datagrams_sent);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        DebugStats::get(&stats.datagrams_sent),
+        sent,
+        "nothing once alone again"
+    );
+    engine.shutdown();
     server.handle.shutdown().await;
 }
 
