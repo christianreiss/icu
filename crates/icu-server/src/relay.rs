@@ -6,7 +6,9 @@
 //! frame on one unidirectional stream per frame and receiver.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -230,48 +232,119 @@ impl Drop for VideoSender {
     }
 }
 
-/// One sender-receiver pair: at most one frame in flight plus one waiting
-/// (`PROTOCOL.md` §4).
+/// One sender-receiver pair: at most
+/// [`VIDEO_UNACKED_PER_PAIR`](icu_proto::limits::VIDEO_UNACKED_PER_PAIR)
+/// frames unacknowledged by the receiver plus one waiting (`PROTOCOL.md` §4).
 pub struct Slot {
     /// `stable_id` of the receiver connection the forwarder writes to. A
     /// session id can come back after wrapping (`room::allocate_session`);
     /// a slot left over from the id's previous owner must not be inherited,
     /// its forwarder has already ended with that old connection.
     conn_id: usize,
-    waiting: Mutex<Option<Bytes>>,
+    waiting: Mutex<Waiting>,
     notify: tokio::sync::Notify,
     /// Set when nothing will fill this slot again, so that the forwarder
     /// stops waiting instead of parking forever.
     closed: AtomicBool,
 }
 
+/// What became of a frame offered to a [`Slot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offer {
+    /// It waits to be written.
+    Queued,
+    /// A frame was already waiting, so one of the two was dropped: the
+    /// receiver is behind. This is what `VideoCongestionHint` counts.
+    Displaced,
+    /// Dropped because the pair waits for a keyframe after an earlier drop.
+    /// A consequence of that drop, not more congestion: counted as a slow
+    /// receiver's loss, but not again in the hint.
+    Skipped,
+}
+
+/// What waits in a [`Slot`].
+#[derive(Default)]
+struct Waiting {
+    /// The next frame to write, and whether it is a keyframe.
+    frame: Option<(Bytes, bool)>,
+    /// A frame of this pair was dropped: every delta after it refers to a
+    /// picture the receiver never gets, so only a keyframe passes until one
+    /// is taken in (`VIDEO_FLAG_KEYFRAME`).
+    need_keyframe: bool,
+}
+
 impl Slot {
     fn new(conn_id: usize) -> Slot {
         Slot {
             conn_id,
-            waiting: Mutex::new(None),
+            waiting: Mutex::new(Waiting::default()),
             notify: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
         }
     }
 
-    /// Offers a frame. Returns `true` when it displaced an older waiting one,
-    /// which is then dropped.
-    fn offer(&self, frame: Bytes) -> bool {
-        let displaced = lock(&self.waiting).replace(frame).is_some();
+    /// Offers a frame.
+    ///
+    /// A keyframe needs nothing before it, so it takes the place of whatever
+    /// waits. A delta is dropped instead when a frame already waits — the
+    /// waiting one stays decodable, and a delta behind a dropped frame would
+    /// not be (the waiting one may also be the keyframe the receiver needs)
+    /// — and whenever the pair waits for a keyframe.
+    fn offer(&self, frame: Bytes, keyframe: bool) -> Offer {
+        let offer = {
+            let mut waiting = lock(&self.waiting);
+            let taken = waiting.frame.is_some();
+            if keyframe {
+                waiting.need_keyframe = false;
+                waiting.frame = Some((frame, true));
+                if taken {
+                    Offer::Displaced
+                } else {
+                    Offer::Queued
+                }
+            } else if taken {
+                waiting.need_keyframe = true;
+                Offer::Displaced
+            } else if waiting.need_keyframe {
+                Offer::Skipped
+            } else {
+                waiting.frame = Some((frame, false));
+                Offer::Queued
+            }
+        };
         self.notify.notify_one();
-        displaced
+        offer
     }
 
     fn take(&self) -> Option<Bytes> {
-        lock(&self.waiting).take()
+        lock(&self.waiting).frame.take().map(|(frame, _)| frame)
+    }
+
+    /// A frame of this pair was lost after it left the slot (not written or
+    /// not acknowledged in time). A keyframe waiting behind it repairs that;
+    /// otherwise only a keyframe passes from now on, and a delta already
+    /// waiting is dropped with it. Returns whether one was.
+    fn lost(&self) -> bool {
+        let mut waiting = lock(&self.waiting);
+        match waiting.frame {
+            Some((_, true)) => false,
+            Some((_, false)) => {
+                waiting.frame = None;
+                waiting.need_keyframe = true;
+                true
+            }
+            None => {
+                waiting.need_keyframe = true;
+                false
+            }
+        }
     }
 
     /// Retires the slot: drops whatever is still waiting and wakes the
     /// forwarder so it can end.
     fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
-        *lock(&self.waiting) = None;
+        lock(&self.waiting).frame = None;
         self.notify.notify_one();
     }
 
@@ -332,11 +405,12 @@ pub async fn video(
             return;
         }
     }
-    if VideoHeader::decode(&header).is_err() {
+    let Ok(decoded) = VideoHeader::decode(&header) else {
         Counters::inc(&server.counters.video_dropped_rate);
         refuse(&mut recv);
         return;
-    }
+    };
+    let keyframe = decoded.keyframe();
 
     // Only while the camera is on and the sender is active (§6.5).
     if !server.room.flags(sender).is_some_and(|f| f.camera_on()) {
@@ -448,12 +522,13 @@ pub async fn video(
                     slot
                 })
                 .clone();
-            let displaced = slot.offer(out.clone());
-            if displaced {
-                // The older waiting frame is dropped. It never had a stream of
-                // its own, so nothing has to be reset.
+            let offer = slot.offer(out.clone(), keyframe);
+            if offer != Offer::Queued {
+                // A frame that never had a stream of its own is dropped, so
+                // nothing has to be reset.
                 Counters::inc(&server.counters.video_dropped_slow_receiver);
             }
+            let displaced = offer == Offer::Displaced;
             // At most one window closes per frame, so at most one hint.
             hint = state
                 .record_and_maybe_hint_at(*session, displaced, now)
@@ -467,7 +542,27 @@ pub async fn video(
     }
 }
 
+/// A frame handed to quinn that the receiver has not acknowledged yet.
+struct InFlight {
+    send: quinn::SendStream,
+    /// [`quinn::SendStream::stopped`]: `Ok(None)` once the receiver has
+    /// acknowledged all of the finished stream, `Ok(Some(_))` if it stopped
+    /// it, an error if the connection is gone.
+    acked: Pin<Box<dyn Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>> + Send>>,
+    /// Open, write and acknowledgement together end here.
+    deadline: tokio::time::Instant,
+}
+
 /// Writes whatever is in the slot to one receiver, one stream per frame.
+///
+/// `finish()` only queues a frame; quinn delivers it later. Counting frames
+/// handed over let a receiver with too narrow a downlink collect as many as
+/// its stream credit and the send window held — seconds of video, with no
+/// frame ever dropped and so no `VideoCongestionHint`. So at most
+/// [`VIDEO_UNACKED_PER_PAIR`](icu_proto::limits::VIDEO_UNACKED_PER_PAIR)
+/// frames stay unacknowledged; the next one waits in the slot, where newer
+/// frames replace or drop it. One not acknowledged by its deadline is reset
+/// and the pair waits for a keyframe.
 async fn forward_frames(
     server: Arc<Server>,
     conn: quinn::Connection,
@@ -477,7 +572,37 @@ async fn forward_frames(
     let closed = conn.closed();
     let shutdown = server.shutdown_requested();
     tokio::pin!(closed, shutdown);
+    let mut in_flight: VecDeque<InFlight> = VecDeque::new();
+    let lost = |slot: &Slot| {
+        Counters::inc(&server.counters.video_dropped_slow_receiver);
+        if slot.lost() {
+            Counters::inc(&server.counters.video_dropped_slow_receiver);
+        }
+    };
     loop {
+        if in_flight.len() >= icu_proto::limits::VIDEO_UNACKED_PER_PAIR {
+            if let Some(oldest) = in_flight.front_mut() {
+                tokio::select! {
+                    biased;
+                    _ = slot.closed() => return,
+                    _ = &mut shutdown => return,
+                    _ = &mut closed => return,
+                    acked = &mut oldest.acked => {
+                        if acked.is_err() {
+                            return;
+                        }
+                    }
+                    _ = tokio::time::sleep_until(oldest.deadline) => {
+                        // Not delivered in time: stop retransmitting it.
+                        let code = quinn::VarInt::from_u32(icu_proto::error::RATE_LIMITED);
+                        let _ = oldest.send.reset(code);
+                        lost(&slot);
+                    }
+                }
+            }
+            in_flight.pop_front();
+            continue;
+        }
         let frame = match slot.take() {
             Some(frame) => frame,
             None if slot.is_closed() => return,
@@ -504,7 +629,7 @@ async fn forward_frames(
                     return;
                 }
                 Err(_) => {
-                    Counters::inc(&server.counters.video_dropped_slow_receiver);
+                    lost(&slot);
                     continue;
                 }
             },
@@ -519,15 +644,22 @@ async fn forward_frames(
             },
         };
         if !written {
-            Counters::inc(&server.counters.video_dropped_slow_receiver);
             let _ = send.reset(quinn::VarInt::from_u32(icu_proto::error::RATE_LIMITED));
             if slot.is_closed() {
+                Counters::inc(&server.counters.video_dropped_slow_receiver);
                 return;
             }
+            lost(&slot);
             continue;
         }
         if send.finish().is_ok() {
             Counters::inc(&server.counters.video_frames_out);
+            let acked = Box::pin(send.stopped());
+            in_flight.push_back(InFlight {
+                send,
+                acked,
+                deadline,
+            });
         }
     }
 }
@@ -550,10 +682,67 @@ mod tests {
     #[test]
     fn closing_a_slot_drops_the_waiting_frame() {
         let slot = Slot::new(0);
-        assert!(!slot.offer(Bytes::from_static(b"frame")));
+        assert_eq!(
+            slot.offer(Bytes::from_static(b"frame"), true),
+            Offer::Queued
+        );
         slot.close();
         assert!(slot.is_closed());
         assert!(slot.take().is_none(), "nothing is written after a close");
+    }
+
+    const KEY: bool = true;
+    const DELTA: bool = false;
+
+    /// A waiting keyframe never gives way to a delta, and after any drop
+    /// only a keyframe passes until one is taken in (S4, readiness review
+    /// 2026-09-27): the receiver cannot decode a delta behind a lost frame.
+    /// Only a full slot is congestion; a delta skipped while the pair waits
+    /// for a keyframe is not counted again.
+    #[test]
+    fn a_waiting_keyframe_survives_and_a_drop_waits_for_the_next() {
+        let slot = Slot::new(0);
+        let offer =
+            |frame: &'static [u8], keyframe| slot.offer(Bytes::from_static(frame), keyframe);
+        assert_eq!(offer(b"k1", KEY), Offer::Queued);
+        assert_eq!(offer(b"d2", DELTA), Offer::Displaced, "d2 is dropped");
+        assert_eq!(slot.take().as_deref(), Some(&b"k1"[..]), "k1 still waits");
+        assert_eq!(
+            offer(b"d3", DELTA),
+            Offer::Skipped,
+            "d3 follows the dropped d2"
+        );
+        assert!(slot.take().is_none());
+        assert_eq!(offer(b"k4", KEY), Offer::Queued, "k4 clears it");
+        assert_eq!(slot.take().as_deref(), Some(&b"k4"[..]));
+        assert_eq!(offer(b"d5", DELTA), Offer::Queued);
+        assert_eq!(
+            offer(b"k6", KEY),
+            Offer::Displaced,
+            "a keyframe takes a waiting delta's place"
+        );
+        assert_eq!(slot.take().as_deref(), Some(&b"k6"[..]));
+    }
+
+    /// A frame lost after it left the slot drops a waiting delta with it and
+    /// makes the pair wait for a keyframe; a keyframe already waiting stays
+    /// and repairs the loss by itself.
+    #[test]
+    fn a_frame_lost_in_flight_waits_for_a_keyframe() {
+        let slot = Slot::new(0);
+        let offer =
+            |frame: &'static [u8], keyframe| slot.offer(Bytes::from_static(frame), keyframe);
+        assert_eq!(offer(b"d1", DELTA), Offer::Queued);
+        assert!(slot.lost(), "the waiting delta goes");
+        assert!(slot.take().is_none());
+        assert_eq!(offer(b"d2", DELTA), Offer::Skipped);
+        assert_eq!(offer(b"k3", KEY), Offer::Queued);
+        assert!(!slot.lost(), "a waiting keyframe stays");
+        assert_eq!(slot.take().as_deref(), Some(&b"k3"[..]));
+        assert_eq!(offer(b"d4", DELTA), Offer::Queued, "d4 follows k3");
+        assert!(slot.lost(), "a waiting delta goes with the loss");
+        assert!(slot.take().is_none());
+        assert_eq!(offer(b"d5", DELTA), Offer::Skipped);
     }
 
     /// The sender left: every forwarder it spawned must be able to end
