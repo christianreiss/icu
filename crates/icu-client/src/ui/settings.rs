@@ -1365,7 +1365,11 @@ impl SettingsView {
                 ui,
                 false,
                 "Anzeigen",
-                Some("Zeigt über allen Fenstern die Kameras der anderen, mit Namen."),
+                Some(
+                    "Zeigt über allen Fenstern die Kameras der anderen, mit Namen — über \
+                     Spielen nur im Fenster- oder randlosen Modus, nicht im exklusiven \
+                     Vollbild.",
+                ),
                 |ui| widgets::named_toggle(ui, &mut self.draft.overlay.enabled, "Anzeigen"),
             );
             ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {

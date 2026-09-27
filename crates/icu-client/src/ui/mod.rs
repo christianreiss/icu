@@ -74,15 +74,14 @@ pub(crate) fn work_area(ctx: &egui::Context) -> Option<egui::Rect> {
         Foundation::POINT,
         Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST},
     };
+    // No window position, no window to fit: the headless test harness has
+    // none, and would otherwise be held to the desktop it happens to run on.
     let (center, scale) = ctx.input(|i| {
-        (
-            i.viewport()
-                .outer_rect
-                .map(|r| r.center())
-                .unwrap_or_default(),
+        Some((
+            i.viewport().outer_rect?.center(),
             i.viewport().native_pixels_per_point.unwrap_or(1.0),
-        )
-    });
+        ))
+    })?;
     let monitor = unsafe {
         MonitorFromPoint(
             POINT {

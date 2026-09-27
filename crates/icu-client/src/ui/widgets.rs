@@ -4,7 +4,7 @@
 //! plus the current `Visuals` — never a raw hex literal — and radii come
 //! from `theme`'s four-step scale, never an invented number.
 //!
-//! The controls that carry state ([`toggle`], [`segmented`], [`slider`]) are
+//! The controls that carry state ([`named_toggle`], [`segmented`], [`named_slider`]) are
 //! painted here rather than taken from stock egui, because stock egui draws
 //! a slider's rail and its handle from the *same* `Visuals` field and the
 //! two can therefore never be told apart.
@@ -533,12 +533,6 @@ pub fn status_link(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
 // Stateful controls
 // ---------------------------------------------------------------------------
 
-/// A pill-shaped on/off switch, 40x23, that a screen reader announces
-/// without a name; [`named_toggle`] where there is one.
-pub fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
-    named_toggle(ui, on, "")
-}
-
 /// A pill-shaped on/off switch, 40x23. `name` is what a screen reader
 /// announces for it: the label of the row it sits in.
 pub fn named_toggle(ui: &mut Ui, on: &mut bool, name: &str) -> egui::Response {
@@ -715,13 +709,7 @@ pub fn chip_toggle(ui: &mut Ui, on: &mut bool, label: &str) -> egui::Response {
     response
 }
 
-/// A slider that a screen reader announces without a name; [`named_slider`]
-/// where there is one.
-pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui::Response {
-    named_slider(ui, value, range, "")
-}
-
-/// A slider drawn in the same hand as [`toggle`]: a thin recessed track, an
+/// A slider drawn in the same hand as [`named_toggle`]: a thin recessed track, an
 /// accent trail up to the value, a light knob. Fills the available width and
 /// takes a click or a drag anywhere along the row; focused, the arrow keys
 /// (and a screen reader's increment/decrement) move it by a hundredth of

@@ -2072,7 +2072,8 @@ fn details(ui: &mut egui::Ui, p: &Participant<'_>, tok: &theme::Tokens, send: &i
                         if muted { 100.0 } else { 0.0 },
                     ));
                 }
-                if widgets::slider(ui, &mut v, 0.0..=200.0).changed() {
+                let name = format!("Lautstärke {}", p.name);
+                if widgets::named_slider(ui, &mut v, 0.0..=200.0, &name).changed() {
                     send(Command::SetVolume(p.user_id, v));
                 }
             });
@@ -2689,7 +2690,11 @@ impl eframe::App for EnrollApp {
                                     ui.horizontal(|ui| {
                                         ui.label(RichText::new("Von dort übernehmen").size(13.5));
                                         widgets::rtl(ui, 30.0, |ui| {
-                                            widgets::toggle(ui, &mut self.take_settings)
+                                            widgets::named_toggle(
+                                                ui,
+                                                &mut self.take_settings,
+                                                "Von dort übernehmen",
+                                            )
                                         });
                                     });
                                     ui.add_space(2.0);
