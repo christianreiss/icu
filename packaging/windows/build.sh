@@ -57,7 +57,7 @@ EXE=target/$TARGET/release/icu.exe
 log "imports: Windows system DLLs only"
 # Everything a stock Windows 10/11 ships. mf*.dll are missing on N/KN
 # editions without the Media Feature Pack (camera, Client/IMPLEMENTATION.md §1).
-allowed='^(advapi32|api-ms-win-core-[a-z0-9-]+|bcrypt|bcryptprimitives|combase|comctl32|crypt32|d3d11|d3d12|dwmapi|dxgi|gdi32|imm32|kernel32|mf|mfplat|mfreadwrite|mmdevapi|msvcrt|ntdll|ole32|oleaut32|opengl32|propsys|rpcrt4|secur32|setupapi|shell32|shlwapi|uiautomationcore|user32|userenv|uxtheme|winmm|ws2_32|avrt)\.dll$'
+allowed='^(advapi32|api-ms-win-core-[a-z0-9-]+|bcrypt|bcryptprimitives|combase|comctl32|crypt32|d3d11|d3d12|dwmapi|dxgi|gdi32|imm32|kernel32|mf|mfplat|mfreadwrite|mmdevapi|msvcrt|ntdll|ole32|oleaut32|opengl32|propsys|rpcrt4|secur32|setupapi|shell32|shlwapi|uiautomationcore|user32|userenv|uxtheme|winmm|ws2_32|wtsapi32|avrt)\.dll$'
 dlls=$(x86_64-w64-mingw32-objdump -p "$EXE" | awk '/DLL Name:/{print tolower($3)}' | sort -u)
 bad=$(echo "$dlls" | grep -Ev "$allowed" || true)
 [ -z "$bad" ] || die "icu.exe imports non-system DLLs: $bad"

@@ -761,6 +761,18 @@ pub async fn start(
 mod tests {
     use super::*;
 
+    /// The token reading behind the foreground check (UIPI): this
+    /// process's level is a mandatory RID between low and system; a window
+    /// that does not exist has none, which the check counts as higher.
+    #[test]
+    fn integrity_levels_come_from_the_process_token() {
+        // SAFETY: the pseudo handle of this process.
+        let ours = unsafe { token_integrity(GetCurrentProcess()) }.expect("own integrity level");
+        assert!((0x1000..=0x4000).contains(&ours), "{ours:#x}");
+        assert_eq!(window_integrity(HWND(std::ptr::null_mut())), None);
+        assert!(held::foreground_hides_input(Some(ours), None));
+    }
+
     /// In the VM, inject F12 and Pause through its virtual keyboard during
     /// this test (not SendInput, which is not a physical Raw Input device).
     #[test]
