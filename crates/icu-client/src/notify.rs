@@ -117,12 +117,20 @@ mod windows_toast {
     use windows::{
         core::HSTRING,
         Data::Xml::Dom::XmlDocument,
-        Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED},
+        Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
         UI::Notifications::{ToastNotification, ToastNotificationManager},
     };
 
     use super::Note;
     use crate::winreg::{set_class_string, APP_ID};
+
+    struct Com;
+    impl Drop for Com {
+        fn drop(&mut self) {
+            // Each successful CoInitializeEx (including S_FALSE) owns one count.
+            unsafe { CoUninitialize() };
+        }
+    }
 
     pub fn show(note: &Note) -> Result<(), String> {
         static REGISTERED: Once = Once::new();
@@ -134,7 +142,10 @@ mod windows_toast {
         });
         // SAFETY: joins the thread to the multithreaded apartment; a
         // thread already in it gets S_FALSE, which is fine.
-        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+            .ok()
+            .map_err(|e| e.to_string())?;
+        let _com = Com;
         let xml = format!(
             "<toast><visual><binding template=\"ToastGeneric\"><text>ICU</text>\
              <text>{}</text></binding></visual><audio silent=\"true\"/></toast>",

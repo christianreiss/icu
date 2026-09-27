@@ -1,6 +1,8 @@
 //! Global hotkeys: Portal (Linux, primary), evdev (Linux, opt-in/fallback),
 //! Raw Input (Windows).
 
+#[cfg(any(windows, test))]
+mod chord;
 #[cfg(target_os = "linux")]
 pub mod evdev;
 pub mod keys;

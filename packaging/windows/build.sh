@@ -11,7 +11,8 @@
 #
 # Cross-built on Fedora for x86_64-pc-windows-gnu (Research/cross-compile.md):
 # needs mingw64-gcc, mingw64-gcc-c++, mingw64-winpthreads-static,
-# rust-std-static-x86_64-pc-windows-gnu, meson, ninja and zip. The exe is
+# rust-std-static-x86_64-pc-windows-gnu, meson, ninja, zip, cargo-about
+# 0.9.2 and cargo-deny 0.20.2 (same versions as the Linux build container). The exe is
 # unsigned; SmartScreen warns on first start (Research/packaging-licensing.md).
 set -euo pipefail
 
@@ -57,12 +58,29 @@ bad=$(echo "$dlls" | grep -Ev "$allowed" || true)
 [ -z "$bad" ] || die "icu.exe imports non-system DLLs: $bad"
 echo "$dlls" | tr '\n' ' '; echo
 
-log "zip"
-rm -rf "$WORK" && mkdir -p "$WORK/$NAME" "$OUT"
-cp "$EXE" LICENSE "$WORK/$NAME/"
-if [ -f target/pkg/THIRD-PARTY-LICENSES ]; then
-    cp target/pkg/THIRD-PARTY-LICENSES "$WORK/$NAME/THIRD-PARTY-LICENSES.txt"
+log "supply chain and Windows third-party licenses"
+cargo deny --locked check
+mkdir -p "$WORK"
+cargo about generate --locked --fail --target "$TARGET" \
+    --manifest-path crates/icu-client/Cargo.toml --no-default-features \
+    --features "$features" packaging/about.hbs -o "$WORK/THIRD-PARTY-LICENSES.txt"
+{
+    printf '\n%s\n%s\nUsed by:\n  - Inter (embedded)\n\n' \
+        '------------------------------------------------------------------------------' \
+        'SIL Open Font License 1.1 (OFL-1.1)'
+    cat crates/icu-client/assets/fonts/inter/LICENSE.txt
+} >> "$WORK/THIRD-PARTY-LICENSES.txt"
+for dependency in windows opusic-sys openh264; do
+    grep -q "$dependency" "$WORK/THIRD-PARTY-LICENSES.txt" || die "license missing: $dependency"
+done
+if [ "${NO_AEC:-0}" != 1 ]; then
+    grep -q webrtc-audio-processing "$WORK/THIRD-PARTY-LICENSES.txt" || die "AEC license missing"
 fi
+
+log "zip"
+rm -rf "$WORK/$NAME" && mkdir -p "$WORK/$NAME" "$OUT"
+cp "$EXE" LICENSE "$WORK/$NAME/"
+cp "$WORK/THIRD-PARTY-LICENSES.txt" "$WORK/$NAME/THIRD-PARTY-LICENSES.txt"
 sed "s/@VERSION@/$VERSION/" packaging/windows/README.txt | sed 's/$/\r/' > "$WORK/$NAME/LIESMICH.txt"
 (cd "$WORK" && rm -f "$ROOT/$OUT/$NAME.zip" && zip -qr9 "$ROOT/$OUT/$NAME.zip" "$NAME")
 

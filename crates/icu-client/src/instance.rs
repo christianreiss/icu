@@ -270,54 +270,43 @@ pub use windows::{claim_in, Listener};
 /// message.
 #[cfg(windows)]
 mod windows {
+    use super::{encode, parse, Claim, Request, MAX_REQUEST};
+    use ::windows::{
+        core::HSTRING,
+        Win32::{
+            Foundation::{GetLastError, ERROR_ALREADY_EXISTS},
+            System::Threading::CreateMutexW,
+        },
+    };
     use std::{
-        io::{Read, Write},
+        io,
         os::windows::io::{FromRawHandle, OwnedHandle},
         path::Path,
         sync::{mpsc, Arc, Mutex},
         time::{Duration, Instant},
     };
-
-    use ::windows::{
-        core::HSTRING,
-        Win32::{
-            Foundation::{
-                GetLastError, ERROR_ALREADY_EXISTS, ERROR_PIPE_CONNECTED, HANDLE,
-                INVALID_HANDLE_VALUE,
-            },
-            Storage::FileSystem::{FlushFileBuffers, ReadFile, PIPE_ACCESS_DUPLEX},
-            System::{
-                Pipes::{
-                    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_MESSAGE,
-                    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES,
-                    PIPE_WAIT,
-                },
-                Threading::CreateMutexW,
-            },
-        },
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::windows::named_pipe::{ClientOptions, NamedPipeServer, PipeMode, ServerOptions},
+        sync::{oneshot, Semaphore},
     };
 
-    use super::{encode, parse, Claim, Request, MAX_REQUEST};
-
-    /// What to call when a request arrived.
     type Waker = Arc<Mutex<Option<Box<dyn Fn() + Send>>>>;
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+    const MAX_CLIENTS: usize = 8;
 
-    /// The running instance's end: requests from later starts.
     pub struct Listener {
         requests: Mutex<mpsc::Receiver<Request>>,
         waker: Waker,
-        /// Held for as long as this instance runs.
+        // Dropping the listener cancels the accept loop and all pending I/O.
+        _stop: oneshot::Sender<()>,
         _mutex: OwnedHandle,
     }
 
     impl Listener {
-        /// The next request, if one arrived.
         pub fn try_recv(&self) -> Option<Request> {
             self.requests.lock().unwrap().try_recv().ok()
         }
-
-        /// Called after every request: a window hidden to the tray runs its
-        /// logic only when woken (`egui::Context::request_repaint`).
         pub fn set_waker(&self, wake: impl Fn() + Send + 'static) {
             *self.waker.lock().unwrap() = Some(Box::new(wake));
         }
@@ -327,8 +316,6 @@ mod windows {
         format!(r"\\.\pipe\{key}")
     }
 
-    /// [`super::claim`] for `key` (`_dir` is for Unix), trying `hand_over`
-    /// long to reach an instance that holds the mutex.
     pub fn claim_in(
         _dir: &Path,
         key: &str,
@@ -336,150 +323,231 @@ mod windows {
         hand_over: Duration,
     ) -> Result<Claim, String> {
         let name = HSTRING::from(format!(r"Local\{key}"));
-        let mutex = match unsafe { CreateMutexW(None, false, &name) } {
-            Ok(handle) => unsafe { OwnedHandle::from_raw_handle(handle.0) },
-            Err(e) => return Ok(Claim::Unguarded(format!("mutex: {e}"))),
-        };
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        let handle =
+            unsafe { CreateMutexW(None, false, &name) }.map_err(|e| format!("mutex: {e}"))?;
+        let existing = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+        let mutex = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+        if existing {
             return hand(&pipe_name(key), request, hand_over);
         }
         let pipe = pipe_name(key);
         let (tx, rx) = mpsc::channel();
         let waker = Waker::default();
         let wake = waker.clone();
-        // The first pipe instance before `First` is returned: a start right
-        // after this one finds it.
-        let first = create_pipe(&pipe).map_err(|e| format!("pipe: {e}"))?;
+        let (stop, mut stopping) = oneshot::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("icu-instance".into())
             .spawn(move || {
-                let mut next = Some(first);
-                loop {
-                    let conn = match next.take().map(Ok).unwrap_or_else(|| create_pipe(&pipe)) {
-                        Ok(conn) => conn,
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e.to_string()));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    let mut next = match create_pipe(&pipe, true) {
+                        Ok(p) => p,
                         Err(e) => {
-                            tracing::warn!(%e, "instance pipe");
+                            let _ = ready_tx.send(Err(e.to_string()));
                             return;
                         }
                     };
-                    let connected = unsafe { ConnectNamedPipe(conn.handle(), None) };
-                    if let Err(e) = connected {
-                        if e.code() != ERROR_PIPE_CONNECTED.to_hresult() {
-                            tracing::debug!(%e, "instance pipe connect");
-                            continue;
+                    let _ = ready_tx.send(Ok(()));
+                    let slots = Arc::new(Semaphore::new(MAX_CLIENTS));
+                    loop {
+                        tokio::select! {
+                            _ = &mut stopping => return,
+                            result = next.connect() => if let Err(e) = result {
+                                tracing::warn!(%e, "instance pipe connect"); return;
+                            }
                         }
-                    }
-                    // One thread per request: a client that connects and
-                    // says nothing must not hold up the next one.
-                    let (tx, wake) = (tx.clone(), wake.clone());
-                    let _ = std::thread::Builder::new()
-                        .name("icu-instance-req".into())
-                        .spawn(move || {
-                            if let Err(e) = serve(conn, &tx, &wake) {
+                        // Keep a listening instance present before handling this client.
+                        let fresh = match create_pipe(&pipe, false) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!(%e, "instance pipe");
+                                return;
+                            }
+                        };
+                        let conn = std::mem::replace(&mut next, fresh);
+                        let Ok(slot) = slots.clone().try_acquire_owned() else {
+                            continue;
+                        };
+                        let (tx, wake) = (tx.clone(), wake.clone());
+                        tokio::spawn(async move {
+                            let _slot = slot;
+                            if let Ok(Err(e)) =
+                                tokio::time::timeout(REQUEST_TIMEOUT, serve(conn, tx, wake)).await
+                            {
                                 tracing::debug!(%e, "instance request");
                             }
                         });
-                }
+                    }
+                });
             })
             .map_err(|e| e.to_string())?;
+        ready_rx
+            .recv_timeout(Duration::from_secs(3))
+            .map_err(|e| e.to_string())??;
         Ok(Claim::First(Listener {
             requests: Mutex::new(rx),
             waker,
+            _stop: stop,
             _mutex: mutex,
         }))
     }
 
-    /// One server end of the pipe.
-    struct Pipe(OwnedHandle);
-
-    impl Pipe {
-        fn handle(&self) -> HANDLE {
-            use std::os::windows::io::AsRawHandle;
-            HANDLE(self.0.as_raw_handle())
-        }
+    fn create_pipe(name: &str, first: bool) -> io::Result<NamedPipeServer> {
+        ServerOptions::new()
+            .first_pipe_instance(first)
+            .pipe_mode(PipeMode::Message)
+            .reject_remote_clients(true)
+            .in_buffer_size(MAX_REQUEST as u32 + 1)
+            .create(name)
     }
 
-    fn create_pipe(name: &str) -> std::io::Result<Pipe> {
-        let handle = unsafe {
-            CreateNamedPipeW(
-                &HSTRING::from(name),
-                PIPE_ACCESS_DUPLEX,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                PIPE_UNLIMITED_INSTANCES,
-                4096,
-                MAX_REQUEST as u32 + 1,
-                0,
-                None,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE || handle.is_invalid() {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(Pipe(unsafe { OwnedHandle::from_raw_handle(handle.0) }))
-    }
-
-    /// Takes one request: queued and the window woken before the answer, so
-    /// a start that heard `ok` knows it arrived.
-    fn serve(conn: Pipe, tx: &mpsc::Sender<Request>, wake: &Waker) -> std::io::Result<()> {
+    async fn serve(
+        mut conn: NamedPipeServer,
+        tx: mpsc::Sender<Request>,
+        wake: Waker,
+    ) -> io::Result<()> {
         let mut data = vec![0u8; MAX_REQUEST + 1];
-        let mut n = 0u32;
-        // One message is one request; one too big for the buffer fails
-        // with ERROR_MORE_DATA and is not taken.
-        unsafe { ReadFile(conn.handle(), Some(&mut data), Some(&mut n), None) }
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        data.truncate(n as usize);
-        let request = (data.len() <= MAX_REQUEST)
-            .then(|| parse(&data))
+        let n = conn.read(&mut data).await?;
+        let request = (n <= MAX_REQUEST)
+            .then(|| parse(&data[..n]))
             .flatten()
-            .ok_or_else(|| std::io::Error::other("not an instance request"))?;
-        tracing::info!(
-            bundle = request.bundle.is_some(),
-            "another start handed over"
-        );
-        let _ = tx.send(request);
+            .ok_or_else(|| io::Error::other("not an instance request"))?;
+        tx.send(request)
+            .map_err(|_| io::Error::other("instance stopped"))?;
         if let Some(wake) = &*wake.lock().unwrap() {
             wake();
         }
-        let handle = conn.handle();
-        let mut file = std::fs::File::from(conn.0);
-        file.write_all(b"ok\n")?;
-        // Flushed, then closed: the start on the other end reads `ok` and
-        // EOF. (DisconnectNamedPipe would throw the answer away unread.)
-        unsafe {
-            let _ = FlushFileBuffers(handle);
-        }
+        tracing::info!("another start handed over");
+        conn.write_all(b"ok\n").await?;
+        // Wait for the client's receipt before closing. No FlushFileBuffers:
+        // that blocks forever when a client connects but never reads.
+        let mut receipt = [0u8; 1];
+        let _ = conn.read(&mut receipt).await;
         Ok(())
     }
 
-    /// Hands `request` to the instance behind `pipe`, retrying while it may
-    /// still be starting up.
     fn hand(pipe: &str, request: &Request, hand_over: Duration) -> Result<Claim, String> {
-        let deadline = Instant::now() + hand_over;
-        loop {
-            match send(pipe, request) {
-                Ok(()) => return Ok(Claim::Handed),
-                Err(e) if Instant::now() >= deadline => {
-                    return Err(format!("ICU läuft bereits, antwortet aber nicht ({e})"))
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?;
+        runtime.block_on(async {
+            let deadline = Instant::now() + hand_over;
+            loop {
+                // Retry only opening: replay after a lost acknowledgement can
+                // import the same passport multiple times.
+                match ClientOptions::new().open(pipe) {
+                    Ok(mut conn) => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        return tokio::time::timeout(remaining, async {
+                            conn.write_all(&encode(request)).await?;
+                            let mut answer = [0u8; 3];
+                            conn.read_exact(&mut answer).await?;
+                            if &answer != b"ok\n" {
+                                return Err(io::Error::other("no answer"));
+                            }
+                            let _ = conn.write_all(b"!").await;
+                            Ok(Claim::Handed)
+                        })
+                        .await
+                        .map_err(|_| {
+                            "ICU läuft bereits, antwortet aber nicht (Timeout)".to_string()
+                        })?
+                        .map_err(|e: io::Error| {
+                            format!("ICU läuft bereits, antwortet aber nicht ({e})")
+                        });
+                    }
+                    Err(e) if Instant::now() >= deadline => {
+                        return Err(format!("ICU läuft bereits, antwortet aber nicht ({e})"))
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
                 }
-                Err(_) => std::thread::sleep(Duration::from_millis(100)),
             }
-        }
+        })
     }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-    fn send(pipe: &str, request: &Request) -> std::io::Result<()> {
-        let mut conn = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(pipe)?;
-        conn.write_all(&encode(request))?;
-        // Exactly the answer: what follows it is the pipe closing, which a
-        // client end may report as an error rather than EOF.
-        let mut answer = [0u8; 3];
-        conn.read_exact(&mut answer)?;
-        if &answer == b"ok\n" {
-            Ok(())
-        } else {
-            Err(std::io::Error::other("no answer"))
+        fn unique_key() -> String {
+            format!(
+                "icu-gate-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )
+        }
+
+        #[test]
+        fn handoff_is_exactly_once_even_with_a_silent_client() {
+            let key = unique_key();
+            let listener = match claim_in(
+                Path::new(""),
+                &key,
+                &Request::default(),
+                Duration::from_secs(1),
+            )
+            .unwrap()
+            {
+                Claim::First(l) => l,
+                _ => panic!("not first"),
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let _entered = rt.enter();
+            let silent = ClientOptions::new().open(pipe_name(&key)).unwrap();
+            drop(_entered);
+            for _ in 0..10 {
+                let request = Request {
+                    bundle: Some("test passport".into()),
+                };
+                assert!(matches!(
+                    claim_in(Path::new(""), &key, &request, Duration::from_secs(1)),
+                    Ok(Claim::Handed)
+                ));
+                assert_eq!(listener.try_recv(), Some(request));
+                assert_eq!(listener.try_recv(), None);
+            }
+            drop(silent);
+        }
+
+        #[test]
+        fn an_unresponsive_pipe_has_a_deadline() {
+            let key = unique_key();
+            let mutex =
+                unsafe { CreateMutexW(None, false, &HSTRING::from(format!(r"Local\{key}"))) }
+                    .unwrap();
+            let _mutex = unsafe { OwnedHandle::from_raw_handle(mutex.0) };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let enter = rt.enter();
+            let _pipe = create_pipe(&pipe_name(&key), true).unwrap();
+            drop(enter);
+            let start = Instant::now();
+            assert!(claim_in(
+                Path::new(""),
+                &key,
+                &Request::default(),
+                Duration::from_millis(200)
+            )
+            .is_err());
+            assert!(start.elapsed() < Duration::from_secs(1));
         }
     }
 }

@@ -25,7 +25,7 @@ default = ["aec", "gui", "camera", "overlay", "tray"]
 # abseil headers and the rust-objcopy symlink (Client/IMPLEMENTATION.md §12).
 aec = ["dep:webrtc-audio-processing", "dep:webrtc-audio-processing-config"]
 # egui main window and settings. Without it only `--headless` works.
-gui = ["dep:eframe", "dep:egui", "dep:egui-phosphor"]
+gui = ["dep:eframe", "dep:egui", "dep:egui-phosphor", "dep:raw-window-handle"]
 # eframe glow backend in addition to the default wgpu one.
 glow = ["eframe?/glow"]
 # Camera capture and H.264.
@@ -96,6 +96,8 @@ tray-icon = { version = "0.25.1", default-features = false, features = ["ksni"],
 ab_glyph = { version = "0.2.32", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# Exact native window for foreground activation after a tray/IPC restore.
+raw-window-handle = { version = "0.6.2", optional = true }
 # Emergency audio host when WASAPI cannot open a device (audio::native_backend).
 cpal = "0.18.2"
 windows = { version = "0.62.2", features = [

@@ -35,7 +35,7 @@ use windows::{
     core::{implement, Interface, HSTRING, PCWSTR, PWSTR},
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
-        Foundation::{CloseHandle, HANDLE, PROPERTYKEY, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, HANDLE, PROPERTYKEY, WAIT_FAILED, WAIT_OBJECT_0},
         Media::{
             Audio::{
                 eCapture, eConsole, eRender, AudioCategory_GameChat, AudioCategory_Other,
@@ -70,6 +70,12 @@ use super::backend::{
 /// How long a stream thread waits for its event before looking at the stop
 /// flag and the default device again.
 const WAIT_MS: u32 = 100;
+/// Capture and render must keep advancing, even on silence. Some USB/VM
+/// endpoints stop without returning DEVICE_INVALIDATED; reopen the group
+/// rather than leaving a connected client permanently silent. Loopback is
+/// exempt because Windows can omit packets on an idle render endpoint.
+const STALL_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// How often loopback is read: well inside the microphone's period, so a
 /// reference packet reaches the engine soon after the matching capture.
 const LOOPBACK_POLL: Duration = Duration::from_millis(2);
@@ -495,68 +501,45 @@ fn run_stream(
         }
     };
     let name = format!("icu-wasapi-{}", spec.name());
-    if spec.kind != StreamKind::Reference {
-        super::rt::promote_current_thread(&name);
-    }
-    let mut ready = Some(ready);
-    let mut failures = 0u32;
-    loop {
-        let generation = defaults.of(spec.flow()).load(Ordering::SeqCst);
-        let ended = match Stream::open(&spec) {
-            Ok(mut stream) => {
-                failures = 0;
-                if let Some(r) = ready.take() {
-                    let _ = r.send(Ok(()));
-                }
-                tracing::info!(
-                    stream = spec.name(),
-                    device = %stream.device_name,
-                    channels = stream.channels,
-                    period = stream.period,
-                    mode = stream.mode,
-                    "wasapi stream open"
-                );
-                let follows = spec.device.is_none();
-                stream.pump(&mut callback, &stop, || {
-                    follows && defaults.of(spec.flow()).load(Ordering::SeqCst) != generation
-                })
-            }
-            Err(e) => {
-                if let Some(r) = ready.take() {
-                    let _ = r.send(Err(e));
-                    return;
-                }
-                Ended::Failed(e)
-            }
-        };
-        match ended {
-            Ended::Stopped => return,
-            Ended::DefaultChanged => {
-                tracing::info!(stream = spec.name(), "default device changed, following it");
-            }
-            // Following the default: the next one takes over once Windows
-            // has picked it; give up after a few seconds without one.
-            Ended::DeviceLost | Ended::Failed(_) if spec.device.is_none() && failures < 10 => {
-                failures += 1;
-                std::thread::sleep(Duration::from_millis(300));
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
-            }
-            Ended::DeviceLost => {
-                let _ = events.send(BackendEvent::StreamError {
-                    stream: spec.kind,
-                    message: "Gerät nicht mehr verfügbar".into(),
-                });
-                return;
-            }
-            Ended::Failed(message) => {
-                let _ = events.send(BackendEvent::StreamError {
-                    stream: spec.kind,
-                    message,
-                });
-                return;
-            }
+    let _priority =
+        (spec.kind != StreamKind::Reference).then(|| super::rt::promote_current_thread(&name));
+    let generation = defaults.of(spec.flow()).load(Ordering::SeqCst);
+    let mut stream = match Stream::open(&spec) {
+        Ok(stream) => stream,
+        Err(e) => {
+            let _ = ready.send(Err(e.clone()));
+            // Initial failure also needs recovery (audio service restarting,
+            // or no endpoint yet). The engine applies its bounded backoff.
+            let _ = events.send(BackendEvent::StreamError {
+                stream: spec.kind,
+                message: e,
+            });
+            return;
+        }
+    };
+    let _ = ready.send(Ok(()));
+    tracing::info!(stream = spec.name(), device = %stream.device_name,
+        channels = stream.channels, period = stream.period, mode = stream.mode,
+        "wasapi stream open");
+    let ended = stream.pump(&mut callback, &stop, || {
+        spec.device.is_none() && defaults.of(spec.flow()).load(Ordering::SeqCst) != generation
+    });
+    // The engine owns recovery, including clearing the audio rings and resetting
+    // AEC. Reopening just this thread kept samples from unrelated device clocks.
+    match ended {
+        Ended::Stopped => {}
+        Ended::DefaultChanged => {
+            let _ = events.send(BackendEvent::DefaultDeviceChanged);
+        }
+        Ended::DeviceLost | Ended::Failed(_) => {
+            let message = match ended {
+                Ended::Failed(message) => message,
+                _ => "Gerät nicht mehr verfügbar".into(),
+            };
+            let _ = events.send(BackendEvent::StreamError {
+                stream: spec.kind,
+                message,
+            });
         }
     }
 }
@@ -806,6 +789,7 @@ impl Stream {
         moved: impl Fn() -> bool,
     ) -> Ended {
         let mut last_check = Instant::now();
+        let mut last_progress = Instant::now();
         loop {
             if stop.load(Ordering::SeqCst) {
                 return Ended::Stopped;
@@ -816,10 +800,17 @@ impl Stream {
                     return Ended::DefaultChanged;
                 }
             }
+            if !self.loopback && last_progress.elapsed() >= STALL_TIMEOUT {
+                return Ended::Failed("WASAPI stream stalled for 3 seconds".into());
+            }
             match self.event {
                 // SAFETY: our own event handle.
                 Some(event) => {
-                    if unsafe { WaitForSingleObject(event, WAIT_MS) } != WAIT_OBJECT_0 {
+                    let result = unsafe { WaitForSingleObject(event, WAIT_MS) };
+                    if result == WAIT_FAILED {
+                        return Ended::Failed(windows::core::Error::from_thread().to_string());
+                    }
+                    if result != WAIT_OBJECT_0 {
                         continue;
                     }
                 }
@@ -829,23 +820,28 @@ impl Stream {
                 Callback::Capture(cb) => self.read(cb),
                 Callback::Playback(cb) => self.write(cb),
             };
-            if let Err(e) = moved_audio {
-                return if e.code() == AUDCLNT_E_DEVICE_INVALIDATED {
-                    Ended::DeviceLost
-                } else {
-                    Ended::Failed(e.to_string())
-                };
+            match moved_audio {
+                Ok(frames) if frames > 0 => last_progress = Instant::now(),
+                Ok(_) => {}
+                Err(e) => {
+                    return if e.code() == AUDCLNT_E_DEVICE_INVALIDATED {
+                        Ended::DeviceLost
+                    } else {
+                        Ended::Failed(e.to_string())
+                    };
+                }
             }
         }
     }
 
     /// Takes every packet waiting and hands on whole blocks: channel 0 of
     /// a microphone, the average of all channels of the loopback mix.
-    fn read(&mut self, cb: &mut CaptureCallback) -> windows::core::Result<()> {
+    fn read(&mut self, cb: &mut CaptureCallback) -> windows::core::Result<usize> {
         let Some(capture) = &self.capture else {
-            return Ok(());
+            return Ok(0);
         };
         let channels = self.channels;
+        let mut received = 0;
         // SAFETY: GetBuffer/ReleaseBuffer pairs on a started client; the
         // buffer holds `frames × channels` f32 (the format asked for).
         unsafe {
@@ -855,6 +851,7 @@ impl Stream {
                 let mut flags = 0u32;
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
                 let n = frames as usize;
+                received += n;
                 if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data.is_null() {
                     self.pending.extend(std::iter::repeat_n(0.0, n));
                 } else {
@@ -889,14 +886,14 @@ impl Stream {
             cb(&self.pending[..whole]);
             self.pending.drain(..whole);
         }
-        Ok(())
+        Ok(received)
     }
 
     /// Fills the free part of the endpoint buffer, whole blocks only, the
     /// mono voice on every channel.
-    fn write(&mut self, cb: &mut PlaybackCallback) -> windows::core::Result<()> {
+    fn write(&mut self, cb: &mut PlaybackCallback) -> windows::core::Result<usize> {
         let Some(render) = &self.render else {
-            return Ok(());
+            return Ok(0);
         };
         // SAFETY: GetBuffer/ReleaseBuffer on a started client, writing
         // exactly the `frames × channels` f32 asked for.
@@ -905,7 +902,7 @@ impl Stream {
             let free = self.buffer_frames.saturating_sub(padding) as usize;
             let frames = free / BLOCK_SAMPLES * BLOCK_SAMPLES;
             if frames == 0 {
-                return Ok(());
+                return Ok(0);
             }
             let data = render.GetBuffer(frames as u32)?;
             let out = std::slice::from_raw_parts_mut(data as *mut f32, frames * self.channels);
@@ -917,8 +914,8 @@ impl Stream {
                 }
             }
             render.ReleaseBuffer(frames as u32, 0)?;
+            Ok(frames)
         }
-        Ok(())
     }
 }
 
@@ -955,6 +952,107 @@ fn set_properties(client: &IAudioClient, kind: StreamKind) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run in an interactive Windows desktop session, with a default input
+    /// and output. Plays a quiet tone for three seconds and measures loopback.
+    #[test]
+    #[ignore = "needs Windows audio endpoints; plays a quiet test tone"]
+    fn live_wasapi_capture_playback_and_loopback() {
+        use std::sync::atomic::AtomicUsize;
+        let mut backend = WasapiBackend::new().unwrap();
+        let devices = backend.devices();
+        assert!(devices.iter().any(|d| d.kind == DeviceKind::Input));
+        assert!(devices.iter().any(|d| d.kind == DeviceKind::Output));
+        let cap = Arc::new(AtomicUsize::new(0));
+        let reference = Arc::new(AtomicUsize::new(0));
+        let audible = Arc::new(AtomicUsize::new(0));
+        let counter = cap.clone();
+        backend
+            .open_capture(
+                None,
+                Box::new(move |samples| {
+                    assert!(samples.iter().all(|x| x.is_finite()));
+                    counter.fetch_add(samples.len(), Ordering::Relaxed);
+                }),
+            )
+            .unwrap();
+        let (counter, nonzero) = (reference.clone(), audible.clone());
+        backend
+            .open_reference(
+                None,
+                Box::new(move |samples| {
+                    counter.fetch_add(samples.len(), Ordering::Relaxed);
+                    nonzero.fetch_add(
+                        samples.iter().filter(|x| x.abs() > 0.00001).count(),
+                        Ordering::Relaxed,
+                    );
+                }),
+            )
+            .unwrap();
+        let mut phase = 0.0f32;
+        backend
+            .open_playback(
+                None,
+                Box::new(move |samples| {
+                    for sample in samples {
+                        *sample = phase.sin() * 0.02;
+                        phase = (phase + std::f32::consts::TAU * 997.0 / SAMPLE_RATE as f32)
+                            % std::f32::consts::TAU;
+                    }
+                }),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        drop(backend);
+        let (cap, reference, audible) = (
+            cap.load(Ordering::Relaxed),
+            reference.load(Ordering::Relaxed),
+            audible.load(Ordering::Relaxed),
+        );
+        eprintln!("WASAPI: capture={cap} reference={reference} nonzero_reference={audible}");
+        assert!(cap > 48_000, "capture did not keep running");
+        assert!(reference > 48_000, "loopback did not keep running");
+        assert!(audible > 24_000, "rendered tone did not reach loopback");
+    }
+
+    /// Stops actual clients without invalidating their endpoints. This models
+    /// a driver that stops signalling events while COM calls still succeed.
+    #[test]
+    #[ignore = "needs Windows audio endpoints; deliberately stops test streams"]
+    fn live_wasapi_detects_stalled_streams() {
+        let _com = Com::init().unwrap();
+        for kind in [
+            StreamKind::Capture,
+            StreamKind::Playback,
+            StreamKind::Reference,
+        ] {
+            let mut stream = Stream::open(&Spec { kind, device: None }).unwrap();
+            // SAFETY: this thread owns the initialized, started client.
+            unsafe { stream.client.Stop().unwrap() };
+            let stop = Arc::new(AtomicBool::new(false));
+            let end = stop.clone();
+            let timer = std::thread::spawn(move || {
+                std::thread::sleep(STALL_TIMEOUT + Duration::from_secs(1));
+                end.store(true, Ordering::SeqCst);
+            });
+            let mut callback = match kind {
+                StreamKind::Playback => Callback::Playback(Box::new(|samples| samples.fill(0.0))),
+                _ => Callback::Capture(Box::new(|_| {})),
+            };
+            let ended = stream.pump(&mut callback, &stop, || false);
+            timer.join().unwrap();
+            match kind {
+                StreamKind::Reference => assert!(
+                    matches!(ended, Ended::Stopped),
+                    "idle loopback must remain open"
+                ),
+                _ => assert!(
+                    matches!(ended, Ended::Failed(ref message) if message.contains("stalled")),
+                    "capture/render must report lack of progress"
+                ),
+            }
+        }
+    }
 
     #[test]
     fn the_period_is_the_first_fundamental_multiple_from_5_ms() {

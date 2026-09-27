@@ -222,9 +222,38 @@ fn import_in_terminal(cli: &Cli, paths: &Paths, text: &str) -> Result<(), String
 /// `--help`, the import questions and the log reach it.
 #[cfg(windows)]
 fn attach_console() -> bool {
-    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-    // SAFETY: a plain Win32 call; fails harmlessly without a parent console.
-    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok()
+    use windows::Win32::{
+        Storage::FileSystem::{GetFileType, FILE_TYPE_UNKNOWN},
+        System::Console::{
+            AttachConsole, GetConsoleMode, GetStdHandle, SetStdHandle, ATTACH_PARENT_PROCESS,
+            CONSOLE_MODE, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        },
+    };
+    // AttachConsole can replace inherited files/pipes with console handles
+    // (e.g. `icu --help > help.txt` from cmd.exe). Preserve redirection,
+    // including NUL, while letting Windows supply missing console handles.
+    let redirected = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|id| {
+        // SAFETY: borrowed process standard handles; never closed here.
+        let handle = unsafe { GetStdHandle(id) }.ok().filter(|handle| unsafe {
+            !handle.is_invalid()
+                && GetFileType(*handle) != FILE_TYPE_UNKNOWN
+                && GetConsoleMode(*handle, &mut CONSOLE_MODE::default()).is_err()
+        });
+        (id, handle)
+    });
+    // SAFETY: fails harmlessly without a parent console.
+    let attached = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok();
+    let mut redirected_error = false;
+    for (id, handle) in redirected {
+        if let Some(handle) = handle {
+            // SAFETY: restores a valid inherited handle, owned by the process.
+            if unsafe { SetStdHandle(id, handle) }.is_ok() && id == STD_ERROR_HANDLE {
+                redirected_error = true;
+            }
+        }
+    }
+    // SSH/pipes need stderr logging even without a parent console.
+    attached || redirected_error
 }
 
 /// `%LOCALAPPDATA%\icu\data\icu.log`, appended to: a second start (which

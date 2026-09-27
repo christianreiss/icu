@@ -107,6 +107,11 @@ pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String
             // `window_visible` keeps the engine's view, so `logic` reports
             // the difference.
             app.hidden = start_minimized;
+            #[cfg(windows)]
+            if start_minimized {
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
             if start_minimized_to_dock {
                 cc.egui_ctx
                     .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
@@ -173,6 +178,7 @@ struct App {
     self_video: Option<crate::camera::CameraPreview>,
     /// Hidden to the tray (or never shown: `start_minimized`).
     hidden: bool,
+    window_restore: WindowRestore,
     /// What was last reported as `Command::SetWindowVisible`; the engine
     /// starts from the same `start_minimized` value.
     window_visible: bool,
@@ -180,6 +186,8 @@ struct App {
     title: String,
     /// The window has been sized to the list once since connecting.
     fitted: bool,
+    #[cfg(windows)]
+    positioned: bool,
     /// People in the list last frame; one more may grow the window.
     rows_seen: usize,
     quit_requested: bool,
@@ -219,6 +227,11 @@ impl App {
         let inner = ctx.content_rect();
         let monitor = ctx.input(|i| i.viewport().monitor_size);
         let max = monitor.map_or(f32::INFINITY, |m| m.y * 0.9);
+        #[cfg(windows)]
+        let max = super::work_area(ctx).map_or(max, |area| {
+            let top = ctx.input(|i| i.viewport().outer_rect.map(|r| r.top()));
+            max.min((area.bottom() - top.unwrap_or(area.top()) - 48.0).max(inner.height()))
+        });
         let height = (inner.height() + overflow).min(max).ceil();
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             inner.width(),
@@ -260,7 +273,7 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         crate::signals::set_waker(move || ctx.request_repaint());
         #[cfg(feature = "tray")]
-        let tray = crate::tray::Tray::start(cmd.clone(), cc.egui_ctx.clone()).ok();
+        let tray = crate::tray::Tray::start(cmd.clone(), cc.egui_ctx.clone(), tray_waker(cc)).ok();
         #[cfg(feature = "overlay")]
         let overlay = match crate::overlay::OverlayHandle::start(state_rx.clone(), frames.clone()) {
             Ok(h) => {
@@ -308,9 +321,12 @@ impl App {
             #[cfg(feature = "camera")]
             self_video,
             hidden: start_minimized,
+            window_restore: WindowRestore::default(),
             window_visible: !start_minimized,
             title: "ICU".into(),
             fitted: false,
+            #[cfg(windows)]
+            positioned: false,
             rows_seen: 0,
             quit_requested: false,
             #[cfg(feature = "tray")]
@@ -325,6 +341,81 @@ impl App {
 fn quit(quit_requested: &mut bool, ctx: &egui::Context) {
     *quit_requested = true;
     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+}
+
+/// A native popup menu runs a nested Windows message loop. A repaint request
+/// alone can be consumed there without running the app again when it closes.
+#[cfg(feature = "tray")]
+fn tray_waker(cc: &eframe::CreationContext<'_>) -> impl Fn() + Send + Sync + 'static {
+    let ctx = cc.egui_ctx.clone();
+    #[cfg(windows)]
+    let hwnd = {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        cc.window_handle()
+            .ok()
+            .and_then(|handle| match handle.as_raw() {
+                RawWindowHandle::Win32(window) => Some(window.hwnd.get()),
+                _ => None,
+            })
+    };
+    move || {
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+        #[cfg(windows)]
+        if let Some(hwnd) = hwnd {
+            use windows::Win32::{
+                Foundation::{HWND, LPARAM, WPARAM},
+                UI::WindowsAndMessaging::{PostMessageW, WM_PAINT},
+            };
+            unsafe {
+                let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_PAINT, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+}
+
+/// Restoring a Win32 window can make winit report thread-local active focus
+/// while Explorer still owns the foreground. eframe then skips `Focus`.
+/// Complete that user-requested activation once, after the restore events.
+#[derive(Default)]
+struct WindowRestore {
+    #[cfg(windows)]
+    pending: bool,
+}
+
+impl WindowRestore {
+    fn show(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        #[cfg(windows)]
+        {
+            self.pending = true;
+            ctx.request_repaint();
+        }
+    }
+
+    fn finish(&mut self, _frame: &eframe::Frame) {
+        #[cfg(windows)]
+        if std::mem::take(&mut self.pending) {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            use windows::Win32::{
+                Foundation::HWND,
+                UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow},
+            };
+            if let Ok(handle) = _frame.window_handle() {
+                if let RawWindowHandle::Win32(window) = handle.as_raw() {
+                    let hwnd = HWND(window.hwnd.get() as *mut _);
+                    // Use this frame's window, even when a settings viewport
+                    // became active during an invitation handoff.
+                    unsafe {
+                        if GetForegroundWindow() != hwnd {
+                            let _ = SetForegroundWindow(hwnd);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Whether the window can start hidden in the tray (`can_hide` and a tray
@@ -389,6 +480,7 @@ impl eframe::App for App {
     /// Runs before every `ui` pass and also while the window is hidden (on
     /// `request_repaint`): tray events, camera state, close handling.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.window_restore.finish(_frame);
         if self.state_rx.has_changed().unwrap_or(false) {
             let theme_before = self.state.settings.ui.theme.clone();
             self.state = self.state_rx.borrow_and_update().clone();
@@ -423,8 +515,7 @@ impl eframe::App for App {
             match tray.poll() {
                 Some(crate::tray::TrayEvent::ShowWindow) => {
                     self.hidden = false;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.window_restore.show(ctx);
                 }
                 Some(crate::tray::TrayEvent::Quit) => quit(&mut self.quit_requested, ctx),
                 None => {}
@@ -436,8 +527,7 @@ impl eframe::App for App {
         // opens in Einstellungen → Allgemein, checked and ready to take.
         if let Some(request) = crate::instance::poll() {
             self.hidden = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.window_restore.show(ctx);
             if let Some(text) = request.bundle {
                 if self.settings.is_none() {
                     self.settings = Some(self.new_settings_view());
@@ -477,6 +567,10 @@ impl eframe::App for App {
             match hide {
                 Some(true) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    // eframe 0.36 recognizes minimized/occluded viewports,
+                    // but not a hidden Win32 window, when skipping rendering.
+                    #[cfg(windows)]
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     self.hidden = true;
                 }
@@ -513,6 +607,10 @@ impl eframe::App for App {
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
+        #[cfg(windows)]
+        if !self.positioned {
+            self.positioned = super::position_window(&ctx, [400.0, 620.0], [360.0, 320.0]);
+        }
         ctx.request_repaint_after(Duration::from_millis(33));
 
         self.debug_window(&ctx);
@@ -782,6 +880,16 @@ impl App {
         let Some(view) = &mut self.setup else {
             return false;
         };
+        // eframe shows the root after its first paint, which on Windows
+        // raises it above the setup created during that paint. Give the
+        // setup focus once the root has actually appeared.
+        #[cfg(windows)]
+        if ctx.cumulative_frame_nr() == 1 {
+            ctx.send_viewport_cmd_to(
+                egui::ViewportId::from_hash_of(SETUP_ID),
+                egui::ViewportCommand::Focus,
+            );
+        }
         let state = &self.state;
         let mut out = None;
         let still_open = immediate_window(
@@ -830,6 +938,14 @@ fn immediate_window(
         .with_inner_size(size);
     if let Some(min) = min_size {
         builder = builder.with_min_inner_size(min).with_resizable(true);
+    }
+    #[cfg(windows)]
+    if let Some(area) = super::work_area(ctx) {
+        let (fitted, pos) = super::fit_window(size, area);
+        builder = builder.with_inner_size(fitted).with_position(pos);
+        if let Some(min) = min_size {
+            builder = builder.with_min_inner_size(egui::vec2(min[0], min[1]).min(fitted));
+        }
     }
     let mut still_open = true;
     // The viewport callback is `FnMut`; `body` runs once per call.
@@ -2025,6 +2141,11 @@ pub fn run_enroll(
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx, &enroll_theme);
+            let ctx = cc.egui_ctx.clone();
+            crate::instance::set_waker(move || ctx.request_repaint());
+            let ctx = cc.egui_ctx.clone();
+            crate::signals::set_waker(move || ctx.request_repaint());
+            crate::signals::listen();
             let mut app = EnrollApp::new(paths, server_addr, result_app);
             if let Some(text) = text {
                 app.paste(text);
@@ -2063,6 +2184,9 @@ enum EnrollStep {
 /// file on it; check where it leads, pick a name, join. `pub` for
 /// `tests/ui_layout.rs`.
 pub struct EnrollApp {
+    window_restore: WindowRestore,
+    #[cfg(windows)]
+    positioned: bool,
     paths: Paths,
     server_addr: Option<SocketAddr>,
     link: String,
@@ -2107,6 +2231,9 @@ impl EnrollApp {
     ) -> EnrollApp {
         let current = Identity::load(&paths).ok().flatten();
         EnrollApp {
+            window_restore: WindowRestore::default(),
+            #[cfg(windows)]
+            positioned: false,
             current,
             paths,
             server_addr,
@@ -2204,18 +2331,23 @@ impl EnrollApp {
 }
 
 impl eframe::App for EnrollApp {
-    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = root.ctx().clone();
-        ctx.request_repaint_after(Duration::from_millis(100));
-
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.window_restore.finish(_frame);
+        // Registration completes on a worker, including while minimized.
+        // An idle invitation needs no periodic repaint.
+        if self.pending.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if crate::signals::requested() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         // ICU started again (`crate::instance`): come to the front, with the
         // invite or passport it was given, unless a join is under way.
         if let Some(request) = crate::instance::poll() {
             if let Some(text) = request.bundle.filter(|_| self.pending.is_none()) {
                 self.paste(text);
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.window_restore.show(ctx);
         }
 
         // Taken out of the slot first: holding the lock across the match
@@ -2249,6 +2381,14 @@ impl eframe::App for EnrollApp {
                 },
                 Err(e) => self.status = Some(EnrollStatus::Failed(e)),
             }
+        }
+    }
+
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = root.ctx().clone();
+        #[cfg(windows)]
+        if !self.positioned {
+            self.positioned = super::position_window(&ctx, [560.0, 600.0], [480.0, 520.0]);
         }
         let busy = self.pending.is_some();
         if !busy {
@@ -2539,6 +2679,7 @@ impl eframe::App for EnrollApp {
             self.focus_paste = true;
         } else if join && join_ok && step == EnrollStep::Join {
             self.submit();
+            ctx.request_repaint();
         }
     }
 }

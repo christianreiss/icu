@@ -644,3 +644,55 @@ async fn sigterm_ends_the_session_with_a_goodbye() {
     assert!(left.is_some(), "the others see the client leave at once");
     assert!(exited, "the client ends after SIGTERM");
 }
+
+/// Windows default-endpoint notifications must reset all three streams,
+/// even though the configured device stays `None`. A burst gets one reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_default_endpoint_change_reopens_the_audio_group_once() {
+    use icu_client::audio::{BackendEvent, StreamKind};
+    use std::sync::{Arc, Mutex};
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let (events, rx) = std::sync::mpsc::channel();
+    let backend = Devices {
+        list: Arc::new(Mutex::new(vec![])),
+        opened: opened.clone(),
+        events: Some(rx),
+    };
+    let mut settings = test_settings();
+    settings.audio.aec = true;
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, settings, paths);
+    cfg.server_addr = Some(server.addr());
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).unwrap();
+    wait_connected(&engine).await;
+    opened.lock().unwrap().clear();
+    for _ in 0..3 {
+        events.send(BackendEvent::DefaultDeviceChanged).unwrap();
+    }
+    tokio::time::timeout(SOON, async {
+        while opened.lock().unwrap().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        *opened.lock().unwrap(),
+        vec![
+            (StreamKind::Capture, None),
+            (StreamKind::Reference, None),
+            (StreamKind::Playback, None)
+        ]
+    );
+    events
+        .send(BackendEvent::StreamError {
+            stream: StreamKind::Playback,
+            message: "audio service stopped".into(),
+        })
+        .unwrap();
+    wait_for(&engine, SOON, |s| s.banner.is_some()).await;
+    wait_for(&engine, SOON, |s| s.banner.is_none()).await;
+    drop(engine);
+}

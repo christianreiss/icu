@@ -15,6 +15,8 @@ pub struct Problem {
     pub text: String,
     /// What a developer needs; `None` when `text` already says everything.
     pub technical: Option<String>,
+    /// Cleared when audio streams are reopened; other problems must survive.
+    audio: bool,
 }
 
 impl Problem {
@@ -23,6 +25,7 @@ impl Problem {
         Problem {
             text: text.into(),
             technical: None,
+            audio: false,
         }
     }
 
@@ -31,7 +34,12 @@ impl Problem {
         Problem {
             text: text.into(),
             technical: Some(technical.into()),
+            audio: false,
         }
+    }
+
+    pub(crate) fn is_audio(&self) -> bool {
+        self.audio
     }
 
     /// The text with the technical detail in parentheses, for places that
@@ -247,13 +255,15 @@ pub fn storage(what: &str, e: &dyn std::fmt::Display) -> Problem {
 
 /// An audio device that would not open or broke down.
 pub fn audio(device: &str, e: &dyn std::fmt::Display) -> Problem {
-    Problem::new(
+    let mut problem = Problem::new(
         format!(
             "{device} lässt sich nicht verwenden. Ist das Gerät angeschlossen und in den \
              Einstellungen unter Audio ausgewählt?"
         ),
         e.to_string(),
-    )
+    );
+    problem.audio = true;
+    problem
 }
 
 #[cfg(test)]
