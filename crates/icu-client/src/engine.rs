@@ -1277,6 +1277,8 @@ fn dsp_thread(
     let mut block = vec![0.0f32; BLOCK];
     let mut ref_block = vec![0.0f32; BLOCK];
     let mut frame_acc: Vec<f32> = Vec::with_capacity(960);
+    // The frame length `frame_acc` is being collected for.
+    let mut acc_frame = 0usize;
     // The previous frame, for the VAD pre-roll (`preroll_now`).
     let mut prev_frame: Vec<f32> = Vec::with_capacity(960);
     let mut prev_frame_valid = false;
@@ -1510,8 +1512,14 @@ fn dsp_thread(
         }
 
         // 4. Accumulate to an Opus frame.
-        frame_acc.extend_from_slice(&block);
         let frame_samples = ctl.frame_samples.load(Ordering::Relaxed) as usize;
+        collect_block(
+            &mut frame_acc,
+            &mut acc_frame,
+            &mut ts,
+            frame_samples,
+            &block,
+        );
         if frame_acc.len() >= frame_samples {
             let now = Instant::now();
             gate.set_mode(mode_of(ctl.vad_mode.load(Ordering::Relaxed)));
@@ -1615,6 +1623,27 @@ fn dsp_thread(
             });
         }
     }
+}
+
+/// Adds one capture block to the Opus frame being collected. When the frame
+/// length changed since (`Command::SetFrameMs`), what was collected towards
+/// the old length is dropped first and `ts` moves past it, so the sample
+/// clock stays true and receivers see a new talk spurt. Kept, it stayed in
+/// front of every later frame: 20 → 10 ms with half a long frame collected
+/// sent everything 10 ms late until the next change.
+fn collect_block(
+    acc: &mut Vec<f32>,
+    acc_frame: &mut usize,
+    ts: &mut u32,
+    frame_samples: usize,
+    block: &[f32],
+) {
+    if *acc_frame != frame_samples {
+        *acc_frame = frame_samples;
+        *ts = ts.wrapping_add(acc.len() as u32);
+        acc.clear();
+    }
+    acc.extend_from_slice(block);
 }
 
 /// Whether this block is speech as far as the VAD's noise-floor tracker
@@ -4304,6 +4333,41 @@ mod tests {
         assert_eq!(local_indicator(Some(t0), false, at(1000)), None);
         // A datagram stamped after the mixer took `now`.
         assert_eq!(local_indicator(Some(at(5)), false, t0), Some(true));
+    }
+
+    /// Switching the Opus frame from 20 to 10 ms halfway through a long
+    /// frame leaves nothing queued: every later frame goes out with the
+    /// block that completes it, and `ts` still counts every sample.
+    #[test]
+    fn a_shorter_frame_leaves_no_remainder_behind() {
+        let block = [0.0f32; BLOCK];
+        let (mut acc, mut acc_frame, mut ts) = (Vec::new(), 0usize, 0u32);
+        let mut sent = Vec::new();
+        // One DSP tick: collect a block, send a frame if one is complete;
+        // returns what stays queued.
+        let mut tick = |frame: usize| {
+            collect_block(&mut acc, &mut acc_frame, &mut ts, frame, &block);
+            if acc.len() >= frame {
+                sent.push(ts);
+                ts = ts.wrapping_add(frame as u32);
+                acc.drain(..frame);
+            }
+            acc.len()
+        };
+        assert_eq!(tick(960), 480);
+        assert_eq!(tick(960), 0);
+        assert_eq!(tick(960), 480, "half a long frame collected");
+        for _ in 0..5 {
+            assert_eq!(tick(480), 0, "nothing left over");
+        }
+        // Back to 20 ms from an empty buffer: nothing is dropped.
+        assert_eq!(tick(960), 480);
+        assert_eq!(tick(960), 0);
+        assert_eq!(
+            sent,
+            [0, 1440, 1920, 2400, 2880, 3360, 3840],
+            "the dropped half moves ts on"
+        );
     }
 
     /// Whichever way `run_session` returns, its reader tasks end with it.
