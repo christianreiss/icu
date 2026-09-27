@@ -1408,6 +1408,10 @@ fn dsp_thread(
                 }
             }
         }
+        // Whatever the capture path delivered, the AEC and the denoiser only
+        // ever see numbers within ±4 (`dsp::sanitize`).
+        crate::dsp::sanitize(&mut block);
+        crate::dsp::sanitize(&mut ref_block);
         let t_block = Instant::now();
         DebugStats::inc(&stats.dsp_blocks);
 

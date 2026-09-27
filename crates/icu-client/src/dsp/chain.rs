@@ -108,8 +108,9 @@ impl SendChain {
 
     /// Clears the adaptive state after the streams were reopened: the
     /// device may have changed, and a held gain for the old microphone
-    /// would hit the new one.
+    /// would hit the new one. The denoiser starts over too.
     pub fn restart(&mut self) {
+        self.denoiser = Denoiser::new();
         self.leveler.reset();
         self.prev_voice = false;
         self.voice_chain.reset();
@@ -132,7 +133,16 @@ impl SendChain {
             self.leveler.process_hinted(block, Some(self.prev_voice));
         }
         let prob = if s.denoise {
-            Some(self.denoiser.process(block))
+            let p = self.denoiser.process(block);
+            if p.is_finite() {
+                Some(p)
+            } else {
+                // Its state is no number: start over rather than leave the
+                // VAD deaf until the next restart.
+                self.denoiser = Denoiser::new();
+                block.fill(0.0);
+                None
+            }
         } else {
             None
         };
@@ -185,5 +195,57 @@ impl SendChain {
     /// diagnostics).
     pub fn gains_db(&self) -> (f32, f32) {
         (self.leveler.gain_db(), self.out_norm.gain_db())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsp::testsignal;
+
+    /// One corrupt capture block (a float driver's NaN or ±Inf) reaches the
+    /// denoiser with the leveler off. It must not poison it: afterwards the
+    /// probability is a number again and the voice is recognised.
+    #[test]
+    fn a_non_finite_block_does_not_poison_the_voice_detector() {
+        let s = SendSettings {
+            auto_level: false,
+            ..SendSettings::default()
+        };
+        let voice = testsignal::voice(48_000 * 3, 7, 0.05);
+        let mut chain = SendChain::new();
+        let run = |chain: &mut SendChain, range: std::ops::Range<usize>| {
+            let mut probs = Vec::new();
+            for (b, loud) in range.clone().zip(&voice.loud[range]) {
+                let mut block = voice.samples[b * 480..(b + 1) * 480].to_vec();
+                let a = chain.analyze(&mut block, &s);
+                chain.finish(&mut block, false, &s);
+                assert!(block.iter().all(|x| x.is_finite()), "block {b}");
+                if *loud {
+                    probs.push(a.prob);
+                }
+            }
+            probs
+        };
+        let blocks = voice.loud.len();
+        run(&mut chain, 0..blocks / 3);
+        let mut bad = vec![0.1f32; 480];
+        bad[10] = f32::NAN;
+        bad[20] = f32::INFINITY;
+        bad[30] = f32::NEG_INFINITY;
+        let a = chain.analyze(&mut bad, &s);
+        assert!(a.prob.is_none_or(f32::is_finite));
+        assert!(bad.iter().all(|x| x.is_finite()));
+        let after = run(&mut chain, blocks / 3 + 10..blocks);
+        let heard = after.iter().filter(|p| p.is_some_and(|p| p >= 0.5)).count();
+        assert!(
+            after.iter().all(|p| p.is_some_and(f32::is_finite)),
+            "a probability that is no number"
+        );
+        assert!(
+            heard * 2 > after.len(),
+            "voice heard in {heard} of {} loud blocks",
+            after.len()
+        );
     }
 }
