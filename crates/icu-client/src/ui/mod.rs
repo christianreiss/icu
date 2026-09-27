@@ -134,6 +134,35 @@ pub(crate) fn grow_to_fit(ctx: &egui::Context, overflow: f32) {
     }
 }
 
+/// ICU's eye for the title bar, taskbar and Alt+Tab (eframe would show its
+/// own logo); the child windows inherit it. Rendered from
+/// `packaging/files/icu.svg`, like `assets/icu.ico` for `icu.exe`.
+pub(crate) fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icu.png")).unwrap_or_default()
+}
+
+/// eframe's options for a window of its own: ICU's icon, and on Windows
+/// the DX12 shader compiler pinned to FXC (`d3dcompiler_47.dll`, part of
+/// Windows). wgpu's default first looks for `dxcompiler.dll`, which no
+/// Windows ships — a copy lying next to a downloaded `.icu` file must not
+/// be what renders ICU.
+pub(crate) fn native_options(viewport: egui::ViewportBuilder) -> eframe::NativeOptions {
+    #[allow(unused_mut)]
+    let mut options = eframe::NativeOptions {
+        viewport: viewport.with_icon(app_icon()),
+        ..Default::default()
+    };
+    #[cfg(windows)]
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        setup
+            .instance_descriptor
+            .backend_options
+            .dx12
+            .shader_compiler = eframe::wgpu::Dx12Compiler::Fxc;
+    }
+    options
+}
+
 /// Runs the main window until the user quits or logs out. Owns the engine.
 pub fn run_main_window(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String> {
     main_window::run(engine, debug_stats, show)
@@ -157,6 +186,32 @@ pub fn run_enroll_window_with(
     text: String,
 ) -> Result<Option<Identity>, String> {
     main_window::run_enroll(paths, server_addr, Some(text))
+}
+
+#[cfg(test)]
+mod native_options_tests {
+    /// The window gets ICU's icon, not eframe's (a default `IconData` would
+    /// mean none); on Windows DX12 compiles with FXC.
+    #[test]
+    fn windows_carry_the_icu_icon_and_no_dxc() {
+        let icon = super::app_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        let options = super::native_options(egui::ViewportBuilder::default());
+        assert_eq!(options.viewport.icon.as_deref(), Some(&icon));
+        #[cfg(windows)]
+        match &options.wgpu_options.wgpu_setup {
+            eframe::egui_wgpu::WgpuSetup::CreateNew(setup) => assert!(matches!(
+                setup
+                    .instance_descriptor
+                    .backend_options
+                    .dx12
+                    .shader_compiler,
+                eframe::wgpu::Dx12Compiler::Fxc
+            )),
+            other => panic!("unexpected wgpu setup: {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]

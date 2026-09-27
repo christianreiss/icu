@@ -2,6 +2,10 @@ ICU @VERSION@ für Windows 10/11 (64 Bit)
 
 Entpacken, icu.exe starten. Keine Installation, keine Administratorrechte.
 
+Einen Eintrag im Startmenü legt ICU ohne Installation nicht an. Wer ihn
+möchte: icu.exe dorthin legen, wo es bleiben soll, dann Rechtsklick auf
+icu.exe → „An „Start“ anheften“.
+
 Beim ersten Start warnt Windows („Der Computer wurde durch Windows
 geschützt“), weil icu.exe nicht signiert ist: „Weitere Informationen“, dann
 „Trotzdem ausführen“.

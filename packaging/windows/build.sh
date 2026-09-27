@@ -11,6 +11,7 @@
 #
 # Cross-built on Fedora for x86_64-pc-windows-gnu (Research/cross-compile.md):
 # needs mingw64-gcc, mingw64-gcc-c++, mingw64-winpthreads-static,
+# mingw64-binutils (windres for the icon and version resource),
 # rust-std-static-x86_64-pc-windows-gnu, meson, ninja, zip, cargo-about
 # 0.9.2 and cargo-deny 0.20.2 (same versions as the Linux build container). The exe is
 # unsigned; SmartScreen warns on first start (Research/packaging-licensing.md).
@@ -57,6 +58,12 @@ dlls=$(x86_64-w64-mingw32-objdump -p "$EXE" | awk '/DLL Name:/{print tolower($3)
 bad=$(echo "$dlls" | grep -Ev "$allowed" || true)
 [ -z "$bad" ] || die "icu.exe imports non-system DLLs: $bad"
 echo "$dlls" | tr '\n' ' '; echo
+
+log "resources: icon, version and manifest"
+# crates/icu-client/build.rs only warns when windres is missing; a release
+# without them shows a blank icon in Explorer and for .icu files.
+x86_64-w64-mingw32-objdump -h "$EXE" | grep -q '\.rsrc' \
+    || die "icu.exe has no resource section (x86_64-w64-mingw32-windres missing?)"
 
 log "supply chain and Windows third-party licenses"
 cargo deny --locked check
