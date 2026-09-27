@@ -798,3 +798,161 @@ async fn a_default_endpoint_change_reopens_the_audio_group_once() {
     wait_for(&engine, SOON, |s| s.banner.is_none()).await;
     drop(engine);
 }
+
+/// A backend whose microphone does not open while `mic` is off — a
+/// desktop without one — recording every open like [`Devices`]. No audio
+/// flows.
+struct NoMic {
+    mic: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    opened: Opened,
+    events: Option<std::sync::mpsc::Receiver<icu_client::audio::BackendEvent>>,
+}
+
+impl icu_client::audio::AudioBackend for NoMic {
+    fn name(&self) -> &'static str {
+        "test"
+    }
+    fn devices(&self) -> Vec<icu_client::audio::DeviceInfo> {
+        Vec::new()
+    }
+    fn open_capture(
+        &mut self,
+        device: Option<&str>,
+        _cb: icu_client::audio::CaptureCallback,
+    ) -> Result<(), icu_client::audio::BackendError> {
+        let kind = icu_client::audio::StreamKind::Capture;
+        self.opened
+            .lock()
+            .unwrap()
+            .push((kind, device.map(str::to_string)));
+        if self.mic.load(std::sync::atomic::Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("kein Standardgerät".into())
+        }
+    }
+    fn open_reference(
+        &mut self,
+        sink: Option<&str>,
+        _cb: icu_client::audio::CaptureCallback,
+    ) -> Result<(), icu_client::audio::BackendError> {
+        let kind = icu_client::audio::StreamKind::Reference;
+        self.opened
+            .lock()
+            .unwrap()
+            .push((kind, sink.map(str::to_string)));
+        Ok(())
+    }
+    fn open_playback(
+        &mut self,
+        device: Option<&str>,
+        _cb: icu_client::audio::PlaybackCallback,
+    ) -> Result<(), icu_client::audio::BackendError> {
+        let kind = icu_client::audio::StreamKind::Playback;
+        self.opened
+            .lock()
+            .unwrap()
+            .push((kind, device.map(str::to_string)));
+        Ok(())
+    }
+    fn close(&mut self, _stream: icu_client::audio::StreamKind) {}
+    fn take_events(
+        &mut self,
+    ) -> Option<std::sync::mpsc::Receiver<icu_client::audio::BackendEvent>> {
+        self.events.take()
+    }
+}
+
+/// A microphone that does not open is tried again on its own, and the
+/// streams that run are left alone: before, every attempt reopened all
+/// three — a gap in the playback and an AEC restart every 30 s on a desktop
+/// without a microphone. Once one is there, it opens and the banner goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_microphone_that_does_not_open_is_retried_alone() {
+    use icu_client::audio::StreamKind;
+    use std::sync::{atomic::AtomicBool, Arc, Mutex};
+
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let mic = Arc::new(AtomicBool::new(false));
+    let opened: Opened = Arc::new(Mutex::new(Vec::new()));
+    let (_events, events_rx) = std::sync::mpsc::channel();
+    let backend = NoMic {
+        mic: mic.clone(),
+        opened: opened.clone(),
+        events: Some(events_rx),
+    };
+    let mut settings = test_settings();
+    settings.audio.aec = true;
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, settings, paths);
+    cfg.server_addr = Some(server.addr());
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).expect("engine starts");
+    let count = |kind| {
+        opened
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .count()
+    };
+    let banner = engine.snapshot().banner.expect("a banner");
+    assert!(banner.text.contains("Mikrofon"), "{}", banner.text);
+
+    assert!(
+        wait_until(SOON, || count(StreamKind::Capture) >= 2).await,
+        "the microphone is tried again"
+    );
+    assert_eq!(count(StreamKind::Playback), 1, "the playback runs on");
+    assert_eq!(count(StreamKind::Reference), 1, "so does the reference");
+
+    mic.store(true, std::sync::atomic::Ordering::SeqCst);
+    wait_for(&engine, SOON, |s| s.banner.is_none()).await;
+    let tries = count(StreamKind::Capture);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(count(StreamKind::Capture), tries, "open now: no more tries");
+    assert_eq!(count(StreamKind::Playback), 1);
+    assert_eq!(count(StreamKind::Reference), 1);
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// The AEC reference failing is not the microphone failing: no banner
+/// saying so (the settings show the missing reference), and the streams
+/// are reopened as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reference_error_blames_no_microphone() {
+    use icu_client::audio::{BackendEvent, StreamKind};
+    use std::sync::{Arc, Mutex};
+
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let (events, rx) = std::sync::mpsc::channel();
+    let backend = Devices {
+        list: Arc::new(Mutex::new(vec![])),
+        opened: opened.clone(),
+        events: Some(rx),
+    };
+    let mut settings = test_settings();
+    settings.audio.aec = true;
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, settings, paths);
+    cfg.server_addr = Some(server.addr());
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).unwrap();
+    wait_connected(&engine).await;
+    opened.lock().unwrap().clear();
+    events
+        .send(BackendEvent::StreamError {
+            stream: StreamKind::Reference,
+            message: "loopback gone".into(),
+        })
+        .unwrap();
+    wait_for(&engine, SOON, |s| !s.aec_reference).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(engine.snapshot().banner, None);
+    assert!(
+        wait_until(SOON, || opened.lock().unwrap().len() >= 3).await,
+        "reopened after the backoff"
+    );
+    drop(engine);
+}

@@ -369,6 +369,9 @@ pub enum Command {
     HotkeyBackend(String),
     /// Reopen the audio streams after a backend error (`icu-audio-events`).
     ReopenStreams,
+    /// Try the streams that did not open again, only those
+    /// (`icu-audio-events`, internal).
+    RetryStreams,
     /// The device list changed (`icu-audio-events`, internal): reopen the
     /// streams if a saved device came back or went away.
     DevicesChanged,
@@ -631,6 +634,9 @@ struct Shared {
     /// Largest block the playback callback has asked for; the mixer keeps
     /// at least that much plus a block queued, whatever the graph quantum.
     play_request: Arc<AtomicUsize>,
+    /// The streams the last open could not open (`FAILED_CAPTURE` …); the
+    /// audio events thread has them retried alone ([`StreamRetry`]).
+    failed_streams: AtomicU8,
     /// The engine is shutting down: nothing may be written to `identity/`
     /// any more — a logout deletes it as soon as `Engine::shutdown` returns.
     closing: AtomicBool,
@@ -833,6 +839,7 @@ impl Engine {
             ref_prod: Arc::new(Mutex::new(ref_prod)),
             play_cons: Arc::new(Mutex::new(play_cons)),
             play_request: Arc::new(AtomicUsize::new(0)),
+            failed_streams: AtomicU8::new(0),
             closing: AtomicBool::new(false),
             net: Mutex::new(NetworkTracker::new()),
             video_tier: AtomicU8::new(VideoTier::T0.as_u8()),
@@ -885,6 +892,8 @@ impl Engine {
                     // together when a device vanishes.
                     let mut backoff = Duration::from_secs(1);
                     let mut last_error: Option<Instant> = None;
+                    // A stream that never opened is retried alone.
+                    let mut retry = StreamRetry::default();
                     let pending = Arc::new(AtomicBool::new(false));
                     let schedule_reopen = |delay: Duration| {
                         if pending.swap(true, Ordering::Relaxed) {
@@ -900,7 +909,16 @@ impl Engine {
                                 let _ = tx.send(Command::ReopenStreams);
                             });
                     };
-                    while let Ok(ev) = events.recv() {
+                    loop {
+                        let missing = shared.failed_streams.load(Ordering::Relaxed) != 0;
+                        if retry.due(Instant::now(), missing) {
+                            let _ = reopen_tx.send(Command::RetryStreams);
+                        }
+                        let ev = match events.recv_timeout(RETRY_POLL) {
+                            Ok(ev) => ev,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        };
                         match ev {
                             BackendEvent::DefaultDeviceChanged => {
                                 schedule_reopen(Duration::from_millis(100));
@@ -922,15 +940,23 @@ impl Engine {
                             }
                             BackendEvent::StreamError { stream, message } => {
                                 tracing::warn!(?stream, %message, "audio stream error");
-                                shared.state.send_modify(|s| {
-                                    s.banner = Some(crate::problem::audio(
-                                        match stream {
-                                            StreamKind::Playback => "Der Lautsprecher",
-                                            _ => "Das Mikrofon",
-                                        },
-                                        &format!("{stream:?}: {message}"),
-                                    ))
-                                });
+                                // The AEC reference is no device of its own:
+                                // like a reference that does not open, it
+                                // shows in the settings, not as a banner
+                                // about the microphone.
+                                let device = match stream {
+                                    StreamKind::Capture => Some("Das Mikrofon"),
+                                    StreamKind::Playback => Some("Der Lautsprecher"),
+                                    StreamKind::Reference => None,
+                                };
+                                if let Some(device) = device {
+                                    shared.state.send_modify(|s| {
+                                        s.banner = Some(crate::problem::audio(
+                                            device,
+                                            &format!("{stream:?}: {message}"),
+                                        ))
+                                    });
+                                }
                                 if let Some(backend) = backend.upgrade() {
                                     lock(&backend).close(stream);
                                 }
@@ -1074,6 +1100,10 @@ impl Engine {
     }
 }
 
+/// How often the audio events thread looks whether a stream that did not
+/// open is due for a retry ([`StreamRetry`]).
+const RETRY_POLL: Duration = Duration::from_millis(250);
+
 /// How long [`Engine::shutdown`] waits for the network task: the close
 /// handshake (≤ 0.5 s), the last settings write (≤ [`SETTINGS_FLUSH_WAIT`]).
 const NET_STOP_WAIT: Duration = Duration::from_secs(3);
@@ -1114,6 +1144,101 @@ fn effective_device(
     }
 }
 
+/// [`Shared::failed_streams`]: the microphone did not open.
+const FAILED_CAPTURE: u8 = 1;
+/// [`Shared::failed_streams`]: the AEC reference did not open, or was
+/// closed with a playback that did not ([`reference_needs_playback`]).
+const FAILED_REFERENCE: u8 = 2;
+/// [`Shared::failed_streams`]: the playback did not open.
+const FAILED_PLAYBACK: u8 = 4;
+
+/// Opens the microphone into the capture ring.
+fn open_capture_stream(
+    backend: &mut dyn AudioBackend,
+    input: Option<&str>,
+    shared: &Arc<Shared>,
+) -> Result<(), crate::audio::BackendError> {
+    let stats = shared.stats.clone();
+    let cap_prod = shared.cap_prod.clone();
+    let cycle = shared.cycle.clone();
+    backend.open_capture(
+        input,
+        Box::new(move |block| {
+            // A failed `try_lock` (stream reopen in flight) loses the block
+            // like a full ring does; count both.
+            let pushed = cap_prod
+                .try_lock()
+                .map(|mut p| p.push_slice(block))
+                .unwrap_or(0);
+            if pushed < block.len() {
+                DebugStats::inc(&stats.capture_overruns);
+            }
+            cycle.capture_pushed(block.len());
+        }),
+    )
+}
+
+/// Opens the AEC reference into its ring.
+fn open_reference_stream(
+    backend: &mut dyn AudioBackend,
+    output: Option<&str>,
+    shared: &Arc<Shared>,
+) -> Result<(), crate::audio::BackendError> {
+    let ref_prod = shared.ref_prod.clone();
+    let cycle = shared.cycle.clone();
+    let stats = shared.stats.clone();
+    backend.open_reference(
+        output,
+        Box::new(move |block| {
+            let pushed = ref_prod
+                .try_lock()
+                .map(|mut p| p.push_slice(block))
+                .unwrap_or(0);
+            if pushed < block.len() {
+                DebugStats::inc(&stats.reference_overruns);
+            }
+            cycle.reference_pushed();
+        }),
+    )?;
+    shared.cycle.set_slack(backend.reference_slack());
+    Ok(())
+}
+
+/// Opens the playback from the playback ring.
+fn open_playback_stream(
+    backend: &mut dyn AudioBackend,
+    output: Option<&str>,
+    shared: &Arc<Shared>,
+) -> Result<(), crate::audio::BackendError> {
+    let play_cons = shared.play_cons.clone();
+    let play_request = shared.play_request.clone();
+    let stats = shared.stats.clone();
+    // The new device may run a smaller quantum; let the mixer's lead shrink
+    // back to it instead of keeping the old device's for the session.
+    play_request.store(0, Ordering::Relaxed);
+    backend.open_playback(
+        output,
+        Box::new(move |out| {
+            play_request.fetch_max(out.len(), Ordering::Relaxed);
+            let n = match play_cons.try_lock() {
+                Ok(mut c) => c.pop_slice(out),
+                Err(_) => 0,
+            };
+            if n < out.len() {
+                // The mixer always queues (silence included): a gap.
+                DebugStats::inc(&stats.playback_underruns);
+            }
+            out[n..].fill(0.0);
+        }),
+    )
+}
+
+/// WASAPI loopback has no clock while the endpoint is idle: without ICU's
+/// own playback it can stop delivering, stalling every outgoing block.
+fn reference_needs_playback(backend: &dyn AudioBackend) -> bool {
+    cfg!(windows) && backend.name() == "wasapi"
+}
+
 fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Arc<Shared>) {
     // Replace stale device errors with the outcome of this attempt. Keep
     // unrelated storage/network errors; failed opens below report a fresh one.
@@ -1132,99 +1257,164 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
     if output.is_none() && settings.audio.output_device.is_some() {
         tracing::info!(saved = ?settings.audio.output_device, "speaker missing, using the default");
     }
-    let stats = shared.stats.clone();
-    let cap_prod = shared.cap_prod.clone();
-    let cycle = shared.cycle.clone();
-    if let Err(e) = backend.open_capture(
-        input.as_deref(),
-        Box::new(move |block| {
-            // A failed `try_lock` (stream reopen in flight) loses the block
-            // like a full ring does; count both.
-            let pushed = cap_prod
-                .try_lock()
-                .map(|mut p| p.push_slice(block))
-                .unwrap_or(0);
-            if pushed < block.len() {
-                DebugStats::inc(&stats.capture_overruns);
-            }
-            cycle.capture_pushed(block.len());
-        }),
-    ) {
+    let mut failed = 0;
+    if let Err(e) = open_capture_stream(backend, input.as_deref(), shared) {
         tracing::warn!(error = %e, "cannot open capture");
+        failed |= FAILED_CAPTURE;
         shared
             .state
             .send_modify(|s| s.banner = Some(crate::problem::audio("Das Mikrofon", &e)));
     }
     let mut reference_open = false;
     if settings.audio.aec {
-        let ref_prod = shared.ref_prod.clone();
-        let cycle = shared.cycle.clone();
-        let stats = shared.stats.clone();
-        match backend.open_reference(
-            output.as_deref(),
-            Box::new(move |block| {
-                let pushed = ref_prod
-                    .try_lock()
-                    .map(|mut p| p.push_slice(block))
-                    .unwrap_or(0);
-                if pushed < block.len() {
-                    DebugStats::inc(&stats.reference_overruns);
-                }
-                cycle.reference_pushed();
-            }),
-        ) {
-            Ok(()) => {
-                reference_open = true;
-                shared.cycle.set_slack(backend.reference_slack());
+        match open_reference_stream(backend, output.as_deref(), shared) {
+            Ok(()) => reference_open = true,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot open AEC reference");
+                failed |= FAILED_REFERENCE;
             }
-            Err(e) => tracing::warn!(error = %e, "cannot open AEC reference"),
         }
     }
     shared
         .reference_open
         .store(reference_open, Ordering::Relaxed);
-    let active_input = input.clone();
-    let active_output = output.clone();
+    if let Err(e) = open_playback_stream(backend, output.as_deref(), shared) {
+        tracing::warn!(error = %e, "cannot open playback");
+        failed |= FAILED_PLAYBACK;
+        if reference_open && reference_needs_playback(backend) {
+            backend.close(StreamKind::Reference);
+            reference_open = false;
+            shared.reference_open.store(false, Ordering::Relaxed);
+            failed |= FAILED_REFERENCE;
+        }
+        shared
+            .state
+            .send_modify(|s| s.banner = Some(crate::problem::audio("Der Lautsprecher", &e)));
+    }
+    shared.failed_streams.store(failed, Ordering::Relaxed);
+    // Published last: whoever sees the devices of this attempt sees every
+    // one of its streams opened.
     shared.state.send_modify(|s| {
         s.aec_reference = reference_open;
-        s.active_input = active_input;
-        s.active_output = active_output;
+        s.active_input = input;
+        s.active_output = output;
     });
-    let play_cons = shared.play_cons.clone();
-    let play_request = shared.play_request.clone();
-    let stats = shared.stats.clone();
-    // The new device may run a smaller quantum; let the mixer's lead shrink
-    // back to it instead of keeping the old device's for the session.
-    play_request.store(0, Ordering::Relaxed);
-    match backend.open_playback(
-        output.as_deref(),
-        Box::new(move |out| {
-            play_request.fetch_max(out.len(), Ordering::Relaxed);
-            let n = match play_cons.try_lock() {
-                Ok(mut c) => c.pop_slice(out),
-                Err(_) => 0,
-            };
-            if n < out.len() {
-                // The mixer always queues (silence included): a gap.
-                DebugStats::inc(&stats.playback_underruns);
+}
+
+/// Opens what [`open_streams`] could not, and only that
+/// ([`Shared::failed_streams`]): the streams that run are left alone. A
+/// desktop without a microphone used to reopen all three every 30 s — a
+/// gap in the playback and an AEC restart each time. On the devices the
+/// last open chose; a device that came or went reopens everything
+/// (`Command::DevicesChanged`). A microphone or reference that opens
+/// restarts the DSP's rings together, so the reference lag reads true
+/// again.
+fn retry_failed_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Arc<Shared>) {
+    let failed = shared.failed_streams.load(Ordering::Relaxed);
+    if failed == 0 {
+        return;
+    }
+    let (input, output) = {
+        let s = shared.state.borrow();
+        (s.active_input.clone(), s.active_output.clone())
+    };
+    let mut still = 0;
+    let mut restart_dsp = false;
+    if failed & FAILED_CAPTURE != 0 {
+        match open_capture_stream(backend, input.as_deref(), shared) {
+            Ok(()) => {
+                tracing::info!("microphone opened on a retry");
+                restart_dsp = true;
             }
-            out[n..].fill(0.0);
-        }),
-    ) {
-        Ok(()) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot open playback");
-            // WASAPI loopback has no clock while the endpoint is idle. Without
-            // playback it can stop delivering, stalling every outgoing block.
-            #[cfg(windows)]
-            if backend.name() == "wasapi" {
-                backend.close(StreamKind::Reference);
-                shared.reference_open.store(false, Ordering::Relaxed);
-                shared.state.send_modify(|s| s.aec_reference = false);
+            Err(e) => {
+                tracing::debug!(error = %e, "microphone still does not open");
+                still |= FAILED_CAPTURE;
             }
-            shared
-                .state
-                .send_modify(|s| s.banner = Some(crate::problem::audio("Der Lautsprecher", &e)));
+        }
+    }
+    if failed & FAILED_PLAYBACK != 0 {
+        match open_playback_stream(backend, output.as_deref(), shared) {
+            Ok(()) => tracing::info!("playback opened on a retry"),
+            Err(e) => {
+                tracing::debug!(error = %e, "playback still does not open");
+                still |= FAILED_PLAYBACK;
+            }
+        }
+    }
+    let mut reference_open = shared.reference_open.load(Ordering::Relaxed);
+    if failed & FAILED_REFERENCE != 0 && settings.audio.aec {
+        if still & FAILED_PLAYBACK != 0 && reference_needs_playback(backend) {
+            still |= FAILED_REFERENCE;
+        } else {
+            match open_reference_stream(backend, output.as_deref(), shared) {
+                Ok(()) => {
+                    tracing::info!("AEC reference opened on a retry");
+                    reference_open = true;
+                    restart_dsp = true;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "AEC reference still does not open");
+                    still |= FAILED_REFERENCE;
+                }
+            }
+        }
+    }
+    if restart_dsp {
+        shared.dsp.reinit_aec.store(true, Ordering::Relaxed);
+    }
+    shared
+        .reference_open
+        .store(reference_open, Ordering::Relaxed);
+    shared.failed_streams.store(still, Ordering::Relaxed);
+    shared.state.send_modify(|s| {
+        s.aec_reference = reference_open;
+        if still & (FAILED_CAPTURE | FAILED_PLAYBACK) == 0
+            && s.banner
+                .as_ref()
+                .is_some_and(crate::problem::Problem::is_audio)
+        {
+            s.banner = None;
+        }
+    });
+}
+
+/// When the streams that did not open are tried again
+/// ([`Command::RetryStreams`]): 1, 2, 4 … 30 s after the failure was
+/// noticed, starting over once nothing is missing.
+#[derive(Debug)]
+struct StreamRetry {
+    backoff: Duration,
+    next: Option<Instant>,
+}
+
+impl Default for StreamRetry {
+    fn default() -> Self {
+        StreamRetry {
+            backoff: Duration::from_secs(1),
+            next: None,
+        }
+    }
+}
+
+impl StreamRetry {
+    /// Whether a retry is due at `now`, `missing` saying whether a stream
+    /// is missing.
+    fn due(&mut self, now: Instant, missing: bool) -> bool {
+        if !missing {
+            *self = StreamRetry::default();
+            return false;
+        }
+        match self.next {
+            None => {
+                self.next = Some(now + self.backoff);
+                false
+            }
+            Some(at) if now >= at => {
+                self.backoff = (self.backoff * 2).min(Duration::from_secs(30));
+                self.next = Some(now + self.backoff);
+                true
+            }
+            Some(_) => false,
         }
     }
 }
@@ -2644,9 +2834,12 @@ impl LocalState {
                 tracing::info!("reopening audio streams after a stream error");
                 self.reopen_streams(shared);
             }
+            Command::RetryStreams => self.retry_streams(shared),
             Command::DevicesChanged => {
                 // A saved device came back or went away: follow it. Anything
-                // else in the list changing leaves the streams alone.
+                // else in the list changing leaves the running streams alone
+                // and tries the ones that did not open — the device they
+                // were missing may be the one that came.
                 let want = wanted_devices(&self.settings, &lock(&self.backend).devices());
                 let active = {
                     let s = shared.state.borrow();
@@ -2655,6 +2848,8 @@ impl LocalState {
                 if want != active {
                     tracing::info!(?want, ?active, "audio devices changed, reopening");
                     self.reopen_streams(shared);
+                } else {
+                    self.retry_streams(shared);
                 }
             }
             Command::RequestRename(_) => {
@@ -2877,6 +3072,15 @@ impl LocalState {
         open_streams(&mut **backend, &self.settings, shared);
         let devices = backend.devices();
         shared.state.send_modify(|s| s.devices = devices);
+    }
+
+    /// [`retry_failed_streams`], if anything is missing.
+    fn retry_streams(&mut self, shared: &Arc<Shared>) {
+        if shared.failed_streams.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut backend = lock(&self.backend);
+        retry_failed_streams(&mut **backend, &self.settings, shared);
     }
 
     fn cue(&self, shared: &Arc<Shared>, cue: Cue) {
@@ -4440,6 +4644,28 @@ mod tests {
         assert_eq!(video.frames(3), 0, "a stale frame creates no receiver");
         let _ = video.accept_for(new, 3, &frame());
         assert_eq!(video.frames(3), 1);
+    }
+
+    /// A stream that did not open is tried again 1, 2, 4 … 30 s after the
+    /// failure was noticed, and the schedule starts over once nothing is
+    /// missing.
+    #[test]
+    fn a_missing_stream_is_retried_with_backoff() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut r = StreamRetry::default();
+        assert!(!r.due(t0, false));
+        assert!(!r.due(t0, true), "noticed");
+        let mut tries = Vec::new();
+        for s in 0..120 {
+            if r.due(at(s), true) {
+                tries.push(s);
+            }
+        }
+        assert_eq!(tries, [1, 3, 7, 15, 31, 61, 91]);
+        assert!(!r.due(at(120), false), "open now");
+        assert!(!r.due(at(121), true));
+        assert!(r.due(at(122), true), "the next failure starts at 1 s again");
     }
 
     /// A lost automatic renewal is retried on the next connect; a lost
