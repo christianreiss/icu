@@ -259,13 +259,15 @@ async fn in_band_invitations_are_rate_limited_per_admin() {
 /// Revoking an invitation nobody used frees its place under
 /// `limits.max_pending_invites` right away; it used to hold the place until
 /// it expired, up to a week.
+///
+/// On an empty server, so the invitation is the first bundle and marked
+/// admin: withdrawing it used to fail with `LAST_ADMIN` (external review
+/// 2026-09-27, S-1), and whoever redeemed a leaked one became the only
+/// admin.
 #[tokio::test]
 async fn a_revoked_invitation_frees_its_place() {
     use icu_server::{AdminRequest, AdminResponse};
     let server = TestServer::start_with(|c| c.limits.max_pending_invites = Some(1)).await;
-    // A confirmed admin first: the first bundle of an empty server is marked
-    // admin, and the last admin cannot be revoked.
-    server.enroll("admin").await;
     let invite = |name: &str| {
         server.handle.admin(AdminRequest::Invite {
             name: name.to_string(),
@@ -273,7 +275,13 @@ async fn a_revoked_invitation_frees_its_place() {
         })
     };
     let first = invite("guest").await;
-    assert!(matches!(first, AdminResponse::Invite { .. }), "{first:?}");
+    let AdminResponse::Invite {
+        bundle, is_admin, ..
+    } = &first
+    else {
+        panic!("{first:?}")
+    };
+    assert!(is_admin, "the first bundle of an empty server");
     let full = invite("guest2").await;
     assert!(
         matches!(&full, AdminResponse::Error { error, .. } if error == "RATE_LIMITED"),
@@ -289,6 +297,10 @@ async fn a_revoked_invitation_frees_its_place() {
     assert!(
         matches!(revoked, AdminResponse::Revoke { .. }),
         "{revoked:?}"
+    );
+    assert!(
+        server.register(bundle, "mallory").await.is_err(),
+        "the withdrawn bundle is dead"
     );
     let again = invite("guest2").await;
     assert!(matches!(again, AdminResponse::Invite { .. }), "{again:?}");
