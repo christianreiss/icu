@@ -2087,6 +2087,7 @@ async fn net_task(
         // must not tell.
         end_session(&shared);
         local.forget_session(&shared);
+        let slowly = matches!(outcome, SessionEnd::RetrySlowly(_));
         match outcome {
             SessionEnd::Quit => break,
             SessionEnd::Fatal(reason) => {
@@ -2100,8 +2101,12 @@ async fn net_task(
                     _ => attempt = 0,
                 }
             }
-            SessionEnd::Retry(reason) => {
-                let wait = conn::backoff(attempt);
+            SessionEnd::Retry(reason) | SessionEnd::RetrySlowly(reason) => {
+                let wait = if slowly {
+                    conn::slow_backoff(attempt)
+                } else {
+                    conn::backoff(attempt)
+                };
                 attempt += 1;
                 shared.state.send_modify(|s| {
                     s.conn = ConnStatus::Disconnected { reason, attempt };
@@ -2168,6 +2173,9 @@ enum SessionEnd {
     Quit,
     Fatal(Problem),
     Retry(Problem),
+    /// Retried after [`conn::slow_backoff`]: a server certificate nobody
+    /// vouched for (`ConnectError::retries_slowly`).
+    RetrySlowly(Problem),
 }
 
 impl From<ConnectError> for SessionEnd {
@@ -2176,6 +2184,8 @@ impl From<ConnectError> for SessionEnd {
     fn from(e: ConnectError) -> SessionEnd {
         if e.is_fatal() {
             SessionEnd::Fatal(e.problem())
+        } else if e.retries_slowly() {
+            SessionEnd::RetrySlowly(e.problem())
         } else {
             SessionEnd::Retry(e.problem())
         }

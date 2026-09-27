@@ -62,6 +62,20 @@ impl std::fmt::Display for Problem {
 pub const CREDENTIALS_STALE: &str = "Deine Zugangsdaten passen nicht (mehr) zu diesem Server – \
      vermutlich wurde er neu eingerichtet. Bitte beim Admin eine neue Einladung anfordern.";
 
+/// The server's certificate does not come from our CA, and the server has
+/// not proven anything yet (`net::conn::ConnectError::Unverified`): a server
+/// set up anew and somebody on the path look the same. Not „neue Einladung
+/// anfordern“ — an attacker's invitation is exactly what would come next.
+pub const SERVER_UNVERIFIED: &str = "Server-Identität nicht bestätigt – möglicher Angriff oder \
+     der Server wurde neu aufgesetzt. Beim Admin auf anderem Weg nachfragen und keine Dateien \
+     von Dritten einspielen. ICU versucht es weiter.";
+
+/// Like [`SERVER_UNVERIFIED`], for a certificate of our CA issued to another
+/// name.
+pub const SERVER_NAME_UNVERIFIED: &str = "Die Serveradresse passt nicht zum Zertifikat des \
+     Servers – möglicher Angriff oder der Server ist umgezogen. Beim Admin auf anderem Weg \
+     nachfragen und keine Dateien von Dritten einspielen. ICU versucht es weiter.";
+
 /// Our certificate was revoked. Since 2026-09-25 that is what a second
 /// device holding the same passport sees once the other one renewed or
 /// renamed and logged in with the new certificate: that login revokes every
