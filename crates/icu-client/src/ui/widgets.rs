@@ -487,16 +487,28 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
     response
 }
 
+/// Room for the dot and the padding around a [`status_link`]'s word.
+const STATUS_PAD: f32 = 26.0;
+
+fn status_galley(ui: &Ui, text: &str) -> std::sync::Arc<egui::Galley> {
+    ui.painter().layout_no_wrap(
+        text.to_string(),
+        FontId::new(12.0, egui::FontFamily::Proportional),
+        theme::tokens(ui.visuals()).muted_text,
+    )
+}
+
+/// How wide a [`status_link`] with this word is.
+pub fn status_link_width(ui: &Ui, text: &str) -> f32 {
+    status_galley(ui, text).size().x + STATUS_PAD
+}
+
 /// The header's connection indicator: a dot and one quiet word, clickable
 /// as a whole. Anything longer belongs in the caller's tooltip.
 pub fn status_link(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
     let tok = theme::tokens(ui.visuals());
-    let galley = ui.painter().layout_no_wrap(
-        text.to_string(),
-        FontId::new(12.0, egui::FontFamily::Proportional),
-        tok.muted_text,
-    );
-    let size = egui::vec2(galley.size().x + 26.0, 24.0);
+    let galley = status_galley(ui, text);
+    let size = egui::vec2(galley.size().x + STATUS_PAD, 24.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     response
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), text));
@@ -751,15 +763,18 @@ pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui:
 // Audio indicators
 // ---------------------------------------------------------------------------
 
+/// How wide [`speaking_bars`] are: five bars of 2, 2 apart.
+pub const SPEAKING_BARS_W: f32 = 5.0 * 2.0 + 4.0 * 2.0;
+
 /// Five static accent bars indicating "currently speaking". Always
 /// allocates its footprint so rows don't reflow when this toggles.
 pub fn speaking_bars(ui: &mut Ui) -> egui::Response {
     const HEIGHTS: [f32; 5] = [5.0, 11.0, 7.0, 13.0, 6.0];
     let w = 2.0;
     let gap = 2.0;
-    let total_w = HEIGHTS.len() as f32 * w + (HEIGHTS.len() as f32 - 1.0) * gap;
     let max_h = 13.0;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(total_w, max_h), Sense::hover());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(SPEAKING_BARS_W, max_h), Sense::hover());
     if ui.is_rect_visible(rect) {
         let tok = theme::tokens(ui.visuals());
         let painter = ui.painter();

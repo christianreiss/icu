@@ -42,7 +42,7 @@ use icu_proto::{AudioParams, UserFlags, UserInfo, UserSummary};
 mod common;
 
 /// What the windows open with (`ui::main_window`).
-const MAIN: [f32; 2] = [400.0, 620.0];
+const MAIN: [f32; 2] = icu_client::ui::main_window::MAIN_SIZE;
 const SETTINGS: [f32; 2] = icu_client::ui::main_window::SETTINGS_SIZE;
 const CONNECTION: [f32; 2] = icu_client::ui::main_window::CONNECTION_SIZE;
 const SETUP: [f32; 2] = icu_client::ui::main_window::SETUP_SIZE;
@@ -367,11 +367,29 @@ fn main_window(
     (harness, overflow)
 }
 
+/// Four people, the room the main window opens for: oneself and three
+/// more, the longest name speaking with every badge column in use, so the
+/// narrow window is checked at its widest row.
+fn four() -> AppState {
+    let mut s = state();
+    s.peers = vec![
+        peer(2, "Anna", UserFlags::PTT | UserFlags::VIEWING, 18),
+        peer(5, "Dennis", UserFlags::DEAFENED | UserFlags::MUTED, 170),
+        peer(
+            6,
+            "Eva-Maria Schulte",
+            UserFlags::SPEAKING | UserFlags::ADMIN | UserFlags::CAMERA_ON | UserFlags::VIEWING,
+            22,
+        ),
+    ];
+    s
+}
+
 #[test]
 fn main_window_fits() {
     let mut overflows = Overflows::default();
     let cases: Vec<(&str, AppState)> = vec![
-        ("room", state()),
+        ("four", four()),
         ("alone", {
             let mut s = state();
             s.peers.clear();
@@ -387,7 +405,7 @@ fn main_window_fits() {
             s
         }),
         ("restricted", {
-            let mut s = state();
+            let mut s = four();
             s.muted = true;
             s.restricted_muted = true;
             s
@@ -400,6 +418,26 @@ fn main_window_fits() {
             overflows.check(&what, *overflow.borrow());
             shot(&mut h, &what.replace('/', "-"));
         }
+    }
+    overflows.assert_none();
+}
+
+/// More than four people do not fit the window as it opens; after
+/// connecting it grows to fit them (`App::fit_to_list`), and a room of six
+/// must still fit on a 1080p screen.
+#[test]
+fn main_window_grows_for_a_bigger_room() {
+    let mut overflows = Overflows::default();
+    for theme_name in THEMES {
+        let (mut h, overflow) = main_window(state(), theme_name);
+        let what = format!("main/room/{theme_name}");
+        let overflow = *overflow.borrow();
+        let height = MAIN[1] + overflow.max(0.0);
+        eprintln!("{what:<44} overflow {overflow:>7.1} px, grows to {height:>6.1} px");
+        if height > MAX_HEIGHT {
+            overflows.0.push(format!("{what}: {height:.0} px tall"));
+        }
+        shot(&mut h, &what.replace('/', "-"));
     }
     overflows.assert_none();
 }

@@ -49,6 +49,13 @@ type Toggle = (
     Option<Command>,
 );
 
+/// What the main window opens with: four people — oneself and three more —
+/// fit without a scroll bar, and it is no wider than the control dock needs;
+/// long names end in „…“ (`tests/ui_layout.rs`). A bigger room grows it after
+/// connecting (`App::fit_to_list`).
+pub const MAIN_SIZE: [f32; 2] = [360.0, 420.0];
+/// The smallest the main window can be made.
+pub const MAIN_MIN_SIZE: [f32; 2] = [360.0, 320.0];
 /// What the settings window opens with: every page fits without a scroll
 /// bar at this size unless expert rows or a long member list make it grow
 /// (`tests/ui_layout.rs`).
@@ -88,8 +95,8 @@ pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String
         viewport: egui::ViewportBuilder::default()
             .with_title("ICU")
             .with_app_id("icu")
-            .with_inner_size([400.0, 620.0])
-            .with_min_inner_size([360.0, 320.0])
+            .with_inner_size(MAIN_SIZE)
+            .with_min_inner_size(MAIN_MIN_SIZE)
             .with_resizable(true)
             .with_visible(!start_minimized),
         ..Default::default()
@@ -200,19 +207,30 @@ struct App {
 
 impl App {
     /// Window height follows the people list: once after connecting it
-    /// shrinks or grows to exactly fit, afterwards it only grows, and only
-    /// when somebody joins — a window the user made smaller stays so.
+    /// shrinks or grows to fit, but not below the four people it opens for
+    /// (`MAIN_SIZE`); afterwards it only grows, and only when somebody joins
+    /// — a window the user made smaller stays so. Without a connection it
+    /// only grows, for a banner that would not fit.
     fn fit_to_list(&mut self, ctx: &egui::Context, overflow: f32) {
         let state = &self.state;
         let connected = state.conn == ConnStatus::Connected && state.me.is_some();
         if !connected {
             self.fitted = false;
             self.rows_seen = 0;
+            if !self.hidden {
+                super::grow_to_fit(ctx, overflow);
+            }
             return;
         }
         let rows = state.peers.len() + 1;
         let joined = rows > self.rows_seen;
         self.rows_seen = rows;
+        let inner = ctx.content_rect();
+        let overflow = if self.fitted {
+            overflow
+        } else {
+            overflow.max(MAIN_SIZE[1] - inner.height())
+        };
         let resize = if !self.fitted {
             overflow.abs() > 1.0
         } else {
@@ -224,7 +242,6 @@ impl App {
         }
         // Shrinking is only right once, right after connecting; afterwards
         // the window only grows (`super::grow_to_fit`).
-        let inner = ctx.content_rect();
         let monitor = ctx.input(|i| i.viewport().monitor_size);
         let max = monitor.map_or(f32::INFINITY, |m| m.y * 0.9);
         #[cfg(windows)]
@@ -609,7 +626,7 @@ impl eframe::App for App {
         let ctx = root.ctx().clone();
         #[cfg(windows)]
         if !self.positioned {
-            self.positioned = super::position_window(&ctx, [400.0, 620.0], [360.0, 320.0]);
+            self.positioned = super::position_window(&ctx, MAIN_SIZE, MAIN_MIN_SIZE);
         }
         ctx.request_repaint_after(Duration::from_millis(33));
 
@@ -1042,22 +1059,46 @@ impl MainView {
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         ui.add_space(4.0);
+                        let (color, short, detail) = conn_status(state, &tok);
+                        let admin = format!("{} Admin", icon::SHIELD_STAR);
                         // The server, then the connection as a dot and a word.
                         // The own name is not repeated here — it is the first
-                        // row of the list right below.
-                        ui.label(theme::strong_text(&state.server_name));
+                        // row of the list right below. The server name gets
+                        // what the rest of the row leaves and ends in „…“ in
+                        // a narrow window, whole on hover.
+                        let gap = ui.spacing().item_spacing.x;
+                        let text_w = |text: &str, size: f32| {
+                            ui.painter()
+                                .layout_no_wrap(
+                                    text.to_string(),
+                                    egui::FontId::proportional(size),
+                                    tok.muted_text,
+                                )
+                                .size()
+                                .x
+                        };
+                        let mut rest = 3.0 * HEADER + 2.0 * 2.0 + gap;
+                        rest += widgets::status_link_width(ui, &short) + gap;
+                        if state.is_admin {
+                            rest += text_w(&admin, 12.0) + 4.0 + gap;
+                        }
+                        if env.video_tier != VideoTier::T0 {
+                            rest += text_w(icon::VIDEO_CAMERA_SLASH, 15.0) + gap;
+                        }
+                        let room = (ui.available_width() - rest - gap).max(24.0);
+                        ui.scope(|ui| {
+                            ui.set_max_width(room);
+                            ui.add(
+                                egui::Label::new(theme::strong_text(&state.server_name)).truncate(),
+                            );
+                        });
                         // Own role on this server: an admin sees it at a
                         // glance, not only behind the Benutzer tab.
                         if state.is_admin {
-                            ui.label(
-                                RichText::new(format!("{} Admin", icon::SHIELD_STAR))
-                                    .size(12.0)
-                                    .color(tok.accent),
-                            )
-                            .on_hover_text("Du bist Admin auf diesem Server");
+                            ui.label(RichText::new(admin).size(12.0).color(tok.accent))
+                                .on_hover_text("Du bist Admin auf diesem Server");
                             ui.add_space(4.0);
                         }
-                        let (color, short, detail) = conn_status(state, &tok);
                         // Clickable in every state, not just Connected: a failed
                         // or retrying connection is exactly when the details are
                         // worth a window instead of a one-line tooltip.
@@ -1362,9 +1403,11 @@ impl MainView {
                 .corner_radius(egui::CornerRadius::same(theme::R_CARD))
                 .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
+                    let visible = ui.available_height();
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
+                            let top = ui.cursor().top();
                             ui.spacing_mut().item_spacing.y = 4.0;
                             ui.add_space(2.0);
                             if let Some(me) = &state.me {
@@ -1443,7 +1486,8 @@ impl MainView {
                                 );
                             }
                             if state.peers.is_empty() {
-                                empty(ui, &state.conn);
+                                let used = ui.cursor().top() - top;
+                                empty(ui, &state.conn, visible - used);
                             }
                         })
                 })
@@ -1765,11 +1809,30 @@ fn participant_row(
                     }
                     let avatar = widgets::avatar(ui, p.name, p.user_id, p.speaking, 30.0, p.video);
                     ui.add_space(2.0);
-                    let name = ui.label(if p.mode.is_some() {
-                        theme::strong_text(p.name)
-                    } else {
-                        RichText::new(p.name).size(14.0)
-                    });
+                    // The name gets what the icons on the right leave — ping
+                    // 22, volume 28, an 18 slot for the mode and one per badge
+                    // column, 6 apart — and ends in „…“ in a narrow window,
+                    // whole on hover.
+                    let gap = ui.spacing().item_spacing.x;
+                    let slots = 1.0 + columns.len() as f32;
+                    let mut rest = 22.0 + 28.0 + 18.0 * slots + 6.0 * (slots + 1.0) + gap;
+                    if p.speaking {
+                        rest += widgets::SPEAKING_BARS_W + gap;
+                    }
+                    let room = (ui.available_width() - rest).max(24.0);
+                    let name = ui
+                        .scope(|ui| {
+                            ui.set_max_width(room);
+                            ui.add(
+                                egui::Label::new(if p.mode.is_some() {
+                                    theme::strong_text(p.name)
+                                } else {
+                                    RichText::new(p.name).size(14.0)
+                                })
+                                .truncate(),
+                            )
+                        })
+                        .inner;
                     if !hint.is_empty() {
                         avatar.on_hover_text(&hint);
                         name.on_hover_text(&hint);
@@ -2094,8 +2157,10 @@ fn moderation_menu(
 }
 
 /// The empty list: alone in the room, or not in it at all — never a blank
-/// card that looks like something failed to draw.
-fn empty(ui: &mut egui::Ui, conn: &ConnStatus) {
+/// card that looks like something failed to draw. Centered in the `room`
+/// the list leaves it, but no lower than 48 points down, so it also fits
+/// under an error banner in a short window.
+fn empty(ui: &mut egui::Ui, conn: &ConnStatus, room: f32) {
     let tok = theme::tokens(ui.visuals());
     let (glyph, text) = match conn {
         ConnStatus::Connected => (icon::USERS, "Allein hier"),
@@ -2103,8 +2168,21 @@ fn empty(ui: &mut egui::Ui, conn: &ConnStatus) {
         ConnStatus::Disconnected { .. } => (icon::PLUGS, "Getrennt — verbinde gleich neu"),
         ConnStatus::Fatal(_) => (icon::PLUGS, "Nicht verbunden"),
     };
+    let height = |text: &str, size: f32| {
+        ui.painter()
+            .layout_no_wrap(
+                text.to_string(),
+                egui::FontId::proportional(size),
+                tok.dim_text,
+            )
+            .size()
+            .y
+    };
+    let content =
+        height(glyph, 30.0) + 2.0 + height(text, 12.5) + 2.0 * ui.spacing().item_spacing.y;
+    let pad = ((room - content) / 2.0).clamp(0.0, 48.0).floor();
     ui.vertical_centered(|ui| {
-        ui.add_space(48.0);
+        ui.add_space(pad);
         ui.label(RichText::new(glyph).size(30.0).color(tok.dim_text));
         ui.add_space(2.0);
         ui.label(RichText::new(text).size(12.5).color(tok.dim_text));
