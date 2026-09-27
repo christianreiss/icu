@@ -144,8 +144,9 @@ startet weiter und warnt im Journal. `localhost` und IP-Adressen gehen.
 `users.toml` und `state.lock`. **`ca.key` und `com.key` sind die Geheimnisse,
 die zählen** — geht eines verloren, müssen sich alle Nutzer neu registrieren.
 `com.key` ist der Com-Schlüssel (2026-09-27, `PROTOCOL.md` §1): jedes
-UDP-Datagramm trägt ein Tag daraus, und jeder Passport trägt ihn. Ein Backup
-von `/var/lib/icu/` gehört zur Inbetriebnahme. Eine neue CA legt der Server nur an,
+UDP-Datagramm trägt ein Tag daraus, und jeder Passport trägt ihn. Der Server
+sichert den State selbst (unten, „Backup und Restore“); eine Kopie davon außer
+Haus gehört zur Inbetriebnahme. Eine neue CA legt der Server nur an,
 wenn `ca.crt` und `ca.key` beide fehlen und `users.toml` noch nie benutzt wurde
 (keine Nutzer, keine CRL); fehlt nur eine, ist eine nicht lesbar (etwa nach
 einem Restore mit falschem Besitzer), passen sie nicht zusammen oder fehlen
@@ -158,7 +159,75 @@ der Rotation nicht geschrieben werden konnte); der nächste Start trägt es nach
 und löscht die Datei. Nicht von Hand löschen, sonst bleibt das alte Leaf
 gültig.
 
-**Backup und Restore.** `ca.crt`, `ca.key`, `com.key` und `users.toml` gehören
+**Backup und Restore** (2026-09-27). Der Server sichert seinen State selbst:
+beim Start und wenige Sekunden nach jeder Änderung (Einladung, Registrierung,
+Widerruf, Rotation, …) einen Snapshot nach `/var/lib/icu/backups/<UTC-Zeit>/`;
+die neuesten 30 bleiben. Ein Snapshot enthält `ca.crt`, `ca.key`, `com.key`,
+`users.toml`, das Server-Leaf und ein `MANIFEST` mit Prüfsummen, alles 0600
+bzw. 0700 und wie der State nur für root lesbar. Ein Neustart ohne Änderung
+legt keinen neuen an. Einstellbar in `server.toml`:
+
+```toml
+[backup]
+keep = 30                  # so viele bleiben; 0 schaltet die automatischen ab
+#dir = "/srv/icu-backups"  # Default: backups/ im State-Verzeichnis
+#settle_ms = 5000          # Wartezeit nach einer Änderung
+```
+
+```bash
+sudo icu-server backup            # Snapshot jetzt, gibt den Pfad aus
+sudo icu-server backup --list     # vorhandene Snapshots mit Zeit, Anlass, Nutzerzahl
+```
+
+Scheitert ein Snapshot (Platte voll, Rechte), läuft der Server weiter;
+`icu-server status --json` meldet `"backup":{"failed":1,"error":…}`, und der
+Checkmk-Check zeigt `ICU_Backup` auf WARN.
+
+**Außer Haus kopieren.** Die Snapshots liegen auf derselben Platte wie der
+State; gegen Plattenverlust oder einen verlorenen Host das Verzeichnis
+regelmäßig woandershin kopieren, etwa per Timer mit
+`rsync -a /var/lib/private/icu/backups/ backup-host:/srv/icu/` oder mit
+borg/restic. Die Kopie enthält `ca.key` und `com.key`: verschlüsselt oder auf
+ein vertrauenswürdiges Ziel. Soll der Server direkt woandershin schreiben (NFS,
+zweite Platte), `backup.dir` setzen und der Unit das Verzeichnis freigeben —
+sie läuft mit `ProtectSystem=strict`:
+
+```ini
+# sudo systemctl edit icu-server
+[Service]
+ReadWritePaths=/srv/icu-backups
+```
+
+**Zurückspielen**, nach einem Fehler (falscher Widerruf, verkorkster Bestand):
+
+```bash
+sudo systemctl stop icu-server
+sudo icu-server restore latest   # oder ein Snapshot: /var/lib/icu/backups/20260927T120000Z
+sudo systemctl start icu-server
+```
+
+`restore` prüft den Snapshot gegen sein `MANIFEST` und lädt ihn probehalber so,
+wie der Server es täte (`users.toml`, CA-Paar, Com-Schlüssel, Servername); erst
+dann ersetzt es etwas. Den ersetzten State legt es vorher als Snapshot
+`pre-restore` ab — ein Restore lässt sich also selbst zurücknehmen —, stellt
+danach ein neues Server-Leaf aus (siehe „Nach dem Zurückspielen“ unten) und
+gibt die Dateien dem Besitzer des State-Verzeichnisses. Läuft der Server, lehnt
+es ab. `latest` ist der neueste Snapshot außer `pre-restore`.
+
+**Neuer Host (Disaster Recovery).** Paket installieren, den Dienst am besten
+noch nicht starten, einen Snapshot-Ordner aus der Kopie außer Haus auf den Host
+bringen, `sudo icu-server restore /pfad/zum/snapshot`, dann `sudo systemctl
+enable --now icu-server`. `server_name` in `server.toml` weglassen oder auf den
+Namen der CA setzen; `restore` lehnt einen anderen ab und nennt den richtigen.
+Zeigt der DNS-Name (`public_host`) auf den neuen Host, verbinden sich alle
+Clients wie vorher. Lief der Dienst schon einmal, hat er eine frische CA
+angelegt; `restore` ersetzt sie, sie landet als `pre-restore`. Im Container:
+Container stoppen, `restore` in einem Wegwerf-Container mit demselben Volume
+und dem Snapshot als zweitem Mount, Container wieder starten.
+
+**Von Hand** geht es weiterhin: die Dateien eines Snapshots zurück ins
+State-Verzeichnis kopieren, dann wie unten `rotate-server-cert`.
+`ca.crt`, `ca.key`, `com.key` und `users.toml` gehören
 zusammen und kommen aus demselben Backup zurück, lesbar für den Dienst. Meldet
 der Start `no CA in …: ca.crt and ca.key are both missing, but users.toml has
 been in use`, fehlt die CA neben einem benutzten Nutzerbestand — ein
@@ -177,8 +246,8 @@ Ausnahme: ein State, in dem vor diesem Stand nur Offline-CLI-Kommandos
 verliert nichts. Wer wirklich neu anfangen will (neue CA, alle registrieren sich
 neu), schiebt das ganze State-Verzeichnis beiseite.
 
-**Nach dem Zurückspielen eines Backups** `icu-server rotate-server-cert`
-ausführen. Lag zwischen Backup und Restore eine Rotation, präsentiert der Server
+**Nach dem Zurückspielen eines Backups** von Hand `icu-server rotate-server-cert`
+ausführen (`restore` macht das selbst). Lag zwischen Backup und Restore eine Rotation, präsentiert der Server
 sonst ein Leaf, das die Clients schon auf ihrer CRL haben; sie versuchen es dann
 im Backoff weiter, bis das neue Leaf da ist. Die CRL-Nummer folgt der Uhr und
 fällt durch einen Restore nicht unter die der Clients.
@@ -272,6 +341,9 @@ icu-server status                          # Uptime, online, offene Verbindungen
 icu-server status --json                   # dasselbe für Monitoring
 icu-server rotate-server-cert              # neues Server-Leaf derselben CA
 icu-server renew-ca                        # CA-Zertifikat neu, selber Schlüssel
+icu-server backup                          # State-Snapshot jetzt (sonst nach jeder Änderung von selbst)
+icu-server backup --list                   # Snapshots anzeigen (root)
+icu-server restore latest                  # Snapshot zurück, nur bei gestopptem Server (§2 „Backup und Restore“)
 ```
 
 **Erster Admin:** Admin wird, wer als Erster eine Registrierung abschließt

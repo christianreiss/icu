@@ -274,6 +274,9 @@ impl Default for UsersFile {
 pub struct Store {
     dir: PathBuf,
     users: UsersFile,
+    /// Counts the writes of `users.toml`, for the backup task
+    /// ([`Store::changes`]).
+    changed: tokio::sync::watch::Sender<u64>,
     /// Held for as long as the `Store` lives; dropping it releases the lock.
     _lock: File,
 }
@@ -289,22 +292,7 @@ impl Store {
     pub fn open(dir: &Path) -> Result<Store> {
         std::fs::create_dir_all(dir)
             .context(format!("cannot create state dir {}", dir.display()))?;
-        let lock_path = dir.join(LOCK_FILE);
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .context(format!("cannot open {}", lock_path.display()))?;
-        rustix::fs::flock(
-            lock.as_fd(),
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        )
-        .context(format!(
-            "cannot lock {} (is a server running?)",
-            lock_path.display()
-        ))?;
+        let lock = lock_state(dir)?;
 
         let users = match load(&dir.join(USERS_FILE))? {
             Some(users) => users,
@@ -319,8 +307,15 @@ impl Store {
         Ok(Store {
             dir: dir.to_path_buf(),
             users,
+            changed: tokio::sync::watch::channel(0).0,
             _lock: lock,
         })
+    }
+
+    /// Ticks after every write of `users.toml`: what the backup task waits
+    /// for (`crate::backup`).
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 
     /// All users, keyed by `user_id`.
@@ -345,6 +340,7 @@ impl Store {
         let out = change(&mut next)?;
         write_atomic(&self.dir.join(USERS_FILE), &toml::to_string(&next)?)?;
         self.users = next;
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
         Ok(out)
     }
 
@@ -1019,10 +1015,33 @@ fn write_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
     blocking(|| write_mode_now(path, contents, mode))
 }
 
+/// Takes `flock(state.lock)` in `dir`, without waiting: held for as long as
+/// the returned file is open. Fails with a clear error when another process
+/// holds it — a running server.
+pub(crate) fn lock_state(dir: &Path) -> Result<File> {
+    let lock_path = dir.join(LOCK_FILE);
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .context(format!("cannot open {}", lock_path.display()))?;
+    rustix::fs::flock(
+        lock.as_fd(),
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .context(format!(
+        "cannot lock {} (is a server running?)",
+        lock_path.display()
+    ))?;
+    Ok(lock)
+}
+
 /// Runs `f` with `block_in_place` on a multi-thread runtime, directly
 /// everywhere else (`current_thread` runtimes such as `#[tokio::test]`, where
 /// `block_in_place` would panic, and plain threads).
-fn blocking<R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn blocking<R>(f: impl FnOnce() -> R) -> R {
     use tokio::runtime::{Handle, RuntimeFlavor};
     match Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),

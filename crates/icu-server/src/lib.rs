@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+pub mod backup;
 pub mod ca;
 pub mod cli;
 pub mod config;
@@ -118,6 +119,8 @@ pub struct Server {
     pub crl: std::sync::RwLock<Vec<u8>>,
     /// Flipped to `true` on shutdown.
     pub shutdown: watch::Sender<bool>,
+    /// How the last state snapshot went (`backup`), for `status`.
+    pub backup: std::sync::Mutex<backup::Status>,
     started: Instant,
 }
 
@@ -186,6 +189,7 @@ impl Server {
             store: tokio::sync::Mutex::new(store),
             started: Instant::now(),
             shutdown,
+            backup: Default::default(),
             config,
         }
     }
@@ -333,6 +337,7 @@ pub async fn run(config: Config) -> Result<Handle> {
         ));
     }
     tasks.push(spawn_logged("housekeeping", housekeeping(server.clone())));
+    tasks.push(spawn_logged("backup", backup::task(server.clone())));
 
     // 8: admin socket. Not being able to create it is not fatal — the server
     // still serves; only the CLI is then unavailable (deviation, see report).

@@ -3,7 +3,9 @@
 //! The on-disk format is `/etc/icu/server.toml`. Two sections beyond the spec
 //! exist so that the server can run as a library in integration tests:
 //! `[paths]` (state and runtime directory) and `[timing]` (timeouts that the
-//! spec fixes, with the spec values as defaults).
+//! spec fixes, with the spec values as defaults). `[backup]` (2026-09-27) is
+//! in the spec; its defaults are on, because the packaged config file is not
+//! replaced on update and an existing install never gets the section.
 
 use std::{
     net::SocketAddr,
@@ -33,6 +35,8 @@ pub struct Config {
     /// Timeouts the spec fixes. Not in the spec; the defaults are the spec
     /// values, tests shorten them.
     pub timing: TimingSection,
+    /// Automatic snapshots of the state directory (`crate::backup`).
+    pub backup: BackupSection,
 }
 
 /// `[server]`
@@ -193,6 +197,35 @@ impl Default for PathsSection {
         }
     }
 }
+
+/// `[backup]` — automatic snapshots of the state directory after every
+/// change (`crate::backup`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackupSection {
+    /// Snapshots kept, the oldest go first. `0` turns the automatic ones
+    /// off; `icu-server backup` still writes one.
+    pub keep: u32,
+    /// Where the snapshots go. Unset: `backups/` in the state directory, the
+    /// only place the systemd unit lets the server write besides the state.
+    pub dir: Option<PathBuf>,
+    /// How long a snapshot waits after a change, so that the writes of one
+    /// action — a rotation is five — land in one snapshot.
+    pub settle_ms: u64,
+}
+
+impl Default for BackupSection {
+    fn default() -> Self {
+        BackupSection {
+            keep: 30,
+            dir: None,
+            settle_ms: 5000,
+        }
+    }
+}
+
+/// Most snapshots `backup.keep` may ask for.
+pub const MAX_BACKUP_KEEP: u32 = 10_000;
 
 /// `[timing]` — beyond the spec, see the module docs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,6 +588,23 @@ impl Config {
                 self.log.format
             )));
         }
+        if self.backup.keep > MAX_BACKUP_KEEP {
+            return Err(Error::msg(format!(
+                "backup.keep must be at most {MAX_BACKUP_KEEP}, got {}",
+                self.backup.keep
+            )));
+        }
+        if self.backup.settle_ms > MAX_TIMING_MS {
+            return Err(Error::msg(format!(
+                "backup.settle_ms must be at most {MAX_TIMING_MS}, got {}",
+                self.backup.settle_ms
+            )));
+        }
+        if self.backup_dir() == self.paths.state_dir {
+            return Err(Error::msg(
+                "backup.dir must not be the state directory itself",
+            ));
+        }
         Ok(())
     }
 
@@ -634,8 +684,18 @@ impl Config {
             .unwrap_or_else(|| self.paths.runtime_dir.join("admin.sock"))
     }
 
+    /// Where snapshots go: `backup.dir`, else `backups/` in the state
+    /// directory.
+    pub fn backup_dir(&self) -> PathBuf {
+        self.backup
+            .dir
+            .clone()
+            .unwrap_or_else(|| self.paths.state_dir.join("backups"))
+    }
+
     /// A configuration suitable for tests: loopback, ephemeral port, state in
-    /// `dir`, short timeouts.
+    /// `dir`, short timeouts, no automatic backups (the backup tests turn
+    /// them on).
     pub fn for_test(dir: &Path) -> Config {
         let mut config = Config {
             server: ServerSection {
@@ -649,6 +709,8 @@ impl Config {
         config.paths.state_dir = dir.to_path_buf();
         config.paths.runtime_dir = dir.to_path_buf();
         config.timing.shutdown_grace_ms = 50;
+        config.backup.keep = 0;
+        config.backup.settle_ms = 50;
         config
     }
 }
@@ -764,6 +826,10 @@ server_validity_days = 365
 [log]
 level = "info"
 format = "text"
+
+[backup]
+keep = 30
+settle_ms = 5000
 "#;
         let mut config: Config = toml::from_str(text).unwrap();
         // The example names are placeholders: taken as they are, they would
@@ -782,6 +848,34 @@ format = "text"
         assert_eq!(config.server.max_users, 16);
         assert_eq!(config.public_host(), "icu.home.arpa:4711");
         assert_eq!(config.admin_socket(), Path::new("/run/icu/admin.sock"));
+        assert_eq!(config.backup_dir(), Path::new("/var/lib/icu/backups"));
+    }
+
+    #[test]
+    fn backups_are_on_by_default_and_bounded() {
+        // On without a `[backup]` section: an updated install keeps its old
+        // config file.
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.backup.keep, 30);
+        assert_eq!(config.backup.settle_ms, 5000);
+        let parsed: Config =
+            toml::from_str("[backup]\nkeep = 0\ndir = \"/srv/icu-backups\"\n").unwrap();
+        assert_eq!(parsed.backup.keep, 0);
+        assert_eq!(parsed.backup_dir(), Path::new("/srv/icu-backups"));
+        assert!(toml::from_str::<Config>("[backup]\nkepp = 3\n").is_err());
+
+        let mut c = base();
+        c.backup.keep = MAX_BACKUP_KEEP + 1;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("backup.keep"), "{err}");
+        let mut c = base();
+        c.backup.settle_ms = MAX_TIMING_MS + 1;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("backup.settle_ms"), "{err}");
+        let mut c = base();
+        c.backup.dir = Some(c.paths.state_dir.clone());
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("backup.dir"), "{err}");
     }
 
     #[test]

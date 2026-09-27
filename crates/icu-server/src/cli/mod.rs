@@ -6,6 +6,7 @@
 //! refused — does the CLI open the state itself, holding
 //! `flock(state.lock)` while it does.
 
+pub mod backup;
 pub mod invite;
 pub mod status;
 pub mod users;
@@ -42,7 +43,18 @@ pub async fn dispatch(config: &Config, request: AdminRequest) -> Result<serde_js
         }
     }
     let server = crate::Server::offline(config.clone().resolve()?)?;
-    Ok(admin::handle(&server, request).await.to_json())
+    let changes = !matches!(
+        request,
+        AdminRequest::Users | AdminRequest::Status | AdminRequest::Backup
+    );
+    let response = admin::handle(&server, request).await.to_json();
+    // No server runs to notice the change: the snapshot is taken here.
+    if changes && config.backup.keep > 0 {
+        if let Err(e) = crate::backup::snapshot(&server, crate::backup::Reason::Change).await {
+            eprintln!("icu-server: warning: no snapshot of the changed state: {e}");
+        }
+    }
+    Ok(response)
 }
 
 /// Turns a `{"ok":false,…}` answer into an error.
