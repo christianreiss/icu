@@ -884,14 +884,19 @@ impl SettingsView {
                 widgets::row_group(ui, width, |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if widgets::button(ui, widgets::ButtonKind::Neutral, icon::COPY, "Kopieren")
-                        .on_hover_text("Als Text in die Zwischenablage, mit deinen Einstellungen")
+                        .on_hover_text(
+                            "Als Text in die Zwischenablage, mit deinen Einstellungen; ICU leert \
+                             sie nach einer Minute wieder",
+                        )
                         .clicked()
                     {
                         match self.passport_text() {
                             Ok((text, with_settings)) => {
-                                ui.ctx().copy_text(text);
+                                ui.ctx().copy_text(text.clone());
+                                clear_clipboard_later(text);
                                 self.passport_status = Some(format!(
-                                    "In die Zwischenablage kopiert.{}",
+                                    "In die Zwischenablage kopiert, für {} s.{}",
+                                    PASSPORT_CLIPBOARD.as_secs(),
                                     without_settings(with_settings)
                                 ));
                             }
@@ -947,8 +952,9 @@ impl SettingsView {
                     tok.error,
                     RichText::new(
                         "Der Passport enthält deinen privaten Schlüssel — nur sicher \
-                         weitergeben. Erneuert ein Gerät sein Zertifikat (neuer Name, \
-                         jährlich), braucht das andere einen neuen Passport.",
+                         weitergeben, lieber als Datei: ein Zwischenablage-Verlauf behält \
+                         ihn. Erneuert ein Gerät sein Zertifikat (neuer Name, jährlich), \
+                         braucht das andere einen neuen Passport.",
                     )
                     .size(11.5),
                 );
@@ -2311,6 +2317,39 @@ fn without_settings(with_settings: bool) -> &'static str {
         ""
     } else {
         " Ohne Einstellungen: dieser Passport kann sie nicht mitnehmen."
+    }
+}
+
+/// How long a copied passport may stay on the clipboard.
+const PASSPORT_CLIPBOARD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Takes `passport` off the clipboard after [`PASSPORT_CLIPBOARD`] — only
+/// if it is still what the clipboard holds; whatever was copied since stays.
+/// Its own thread and its own clipboard handle, so it happens with the
+/// settings closed and the window in the tray. X11 and Windows clear for
+/// real; under Wayland this goes through Xwayland, and whether that reaches
+/// the compositor's clipboard is up to the compositor (an unfocused Wayland
+/// client cannot set the selection itself).
+fn clear_clipboard_later(passport: String) {
+    let spawned = std::thread::Builder::new()
+        .name("icu-clipboard".into())
+        .spawn(move || {
+            std::thread::sleep(PASSPORT_CLIPBOARD);
+            let cleared = arboard::Clipboard::new().and_then(|mut clipboard| {
+                if clipboard.get_text()? != passport {
+                    return Ok(false);
+                }
+                clipboard.clear()?;
+                Ok(true)
+            });
+            match cleared {
+                Ok(true) => tracing::info!("passport taken off the clipboard"),
+                Ok(false) => {}
+                Err(e) => tracing::info!(%e, "clipboard not checked for the passport"),
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(%e, "no clipboard thread");
     }
 }
 

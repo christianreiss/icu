@@ -779,6 +779,24 @@ fn no_hotkey_backend_offers_voice_activation() {
     assert_eq!(last_update(&cmds.borrow()).audio.mode, ModeSetting::Vad);
 }
 
+/// The passport's warning names the clipboard, which „Kopieren“ uses.
+#[test]
+fn the_passport_warning_names_the_clipboard() {
+    let s = state();
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        view.ui(ui, &s, false);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Allgemein")
+        .click();
+    h.run();
+    h.get_by_label_contains("Zwischenablage-Verlauf");
+}
+
 /// „Weiter“ in the setup's bottom bar.
 fn next_label() -> String {
     format!("Weiter  {}", egui_phosphor::regular::ARROW_RIGHT)
