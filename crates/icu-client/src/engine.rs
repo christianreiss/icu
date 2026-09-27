@@ -2465,7 +2465,7 @@ fn end_session(shared: &Arc<Shared>) {
     *lock(&shared.conn) = None;
     shared.dsp.online.store(false, Ordering::Relaxed);
     shared.dsp.audience.store(false, Ordering::Relaxed);
-    lock(&shared.speakers).clear();
+    drop_speakers(shared);
     lock(&shared.video).reset();
     shared.state.send_modify(|s| {
         s.peers.clear();
@@ -2521,6 +2521,21 @@ fn store_identity(
         )));
     }
     identity.save(paths)
+}
+
+/// Runs `f`, which may block for seconds — opening an audio device waits up
+/// to 5 s per stream (WASAPI) — through `block_in_place`: the connection's
+/// other tasks on this worker (the datagram reader stamping arrival times,
+/// quinn's driver) move to another thread meanwhile, instead of waiting
+/// behind it. Still in order with every other command: this task waits.
+/// Outside a multi-thread runtime `f` just runs.
+fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
 }
 
 /// Deliberate reconnect with new credentials; not a failure.
@@ -3120,15 +3135,17 @@ impl LocalState {
     }
 
     fn reopen_streams(&mut self, shared: &Arc<Shared>) {
-        let mut backend = lock(&self.backend);
-        shared.reference_open.store(false, Ordering::Relaxed);
-        backend.close(StreamKind::Capture);
-        backend.close(StreamKind::Reference);
-        backend.close(StreamKind::Playback);
-        shared.dsp.reinit_aec.store(true, Ordering::Relaxed);
-        open_streams(&mut **backend, &self.settings, shared);
-        let devices = backend.devices();
-        shared.state.send_modify(|s| s.devices = devices);
+        blocking(|| {
+            let mut backend = lock(&self.backend);
+            shared.reference_open.store(false, Ordering::Relaxed);
+            backend.close(StreamKind::Capture);
+            backend.close(StreamKind::Reference);
+            backend.close(StreamKind::Playback);
+            shared.dsp.reinit_aec.store(true, Ordering::Relaxed);
+            open_streams(&mut **backend, &self.settings, shared);
+            let devices = backend.devices();
+            shared.state.send_modify(|s| s.devices = devices);
+        });
     }
 
     /// [`retry_failed_streams`], if anything is missing.
@@ -3136,8 +3153,10 @@ impl LocalState {
         if shared.failed_streams.load(Ordering::Relaxed) == 0 {
             return;
         }
-        let mut backend = lock(&self.backend);
-        retry_failed_streams(&mut **backend, &self.settings, shared);
+        blocking(|| {
+            let mut backend = lock(&self.backend);
+            retry_failed_streams(&mut **backend, &self.settings, shared);
+        });
     }
 
     fn cue(&self, shared: &Arc<Shared>, cue: Cue) {
@@ -3328,7 +3347,7 @@ async fn run_session(
     // session's datagram reader may have been mid-insert when it was aborted.
     // Likewise the video: the previous connection's decode thread may still
     // deliver queued frames, which the new generation drops.
-    lock(&shared.speakers).clear();
+    drop_speakers(shared);
     let video_generation = lock(&shared.video).reset();
     forget_network_feedback(shared);
     let peers: Vec<Peer> = welcome
@@ -3774,8 +3793,16 @@ impl crate::video::VideoSink for SessionVideo {
 fn admit(shared: &Arc<Shared>, settings: &Settings, user: &UserInfo) -> Peer {
     let volume = settings.volume(user.user_id);
     let frame_samples = shared.dsp.frame_samples.load(Ordering::Relaxed);
-    let mut speakers = lock(&shared.speakers);
     let mut peer = Peer::new(user.clone(), volume);
+    // Built before the lock is taken: the real-time mixer takes it for
+    // every block, and a decoder with Deep PLC is no quick allocation.
+    // Wasted when the session's audio came first and made one already.
+    let fresh = if lock(&shared.speakers).contains_key(&user.session) {
+        None
+    } else {
+        Speaker::new(user.user_id, volume, frame_samples).ok()
+    };
+    let mut speakers = lock(&shared.speakers);
     match speakers.get_mut(&user.session) {
         Some(sp) => {
             sp.user_id = user.user_id;
@@ -3786,12 +3813,19 @@ fn admit(shared: &Arc<Shared>, settings: &Settings, user: &UserInfo) -> Peer {
             }
         }
         None => {
-            if let Ok(sp) = Speaker::new(user.user_id, volume, frame_samples) {
+            if let Some(sp) = fresh {
                 speakers.insert(user.session, sp);
             }
         }
     }
     peer
+}
+
+/// Forgets every speaker. Their decoders are destroyed after the lock is
+/// released: the real-time mixer takes it for every block.
+fn drop_speakers(shared: &Shared) {
+    let gone = std::mem::take(&mut *lock(&shared.speakers));
+    drop(gone);
 }
 
 /// Handles commands while a connection is being established. Returns `Quit`
@@ -3943,13 +3977,17 @@ fn prune_stray_speakers(shared: &Arc<Shared>) {
         .iter()
         .map(|p| p.info.session)
         .collect();
-    let mut speakers = lock(&shared.speakers);
-    speakers.retain(|session, sp| {
-        known.contains(session)
-            || sp
-                .last_packet
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
-    });
+    // Destroyed after the lock is released (`drop_speakers`).
+    let gone: Vec<Speaker> = lock(&shared.speakers)
+        .extract_if(|session, sp| {
+            !known.contains(session)
+                && !sp
+                    .last_packet
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+        })
+        .map(|(_, sp)| sp)
+        .collect();
+    drop(gone);
 }
 
 /// `(session, loss per mille)` for every speaker with traffic this tick.
@@ -4067,7 +4105,9 @@ async fn handle_control(
             });
         }
         ControlMsg::UserLeft { session, .. } => {
-            lock(&shared.speakers).remove(&session);
+            // Destroyed after the lock is released (`drop_speakers`).
+            let gone = lock(&shared.speakers).remove(&session);
+            drop(gone);
             shared.video.lock().unwrap().remove(session);
             local.cue(shared, Cue::Leave);
             if local.settings.ui.notify_join {
