@@ -38,8 +38,6 @@ tray = ["dep:tray-icon"]
 # Emergency audio host through cpal (ALSA) instead of pipewire-rs. Always on
 # for Windows (see the target dependencies below).
 cpal-fallback = ["dep:cpal"]
-# MJPEG receive/debug path (never sent in v1).
-mjpeg = ["dep:zune-jpeg"]
 
 [dependencies]
 icu-proto.workspace = true
@@ -76,7 +74,6 @@ arboard = { version = "3.6.1", default-features = false, optional = true }
 # Camera / video
 nokhwa = { version = "0.10.11", features = ["input-native", "camera-sync-impl"], optional = true }
 openh264 = { version = "0.9.8", features = ["source"], optional = true }
-zune-jpeg = { version = "0.5", optional = true }
 
 # Paths
 directories = "6"
