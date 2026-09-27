@@ -226,25 +226,30 @@ pub fn build_crls(store: &mut Store, ca: &Ca) -> Result<Crls> {
 /// every client in the room. Call it after anything that revokes a
 /// certificate or replaces the server leaf, never while holding the store
 /// lock.
+///
+/// All of it under the store lock, in CRL number order: two reloads at once
+/// — the hourly rotation and a login retiring certificates — used to build
+/// in one order and publish in the other, leaving the older CRL in
+/// `Server::crl` for every client joining until the next reload (external
+/// review 2026-09-27, S-4).
 pub async fn reload_tls(server: &Arc<Server>) -> Result<()> {
-    let crl = {
-        let mut store = server.store.lock().await;
-        let ca = server.ca.read().await;
-        let crls = build_crls(&mut store, &ca)?;
-        if !server.endpoints.is_empty() {
-            let quic = server_config(&server.config, &ca, &crls.handshake)?;
-            for endpoint in &server.endpoints {
-                endpoint.set_server_config(Some(quic.clone()));
-            }
+    let mut store = server.store.lock().await;
+    let ca = server.ca.read().await;
+    let crls = build_crls(&mut store, &ca)?;
+    if !server.endpoints.is_empty() {
+        let quic = server_config(&server.config, &ca, &crls.handshake)?;
+        for endpoint in &server.endpoints {
+            endpoint.set_server_config(Some(quic.clone()));
         }
-        crls.clients
-    };
-    let crl_der = crl.to_vec();
+    }
+    let crl_der = crls.clients.to_vec();
     tracing::info!(bytes = crl_der.len(), "CRL and TLS config reloaded");
     *server.crl.write().unwrap_or_else(|e| e.into_inner()) = crl_der.clone();
     server
         .room
         .broadcast(&icu_proto::ControlMsg::CrlUpdate { crl_der });
+    drop(ca);
+    drop(store);
     Ok(())
 }
 
