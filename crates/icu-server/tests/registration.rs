@@ -256,6 +256,18 @@ async fn in_band_invitations_are_rate_limited_per_admin() {
     server.shutdown().await;
 }
 
+/// `limits.invites_per_admin_per_hour = 0` turns in-band invitations off
+/// instead of meaning one an hour (external review 2026-09-27); the host's
+/// CLI still issues them.
+#[tokio::test]
+async fn zero_invitations_per_hour_means_none_in_band() {
+    let server = TestServer::start_with(|c| c.limits.invites_per_admin_per_hour = 0).await;
+    let mut admin = admin_client(&server).await;
+    assert_eq!(invite_code(&mut admin).await, Some(ec::RATE_LIMITED));
+    let _ = server.invite("").await;
+    server.shutdown().await;
+}
+
 /// Revoking an invitation nobody used frees its place under
 /// `limits.max_pending_invites` right away; it used to hold the place until
 /// it expired, up to a week.

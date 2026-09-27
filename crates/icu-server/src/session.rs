@@ -1521,6 +1521,18 @@ async fn handle_create_invite(
     // expires; an admin certificate in the wrong hands must not be able to
     // fill it.
     let per_hour = server.config.limits.invites_per_admin_per_hour;
+    // Zero means none in-band, only the host's CLI: a bucket of zero would
+    // be rounded up to one an hour (external review 2026-09-27).
+    if per_hour == 0 {
+        server.room.send_to(
+            session,
+            &reject(
+                ec::RATE_LIMITED,
+                "invitations are issued on the server host only here".into(),
+            ),
+        );
+        return;
+    }
     if !lock(&server.invite_budget)
         .entry(user_id)
         .or_insert_with(|| TokenBucket::per_hour(per_hour))

@@ -113,7 +113,8 @@ pub struct LimitsSection {
     /// `RATE_LIMITED`. Unset: `2 x max_users`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_pending_invites: Option<u32>,
-    /// Bundles one admin may mint per hour in-band (`CreateInviteRequest`).
+    /// Bundles one admin may mint per hour in-band (`CreateInviteRequest`);
+    /// 0 turns in-band invitations off, the host's CLI still issues them.
     pub invites_per_admin_per_hour: u32,
 }
 

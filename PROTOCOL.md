@@ -286,7 +286,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | Sitzungen außerhalb des Raums | ≤ 8 gleichzeitig, Registrierung und renew-only zusammen, serverweit; darüber schließt der Server mit `SERVER_FULL`, eine Sitzung, die eine desselben Zertifikats ablöst, kommt immer durch (2026-09-26) |
 | CRL | `CrlUpdate` nennt nur ersetzte Server-Leaves bis zu ihrem Ablauf (2026-09-26). Die CRL des Handshakes: widerrufene Client-Zertifikate bleiben, abgelaufene Registrierungs-, abgelöste und Server-Zertifikate fallen heraus |
 | Registrierung | 5/min pro IP (IPv6: pro /64), 20/min global; je Sitzung ≤ 10 `RenewRequest`, ≤ 120 s; Registrierungszertifikat ≤ 7 Tage; ≤ 5 Einlösungen je Bundle ohne Quittung |
-| Einladungen | offen (ausgestellt, nicht quittiert) ≤ `limits.max_pending_invites`, Default `2 × max_users`, über alle Wege; per `CreateInviteRequest` ≤ 20/h je Admin (`limits.invites_per_admin_per_hour`); darüber `RATE_LIMITED`. Jede offene Einladung ist ein Nutzer in `users.toml` (2026-09-26) |
+| Einladungen | offen (ausgestellt, nicht quittiert) ≤ `limits.max_pending_invites`, Default `2 × max_users`, über alle Wege; per `CreateInviteRequest` ≤ 20/h je Admin (`limits.invites_per_admin_per_hour`; 0 = keine per `CreateInviteRequest`, nur über die CLI auf dem Host, 2026-09-27 — vorher hieß 0 eine je Stunde); darüber `RATE_LIMITED`. Jede offene Einladung ist ein Nutzer in `users.toml` (2026-09-26) |
 | Hello | ≤ 5 s nach Handshake |
 
 ## 8. Versionierung
