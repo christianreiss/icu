@@ -170,7 +170,11 @@ in einem nie benutzten State an. Umgekehrt ebenso: meldet der Start `no
 users.toml in …, but ca.crt, ca.key, … are there`, fehlt der Nutzerbestand
 neben CA und Com-Schlüssel — `users.toml` aus demselben Backup zurückholen.
 Ein leerer Bestand an seiner Stelle kennte keinen Nutzer und keinen Widerruf
-mehr, deshalb legt der Server dann keinen an (2026-09-27). Wer wirklich neu anfangen will (neue CA, alle registrieren sich
+mehr, deshalb legt der Server dann keinen an (2026-09-27). Einzige harmlose
+Ausnahme: ein State, in dem vor diesem Stand nur Offline-CLI-Kommandos
+(etwa `status`) liefen und nie `run` — dort entstanden CA und `com.key` ohne
+`users.toml`, registriert war aber niemand; das Verzeichnis beiseiteschieben
+verliert nichts. Wer wirklich neu anfangen will (neue CA, alle registrieren sich
 neu), schiebt das ganze State-Verzeichnis beiseite.
 
 **Nach dem Zurückspielen eines Backups** `icu-server rotate-server-cert`
