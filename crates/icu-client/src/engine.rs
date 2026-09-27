@@ -603,7 +603,8 @@ struct Shared {
     /// of a non-negative `f32`, which order like the value): whether the
     /// loudspeaker plays something the AEC reference should carry.
     play_peak: AtomicU32,
-    cues: Mutex<VecDeque<f32>>,
+    /// Cues for the mixer, bounded and without repeats (`cues::CueQueue`).
+    cues: Mutex<crate::cues::CueQueue>,
     /// A transmit cue the DSP thread asks the mixer to play
     /// ([`TX_CUE_START`], [`TX_CUE_STOP`], 0 = none): the DSP thread neither
     /// renders nor takes the cue lock.
@@ -819,9 +820,9 @@ impl Engine {
             output_gain: AtomicF32::new(mixer::volume_gain(settings.audio.output_volume)),
             normalize_incoming: AtomicBool::new(settings.audio.normalize_incoming),
             play_peak: AtomicU32::new(0),
-            // Room for a second of cues, so queueing one in the mixer
-            // thread never allocates.
-            cues: Mutex::new(VecDeque::with_capacity(48_000)),
+            // Allocated once, so queueing one in the mixer thread never
+            // allocates.
+            cues: Mutex::new(crate::cues::CueQueue::new()),
             pending_tx_cue: AtomicU8::new(0),
             reference_open: AtomicBool::new(false),
             cycle: Arc::new(CycleClock::default()),
@@ -1896,17 +1897,18 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
         let cue = {
             let mut cues = shared.cues.lock().unwrap();
             match shared.pending_tx_cue.swap(0, Ordering::Relaxed) {
-                TX_CUE_START => cues.extend(tx_start.iter().copied()),
-                TX_CUE_STOP => cues.extend(tx_stop.iter().copied()),
+                TX_CUE_START => {
+                    cues.push(Cue::TxStart, &tx_start);
+                }
+                TX_CUE_STOP => {
+                    cues.push(Cue::TxStop, &tx_stop);
+                }
                 _ => {}
             }
-            if cues.is_empty() {
-                None
-            } else {
-                for s in cue_buf.iter_mut() {
-                    *s = cues.pop_front().unwrap_or(0.0);
-                }
+            if cues.fill(&mut cue_buf) {
                 Some((cue_buf.as_slice(), 1.0))
+            } else {
+                None
             }
         };
         // The mic test, like the cues: unity gain, heard even when deafened.
@@ -2886,7 +2888,7 @@ impl LocalState {
         };
         if enabled {
             let samples = crate::cues::render(cue);
-            shared.cues.lock().unwrap().extend(samples);
+            shared.cues.lock().unwrap().push(cue, &samples);
         }
     }
 }
