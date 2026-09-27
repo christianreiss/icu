@@ -14,7 +14,7 @@ use egui::{Color32, RichText};
 use egui_phosphor::regular as icon;
 
 use super::{
-    connection::{opt, wrap_fingerprint, ConnectionView, NONE},
+    connection::{fmt_uptime, opt, wrap_fingerprint, ConnectionView, NONE},
     fonts,
     settings::SettingsView,
     setup::SetupView,
@@ -28,8 +28,6 @@ use crate::{
     video::VideoTier,
 };
 
-/// Header height, and with it the size of the header's icon buttons.
-const HEADER: f32 = 32.0;
 /// The speak surface and the mode tile beside it.
 const SPEAK_H: f32 = 52.0;
 /// The control tiles along the bottom.
@@ -53,9 +51,9 @@ type Toggle = (
 /// fit without a scroll bar, and it is no wider than the control dock needs;
 /// long names end in „…“ (`tests/ui_layout.rs`). A bigger room grows it after
 /// connecting (`App::fit_to_list`).
-pub const MAIN_SIZE: [f32; 2] = [360.0, 420.0];
+pub const MAIN_SIZE: [f32; 2] = [360.0, 440.0];
 /// The smallest the main window can be made.
-pub const MAIN_MIN_SIZE: [f32; 2] = [360.0, 320.0];
+pub const MAIN_MIN_SIZE: [f32; 2] = [360.0, 340.0];
 /// What the settings window opens with: every page fits without a scroll
 /// bar at this size unless expert rows or a long member list make it grow
 /// (`tests/ui_layout.rs`).
@@ -1045,128 +1043,152 @@ impl MainView {
             .show_separator_line(false)
             .show(root, |ui| {
                 let tok = theme::tokens(ui.visuals());
-                ui.add_space(4.0);
-                // One row, one explicit height, everything centered on a shared
-                // baseline — `allocate_ui_with_layout` with an explicit height,
-                // not `with_layout`: the latter claims the parent's *entire*
-                // remaining height, and `Align::Center` then centers the content
-                // inside that tall rect, which balloons the row's `min_rect` and
-                // pushes everything after it off-screen.
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), HEADER),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.add_space(4.0);
-                        let (color, short, detail) = conn_status(state, &tok);
-                        let admin = format!("{} Admin", icon::SHIELD_STAR);
-                        // The server, then the connection as a dot and a word.
-                        // The own name is not repeated here — it is the first
-                        // row of the list right below. The server name gets
-                        // what the rest of the row leaves and ends in „…“ in
-                        // a narrow window, whole on hover.
-                        let gap = ui.spacing().item_spacing.x;
-                        let text_w = |text: &str, size: f32| {
-                            ui.painter()
-                                .layout_no_wrap(
-                                    text.to_string(),
-                                    egui::FontId::proportional(size),
-                                    tok.muted_text,
-                                )
-                                .size()
-                                .x
-                        };
-                        let mut rest = 3.0 * HEADER + 2.0 * 2.0 + gap;
-                        rest += widgets::status_link_width(ui, &short) + gap;
-                        if state.is_admin {
-                            rest += text_w(&admin, 12.0) + 4.0 + gap;
-                        }
-                        if env.video_tier != VideoTier::T0 {
-                            rest += text_w(icon::VIDEO_CAMERA_SLASH, 15.0) + gap;
-                        }
-                        let room = (ui.available_width() - rest - gap).max(24.0);
-                        ui.scope(|ui| {
-                            ui.set_max_width(room);
-                            ui.add(
-                                egui::Label::new(theme::strong_text(&state.server_name)).truncate(),
-                            );
-                        });
-                        // Own role on this server: an admin sees it at a
-                        // glance, not only behind the Benutzer tab.
-                        if state.is_admin {
-                            ui.label(RichText::new(admin).size(12.0).color(tok.accent))
-                                .on_hover_text("Du bist Admin auf diesem Server");
-                            ui.add_space(4.0);
-                        }
-                        // Clickable in every state, not just Connected: a failed
-                        // or retrying connection is exactly when the details are
-                        // worth a window instead of a one-line tooltip.
-                        if widgets::status_link(ui, color, &short)
-                            .on_hover_ui(|ui| {
-                                ui.label(if detail.is_empty() {
-                                    format!("{short}\n\nKlicken für Verbindungsdetails")
-                                } else {
-                                    format!("{short} — {detail}\n\nKlicken für Verbindungsdetails")
-                                });
-                            })
-                            .clicked()
-                        {
-                            out.toggle_connection = true;
-                        }
+                let (color, short, detail) = conn_status(state, &tok);
+                let connected = state.conn == ConnStatus::Connected;
+                let uptime = state
+                    .conn_info
+                    .as_ref()
+                    .filter(|_| connected)
+                    .map(|info| fmt_uptime(info.connected_at.elapsed()));
+                // The round trip as the server measured it, the same number
+                // the own row's bars stand for.
+                let rtt = state
+                    .server_rtt_ms
+                    .or(state.rtt_ms.map(|ms| ms.round() as u16))
+                    .filter(|_| connected);
+                // Own outgoing video quality tier, set by
+                // `crate::quality::QualityController`. Automatic, no settings
+                // toggle (`Research/feature-freeze.md`'s bias against exposing
+                // adaptive behavior as a dial) — but shown, since a tier-down
+                // is visible to other people as this client's video degrading.
+                let video_hint = match env.video_tier {
+                    VideoTier::T0 => None,
+                    VideoTier::T4 => Some("Video pausiert — das Netz trägt es gerade nicht."),
+                    _ => Some("Video reduziert — weniger Bitrate für eine stabile Stimme."),
+                };
+                // Right to left from the signal: the video tier, then the own
+                // role on this server — an admin sees it at a glance, not
+                // only behind the Nutzer tab.
+                let mut indicators = Vec::new();
+                if video_hint.is_some() {
+                    indicators.push((icon::VIDEO_CAMERA_SLASH, tok.connecting));
+                }
+                if state.is_admin {
+                    indicators.push((icon::SHIELD_STAR, tok.accent));
+                }
 
-                        // Own outgoing video quality tier, set by
-                        // `crate::quality::QualityController`. Automatic, no
-                        // settings toggle (`Research/feature-freeze.md`'s bias
-                        // against exposing adaptive behavior as a dial) — but
-                        // shown, since a tier-down is visible to other people as
-                        // this client's video degrading.
-                        let hint = match env.video_tier {
-                            VideoTier::T0 => None,
-                            VideoTier::T4 => {
-                                Some("Video pausiert — das Netz trägt es gerade nicht.")
-                            }
-                            _ => Some("Video reduziert — weniger Bitrate für eine stabile Stimme."),
-                        };
-                        if let Some(hint) = hint {
-                            ui.label(
-                                RichText::new(icon::VIDEO_CAMERA_SLASH)
-                                    .size(15.0)
-                                    .color(tok.connecting),
-                            )
-                            .on_hover_text(hint);
-                        }
-
-                        widgets::rtl(ui, HEADER, |ui| {
-                            ui.spacing_mut().item_spacing.x = 2.0;
-                            if widgets::icon_button(ui, icon::POWER, HEADER, false)
-                                .on_hover_text("Beenden (Strg+Q)")
-                                .clicked()
-                            {
-                                out.quit = true;
-                            }
-                            if widgets::icon_button(ui, icon::GEAR_FINE, HEADER, env.settings_open)
-                                .on_hover_text("Einstellungen")
-                                .clicked()
-                            {
-                                out.toggle_settings = true;
-                            }
-                            // Flips whatever is on screen right now, so from
-                            // `system` it always does something visible.
-                            let dark = ui.visuals().dark_mode;
-                            let (glyph, hint, next) = if dark {
-                                (icon::SUN, "Hell", "light")
+                // Two lines, the way the top of a phone reads: a status bar
+                // with the connection, then the title row with the server
+                // and the actions. Everything on a line shares its height.
+                ui.add_space(2.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let bar = widgets::status_bar(
+                        ui,
+                        &widgets::StatusBar {
+                            color,
+                            word: &short,
+                            extra: uptime.as_deref(),
+                            signal: rtt.map(|ms| (rtt_bars(ms), ms)),
+                            indicators: &indicators,
+                        },
+                    );
+                    // Clickable in every state, not just Connected: a failed
+                    // or retrying connection is exactly when the details are
+                    // worth a window instead of a one-line tooltip.
+                    if bar
+                        .on_hover_ui(|ui| {
+                            let mut lines = vec![if detail.is_empty() {
+                                short.clone()
                             } else {
-                                (icon::MOON, "Dunkel", "dark")
-                            };
-                            if widgets::icon_button(ui, glyph, HEADER, false)
-                                .on_hover_text(hint)
-                                .clicked()
-                            {
-                                out.theme = Some(next);
+                                format!("{short} — {detail}")
+                            }];
+                            if let Some(ms) = rtt {
+                                lines.push(format!("Ping {ms} ms"));
                             }
-                        });
-                    },
-                );
+                            if let Some(hint) = video_hint {
+                                lines.push(hint.to_string());
+                            }
+                            if state.is_admin {
+                                lines.push("Du bist Admin auf diesem Server".to_string());
+                            }
+                            lines.push(String::new());
+                            lines.push("Klicken für Verbindungsdetails".to_string());
+                            ui.label(lines.join("\n"));
+                        })
+                        .clicked()
+                    {
+                        out.toggle_connection = true;
+                    }
+
+                    // An explicit height, not `with_layout`: that claims the
+                    // parent's entire remaining height, and `Align::Center`
+                    // then centers the row inside it (`widgets::rtl`).
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), widgets::CAPSULE_H),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(widgets::HEADER_INSET);
+                            // The server gets what the actions leave and ends
+                            // in „…“ in a narrow window, whole on hover.
+                            let gap = ui.spacing().item_spacing.x;
+                            let room =
+                                ui.available_width() - widgets::action_capsule_width(3) - gap;
+                            ui.scope(|ui| {
+                                ui.set_max_width(room.max(24.0));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&state.server_name)
+                                            .font(egui::FontId::new(16.0, fonts::semibold())),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                            widgets::rtl(ui, widgets::CAPSULE_H, |ui| {
+                                // Flips whatever is on screen right now, so
+                                // from `system` it always does something
+                                // visible.
+                                let (glyph, hint, next) = if ui.visuals().dark_mode {
+                                    (icon::SUN, "Hell", "light")
+                                } else {
+                                    (icon::MOON, "Dunkel", "dark")
+                                };
+                                let button =
+                                    |glyph, label, active, danger| widgets::CapsuleButton {
+                                        glyph,
+                                        label,
+                                        active,
+                                        danger,
+                                    };
+                                let clicked: Vec<bool> = widgets::action_capsule(
+                                    ui,
+                                    &[
+                                        button(glyph, hint, false, false),
+                                        button(
+                                            icon::GEAR_FINE,
+                                            "Einstellungen",
+                                            env.settings_open,
+                                            false,
+                                        ),
+                                        button(icon::POWER, "Beenden (Strg+Q)", false, true),
+                                    ],
+                                )
+                                .iter()
+                                .map(egui::Response::clicked)
+                                .collect();
+                                if clicked[0] {
+                                    out.theme = Some(next);
+                                }
+                                if clicked[1] {
+                                    out.toggle_settings = true;
+                                }
+                                if clicked[2] {
+                                    out.quit = true;
+                                }
+                            });
+                        },
+                    );
+                });
                 ui.add_space(4.0);
 
                 if let Some(min) = &state.update_required {
@@ -1845,29 +1867,12 @@ fn participant_row(
                         // a client self-report: every viewer sees the same number
                         // for a given peer. Signal bars in a fixed box, the exact
                         // number on hover. Far right, the column every row has.
-                        let (bars, _) =
-                            ui.allocate_exact_size(egui::vec2(22.0, 20.0), egui::Sense::hover());
+                        let (bars, _) = ui.allocate_exact_size(
+                            egui::vec2(widgets::SIGNAL_BARS_W, 20.0),
+                            egui::Sense::hover(),
+                        );
                         if let Some(ms) = p.rtt_ms {
-                            let lit = rtt_bars(ms);
-                            let on = match lit {
-                                4.. => tok.connected,
-                                2..=3 => tok.connecting,
-                                _ => tok.error,
-                            };
-                            let off = tok.dim_text.gamma_multiply(0.25);
-                            for i in 0..5u8 {
-                                let h = 4.0 + 2.5 * f32::from(i);
-                                let x = bars.left() + 2.0 + 4.0 * f32::from(i);
-                                let bar = egui::Rect::from_min_max(
-                                    egui::pos2(x, bars.center().y + 6.0 - h),
-                                    egui::pos2(x + 2.5, bars.center().y + 6.0),
-                                );
-                                ui.painter().rect_filled(
-                                    bar,
-                                    egui::CornerRadius::same(1),
-                                    if i < lit { on } else { off },
-                                );
-                            }
+                            widgets::signal_bars(ui, bars, rtt_bars(ms));
                             ui.interact(
                                 bars,
                                 ui.id().with(("rtt", p.user_id)),
