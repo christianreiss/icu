@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem},
-    Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent,
+    Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
 use crate::engine::{AppState, Command, ConnStatus};
@@ -74,14 +74,34 @@ fn dispatch_menu(event: MenuEvent) {
     }
 }
 
+/// Whether a click on the icon itself shows the window. On Windows a double
+/// click, as usual there (a single one does nothing, the right one opens the
+/// menu). Elsewhere a click: the StatusNotifier backend (ksni) reports the
+/// host's `Activate` as `Click` and never a double click, so waiting for one
+/// left the icon dead on Linux.
+fn shows_window(event: &TrayIconEvent) -> bool {
+    if cfg!(windows) {
+        matches!(
+            event,
+            TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            }
+        )
+    } else {
+        matches!(
+            event,
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+        )
+    }
+}
+
 fn dispatch_tray(event: TrayIconEvent) {
-    if !matches!(
-        event,
-        TrayIconEvent::DoubleClick {
-            button: MouseButton::Left,
-            ..
-        }
-    ) {
+    if !shows_window(&event) {
         return;
     }
     let active = ACTIVE_EVENTS.lock().unwrap().clone();
@@ -180,11 +200,7 @@ impl Tray {
             }
         }
         while let Ok(ev) = self.tray_rx.try_recv() {
-            if let TrayIconEvent::DoubleClick {
-                button: MouseButton::Left,
-                ..
-            } = ev
-            {
+            if shows_window(&ev) {
                 out = Some(TrayEvent::ShowWindow);
             }
         }
@@ -344,6 +360,42 @@ fn render_icon(rgb: [u8; 3], bar: bool) -> Icon {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// A left click on the icon shows the window on Linux (ksni knows only
+    /// `Click`); on Windows the double click does, and a single click not.
+    #[test]
+    fn a_click_on_the_icon_shows_the_window() {
+        use tray_icon::{dpi::PhysicalPosition, Rect, TrayIconId};
+        let click = |button, button_state| TrayIconEvent::Click {
+            id: TrayIconId::new("icu"),
+            position: PhysicalPosition::new(0.0, 0.0),
+            rect: Rect::default(),
+            button,
+            button_state,
+        };
+        let double = |button| TrayIconEvent::DoubleClick {
+            id: TrayIconId::new("icu"),
+            position: PhysicalPosition::new(0.0, 0.0),
+            rect: Rect::default(),
+            button,
+        };
+        let left_up = click(MouseButton::Left, MouseButtonState::Up);
+        assert_eq!(shows_window(&left_up), !cfg!(windows));
+        assert_eq!(shows_window(&double(MouseButton::Left)), cfg!(windows));
+        assert!(!shows_window(&click(
+            MouseButton::Left,
+            MouseButtonState::Down
+        )));
+        assert!(!shows_window(&click(
+            MouseButton::Right,
+            MouseButtonState::Up
+        )));
+        assert!(!shows_window(&click(
+            MouseButton::Middle,
+            MouseButtonState::Up
+        )));
+        assert!(!shows_window(&double(MouseButton::Right)));
+    }
 
     #[test]
     fn native_handlers_follow_the_replacement_tray() {

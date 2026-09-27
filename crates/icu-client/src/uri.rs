@@ -31,7 +31,8 @@ fn desktop_entry(exe: &Path) -> String {
 
 /// `exe` as the program of an `Exec` key: quoted when it holds anything
 /// but plain path characters, with the escapes the desktop entry spec asks
-/// for (a backslash doubled once for the quoting, once for the string).
+/// for (a backslash doubled once for the quoting, once for the string; a
+/// literal `%` doubled, or it would read as a field code).
 #[cfg(target_os = "linux")]
 fn exec_quoted(exe: &Path) -> String {
     let exe = exe.to_string_lossy();
@@ -46,6 +47,7 @@ fn exec_quoted(exe: &Path) -> String {
         match c {
             '"' | '`' | '$' => out.push_str("\\\\"),
             '\\' => out.push_str("\\\\\\"),
+            '%' => out.push('%'),
             _ => {}
         }
         out.push(c);
@@ -96,22 +98,44 @@ fn write_if_changed(path: &Path, contents: &str) -> Result<bool, String> {
 #[cfg(target_os = "linux")]
 pub fn register() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    // Installed from the rpm/deb: the package ships both files (its
-    // triggers rebuild the databases), and user copies would shadow them.
-    let packaged = Path::new("/usr/share/applications/icu.desktop");
-    if exe == Path::new("/usr/bin/icu") && packaged.exists() {
-        return Ok(packaged.to_path_buf());
-    }
-    let data = directories::BaseDirs::new()
-        .ok_or("no home directory")?
-        .data_local_dir()
-        .to_path_buf();
-    let written = write_files(&data, &exe)?;
     let run = |program: &str, args: &[&std::ffi::OsStr]| {
         if let Err(e) = std::process::Command::new(program).args(args).status() {
             tracing::debug!(%e, program, "not run");
         }
     };
+    let set_default = || {
+        run(
+            "xdg-mime",
+            &[
+                "default".as_ref(),
+                "icu.desktop".as_ref(),
+                MIME_TYPE.as_ref(),
+            ],
+        )
+    };
+    let data = directories::BaseDirs::new().map(|d| d.data_local_dir().to_path_buf());
+    // Installed from the rpm/deb: the package ships both files (its
+    // triggers rebuild the databases), and user copies would shadow them —
+    // so one an earlier, unpackaged ICU left behind goes.
+    let packaged = Path::new("/usr/share/applications/icu.desktop");
+    if exe == Path::new("/usr/bin/icu") && packaged.exists() {
+        if let Some(data) = &data {
+            match remove_stale_entry(data, &exe) {
+                Ok(true) => {
+                    run(
+                        "update-desktop-database",
+                        &[data.join("applications").as_os_str()],
+                    );
+                    set_default();
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!(%e, "old desktop entry not removed"),
+            }
+        }
+        return Ok(packaged.to_path_buf());
+    }
+    let data = data.ok_or("no home directory")?;
+    let written = write_files(&data, &exe)?;
     if written.mime {
         run("update-mime-database", &[data.join("mime").as_os_str()]);
     }
@@ -122,16 +146,38 @@ pub fn register() -> Result<PathBuf, String> {
         );
     }
     if written.mime || written.desktop {
-        run(
-            "xdg-mime",
-            &[
-                "default".as_ref(),
-                "icu.desktop".as_ref(),
-                MIME_TYPE.as_ref(),
-            ],
-        );
+        set_default();
     }
     Ok(data.join("applications").join("icu.desktop"))
+}
+
+/// Removes the per-user desktop entry under `data` (`~/.local/share`) that
+/// an ICU run from elsewhere wrote, when it opens files with another binary
+/// than `exe`. It has the package's name, so it shadowed the package's
+/// entry, and invites kept opening a build that may be long gone. Only an
+/// entry for our MIME type goes; one that already runs `exe` stays. Returns
+/// whether one was removed.
+#[cfg(target_os = "linux")]
+fn remove_stale_entry(data: &Path, exe: &Path) -> Result<bool, String> {
+    let path = data.join("applications").join("icu.desktop");
+    let Ok(entry) = std::fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    let ours = entry
+        .lines()
+        .any(|l| l.trim() == format!("MimeType={MIME_TYPE};"));
+    let program = exec_quoted(exe);
+    let runs_exe = entry.lines().any(|l| {
+        l.trim_end()
+            .strip_prefix("Exec=")
+            .is_some_and(|rest| rest == program || rest.starts_with(&format!("{program} ")))
+    });
+    if !ours || runs_exe {
+        return Ok(false);
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    tracing::info!(path = %path.display(), "removed an old desktop entry that shadowed the package's");
+    Ok(true)
 }
 
 /// The ProgID `.icu` files point to.
@@ -214,6 +260,37 @@ mod tests {
             exec_quoted(Path::new("/usr/local/bin/icu")),
             "/usr/local/bin/icu"
         );
+        assert_eq!(
+            exec_quoted(Path::new("/opt/100%/icu")),
+            "\"/opt/100%%/icu\"",
+            "a percent sign is not a field code"
+        );
+    }
+
+    /// Running as the package, a user entry an earlier build left behind is
+    /// removed — it shadowed the package's — but not one that already runs
+    /// the package's binary, nor somebody else's `icu.desktop`.
+    #[test]
+    fn the_package_removes_a_stale_user_entry() {
+        let data = tempfile::tempdir().unwrap();
+        let entry = data.path().join("applications/icu.desktop");
+        let packaged = Path::new("/usr/bin/icu");
+        assert!(
+            !remove_stale_entry(data.path(), packaged).unwrap(),
+            "none there"
+        );
+
+        write_files(data.path(), Path::new("/home/a/src/icu/target/release/icu")).unwrap();
+        assert!(remove_stale_entry(data.path(), packaged).unwrap());
+        assert!(!entry.exists());
+
+        write_files(data.path(), packaged).unwrap();
+        assert!(!remove_stale_entry(data.path(), packaged).unwrap());
+        assert!(entry.exists(), "it runs the package's binary");
+
+        std::fs::write(&entry, "[Desktop Entry]\nExec=/opt/other/icu\n").unwrap();
+        assert!(!remove_stale_entry(data.path(), packaged).unwrap());
+        assert!(entry.exists(), "not ours");
     }
 
     #[test]

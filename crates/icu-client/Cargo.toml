@@ -25,7 +25,7 @@ default = ["aec", "gui", "camera", "overlay", "tray"]
 # abseil headers and the rust-objcopy symlink (Client/IMPLEMENTATION.md §12).
 aec = ["dep:webrtc-audio-processing", "dep:webrtc-audio-processing-config"]
 # egui main window and settings. Without it only `--headless` works.
-gui = ["dep:eframe", "dep:egui", "dep:egui-phosphor", "dep:raw-window-handle"]
+gui = ["dep:eframe", "dep:egui", "dep:egui-phosphor", "dep:raw-window-handle", "dep:arboard"]
 # eframe glow backend in addition to the default wgpu one.
 glow = ["eframe?/glow"]
 # Camera capture and H.264.
@@ -69,6 +69,9 @@ cpal = { version = "0.18.2", optional = true }
 eframe = { version = "0.36.2", optional = true }
 egui = { version = "0.36.2", optional = true }
 egui-phosphor = { version = "0.14.0", optional = true }
+# Takes a copied passport off the clipboard again; already in the tree
+# through eframe (egui-winit's clipboard).
+arboard = { version = "3.6.1", default-features = false, optional = true }
 
 # Camera / video
 nokhwa = { version = "0.10.11", features = ["input-native", "camera-sync-impl"], optional = true }
@@ -108,6 +111,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Media_KernelStreaming",
     "Win32_Media_Multimedia",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
@@ -117,6 +121,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_Registry",
+    "Win32_System_Shutdown",
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_UI_HiDpi",

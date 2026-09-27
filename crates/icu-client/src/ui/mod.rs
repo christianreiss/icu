@@ -19,10 +19,21 @@ use crate::{
 pub use main_window::Exit;
 
 /// The push-to-talk binding as a person would say it: `KEY_RIGHTCTRL`
-/// becomes `RIGHTCTRL`, and the Portal backend shows its own trigger
-/// (`CTRL+SHIFT+F12`) because that is what it actually bound.
+/// becomes `RIGHTCTRL`. Through the Portal it is the key the desktop
+/// assigned (its dialog may take another than the one proposed), else the
+/// proposed trigger (`CTRL+SHIFT+F12`).
 pub(crate) fn ptt_key_label(hotkeys: &crate::config::HotkeySettings, backend: &str) -> String {
     let binding = &hotkeys.ptt;
+    if backend == "portal" {
+        if let Some(assigned) = crate::hotkey::portal_trigger(crate::hotkey::Action::Ptt) {
+            // Left blank in the dialog: no key works, whatever was proposed.
+            return if assigned.is_empty() {
+                "—".to_string()
+            } else {
+                assigned
+            };
+        }
+    }
     if backend == "portal"
         || (backend == crate::hotkey::BACKEND_RAWINPUT && binding.key.trim().is_empty())
     {
@@ -41,6 +52,20 @@ pub(crate) fn ptt_key_label(hotkeys: &crate::config::HotkeySettings, backend: &s
         .to_string()
 }
 
+/// Whether a file dropped onto a window arrives: winit 0.30 delivers
+/// `DroppedFile` on X11 and Windows, not on Wayland — which it uses
+/// whenever `WAYLAND_DISPLAY` is set, unless `WINIT_UNIX_BACKEND=x11`
+/// forces X11. The first-start window promises drag & drop only where it
+/// works.
+pub(crate) fn file_drop_works() -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|v| v == "x11");
+    !wayland || forced_x11
+}
+
 /// Work area in egui screen coordinates, including the taskbar exclusion.
 /// winit supplies the monitor size but not its usable rectangle.
 #[cfg(windows)]
@@ -49,15 +74,14 @@ pub(crate) fn work_area(ctx: &egui::Context) -> Option<egui::Rect> {
         Foundation::POINT,
         Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST},
     };
+    // No window position, no window to fit: the headless test harness has
+    // none, and would otherwise be held to the desktop it happens to run on.
     let (center, scale) = ctx.input(|i| {
-        (
-            i.viewport()
-                .outer_rect
-                .map(|r| r.center())
-                .unwrap_or_default(),
+        Some((
+            i.viewport().outer_rect?.center(),
             i.viewport().native_pixels_per_point.unwrap_or(1.0),
-        )
-    });
+        ))
+    })?;
     let monitor = unsafe {
         MonitorFromPoint(
             POINT {
@@ -134,6 +158,35 @@ pub(crate) fn grow_to_fit(ctx: &egui::Context, overflow: f32) {
     }
 }
 
+/// ICU's eye for the title bar, taskbar and Alt+Tab (eframe would show its
+/// own logo); the child windows inherit it. Rendered from
+/// `packaging/files/icu.svg`, like `assets/icu.ico` for `icu.exe`.
+pub(crate) fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icu.png")).unwrap_or_default()
+}
+
+/// eframe's options for a window of its own: ICU's icon, and on Windows
+/// the DX12 shader compiler pinned to FXC (`d3dcompiler_47.dll`, part of
+/// Windows). wgpu's default first looks for `dxcompiler.dll`, which no
+/// Windows ships — a copy lying next to a downloaded `.icu` file must not
+/// be what renders ICU.
+pub(crate) fn native_options(viewport: egui::ViewportBuilder) -> eframe::NativeOptions {
+    #[allow(unused_mut)]
+    let mut options = eframe::NativeOptions {
+        viewport: viewport.with_icon(app_icon()),
+        ..Default::default()
+    };
+    #[cfg(windows)]
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
+        setup
+            .instance_descriptor
+            .backend_options
+            .dx12
+            .shader_compiler = eframe::wgpu::Dx12Compiler::Fxc;
+    }
+    options
+}
+
 /// Runs the main window until the user quits or logs out. Owns the engine.
 pub fn run_main_window(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String> {
     main_window::run(engine, debug_stats, show)
@@ -157,6 +210,32 @@ pub fn run_enroll_window_with(
     text: String,
 ) -> Result<Option<Identity>, String> {
     main_window::run_enroll(paths, server_addr, Some(text))
+}
+
+#[cfg(test)]
+mod native_options_tests {
+    /// The window gets ICU's icon, not eframe's (a default `IconData` would
+    /// mean none); on Windows DX12 compiles with FXC.
+    #[test]
+    fn windows_carry_the_icu_icon_and_no_dxc() {
+        let icon = super::app_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        let options = super::native_options(egui::ViewportBuilder::default());
+        assert_eq!(options.viewport.icon.as_deref(), Some(&icon));
+        #[cfg(windows)]
+        match &options.wgpu_options.wgpu_setup {
+            eframe::egui_wgpu::WgpuSetup::CreateNew(setup) => assert!(matches!(
+                setup
+                    .instance_descriptor
+                    .backend_options
+                    .dx12
+                    .shader_compiler,
+                eframe::wgpu::Dx12Compiler::Fxc
+            )),
+            other => panic!("unexpected wgpu setup: {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]

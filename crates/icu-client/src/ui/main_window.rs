@@ -14,7 +14,7 @@ use egui::{Color32, RichText};
 use egui_phosphor::regular as icon;
 
 use super::{
-    connection::{opt, wrap_fingerprint, ConnectionView, NONE},
+    connection::{fmt_uptime, opt, wrap_fingerprint, ConnectionView, NONE},
     fonts,
     settings::SettingsView,
     setup::SetupView,
@@ -28,8 +28,6 @@ use crate::{
     video::VideoTier,
 };
 
-/// Header height, and with it the size of the header's icon buttons.
-const HEADER: f32 = 32.0;
 /// The speak surface and the mode tile beside it.
 const SPEAK_H: f32 = 52.0;
 /// The control tiles along the bottom.
@@ -49,6 +47,13 @@ type Toggle = (
     Option<Command>,
 );
 
+/// What the main window opens with: four people — oneself and three more —
+/// fit without a scroll bar, and it is no wider than the control dock needs;
+/// long names end in „…“ (`tests/ui_layout.rs`). A bigger room grows it after
+/// connecting (`App::fit_to_list`).
+pub const MAIN_SIZE: [f32; 2] = [360.0, 440.0];
+/// The smallest the main window can be made.
+pub const MAIN_MIN_SIZE: [f32; 2] = [360.0, 340.0];
 /// What the settings window opens with: every page fits without a scroll
 /// bar at this size unless expert rows or a long member list make it grow
 /// (`tests/ui_layout.rs`).
@@ -84,16 +89,15 @@ pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String
     // the task bar/dock instead of on screen.
     let start_minimized_to_dock = start_minimized && !start_hidden_possible();
     let start_minimized = start_minimized && !start_minimized_to_dock;
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    let options = super::native_options(
+        egui::ViewportBuilder::default()
             .with_title("ICU")
             .with_app_id("icu")
-            .with_inner_size([400.0, 620.0])
-            .with_min_inner_size([360.0, 320.0])
+            .with_inner_size(MAIN_SIZE)
+            .with_min_inner_size(MAIN_MIN_SIZE)
             .with_resizable(true)
             .with_visible(!start_minimized),
-        ..Default::default()
-    };
+    );
     let paths = engine.paths();
     let engine = Arc::new(Mutex::new(Some(engine)));
     let engine_for_app = engine.clone();
@@ -200,19 +204,30 @@ struct App {
 
 impl App {
     /// Window height follows the people list: once after connecting it
-    /// shrinks or grows to exactly fit, afterwards it only grows, and only
-    /// when somebody joins — a window the user made smaller stays so.
+    /// shrinks or grows to fit, but not below the four people it opens for
+    /// (`MAIN_SIZE`); afterwards it only grows, and only when somebody joins
+    /// — a window the user made smaller stays so. Without a connection it
+    /// only grows, for a banner that would not fit.
     fn fit_to_list(&mut self, ctx: &egui::Context, overflow: f32) {
         let state = &self.state;
         let connected = state.conn == ConnStatus::Connected && state.me.is_some();
         if !connected {
             self.fitted = false;
             self.rows_seen = 0;
+            if !self.hidden {
+                super::grow_to_fit(ctx, overflow);
+            }
             return;
         }
         let rows = state.peers.len() + 1;
         let joined = rows > self.rows_seen;
         self.rows_seen = rows;
+        let inner = ctx.content_rect();
+        let overflow = if self.fitted {
+            overflow
+        } else {
+            overflow.max(MAIN_SIZE[1] - inner.height())
+        };
         let resize = if !self.fitted {
             overflow.abs() > 1.0
         } else {
@@ -224,7 +239,6 @@ impl App {
         }
         // Shrinking is only right once, right after connecting; afterwards
         // the window only grows (`super::grow_to_fit`).
-        let inner = ctx.content_rect();
         let monitor = ctx.input(|i| i.viewport().monitor_size);
         let max = monitor.map_or(f32::INFINITY, |m| m.y * 0.9);
         #[cfg(windows)]
@@ -609,7 +623,7 @@ impl eframe::App for App {
         let ctx = root.ctx().clone();
         #[cfg(windows)]
         if !self.positioned {
-            self.positioned = super::position_window(&ctx, [400.0, 620.0], [360.0, 320.0]);
+            self.positioned = super::position_window(&ctx, MAIN_SIZE, MAIN_MIN_SIZE);
         }
         ctx.request_repaint_after(Duration::from_millis(33));
 
@@ -1029,104 +1043,152 @@ impl MainView {
             .show_separator_line(false)
             .show(root, |ui| {
                 let tok = theme::tokens(ui.visuals());
-                ui.add_space(4.0);
-                // One row, one explicit height, everything centered on a shared
-                // baseline — `allocate_ui_with_layout` with an explicit height,
-                // not `with_layout`: the latter claims the parent's *entire*
-                // remaining height, and `Align::Center` then centers the content
-                // inside that tall rect, which balloons the row's `min_rect` and
-                // pushes everything after it off-screen.
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), HEADER),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        ui.add_space(4.0);
-                        // The server, then the connection as a dot and a word.
-                        // The own name is not repeated here — it is the first
-                        // row of the list right below.
-                        ui.label(theme::strong_text(&state.server_name));
-                        // Own role on this server: an admin sees it at a
-                        // glance, not only behind the Benutzer tab.
-                        if state.is_admin {
-                            ui.label(
-                                RichText::new(format!("{} Admin", icon::SHIELD_STAR))
-                                    .size(12.0)
-                                    .color(tok.accent),
-                            )
-                            .on_hover_text("Du bist Admin auf diesem Server");
-                            ui.add_space(4.0);
-                        }
-                        let (color, short, detail) = conn_status(state, &tok);
-                        // Clickable in every state, not just Connected: a failed
-                        // or retrying connection is exactly when the details are
-                        // worth a window instead of a one-line tooltip.
-                        if widgets::status_link(ui, color, &short)
-                            .on_hover_ui(|ui| {
-                                ui.label(if detail.is_empty() {
-                                    format!("{short}\n\nKlicken für Verbindungsdetails")
-                                } else {
-                                    format!("{short} — {detail}\n\nKlicken für Verbindungsdetails")
-                                });
-                            })
-                            .clicked()
-                        {
-                            out.toggle_connection = true;
-                        }
+                let (color, short, detail) = conn_status(state, &tok);
+                let connected = state.conn == ConnStatus::Connected;
+                let uptime = state
+                    .conn_info
+                    .as_ref()
+                    .filter(|_| connected)
+                    .map(|info| fmt_uptime(info.connected_at.elapsed()));
+                // The round trip as the server measured it, the same number
+                // the own row's bars stand for.
+                let rtt = state
+                    .server_rtt_ms
+                    .or(state.rtt_ms.map(|ms| ms.round() as u16))
+                    .filter(|_| connected);
+                // Own outgoing video quality tier, set by
+                // `crate::quality::QualityController`. Automatic, no settings
+                // toggle (`Research/feature-freeze.md`'s bias against exposing
+                // adaptive behavior as a dial) — but shown, since a tier-down
+                // is visible to other people as this client's video degrading.
+                let video_hint = match env.video_tier {
+                    VideoTier::T0 => None,
+                    VideoTier::T4 => Some("Video pausiert — das Netz trägt es gerade nicht."),
+                    _ => Some("Video reduziert — weniger Bitrate für eine stabile Stimme."),
+                };
+                // Right to left from the signal: the video tier, then the own
+                // role on this server — an admin sees it at a glance, not
+                // only behind the Nutzer tab.
+                let mut indicators = Vec::new();
+                if video_hint.is_some() {
+                    indicators.push((icon::VIDEO_CAMERA_SLASH, tok.connecting));
+                }
+                if state.is_admin {
+                    indicators.push((icon::SHIELD_STAR, tok.accent));
+                }
 
-                        // Own outgoing video quality tier, set by
-                        // `crate::quality::QualityController`. Automatic, no
-                        // settings toggle (`Research/feature-freeze.md`'s bias
-                        // against exposing adaptive behavior as a dial) — but
-                        // shown, since a tier-down is visible to other people as
-                        // this client's video degrading.
-                        let hint = match env.video_tier {
-                            VideoTier::T0 => None,
-                            VideoTier::T4 => {
-                                Some("Video pausiert — das Netz trägt es gerade nicht.")
-                            }
-                            _ => Some("Video reduziert — weniger Bitrate für eine stabile Stimme."),
-                        };
-                        if let Some(hint) = hint {
-                            ui.label(
-                                RichText::new(icon::VIDEO_CAMERA_SLASH)
-                                    .size(15.0)
-                                    .color(tok.connecting),
-                            )
-                            .on_hover_text(hint);
-                        }
-
-                        widgets::rtl(ui, HEADER, |ui| {
-                            ui.spacing_mut().item_spacing.x = 2.0;
-                            if widgets::icon_button(ui, icon::POWER, HEADER, false)
-                                .on_hover_text("Beenden (Strg+Q)")
-                                .clicked()
-                            {
-                                out.quit = true;
-                            }
-                            if widgets::icon_button(ui, icon::GEAR_FINE, HEADER, env.settings_open)
-                                .on_hover_text("Einstellungen")
-                                .clicked()
-                            {
-                                out.toggle_settings = true;
-                            }
-                            // Flips whatever is on screen right now, so from
-                            // `system` it always does something visible.
-                            let dark = ui.visuals().dark_mode;
-                            let (glyph, hint, next) = if dark {
-                                (icon::SUN, "Hell", "light")
+                // Two lines, the way the top of a phone reads: a status bar
+                // with the connection, then the title row with the server
+                // and the actions. Everything on a line shares its height.
+                ui.add_space(2.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let bar = widgets::status_bar(
+                        ui,
+                        &widgets::StatusBar {
+                            color,
+                            word: &short,
+                            extra: uptime.as_deref(),
+                            signal: rtt.map(|ms| (rtt_bars(ms), ms)),
+                            indicators: &indicators,
+                        },
+                    );
+                    // Clickable in every state, not just Connected: a failed
+                    // or retrying connection is exactly when the details are
+                    // worth a window instead of a one-line tooltip.
+                    if bar
+                        .on_hover_ui(|ui| {
+                            let mut lines = vec![if detail.is_empty() {
+                                short.clone()
                             } else {
-                                (icon::MOON, "Dunkel", "dark")
-                            };
-                            if widgets::icon_button(ui, glyph, HEADER, false)
-                                .on_hover_text(hint)
-                                .clicked()
-                            {
-                                out.theme = Some(next);
+                                format!("{short} — {detail}")
+                            }];
+                            if let Some(ms) = rtt {
+                                lines.push(format!("Ping {ms} ms"));
                             }
-                        });
-                    },
-                );
+                            if let Some(hint) = video_hint {
+                                lines.push(hint.to_string());
+                            }
+                            if state.is_admin {
+                                lines.push("Du bist Admin auf diesem Server".to_string());
+                            }
+                            lines.push(String::new());
+                            lines.push("Klicken für Verbindungsdetails".to_string());
+                            ui.label(lines.join("\n"));
+                        })
+                        .clicked()
+                    {
+                        out.toggle_connection = true;
+                    }
+
+                    // An explicit height, not `with_layout`: that claims the
+                    // parent's entire remaining height, and `Align::Center`
+                    // then centers the row inside it (`widgets::rtl`).
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), widgets::CAPSULE_H),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(widgets::HEADER_INSET);
+                            // The server gets what the actions leave and ends
+                            // in „…“ in a narrow window, whole on hover.
+                            let gap = ui.spacing().item_spacing.x;
+                            let room =
+                                ui.available_width() - widgets::action_capsule_width(3) - gap;
+                            ui.scope(|ui| {
+                                ui.set_max_width(room.max(24.0));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&state.server_name)
+                                            .font(egui::FontId::new(16.0, fonts::semibold())),
+                                    )
+                                    .truncate(),
+                                );
+                            });
+                            widgets::rtl(ui, widgets::CAPSULE_H, |ui| {
+                                // Flips whatever is on screen right now, so
+                                // from `system` it always does something
+                                // visible.
+                                let (glyph, hint, next) = if ui.visuals().dark_mode {
+                                    (icon::SUN, "Hell", "light")
+                                } else {
+                                    (icon::MOON, "Dunkel", "dark")
+                                };
+                                let button =
+                                    |glyph, label, active, danger| widgets::CapsuleButton {
+                                        glyph,
+                                        label,
+                                        active,
+                                        danger,
+                                    };
+                                let clicked: Vec<bool> = widgets::action_capsule(
+                                    ui,
+                                    &[
+                                        button(glyph, hint, false, false),
+                                        button(
+                                            icon::GEAR_FINE,
+                                            "Einstellungen",
+                                            env.settings_open,
+                                            false,
+                                        ),
+                                        button(icon::POWER, "Beenden (Strg+Q)", false, true),
+                                    ],
+                                )
+                                .iter()
+                                .map(egui::Response::clicked)
+                                .collect();
+                                if clicked[0] {
+                                    out.theme = Some(next);
+                                }
+                                if clicked[1] {
+                                    out.toggle_settings = true;
+                                }
+                                if clicked[2] {
+                                    out.quit = true;
+                                }
+                            });
+                        },
+                    );
+                });
                 ui.add_space(4.0);
 
                 if let Some(min) = &state.update_required {
@@ -1362,9 +1424,11 @@ impl MainView {
                 .corner_radius(egui::CornerRadius::same(theme::R_CARD))
                 .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
+                    let visible = ui.available_height();
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
+                            let top = ui.cursor().top();
                             ui.spacing_mut().item_spacing.y = 4.0;
                             ui.add_space(2.0);
                             if let Some(me) = &state.me {
@@ -1443,7 +1507,8 @@ impl MainView {
                                 );
                             }
                             if state.peers.is_empty() {
-                                empty(ui, &state.conn);
+                                let used = ui.cursor().top() - top;
+                                empty(ui, &state.conn, visible - used);
                             }
                         })
                 })
@@ -1765,11 +1830,30 @@ fn participant_row(
                     }
                     let avatar = widgets::avatar(ui, p.name, p.user_id, p.speaking, 30.0, p.video);
                     ui.add_space(2.0);
-                    let name = ui.label(if p.mode.is_some() {
-                        theme::strong_text(p.name)
-                    } else {
-                        RichText::new(p.name).size(14.0)
-                    });
+                    // The name gets what the icons on the right leave — ping
+                    // 22, volume 28, an 18 slot for the mode and one per badge
+                    // column, 6 apart — and ends in „…“ in a narrow window,
+                    // whole on hover.
+                    let gap = ui.spacing().item_spacing.x;
+                    let slots = 1.0 + columns.len() as f32;
+                    let mut rest = 22.0 + 28.0 + 18.0 * slots + 6.0 * (slots + 1.0) + gap;
+                    if p.speaking {
+                        rest += widgets::SPEAKING_BARS_W + gap;
+                    }
+                    let room = (ui.available_width() - rest).max(24.0);
+                    let name = ui
+                        .scope(|ui| {
+                            ui.set_max_width(room);
+                            ui.add(
+                                egui::Label::new(if p.mode.is_some() {
+                                    theme::strong_text(p.name)
+                                } else {
+                                    RichText::new(p.name).size(14.0)
+                                })
+                                .truncate(),
+                            )
+                        })
+                        .inner;
                     if !hint.is_empty() {
                         avatar.on_hover_text(&hint);
                         name.on_hover_text(&hint);
@@ -1783,29 +1867,12 @@ fn participant_row(
                         // a client self-report: every viewer sees the same number
                         // for a given peer. Signal bars in a fixed box, the exact
                         // number on hover. Far right, the column every row has.
-                        let (bars, _) =
-                            ui.allocate_exact_size(egui::vec2(22.0, 20.0), egui::Sense::hover());
+                        let (bars, _) = ui.allocate_exact_size(
+                            egui::vec2(widgets::SIGNAL_BARS_W, 20.0),
+                            egui::Sense::hover(),
+                        );
                         if let Some(ms) = p.rtt_ms {
-                            let lit = rtt_bars(ms);
-                            let on = match lit {
-                                4.. => tok.connected,
-                                2..=3 => tok.connecting,
-                                _ => tok.error,
-                            };
-                            let off = tok.dim_text.gamma_multiply(0.25);
-                            for i in 0..5u8 {
-                                let h = 4.0 + 2.5 * f32::from(i);
-                                let x = bars.left() + 2.0 + 4.0 * f32::from(i);
-                                let bar = egui::Rect::from_min_max(
-                                    egui::pos2(x, bars.center().y + 6.0 - h),
-                                    egui::pos2(x + 2.5, bars.center().y + 6.0),
-                                );
-                                ui.painter().rect_filled(
-                                    bar,
-                                    egui::CornerRadius::same(1),
-                                    if i < lit { on } else { off },
-                                );
-                            }
+                            widgets::signal_bars(ui, bars, rtt_bars(ms));
                             ui.interact(
                                 bars,
                                 ui.id().with(("rtt", p.user_id)),
@@ -2010,7 +2077,8 @@ fn details(ui: &mut egui::Ui, p: &Participant<'_>, tok: &theme::Tokens, send: &i
                         if muted { 100.0 } else { 0.0 },
                     ));
                 }
-                if widgets::slider(ui, &mut v, 0.0..=200.0).changed() {
+                let name = format!("Lautstärke {}", p.name);
+                if widgets::named_slider(ui, &mut v, 0.0..=200.0, &name).changed() {
                     send(Command::SetVolume(p.user_id, v));
                 }
             });
@@ -2094,8 +2162,10 @@ fn moderation_menu(
 }
 
 /// The empty list: alone in the room, or not in it at all — never a blank
-/// card that looks like something failed to draw.
-fn empty(ui: &mut egui::Ui, conn: &ConnStatus) {
+/// card that looks like something failed to draw. Centered in the `room`
+/// the list leaves it, but no lower than 48 points down, so it also fits
+/// under an error banner in a short window.
+fn empty(ui: &mut egui::Ui, conn: &ConnStatus, room: f32) {
     let tok = theme::tokens(ui.visuals());
     let (glyph, text) = match conn {
         ConnStatus::Connected => (icon::USERS, "Allein hier"),
@@ -2103,8 +2173,21 @@ fn empty(ui: &mut egui::Ui, conn: &ConnStatus) {
         ConnStatus::Disconnected { .. } => (icon::PLUGS, "Getrennt — verbinde gleich neu"),
         ConnStatus::Fatal(_) => (icon::PLUGS, "Nicht verbunden"),
     };
+    let height = |text: &str, size: f32| {
+        ui.painter()
+            .layout_no_wrap(
+                text.to_string(),
+                egui::FontId::proportional(size),
+                tok.dim_text,
+            )
+            .size()
+            .y
+    };
+    let content =
+        height(glyph, 30.0) + 2.0 + height(text, 12.5) + 2.0 * ui.spacing().item_spacing.y;
+    let pad = ((room - content) / 2.0).clamp(0.0, 48.0).floor();
     ui.vertical_centered(|ui| {
-        ui.add_space(48.0);
+        ui.add_space(pad);
         ui.label(RichText::new(glyph).size(30.0).color(tok.dim_text));
         ui.add_space(2.0);
         ui.label(RichText::new(text).size(12.5).color(tok.dim_text));
@@ -2127,14 +2210,13 @@ pub fn run_enroll(
     let enroll_theme = crate::config::Settings::load(&paths)
         .map(|s| s.ui.theme)
         .unwrap_or_else(|_| "system".to_string());
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    let options = super::native_options(
+        egui::ViewportBuilder::default()
             .with_title("ICU — Einladung")
             .with_app_id("icu")
             .with_inner_size([560.0, 600.0])
             .with_min_inner_size([480.0, 520.0]),
-        ..Default::default()
-    };
+    );
     eframe::run_native(
         "ICU",
         options,
@@ -2494,9 +2576,14 @@ impl eframe::App for EnrollApp {
         }
 
         let subtitle = match step {
-            EnrollStep::Paste => {
+            EnrollStep::Paste if super::file_drop_works() => {
                 "Füge die Einladung ein, die du bekommen hast, oder zieh die Datei hierher — \
                  auch ein Passport von einem anderen Gerät geht."
+            }
+            // Wayland delivers no dropped files to winit windows.
+            EnrollStep::Paste => {
+                "Füge die Einladung ein, die du bekommen hast, oder öffne die .icu-Datei per \
+                 Doppelklick — auch ein Passport von einem anderen Gerät geht."
             }
             EnrollStep::Join if needs_name => {
                 "Prüfe, wohin die Einladung führt, und wähle deinen Namen."
@@ -2608,7 +2695,11 @@ impl eframe::App for EnrollApp {
                                     ui.horizontal(|ui| {
                                         ui.label(RichText::new("Von dort übernehmen").size(13.5));
                                         widgets::rtl(ui, 30.0, |ui| {
-                                            widgets::toggle(ui, &mut self.take_settings)
+                                            widgets::named_toggle(
+                                                ui,
+                                                &mut self.take_settings,
+                                                "Von dort übernehmen",
+                                            )
                                         });
                                     });
                                     ui.add_space(2.0);
@@ -2722,10 +2813,13 @@ impl EnrollApp {
                                 .min_size(egui::vec2(0.0, height))
                                 .font(egui::FontId::new(12.0, egui::FontFamily::Monospace))
                                 .hint_text(
-                                    RichText::new(
+                                    RichText::new(if super::file_drop_works() {
                                         "Einladung hier einfügen (Strg+V) oder die .icu-Datei \
-                                         hierher ziehen",
-                                    )
+                                         hierher ziehen"
+                                    } else {
+                                        "Einladung hier einfügen (Strg+V) oder die .icu-Datei \
+                                         doppelklicken"
+                                    })
                                     .size(13.0)
                                     .color(tok.dim_text),
                                 ),

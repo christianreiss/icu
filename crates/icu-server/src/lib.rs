@@ -361,8 +361,31 @@ pub async fn run(config: Config) -> Result<Handle> {
 /// name reserved for examples, which a new CA carries for good
 /// ([`Config::reserved_names`]); an existing one keeps its names, with a
 /// warning.
+///
+/// Nor with a `server_name` other than the one an existing CA carries in its
+/// CN: clients take their SNI from there, so the next server leaf issued for
+/// the configured name — automatic renewal, `rotate-server-cert`, a repair
+/// while loading — would fail every client's name check, and none of them
+/// would reconnect. Refused before anything is issued; a CA from before the
+/// name moved into its CN names none and is not checked.
 fn open_ca(config: &Config, store: &Store) -> Result<Ca> {
     let dir = &config.paths.state_dir;
+    if let Ok(Some(ca_name)) = crate::ca::ca_server_name(dir) {
+        let configured = config.server.server_name.trim();
+        let key = |name: &str| name.to_ascii_lowercase();
+        if key(&ca_name) != key(configured) {
+            return Err(Error::msg(format!(
+                "server.server_name is {configured:?}, but the CA in {} was made for \
+                 {ca_name:?} (CN \"{} {ca_name}\"), and clients take the server name from \
+                 there: a server certificate for {configured:?} would lock every client \
+                 out at the next certificate change. Set server.server_name to \
+                 {ca_name:?} or remove it (the CA's name is then used); a different name \
+                 needs a new CA, and every user registering again",
+                dir.display(),
+                crate::ca::CA_COMMON_NAME,
+            )));
+        }
+    }
     let ca = Ca::load_or_create_if(dir, &config.tls, &config.server.server_name, || {
         if !store.is_fresh() {
             return Err(Error::msg(format!(

@@ -4,7 +4,7 @@
 //! plus the current `Visuals` — never a raw hex literal — and radii come
 //! from `theme`'s four-step scale, never an invented number.
 //!
-//! The controls that carry state ([`toggle`], [`segmented`], [`slider`]) are
+//! The controls that carry state ([`named_toggle`], [`segmented`], [`named_slider`]) are
 //! painted here rather than taken from stock egui, because stock egui draws
 //! a slider's rail and its handle from the *same* `Visuals` field and the
 //! two can therefore never be told apart.
@@ -487,42 +487,216 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
     response
 }
 
-/// The header's connection indicator: a dot and one quiet word, clickable
-/// as a whole. Anything longer belongs in the caller's tooltip.
-pub fn status_link(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
+// ---------------------------------------------------------------------------
+// Main window header
+// ---------------------------------------------------------------------------
+
+/// Height of the [`status_bar`].
+pub const STATUS_BAR_H: f32 = 20.0;
+/// Height of an [`action_capsule`], and with it the header's title row.
+pub const CAPSULE_H: f32 = 32.0;
+/// Inset of the header's content from its edges: the status bar's text and
+/// the title start where the rows in the list card below do.
+pub const HEADER_INSET: f32 = 8.0;
+/// Room between two things in the [`status_bar`].
+const STATUS_GAP: f32 = 6.0;
+/// Width of the box [`signal_bars`] draws into.
+pub const SIGNAL_BARS_W: f32 = 22.0;
+
+/// Five signal bars, the lowest `lit` of them colored by how many that is
+/// (4–5 good, 2–3 amber, 1 bad), the rest faint — like a phone's reception.
+/// Painted into `rect`, [`SIGNAL_BARS_W`] wide and bottom-aligned 6 px below
+/// its center.
+pub fn signal_bars(ui: &Ui, rect: egui::Rect, lit: u8) {
     let tok = theme::tokens(ui.visuals());
-    let galley = ui.painter().layout_no_wrap(
-        text.to_string(),
-        FontId::new(12.0, egui::FontFamily::Proportional),
-        tok.muted_text,
-    );
-    let size = egui::vec2(galley.size().x + 26.0, 24.0);
+    let on = match lit {
+        4.. => tok.connected,
+        2..=3 => tok.connecting,
+        _ => tok.error,
+    };
+    let off = tok.dim_text.gamma_multiply(0.25);
+    for i in 0..5u8 {
+        let h = 4.0 + 2.5 * f32::from(i);
+        let x = rect.left() + 2.0 + 4.0 * f32::from(i);
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(x, rect.center().y + 6.0 - h),
+            egui::pos2(x + 2.5, rect.center().y + 6.0),
+        );
+        ui.painter()
+            .rect_filled(bar, CornerRadius::same(1), if i < lit { on } else { off });
+    }
+}
+
+/// What the [`status_bar`] shows.
+pub struct StatusBar<'a> {
+    /// The dot's color: the connection's state.
+    pub color: Color32,
+    /// The state in one word.
+    pub word: &'a str,
+    /// Quiet text after the word: how long the connection has been up.
+    pub extra: Option<&'a str>,
+    /// Signal bars (1–5) and the round trip they stand for, in ms.
+    pub signal: Option<(u8, u16)>,
+    /// Glyphs left of the signal, each in its own color.
+    pub indicators: &'a [(&'a str, Color32)],
+}
+
+/// The top line of the main window, the way a phone's status bar reads:
+/// the connection's state on the left, reception and indicators on the
+/// right, all in one small size on one [`STATUS_BAR_H`] line. Clickable as a
+/// whole; anything longer belongs in the caller's tooltip.
+pub fn status_bar(ui: &mut Ui, s: &StatusBar<'_>) -> egui::Response {
+    let tok = theme::tokens(ui.visuals());
+    let size = egui::vec2(ui.available_width(), STATUS_BAR_H);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), text));
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        if response.hovered() {
-            painter.rect_filled(rect, R_CTRL, tok.hover_overlay);
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        let dot = egui::pos2(rect.left() + 10.0, rect.center().y);
-        painter.circle_filled(dot, 3.5, color);
-        painter.galley(
-            egui::pos2(rect.left() + 19.0, rect.center().y - galley.size().y / 2.0),
-            galley,
-            tok.muted_text,
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Link, ui.is_enabled(), s.word));
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, R_CHIP, tok.hover_overlay);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let text = |text: &str, font: FontId, color: Color32| {
+        painter.layout_no_wrap(text.to_string(), font, color)
+    };
+    let regular = FontId::new(11.5, egui::FontFamily::Proportional);
+    let mid = rect.center().y;
+    let at = |x: f32, g: &egui::Galley| egui::pos2(x, mid - g.size().y / 2.0);
+
+    let mut x = rect.left() + HEADER_INSET;
+    painter.circle_filled(egui::pos2(x + 3.5, mid), 3.5, s.color);
+    x += 7.0 + STATUS_GAP;
+    let word = text(
+        s.word,
+        FontId::new(11.5, super::fonts::semibold()),
+        ui.visuals().text_color(),
+    );
+    let word_w = word.size().x;
+    painter.galley(at(x, &word), word, ui.visuals().text_color());
+    x += word_w;
+    if let Some(extra) = s.extra {
+        let extra = text(&format!("  ·  {extra}"), regular.clone(), tok.muted_text);
+        painter.galley(at(x, &extra), extra, tok.muted_text);
+    }
+
+    let mut x = rect.right() - HEADER_INSET;
+    if let Some((lit, ms)) = s.signal {
+        let ms = text(&format!("{ms} ms"), regular, tok.muted_text);
+        x -= ms.size().x;
+        painter.galley(at(x, &ms), ms, tok.muted_text);
+        x -= 2.0 + SIGNAL_BARS_W;
+        let bars = egui::Rect::from_min_size(
+            egui::pos2(x, rect.top()),
+            egui::vec2(SIGNAL_BARS_W, STATUS_BAR_H),
         );
+        signal_bars(ui, bars, lit);
+        x -= STATUS_GAP;
+    }
+    for &(glyph, color) in s.indicators {
+        let g = text(
+            glyph,
+            FontId::new(13.0, egui::FontFamily::Proportional),
+            color,
+        );
+        x -= g.size().x;
+        painter.galley(at(x, &g), g, color);
+        x -= STATUS_GAP;
     }
     response
+}
+
+/// One button of an [`action_capsule`].
+pub struct CapsuleButton<'a> {
+    pub glyph: &'a str,
+    /// Its tooltip and accessible name.
+    pub label: &'a str,
+    /// Tinted in the accent: what it opens is open.
+    pub active: bool,
+    /// Turns the error color under the pointer: it ends something.
+    pub danger: bool,
+}
+
+/// Room around the buttons inside an [`action_capsule`].
+const CAPSULE_PAD: f32 = 2.0;
+/// One round button of an [`action_capsule`].
+const CAPSULE_BUTTON: f32 = CAPSULE_H - 2.0 * CAPSULE_PAD;
+
+/// How wide an [`action_capsule`] with `n` buttons is.
+pub fn action_capsule_width(n: usize) -> f32 {
+    n as f32 * CAPSULE_BUTTON + 2.0 * CAPSULE_PAD
+}
+
+/// A row of round icon buttons on one pill-shaped surface, all the same
+/// size: the header's actions, grouped the way a phone's title bar groups
+/// them. Returns one response per button, in order.
+pub fn action_capsule(ui: &mut Ui, buttons: &[CapsuleButton<'_>]) -> Vec<egui::Response> {
+    let tok = theme::tokens(ui.visuals());
+    let size = egui::vec2(action_capsule_width(buttons.len()), CAPSULE_H);
+    let (rect, capsule) = ui.allocate_exact_size(size, Sense::hover());
+    let visible = ui.is_rect_visible(rect);
+    if visible {
+        ui.painter()
+            .rect_filled(rect, CAPSULE_H / 2.0, tok.surface_hi);
+        ui.painter().rect_stroke(
+            rect,
+            CAPSULE_H / 2.0,
+            Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            StrokeKind::Inside,
+        );
+    }
+    buttons
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let r = egui::Rect::from_min_size(
+                rect.min + egui::vec2(CAPSULE_PAD + i as f32 * CAPSULE_BUTTON, CAPSULE_PAD),
+                egui::vec2(CAPSULE_BUTTON, CAPSULE_BUTTON),
+            );
+            let response = ui.interact(r, capsule.id.with(i), Sense::click());
+            response.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Button,
+                    ui.is_enabled(),
+                    b.active,
+                    b.label,
+                )
+            });
+            if visible {
+                let hovered = response.hovered();
+                let (fill, color) = match (b.active, hovered) {
+                    (true, _) => (tok.accent_tint, tok.accent),
+                    (false, true) if b.danger => (tok.error_tint, tok.error),
+                    (false, true) => (tok.hover_overlay, ui.visuals().text_color()),
+                    (false, false) => (Color32::TRANSPARENT, tok.muted_text),
+                };
+                let painter = ui.painter();
+                painter.circle_filled(r.center(), CAPSULE_BUTTON / 2.0, fill);
+                if hovered {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                painter.text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    b.glyph,
+                    FontId::new(16.0, egui::FontFamily::Proportional),
+                    color,
+                );
+            }
+            response.on_hover_text(b.label)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
 // Stateful controls
 // ---------------------------------------------------------------------------
 
-/// A pill-shaped on/off switch, 40x23.
-pub fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
+/// A pill-shaped on/off switch, 40x23. `name` is what a screen reader
+/// announces for it: the label of the row it sits in.
+pub fn named_toggle(ui: &mut Ui, on: &mut bool, name: &str) -> egui::Response {
     let size = egui::vec2(40.0, 23.0);
     let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
     if response.clicked() {
@@ -530,7 +704,7 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
         response.mark_changed();
     }
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "")
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, name)
     });
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(response.id, *on);
@@ -696,10 +870,18 @@ pub fn chip_toggle(ui: &mut Ui, on: &mut bool, label: &str) -> egui::Response {
     response
 }
 
-/// A slider drawn in the same hand as [`toggle`]: a thin recessed track, an
+/// A slider drawn in the same hand as [`named_toggle`]: a thin recessed track, an
 /// accent trail up to the value, a light knob. Fills the available width and
-/// takes a click or a drag anywhere along the row.
-pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui::Response {
+/// takes a click or a drag anywhere along the row; focused, the arrow keys
+/// (and a screen reader's increment/decrement) move it by a hundredth of
+/// the range. `name` is what a screen reader announces for it.
+pub fn named_slider(
+    ui: &mut Ui,
+    value: &mut f32,
+    range: RangeInclusive<f32>,
+    name: &str,
+) -> egui::Response {
+    use egui::accesskit::Action;
     const HEIGHT: f32 = 22.0;
     const KNOB: f32 = 8.0;
     const TRACK: f32 = 5.0;
@@ -707,8 +889,6 @@ pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui:
     let width = ui.available_width().max(KNOB * 4.0);
     let (rect, mut response) =
         ui.allocate_exact_size(egui::vec2(width, HEIGHT), Sense::click_and_drag());
-    let shown = f64::from(*value);
-    response.widget_info(|| egui::WidgetInfo::slider(ui.is_enabled(), shown, ""));
     // The knob centre never leaves the track, so the value stays reachable
     // at both ends without the knob hanging over the edge.
     let span = (rect.left() + KNOB)..=(rect.right() - KNOB);
@@ -720,6 +900,45 @@ pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui:
             response.mark_changed();
         }
     }
+    let focused = response.has_focus();
+    if focused {
+        // Left and right move the knob instead of the focus.
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter {
+                    horizontal_arrows: true,
+                    ..Default::default()
+                },
+            )
+        });
+    }
+    let steps = ui.input(|i| {
+        let keys = if focused {
+            i.num_presses(egui::Key::ArrowRight) as i32 - i.num_presses(egui::Key::ArrowLeft) as i32
+        } else {
+            0
+        };
+        keys + i.num_accesskit_action_requests(response.id, Action::Increment) as i32
+            - i.num_accesskit_action_requests(response.id, Action::Decrement) as i32
+    });
+    let step = (range.end() - range.start()) / 100.0;
+    if steps != 0 {
+        let moved = (*value + steps as f32 * step).clamp(*range.start(), *range.end());
+        if moved != *value {
+            *value = moved;
+            response.mark_changed();
+        }
+    }
+    let shown = f64::from(*value);
+    response.widget_info(|| egui::WidgetInfo::slider(ui.is_enabled(), shown, name));
+    ui.ctx().accesskit_node_builder(response.id, |node| {
+        node.set_min_numeric_value(f64::from(*range.start()));
+        node.set_max_numeric_value(f64::from(*range.end()));
+        node.set_numeric_value_step(f64::from(step));
+        node.add_action(Action::Increment);
+        node.add_action(Action::Decrement);
+    });
     if ui.is_rect_visible(rect) {
         let tok = theme::tokens(ui.visuals());
         let t = egui::remap_clamp(*value, range, 0.0..=1.0);
@@ -736,7 +955,7 @@ pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui:
         let mut trail = track;
         trail.max.x = cx;
         painter.rect_filled(trail, TRACK / 2.0, tok.accent);
-        let hot = response.hovered() || response.dragged();
+        let hot = response.hovered() || response.dragged() || focused;
         painter.circle(
             egui::pos2(cx, rect.center().y),
             if hot { KNOB + 1.0 } else { KNOB },
@@ -751,15 +970,18 @@ pub fn slider(ui: &mut Ui, value: &mut f32, range: RangeInclusive<f32>) -> egui:
 // Audio indicators
 // ---------------------------------------------------------------------------
 
+/// How wide [`speaking_bars`] are: five bars of 2, 2 apart.
+pub const SPEAKING_BARS_W: f32 = 5.0 * 2.0 + 4.0 * 2.0;
+
 /// Five static accent bars indicating "currently speaking". Always
 /// allocates its footprint so rows don't reflow when this toggles.
 pub fn speaking_bars(ui: &mut Ui) -> egui::Response {
     const HEIGHTS: [f32; 5] = [5.0, 11.0, 7.0, 13.0, 6.0];
     let w = 2.0;
     let gap = 2.0;
-    let total_w = HEIGHTS.len() as f32 * w + (HEIGHTS.len() as f32 - 1.0) * gap;
     let max_h = 13.0;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(total_w, max_h), Sense::hover());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(SPEAKING_BARS_W, max_h), Sense::hover());
     if ui.is_rect_visible(rect) {
         let tok = theme::tokens(ui.visuals());
         let painter = ui.painter();
@@ -1429,7 +1651,7 @@ pub fn slider_row(
                 label_column(ui, LABEL_W, 22.0, label);
                 rtl(ui, 22.0, |ui| {
                     chip(ui, &format(*value), reserve);
-                    slider(ui, value, range)
+                    named_slider(ui, value, range, label)
                 })
             })
             .inner

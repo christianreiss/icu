@@ -134,6 +134,8 @@ icu stats: sent=498 recv=500 bad=0 decoded=499 fec=0 plc=0 played=480960 play_un
 - **Kamera**: `/dev/video0` (C270) braucht ~3 s bis zum ersten Bild (Auto-Belichtung); bei wenig Licht 4–6 fps statt 15.
 - **Windows**: implementiert (2026-09-26), auf der Windows-VM geprüft; verbleibende Hardware-Checks in §7.
 - Der Debug-Build braucht ~1,2 ms je 10-ms-Block; für Latenzmessungen den Release-Build nehmen.
+- **Seit 2026-09-27 nur per Test belegt, am Gerät offen**: Kamera ohne 320×240-MJPEG (reine YUYV-Kamera, nur 640×480) öffnet über den Formatrückfall; `video_tx_kbps` je Stufe bei echten 15 fps (T0 150, T1 100, T2 60, T3 40); Anzeige der vom Portal vergebenen PTT-Taste nach dem KDE-Dialog; Klick aufs Tray-Symbol unter KDE und GNOME mit AppIndicator; Leeren der Zwischenablage 60 s nach „Passport kopieren“ unter nativem Wayland; Banner „kein Audiosystem“ bei gestopptem `pipewire.socket` (Probe: `PIPEWIRE_REMOTE=icu-no-such-daemon cargo test -p icu-client --lib a_failed_connect -- --ignored`).
+- **Video über WAN**: je Sender/Zuschauer höchstens zwei unbestätigte Frames (`VIDEO_UNACKED_PER_PAIR`); ein Zuschauer mit mehr als ~130 ms RTT bekommt Lücken und danach nur Keyframes. Mit einem ratenbegrenzten, weit entfernten Zuschauer (`tc netem rate 128kbit delay 80ms`) Bildrate und Verzögerung messen.
 
 ## 7. Windows
 
@@ -163,7 +165,8 @@ Bekannte Abweichungen von Linux (Paritäts-Audit 2026-09-26), gezielt prüfen:
 - [x] **Loopback ohne Wiedergabe**: bei fehlgeschlagener WASAPI-Wiedergabe wird die Referenz geschlossen und die DSP wartet nicht auf einen stillstehenden Loopback; das Öffnen wird mit Backoff wiederholt.
 - [x] **Tastenkombinationen**: Windows wertet einen Portal-Trigger aus, wenn `key` leer ist; Modifier- und Release-Semantik durch Regressionstests geprüft, Desktop-Prüfung im Gate-Bericht.
 - [ ] **Standardgerät**: gefolgt wird der Rolle „Standardgerät“ (eConsole), nicht „Standardkommunikationsgerät“.
-- [ ] **Abmelden**: `WM_ENDSESSION` hält bis zu 5 s ohne `ShutdownBlockReasonCreate`.
+- [ ] **Seit 2026-09-27, nur per Test belegt**: Symbol in Taskleiste, Alt-Tab, Explorer und an `.icu`-Dateien, Versionsinfo in den Eigenschaften; Dialog „Zugangsdaten verwerfen?“, wenn DPAPI den Schlüssel nicht entsiegelt (Profil auf einen anderen PC kopieren); „Aufnehmen“ einer Kombination (Strg+Umschalt+F12) und eines einzelnen Modifiers (Rechts-Strg); Stimme nur vorne bei einem auf 5.1 gestellten Ausgabegerät; Overlay bei 150 % und 200 % so groß wie unter Linux; ältere Version im Tray + neue Exe starten → Meldung „laufendes ICU beenden“.
+- [ ] **Abmelden**: `WM_ENDSESSION` hält bis zu 5 s, seit 2026-09-27 mit `ShutdownBlockReasonCreate` („ICU meldet sich vom Server ab …“); `taskkill /PID <pid>` ohne `/F` beendet ICU samt Abmeldung beim Server wie SIGTERM, danach verabschiedet sich ein neu gestartetes ICU beim Abmelden weiterhin (Server-Log `left reason=NO_ERROR`).
 
 
 ### Ergänzender Gate-Lauf auf 10.2.0.201

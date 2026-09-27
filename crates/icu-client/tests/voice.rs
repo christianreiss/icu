@@ -15,6 +15,7 @@ use icu_client::{
     dsp::testsignal::{best_lag, harmonic_voice, pearson},
     engine::{Command, ConnStatus},
     stats::DebugStats,
+    video::VideoTier,
 };
 use icu_proto::ControlMsg;
 
@@ -175,6 +176,54 @@ async fn loss_hint_sets_packet_loss_perc() {
     })
     .await;
     assert!(wait_until(SOON, || engine.packet_loss_perc() == 20).await);
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// A `LossHint` belongs to the connection it came on. After a reconnect on
+/// a clean network no new hint comes (receivers report only changes), so a
+/// high one left standing held the FEC at its cap and the video paused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_forgets_the_loss_hint() {
+    let server = TestServer::start().await;
+    let addr = server.addr();
+    let (backend, _probe) = FakeBackend::silent();
+    let (engine, _dir) = server.engine("alice", Box::new(backend), true).await;
+    let state = wait_connected(&engine).await;
+    let speaker = state.me.unwrap().session;
+    let camera = engine.camera_link();
+
+    let mut bob = server.raw_client("bob").await;
+    bob.send(&ControlMsg::LossReport {
+        speaker,
+        loss_permille: 950,
+    })
+    .await;
+    assert!(wait_until(SOON, || engine.packet_loss_perc() == 20).await);
+    assert!(
+        wait_until(SOON, || camera.video_tier() == VideoTier::T4).await,
+        "severe loss pauses the video"
+    );
+    drop(bob);
+
+    let server = server.restart(addr).await;
+    wait_for(&engine, SOON, |s| s.conn != ConnStatus::Connected).await;
+    wait_for(&engine, Duration::from_secs(20), |s| {
+        s.conn == ConnStatus::Connected
+    })
+    .await;
+    let floor = icu_client::dsp::opus::FEC_FLOOR_PERCENT as i64;
+    assert!(
+        wait_until(SOON, || engine.packet_loss_perc() == floor).await,
+        "loss perc {} after the reconnect",
+        engine.packet_loss_perc()
+    );
+    assert!(
+        wait_until(SOON, || camera.video_tier() == VideoTier::T0).await,
+        "tier {:?} after the reconnect",
+        camera.video_tier()
+    );
 
     engine.shutdown();
     server.handle.shutdown().await;

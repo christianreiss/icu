@@ -501,8 +501,8 @@ fn run_stream(
         }
     };
     let name = format!("icu-wasapi-{}", spec.name());
-    let _priority =
-        (spec.kind != StreamKind::Reference).then(|| super::rt::promote_current_thread(&name));
+    // The loopback too: a reference late under game load resets the AEC.
+    let _priority = super::rt::promote_current_thread(&name);
     let generation = defaults.of(spec.flow()).load(Ordering::SeqCst);
     let mut stream = match Stream::open(&spec) {
         Ok(stream) => stream,
@@ -558,6 +558,9 @@ struct Stream {
     period: u32,
     /// Which initialization took: "IAudioClient3" or "autoconvert".
     mode: &'static str,
+    /// Per channel, whether playback writes the voice there
+    /// (`channels::voice_channels`).
+    voice: Vec<bool>,
     loopback: bool,
     device_name: String,
     /// Captured samples not yet handed on as a whole block.
@@ -763,6 +766,10 @@ impl Stream {
                 buffer_frames,
                 period,
                 mode,
+                voice: super::channels::voice_channels(
+                    usize::from(channels),
+                    mix.extensible.map(|x| x.dwChannelMask),
+                ),
                 loopback: spec.loopback(),
                 device_name,
                 pending: Vec::with_capacity(BLOCK_SAMPLES * 8),
@@ -890,7 +897,7 @@ impl Stream {
     }
 
     /// Fills the free part of the endpoint buffer, whole blocks only, the
-    /// mono voice on every channel.
+    /// mono voice on the front pair (or center), silence elsewhere.
     fn write(&mut self, cb: &mut PlaybackCallback) -> windows::core::Result<usize> {
         let Some(render) = &self.render else {
             return Ok(0);
@@ -910,7 +917,9 @@ impl Stream {
                 self.block.fill(0.0);
                 cb(&mut self.block);
                 for (frame, s) in chunk.chunks_exact_mut(self.channels).zip(&self.block) {
-                    frame.fill(*s);
+                    for (out, voice) in frame.iter_mut().zip(&self.voice) {
+                        *out = if *voice { *s } else { 0.0 };
+                    }
                 }
             }
             render.ReleaseBuffer(frames as u32, 0)?;

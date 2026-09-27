@@ -1312,6 +1312,18 @@ async fn renew_leaf(
     let user_id = identity.user_id;
     let requested =
         ca::csr_common_name(csr_der).map_err(|e| (ec::RENEW_REJECTED, e.to_string()))?;
+    // An expired certificate renews onto its own key (`PROTOCOL.md` §2.3.3):
+    // the handshake proved that key and nothing else, so a new one would be
+    // trusted on the strength of an expired certificate alone.
+    if identity.expired
+        && ca::csr_public_key(csr_der).map_err(|e| (ec::RENEW_REJECTED, e.to_string()))?
+            != identity.cert_spki
+    {
+        return Err((
+            ec::RENEW_REJECTED,
+            "an expired certificate renews onto its own key only".into(),
+        ));
+    }
     // A store refusal keeps its own code (`NAME_TAKEN`, `AUTH_REVOKED`, …).
     let store_err = |e: Error| (e.code().unwrap_or(ec::RENEW_REJECTED), e.to_string());
 

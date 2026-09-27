@@ -31,8 +31,11 @@ nur, wenn der Name per DNS auf eine Adresse dieses Hosts zeigt, die weder
 Loopback noch Link-local ist (Debians `127.0.1.1`-Eintrag und `fe80::` von
 nss-myhostname zählen nicht); sonst startet er nicht
 und sagt, warum. Gibt es schon eine CA, gilt der Name aus ihrem CN
-(`ICU CA <server_name>`), egal wie der Host inzwischen heißt. Hinter NAT oder
-unter einem DNS-Alias `server_name` und `public_host` selbst setzen.
+(`ICU CA <server_name>`), egal wie der Host inzwischen heißt; ein gesetztes
+`server_name`, das davon abweicht, lehnt der Server beim Start ab (die Clients
+nehmen den Namen aus der CA, ein Zertifikat auf einen anderen sperrte sie
+alle aus). Hinter NAT oder unter einem DNS-Alias `server_name` und
+`public_host` selbst setzen.
 Deinstallieren lässt den State (`/var/lib/private/icu/`, darin `ca.key`) liegen.
 
 Bauen aller Pakete (nur podman nötig): `packaging/build.sh`, Ergebnis unter
@@ -126,7 +129,9 @@ sudo systemctl enable --now icu-server
 ```
 
 `server_name` und `public_host` landen in der CA und in jedem Zertifikat;
-später ändern heißt neue CA und alle registrieren sich neu. Mit den Namen aus
+später ändern heißt neue CA und alle registrieren sich neu. Weicht
+`server_name` vom Namen der bestehenden CA ab, startet der Server nicht und
+nennt beide Werte: zurück auf den CA-Namen oder die Zeile weglassen. Mit den Namen aus
 dem Beispiel (`example.org`, `.example`, `.invalid`, `.test`, RFC 2606) legt
 der Server deshalb keine CA an — der erste Start scheitert —, und die erste
 Einladung eines Servers ohne Nutzer stellt `icu-server invite` nicht aus.
@@ -228,13 +233,17 @@ Alle Kommandos außer `run` sprechen über `/run/icu/admin.sock` mit dem
 laufenden Server; eine Änderung wirkt damit sofort und nicht erst nach einem
 Neustart. Sie brauchen root oder Mitgliedschaft in der Gruppe `icu`: die Unit
 läuft mit `Group=icu`, damit gehören `/run/icu` (0750) und der Socket (0660)
-dieser Gruppe. `server.admin_socket_group` bleibt deshalb `icu`.
+dieser Gruppe. `server.admin_socket_group` bleibt deshalb `icu`. Mehr als den
+Socket brauchen sie nicht, auch ohne `server_name` in der Konfiguration (der
+State unter `/var/lib/private` bleibt root vorbehalten). Wer nicht an den
+Socket darf, bekommt das als Fehler mit Pfad und Ursache.
 
 ```bash
 icu-server invite --ttl 24h --out bob.txt  # Registrierungs-Bundle, einmalig, 24 h gültig
 icu-server users                           # Tabelle mit user_id, Cert, online
 icu-server revoke alice                    # alle Certs sperren, sofort kicken
-icu-server status                          # Uptime, online, Relay-Zähler
+icu-server revoke id:7                     # ausdrücklich die user_id (name:… für den Namen)
+icu-server status                          # Uptime, online, offene Verbindungen, Zähler
 icu-server status --json                   # dasselbe für Monitoring
 icu-server rotate-server-cert              # neues Server-Leaf derselben CA
 icu-server renew-ca                        # CA-Zertifikat neu, selber Schlüssel
@@ -253,10 +262,18 @@ Weitere Bundles stellt ein Admin auch im Client aus (⚙ → Allgemein →
 Einladung). Die Serveradresse steht in den Zertifikaten (`public_host`,
 `server_name`), der Eingeladene braucht nichts weiter.
 
-Läuft **kein** Server, erledigt die CLI dieselbe Arbeit selbst und hält dabei
-`flock(/var/lib/icu/state.lock)`. Läuft einer und der Socket fehlt, bricht die
-CLI mit `cannot lock … (is a server running?)` ab — das ist Absicht, damit CLI
-und Server einander nie eine Änderung überschreiben.
+Nutzer gibt man per Name, `user_id` oder Fingerprint an. Ein Name darf nur
+aus Ziffern bestehen; passt eine Angabe auf mehr als einen Nutzer (`revoke 1`
+bei einem Nutzer namens „1“), lehnt der Server mit `AMBIGUOUS_USER` ab und
+nennt beide — dann `id:<user_id>` oder `name:<name>` schreiben. Jede
+Bestätigung nennt den getroffenen Nutzer: `revoked alice (user_id 3), closed 1
+connection(s)`.
+
+Läuft **kein** Server (Socket fehlt oder verweigert die Verbindung), erledigt
+die CLI dieselbe Arbeit selbst und hält dabei `flock(/var/lib/icu/state.lock)`;
+dafür braucht sie root. Läuft einer und der Socket fehlt, bricht die CLI mit
+`cannot lock … (is a server running?)` ab — das ist Absicht, damit CLI und
+Server einander nie eine Änderung überschreiben.
 
 `rotate-server-cert` stellt ein neues Leaf derselben CA aus, setzt das alte auf
 die CRL und wirkt ohne Neustart für jede neue Verbindung. Clients brauchen
@@ -315,8 +332,21 @@ sudo install -m0755 deploy/checkmk/icu_server /usr/lib/check_mk_agent/local/
 sudo usermod -aG icu root      # oder den Agent-User in die Gruppe icu
 ```
 
-Er ruft `icu-server status --json` auf und liefert `online`, `uptime` und die
-Relay-Zähler als Metriken. Ist der Server unten, geht der Check auf CRIT.
+Er ruft `icu-server status --json` auf. `ICU_Server` liefert die
+Momentanwerte `online`, `uptime`, `open_connections` und `handshakes` und aus
+den Zählern Raten gegen den vorigen Lauf (`connects_per_s`,
+`datagrams_in_per_s`, `datagrams_out_per_s`); der erste Lauf und der erste
+nach einem Server-Neustart haben noch keine. Die Metriken `connections`,
+`datagrams_in` und `datagrams_out` von vorher (Summen seit Start, als
+Momentanwert gegraphed) gibt es nicht mehr. Den vorigen Lauf merkt sich der
+Check in `$MK_VARDIR/icu_server.state` (sonst
+`/var/lib/check_mk_agent/icu_server.state`, oder `ICU_CHECK_STATE`); ist das
+nicht schreibbar, sagt der Text es. `ICU_Video` zeigt Video-Frames je Sekunde
+an Zuschauer und die, die für zu langsame Zuschauer verworfen wurden
+(`video_slow_receiver`), und geht auf WARN, wenn deren Anteil drei Läufe in
+Folge mindestens 10 % beträgt (`ICU_SLOW_WARN_PCT`, `ICU_SLOW_WARN_RUNS`):
+dann schaut jemand mit viel zu wenig Bandbreite zu. Ist der Server unten, geht
+der Check auf CRIT.
 Dazu kommen `ICU_Server_Certificate` und `ICU_CA_Certificate` (`tls` im
 Status-JSON): WARN unter 30, CRIT unter 7 Tagen Restlaufzeit. Beide erneuert
 der Server selbst (Leaf 30 Tage, CA ein Jahr vor Ablauf), ein WARN heißt also,

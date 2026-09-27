@@ -414,7 +414,13 @@ impl SetupView {
     /// arrives.
     fn key_card(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         let backend = state.hotkey_backend.as_str();
-        hotkey_notice(ui, backend, &mut self.draft.hotkeys.backend, cmds);
+        hotkey_notice(
+            ui,
+            backend,
+            &mut self.draft.hotkeys.backend,
+            &mut self.draft.audio.mode,
+            cmds,
+        );
         if cfg!(target_os = "linux") && self.draft.hotkeys.backend == HotkeyBackend::Evdev {
             evdev_notice(ui);
             ui.add_space(12.0);
@@ -446,6 +452,7 @@ impl SetupView {
                 ui,
                 false,
                 PTT_LABEL,
+                crate::hotkey::Action::Ptt,
                 binding,
                 portal,
                 capturing,
@@ -503,7 +510,7 @@ impl SetupView {
                     Some(
                         "Passt sich laufend an deine Umgebung an. Braucht die Rauschunterdrückung.",
                     ),
-                    |ui| widgets::toggle(ui, &mut audio.vad_auto),
+                    |ui| widgets::named_toggle(ui, &mut audio.vad_auto, "Schwelle automatisch"),
                 )
             });
             if !audio.vad_auto {
@@ -558,7 +565,7 @@ impl SetupView {
                 false,
                 "Rauschunterdrückung",
                 Some("Filtert Tastatur, Lüfter und Hintergrundgeräusche heraus."),
-                |ui| widgets::toggle(ui, &mut audio.denoise),
+                |ui| widgets::named_toggle(ui, &mut audio.denoise, "Rauschunterdrückung"),
             );
             ui.add_enabled_ui(state.aec_available, |ui| {
                 widgets::setting_row(
@@ -570,7 +577,7 @@ impl SetupView {
                     } else {
                         "Auf dieser Installation nicht verfügbar."
                     }),
-                    |ui| widgets::toggle(ui, &mut audio.aec),
+                    |ui| widgets::named_toggle(ui, &mut audio.aec, "Echo-Unterdrückung"),
                 )
             });
             ui.add_enabled_ui(audio.denoise, |ui| {
@@ -579,7 +586,7 @@ impl SetupView {
                     true,
                     "Pegel automatisch",
                     Some("Regelt dein Mikrofon nach, wenn du zu leise oder zu laut bist."),
-                    |ui| widgets::toggle(ui, &mut audio.auto_level),
+                    |ui| widgets::named_toggle(ui, &mut audio.auto_level, "Pegel automatisch"),
                 )
             });
             widgets::setting_row(
@@ -587,14 +594,26 @@ impl SetupView {
                 true,
                 "Selbst gleich laut ankommen",
                 Some("Du kommst bei den anderen immer ähnlich laut an."),
-                |ui| widgets::toggle(ui, &mut audio.normalize_outgoing),
+                |ui| {
+                    widgets::named_toggle(
+                        ui,
+                        &mut audio.normalize_outgoing,
+                        "Selbst gleich laut ankommen",
+                    )
+                },
             );
             widgets::setting_row(
                 ui,
                 true,
                 "Andere gleich laut hören",
                 Some("Bringt alle auf eine ähnliche Lautstärke, leise wie laute."),
-                |ui| widgets::toggle(ui, &mut audio.normalize_incoming),
+                |ui| {
+                    widgets::named_toggle(
+                        ui,
+                        &mut audio.normalize_incoming,
+                        "Andere gleich laut hören",
+                    )
+                },
             );
             // The strength beside the switch rather than in a row of its
             // own (the Klang page's): switching it on does not push the
@@ -606,7 +625,7 @@ impl SetupView {
                 Some("Gleicht leise und laute Stellen aus, damit du gleichmäßig klingst."),
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    widgets::toggle(ui, &mut audio.voice_opt);
+                    widgets::named_toggle(ui, &mut audio.voice_opt, "Stimmoptimierung");
                     if audio.voice_opt {
                         widgets::segmented(
                             ui,

@@ -42,52 +42,62 @@ enum Command {
     },
     /// Revoke every certificate of a user and kick it.
     Revoke {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous.
         user: String,
     },
     /// Grant admin rights.
     Promote {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous.
         user: String,
     },
     /// Revoke admin rights. Rejected if `user` is the sole remaining admin.
     Demote {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous.
         user: String,
     },
     /// Reversibly block login without touching certificates.
     Disable {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous.
         user: String,
     },
     /// Restore login after `disable`.
     Enable {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous.
         user: String,
     },
     /// Close a user's live connections; they may connect again.
     Kick {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous.
         user: String,
     },
     /// Enforce mute: the user's microphone stays off until `unmute`.
     Mute {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous.
         user: String,
     },
     /// Lift an enforced mute.
     Unmute {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous.
         user: String,
     },
     /// Enforce deafen: the user receives no audio until `undeafen`.
     Deafen {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous.
         user: String,
     },
     /// Lift an enforced deafen.
     Undeafen {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous.
         user: String,
     },
     /// Show uptime, online users and relay counters.
@@ -124,9 +134,13 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    let config = Config::load(&cli.config)?;
+    // Resolved and validated only where it is used: `run` here, the offline
+    // CLI in `cli::dispatch`. A command that reaches the running server needs
+    // nothing but the socket path.
+    let config = Config::read(&cli.config)?;
     match cli.command {
         Command::Run => {
+            let config = config.resolve()?;
             icu_server::init_tracing(&config.log);
             let handle = icu_server::run(config).await?;
             wait_for_signal().await;
@@ -139,41 +153,44 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Users { json } => cli::users::run(&config, json).await,
         Command::Revoke { user } => {
-            cli::with_closed(&config, AdminRequest::Revoke { user }, "revoked").await
+            let request = AdminRequest::Revoke { user: user.clone() };
+            cli::with_closed(&config, request, &user, "revoked").await
         }
         Command::Promote { user } => {
-            let done = format!("promoted {user} to admin");
-            cli::simple(&config, AdminRequest::Promote { user }, &done).await
+            let request = AdminRequest::Promote { user: user.clone() };
+            cli::for_user(&config, request, &user, "promoted", " to admin").await
         }
         Command::Demote { user } => {
-            let done = format!("demoted {user}");
-            cli::simple(&config, AdminRequest::Demote { user }, &done).await
+            let request = AdminRequest::Demote { user: user.clone() };
+            cli::for_user(&config, request, &user, "demoted", "").await
         }
         Command::Disable { user } => {
-            cli::with_closed(&config, AdminRequest::Disable { user }, "disabled").await
+            let request = AdminRequest::Disable { user: user.clone() };
+            cli::with_closed(&config, request, &user, "disabled").await
         }
         Command::Enable { user } => {
-            let done = format!("enabled {user}");
-            cli::simple(&config, AdminRequest::Enable { user }, &done).await
+            let request = AdminRequest::Enable { user: user.clone() };
+            cli::for_user(&config, request, &user, "enabled", "").await
         }
         Command::Kick { user } => {
-            cli::with_closed(&config, AdminRequest::Kick { user }, "kicked").await
+            let request = AdminRequest::Kick { user: user.clone() };
+            cli::with_closed(&config, request, &user, "kicked").await
         }
         Command::Mute { user } => {
-            let done = format!("muted {user}");
-            cli::simple(&config, AdminRequest::Mute { user }, &done).await
+            let request = AdminRequest::Mute { user: user.clone() };
+            cli::for_user(&config, request, &user, "muted", "").await
         }
         Command::Unmute { user } => {
-            let done = format!("unmuted {user}");
-            cli::simple(&config, AdminRequest::Unmute { user }, &done).await
+            let request = AdminRequest::Unmute { user: user.clone() };
+            cli::for_user(&config, request, &user, "unmuted", "").await
         }
         Command::Deafen { user } => {
-            let done = format!("deafened {user}");
-            cli::simple(&config, AdminRequest::Deafen { user }, &done).await
+            let request = AdminRequest::Deafen { user: user.clone() };
+            cli::for_user(&config, request, &user, "deafened", "").await
         }
         Command::Undeafen { user } => {
-            let done = format!("undeafened {user}");
-            cli::simple(&config, AdminRequest::Undeafen { user }, &done).await
+            let request = AdminRequest::Undeafen { user: user.clone() };
+            cli::for_user(&config, request, &user, "undeafened", "").await
         }
         Command::Status { json } => cli::status::run(&config, json).await,
         Command::RotateServerCert => {

@@ -424,7 +424,7 @@ impl SettingsView {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Erweitert").size(13.0));
                         widgets::rtl(ui, 24.0, |ui| {
-                            widgets::toggle(ui, &mut self.draft.ui.show_advanced)
+                            widgets::named_toggle(ui, &mut self.draft.ui.show_advanced, "Erweitert")
                                 .on_hover_text("Erweiterte Einstellungen anzeigen")
                         });
                     });
@@ -597,7 +597,7 @@ impl SettingsView {
                         true,
                         "Schwelle automatisch",
                         Some("Passt sich laufend an deine Umgebung an. Braucht die Rauschunterdrückung."),
-                        |ui| widgets::toggle(ui, &mut self.draft.audio.vad_auto),
+                        |ui| widgets::named_toggle(ui, &mut self.draft.audio.vad_auto, "Schwelle automatisch"),
                     )
                 });
                 if !self.draft.audio.vad_auto {
@@ -705,7 +705,9 @@ impl SettingsView {
                 false,
                 "Rauschunterdrückung",
                 Some("Filtert Tastatur, Lüfter und Hintergrundgeräusche heraus."),
-                |ui| widgets::toggle(ui, &mut self.draft.audio.denoise),
+                |ui| {
+                    widgets::named_toggle(ui, &mut self.draft.audio.denoise, "Rauschunterdrückung")
+                },
             );
             ui.add_enabled_ui(state.aec_available, |ui| {
                 widgets::setting_row(
@@ -717,7 +719,7 @@ impl SettingsView {
                     } else {
                         "Auf dieser Installation nicht verfügbar."
                     }),
-                    |ui| widgets::toggle(ui, &mut self.draft.audio.aec),
+                    |ui| widgets::named_toggle(ui, &mut self.draft.audio.aec, "Echo-Unterdrückung"),
                 )
             });
             let tok = theme::tokens(ui.visuals());
@@ -780,7 +782,13 @@ impl SettingsView {
                     true,
                     "Pegel automatisch",
                     Some("Regelt dein Mikrofon nach, wenn du zu leise oder zu laut bist."),
-                    |ui| widgets::toggle(ui, &mut self.draft.audio.auto_level),
+                    |ui| {
+                        widgets::named_toggle(
+                            ui,
+                            &mut self.draft.audio.auto_level,
+                            "Pegel automatisch",
+                        )
+                    },
                 )
             });
             widgets::setting_row(
@@ -788,21 +796,33 @@ impl SettingsView {
                 true,
                 "Selbst gleich laut ankommen",
                 Some("Du kommst bei den anderen immer ähnlich laut an."),
-                |ui| widgets::toggle(ui, &mut self.draft.audio.normalize_outgoing),
+                |ui| {
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.audio.normalize_outgoing,
+                        "Selbst gleich laut ankommen",
+                    )
+                },
             );
             widgets::setting_row(
                 ui,
                 true,
                 "Andere gleich laut hören",
                 Some("Bringt alle auf eine ähnliche Lautstärke, leise wie laute."),
-                |ui| widgets::toggle(ui, &mut self.draft.audio.normalize_incoming),
+                |ui| {
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.audio.normalize_incoming,
+                        "Andere gleich laut hören",
+                    )
+                },
             );
             widgets::setting_row(
                 ui,
                 true,
                 "Stimmoptimierung",
                 Some("Gleicht leise und laute Stellen aus, damit du gleichmäßig klingst."),
-                |ui| widgets::toggle(ui, &mut self.draft.audio.voice_opt),
+                |ui| widgets::named_toggle(ui, &mut self.draft.audio.voice_opt, "Stimmoptimierung"),
             );
             if self.draft.audio.voice_opt {
                 widgets::setting_row(ui, true, "Stärke", None, |ui| {
@@ -864,14 +884,19 @@ impl SettingsView {
                 widgets::row_group(ui, width, |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if widgets::button(ui, widgets::ButtonKind::Neutral, icon::COPY, "Kopieren")
-                        .on_hover_text("Als Text in die Zwischenablage, mit deinen Einstellungen")
+                        .on_hover_text(
+                            "Als Text in die Zwischenablage, mit deinen Einstellungen; ICU leert \
+                             sie nach einer Minute wieder",
+                        )
                         .clicked()
                     {
                         match self.passport_text() {
                             Ok((text, with_settings)) => {
-                                ui.ctx().copy_text(text);
+                                ui.ctx().copy_text(text.clone());
+                                clear_clipboard_later(text);
                                 self.passport_status = Some(format!(
-                                    "In die Zwischenablage kopiert.{}",
+                                    "In die Zwischenablage kopiert, für {} s.{}",
+                                    PASSPORT_CLIPBOARD.as_secs(),
                                     without_settings(with_settings)
                                 ));
                             }
@@ -927,8 +952,9 @@ impl SettingsView {
                     tok.error,
                     RichText::new(
                         "Der Passport enthält deinen privaten Schlüssel — nur sicher \
-                         weitergeben. Erneuert ein Gerät sein Zertifikat (neuer Name, \
-                         jährlich), braucht das andere einen neuen Passport.",
+                         weitergeben, lieber als Datei: ein Zwischenablage-Verlauf behält \
+                         ihn. Erneuert ein Gerät sein Zertifikat (neuer Name, jährlich), \
+                         braucht das andere einen neuen Passport.",
                     )
                     .size(11.5),
                 );
@@ -993,7 +1019,9 @@ impl SettingsView {
                 true,
                 "Einstellungen übernehmen",
                 Some(SETTINGS_HELP),
-                |ui| widgets::toggle(ui, &mut self.import_settings),
+                |ui| {
+                    widgets::named_toggle(ui, &mut self.import_settings, "Einstellungen übernehmen")
+                },
             );
         }
         let replaces = if carries_settings && self.import_settings {
@@ -1109,20 +1137,31 @@ impl SettingsView {
             |_| {},
         );
         let backend = state.hotkey_backend.as_str();
-        hotkey_notice(ui, backend, &mut self.draft.hotkeys.backend, cmds);
+        hotkey_notice(
+            ui,
+            backend,
+            &mut self.draft.hotkeys.backend,
+            &mut self.draft.audio.mode,
+            cmds,
+        );
 
         let portal = backend == "portal";
         let capture = self.poll_capture(ui);
         widgets::group_card(ui, "Belegung", |ui| {
             let hotkeys = &mut self.draft.hotkeys;
-            let rows: [(&'static str, &mut crate::config::KeyBinding); 5] = [
-                ("Push-to-Talk", &mut hotkeys.ptt),
-                ("Stummschalten", &mut hotkeys.mute),
-                ("Ton aus", &mut hotkeys.deafen),
-                ("Modus wechseln", &mut hotkeys.toggle_mode),
-                ("Kamera", &mut hotkeys.camera),
+            use crate::hotkey::Action;
+            let rows: [(&'static str, Action, &mut crate::config::KeyBinding); 5] = [
+                ("Push-to-Talk", Action::Ptt, &mut hotkeys.ptt),
+                ("Stummschalten", Action::Mute, &mut hotkeys.mute),
+                ("Ton aus", Action::Deafen, &mut hotkeys.deafen),
+                (
+                    "Modus wechseln",
+                    Action::ToggleMode,
+                    &mut hotkeys.toggle_mode,
+                ),
+                ("Kamera", Action::Camera, &mut hotkeys.camera),
             ];
-            for (i, (label, binding)) in rows.into_iter().enumerate() {
+            for (i, (label, key_action, binding)) in rows.into_iter().enumerate() {
                 let capturing = self.capture.as_ref().is_some_and(|c| c.label == label);
                 if capturing {
                     if let Some(Ok(result)) = &capture {
@@ -1133,6 +1172,7 @@ impl SettingsView {
                     ui,
                     i > 0,
                     label,
+                    key_action,
                     binding,
                     portal,
                     capturing,
@@ -1253,7 +1293,13 @@ impl SettingsView {
                         cfg!(feature = "camera"),
                         "Beim Start einschalten",
                         None,
-                        |ui| widgets::toggle(ui, &mut self.draft.camera.enabled),
+                        |ui| {
+                            widgets::named_toggle(
+                                ui,
+                                &mut self.draft.camera.enabled,
+                                "Beim Start einschalten",
+                            )
+                        },
                     );
                 });
                 #[cfg(feature = "camera")]
@@ -1303,9 +1349,15 @@ impl SettingsView {
             if !self.overlay_available {
                 widgets::help_note(
                     ui,
-                    "Diese Arbeitsumgebung erlaubt keine Fenster über Spielen (Wayland \
-                     ohne Layer-Shell, etwa GNOME). Die Kameras erscheinen dann nur in der \
-                     Teilnehmerliste.",
+                    if cfg!(target_os = "linux") {
+                        "Das Overlay braucht eine Wayland-Sitzung, deren Arbeitsumgebung \
+                         Fenster über Spielen erlaubt (Layer-Shell, etwa KDE Plasma oder \
+                         Sway). Hier gibt es das nicht — unter X11 nie, unter GNOME ebenso \
+                         wenig. Die Kameras erscheinen dann nur in der Teilnehmerliste."
+                    } else {
+                        "Das Overlay ließ sich hier nicht starten. Die Kameras erscheinen \
+                         dann nur in der Teilnehmerliste."
+                    },
                 );
                 return;
             }
@@ -1313,8 +1365,12 @@ impl SettingsView {
                 ui,
                 false,
                 "Anzeigen",
-                Some("Zeigt über allen Fenstern die Kameras der anderen, mit Namen."),
-                |ui| widgets::toggle(ui, &mut self.draft.overlay.enabled),
+                Some(
+                    "Zeigt über allen Fenstern die Kameras der anderen, mit Namen — über \
+                     Spielen nur im Fenster- oder randlosen Modus, nicht im exklusiven \
+                     Vollbild.",
+                ),
+                |ui| widgets::named_toggle(ui, &mut self.draft.overlay.enabled, "Anzeigen"),
             );
             ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {
                 widgets::setting_row(ui, true, "Position", None, |ui| {
@@ -1334,7 +1390,11 @@ impl SettingsView {
                     )
                 });
                 widgets::setting_row(ui, true, "Wer ohne Kamera spricht", None, |ui| {
-                    widgets::toggle(ui, &mut self.draft.overlay.voice_plates)
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.overlay.voice_plates,
+                        "Wer ohne Kamera spricht",
+                    )
                 })
                 .on_hover_text("Solange jemand ohne Kamera spricht, steht der Name im Overlay");
                 if !adv {
@@ -1342,7 +1402,11 @@ impl SettingsView {
                 }
                 widgets::advanced_caption(ui);
                 widgets::setting_row(ui, false, "Sprechende Person umranden", None, |ui| {
-                    widgets::toggle(ui, &mut self.draft.overlay.speaking_frame)
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.overlay.speaking_frame,
+                        "Sprechende Person umranden",
+                    )
                 });
                 let edge = matches!(self.draft.overlay.corner, Corner::Top | Corner::Bottom);
                 widgets::setting_row(ui, true, "Anordnung", None, |ui| {
@@ -1374,7 +1438,11 @@ impl SettingsView {
                     });
                 });
                 widgets::setting_row(ui, true, "Stille Personen abdunkeln", None, |ui| {
-                    widgets::toggle(ui, &mut self.draft.overlay.dim_non_speaking)
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.overlay.dim_non_speaking,
+                        "Stille Personen abdunkeln",
+                    )
                 });
                 widgets::setting_row(ui, true, "Rahmenfarbe", None, |ui| {
                     ui.add_enabled_ui(self.draft.overlay.speaking_frame, |ui| {
@@ -1468,7 +1536,13 @@ impl SettingsView {
                     Some(
                         "Ein Doppelklick auf eine Einladung oder einen Passport (.icu) öffnet ICU.",
                     ),
-                    |ui| widgets::toggle(ui, &mut self.draft.ui.register_uri_handler),
+                    |ui| {
+                        widgets::named_toggle(
+                            ui,
+                            &mut self.draft.ui.register_uri_handler,
+                            "Einladungen mit ICU öffnen",
+                        )
+                    },
                 );
                 ui.separator();
             }
@@ -1525,7 +1599,13 @@ impl SettingsView {
                 true,
                 "Minimiert starten",
                 Some("ICU startet im Infobereich, wo es keinen gibt, minimiert in der Taskleiste."),
-                |ui| widgets::toggle(ui, &mut self.draft.ui.start_minimized),
+                |ui| {
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.ui.start_minimized,
+                        "Minimiert starten",
+                    )
+                },
             );
         });
 
@@ -2244,6 +2324,39 @@ fn without_settings(with_settings: bool) -> &'static str {
     }
 }
 
+/// How long a copied passport may stay on the clipboard.
+const PASSPORT_CLIPBOARD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Takes `passport` off the clipboard after [`PASSPORT_CLIPBOARD`] — only
+/// if it is still what the clipboard holds; whatever was copied since stays.
+/// Its own thread and its own clipboard handle, so it happens with the
+/// settings closed and the window in the tray. X11 and Windows clear for
+/// real; under Wayland this goes through Xwayland, and whether that reaches
+/// the compositor's clipboard is up to the compositor (an unfocused Wayland
+/// client cannot set the selection itself).
+fn clear_clipboard_later(passport: String) {
+    let spawned = std::thread::Builder::new()
+        .name("icu-clipboard".into())
+        .spawn(move || {
+            std::thread::sleep(PASSPORT_CLIPBOARD);
+            let cleared = arboard::Clipboard::new().and_then(|mut clipboard| {
+                if clipboard.get_text()? != passport {
+                    return Ok(false);
+                }
+                clipboard.clear()?;
+                Ok(true)
+            });
+            match cleared {
+                Ok(true) => tracing::info!("passport taken off the clipboard"),
+                Ok(false) => {}
+                Err(e) => tracing::info!(%e, "clipboard not checked for the passport"),
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(%e, "no clipboard thread");
+    }
+}
+
 /// Where „Speichern" puts the passport: the download folder, where a file
 /// to be carried to another device is looked for first; the home directory
 /// or the config directory without one. `.icu`, so a double-click on the
@@ -2392,15 +2505,17 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
 
 /// What the Tastenkürzel page and the setup say while the hotkeys do not
 /// work: still being set up, never started, the portal's dialog turned down
-/// (with the two ways on), or no way to read keys at all. Nothing while they
-/// work. `backend` is what `crate::hotkey` reports — "starting", "portal",
-/// "evdev (n devices)", "portal-declined" or "none"; the empty string means
-/// it was never started (`--no-hotkeys`). `choice` is the draft's backend
-/// setting.
+/// (with the two ways on), or no way to read keys at all (with what to do,
+/// and the way around it). Nothing while they work. `backend` is what
+/// `crate::hotkey` reports — "starting", "portal", "evdev (n devices)",
+/// "portal-declined" or "none"; the empty string means it was never started
+/// (`--no-hotkeys`). `choice` is the draft's backend setting, `mode` its
+/// sending mode.
 pub(super) fn hotkey_notice(
     ui: &mut Ui,
     backend: &str,
     choice: &mut HotkeyBackend,
+    mode: &mut ModeSetting,
     cmds: &mut Vec<Command>,
 ) {
     match backend {
@@ -2473,7 +2588,10 @@ pub(super) fn hotkey_notice(
                 "Tastenkürzel funktionieren gerade nicht",
                 if cfg!(target_os = "linux") {
                     "Das System bietet keinen Weg an, Tasten im Hintergrund zu lesen, und ICU \
-                     darf sie nicht selbst lesen (Gruppe input). Bedienen geht weiter über das \
+                     darf sie nicht selbst lesen. Abhilfe: im Terminal\n\
+                     sudo usermod -aG input $USER\n\
+                     eingeben, dann ab- und wieder anmelden (ICU kann dann jede Taste \
+                     mitlesen). Oder ohne Taste senden; bedienen geht auch über das \
                      Hauptfenster."
                 } else {
                     "ICU kann Tastatur und Maus gerade nicht lesen, oder es ist keine Taste \
@@ -2481,6 +2599,20 @@ pub(super) fn hotkey_notice(
                 },
                 None::<fn()>,
             );
+            if *mode == ModeSetting::Ptt {
+                ui.add_space(6.0);
+                if widgets::button(
+                    ui,
+                    widgets::ButtonKind::Primary,
+                    icon::WAVEFORM,
+                    "Stattdessen automatisch senden",
+                )
+                .on_hover_text("Sprachaktivierung: du bist zu hören, sobald du sprichst")
+                .clicked()
+                {
+                    *mode = ModeSetting::Vad;
+                }
+            }
             ui.add_space(12.0);
         }
         _ => {}
@@ -2674,6 +2806,14 @@ pub(super) struct Captured {
 
 impl Captured {
     fn from_evdev(key: String) -> Captured {
+        // Raw Input records a combination as a trigger (`CTRL+F12`): bound
+        // as one, without a key, which would win (`hotkey::chord`).
+        if key.contains('+') {
+            return Captured {
+                key: String::new(),
+                trigger: Some(key),
+            };
+        }
         let trigger = key
             .strip_prefix("KEY_")
             .filter(|k| {
@@ -2854,6 +2994,7 @@ pub(super) fn binding_row(
     ui: &mut Ui,
     divider: bool,
     label: &'static str,
+    shortcut: crate::hotkey::Action,
     binding: &mut crate::config::KeyBinding,
     portal: bool,
     capturing: bool,
@@ -2869,10 +3010,17 @@ pub(super) fn binding_row(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 widgets::label_column(ui, BINDING_LABEL_W, 30.0, label);
+                // Through the portal, the key the desktop assigned: the
+                // dialog may have taken another than the one proposed.
+                let assigned = portal
+                    .then(|| crate::hotkey::portal_trigger(shortcut))
+                    .flatten();
                 let shown = match (
                     portal || (cfg!(windows) && binding.key.trim().is_empty()),
                     binding.trigger.as_deref(),
                 ) {
+                    (true, _) if assigned.as_deref() == Some("") => "—".to_string(),
+                    (true, _) if assigned.is_some() => assigned.unwrap_or_default(),
                     (true, Some(t)) => t.to_string(),
                     _ if binding.key.is_empty() => "—".to_string(),
                     _ => binding
@@ -2940,7 +3088,12 @@ pub(super) fn binding_row(
                             icon::RECORD,
                             "Aufnehmen",
                         )
-                        .on_hover_text("Die nächste gedrückte Taste oder Maustaste übernehmen")
+                        .on_hover_text(if cfg!(windows) {
+                            "Die nächste gedrückte Taste, Tastenkombination oder Maustaste \
+                             übernehmen"
+                        } else {
+                            "Die nächste gedrückte Taste oder Maustaste übernehmen"
+                        })
                         .clicked()
                         {
                             action = BindingAction::Record;
@@ -3011,6 +3164,11 @@ mod tests {
         Captured::from_evdev("BTN_SIDE".into()).apply(&mut binding);
         assert_eq!(binding.key, "BTN_SIDE");
         assert_eq!(binding.trigger.as_deref(), Some("CTRL+SHIFT+F12"));
+        // A combination recorded by Raw Input replaces the key, which
+        // would otherwise win over it.
+        Captured::from_evdev("CTRL+ALT+P".into()).apply(&mut binding);
+        assert_eq!(binding.key, "");
+        assert_eq!(binding.trigger.as_deref(), Some("CTRL+ALT+P"));
     }
 
     /// The window's own key names match what the evdev backend parses.

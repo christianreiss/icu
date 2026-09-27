@@ -14,7 +14,12 @@ pub async fn run(config: &Config, json: bool) -> Result<()> {
     let get = |key: &str| value.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
     println!("uptime    {} s", get("uptime_s"));
     println!("online    {}/{}", get("online"), get("max_users"));
-    println!("connects  {}", get("connections"));
+    println!(
+        "connects  {} open, {} in handshake, {} since start",
+        get("open_connections"),
+        get("handshakes"),
+        get("connections")
+    );
     if let Some(relay) = value.get("relay") {
         let r = |key: &str| relay.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
         println!(

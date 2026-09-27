@@ -67,6 +67,11 @@ host's FQDN, if it resolves to this host) and \`sudo systemctl enable --now icu-
     sudo dnf install ./icu-$VERSION-*.fc43.x86_64.rpm       # Fedora 43 (fc42 for Fedora 42)
     sudo apt install ./icu_${VERSION}-*+deb13_amd64.deb      # Debian 13
 
+**Client for Windows 10/11** (portable, unsigned): unzip
+\`icu-$VERSION-windows-x86_64.zip\` and start \`icu.exe\`. SmartScreen warns about
+an unknown publisher on the first start: "More info" → "Run anyway". Details:
+\`README.txt\` in the ZIP.
+
 Verify downloads with \`sha256sum -c SHA256SUMS\`.
 
 The client contains OpenH264 built from source; Cisco's patent license covers

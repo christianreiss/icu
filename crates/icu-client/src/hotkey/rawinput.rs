@@ -1,6 +1,9 @@
 //! Raw Input hotkeys (Windows): a hidden message-only window on a thread of
-//! its own takes `WM_INPUT` for every keyboard and mouse with
-//! `RIDEV_INPUTSINK`, so keys reach ICU while another window has the focus.
+//! its own takes `WM_INPUT` for every keyboard with `RIDEV_INPUTSINK`, so
+//! keys reach ICU while another window has the focus — and for every mouse
+//! only while a mouse button is bound or „Aufnehmen“ runs: a gaming mouse
+//! reports its movement up to 8000 times a second, and each report would
+//! wake the reader.
 //! Nothing is swallowed: the press still reaches that window. What Windows
 //! hands to an elevated window in the foreground (a game run as
 //! administrator) stays invisible to a normal process (UIPI).
@@ -8,10 +11,11 @@
 //! Raw Input is registered per process, not per window: the last
 //! `RegisterRawInputDevices` for keyboards takes them from the window that
 //! had them. winit registers its own window when its event loop starts, so
-//! the reader checks every two seconds that the keyboards and mice are
-//! still its own and takes them back if not. One reader serves the backend
-//! and „Aufnehmen" alike ([`capture_next_key`]); it runs from its first use
-//! until the process ends.
+//! the reader checks every two seconds that the keyboards (and the mice,
+//! while it wants them) are still its own and takes them back if not. One
+//! reader serves the backend and „Aufnehmen" alike ([`capture_next_key`],
+//! which also takes combinations: `super::chord::Recorder`); it runs from
+//! its first use until the process ends.
 //!
 //! Keys are named as evdev names them (`super::keys`), so the bindings in
 //! the settings mean the same keys on Linux and Windows.
@@ -19,7 +23,7 @@
 use std::{
     collections::HashSet,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering},
         mpsc as std_mpsc, Arc, Mutex,
     },
     time::Duration,
@@ -36,16 +40,16 @@ use windows::{
                 GetRawInputData, GetRegisteredRawInputDevices,
                 KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC_EX, VK_PAUSE},
                 RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
-                RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
+                RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassExW,
-                SetTimer, HWND_MESSAGE, MSG, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1,
+                CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW,
+                RegisterClassExW, SetTimer, HWND_MESSAGE, MSG, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1,
                 RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN,
                 RI_MOUSE_BUTTON_5_UP, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP,
                 RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN,
-                RI_MOUSE_RIGHT_BUTTON_UP, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_TIMER,
-                WNDCLASSEXW,
+                RI_MOUSE_RIGHT_BUTTON_UP, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT,
+                WM_TIMER, WNDCLASSEXW,
             },
         },
     },
@@ -62,6 +66,9 @@ const USAGE_KEYBOARD: u16 = 0x06;
 /// How often the reader makes sure the keys are still its own.
 const RECLAIM_MS: u32 = 2000;
 
+/// Posted to the reader's window when the mice are wanted, or no longer.
+const WM_MICE: u32 = WM_APP + 1;
+
 /// Gets every key transition, `(evdev code, pressed)`; returns `false` to
 /// be removed.
 type Listener = Box<dyn FnMut(u16, bool) -> bool + Send>;
@@ -71,9 +78,26 @@ type Listener = Box<dyn FnMut(u16, bool) -> bool + Send>;
 struct Hub {
     next: AtomicU64,
     listeners: Mutex<Vec<(u64, Listener)>>,
+    /// How many want the mice read ([`Mice`]).
+    mice: AtomicUsize,
+    /// The reader's window, for [`WM_MICE`].
+    window: AtomicIsize,
 }
 
 impl Hub {
+    fn wants_mice(&self) -> bool {
+        self.mice.load(Ordering::SeqCst) > 0
+    }
+
+    /// Has the reader thread register or drop the mice to match
+    /// [`Hub::wants_mice`].
+    fn update_mice(&self) {
+        let hwnd = HWND(self.window.load(Ordering::SeqCst) as _);
+        // SAFETY: posting to the reader's window; a failure (the reader
+        // gone) leaves the registration as it is.
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_MICE, WPARAM(0), LPARAM(0)) };
+    }
+
     fn add(&self, listener: Listener) -> u64 {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.listeners.lock().unwrap().push((id, listener));
@@ -111,6 +135,25 @@ impl Hub {
 }
 
 static READER: Mutex<Option<Arc<Hub>>> = Mutex::new(None);
+
+/// Keeps the mice registered for as long as it lives: a backend with a
+/// mouse button bound, or a running „Aufnehmen“.
+struct Mice(Arc<Hub>);
+
+impl Mice {
+    fn new(hub: Arc<Hub>) -> Mice {
+        hub.mice.fetch_add(1, Ordering::SeqCst);
+        hub.update_mice();
+        Mice(hub)
+    }
+}
+
+impl Drop for Mice {
+    fn drop(&mut self) {
+        self.0.mice.fetch_sub(1, Ordering::SeqCst);
+        self.0.update_mice();
+    }
+}
 
 /// The running reader, started on first use; a start that failed is tried
 /// again on the next use („Erneut versuchen“, a new binding).
@@ -157,13 +200,14 @@ fn reader_thread(hub: Arc<Hub>, ready: std_mpsc::Sender<Result<(), String>>) {
             return;
         }
     };
+    hub.window.store(hwnd.0 as isize, Ordering::SeqCst);
     STATE.with(|s| {
         *s.borrow_mut() = Some(ReaderState {
             hub,
             held: HashSet::new(),
         })
     });
-    if let Err(e) = register(hwnd) {
+    if let Err(e) = register(hwnd, false) {
         let _ = ready.send(Err(e));
         return;
     }
@@ -209,20 +253,69 @@ unsafe fn create_window() -> Result<HWND, String> {
     .map_err(|e| format!("CreateWindowExW: {e}"))
 }
 
-/// Takes keyboards and mice for `hwnd`, in the background too.
-fn register(hwnd: HWND) -> Result<(), String> {
-    let devices = [USAGE_KEYBOARD, USAGE_MOUSE].map(|usage| RAWINPUTDEVICE {
-        usUsagePage: USAGE_PAGE_GENERIC,
-        usUsage: usage,
-        dwFlags: RIDEV_INPUTSINK,
-        hwndTarget: hwnd,
-    });
+/// The usages the reader takes: keyboards, and mice when `mice`.
+fn usages(mice: bool) -> &'static [u16] {
+    if mice {
+        &[USAGE_KEYBOARD, USAGE_MOUSE]
+    } else {
+        &[USAGE_KEYBOARD]
+    }
+}
+
+/// Takes keyboards — and mice when `mice` — for `hwnd`, in the background
+/// too.
+fn register(hwnd: HWND, mice: bool) -> Result<(), String> {
+    let devices: Vec<RAWINPUTDEVICE> = usages(mice)
+        .iter()
+        .map(|usage| RAWINPUTDEVICE {
+            usUsagePage: USAGE_PAGE_GENERIC,
+            usUsage: *usage,
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd,
+        })
+        .collect();
     unsafe { RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32) }
         .map_err(|e| format!("RegisterRawInputDevices: {e}"))
 }
 
-/// Whether keyboards and mice still go to `hwnd` with `RIDEV_INPUTSINK`.
-fn still_ours(hwnd: HWND) -> bool {
+/// Gives the mice up, if `hwnd` has them (not winit's registration).
+fn release_mice(hwnd: HWND) {
+    if !still_ours_for(hwnd, &[USAGE_MOUSE]) {
+        return;
+    }
+    let device = RAWINPUTDEVICE {
+        usUsagePage: USAGE_PAGE_GENERIC,
+        usUsage: USAGE_MOUSE,
+        dwFlags: RIDEV_REMOVE,
+        hwndTarget: HWND::default(),
+    };
+    if let Err(e) =
+        unsafe { RegisterRawInputDevices(&[device], std::mem::size_of::<RAWINPUTDEVICE>() as u32) }
+    {
+        tracing::warn!(%e, "raw input: mice not released");
+    }
+}
+
+/// Registers or releases the mice to match `mice`.
+fn update_mice(hwnd: HWND, mice: bool) {
+    if !mice {
+        release_mice(hwnd);
+    } else if !still_ours(hwnd, true) {
+        if let Err(e) = register(hwnd, true) {
+            tracing::warn!(%e, "raw input");
+        }
+    }
+}
+
+/// Whether keyboards (and mice when `mice`) still go to `hwnd` with
+/// `RIDEV_INPUTSINK`.
+fn still_ours(hwnd: HWND, mice: bool) -> bool {
+    still_ours_for(hwnd, usages(mice))
+}
+
+/// Whether every one of `usages` still goes to `hwnd` with
+/// `RIDEV_INPUTSINK`.
+fn still_ours_for(hwnd: HWND, usages: &[u16]) -> bool {
     let mut devices = [RAWINPUTDEVICE::default(); 16];
     let mut n = devices.len() as u32;
     let got = unsafe {
@@ -235,7 +328,7 @@ fn still_ours(hwnd: HWND) -> bool {
     if got == u32::MAX {
         return false;
     }
-    [USAGE_KEYBOARD, USAGE_MOUSE].iter().all(|usage| {
+    usages.iter().all(|usage| {
         devices[..got as usize].iter().any(|d| {
             d.usUsagePage == USAGE_PAGE_GENERIC
                 && d.usUsage == *usage
@@ -254,10 +347,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
         }
+        WM_MICE => {
+            update_mice(hwnd, wants_mice());
+            return LRESULT(0);
+        }
         WM_TIMER => {
-            if !still_ours(hwnd) {
+            let mice = wants_mice();
+            if !still_ours(hwnd, mice) {
                 tracing::info!("raw input taken by another window, taking it back");
-                if let Err(e) = register(hwnd) {
+                if let Err(e) = register(hwnd, mice) {
                     tracing::warn!(%e, "raw input");
                 }
                 // A release that went to the other window is lost: let go
@@ -347,6 +445,11 @@ fn transitions(input: &RAWINPUT) -> Vec<(u16, bool)> {
     Vec::new()
 }
 
+/// Whether the reader's hub wants the mice (on the reader thread).
+fn wants_mice() -> bool {
+    STATE.with(|s| s.borrow().as_ref().is_some_and(|s| s.hub.wants_mice()))
+}
+
 /// Releases every key held (after the keys were someone else's).
 fn release_all() {
     let released = STATE.with(|s| {
@@ -382,39 +485,45 @@ fn deliver(code: u16, pressed: bool) {
 /// What [`capture_next_key`] says when there is no reader.
 const NO_READER: &str = "ICU kann Tastatur und Maus nicht lesen.";
 
-/// Waits for the next key or button press and returns its binding name
-/// (`super::keys::key_name`) — for the settings' „Taste drücken“. Left and
-/// right click operate the window the capture runs in and do not count.
+/// Waits for the next key, combination or button and returns its binding —
+/// a key name (`super::keys::key_name`) or a trigger such as `CTRL+F12`
+/// (`super::chord::Recorder`) — for the settings' „Taste drücken“. Left
+/// and right click operate the window the capture runs in and do not
+/// count.
 pub async fn capture_next_key(timeout: Duration) -> Result<String, String> {
     let hub = hub().map_err(|e| {
         tracing::warn!(%e, "raw input");
         NO_READER.to_string()
     })?;
+    let _mice = Mice::new(hub.clone());
     let (tx, rx) = oneshot::channel();
     let mut tx = Some(tx);
+    let mut recorder = super::chord::Recorder::default();
     let id = hub.add(Box::new(move |code, pressed| {
-        if !pressed || code == keys::BTN_LEFT || code == keys::BTN_RIGHT {
+        let Some(binding) = recorder.feed(code, pressed) else {
             return true;
-        }
+        };
         if let Some(tx) = tx.take() {
-            let _ = tx.send(code);
+            let _ = tx.send(binding);
         }
         false
     }));
     let result = tokio::time::timeout(timeout, rx).await;
     hub.remove(id);
     match result {
-        Ok(Ok(code)) => Ok(keys::key_name(code)),
+        Ok(Ok(binding)) => Ok(binding),
         Ok(Err(_)) => Err(NO_READER.into()),
         Err(_) => Err("Keine Taste gedrückt.".into()),
     }
 }
 
 /// Stops the backend when dropped: its listener goes, and with it the
-/// `Dispatch`, which releases a held push-to-talk key.
+/// `Dispatch`, which releases a held push-to-talk key; and the mice, if a
+/// mouse button was bound.
 pub struct Guard {
     hub: Arc<Hub>,
     id: u64,
+    _mice: Option<Mice>,
 }
 
 impl Drop for Guard {
@@ -439,6 +548,10 @@ pub async fn start(
     let hub = tokio::task::spawn_blocking(hub)
         .await
         .map_err(|e| e.to_string())??;
+    let mice = bindings
+        .iter()
+        .any(|(chord, _, _)| chord.uses_mouse())
+        .then(|| Mice::new(hub.clone()));
     let mut dispatch = Dispatch::new(cmd);
     let mut held = HashSet::new();
     let id = hub.add(Box::new(move |code, pressed| {
@@ -456,7 +569,11 @@ pub async fn start(
         }
         true
     }));
-    Ok(Guard { hub, id })
+    Ok(Guard {
+        hub,
+        id,
+        _mice: mice,
+    })
 }
 
 #[cfg(test)]

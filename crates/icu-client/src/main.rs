@@ -2,14 +2,18 @@
 //!
 //! `icu` starts. `icu <file>` opens an invite or passport in the first-start
 //! window (with `--name`/`--yes`/`--skip-settings`/`--headless` it is taken
-//! on the terminal), then starts. `--config-dir` allows two instances on one machine,
+//! on the terminal), then starts; `icu -` reads it from standard input.
+//! `--config-dir` allows two instances on one machine,
 //! `--headless` runs without a window,
 //! `--debug-stats` prints latency histograms to stderr every 2 s,
 //! `--test-tone` replaces the microphone with a synthetic voice.
 //!
 //! On Windows `icu.exe` is a GUI program: a double-click opens no console.
 //! Started from a terminal it writes to that terminal (`AttachConsole`);
-//! otherwise the log goes to `%LOCALAPPDATA%\icu\data\icu.log`.
+//! otherwise the log goes to `%LOCALAPPDATA%\icu\data\icu.log`, and an
+//! error that ends ICU is shown in a message box as well. Elsewhere the log
+//! goes to stderr, and without a terminal on it also to
+//! `$XDG_STATE_HOME/icu/icu.log` (`~/.local/state/icu/icu.log`).
 
 // A desktop start must not open a console window next to ICU's own.
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -28,10 +32,12 @@ use icu_client::{
 #[command(name = "icu", version, about, long_about = None)]
 struct Cli {
     /// Invite (registration bundle) or passport to take over: an `.icu`
-    /// file, or the armored text itself (`-----BEGIN ICU PASSPORT-----`). It
-    /// opens in the first-start window, which shows where it leads and joins
-    /// on a click; with --yes, --name, --skip-settings or --headless it is
-    /// taken on the terminal instead.
+    /// file, or `-` for its text on standard input. Never the text itself:
+    /// it carries a private key, and arguments are visible to every local
+    /// user and end up in the shell history. It opens in the first-start
+    /// window, which shows where it leads and joins on a click; with --yes,
+    /// --name, --skip-settings or --headless it is taken on the terminal
+    /// instead.
     bundle: Option<String>,
     /// The name to register with. It goes into the certificate, so it is what
     /// everyone sees. Needed for a registration bundle, ignored for a
@@ -80,6 +86,20 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    // Before anything loads a DLL by name: wgpu asks for `dxcompiler.dll`
+    // and `vulkan-1.dll`, which Windows would otherwise also look for in the
+    // working directory — the folder of a double-clicked `.icu` file,
+    // Downloads — and on PATH. From here on only System32 and ICU's own
+    // folder count.
+    #[cfg(windows)]
+    // SAFETY: a plain Win32 call on process-wide loader state.
+    let dll_search = unsafe {
+        use windows::Win32::System::LibraryLoader::{
+            SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        };
+        SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR)
+    };
     #[cfg(windows)]
     let console = attach_console();
     // Toasts and the taskbar button go by ICU's app id (`notify`).
@@ -91,25 +111,104 @@ fn main() -> ExitCode {
         )
     };
     let cli = Cli::parse();
+    // A terminal shows the log as it comes; without one it goes to a file.
     #[cfg(windows)]
-    if !console {
-        if let Some(log) = windows_log_file() {
-            init_tracing_to(log);
-        } else {
-            init_tracing();
-        }
-    } else {
-        init_tracing();
-    }
+    let terminal = console;
     #[cfg(not(windows))]
-    init_tracing();
+    let terminal = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let log_file = (!terminal)
+        .then(|| log_dir().and_then(|dir| open_log(&dir)))
+        .flatten();
+    let to_file = log_file.is_some();
+    init_tracing(log_file);
+    install_panic_hook();
+    #[cfg(windows)]
+    if let Err(e) = dll_search {
+        tracing::warn!(%e, "SetDefaultDllDirectories: DLLs are still searched for everywhere");
+    }
+    // Started from the desktop, an error that ends ICU would otherwise end
+    // it without a word: nobody reads a log file on a double-click.
+    #[cfg(windows)]
+    let dialog = !console && !cli.headless;
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("icu: {e}");
+            if to_file {
+                tracing::error!(error = %e, "ICU ends");
+            } else {
+                eprintln!("icu: {e}");
+            }
+            #[cfg(windows)]
+            if dialog {
+                message_box(
+                    &format!("ICU konnte nicht starten:\n\n{e}"),
+                    windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+                );
+            }
             ExitCode::FAILURE
         }
     }
+}
+
+/// Every panic goes to the log before the process ends (the release build
+/// aborts on a panic): on a desktop start that is the only trace it leaves.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        tracing::error!(thread = thread.name().unwrap_or("?"), %info, "panic");
+        default(info);
+    }));
+}
+
+/// Shows `text` in a message box of its own (no owner window) and returns
+/// the button pressed.
+#[cfg(windows)]
+fn message_box(
+    text: &str,
+    style: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE,
+) -> windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_RESULT {
+    use windows::{
+        core::HSTRING,
+        Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_SETFOREGROUND, MB_TOPMOST},
+    };
+    // SAFETY: both strings outlive the call.
+    unsafe {
+        MessageBoxW(
+            None,
+            &HSTRING::from(text),
+            &HSTRING::from("ICU"),
+            style | MB_SETFOREGROUND | MB_TOPMOST,
+        )
+    }
+}
+
+/// Whether `Identity::load` failed because DPAPI would not unseal the
+/// private key (`config::key_seal`): the Windows password was reset by an
+/// administrator, or the profile came from another machine. Retrying never
+/// helps; only a new invite or a passport does.
+#[cfg(windows)]
+fn key_unsealable(e: &icu_client::config::ConfigError) -> bool {
+    matches!(e, icu_client::config::ConfigError::Io(io)
+        if io.to_string().starts_with("CryptUnprotectData"))
+}
+
+/// Asks whether to drop credentials this Windows account cannot decrypt.
+/// „Nein“ (the default button) changes nothing.
+#[cfg(windows)]
+fn confirm_forget_identity() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO};
+    message_box(
+        "ICU kann seine gespeicherten Zugangsdaten mit diesem Windows-Konto nicht \
+         entschlüsseln. Das passiert, wenn das Kennwort des Kontos von einem Administrator \
+         zurückgesetzt wurde oder das Profil von einem anderen PC stammt.\n\n\
+         Zugangsdaten verwerfen und ICU mit einer neuen Einladung oder einem Passport \
+         einrichten?\n\n\
+         Ja: die Zugangsdaten (und hier gespeicherte Einladungen) werden gelöscht, das \
+         Einladungsfenster öffnet sich.\n\
+         Nein: ICU beendet sich, nichts wird geändert.",
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+    ) == IDYES
 }
 
 /// Asks on the terminal whether to take the shown bundle or passport. Without
@@ -134,17 +233,38 @@ fn confirm_import() -> Result<bool, String> {
     ))
 }
 
-/// The bundle argument as text: the armored text itself, or a file's
-/// contents. A passport is at most 8 KiB decoded; a much larger file is not
+/// The bundle argument as text: a file's contents, or with `-` standard
+/// input. A passport is at most 8 KiB decoded; a much larger file is not
 /// one and is not read whole.
 fn read_bundle(arg: &str) -> Result<String, String> {
+    read_bundle_from(arg, std::io::stdin().lock())
+}
+
+/// [`read_bundle`], with `-` reading `stdin`. The armored text itself is
+/// refused: with its private key it would sit in `/proc/<pid>/cmdline` for
+/// every local user as long as ICU runs, and in the shell history.
+fn read_bundle_from(arg: &str, stdin: impl std::io::Read) -> Result<String, String> {
     use std::io::Read;
+    const MAX: u64 = 64 * 1024;
     if icu_proto::passport::Passport::looks_like(arg) {
-        return Ok(arg.to_owned());
+        return Err(
+            "Einladung und Passport bitte nicht als Text übergeben: der private \
+                    Schlüssel darin wäre für jeden Nutzer dieses Rechners in der Prozessliste \
+                    zu sehen und stünde in der Shell-History. Stattdessen als Datei \
+                    (`icu datei.icu`) oder über die Standardeingabe (`icu - < datei.icu`)."
+                .into(),
+        );
     }
     let mut text = String::new();
+    if arg == "-" {
+        stdin
+            .take(MAX)
+            .read_to_string(&mut text)
+            .map_err(|e| format!("stdin: {e}"))?;
+        return Ok(text);
+    }
     std::fs::File::open(arg)
-        .and_then(|f| f.take(64 * 1024).read_to_string(&mut text))
+        .and_then(|f| f.take(MAX).read_to_string(&mut text))
         .map_err(|e| format!("{arg}: {e}"))?;
     Ok(text)
 }
@@ -256,48 +376,77 @@ fn attach_console() -> bool {
     attached || redirected_error
 }
 
-/// `%LOCALAPPDATA%\icu\data\icu.log`, appended to: a second start (which
-/// hands over to the running ICU and ends) must not cut the running one's
-/// log. Over 1 MiB it moves to `icu.log.1` first.
-#[cfg(windows)]
-fn windows_log_file() -> Option<std::fs::File> {
-    let dir = directories::ProjectDirs::from("", "", "icu")?
-        .data_local_dir()
-        .to_path_buf();
-    std::fs::create_dir_all(&dir).ok()?;
+/// Where the log goes when no terminal shows it: `%LOCALAPPDATA%\icu\data`
+/// on Windows, elsewhere the XDG state directory.
+fn log_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    return Some(
+        directories::ProjectDirs::from("", "", "icu")?
+            .data_local_dir()
+            .to_path_buf(),
+    );
+    #[cfg(not(windows))]
+    state_dir(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+/// `$XDG_STATE_HOME/icu`, or `~/.local/state/icu` when that is unset or not
+/// absolute (XDG Base Directory Specification).
+#[cfg(not(windows))]
+fn state_dir(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let absolute = |p: std::ffi::OsString| Some(PathBuf::from(p)).filter(|p| p.is_absolute());
+    let base = xdg_state_home
+        .and_then(absolute)
+        .or_else(|| home.and_then(absolute).map(|h| h.join(".local/state")))?;
+    Some(base.join("icu"))
+}
+
+/// `icu.log` in `dir`, appended to: a second start (which hands over to the
+/// running ICU and ends) must not cut the running one's log. Over 1 MiB it
+/// moves to `icu.log.1` first. Only the owner may read it on Unix.
+fn open_log(dir: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(dir).ok()?;
     let log = dir.join("icu.log");
     if std::fs::metadata(&log).is_ok_and(|m| m.len() > 1 << 20) {
         let _ = std::fs::rename(&log, dir.join("icu.log.1"));
     }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .ok()
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(log).ok()
 }
 
-#[cfg(windows)]
-fn init_tracing_to(file: std::fs::File) {
+/// Logs to stderr, or to `file` — on Linux to both: a desktop start's
+/// stderr goes to the journal, which keeps getting it.
+fn init_tracing(file: Option<std::fs::File>) {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing::subscriber::set_global_default(
-        fmt::Subscriber::builder()
-            .with_env_filter(filter)
-            .with_ansi(false)
-            .with_writer(std::sync::Mutex::new(file))
-            .finish(),
-    );
-}
-
-fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing::subscriber::set_global_default(
-        fmt::Subscriber::builder()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .finish(),
-    );
+    let builder = fmt::Subscriber::builder().with_env_filter(filter);
+    let _ = match file {
+        #[cfg(windows)]
+        Some(file) => tracing::subscriber::set_global_default(
+            builder
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .finish(),
+        ),
+        #[cfg(not(windows))]
+        Some(file) => {
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
+            tracing::subscriber::set_global_default(
+                builder
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(file).and(std::io::stderr))
+                    .finish(),
+            )
+        }
+        None => {
+            tracing::subscriber::set_global_default(builder.with_writer(std::io::stderr).finish())
+        }
+    };
 }
 
 // Without `gui` there is no logout, so nothing loops, and no window to show.
@@ -386,7 +535,25 @@ fn run(cli: Cli) -> Result<(), String> {
 
     let mut logged_out = false;
     loop {
-        let identity = match Identity::load(&paths).map_err(|e| e.to_string())? {
+        let loaded = Identity::load(&paths);
+        // A key this account can no longer unseal would end every start
+        // before a window opens — no way to log out or take a new invite.
+        // Asked once; „Ja“ removes it and the invite window follows.
+        #[cfg(windows)]
+        let loaded = match loaded {
+            Err(e) if key_unsealable(&e) && !cli.headless => {
+                tracing::error!(error = %e, "the stored key does not unseal for this account");
+                if !confirm_forget_identity() {
+                    tracing::info!("stored credentials kept, quitting");
+                    return Ok(());
+                }
+                Identity::remove(&paths).map_err(|e| e.to_string())?;
+                tracing::warn!("stored credentials removed, asking for an invite");
+                Ok(None)
+            }
+            other => other,
+        };
+        let identity = match loaded.map_err(|e| e.to_string())? {
             Some(id) => id,
             None => {
                 #[cfg(feature = "gui")]
@@ -399,7 +566,9 @@ fn run(cli: Cli) -> Result<(), String> {
                 let enrolled: Option<Identity> = None;
                 match enrolled {
                     Some(id) => id,
-                    None if logged_out => return Ok(()),
+                    // The invite window was closed: the user's answer, not
+                    // an error to report.
+                    None if logged_out || (cfg!(feature = "gui") && !cli.headless) => return Ok(()),
                     None => {
                         return Err(format!(
                         "not registered: run `icu <bundle> --name <name>` first (config dir {})",
@@ -410,6 +579,9 @@ fn run(cli: Cli) -> Result<(), String> {
             }
         };
 
+        // Without an audio system ICU still runs, silent — and says so in the
+        // window, not only in the log.
+        let mut audio_problem = None;
         let backend: Box<dyn icu_client::audio::AudioBackend> = if cli.fake_audio {
             Box::new(icu_client::audio::fake::FakeBackend::silent().0)
         } else {
@@ -417,6 +589,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!(%e, "no audio backend, using the silent fake backend");
+                    audio_problem = Some(icu_client::problem::no_audio_system(&e));
                     Box::new(icu_client::audio::fake::FakeBackend::silent().0)
                 }
             }
@@ -431,7 +604,9 @@ fn run(cli: Cli) -> Result<(), String> {
         let mut cfg = EngineConfig::new(identity, settings.clone(), paths.clone());
         cfg.server_addr = cli.server_addr;
         cfg.test_tone = cli.test_tone;
-        cfg.banner = settings_problem.take().or(problem);
+        cfg.banner = audio_problem
+            .or_else(|| settings_problem.take())
+            .or(problem);
         let engine = Engine::start(cfg, backend).map_err(|e| e.to_string())?;
         // From here a SIGTERM (a desktop logging out) quits like „Beenden“,
         // with a proper goodbye to the server.
@@ -523,4 +698,118 @@ fn run_headless(engine: Engine, debug_stats: bool) -> Result<(), String> {
     camera.stop();
     engine.shutdown();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A passport never comes in as an argument (the key would be in the
+    /// process list); a file and standard input (`-`) do.
+    #[test]
+    fn a_passport_is_taken_from_a_file_or_stdin_not_as_an_argument() {
+        const TEXT: &str = "-----BEGIN ICU PASSPORT-----\nAAAA\n-----END ICU PASSPORT-----\n";
+        let refused = read_bundle_from(TEXT, std::io::empty()).unwrap_err();
+        assert!(refused.contains("icu - <"), "{refused}");
+        assert!(read_bundle_from(&format!("  {TEXT}"), std::io::empty()).is_err());
+
+        assert_eq!(read_bundle_from("-", TEXT.as_bytes()).unwrap(), TEXT);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("einladung.icu");
+        std::fs::write(&file, TEXT).unwrap();
+        assert_eq!(
+            read_bundle_from(file.to_str().unwrap(), std::io::empty()).unwrap(),
+            TEXT
+        );
+        let missing = dir.path().join("fehlt.icu");
+        assert!(read_bundle_from(missing.to_str().unwrap(), std::io::empty()).is_err());
+    }
+
+    /// The log sits in `$XDG_STATE_HOME/icu`, or `~/.local/state/icu` when
+    /// that is unset or relative.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_log_goes_to_the_xdg_state_directory() {
+        let dir = |xdg: Option<&str>, home: Option<&str>| {
+            state_dir(xdg.map(Into::into), home.map(Into::into))
+        };
+        assert_eq!(
+            dir(Some("/var/state"), Some("/home/a")),
+            Some(PathBuf::from("/var/state/icu"))
+        );
+        assert_eq!(
+            dir(Some("state"), Some("/home/a")),
+            Some(PathBuf::from("/home/a/.local/state/icu"))
+        );
+        assert_eq!(
+            dir(None, Some("/home/a")),
+            Some(PathBuf::from("/home/a/.local/state/icu"))
+        );
+        assert_eq!(dir(None, None), None);
+        assert_eq!(dir(None, Some("relative")), None);
+    }
+
+    /// The log is appended to; over 1 MiB it moves to `icu.log.1` first,
+    /// replacing an older one.
+    #[test]
+    fn the_log_is_appended_and_rotated_at_one_mebibyte() {
+        use std::io::Write;
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("icu");
+        let mut log = open_log(&dir).expect("created with its directory");
+        log.write_all(b"first\n").unwrap();
+        drop(log);
+        open_log(&dir).unwrap().write_all(b"second\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("icu.log")).unwrap(),
+            "first\nsecond\n"
+        );
+        assert!(!dir.join("icu.log.1").exists());
+
+        std::fs::write(dir.join("icu.log.1"), "oldest").unwrap();
+        std::fs::write(dir.join("icu.log"), vec![b'x'; (1 << 20) + 1]).unwrap();
+        open_log(&dir).unwrap().write_all(b"fresh\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("icu.log")).unwrap(),
+            "fresh\n"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join("icu.log.1")).unwrap().len(),
+            (1 << 20) + 1
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("icu.log"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "only the owner reads the log");
+        }
+    }
+
+    /// A key sealed for another account (or damaged) is told apart from any
+    /// other reason the identity does not load: only that one is offered to
+    /// be dropped.
+    #[cfg(windows)]
+    #[test]
+    fn a_key_that_does_not_unseal_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf()));
+        let identity = paths.identity_dir();
+        std::fs::create_dir_all(&identity).unwrap();
+        std::fs::write(identity.join("server.toml"), "").unwrap();
+        let mut sealed = b"ICU-DPAPI/1\n".to_vec();
+        sealed.extend([0x01, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef]);
+        std::fs::write(identity.join("key.pk8"), sealed).unwrap();
+        let e = Identity::load(&paths).unwrap_err();
+        assert!(key_unsealable(&e), "{e}");
+
+        std::fs::write(identity.join("key.pk8"), [0x30, 0x03, 1, 2, 3]).unwrap();
+        let e = Identity::load(&paths).unwrap_err();
+        assert!(
+            !key_unsealable(&e),
+            "a missing certificate is not DPAPI: {e}"
+        );
+    }
 }

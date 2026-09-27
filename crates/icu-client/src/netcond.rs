@@ -91,7 +91,9 @@ const RTT_EWMA_ALPHA: f32 = 0.3;
 const CWND_SATURATION_FRACTION: f64 = 0.9;
 
 /// Folds successive [`Sample`]s into a [`NetworkCondition`]. One instance
-/// per connection.
+/// per engine, replaced by a fresh one at every `Welcome`: the hints and the
+/// cumulative counters of a connection that ended say nothing about the
+/// next one.
 #[derive(Debug, Default)]
 pub struct NetworkTracker {
     prev: Option<Sample>,

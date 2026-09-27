@@ -195,9 +195,6 @@ fn connect() -> Result<Connected, BackendError> {
         .map_err(|e| BackendError(format!("main loop: {e}")))?;
     let context = pw::context::ContextRc::new(&mainloop, None)
         .map_err(|e| BackendError(format!("context: {e}")))?;
-    // module-rt, loaded by the client context, is what can lift the engine's
-    // audio threads to real-time priority (`super::rt`).
-    super::rt::register_context(context.as_raw_ptr() as *mut std::ffi::c_void);
     let core = context
         .connect_rc(None)
         .map_err(|e| BackendError(format!("connect: {e}")))?;
@@ -214,13 +211,18 @@ fn pw_thread(
     ready: Sender<Result<(), BackendError>>,
 ) {
     pw::init();
-    let (mainloop, _context, core, registry) = match connect() {
+    let (mainloop, context, core, registry) = match connect() {
         Ok(x) => x,
         Err(e) => {
             let _ = ready.send(Err(e));
             return;
         }
     };
+    // module-rt, loaded by the client context, is what can lift the engine's
+    // audio threads to real-time priority (`super::rt`). Registered only now
+    // that the context is connected; declared after it, so the registration
+    // is dropped first whenever this thread ends.
+    let _rt = super::rt::register_context(context.as_raw_ptr() as *mut std::ffi::c_void);
 
     // Device list from the registry: every Audio/Source and Audio/Sink node.
     let dev_add = devices.clone();
@@ -486,4 +488,26 @@ fn open_stream(
         _listener: listener,
         stream,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The case from the review (L6): PipeWire's library is there, its
+    /// daemon is not. The backend fails, and no freed context stays behind
+    /// for the silent fallback's threads to promote themselves through.
+    /// Run as `PIPEWIRE_REMOTE=icu-no-such-daemon cargo test -p icu-client
+    /// --lib a_failed_connect -- --ignored`.
+    #[test]
+    #[ignore = "needs PIPEWIRE_REMOTE pointing at no daemon"]
+    fn a_failed_connect_leaves_no_rt_context() {
+        assert_eq!(
+            std::env::var("PIPEWIRE_REMOTE").as_deref(),
+            Ok("icu-no-such-daemon"),
+            "would connect to the real daemon"
+        );
+        assert!(PipeWireBackend::new().is_err());
+        assert!(super::super::rt::registered_context().is_null());
+    }
 }

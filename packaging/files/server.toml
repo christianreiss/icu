@@ -9,7 +9,8 @@
 [server]
 listen = ["0.0.0.0:4711", "[::]:4711"]
 # DNS name (or IP) clients connect to; baked into every certificate.
-# Default: the host's FQDN, confirmed by DNS (see above).
+# Default: the host's FQDN, confirmed by DNS (see above). Once there is a CA,
+# the name it carries; set to anything else, the server refuses to start.
 #server_name = "icu.example.org"
 # host:port written into registration bundles. Default: server_name:4711.
 #public_host = "icu.example.org:4711"

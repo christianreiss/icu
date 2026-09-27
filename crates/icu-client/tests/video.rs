@@ -295,6 +295,40 @@ async fn a_camera_that_will_not_open_is_retried_with_backoff() {
     server.handle.shutdown().await;
 }
 
+/// A camera that offers no format ICU can decode is not retried: it says so
+/// at once, in its own words, and the camera goes off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_camera_without_a_usable_format_says_so_at_once() {
+    let server = TestServer::start().await;
+    let (backend, _probe) = FakeBackend::silent();
+    let (engine, _dir) = server.engine("alice", Box::new(backend), false).await;
+    wait_connected(&engine).await;
+    engine.command(Command::SetCamera(true));
+    let on = wait_for(&engine, SOON, |s| s.camera_on).await;
+
+    let tries = Arc::new(AtomicUsize::new(0));
+    let counted = tries.clone();
+    let mut camera = CameraHandle::with_opener(
+        engine.camera_link(),
+        Box::new(
+            move |_: Option<&str>| -> Result<Box<dyn FrameSource>, String> {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Err(format!("{}: GRAY", icu_client::camera::NO_USABLE_FORMAT))
+            },
+        ),
+    );
+    camera.sync(&on);
+    let off = wait_for(&engine, SOON, |s| !s.camera_on).await;
+    let banner = off.banner.expect("banner");
+    assert!(banner.text.contains("kein Bildformat"), "{}", banner.text);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    camera.sync(&on);
+    assert_eq!(tries.load(Ordering::Relaxed), 1, "not retried");
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
 /// Given up: the camera goes off and the banner says why. The camera hotkey
 /// toggles it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -147,6 +147,13 @@ pub async fn start(
             return Err(Unavailable(e.to_string()));
         }
     };
+    // What the desktop assigned, which the windows show as the key.
+    let tag = super::portal_bound(
+        bind.shortcuts()
+            .iter()
+            .map(|s| (s.id().to_string(), s.trigger_description().to_string()))
+            .collect(),
+    );
     let own = object_path(&session);
     if own.is_none() {
         tracing::warn!("portal session without a readable path; events are not filtered");
@@ -178,6 +185,7 @@ pub async fn start(
             End::Lost => tracing::info!("the portal shortcut signals ended"),
             End::Stopped => {}
         }
+        super::portal_unbound(tag);
         if !matches!(end, End::Closed) {
             close(&session).await;
         }

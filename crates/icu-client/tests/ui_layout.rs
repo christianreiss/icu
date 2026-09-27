@@ -9,16 +9,11 @@
 //! ICU_UI_SHOTS=/tmp/icu-shots cargo test -p icu-client --test ui_layout -- --nocapture
 //! ```
 //!
-//! Unix only: the in-process server (`common`) is.
-#![cfg(unix)]
+//! The two tests that need a real invite and passport run on Unix only:
+//! the in-process server (`common`) does. The rest renders on Windows too
+//! (its pages differ: Tastenkürzel, window fitting).
 
-use std::{
-    cell::RefCell,
-    net::SocketAddr,
-    rc::Rc,
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{cell::RefCell, net::SocketAddr, rc::Rc, sync::Arc, time::Instant};
 
 use egui_kittest::{kittest::Queryable, Harness};
 use icu_client::{
@@ -31,7 +26,7 @@ use icu_client::{
     ui::{
         connection::ConnectionView,
         fonts,
-        main_window::{EnrollApp, MainEnv, MainView},
+        main_window::{MainEnv, MainView},
         settings::SettingsView,
         setup::{SetupView, Step},
         theme,
@@ -39,13 +34,15 @@ use icu_client::{
 };
 use icu_proto::{AudioParams, UserFlags, UserInfo, UserSummary};
 
+#[cfg(unix)]
 mod common;
 
 /// What the windows open with (`ui::main_window`).
-const MAIN: [f32; 2] = [400.0, 620.0];
+const MAIN: [f32; 2] = icu_client::ui::main_window::MAIN_SIZE;
 const SETTINGS: [f32; 2] = icu_client::ui::main_window::SETTINGS_SIZE;
 const CONNECTION: [f32; 2] = icu_client::ui::main_window::CONNECTION_SIZE;
 const SETUP: [f32; 2] = icu_client::ui::main_window::SETUP_SIZE;
+#[cfg(unix)]
 const ENROLL: [f32; 2] = [560.0, 600.0];
 
 const THEMES: [&str; 2] = ["light", "dark"];
@@ -367,11 +364,29 @@ fn main_window(
     (harness, overflow)
 }
 
+/// Four people, the room the main window opens for: oneself and three
+/// more, the longest name speaking with every badge column in use, so the
+/// narrow window is checked at its widest row.
+fn four() -> AppState {
+    let mut s = state();
+    s.peers = vec![
+        peer(2, "Anna", UserFlags::PTT | UserFlags::VIEWING, 18),
+        peer(5, "Dennis", UserFlags::DEAFENED | UserFlags::MUTED, 170),
+        peer(
+            6,
+            "Eva-Maria Schulte",
+            UserFlags::SPEAKING | UserFlags::ADMIN | UserFlags::CAMERA_ON | UserFlags::VIEWING,
+            22,
+        ),
+    ];
+    s
+}
+
 #[test]
 fn main_window_fits() {
     let mut overflows = Overflows::default();
     let cases: Vec<(&str, AppState)> = vec![
-        ("room", state()),
+        ("four", four()),
         ("alone", {
             let mut s = state();
             s.peers.clear();
@@ -387,7 +402,7 @@ fn main_window_fits() {
             s
         }),
         ("restricted", {
-            let mut s = state();
+            let mut s = four();
             s.muted = true;
             s.restricted_muted = true;
             s
@@ -400,6 +415,26 @@ fn main_window_fits() {
             overflows.check(&what, *overflow.borrow());
             shot(&mut h, &what.replace('/', "-"));
         }
+    }
+    overflows.assert_none();
+}
+
+/// More than four people do not fit the window as it opens; after
+/// connecting it grows to fit them (`App::fit_to_list`), and a room of six
+/// must still fit on a 1080p screen.
+#[test]
+fn main_window_grows_for_a_bigger_room() {
+    let mut overflows = Overflows::default();
+    for theme_name in THEMES {
+        let (mut h, overflow) = main_window(state(), theme_name);
+        let what = format!("main/room/{theme_name}");
+        let overflow = *overflow.borrow();
+        let height = MAIN[1] + overflow.max(0.0);
+        eprintln!("{what:<44} overflow {overflow:>7.1} px, grows to {height:>6.1} px");
+        if height > MAX_HEIGHT {
+            overflows.0.push(format!("{what}: {height:.0} px tall"));
+        }
+        shot(&mut h, &what.replace('/', "-"));
     }
     overflows.assert_none();
 }
@@ -479,8 +514,11 @@ fn connection_pages_fit() {
 /// The first-start window: empty, with an invite (asks for the name) and
 /// with a passport (does not, but offers to take its settings along), each
 /// checked where it leads before joining.
+#[cfg(unix)]
 #[test]
 fn enroll_window_fits() {
+    use icu_client::ui::main_window::EnrollApp;
+    use std::sync::Mutex;
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (bundle, passport) = rt.block_on(async {
         let server = common::TestServer::start().await;
@@ -588,6 +626,7 @@ fn settings_window_keeps_outside_changes() {
 /// ⚙ → Allgemein: a pasted passport that carries settings offers to take
 /// them along, on by default; switched off, „Übernehmen“ sends the identity
 /// alone.
+#[cfg(unix)]
 #[test]
 fn settings_import_takes_the_settings_unless_switched_off() {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -613,12 +652,9 @@ fn settings_import_takes_the_settings_unless_switched_off() {
             cmds_out.borrow_mut().extend(view.ui(ui, &s, false).cmds);
         });
         shot(&mut h, &format!("settings-import-{take}"));
-        // The switch sits in the row its label names.
-        let row = h.get_by_label("Einstellungen übernehmen").rect();
+        // The switch carries the name of its row.
         if !take {
-            h.query_all_by_role(egui::accesskit::Role::CheckBox)
-                .find(|n| (n.rect().center().y - row.center().y).abs() < 16.0)
-                .expect("the import option's switch")
+            h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Einstellungen übernehmen")
                 .click_accesskit();
             h.run();
         }
@@ -644,6 +680,122 @@ fn settings_import_takes_the_settings_unless_switched_off() {
             None => assert!(!take, "the settings were left behind"),
         }
     }
+}
+
+/// Switches and sliders carry the name of their row for a screen reader,
+/// and a focused slider moves with the arrow keys.
+#[test]
+fn switches_and_sliders_are_named_and_keyboard_driven() {
+    let s = state();
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let cmds_out = cmds.clone();
+    let state_in = s.clone();
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        cmds_out
+            .borrow_mut()
+            .extend(view.ui(ui, &state_in, false).cmds);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Klang")
+        .click();
+    h.run();
+    for name in [
+        "Rauschunterdrückung",
+        "Echo-Unterdrückung",
+        "Pegel automatisch",
+        "Selbst gleich laut ankommen",
+        "Andere gleich laut hören",
+        "Stimmoptimierung",
+    ] {
+        h.get_by_role_and_label(egui::accesskit::Role::CheckBox, name);
+    }
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Audio")
+        .click();
+    h.run();
+    let before = s.settings.audio.output_volume;
+    let volume = h.get_by_role_and_label(egui::accesskit::Role::Slider, "Lautstärke");
+    volume.focus();
+    h.run();
+    h.key_press(egui::Key::ArrowRight);
+    h.key_press(egui::Key::ArrowRight);
+    h.run();
+    let after = last_update(&cmds.borrow()).audio.output_volume;
+    assert!(after > before, "volume {before} → {after}");
+    h.key_press(egui::Key::ArrowLeft);
+    h.run();
+    let back = last_update(&cmds.borrow()).audio.output_volume;
+    assert!(back < after && back > before, "one step back: {back}");
+}
+
+/// No way to read keys: the banner says what to do and switches to voice
+/// activation with one click, on the Tastenkürzel page and in the setup.
+#[test]
+fn no_hotkey_backend_offers_voice_activation() {
+    let switch = format!(
+        "{}  Stattdessen automatisch senden",
+        egui_phosphor::regular::WAVEFORM
+    );
+    let mut s = state();
+    s.hotkey_backend = "none".into();
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let (cmds_out, state_in) = (cmds.clone(), s.clone());
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        cmds_out
+            .borrow_mut()
+            .extend(view.ui(ui, &state_in, false).cmds);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Tastenkürzel")
+        .click();
+    h.run();
+    if cfg!(target_os = "linux") {
+        h.get_by_label_contains("sudo usermod -aG input $USER");
+    }
+    h.get_by_role_and_label(egui::accesskit::Role::Button, &switch)
+        .click();
+    h.run();
+    assert_eq!(last_update(&cmds.borrow()).audio.mode, ModeSetting::Vad);
+
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let cmds_out = cmds.clone();
+    s.settings.ui.setup_done = false;
+    let mut view = SetupView::new(&s);
+    let mut h = harness(SETUP, "light", true, move |ui| {
+        cmds_out.borrow_mut().extend(view.ui(ui, &s).cmds);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, &next_label())
+        .click();
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, &switch)
+        .click();
+    h.run();
+    assert_eq!(last_update(&cmds.borrow()).audio.mode, ModeSetting::Vad);
+}
+
+/// The passport's warning names the clipboard, which „Kopieren“ uses.
+#[test]
+fn the_passport_warning_names_the_clipboard() {
+    let s = state();
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        view.ui(ui, &s, false);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Allgemein")
+        .click();
+    h.run();
+    h.get_by_label_contains("Zwischenablage-Verlauf");
 }
 
 /// „Weiter“ in the setup's bottom bar.
