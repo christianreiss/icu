@@ -2024,6 +2024,7 @@ async fn net_task(
         window_visible: !cfg.settings.ui.start_minimized,
         muted_before_deafen: false,
         notifier: crate::notify::Notifier::default(),
+        trial: None,
     };
     local.update_viewing();
     let mut attempt: u32 = 0;
@@ -2090,6 +2091,11 @@ async fn net_task(
         let slowly = matches!(outcome, SessionEnd::RetrySlowly(_));
         match outcome {
             SessionEnd::Quit => break,
+            // An import that failed before it proved itself gives way to
+            // the identity it replaced, which connects again at once.
+            SessionEnd::Fatal(reason) if local.undo_import(&reason, &shared) => {
+                attempt = 0;
+            }
             SessionEnd::Fatal(reason) => {
                 shared
                     .state
@@ -2268,10 +2274,13 @@ fn adopt_issued(
     fail: quinn::VarInt,
     what: &str,
 ) -> Result<(), Problem> {
-    match store_identity(&identity, &local.paths, shared) {
+    match store_identity(&identity, &local.paths, shared, false) {
         Ok(()) => {
             connection.close(ok, b"");
             local.adopt(identity, shared);
+            // Issued by the server and on disk: whatever import led here
+            // has proven itself.
+            local.trial = None;
             Ok(())
         }
         Err(e) => {
@@ -2284,17 +2293,24 @@ fn adopt_issued(
 /// Writes `identity` to disk before the engine takes it into use — unless
 /// the engine is shutting down: a logout deletes `identity/` as soon as
 /// `Engine::shutdown` returns, and a write after that would bring it back.
+/// `keep_previous` keeps the set it replaces for an import on trial
+/// (`Identity::save_keeping_previous`, [`ImportTrial`]).
 fn store_identity(
     identity: &Identity,
     paths: &Paths,
     shared: &Shared,
+    keep_previous: bool,
 ) -> Result<(), crate::config::ConfigError> {
     if shared.closing.load(Ordering::SeqCst) {
         return Err(crate::config::ConfigError::Io(std::io::Error::other(
             "the engine is shutting down",
         )));
     }
-    identity.save(paths)
+    if keep_previous {
+        identity.save_keeping_previous(paths)
+    } else {
+        identity.save(paths)
+    }
 }
 
 /// Deliberate reconnect with new credentials; not a failure.
@@ -2332,6 +2348,29 @@ struct LocalState {
     muted_before_deafen: bool,
     /// Join/leave notifications (`UiSettings::notify_join`).
     notifier: crate::notify::Notifier,
+    /// An imported identity that has yet to prove itself, and what to go
+    /// back to if it cannot.
+    trial: Option<ImportTrial>,
+}
+
+/// The identity in force before an import, kept until the imported one
+/// proved itself — a passport by its first `Welcome`, a registration bundle
+/// by the identity its registration stored (`adopt_issued`). An import that
+/// ends fatally before that gives way to it again: an old invitation or a
+/// revoked passport must not cost the identity that worked (review
+/// 2026-09-27, C-2). A second import first puts the previous one back, so
+/// the fallback is always the last identity that worked.
+enum ImportTrial {
+    /// A passport, saved with the set it replaced kept in `identity.old/`.
+    Passport {
+        previous: Identity,
+        /// The settings it replaced, if it brought any.
+        settings: Option<Box<Settings>>,
+    },
+    /// A registration bundle, not written at all: registering stores the
+    /// identity it earns, and until then `identity/` holds `previous`, as
+    /// in the first-start window.
+    Registration { previous: Identity },
 }
 
 /// A renewal in flight: which name it asks for, and why it was sent.
@@ -2754,14 +2793,26 @@ impl LocalState {
     /// certificate's first login retired it. A failed write keeps the
     /// identity in force and says so, and leaves the settings alone too.
     /// Settings that came with it replace this machine's portable ones
-    /// (`Settings::take_portable`). Returns whether it was taken over.
+    /// (`Settings::take_portable`). The identity it replaces stays until the
+    /// new one proved itself ([`ImportTrial`]). A registration bundle is not
+    /// stored at all: it is only a way to the identity its registration
+    /// stores, and brings no settings. Returns whether it was taken over.
     fn replace_identity(
         &mut self,
         identity: Identity,
         settings: Option<Settings>,
         shared: &Arc<Shared>,
     ) -> bool {
-        if let Err(e) = store_identity(&identity, &self.paths, shared) {
+        if !self.abandon_trial(shared) {
+            return false;
+        }
+        let previous = self.identity.clone();
+        if identity.is_registration() {
+            self.adopt(identity, shared);
+            self.trial = Some(ImportTrial::Registration { previous });
+            return true;
+        }
+        if let Err(e) = store_identity(&identity, &self.paths, shared, true) {
             tracing::warn!(error = %e, "cannot store the imported identity, keeping the old one");
             shared.state.send_modify(|s| {
                 s.banner = Some(crate::problem::storage("Der Passport", &e));
@@ -2769,13 +2820,94 @@ impl LocalState {
             return false;
         }
         self.adopt(identity, shared);
-        if let Some(incoming) = settings {
-            let mut taken = self.settings.clone();
+        let replaced = settings.map(|incoming| {
+            let before = self.settings.clone();
+            let mut taken = before.clone();
             taken.take_portable(incoming);
             // A `SetState` for a changed overlay switch is moot: the callers
             // reconnect, and the new `Hello` carries the flags.
             self.replace_settings(taken, shared);
             tracing::info!("settings taken over from the passport");
+            Box::new(before)
+        });
+        self.trial = Some(ImportTrial::Passport {
+            previous,
+            settings: replaced,
+        });
+        true
+    }
+
+    /// The first `Welcome` with an imported passport: it works, the set it
+    /// replaced can go. A registration bundle proves itself later, by what
+    /// its registration stores (`adopt_issued`).
+    fn welcomed(&mut self) {
+        if matches!(self.trial, Some(ImportTrial::Passport { .. })) {
+            self.trial = None;
+            if let Err(e) = Identity::drop_previous(&self.paths) {
+                tracing::warn!(error = %e, "cannot remove identity.old/");
+            }
+        }
+    }
+
+    /// An import on trial ended fatally, `why`: puts the identity it
+    /// replaced back — on disk, in force and with its settings — and says
+    /// so. Returns whether it is back; when it cannot be written back, the
+    /// fatal end stands (reconnecting would only fail the same way).
+    fn undo_import(&mut self, why: &Problem, shared: &Arc<Shared>) -> bool {
+        let Some(trial) = self.trial.take() else {
+            return false;
+        };
+        let what = match &trial {
+            ImportTrial::Passport { .. } => "Der eingespielte Passport",
+            ImportTrial::Registration { .. } => "Die eingespielte Einladung",
+        };
+        tracing::warn!(problem = %why.full(), "import failed, back to the previous identity");
+        if !self.restore(trial, shared) {
+            return false;
+        }
+        let text = format!(
+            "{what} ließ sich nicht verwenden: {} Die bisherigen Zugangsdaten gelten weiter.",
+            why.text
+        );
+        let problem = match &why.technical {
+            Some(t) => Problem::new(text, t.clone()),
+            None => Problem::plain(text),
+        };
+        shared.state.send_modify(|s| s.banner = Some(problem));
+        true
+    }
+
+    /// Before a second import: puts the identity the first one replaced
+    /// back, so the new trial keeps the last identity that worked. `false`
+    /// when that cannot be written back — the import is refused then, or
+    /// the kept set would be overwritten with an untested one.
+    fn abandon_trial(&mut self, shared: &Arc<Shared>) -> bool {
+        match self.trial.take() {
+            None => true,
+            Some(trial) => self.restore(trial, shared),
+        }
+    }
+
+    /// Takes the identity `trial` replaced back into use. Returns `false`
+    /// when a passport's kept set could not be put back on disk; the trial
+    /// then stays, and the window says so.
+    fn restore(&mut self, trial: ImportTrial, shared: &Arc<Shared>) -> bool {
+        match trial {
+            ImportTrial::Registration { previous } => self.adopt(previous, shared),
+            ImportTrial::Passport { previous, settings } => {
+                if let Err(e) = Identity::restore_previous(&self.paths) {
+                    tracing::warn!(error = %e, "cannot put the previous identity back");
+                    shared.state.send_modify(|s| {
+                        s.banner = Some(crate::problem::storage("Die bisherige Identität", &e));
+                    });
+                    self.trial = Some(ImportTrial::Passport { previous, settings });
+                    return false;
+                }
+                self.adopt(previous, shared);
+                if let Some(settings) = settings {
+                    self.replace_settings(*settings, shared);
+                }
+            }
         }
         true
     }
@@ -2843,7 +2975,7 @@ impl LocalState {
         // (`PROTOCOL.md` §2.2 Nr. 10), so reconnecting with a leaf that is
         // not on disk would leave the next start with a revoked certificate.
         // The old one stays valid until then; the next renewal tries again.
-        if let Err(e) = store_identity(&renewed, &self.paths, shared) {
+        if let Err(e) = store_identity(&renewed, &self.paths, shared, false) {
             tracing::warn!(error = %e, "cannot store the renewed certificate, keeping the old one");
             shared.state.send_modify(|s| {
                 s.banner = Some(crate::problem::storage("Das neue Zertifikat", &e));
@@ -2948,6 +3080,9 @@ async fn run_session(
         mut recv,
         welcome,
     } = session;
+    if !welcome.registration {
+        local.welcomed();
+    }
 
     // A registration bundle imported into a running client: swap it for a
     // certificate of our own under the placeholder name, which the user can

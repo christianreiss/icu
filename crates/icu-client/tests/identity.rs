@@ -183,6 +183,109 @@ async fn replacing_the_identity_reconnects_as_the_other_user() {
         wait_until(SOON, || leaf_cn(&paths) == "bob").await,
         "the imported identity is on disk"
     );
+    assert!(
+        wait_until(SOON, || !paths
+            .identity_dir()
+            .with_extension("old")
+            .exists())
+        .await,
+        "after its first Welcome the replaced set goes"
+    );
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// A passport that ends fatally before its first `Welcome` — here revoked —
+/// does not cost the identity that worked: it is put back on disk and in
+/// force, with its settings, and connects again; the window says why
+/// (review 2026-09-27, C-2).
+#[tokio::test]
+async fn a_failing_passport_import_gives_way_to_the_identity_that_worked() {
+    let server = TestServer::start().await;
+    // Alice first: the first user is the admin, and the last admin cannot
+    // be revoked.
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+    let (bob, _bob_paths, _bob_dir) = server.enroll("bob").await;
+    let revoked = server
+        .handle
+        .admin(icu_server::AdminRequest::Revoke { user: "bob".into() })
+        .await;
+    assert!(
+        matches!(revoked, icu_server::AdminResponse::Revoke { .. }),
+        "{revoked:?}"
+    );
+
+    let mut settings = Settings::default();
+    settings.audio.mode = ModeSetting::Ptt;
+    engine.command(Command::ReplaceIdentity(
+        Box::new(bob),
+        Some(Box::new(settings)),
+    ));
+    let state = wait_for(&engine, SOON, |s| {
+        s.banner
+            .as_ref()
+            .is_some_and(|b| b.text.contains("Passport ließ sich nicht verwenden"))
+    })
+    .await;
+    assert!(
+        !matches!(state.conn, icu_client::engine::ConnStatus::Fatal(_)),
+        "{:?}",
+        state.conn
+    );
+    let state = wait_for(&engine, SOON, |s| {
+        s.me.as_ref().map(|m| m.name.as_str()) == Some("alice")
+            && matches!(s.conn, icu_client::engine::ConnStatus::Connected)
+    })
+    .await;
+    assert_eq!(state.settings.audio.mode, ModeSetting::Vad, "settings back");
+    assert_eq!(leaf_cn(&paths), "alice");
+    assert!(!paths.identity_dir().with_extension("old").exists());
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// An invitation that was already redeemed, imported into a running
+/// client, is never written over the identity in force: the server refuses
+/// it, and the old identity reconnects (review 2026-09-27, C-2).
+#[tokio::test]
+async fn a_spent_invitation_import_gives_way_to_the_identity_that_worked() {
+    use icu_client::net::register::register;
+    let server = TestServer::start().await;
+    let bundle = Identity::from_passport(&server.invite_bundle("carol").await).unwrap();
+    let spent = tempfile::tempdir().unwrap();
+    register(
+        &bundle,
+        "carol",
+        "icu-test/0.1.0 linux",
+        Some(server.addr()),
+        &Paths::new(Some(spent.path().to_path_buf())),
+    )
+    .await
+    .expect("first redemption");
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+
+    engine.command(Command::ReplaceIdentity(Box::new(bundle), None));
+    wait_for(&engine, SOON, |s| {
+        s.banner
+            .as_ref()
+            .is_some_and(|b| b.text.contains("Einladung ließ sich nicht verwenden"))
+    })
+    .await;
+    wait_for(&engine, SOON, |s| {
+        s.me.as_ref().map(|m| m.name.as_str()) == Some("alice")
+            && matches!(s.conn, icu_client::engine::ConnStatus::Connected)
+    })
+    .await;
+    assert_eq!(leaf_cn(&paths), "alice");
+    assert!(!Identity::load(&paths).unwrap().unwrap().is_registration());
 
     engine.shutdown();
     server.handle.shutdown().await;

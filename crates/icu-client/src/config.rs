@@ -825,6 +825,59 @@ impl Identity {
     /// non-empty one everywhere); after a crash between them `load` reads
     /// `identity.old/`, which stays until the new set is in place.
     pub fn save(&self, paths: &Paths) -> Result<(), ConfigError> {
+        self.save_set(paths, false)
+    }
+
+    /// [`Identity::save`] for an imported identity that has yet to prove
+    /// itself: the set it replaces stays in `identity.old/` until
+    /// [`Identity::restore_previous`] puts it back or
+    /// [`Identity::drop_previous`] lets it go (review 2026-09-27, C-2).
+    /// `load` prefers `identity/`, so the kept set changes nothing until
+    /// then; the next plain `save` or a logout removes it.
+    pub fn save_keeping_previous(&self, paths: &Paths) -> Result<(), ConfigError> {
+        self.save_set(paths, true)
+    }
+
+    /// Puts the set [`Identity::save_keeping_previous`] kept back in place of
+    /// the one saved over it, which is deleted. Two renames like `save`:
+    /// after a crash between them `load` reads the kept set.
+    pub fn restore_previous(paths: &Paths) -> Result<(), ConfigError> {
+        let _files = crate::sync::lock(&IDENTITY_FILES);
+        let dir = paths.identity_dir();
+        let previous = dir.with_extension("old");
+        let failed = dir.with_extension("new");
+        if !previous.join("server.toml").exists() {
+            return Err(ConfigError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no previous identity kept",
+            )));
+        }
+        remove_dir_if_present(&failed)?;
+        if dir.exists() {
+            fs::rename(&dir, &failed)?;
+        }
+        fs::rename(&previous, &dir)?;
+        #[cfg(unix)]
+        if let Ok(parent) = fs::File::open(&paths.config_dir) {
+            let _ = parent.sync_all();
+        }
+        let _ = remove_dir_if_present(&failed);
+        Ok(())
+    }
+
+    /// Lets the set [`Identity::save_keeping_previous`] kept go, once the one
+    /// in `identity/` proved itself. Never while `identity/` is incomplete:
+    /// then `identity.old/` is the set `load` reads.
+    pub fn drop_previous(paths: &Paths) -> Result<(), ConfigError> {
+        let _files = crate::sync::lock(&IDENTITY_FILES);
+        let dir = paths.identity_dir();
+        if !dir.join("server.toml").exists() {
+            return Ok(());
+        }
+        remove_dir_if_present(&dir.with_extension("old"))
+    }
+
+    fn save_set(&self, paths: &Paths, keep_previous: bool) -> Result<(), ConfigError> {
         let _files = crate::sync::lock(&IDENTITY_FILES);
         let dir = paths.identity_dir();
         let fresh = dir.with_extension("new");
@@ -859,7 +912,9 @@ impl Identity {
         if let Ok(parent) = fs::File::open(&paths.config_dir) {
             let _ = parent.sync_all();
         }
-        let _ = remove_dir_if_present(&previous);
+        if !keep_previous {
+            let _ = remove_dir_if_present(&previous);
+        }
         Ok(())
     }
 
@@ -1639,6 +1694,47 @@ mod tests {
 
     /// Logging out takes the saved invitations with it: each one is a live
     /// registration key.
+    /// An import that has yet to prove itself keeps the set it replaced:
+    /// restored, the old identity is back in force; dropped, the new one
+    /// stays alone (review 2026-09-27, C-2).
+    #[test]
+    fn an_import_on_trial_keeps_the_previous_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf()));
+        let identity = |cn: &str| {
+            let (leaf, ca, key) = issued_as(
+                Some("icu://icu.example.org:4711"),
+                "ICU CA icu.example.org",
+                cn,
+                |_| {},
+            );
+            Identity::from_passport(&passport(key, leaf, ca, "")).unwrap()
+        };
+        let (alice, bob) = (identity("alice"), identity("bob"));
+        let previous = paths.identity_dir().with_extension("old");
+        assert!(Identity::restore_previous(&paths).is_err(), "nothing kept");
+
+        alice.save(&paths).unwrap();
+        bob.save_keeping_previous(&paths).unwrap();
+        assert_eq!(Identity::load(&paths).unwrap().unwrap(), bob);
+        assert!(previous.join("server.toml").exists());
+        Identity::restore_previous(&paths).unwrap();
+        assert_eq!(Identity::load(&paths).unwrap().unwrap(), alice);
+        assert!(!previous.exists());
+        assert!(!paths.identity_dir().with_extension("new").exists());
+
+        bob.save_keeping_previous(&paths).unwrap();
+        Identity::drop_previous(&paths).unwrap();
+        assert!(!previous.exists());
+        assert_eq!(Identity::load(&paths).unwrap().unwrap(), bob);
+        assert!(Identity::restore_previous(&paths).is_err());
+        assert_eq!(Identity::load(&paths).unwrap().unwrap(), bob);
+
+        // A plain save does not keep it.
+        alice.save(&paths).unwrap();
+        assert!(!previous.exists());
+    }
+
     #[test]
     fn logging_out_deletes_saved_invitations() {
         let dir = tempfile::tempdir().unwrap();
