@@ -5,6 +5,8 @@
 mod chord;
 #[cfg(target_os = "linux")]
 pub mod evdev;
+#[cfg(any(windows, test))]
+mod held;
 pub mod keys;
 #[cfg(target_os = "linux")]
 pub mod portal;
