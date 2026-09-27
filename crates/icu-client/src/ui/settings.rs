@@ -424,7 +424,7 @@ impl SettingsView {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Erweitert").size(13.0));
                         widgets::rtl(ui, 24.0, |ui| {
-                            widgets::toggle(ui, &mut self.draft.ui.show_advanced)
+                            widgets::named_toggle(ui, &mut self.draft.ui.show_advanced, "Erweitert")
                                 .on_hover_text("Erweiterte Einstellungen anzeigen")
                         });
                     });
@@ -597,7 +597,7 @@ impl SettingsView {
                         true,
                         "Schwelle automatisch",
                         Some("Passt sich laufend an deine Umgebung an. Braucht die Rauschunterdrückung."),
-                        |ui| widgets::toggle(ui, &mut self.draft.audio.vad_auto),
+                        |ui| widgets::named_toggle(ui, &mut self.draft.audio.vad_auto, "Schwelle automatisch"),
                     )
                 });
                 if !self.draft.audio.vad_auto {
@@ -705,7 +705,9 @@ impl SettingsView {
                 false,
                 "Rauschunterdrückung",
                 Some("Filtert Tastatur, Lüfter und Hintergrundgeräusche heraus."),
-                |ui| widgets::toggle(ui, &mut self.draft.audio.denoise),
+                |ui| {
+                    widgets::named_toggle(ui, &mut self.draft.audio.denoise, "Rauschunterdrückung")
+                },
             );
             ui.add_enabled_ui(state.aec_available, |ui| {
                 widgets::setting_row(
@@ -717,7 +719,7 @@ impl SettingsView {
                     } else {
                         "Auf dieser Installation nicht verfügbar."
                     }),
-                    |ui| widgets::toggle(ui, &mut self.draft.audio.aec),
+                    |ui| widgets::named_toggle(ui, &mut self.draft.audio.aec, "Echo-Unterdrückung"),
                 )
             });
             let tok = theme::tokens(ui.visuals());
@@ -780,7 +782,13 @@ impl SettingsView {
                     true,
                     "Pegel automatisch",
                     Some("Regelt dein Mikrofon nach, wenn du zu leise oder zu laut bist."),
-                    |ui| widgets::toggle(ui, &mut self.draft.audio.auto_level),
+                    |ui| {
+                        widgets::named_toggle(
+                            ui,
+                            &mut self.draft.audio.auto_level,
+                            "Pegel automatisch",
+                        )
+                    },
                 )
             });
             widgets::setting_row(
@@ -788,21 +796,33 @@ impl SettingsView {
                 true,
                 "Selbst gleich laut ankommen",
                 Some("Du kommst bei den anderen immer ähnlich laut an."),
-                |ui| widgets::toggle(ui, &mut self.draft.audio.normalize_outgoing),
+                |ui| {
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.audio.normalize_outgoing,
+                        "Selbst gleich laut ankommen",
+                    )
+                },
             );
             widgets::setting_row(
                 ui,
                 true,
                 "Andere gleich laut hören",
                 Some("Bringt alle auf eine ähnliche Lautstärke, leise wie laute."),
-                |ui| widgets::toggle(ui, &mut self.draft.audio.normalize_incoming),
+                |ui| {
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.audio.normalize_incoming,
+                        "Andere gleich laut hören",
+                    )
+                },
             );
             widgets::setting_row(
                 ui,
                 true,
                 "Stimmoptimierung",
                 Some("Gleicht leise und laute Stellen aus, damit du gleichmäßig klingst."),
-                |ui| widgets::toggle(ui, &mut self.draft.audio.voice_opt),
+                |ui| widgets::named_toggle(ui, &mut self.draft.audio.voice_opt, "Stimmoptimierung"),
             );
             if self.draft.audio.voice_opt {
                 widgets::setting_row(ui, true, "Stärke", None, |ui| {
@@ -993,7 +1013,9 @@ impl SettingsView {
                 true,
                 "Einstellungen übernehmen",
                 Some(SETTINGS_HELP),
-                |ui| widgets::toggle(ui, &mut self.import_settings),
+                |ui| {
+                    widgets::named_toggle(ui, &mut self.import_settings, "Einstellungen übernehmen")
+                },
             );
         }
         let replaces = if carries_settings && self.import_settings {
@@ -1253,7 +1275,13 @@ impl SettingsView {
                         cfg!(feature = "camera"),
                         "Beim Start einschalten",
                         None,
-                        |ui| widgets::toggle(ui, &mut self.draft.camera.enabled),
+                        |ui| {
+                            widgets::named_toggle(
+                                ui,
+                                &mut self.draft.camera.enabled,
+                                "Beim Start einschalten",
+                            )
+                        },
                     );
                 });
                 #[cfg(feature = "camera")]
@@ -1314,7 +1342,7 @@ impl SettingsView {
                 false,
                 "Anzeigen",
                 Some("Zeigt über allen Fenstern die Kameras der anderen, mit Namen."),
-                |ui| widgets::toggle(ui, &mut self.draft.overlay.enabled),
+                |ui| widgets::named_toggle(ui, &mut self.draft.overlay.enabled, "Anzeigen"),
             );
             ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {
                 widgets::setting_row(ui, true, "Position", None, |ui| {
@@ -1334,7 +1362,11 @@ impl SettingsView {
                     )
                 });
                 widgets::setting_row(ui, true, "Wer ohne Kamera spricht", None, |ui| {
-                    widgets::toggle(ui, &mut self.draft.overlay.voice_plates)
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.overlay.voice_plates,
+                        "Wer ohne Kamera spricht",
+                    )
                 })
                 .on_hover_text("Solange jemand ohne Kamera spricht, steht der Name im Overlay");
                 if !adv {
@@ -1342,7 +1374,11 @@ impl SettingsView {
                 }
                 widgets::advanced_caption(ui);
                 widgets::setting_row(ui, false, "Sprechende Person umranden", None, |ui| {
-                    widgets::toggle(ui, &mut self.draft.overlay.speaking_frame)
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.overlay.speaking_frame,
+                        "Sprechende Person umranden",
+                    )
                 });
                 let edge = matches!(self.draft.overlay.corner, Corner::Top | Corner::Bottom);
                 widgets::setting_row(ui, true, "Anordnung", None, |ui| {
@@ -1374,7 +1410,11 @@ impl SettingsView {
                     });
                 });
                 widgets::setting_row(ui, true, "Stille Personen abdunkeln", None, |ui| {
-                    widgets::toggle(ui, &mut self.draft.overlay.dim_non_speaking)
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.overlay.dim_non_speaking,
+                        "Stille Personen abdunkeln",
+                    )
                 });
                 widgets::setting_row(ui, true, "Rahmenfarbe", None, |ui| {
                     ui.add_enabled_ui(self.draft.overlay.speaking_frame, |ui| {
@@ -1468,7 +1508,13 @@ impl SettingsView {
                     Some(
                         "Ein Doppelklick auf eine Einladung oder einen Passport (.icu) öffnet ICU.",
                     ),
-                    |ui| widgets::toggle(ui, &mut self.draft.ui.register_uri_handler),
+                    |ui| {
+                        widgets::named_toggle(
+                            ui,
+                            &mut self.draft.ui.register_uri_handler,
+                            "Einladungen mit ICU öffnen",
+                        )
+                    },
                 );
                 ui.separator();
             }
@@ -1525,7 +1571,13 @@ impl SettingsView {
                 true,
                 "Minimiert starten",
                 Some("ICU startet im Infobereich, wo es keinen gibt, minimiert in der Taskleiste."),
-                |ui| widgets::toggle(ui, &mut self.draft.ui.start_minimized),
+                |ui| {
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.ui.start_minimized,
+                        "Minimiert starten",
+                    )
+                },
             );
         });
 
