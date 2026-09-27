@@ -380,7 +380,8 @@ Server einander nie eine Änderung überschreiben.
 die CRL und wirkt ohne Neustart für jede neue Verbindung. Clients brauchen
 nichts. **Der Server rotiert selbst**, sobald sein Leaf weniger als 30 Tage
 (höchstens ein Drittel von `server_validity_days`) Restlaufzeit hat, geprüft
-beim Start und stündlich. Ein abgelaufenes oder widerrufenes Server-Leaf ist
+beim Start und stündlich — ebenso, wenn es noch nicht gilt, weil die Uhr beim
+Ausstellen vorlief. Ein abgelaufenes oder widerrufenes Server-Leaf ist
 für die Clients kein fataler Fehler: sie versuchen es weiter und verbinden
 sich, sobald das neue Leaf da ist.
 

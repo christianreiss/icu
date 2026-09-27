@@ -716,6 +716,13 @@ pub fn leaf_days_left_checked(der: &[u8]) -> Option<i64> {
     leaf_validity(der).map(|(_, not_after)| (not_after - store::now()).whole_days())
 }
 
+/// Whether a certificate is not valid yet: its notBefore lies ahead. Only a
+/// clock that ran ahead when it was issued does that; the CA backdates every
+/// certificate by an hour.
+pub fn leaf_not_yet_valid(der: &[u8]) -> bool {
+    leaf_validity(der).is_some_and(|(not_before, _)| not_before > store::now())
+}
+
 /// [`leaf_days_left_checked`] for reporting: `i64::MAX` when it does not
 /// parse, so monitoring does not alarm on a number that means nothing.
 pub fn leaf_days_left(der: &[u8]) -> i64 {
