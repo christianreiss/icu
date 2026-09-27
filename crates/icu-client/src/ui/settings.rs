@@ -1131,20 +1131,31 @@ impl SettingsView {
             |_| {},
         );
         let backend = state.hotkey_backend.as_str();
-        hotkey_notice(ui, backend, &mut self.draft.hotkeys.backend, cmds);
+        hotkey_notice(
+            ui,
+            backend,
+            &mut self.draft.hotkeys.backend,
+            &mut self.draft.audio.mode,
+            cmds,
+        );
 
         let portal = backend == "portal";
         let capture = self.poll_capture(ui);
         widgets::group_card(ui, "Belegung", |ui| {
             let hotkeys = &mut self.draft.hotkeys;
-            let rows: [(&'static str, &mut crate::config::KeyBinding); 5] = [
-                ("Push-to-Talk", &mut hotkeys.ptt),
-                ("Stummschalten", &mut hotkeys.mute),
-                ("Ton aus", &mut hotkeys.deafen),
-                ("Modus wechseln", &mut hotkeys.toggle_mode),
-                ("Kamera", &mut hotkeys.camera),
+            use crate::hotkey::Action;
+            let rows: [(&'static str, Action, &mut crate::config::KeyBinding); 5] = [
+                ("Push-to-Talk", Action::Ptt, &mut hotkeys.ptt),
+                ("Stummschalten", Action::Mute, &mut hotkeys.mute),
+                ("Ton aus", Action::Deafen, &mut hotkeys.deafen),
+                (
+                    "Modus wechseln",
+                    Action::ToggleMode,
+                    &mut hotkeys.toggle_mode,
+                ),
+                ("Kamera", Action::Camera, &mut hotkeys.camera),
             ];
-            for (i, (label, binding)) in rows.into_iter().enumerate() {
+            for (i, (label, key_action, binding)) in rows.into_iter().enumerate() {
                 let capturing = self.capture.as_ref().is_some_and(|c| c.label == label);
                 if capturing {
                     if let Some(Ok(result)) = &capture {
@@ -1155,6 +1166,7 @@ impl SettingsView {
                     ui,
                     i > 0,
                     label,
+                    key_action,
                     binding,
                     portal,
                     capturing,
@@ -2444,15 +2456,17 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
 
 /// What the Tastenkürzel page and the setup say while the hotkeys do not
 /// work: still being set up, never started, the portal's dialog turned down
-/// (with the two ways on), or no way to read keys at all. Nothing while they
-/// work. `backend` is what `crate::hotkey` reports — "starting", "portal",
-/// "evdev (n devices)", "portal-declined" or "none"; the empty string means
-/// it was never started (`--no-hotkeys`). `choice` is the draft's backend
-/// setting.
+/// (with the two ways on), or no way to read keys at all (with what to do,
+/// and the way around it). Nothing while they work. `backend` is what
+/// `crate::hotkey` reports — "starting", "portal", "evdev (n devices)",
+/// "portal-declined" or "none"; the empty string means it was never started
+/// (`--no-hotkeys`). `choice` is the draft's backend setting, `mode` its
+/// sending mode.
 pub(super) fn hotkey_notice(
     ui: &mut Ui,
     backend: &str,
     choice: &mut HotkeyBackend,
+    mode: &mut ModeSetting,
     cmds: &mut Vec<Command>,
 ) {
     match backend {
@@ -2525,7 +2539,10 @@ pub(super) fn hotkey_notice(
                 "Tastenkürzel funktionieren gerade nicht",
                 if cfg!(target_os = "linux") {
                     "Das System bietet keinen Weg an, Tasten im Hintergrund zu lesen, und ICU \
-                     darf sie nicht selbst lesen (Gruppe input). Bedienen geht weiter über das \
+                     darf sie nicht selbst lesen. Abhilfe: im Terminal\n\
+                     sudo usermod -aG input $USER\n\
+                     eingeben, dann ab- und wieder anmelden (ICU kann dann jede Taste \
+                     mitlesen). Oder ohne Taste senden; bedienen geht auch über das \
                      Hauptfenster."
                 } else {
                     "ICU kann Tastatur und Maus gerade nicht lesen, oder es ist keine Taste \
@@ -2533,6 +2550,20 @@ pub(super) fn hotkey_notice(
                 },
                 None::<fn()>,
             );
+            if *mode == ModeSetting::Ptt {
+                ui.add_space(6.0);
+                if widgets::button(
+                    ui,
+                    widgets::ButtonKind::Primary,
+                    icon::WAVEFORM,
+                    "Stattdessen automatisch senden",
+                )
+                .on_hover_text("Sprachaktivierung: du bist zu hören, sobald du sprichst")
+                .clicked()
+                {
+                    *mode = ModeSetting::Vad;
+                }
+            }
             ui.add_space(12.0);
         }
         _ => {}
@@ -2906,6 +2937,7 @@ pub(super) fn binding_row(
     ui: &mut Ui,
     divider: bool,
     label: &'static str,
+    shortcut: crate::hotkey::Action,
     binding: &mut crate::config::KeyBinding,
     portal: bool,
     capturing: bool,
@@ -2921,10 +2953,16 @@ pub(super) fn binding_row(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 widgets::label_column(ui, BINDING_LABEL_W, 30.0, label);
+                // Through the portal, the key the desktop assigned: the
+                // dialog may have taken another than the one proposed.
+                let assigned = portal
+                    .then(|| crate::hotkey::portal_trigger(shortcut))
+                    .flatten();
                 let shown = match (
                     portal || (cfg!(windows) && binding.key.trim().is_empty()),
                     binding.trigger.as_deref(),
                 ) {
+                    (true, _) if assigned.is_some() => assigned.unwrap_or_default(),
                     (true, Some(t)) => t.to_string(),
                     _ if binding.key.is_empty() => "—".to_string(),
                     _ => binding

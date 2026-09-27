@@ -414,7 +414,13 @@ impl SetupView {
     /// arrives.
     fn key_card(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         let backend = state.hotkey_backend.as_str();
-        hotkey_notice(ui, backend, &mut self.draft.hotkeys.backend, cmds);
+        hotkey_notice(
+            ui,
+            backend,
+            &mut self.draft.hotkeys.backend,
+            &mut self.draft.audio.mode,
+            cmds,
+        );
         if cfg!(target_os = "linux") && self.draft.hotkeys.backend == HotkeyBackend::Evdev {
             evdev_notice(ui);
             ui.add_space(12.0);
@@ -446,6 +452,7 @@ impl SetupView {
                 ui,
                 false,
                 PTT_LABEL,
+                crate::hotkey::Action::Ptt,
                 binding,
                 portal,
                 capturing,

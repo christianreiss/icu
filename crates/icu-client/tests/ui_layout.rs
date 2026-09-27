@@ -730,6 +730,55 @@ fn switches_and_sliders_are_named_and_keyboard_driven() {
     assert!(back < after && back > before, "one step back: {back}");
 }
 
+/// No way to read keys: the banner says what to do and switches to voice
+/// activation with one click, on the Tastenkürzel page and in the setup.
+#[test]
+fn no_hotkey_backend_offers_voice_activation() {
+    let switch = format!(
+        "{}  Stattdessen automatisch senden",
+        egui_phosphor::regular::WAVEFORM
+    );
+    let mut s = state();
+    s.hotkey_backend = "none".into();
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let (cmds_out, state_in) = (cmds.clone(), s.clone());
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        cmds_out
+            .borrow_mut()
+            .extend(view.ui(ui, &state_in, false).cmds);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Tastenkürzel")
+        .click();
+    h.run();
+    if cfg!(target_os = "linux") {
+        h.get_by_label_contains("sudo usermod -aG input $USER");
+    }
+    h.get_by_role_and_label(egui::accesskit::Role::Button, &switch)
+        .click();
+    h.run();
+    assert_eq!(last_update(&cmds.borrow()).audio.mode, ModeSetting::Vad);
+
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let cmds_out = cmds.clone();
+    s.settings.ui.setup_done = false;
+    let mut view = SetupView::new(&s);
+    let mut h = harness(SETUP, "light", true, move |ui| {
+        cmds_out.borrow_mut().extend(view.ui(ui, &s).cmds);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, &next_label())
+        .click();
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, &switch)
+        .click();
+    h.run();
+    assert_eq!(last_update(&cmds.borrow()).audio.mode, ModeSetting::Vad);
+}
+
 /// „Weiter“ in the setup's bottom bar.
 fn next_label() -> String {
     format!("Weiter  {}", egui_phosphor::regular::ARROW_RIGHT)

@@ -151,6 +151,47 @@ pub async fn capture_next_key(timeout: Duration) -> Result<String, String> {
 /// an answer. The empty string stays for „never started“ (`--no-hotkeys`).
 pub const BACKEND_STARTING: &str = "starting";
 
+/// What the desktop assigned in the running portal session, by portal id,
+/// in its own words (`trigger_description`, e.g. KDE's
+/// „Strg+Umschalt+F12“), tagged with the session that bound it. The dialog
+/// lets the user pick another key than the one ICU proposed, so this — not
+/// the proposal in the settings — is the key that works. Empty while no
+/// portal session runs.
+static PORTAL_TRIGGERS: std::sync::Mutex<(u64, Vec<(String, String)>)> =
+    std::sync::Mutex::new((0, Vec::new()));
+
+/// The key the desktop assigned to `action` in the running portal session;
+/// `None` without one, or when the desktop named no key. The windows show
+/// it instead of the proposed trigger (`ui::ptt_key_label`).
+pub fn portal_trigger(action: Action) -> Option<String> {
+    let bound = PORTAL_TRIGGERS.lock().unwrap_or_else(|e| e.into_inner());
+    bound
+        .1
+        .iter()
+        .find(|(id, desc)| id == action.portal_id() && !desc.trim().is_empty())
+        .map(|(_, desc)| desc.clone())
+}
+
+/// Records what a new portal session bound; returns the session's tag for
+/// [`portal_unbound`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn portal_bound(triggers: Vec<(String, String)>) -> u64 {
+    let mut bound = PORTAL_TRIGGERS.lock().unwrap_or_else(|e| e.into_inner());
+    bound.0 += 1;
+    bound.1 = triggers;
+    bound.0
+}
+
+/// Forgets what session `tag` bound — unless a newer one replaced it
+/// meanwhile: the old session's task ends after the next one has bound.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn portal_unbound(tag: u64) {
+    let mut bound = PORTAL_TRIGGERS.lock().unwrap_or_else(|e| e.into_inner());
+    if bound.0 == tag {
+        bound.1.clear();
+    }
+}
+
 /// A running hotkey backend.
 pub struct Hotkeys {
     /// Human readable backend description for the settings view:
@@ -391,6 +432,29 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use super::*;
+
+    /// The key the desktop assigned is what the windows show while its
+    /// session runs; a session that ended after the next one bound does not
+    /// take the newer keys with it. The only test touching the registry,
+    /// and without push-to-talk, whose label other tests read.
+    #[test]
+    fn the_portal_assigned_key_lasts_as_long_as_its_session() {
+        let first = portal_bound(vec![
+            ("camera".into(), "Strg+Umschalt+K".into()),
+            ("mute".into(), " ".into()),
+        ]);
+        assert_eq!(
+            portal_trigger(Action::Camera).as_deref(),
+            Some("Strg+Umschalt+K")
+        );
+        assert_eq!(portal_trigger(Action::Mute), None, "no key named");
+        assert_eq!(portal_trigger(Action::Deafen), None, "not bound");
+        let second = portal_bound(vec![("camera".into(), "Pause".into())]);
+        portal_unbound(first);
+        assert_eq!(portal_trigger(Action::Camera).as_deref(), Some("Pause"));
+        portal_unbound(second);
+        assert_eq!(portal_trigger(Action::Camera), None);
+    }
 
     /// What the fake backends did, in order.
     type Log = Arc<Mutex<Vec<String>>>;

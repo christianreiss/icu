@@ -19,10 +19,16 @@ use crate::{
 pub use main_window::Exit;
 
 /// The push-to-talk binding as a person would say it: `KEY_RIGHTCTRL`
-/// becomes `RIGHTCTRL`, and the Portal backend shows its own trigger
-/// (`CTRL+SHIFT+F12`) because that is what it actually bound.
+/// becomes `RIGHTCTRL`. Through the Portal it is the key the desktop
+/// assigned (its dialog may take another than the one proposed), else the
+/// proposed trigger (`CTRL+SHIFT+F12`).
 pub(crate) fn ptt_key_label(hotkeys: &crate::config::HotkeySettings, backend: &str) -> String {
     let binding = &hotkeys.ptt;
+    if backend == "portal" {
+        if let Some(assigned) = crate::hotkey::portal_trigger(crate::hotkey::Action::Ptt) {
+            return assigned;
+        }
+    }
     if backend == "portal"
         || (backend == crate::hotkey::BACKEND_RAWINPUT && binding.key.trim().is_empty())
     {
