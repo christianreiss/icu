@@ -679,3 +679,33 @@ pub async fn read_frame(recv: &mut RecvStream, max: usize) -> Result<Vec<u8>, St
         .map_err(|e| e.to_string())?;
     Ok(body)
 }
+
+/// Whether this process runs as root, which reads through every mode bit
+/// a test sets up; says so when it skips.
+pub fn root() -> bool {
+    let root = rustix::process::geteuid().is_root();
+    if root {
+        eprintln!("skipped: root is not held back by file modes");
+    }
+    root
+}
+
+/// Sets a file's mode and puts the old one back when dropped, so the
+/// temporary directory goes away even after a failed assertion.
+pub struct Mode(std::path::PathBuf, u32);
+
+impl Mode {
+    pub fn set(path: &std::path::Path, mode: u32) -> Mode {
+        use std::os::unix::fs::PermissionsExt;
+        let old = std::fs::metadata(path).unwrap().permissions().mode();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        Mode(path.to_path_buf(), old)
+    }
+}
+
+impl Drop for Mode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}

@@ -594,94 +594,17 @@ async fn reserved_example_names_are_refused_only_where_they_are_new() {
     icu_server::Config::load(&file).expect("the configuration loads");
 }
 
-/// Whether this process runs as root, which reads through every mode bit
-/// the tests below set up.
-fn root() -> bool {
-    let root = rustix::process::geteuid().is_root();
-    if root {
-        eprintln!("skipped: root is not held back by file modes");
-    }
-    root
-}
-
-/// Sets a file's mode and puts the old one back when dropped, so the
-/// temporary directory goes away even after a failed assertion.
-struct Mode(std::path::PathBuf, u32);
-
-impl Mode {
-    fn set(path: &std::path::Path, mode: u32) -> Mode {
-        use std::os::unix::fs::PermissionsExt;
-        let old = std::fs::metadata(path).unwrap().permissions().mode();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-        Mode(path.to_path_buf(), old)
-    }
-}
-
-impl Drop for Mode {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
-    }
-}
-
-/// S1 (readiness review 2026-09-27): with the packaged configuration —
-/// `server_name` unset — `status` and `users` need nothing but the admin
-/// socket. Working the name out reads `ca.crt` in the state directory,
-/// which under `DynamicUser` only root can; done up front, it refused every
-/// command to members of the socket's group, Checkmk included.
-#[tokio::test]
-async fn status_and_users_need_only_the_socket() {
-    if root() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let (state, run) = (dir.path().join("state"), dir.path().join("run"));
-    let mut config = icu_server::Config::for_test(&state);
-    config.paths.runtime_dir = run.clone();
-    let handle = icu_server::run(config).await.expect("server");
-    let file = dir.path().join("server.toml");
-    std::fs::write(
-        &file,
-        format!(
-            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
-            state.to_str().unwrap(),
-            run.to_str().unwrap()
-        ),
-    )
-    .unwrap();
-    // `/var/lib/private` as a member of the socket's group sees it.
-    let hidden = Mode::set(&state, 0o000);
-    for command in ["status", "users"] {
-        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
-            .arg("--config")
-            .arg(&file)
-            .args([command, "--json"])
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{command}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(value["ok"], serde_json::json!(true), "{command}");
-    }
-    drop(hidden);
-    handle.shutdown().await;
-}
-
 /// The CLI does the work itself only when no server runs: socket missing or
 /// refusing. A socket it may not use is reported as such, with the fix —
 /// falling back hid it behind the state lock's "is a server running?".
 #[tokio::test]
 async fn a_socket_the_cli_may_not_use_is_reported_not_bypassed() {
-    if root() {
+    if common::root() {
         return;
     }
     let server = TestServer::start().await;
     let socket = server.socket();
-    let locked = Mode::set(&socket, 0o000);
+    let locked = common::Mode::set(&socket, 0o000);
     let config = icu_server::Config::for_test(server.dir.path());
     let error = icu_server::cli::dispatch(&config, AdminRequest::Status)
         .await
