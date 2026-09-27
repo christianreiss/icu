@@ -1,5 +1,6 @@
 //! Ending on SIGTERM, SIGINT and SIGHUP — on Windows on logging off,
-//! shutting down and the console's Ctrl+C/close — the way „Beenden“ does. A desktop
+//! shutting down, a plain `taskkill` (`WM_CLOSE`) and the console's
+//! Ctrl+C/close — the way „Beenden“ does. A desktop
 //! that logs out terminates a client sitting in the tray with SIGTERM;
 //! killed without a close, it stayed online for everyone else until the
 //! server's idle timeout (60 s) ran out, and a setting changed just before
@@ -116,23 +117,56 @@ async fn wait_and_quit() {
 /// once that returns, the process may be killed at any moment. A hidden
 /// window of its own (message-only windows get no broadcasts) asks for the
 /// quit there and holds `WM_ENDSESSION` until ICU has said goodbye — at
-/// most [`GRACE`].
+/// most [`GRACE`], with a reason for Windows to show meanwhile.
+///
+/// `taskkill` without `/F` sends `WM_CLOSE` to every top-level window: the
+/// main window would only hide in the tray, and this one, destroyed by
+/// `DefWindowProc`, would miss the next logoff. It takes `WM_CLOSE` as the
+/// quit request SIGTERM is on Linux and stays.
 #[cfg(windows)]
 mod end_session {
-    use std::time::Instant;
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Instant,
+    };
 
     use windows::{
         core::w,
         Win32::{
             Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-            System::LibraryLoader::GetModuleHandleW,
+            System::{LibraryLoader::GetModuleHandleW, Shutdown::ShutdownBlockReasonCreate},
             UI::WindowsAndMessaging::{
                 CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassExW,
-                MSG, WINDOW_STYLE, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSEXW,
+                MSG, WINDOW_STYLE, WM_CLOSE, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSEXW,
                 WS_EX_TOOLWINDOW,
             },
         },
     };
+
+    /// What the window does with a message.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Reply {
+        /// `WM_QUERYENDSESSION`: the session may end.
+        AllowEnd,
+        /// `WM_ENDSESSION` for real: quit, and hold Windows until done.
+        EndSession,
+        /// `WM_ENDSESSION` after all (another app refused): nothing.
+        SessionContinues,
+        /// `WM_CLOSE` (`taskkill`): quit, keep the window.
+        Close,
+        /// Everything else: `DefWindowProc`.
+        Default,
+    }
+
+    fn reply(msg: u32, wparam: usize) -> Reply {
+        match msg {
+            WM_QUERYENDSESSION => Reply::AllowEnd,
+            WM_ENDSESSION if wparam != 0 => Reply::EndSession,
+            WM_ENDSESSION => Reply::SessionContinues,
+            WM_CLOSE => Reply::Close,
+            _ => Reply::Default,
+        }
+    }
 
     pub(super) fn watch() {
         let spawned = std::thread::Builder::new()
@@ -183,23 +217,59 @@ mod end_session {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        match msg {
-            WM_QUERYENDSESSION => LRESULT(1),
-            WM_ENDSESSION => {
-                if wparam.0 != 0 {
-                    tracing::info!("session ends, quitting");
+        match reply(msg, wparam.0) {
+            Reply::AllowEnd => LRESULT(1),
+            Reply::EndSession => {
+                tracing::info!("session ends, quitting");
+                // SAFETY: our own top-level window, on its thread.
+                let _ = unsafe {
+                    ShutdownBlockReasonCreate(hwnd, w!("ICU meldet sich vom Server ab …"))
+                };
+                super::request();
+                // The window thread quits the process once the engine is
+                // closed; until then, keep Windows waiting.
+                let deadline = Instant::now() + super::GRACE;
+                while Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                std::process::exit(0);
+            }
+            Reply::SessionContinues => LRESULT(0),
+            Reply::Close => {
+                static CLOSING: AtomicBool = AtomicBool::new(false);
+                if !CLOSING.swap(true, Ordering::SeqCst) {
+                    tracing::info!("asked to close (taskkill), quitting");
                     super::request();
-                    // The window thread quits the process once the engine is
-                    // closed; until then, keep Windows waiting.
-                    let deadline = Instant::now() + super::GRACE;
-                    while Instant::now() < deadline {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                    std::process::exit(0);
+                    // Like a signal: a quit that hangs ends after GRACE.
+                    let _ = std::thread::Builder::new()
+                        .name("icu-close".into())
+                        .spawn(|| {
+                            std::thread::sleep(super::GRACE);
+                            tracing::warn!("quitting took too long");
+                            std::process::exit(0);
+                        });
                 }
                 LRESULT(0)
             }
-            _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+            Reply::Default => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows::Win32::UI::WindowsAndMessaging::WM_DESTROY;
+
+        /// `taskkill` quits instead of destroying the window (which then
+        /// would miss logging off); a logoff another app cancelled does
+        /// nothing.
+        #[test]
+        fn close_quits_and_keeps_the_window() {
+            assert_eq!(reply(WM_CLOSE, 0), Reply::Close);
+            assert_eq!(reply(WM_QUERYENDSESSION, 0), Reply::AllowEnd);
+            assert_eq!(reply(WM_ENDSESSION, 1), Reply::EndSession);
+            assert_eq!(reply(WM_ENDSESSION, 0), Reply::SessionContinues);
+            assert_eq!(reply(WM_DESTROY, 0), Reply::Default);
         }
     }
 }
