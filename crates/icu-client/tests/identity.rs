@@ -406,6 +406,31 @@ async fn a_failed_save_does_not_burn_the_bundle() {
     assert_eq!(leaf_cn(&paths), "dora");
 }
 
+/// `register` with a certificate the server does not take for a
+/// registration — here a plain passport, welcomed without `registration` —
+/// ends in an error, stores nothing and sends no receipt (review 2026-09-27,
+/// C-8): it used to come back `Ok`, and the CLI printed „identity stored“.
+#[tokio::test]
+async fn a_certificate_the_server_does_not_register_is_not_reported_as_stored() {
+    use icu_client::net::register::register;
+    let server = TestServer::start().await;
+    let (alice, _alice_paths, _alice_dir) = server.enroll("alice").await;
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(dir.path().to_path_buf()));
+    let err = register(
+        &alice,
+        "dora",
+        "icu-test/0.1.0 linux",
+        Some(server.addr()),
+        &paths,
+    )
+    .await
+    .expect_err("nothing was registered");
+    assert!(err.problem().text.contains("nicht als Anmeldung"), "{err}");
+    assert!(Identity::load(&paths).unwrap().is_none(), "nothing stored");
+    server.handle.shutdown().await;
+}
+
 /// Two devices share one passport. Device A renames and logs in with the new
 /// certificate, which revokes every older one (`PROTOCOL.md` §2.2 Nr. 10).
 /// Device B, still on the old certificate, is refused — and told to fetch the
