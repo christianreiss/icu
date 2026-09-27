@@ -112,12 +112,31 @@ pub fn leaf_matches_key(leaf_der: &[u8], key_der: &[u8]) -> bool {
     cert.public_key().subject_public_key.data.as_ref() == key.public_key_raw()
 }
 
+/// Whether `leaf_der` names the CA of `ca_der` as its issuer and carries a
+/// valid signature by its key. Only that: validity dates are left to the
+/// handshake, which admits an expired own certificate to its renewal.
+pub fn leaf_signed_by(leaf_der: &[u8], ca_der: &[u8]) -> bool {
+    let (Ok((_, leaf)), Ok((_, ca))) = (
+        x509_parser::parse_x509_certificate(leaf_der),
+        x509_parser::parse_x509_certificate(ca_der),
+    ) else {
+        return false;
+    };
+    leaf.issuer() == ca.subject() && leaf.verify_signature(Some(ca.public_key())).is_ok()
+}
+
 /// Checks a leaf the server issued in answer to a CSR: its CN must be the
-/// `cn` asked for and its public key the one of `key_der` (PKCS#8). `Err`
-/// carries the technical detail; the caller words it for the user. The one
-/// check for registration and renewal, so the two cannot drift apart in
-/// what they accept.
-pub fn check_issued_leaf(leaf_der: &[u8], cn: &str, key_der: &[u8]) -> Result<CertInfo, String> {
+/// `cn` asked for, its public key the one of `key_der` (PKCS#8), and its
+/// signature the one of the CA in `ca_der`. `Err` carries the technical
+/// detail; the caller words it for the user. The one check for
+/// registration and renewal, so the two cannot drift apart in what they
+/// accept.
+pub fn check_issued_leaf(
+    leaf_der: &[u8],
+    cn: &str,
+    key_der: &[u8],
+    ca_der: &[u8],
+) -> Result<CertInfo, String> {
     let info = CertInfo::from_der(leaf_der);
     if info.subject != cn {
         return Err(format!(
@@ -127,6 +146,9 @@ pub fn check_issued_leaf(leaf_der: &[u8], cn: &str, key_der: &[u8]) -> Result<Ce
     }
     if !leaf_matches_key(leaf_der, key_der) {
         return Err("Neues Zertifikat passt nicht zum eigenen Schlüssel".to_string());
+    }
+    if !leaf_signed_by(leaf_der, ca_der) {
+        return Err("Neues Zertifikat stammt nicht von der CA des Servers".to_string());
     }
     Ok(info)
 }
@@ -360,6 +382,64 @@ mod tests {
             .all(|c| c.is_ascii_hexdigit() || c == ':'));
         assert_eq!(info.not_before.len(), 10);
         assert!(info.sig_alg.contains("SHA"), "sig_alg: {}", info.sig_alg);
+    }
+
+    /// A CA named like the server's, as `(ca_der, issuer)`.
+    fn test_ca() -> (Vec<u8>, rcgen::Issuer<'static, rcgen::KeyPair>) {
+        let key = rcgen::KeyPair::generate().expect("key");
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "ICU CA icu.example.org");
+        let der = params.self_signed(&key).expect("ca").der().to_vec();
+        (der, rcgen::Issuer::new(params, key))
+    }
+
+    /// A leaf for `cn` on `key`, signed by `issuer`.
+    fn issued(
+        cn: &str,
+        key: &rcgen::KeyPair,
+        issuer: &rcgen::Issuer<'_, rcgen::KeyPair>,
+    ) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::default();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, cn);
+        params.signed_by(key, issuer).expect("leaf").der().to_vec()
+    }
+
+    /// An issued leaf is taken only with the name asked for, on the own key,
+    /// signed by the own CA — a leaf of another CA with the same name would
+    /// be stored and then fail every handshake (review 2026-09-27, C-8).
+    #[test]
+    fn an_issued_leaf_must_match_name_key_and_ca() {
+        let (ca, issuer) = test_ca();
+        let (_, other_issuer) = test_ca();
+        let key = rcgen::KeyPair::generate().expect("key");
+        let key_der = key.serialize_der();
+        let good = issued("alice", &key, &issuer);
+        assert_eq!(
+            check_issued_leaf(&good, "alice", &key_der, &ca)
+                .unwrap()
+                .subject,
+            "alice"
+        );
+        assert!(leaf_signed_by(&good, &ca));
+        let err = check_issued_leaf(&good, "bob", &key_der, &ca).unwrap_err();
+        assert!(err.contains("bob"), "{err}");
+        let other_key = rcgen::KeyPair::generate().expect("key").serialize_der();
+        let err = check_issued_leaf(&good, "alice", &other_key, &ca).unwrap_err();
+        assert!(err.contains("Schlüssel"), "{err}");
+        // Same issuer name, another CA key.
+        let forged = issued("alice", &key, &other_issuer);
+        assert!(!leaf_signed_by(&forged, &ca));
+        let err = check_issued_leaf(&forged, "alice", &key_der, &ca).unwrap_err();
+        assert!(err.contains("CA"), "{err}");
+        assert!(!leaf_signed_by(b"junk", &ca));
+        assert!(!leaf_signed_by(&good, b"junk"));
     }
 
     #[test]

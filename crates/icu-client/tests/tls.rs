@@ -9,12 +9,38 @@ mod common;
 use common::*;
 use icu_client::{audio::fake::FakeBackend, engine::ConnStatus};
 
+/// Waits for the first failed attempt, then checks the engine keeps
+/// retrying on the slow schedule (`conn::slow_backoff`, 15 s first) instead
+/// of ending the reconnects: three seconds later it is still waiting after
+/// attempt 1, where the normal backoff (1, 2 s) would be at attempt 3.
+async fn retried_slowly(engine: &icu_client::engine::Engine) -> icu_client::problem::Problem {
+    let state = wait_for(engine, SOON, |s| {
+        matches!(
+            &s.conn,
+            ConnStatus::Disconnected { .. } | ConnStatus::Fatal(_)
+        )
+    })
+    .await;
+    let ConnStatus::Disconnected { reason, attempt } = state.conn else {
+        panic!("fatal: {:?}", state.conn);
+    };
+    assert_eq!(attempt, 1);
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    match engine.snapshot().conn {
+        ConnStatus::Disconnected { attempt: 1, .. } => {}
+        other => panic!("not waiting on the slow schedule: {other:?}"),
+    }
+    reason
+}
+
 /// A stored identity whose `server_name` no longer matches the leaf cert
-/// (e.g. hand-edited, or the server rotated to a different FQDN) must fail
-/// the handshake with a precise, non-retryable error naming that FQDN — not
-/// cycle through reconnect attempts.
+/// (e.g. hand-edited, or the server moved to a different FQDN) fails the
+/// handshake with a precise error naming that FQDN. The server proved
+/// nothing before our check refused its certificate, so this is retried —
+/// slowly — and not fatal (review 2026-09-27, C-1; until then it ended the
+/// reconnects for good).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wrong_server_name_is_a_fatal_certificate_error() {
+async fn a_wrong_server_name_is_retried_slowly_not_fatal() {
     let server = TestServer::start().await;
     let (identity, paths, dir) = server.enroll("alice").await;
 
@@ -27,10 +53,7 @@ async fn wrong_server_name_is_a_fatal_certificate_error() {
         .engine_from(identity, paths, Box::new(backend), false)
         .expect("engine starts");
 
-    let state = wait_for(&engine, SOON, |s| matches!(&s.conn, ConnStatus::Fatal(_))).await;
-    let ConnStatus::Fatal(reason) = &state.conn else {
-        unreachable!("predicate guarantees Fatal");
-    };
+    let reason = retried_slowly(&engine).await;
     let technical = reason.technical.as_deref().unwrap_or_default();
     assert!(
         technical.contains("wrong.invalid"),
@@ -47,13 +70,16 @@ async fn wrong_server_name_is_a_fatal_certificate_error() {
     drop(dir);
 }
 
-/// A client whose credentials come from another CA — the server was set up
-/// anew since — is told in plain words to ask for a new invitation, with
-/// the raw TLS error kept only as technical detail. The new server keeps the
-/// old com key: with a new one the client would hear nothing at all
-/// (`PROTOCOL.md` §1, §5) and never learn about the CA.
+/// A server whose certificate comes from another CA — set up anew, or
+/// somebody on the path who holds the com key — is not taken at its word:
+/// the client says it cannot confirm the server, points to the admin on
+/// another channel instead of to a new invitation (which is what an
+/// attacker would offer next), and keeps retrying slowly (review
+/// 2026-09-27, C-1). The raw TLS error stays technical detail. The new
+/// server keeps the old com key: with a new one the client would hear
+/// nothing at all (`PROTOCOL.md` §1, §5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn credentials_from_another_ca_read_as_a_plain_request_for_an_invite() {
+async fn a_server_from_another_ca_is_retried_slowly_not_fatal() {
     let old_server = TestServer::start().await;
     let (identity, paths, dir) = old_server.enroll("alice").await;
     let new_server = TestServer::start_with_com_key(Some(&identity.com_key)).await;
@@ -63,15 +89,9 @@ async fn credentials_from_another_ca_read_as_a_plain_request_for_an_invite() {
         .engine_from(identity, paths, Box::new(backend), false)
         .expect("engine starts");
 
-    let state = wait_for(&engine, SOON, |s| matches!(&s.conn, ConnStatus::Fatal(_))).await;
-    let ConnStatus::Fatal(problem) = &state.conn else {
-        unreachable!("predicate guarantees Fatal");
-    };
-    assert!(
-        problem.text.contains("neue Einladung"),
-        "user text: {}",
-        problem.text
-    );
+    let problem = retried_slowly(&engine).await;
+    assert_eq!(problem.text, icu_client::problem::SERVER_UNVERIFIED);
+    assert!(!problem.text.contains("neue Einladung"), "{}", problem.text);
     for jargon in [
         "UnknownIssuer",
         "BadSignature",

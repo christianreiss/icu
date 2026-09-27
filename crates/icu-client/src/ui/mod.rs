@@ -66,6 +66,17 @@ pub(crate) fn file_drop_works() -> bool {
     !wayland || forced_x11
 }
 
+/// Whether the windows run as native Wayland clients — winit's own choice:
+/// Wayland whenever `WAYLAND_DISPLAY` is set, unless `WINIT_UNIX_BACKEND=x11`
+/// forces X11. The clipboard then goes through the compositor, where ICU
+/// can neither mark a secret for clipboard managers nor be sure to take it
+/// off again (`settings::copy_secret`).
+pub(crate) fn native_wayland() -> bool {
+    cfg!(target_os = "linux")
+        && std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
+        && !std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|v| v == "x11")
+}
+
 /// Work area in egui screen coordinates, including the taskbar exclusion.
 /// winit supplies the monitor size but not its usable rectangle.
 #[cfg(windows)]

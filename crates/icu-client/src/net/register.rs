@@ -8,7 +8,7 @@
 //! of its own, carrying the name the user picked. There is no separate
 //! enrollment protocol and nothing to pin: the bundle brings the CA.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use icu_proto::{ControlMsg, MAX_CONTROL_FRAME};
 
@@ -36,9 +36,11 @@ pub fn is_registration(leaf_der: &[u8]) -> bool {
 /// Stored before the session closes, because the clean close is the receipt
 /// that makes the server revoke the bundle (`PROTOCOL.md` §2.3): when saving
 /// fails, the session ends with another code and the bundle stays usable for
-/// another attempt. A bundle that is not a registration (a plain passport)
-/// comes back as it is, so a caller can hand either here. `addr_override`
-/// replaces the DNS lookup (tests bind ephemeral ports).
+/// another attempt. A server that does not take the bundle for a
+/// registration (`Welcome.registration` false) gets no receipt and the
+/// caller an error: nothing was registered or stored (until 2026-09-27 the
+/// bundle came back as if it had been, and the CLI said „identity stored“).
+/// `addr_override` replaces the DNS lookup (tests bind ephemeral ports).
 pub async fn register(
     bundle: &Identity,
     name: &str,
@@ -94,7 +96,11 @@ pub async fn register(
                 Ok(identity)
             })
     } else {
-        Ok(bundle.clone())
+        Err(NetError::User(crate::problem::Problem::new(
+            "Der Server hat die Einladung nicht als Anmeldung angenommen. Bitte beim Admin eine \
+             neue anfordern.",
+            "Welcome.registration = false",
+        )))
     };
     connection.close(receipt(result.is_ok()), b"");
     endpoint.wait_idle().await;
@@ -142,10 +148,47 @@ pub async fn renew_expired(
     exchange(send, recv, identity, &key, name).await
 }
 
-/// `RenewRequest` for `name` on `key` and the answer, checked against both.
-/// `Error{RENEW_REQUIRED}` is the server's prompt for exactly this and is
-/// skipped; any other `Error` ends it.
+/// How long [`exchange`] waits for the server's answer, writing included:
+/// well inside the 120 s a registration session may stay open
+/// (`PROTOCOL.md` §2.3), and a server that sends something else or nothing
+/// at all must not leave the first-start window busy for good.
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `RenewRequest` for `name` on `key` and the answer, checked against both,
+/// within [`EXCHANGE_TIMEOUT`]. `Error{RENEW_REQUIRED}` is the server's
+/// prompt for exactly this and is skipped; any other `Error` ends it. Out
+/// of time it ends as a broken connection, which the engine retries.
 async fn exchange(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    bundle: &Identity,
+    key: &rcgen::KeyPair,
+    name: &str,
+) -> Result<Identity, NetError> {
+    exchange_within(send, recv, bundle, key, name, EXCHANGE_TIMEOUT).await
+}
+
+/// [`exchange`] with the deadline `limit`.
+async fn exchange_within(
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
+    bundle: &Identity,
+    key: &rcgen::KeyPair,
+    name: &str,
+    limit: Duration,
+) -> Result<Identity, NetError> {
+    tokio::time::timeout(limit, answer(send, recv, bundle, key, name))
+        .await
+        .unwrap_or_else(|_| {
+            Err(NetError::Connect(format!(
+                "no RenewResponse within {} s",
+                limit.as_secs_f32()
+            )))
+        })
+}
+
+/// The body of [`exchange`], without the deadline.
+async fn answer(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
     bundle: &Identity,
@@ -159,7 +202,9 @@ async fn exchange(
         match ControlMsg::decode(&body).map_err(|e| NetError::Protocol(e.to_string()))? {
             ControlMsg::RenewResponse { leaf_der } => {
                 let key_der = key.serialize_der();
-                if let Err(detail) = crate::conninfo::check_issued_leaf(&leaf_der, name, &key_der) {
+                if let Err(detail) =
+                    crate::conninfo::check_issued_leaf(&leaf_der, name, &key_der, &bundle.ca_der)
+                {
                     return Err(NetError::User(crate::problem::Problem::new(
                         "Der Server hat die Anmeldung falsch beantwortet. Bitte noch einmal \
                          versuchen.",
@@ -237,6 +282,94 @@ mod tests {
         assert!(!is_registration(&leaf(None)));
         assert!(!is_registration(&leaf(Some("something else"))));
         assert!(!is_registration(b"junk"));
+    }
+
+    /// A server that takes the `RenewRequest` and never answers ends the
+    /// exchange after the deadline, as a broken connection the engine
+    /// retries (review 2026-09-27, C-8) — not a busy window for good.
+    #[tokio::test]
+    async fn a_server_that_never_answers_ends_the_exchange() {
+        use std::sync::Arc;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .unwrap();
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_tls).unwrap(),
+            )),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        // Reads whatever comes and never writes.
+        let silent = tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().await.unwrap();
+            let (_send, mut recv) = conn.accept_bi().await.unwrap();
+            let _ = recv.read_to_end(1 << 16).await;
+            server
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client_tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let conn = client
+            .connect_with(
+                quinn::ClientConfig::new(Arc::new(
+                    quinn::crypto::rustls::QuicClientConfig::try_from(client_tls).unwrap(),
+                )),
+                addr,
+                "localhost",
+            )
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+
+        let bundle = Identity {
+            key_der: key.serialize_der(),
+            leaf_der: cert.der().to_vec(),
+            ca_der: cert.der().to_vec(),
+            com_key: icu_proto::com::ComKey::from_bytes([1; icu_proto::com::COM_KEY_LEN]),
+            server: ServerInfo {
+                host: "localhost".into(),
+                port: addr.port(),
+                server_name: "localhost".into(),
+                name: "neu-0001".into(),
+            },
+        };
+        let own = rcgen::KeyPair::generate().unwrap();
+        let started = std::time::Instant::now();
+        let err = exchange_within(
+            &mut send,
+            &mut recv,
+            &bundle,
+            &own,
+            "alice",
+            Duration::from_millis(300),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, NetError::Connect(_)), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        conn.close(0u32.into(), b"");
+        drop(silent.await);
     }
 
     #[test]

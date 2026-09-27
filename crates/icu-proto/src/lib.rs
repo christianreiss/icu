@@ -32,8 +32,9 @@ pub use control::{ControlMsg, CAPS, MINOR, MIN_PEER_MINOR};
 pub use framing::MAX_CONTROL_FRAME;
 pub use header::{seq_diff, set_speaker_in_place, ts_diff, AudioHeader, VideoHeader};
 pub use types::{
-    client_version, name_key, normalize_name, validate_name, validate_stored_name, AudioParams,
-    NameError, Session, UserFlags, UserId, UserInfo, UserSummary, Version, VersionError,
+    client_version, is_plain_text, name_key, normalize_name, validate_name, validate_stored_name,
+    AudioParams, NameError, Session, UserFlags, UserId, UserInfo, UserSummary, Version,
+    VersionError,
 };
 
 /// Everything that can go wrong while decoding or encoding wire data.

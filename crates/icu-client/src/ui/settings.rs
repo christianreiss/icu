@@ -884,19 +884,21 @@ impl SettingsView {
                 widgets::row_group(ui, width, |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     if widgets::button(ui, widgets::ButtonKind::Neutral, icon::COPY, "Kopieren")
-                        .on_hover_text(
+                        .on_hover_text(if super::native_wayland() {
+                            "Als Text in die Zwischenablage, mit deinen Einstellungen; unter \
+                             Wayland kann ICU sie nicht sicher wieder leeren"
+                        } else {
                             "Als Text in die Zwischenablage, mit deinen Einstellungen; ICU leert \
-                             sie nach einer Minute wieder",
-                        )
+                             sie nach einer Minute wieder"
+                        })
                         .clicked()
                     {
                         match self.passport_text() {
                             Ok((text, with_settings)) => {
-                                ui.ctx().copy_text(text.clone());
-                                clear_clipboard_later(text);
+                                let copied = copy_secret(ui.ctx(), text);
                                 self.passport_status = Some(format!(
-                                    "In die Zwischenablage kopiert, für {} s.{}",
-                                    PASSPORT_CLIPBOARD.as_secs(),
+                                    "{}{}",
+                                    copied_status(copied),
                                     without_settings(with_settings)
                                 ));
                             }
@@ -904,10 +906,7 @@ impl SettingsView {
                         }
                     }
                     if widgets::button(ui, widgets::ButtonKind::Neutral, icon::EXPORT, "Speichern")
-                        .on_hover_text(
-                            "Als .icu-Datei samt Einstellungen in den Download-Ordner, nur für \
-                             dich lesbar — auf dem anderen Gerät doppelklicken",
-                        )
+                        .on_hover_text(SAVE_HELP)
                         .clicked()
                     {
                         self.passport_status = Some(match self.passport_text() {
@@ -915,7 +914,8 @@ impl SettingsView {
                                 let path = passport_file();
                                 match crate::config::write_atomic(&path, text.as_bytes(), true) {
                                     Ok(()) => format!(
-                                        "Gespeichert: {}{}",
+                                        "Gespeichert: {} — enthält deinen privaten Schlüssel, \
+                                         nach dem Einspielen löschen.{}",
                                         path.display(),
                                         without_settings(with_settings)
                                     ),
@@ -1000,6 +1000,10 @@ impl SettingsView {
         let lines = summary.lines();
         let warn = summary.ca_changed;
         let carries_settings = settings.is_some();
+        let changes = settings
+            .as_ref()
+            .map(|incoming| self.draft.send_changes(incoming))
+            .unwrap_or_default();
         widgets::card_note(ui, |ui| {
             let tok = theme::tokens(ui.visuals());
             for (i, line) in lines.iter().enumerate() {
@@ -1023,6 +1027,21 @@ impl SettingsView {
                     widgets::named_toggle(ui, &mut self.import_settings, "Einstellungen übernehmen")
                 },
             );
+        }
+        // What decides when this device can be heard is spelled out, not
+        // hidden in „Einstellungen“ (review 2026-09-27, C-3).
+        if self.import_settings && !changes.is_empty() {
+            widgets::card_note(ui, |ui| {
+                let tok = theme::tokens(ui.visuals());
+                ui.label(
+                    RichText::new("Ändert, wann und wie du zu hören bist:")
+                        .size(11.5)
+                        .color(tok.connecting),
+                );
+                for line in &changes {
+                    ui.label(RichText::new(line).size(11.5));
+                }
+            });
         }
         let replaces = if carries_settings && self.import_settings {
             "Ersetzt Schlüssel, Zertifikat, Serverdaten und Einstellungen dieses Geräts"
@@ -1095,11 +1114,16 @@ impl SettingsView {
 
     /// Reads the pasted text and shows what it would switch to.
     fn preview_passport(&mut self) {
-        // `from_passport` also checks the key: a passport whose key does not
-        // parse would brick the next connection. A registration bundle is
-        // taken as well; the engine registers it under its placeholder name.
+        // `from_passport` also checks key, certificate and names: a passport
+        // that cannot work would replace the one that does. A registration
+        // bundle is taken as well; the engine registers it under its
+        // placeholder name.
         match Identity::from_passport_with_settings(&self.passport_import) {
             Ok((identity, settings)) => {
+                // An invitation brings no settings: whatever one carries
+                // stays behind, as on the command line and in the
+                // first-start window (review 2026-09-27, C-3).
+                let settings = settings.filter(|_| !identity.is_registration());
                 let current = Identity::load(&self.paths).ok().flatten();
                 let summary = config::ImportSummary::of(&identity, current.as_ref());
                 self.import_preview = Some((Box::new(identity), settings.map(Box::new), summary));
@@ -1627,8 +1651,8 @@ impl SettingsView {
                 // Minted from this form: it goes straight to the clipboard,
                 // copying is what comes next anyway.
                 if self.fresh_invite {
-                    ui.ctx().copy_text(bundle.to_string());
-                    self.invite_status = Some("In die Zwischenablage kopiert.".into());
+                    let copied = copy_secret(ui.ctx(), bundle.to_string());
+                    self.invite_status = Some(copied_status(copied));
                 }
             }
         }
@@ -2054,8 +2078,8 @@ impl SettingsView {
                             )
                             .clicked()
                             {
-                                ui.ctx().copy_text(bundle.clone());
-                                self.invite_status = Some("In die Zwischenablage kopiert.".into());
+                                let copied = copy_secret(ui.ctx(), bundle.clone());
+                                self.invite_status = Some(copied_status(copied));
                             }
                             if widgets::button(
                                 ui,
@@ -2314,8 +2338,8 @@ pub(crate) const SETTINGS_HELP: &str =
     "Audio, Klang, Tastenkürzel, Overlay, Lautstärken und Aussehen von dort; Geräte und \
      Kamera bleiben, wie sie hier sind.";
 
-/// The export status' note when the settings could not come along (an old
-/// certificate needs passport version 1, which has no room for them).
+/// The export status' note when the settings could not come along (they
+/// would not fit into the passport's 8 KiB).
 fn without_settings(with_settings: bool) -> &'static str {
     if with_settings {
         ""
@@ -2324,32 +2348,122 @@ fn without_settings(with_settings: bool) -> &'static str {
     }
 }
 
-/// How long a copied passport may stay on the clipboard.
+/// What „Speichern“ does with the passport, true on each platform: only
+/// Unix has the file mode that keeps other accounts out (Windows: the
+/// profile's ACL, and DPAPI seals `key.pk8` alone), and no mode keeps a
+/// synced folder from uploading it (review 2026-09-27, C-6).
+#[cfg(unix)]
+const SAVE_HELP: &str = "Als .icu-Datei samt Einstellungen in den Download-Ordner, nur für dich \
+     lesbar — auf dem anderen Gerät doppelklicken. Nicht in einem synchronisierten Ordner \
+     (Nextcloud, Dropbox …) liegen lassen: die Datei enthält deinen privaten Schlüssel.";
+#[cfg(not(unix))]
+const SAVE_HELP: &str = "Als .icu-Datei samt Einstellungen in den Download-Ordner deines \
+     Benutzerkontos — auf dem anderen Gerät doppelklicken. Nicht in einem synchronisierten \
+     Ordner (OneDrive …) liegen lassen: die Datei enthält deinen privaten Schlüssel, \
+     unverschlüsselt.";
+
+/// How long a copied passport or invitation may stay on the clipboard.
 const PASSPORT_CLIPBOARD: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Takes `passport` off the clipboard after [`PASSPORT_CLIPBOARD`] — only
+/// How a secret reached the clipboard ([`copy_secret`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecretCopy {
+    /// Windows or X11: marked for clipboard managers to leave out of their
+    /// history (Windows: also out of the cloud clipboard), and taken off
+    /// again after [`PASSPORT_CLIPBOARD`].
+    Marked,
+    /// Windows or X11 without the mark (the clipboard would not take it):
+    /// still taken off again.
+    Plain,
+    /// Native Wayland: through the compositor, unmarked, and whether ICU
+    /// can take it off again is up to the compositor.
+    Wayland,
+}
+
+/// Puts a passport or an invitation — a key that lets anybody in — onto the
+/// clipboard, and takes it off again after [`PASSPORT_CLIPBOARD`]. Marked as
+/// a secret where the platform has a way: on Windows the formats that keep
+/// it out of clipboard history, the cloud clipboard and clipboard monitors,
+/// under X11 the `x-kde-passwordManagerHint` that Klipper and others
+/// honour. egui's clipboard has neither under native Wayland (review
+/// 2026-09-27, C-7), so there the status says what ICU cannot promise.
+fn copy_secret(ctx: &egui::Context, text: String) -> SecretCopy {
+    let copied = if super::native_wayland() {
+        ctx.copy_text(text.clone());
+        SecretCopy::Wayland
+    } else {
+        match set_marked(&text) {
+            Ok(()) => SecretCopy::Marked,
+            Err(e) => {
+                tracing::info!(%e, "clipboard mark not set, copying plainly");
+                ctx.copy_text(text.clone());
+                SecretCopy::Plain
+            }
+        }
+    };
+    clear_clipboard_later(text);
+    copied
+}
+
+/// Sets `text` with the platform's "do not keep" marks. A handle of its
+/// own is enough: egui's handle keeps arboard's process-wide X11 owner
+/// alive, and Windows keeps the data itself.
+fn set_marked(text: &str) -> Result<(), arboard::Error> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    let set = clipboard.set();
+    #[cfg(windows)]
+    let set = {
+        use arboard::SetExtWindows;
+        set.exclude_from_monitoring()
+            .exclude_from_cloud()
+            .exclude_from_history()
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let set = {
+        use arboard::SetExtLinux;
+        set.exclude_from_history()
+    };
+    set.text(text)
+}
+
+/// The status line after [`copy_secret`]: „für 60 s“ only where ICU takes
+/// it off again for sure.
+fn copied_status(copied: SecretCopy) -> String {
+    match copied {
+        SecretCopy::Marked | SecretCopy::Plain => format!(
+            "In die Zwischenablage kopiert, für {} s.",
+            PASSPORT_CLIPBOARD.as_secs()
+        ),
+        SecretCopy::Wayland => "In die Zwischenablage kopiert. Unter Wayland kann ICU sie nicht \
+                                sicher wieder leeren, und ein Zwischenablage-Verlauf behält den \
+                                Text – nach dem Einfügen bitte etwas anderes kopieren."
+            .into(),
+    }
+}
+
+/// Takes `secret` off the clipboard after [`PASSPORT_CLIPBOARD`] — only
 /// if it is still what the clipboard holds; whatever was copied since stays.
 /// Its own thread and its own clipboard handle, so it happens with the
 /// settings closed and the window in the tray. X11 and Windows clear for
 /// real; under Wayland this goes through Xwayland, and whether that reaches
 /// the compositor's clipboard is up to the compositor (an unfocused Wayland
 /// client cannot set the selection itself).
-fn clear_clipboard_later(passport: String) {
+fn clear_clipboard_later(secret: String) {
     let spawned = std::thread::Builder::new()
         .name("icu-clipboard".into())
         .spawn(move || {
             std::thread::sleep(PASSPORT_CLIPBOARD);
             let cleared = arboard::Clipboard::new().and_then(|mut clipboard| {
-                if clipboard.get_text()? != passport {
+                if clipboard.get_text()? != secret {
                     return Ok(false);
                 }
                 clipboard.clear()?;
                 Ok(true)
             });
             match cleared {
-                Ok(true) => tracing::info!("passport taken off the clipboard"),
+                Ok(true) => tracing::info!("secret taken off the clipboard"),
                 Ok(false) => {}
-                Err(e) => tracing::info!(%e, "clipboard not checked for the passport"),
+                Err(e) => tracing::info!(%e, "clipboard not checked for the secret"),
             }
         });
     if let Err(e) = spawned {
@@ -3142,6 +3256,18 @@ pub(super) fn binding_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// „für 60 s“ only where ICU takes a copied secret off the clipboard
+    /// for sure (review 2026-09-27, C-7).
+    #[test]
+    fn the_copy_status_promises_clearing_only_where_it_happens() {
+        for copied in [SecretCopy::Marked, SecretCopy::Plain] {
+            assert!(copied_status(copied).contains("60 s"), "{copied:?}");
+        }
+        let wayland = copied_status(SecretCopy::Wayland);
+        assert!(!wayland.contains("60 s"), "{wayland}");
+        assert!(wayland.contains("nicht sicher"), "{wayland}");
+    }
 
     /// A key read from the devices gets a portal trigger where one reads the
     /// same (letters, digits, F-keys); a lone modifier or a mouse button

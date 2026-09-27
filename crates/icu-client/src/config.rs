@@ -487,6 +487,69 @@ impl Settings {
         *self = taken;
     }
 
+    /// What taking `incoming` over ([`Settings::take_portable`]) would
+    /// change about when and how this device can be heard, one line each in
+    /// the words of the settings window: sending mode, threshold, gain,
+    /// noise suppression, VAD hangover, the three cues and „Minimiert
+    /// starten“. The import confirmation shows them next to the switch
+    /// that takes the settings along: a passport from somebody else could
+    /// otherwise switch to voice activation at threshold 0 with +20 dB, no
+    /// cues, started into the tray, and nothing would show it (review
+    /// 2026-09-27, C-3). Empty when none of them changes.
+    pub fn send_changes(&self, incoming: &Settings) -> Vec<String> {
+        let mut after = self.clone();
+        after.take_portable(incoming.clone());
+        let (was, will) = (&self.audio, &after.audio);
+        let mut lines = Vec::new();
+        let mut differs = |what: &str, now: String, before: String| {
+            if now != before {
+                lines.push(format!("{what}: {now} (bisher {before})"));
+            }
+        };
+        let mode = |a: &AudioSettings| match a.mode {
+            ModeSetting::Ptt => "Taste halten".to_string(),
+            ModeSetting::Vad => "Automatisch".to_string(),
+        };
+        let threshold = |a: &AudioSettings| {
+            if a.vad_auto {
+                "automatisch".to_string()
+            } else {
+                format!("{:.0} %", a.vad_threshold * 100.0)
+            }
+        };
+        let on = |b: bool| if b { "an" } else { "aus" }.to_string();
+        differs("Senden", mode(will), mode(was));
+        differs("Schwelle", threshold(will), threshold(was));
+        differs(
+            "Verstärkung",
+            format!("{:+.0} dB", will.gain_db),
+            format!("{:+.0} dB", was.gain_db),
+        );
+        differs("Rauschunterdrückung", on(will.denoise), on(was.denoise));
+        differs(
+            "VAD-Nachlauf",
+            format!("{} ms", will.hangover_ms),
+            format!("{} ms", was.hangover_ms),
+        );
+        differs(
+            "Ton „Jemand kommt oder geht“",
+            on(will.cue_join),
+            on(was.cue_join),
+        );
+        differs(
+            "Ton „Senden beginnt oder endet“",
+            on(will.cue_tx),
+            on(was.cue_tx),
+        );
+        differs("Ton „Stummschalten“", on(will.cue_mute), on(was.cue_mute));
+        differs(
+            "Minimiert starten",
+            on(after.ui.start_minimized),
+            on(self.ui.start_minimized),
+        );
+        lines
+    }
+
     /// The ranges of the settings window's sliders and choices.
     fn clamp_numbers(&mut self) {
         let defaults = AudioSettings::default();
@@ -633,6 +696,8 @@ impl Identity {
     /// [`Identity::from_passport`], plus the settings a passport may carry
     /// (`PROTOCOL.md` §2.3.1). Settings that do not read are left
     /// behind with a log line: the identity is what a passport is for.
+    /// Refused before anything is replaced: what [`Identity::check_importable`]
+    /// finds wrong.
     pub fn from_passport_with_settings(
         armored: &str,
     ) -> Result<(Identity, Option<Settings>), String> {
@@ -656,14 +721,55 @@ impl Identity {
             passport.ca_der,
             passport.com_key,
         )?;
-        if identity.key_pair().is_err() {
-            return Err(
-                "Dieser Passport ist beschädigt (kein gültiger Schlüssel). Bitte auf \
-                        dem anderen Gerät neu exportieren."
-                    .into(),
-            );
-        }
+        identity.check_importable(crate::net::conn::unix_now())?;
         Ok((identity, settings))
+    }
+
+    /// Whether this identity can be taken over as it is, at `now` (Unix
+    /// seconds): the key parses and belongs to the certificate, the
+    /// certificate is signed by the CA that came with it, an invitation has
+    /// not expired, and what the import confirmation shows of it is plain
+    /// text. Otherwise the working identity would be replaced by one that
+    /// cannot connect, or a forged name could draw lines of its own into
+    /// the confirmation (review 2026-09-27, C-2, C-4). An expired own
+    /// certificate passes: the server renews it (`PROTOCOL.md` §2.3.3).
+    fn check_importable(&self, now: i64) -> Result<(), String> {
+        let (what, again) = if self.is_registration() {
+            ("Diese Einladung", "Bitte beim Admin eine neue anfordern.")
+        } else {
+            (
+                "Dieser Passport",
+                "Bitte auf dem anderen Gerät neu exportieren.",
+            )
+        };
+        let broken = |why: &str| format!("{what} ist beschädigt ({why}). {again}");
+        if self.key_pair().is_err() {
+            return Err(broken("kein gültiger Schlüssel"));
+        }
+        if !crate::conninfo::leaf_matches_key(&self.leaf_der, &self.key_der) {
+            return Err(broken("Schlüssel und Zertifikat gehören nicht zusammen"));
+        }
+        if !crate::conninfo::leaf_signed_by(&self.leaf_der, &self.ca_der) {
+            return Err(broken(
+                "das Zertifikat stammt nicht von der mitgelieferten CA",
+            ));
+        }
+        if self.is_registration() && crate::net::conn::leaf_expired(&self.leaf_der, now) {
+            let until = crate::conninfo::CertInfo::from_der(&self.leaf_der).not_after;
+            return Err(format!(
+                "Diese Einladung ist abgelaufen (gültig bis {until}). Bitte beim Admin eine \
+                 neue anfordern."
+            ));
+        }
+        let name = crate::conninfo::CertInfo::from_der(&self.leaf_der).subject;
+        let shown = [name.as_str(), &self.server.server_name, &self.server.host];
+        if !shown.into_iter().all(icu_proto::is_plain_text) {
+            return Err(format!(
+                "{what} enthält Steuer- oder Formatzeichen im Namen oder in der Serveradresse \
+                 und wird nicht übernommen. {again}"
+            ));
+        }
+        Ok(())
     }
 
     /// An identity whose certificates say where the server is.
@@ -782,6 +888,59 @@ impl Identity {
     /// non-empty one everywhere); after a crash between them `load` reads
     /// `identity.old/`, which stays until the new set is in place.
     pub fn save(&self, paths: &Paths) -> Result<(), ConfigError> {
+        self.save_set(paths, false)
+    }
+
+    /// [`Identity::save`] for an imported identity that has yet to prove
+    /// itself: the set it replaces stays in `identity.old/` until
+    /// [`Identity::restore_previous`] puts it back or
+    /// [`Identity::drop_previous`] lets it go (review 2026-09-27, C-2).
+    /// `load` prefers `identity/`, so the kept set changes nothing until
+    /// then; the next plain `save` or a logout removes it.
+    pub fn save_keeping_previous(&self, paths: &Paths) -> Result<(), ConfigError> {
+        self.save_set(paths, true)
+    }
+
+    /// Puts the set [`Identity::save_keeping_previous`] kept back in place of
+    /// the one saved over it, which is deleted. Two renames like `save`:
+    /// after a crash between them `load` reads the kept set.
+    pub fn restore_previous(paths: &Paths) -> Result<(), ConfigError> {
+        let _files = crate::sync::lock(&IDENTITY_FILES);
+        let dir = paths.identity_dir();
+        let previous = dir.with_extension("old");
+        let failed = dir.with_extension("new");
+        if !previous.join("server.toml").exists() {
+            return Err(ConfigError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no previous identity kept",
+            )));
+        }
+        remove_dir_if_present(&failed)?;
+        if dir.exists() {
+            fs::rename(&dir, &failed)?;
+        }
+        fs::rename(&previous, &dir)?;
+        #[cfg(unix)]
+        if let Ok(parent) = fs::File::open(&paths.config_dir) {
+            let _ = parent.sync_all();
+        }
+        let _ = remove_dir_if_present(&failed);
+        Ok(())
+    }
+
+    /// Lets the set [`Identity::save_keeping_previous`] kept go, once the one
+    /// in `identity/` proved itself. Never while `identity/` is incomplete:
+    /// then `identity.old/` is the set `load` reads.
+    pub fn drop_previous(paths: &Paths) -> Result<(), ConfigError> {
+        let _files = crate::sync::lock(&IDENTITY_FILES);
+        let dir = paths.identity_dir();
+        if !dir.join("server.toml").exists() {
+            return Ok(());
+        }
+        remove_dir_if_present(&dir.with_extension("old"))
+    }
+
+    fn save_set(&self, paths: &Paths, keep_previous: bool) -> Result<(), ConfigError> {
         let _files = crate::sync::lock(&IDENTITY_FILES);
         let dir = paths.identity_dir();
         let fresh = dir.with_extension("new");
@@ -816,7 +975,9 @@ impl Identity {
         if let Ok(parent) = fs::File::open(&paths.config_dir) {
             let _ = parent.sync_all();
         }
-        let _ = remove_dir_if_present(&previous);
+        if !keep_previous {
+            let _ = remove_dir_if_present(&previous);
+        }
         Ok(())
     }
 
@@ -878,6 +1039,10 @@ pub struct ImportSummary {
     pub name: String,
     /// A registration bundle (invite) rather than a passport.
     pub registration: bool,
+    /// SHA-256 of the CA the client will hold the server to, as
+    /// `conninfo::CertInfo::fingerprint` prints it: the one thing worth
+    /// comparing with whoever sent the passport.
+    pub ca_fingerprint: String,
     /// An identity exists and trusts a different CA: another server.
     pub ca_changed: bool,
 }
@@ -896,12 +1061,17 @@ impl ImportSummary {
             address,
             name: crate::conninfo::CertInfo::from_der(&identity.leaf_der).subject,
             registration: identity.is_registration(),
-            ca_changed: current.is_some_and(|c| c.ca_der != identity.ca_der),
+            ca_fingerprint: crate::conninfo::CertInfo::from_der(&identity.ca_der).fingerprint,
+            ca_changed: current.is_some_and(|c| !same_ca(&c.ca_der, &identity.ca_der)),
         }
     }
 
-    /// The summary as lines of text, for the CLI and the windows.
+    /// The summary as lines of text, for the CLI and the settings window.
+    /// The fingerprint takes two lines of 16 pairs, so it can be read out
+    /// in halves.
     pub fn lines(&self) -> Vec<String> {
+        let pairs: Vec<&str> = self.ca_fingerprint.split(':').collect();
+        let (first, second) = pairs.split_at(pairs.len().min(16));
         let mut lines = vec![
             format!("Server:  {}", self.server_name),
             format!("Adresse: {}", self.address),
@@ -910,7 +1080,11 @@ impl ImportSummary {
             } else {
                 format!("Name:    {}", self.name)
             },
+            format!("CA:      {}", first.join(":")),
         ];
+        if !second.is_empty() {
+            lines.push(format!("         {}", second.join(":")));
+        }
         if self.ca_changed {
             lines.push(
                 "Achtung: anderer Server als bisher — nur übernehmen, wenn du das erwartest."
@@ -918,6 +1092,23 @@ impl ImportSummary {
             );
         }
         lines
+    }
+}
+
+/// Whether two CA certificates are the same CA: the same subject on the same
+/// key. `icu-server renew-ca` issues a new certificate — new DER — for both,
+/// and a passport from before it is no other server (review 2026-09-27,
+/// C-5). Certificates that do not parse count as the same only when their
+/// bytes are.
+fn same_ca(a: &[u8], b: &[u8]) -> bool {
+    match (
+        x509_parser::parse_x509_certificate(a),
+        x509_parser::parse_x509_certificate(b),
+    ) {
+        (Ok((_, a)), Ok((_, b))) => {
+            a.subject().as_raw() == b.subject().as_raw() && a.public_key().raw == b.public_key().raw
+        }
+        _ => a == b,
     }
 }
 
@@ -1260,6 +1451,17 @@ mod tests {
     /// A CA named like a current server's and a leaf with the URI SAN, as
     /// `(leaf, ca, key)` DER.
     fn issued(uri: Option<&str>, ca_cn: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        issued_as(uri, ca_cn, "alice", |_| {})
+    }
+
+    /// [`issued`] for the leaf name `cn`, with `leaf` adjusting the leaf's
+    /// parameters (OU, validity).
+    fn issued_as(
+        uri: Option<&str>,
+        ca_cn: &str,
+        cn: &str,
+        leaf: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SanType};
         let ca_key = KeyPair::generate().unwrap();
         let mut ca_params = CertificateParams::default();
@@ -1271,12 +1473,75 @@ mod tests {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::default();
         params.distinguished_name = rcgen::DistinguishedName::new();
-        params.distinguished_name.push(DnType::CommonName, "alice");
+        params.distinguished_name.push(DnType::CommonName, cn);
         if let Some(uri) = uri {
             params.subject_alt_names = vec![SanType::URI(uri.to_string().try_into().unwrap())];
         }
+        leaf(&mut params);
         let leaf = params.signed_by(&key, &issuer).unwrap();
         (leaf.der().to_vec(), ca.der().to_vec(), key.serialize_der())
+    }
+
+    /// A passport is refused before anything is replaced when its key does
+    /// not belong to its certificate, its certificate is not from the CA it
+    /// brings, an invitation has expired, or a name it shows is not plain
+    /// text (review 2026-09-27, C-2, C-4). An expired own certificate is
+    /// taken: the server renews it.
+    #[test]
+    fn a_passport_that_cannot_work_is_refused_before_the_import() {
+        const URI: Option<&str> = Some("icu://icu.example.org:4711");
+        const CA: &str = "ICU CA icu.example.org";
+        let (leaf, ca, key) = issued(URI, CA);
+        assert!(
+            Identity::from_passport(&passport(key.clone(), leaf.clone(), ca.clone(), "")).is_ok()
+        );
+
+        let (other_leaf, other_ca, other_key) = issued(URI, CA);
+        let err = Identity::from_passport(&passport(other_key, leaf.clone(), ca.clone(), ""))
+            .unwrap_err();
+        assert!(err.contains("gehören nicht zusammen"), "{err}");
+        // The same CA name, another CA key.
+        let err = Identity::from_passport(&passport(key.clone(), leaf.clone(), other_ca, ""))
+            .unwrap_err();
+        assert!(err.contains("mitgelieferten CA"), "{err}");
+        let err = Identity::from_passport(&passport(key, other_leaf, ca, "")).unwrap_err();
+        assert!(err.contains("gehören nicht zusammen"), "{err}");
+
+        let expired = |p: &mut rcgen::CertificateParams| {
+            p.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            p.not_after = rcgen::date_time_ymd(2021, 1, 1);
+        };
+        let (leaf, ca, key) = issued_as(URI, CA, "neu-1a2b", |p| {
+            expired(p);
+            p.distinguished_name.push(
+                rcgen::DnType::OrganizationalUnitName,
+                crate::net::register::REGISTRATION_OU,
+            );
+        });
+        let err = Identity::from_passport(&passport(key, leaf, ca, "")).unwrap_err();
+        assert!(err.contains("Einladung ist abgelaufen"), "{err}");
+        let (leaf, ca, key) = issued_as(URI, CA, "alice", expired);
+        assert!(
+            Identity::from_passport(&passport(key, leaf, ca, "")).is_ok(),
+            "an expired own certificate is renewed, not refused"
+        );
+
+        for (cn, ca_cn) in [
+            ("alice\nAdresse: evil.example:4711", CA),
+            ("ali\u{202E}ec", CA),
+            (
+                "alice",
+                "ICU CA icu.example.org\nAdresse: evil.example:4711",
+            ),
+            ("alice", "ICU CA \u{1b}[2Jicu.example.org"),
+        ] {
+            let (leaf, ca, key) = issued_as(URI, ca_cn, cn, |_| {});
+            let err = Identity::from_passport(&passport(key, leaf, ca, "")).unwrap_err();
+            assert!(
+                err.contains("Steuer- oder Formatzeichen"),
+                "{cn:?} {ca_cn:?}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1339,7 +1604,14 @@ mod tests {
             !summary.ca_changed,
             "nothing to compare with on first import"
         );
-        assert_eq!(summary.lines().len(), 3);
+        let lines = summary.lines();
+        assert_eq!(lines.len(), 5);
+        // The fingerprint, in halves of 16 pairs.
+        assert_eq!(
+            format!("{}:{}", &lines[3][9..], lines[4].trim()),
+            summary.ca_fingerprint
+        );
+        assert_eq!(summary.ca_fingerprint.split(':').count(), 32);
         assert!(!ImportSummary::of(&incoming, Some(&incoming)).ca_changed);
 
         let (leaf, ca, key) = issued(Some("icu://[2001:db8::1]:4711"), "ICU CA other");
@@ -1362,6 +1634,51 @@ mod tests {
         let changed = ImportSummary::of(&incoming, Some(&current));
         assert!(changed.ca_changed);
         assert!(changed.lines().last().unwrap().contains("anderer Server"));
+    }
+
+    /// A CA certificate renewed on the same key and subject
+    /// (`icu-server renew-ca`) is the same server; another key or another
+    /// name is not (review 2026-09-27, C-5).
+    #[test]
+    fn a_renewed_ca_is_not_another_server() {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+        let ca = |key: &KeyPair, cn: &str, year: i32| {
+            let mut params = CertificateParams::default();
+            params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+            params.distinguished_name = rcgen::DistinguishedName::new();
+            params.distinguished_name.push(DnType::CommonName, cn);
+            params.not_after = rcgen::date_time_ymd(year, 1, 1);
+            params.self_signed(key).unwrap().der().to_vec()
+        };
+        let key = KeyPair::generate().unwrap();
+        let before = ca(&key, "ICU CA icu.example.org", 2030);
+        let renewed = ca(&key, "ICU CA icu.example.org", 2040);
+        assert_ne!(before, renewed, "a new certificate");
+        assert!(same_ca(&before, &renewed));
+        let other_key = ca(
+            &KeyPair::generate().unwrap(),
+            "ICU CA icu.example.org",
+            2030,
+        );
+        assert!(!same_ca(&before, &other_key));
+        let other_name = ca(&key, "ICU CA other.example.org", 2030);
+        assert!(!same_ca(&before, &other_name));
+        assert!(same_ca(b"junk", b"junk"));
+        assert!(!same_ca(b"junk", &before));
+
+        let identity = |ca_der: Vec<u8>| {
+            let (leaf, _, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA x");
+            Identity {
+                server: ServerInfo::from_certs(&leaf, &ca_der).unwrap(),
+                key_der: key,
+                leaf_der: leaf,
+                ca_der,
+                com_key: com(),
+            }
+        };
+        let (old, new) = (identity(before.clone()), identity(renewed));
+        assert!(!ImportSummary::of(&new, Some(&old)).ca_changed);
+        assert!(ImportSummary::of(&identity(other_key), Some(&old)).ca_changed);
     }
 
     /// A passport reads back to the same identity, com key included; the
@@ -1522,6 +1839,47 @@ mod tests {
 
     /// Logging out takes the saved invitations with it: each one is a live
     /// registration key.
+    /// An import that has yet to prove itself keeps the set it replaced:
+    /// restored, the old identity is back in force; dropped, the new one
+    /// stays alone (review 2026-09-27, C-2).
+    #[test]
+    fn an_import_on_trial_keeps_the_previous_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf()));
+        let identity = |cn: &str| {
+            let (leaf, ca, key) = issued_as(
+                Some("icu://icu.example.org:4711"),
+                "ICU CA icu.example.org",
+                cn,
+                |_| {},
+            );
+            Identity::from_passport(&passport(key, leaf, ca, "")).unwrap()
+        };
+        let (alice, bob) = (identity("alice"), identity("bob"));
+        let previous = paths.identity_dir().with_extension("old");
+        assert!(Identity::restore_previous(&paths).is_err(), "nothing kept");
+
+        alice.save(&paths).unwrap();
+        bob.save_keeping_previous(&paths).unwrap();
+        assert_eq!(Identity::load(&paths).unwrap().unwrap(), bob);
+        assert!(previous.join("server.toml").exists());
+        Identity::restore_previous(&paths).unwrap();
+        assert_eq!(Identity::load(&paths).unwrap().unwrap(), alice);
+        assert!(!previous.exists());
+        assert!(!paths.identity_dir().with_extension("new").exists());
+
+        bob.save_keeping_previous(&paths).unwrap();
+        Identity::drop_previous(&paths).unwrap();
+        assert!(!previous.exists());
+        assert_eq!(Identity::load(&paths).unwrap().unwrap(), bob);
+        assert!(Identity::restore_previous(&paths).is_err());
+        assert_eq!(Identity::load(&paths).unwrap().unwrap(), bob);
+
+        // A plain save does not keep it.
+        alice.save(&paths).unwrap();
+        assert!(!previous.exists());
+    }
+
     #[test]
     fn logging_out_deletes_saved_invitations() {
         let dir = tempfile::tempdir().unwrap();
@@ -1630,6 +1988,52 @@ mod tests {
     }
 
     /// Imported numbers land in the ranges the settings window offers.
+    /// The import confirmation names every change to when this device can
+    /// be heard — here a passport that makes the microphone hot — and
+    /// nothing when those settings stay (review 2026-09-27, C-3).
+    #[test]
+    fn the_import_names_what_changes_about_sending() {
+        let here = Settings::default();
+        assert!(here.send_changes(&here).is_empty());
+        let mut hot = Settings::default();
+        hot.audio.vad_auto = false;
+        hot.audio.vad_threshold = 0.0;
+        hot.audio.gain_db = 20.0;
+        hot.audio.denoise = false;
+        hot.audio.hangover_ms = 3000;
+        hot.audio.cue_join = false;
+        hot.audio.cue_mute = false;
+        hot.ui.start_minimized = true;
+        // Nothing about sending: not listed.
+        hot.ui.theme = "dark".into();
+        let lines = here.send_changes(&hot);
+        assert_eq!(
+            lines,
+            [
+                "Schwelle: 0 % (bisher automatisch)",
+                "Verstärkung: +20 dB (bisher +0 dB)",
+                "Rauschunterdrückung: aus (bisher an)",
+                "VAD-Nachlauf: 3000 ms (bisher 1000 ms)",
+                "Ton „Jemand kommt oder geht“: aus (bisher an)",
+                "Ton „Stummschalten“: aus (bisher an)",
+                "Minimiert starten: an (bisher aus)",
+            ]
+        );
+        let mut ptt = Settings::default();
+        ptt.audio.mode = ModeSetting::Ptt;
+        assert_eq!(
+            hot.send_changes(&ptt)[0],
+            "Senden: Taste halten (bisher Automatisch)"
+        );
+        // What is out of range is shown as it will be taken: clamped.
+        let mut loud = Settings::default();
+        loud.audio.gain_db = 99.0;
+        assert_eq!(
+            here.send_changes(&loud),
+            ["Verstärkung: +20 dB (bisher +0 dB)"]
+        );
+    }
+
     #[test]
     fn imported_numbers_are_clamped() {
         let mut incoming = Settings::default();

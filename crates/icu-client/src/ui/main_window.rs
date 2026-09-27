@@ -2307,6 +2307,8 @@ pub struct EnrollApp {
     /// The settings of the passport being joined, stored once its identity
     /// is (`config::import_settings`).
     pending_settings: Option<crate::config::Settings>,
+    /// This installation's settings, which a passport's would change.
+    settings: crate::config::Settings,
     /// How much taller the last frame's content was than the window.
     overflow: f32,
 }
@@ -2320,6 +2322,7 @@ impl EnrollApp {
         result: Arc<Mutex<Option<Identity>>>,
     ) -> EnrollApp {
         let current = Identity::load(&paths).ok().flatten();
+        let settings = crate::config::Settings::load(&paths).unwrap_or_default();
         EnrollApp {
             window_restore: WindowRestore::default(),
             #[cfg(windows)]
@@ -2338,6 +2341,7 @@ impl EnrollApp {
             result,
             take_settings: true,
             pending_settings: None,
+            settings,
             overflow: 0.0,
         }
     }
@@ -2491,10 +2495,19 @@ impl eframe::App for EnrollApp {
         // needs a name, which the user types in: the placeholder is the
         // inviter's, not theirs.
         // Nothing pasted yet: nothing to decode, and no log line per frame.
-        let parsed = (!self.link.trim().is_empty())
-            .then(|| Identity::from_passport_with_settings(&self.link).ok())
-            .flatten();
+        let read = (!self.link.trim().is_empty())
+            .then(|| Identity::from_passport_with_settings(&self.link));
+        // Why the text is refused — an expired invitation, a passport from
+        // an older ICU — rather than a bare „not valid“.
+        let refused = read.as_ref().and_then(|r| r.as_ref().err().cloned());
+        let parsed = read.and_then(Result::ok);
         let carries_settings = parsed.as_ref().is_some_and(|(_, s)| s.is_some());
+        // What they change about when this device can be heard (C-3).
+        let changes = parsed
+            .as_ref()
+            .and_then(|(_, s)| s.as_ref())
+            .map(|incoming| self.settings.send_changes(incoming))
+            .unwrap_or_default();
         let parsed = parsed.map(|(identity, _)| identity);
         // Where the pasted text leads, shown before joining: it brings its
         // own CA and address (`PROTOCOL.md` §2.3.1).
@@ -2638,7 +2651,9 @@ impl eframe::App for EnrollApp {
                     ui.add_space(16.0);
 
                     match step {
-                        EnrollStep::Paste => self.paste_step(ui, &tok, busy, valid, needs_name),
+                        EnrollStep::Paste => {
+                            self.paste_step(ui, &tok, busy, valid, needs_name, refused.as_deref())
+                        }
                         EnrollStep::Join => {
                             if let Some(summary) = &summary {
                                 let mut rows = vec![
@@ -2716,6 +2731,14 @@ impl eframe::App for EnrollApp {
                                             .size(11.5)
                                             .color(tok.dim_text),
                                     );
+                                    if self.take_settings && !changes.is_empty() {
+                                        ui.label(
+                                            RichText::new("Ändert, wann und wie du zu hören bist:")
+                                                .size(11.5)
+                                                .color(tok.connecting),
+                                        );
+                                        ui.label(RichText::new(changes.join("\n")).size(11.5));
+                                    }
                                 }
                                 if join_ok && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                     join = true;
@@ -2793,6 +2816,7 @@ impl EnrollApp {
         busy: bool,
         valid: bool,
         needs_name: bool,
+        refused: Option<&str>,
     ) {
         let has_text = !self.link.trim().is_empty();
         ui.label(theme::caps_text("Einladung"));
@@ -2801,7 +2825,25 @@ impl EnrollApp {
         // verdict line under it and the well's own margins; a pasted bundle
         // (~20 armored lines) scrolls inside it.
         const VERDICT_H: f32 = 32.0;
-        let height = (ui.clip_rect().bottom() - ui.cursor().top() - VERDICT_H - 20.0).max(120.0);
+        // A refusal says why, and may take more than the one line reserved.
+        let verdict_h = match refused.filter(|_| has_text) {
+            Some(text) => {
+                let lines = |text: String| {
+                    ui.painter()
+                        .layout(
+                            text,
+                            egui::FontId::proportional(12.0),
+                            tok.error,
+                            ui.available_width(),
+                        )
+                        .size()
+                        .y
+                };
+                VERDICT_H + lines(format!("{}  {text}", icon::WARNING_CIRCLE)) - lines("x".into())
+            }
+            None => VERDICT_H,
+        };
+        let height = (ui.clip_rect().bottom() - ui.cursor().top() - verdict_h - 20.0).max(120.0);
         let well = egui::Frame::new()
             .fill(ui.visuals().extreme_bg_color)
             .corner_radius(egui::CornerRadius::same(theme::R_ROW))
@@ -2863,7 +2905,7 @@ impl EnrollApp {
         } else if has_text {
             (
                 icon::WARNING_CIRCLE,
-                "Das ist keine gültige ICU-Einladung.",
+                refused.unwrap_or("Das ist keine gültige ICU-Einladung."),
                 tok.error,
             )
         } else {

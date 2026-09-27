@@ -76,6 +76,24 @@ pub fn validate_stored_name(name: &str) -> Result<(), NameError> {
     Ok(())
 }
 
+/// Whether `text` can stand next to other text without redrawing it: no
+/// control, formatting (bidi overrides, zero-width characters), line or
+/// paragraph separator characters. The part of [`validate_name`] that
+/// matters for text that is shown but was not chosen as a name — the server
+/// name and address a passport brings — or was issued before the strict
+/// rules; a line break or `U+202E` there could fake or reorder the lines of
+/// an import confirmation.
+pub fn is_plain_text(text: &str) -> bool {
+    use unicode_general_category::{get_general_category, GeneralCategory as G};
+    text.chars().all(|c| {
+        !c.is_control()
+            && !matches!(
+                get_general_category(c),
+                G::Format | G::LineSeparator | G::ParagraphSeparator
+            )
+    })
+}
+
 /// Validates a display name (`PROTOCOL.md` §2.1): 1–32 bytes UTF-8 in NFC,
 /// no control, formatting, private-use, unassigned or separator characters,
 /// single spaces (U+0020) only between words, no leading combining mark, and
@@ -431,6 +449,31 @@ mod tests {
         assert_eq!(validate_name("C\u{0445}ris"), Err(NameError::MixedScript));
         assert_eq!(validate_name("\u{0421}hris"), Err(NameError::MixedScript));
         assert_eq!(validate_name("Ωmega"), Err(NameError::MixedScript));
+    }
+
+    #[test]
+    fn plain_text_has_no_line_breaks_bidi_or_invisible_characters() {
+        for ok in [
+            "icu.example.org",
+            "2001:db8::1",
+            "Ärger 日本語",
+            "o'Neil",
+            "",
+        ] {
+            assert!(is_plain_text(ok), "{ok:?}");
+        }
+        for bad in [
+            "a\nAdresse: x",
+            "a\rb",
+            "\u{1b}[2Jx",
+            "abc\u{202E}def",
+            "a\u{2066}b",
+            "ad\u{200B}min",
+            "a\u{2028}b",
+            "a\u{2029}b",
+        ] {
+            assert!(!is_plain_text(bad), "{bad:?}");
+        }
     }
 
     #[test]

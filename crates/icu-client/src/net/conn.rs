@@ -230,12 +230,15 @@ pub fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// Turns a certificate-verification failure into a clear, user-facing reason.
-/// Maps a failed check of the *server's* certificate. Expired or revoked are
-/// the server operator's to fix (automatic rotation, `rotate-server-cert`),
-/// not the user's: the client keeps retrying and picks up the new leaf, while
-/// verification still refuses the old one. Everything else — wrong CA, wrong
-/// name — will not heal by waiting.
+/// Turns a failed check of the *server's* certificate into a clear,
+/// user-facing reason. None of them is fatal: rustls checks the certificate
+/// before the server's `CertificateVerify` signature, so whoever sent it has
+/// proven nothing yet (`PROTOCOL.md` §1). Expired or revoked are the server
+/// operator's to fix (automatic rotation, `rotate-server-cert`): the client
+/// keeps retrying and picks up the new leaf, while verification still
+/// refuses the old one. Not valid yet is most likely this machine's clock.
+/// Everything else — wrong CA, wrong name — is retried slowly
+/// ([`ConnectError::Unverified`]).
 fn certificate_error(server_name: &str, ce: &rustls::CertificateError) -> ConnectError {
     match ce {
         rustls::CertificateError::Expired | rustls::CertificateError::ExpiredContext { .. } => {
@@ -246,13 +249,17 @@ fn certificate_error(server_name: &str, ce: &rustls::CertificateError) -> Connec
         rustls::CertificateError::Revoked => ConnectError::ServerCert(
             "Serverzertifikat widerrufen – warte auf ein neues vom Server".into(),
         ),
+        rustls::CertificateError::NotValidYet
+        | rustls::CertificateError::NotValidYetContext { .. } => {
+            ConnectError::NotYetValid(describe_certificate_error(ce))
+        }
         rustls::CertificateError::NotValidForName
-        | rustls::CertificateError::NotValidForNameContext { .. } => ConnectError::Certificate {
+        | rustls::CertificateError::NotValidForNameContext { .. } => ConnectError::Unverified {
             server_name: server_name.to_string(),
             issue: CertIssue::NameMismatch,
             detail: describe_certificate_error(ce),
         },
-        _ => ConnectError::Certificate {
+        _ => ConnectError::Unverified {
             server_name: server_name.to_string(),
             issue: CertIssue::Untrusted,
             detail: describe_certificate_error(ce),
@@ -328,10 +335,15 @@ pub async fn connect(
     let conn = match handshake {
         Ok(c) => c,
         Err(e) => {
-            return Err(match cert_failure.take() {
-                Some(rustls::Error::InvalidCertificate(ce)) => certificate_error(server_name, &ce),
-                _ if cert_failure.server_proven() => ConnectError::from_connection_error(e),
-                _ => ConnectError::unauthenticated(e),
+            // Proof first: what the server says after its signature counts,
+            // our own verdict on a certificate nobody vouched for does not.
+            let failure = cert_failure.take();
+            return Err(if cert_failure.server_proven() {
+                ConnectError::from_connection_error(e)
+            } else if let Some(rustls::Error::InvalidCertificate(ce)) = failure {
+                certificate_error(server_name, &ce)
+            } else {
+                ConnectError::unauthenticated(e)
             });
         }
     };
@@ -436,6 +448,24 @@ pub enum ConnectError {
     /// The server's own certificate is expired or revoked: the operator's to
     /// fix, and it heals on its own once the server rotates it. Not fatal.
     ServerCert(String),
+    /// The server's certificate is not valid yet: most likely this machine's
+    /// clock is behind (a dual boot keeping local time, right after the
+    /// server rotated its leaf). Heals with the clock, so not fatal.
+    NotYetValid(String),
+    /// The server's certificate failed our check — another CA, another
+    /// name — before the server proved it holds the key. Anyone on the path
+    /// can present such a certificate (with the com key, or control of DNS),
+    /// so it must not end the reconnects or send the user off for a new
+    /// invitation, which is what an attacker would hand them next
+    /// (`PROTOCOL.md` §1). Retried with [`slow_backoff`].
+    Unverified {
+        /// The FQDN/IP TLS verification ran against.
+        server_name: String,
+        /// Which kind of failure, for the user-facing text.
+        issue: CertIssue,
+        /// What went wrong.
+        detail: String,
+    },
     /// We could not make sense of what the server sent.
     Protocol(String),
     /// The server speaks another protocol version: TLS alert
@@ -450,8 +480,9 @@ pub enum ConnectError {
     /// The server's protocol minor is below [`icu_proto::MIN_PEER_MINOR`]:
     /// the server needs the update, not this client. Fatal.
     ServerTooOld(u16),
-    /// TLS certificate verification failed for `server_name`. Never
-    /// retryable: retrying will not fix a hostname/cert mismatch.
+    /// The server, after proving who it is, refused our certificate with a
+    /// TLS alert (revoked, unknown). Fatal: the same certificate would be
+    /// refused again. `server_name` is empty: the alert names none.
     Certificate {
         /// The FQDN/IP TLS verification ran against.
         server_name: String,
@@ -548,12 +579,21 @@ impl ConnectError {
             ConnectError::Closed { code, .. } => icu_proto::error::is_fatal(*code),
             ConnectError::Transport(_)
             | ConnectError::ServerCert(_)
+            | ConnectError::NotYetValid(_)
+            | ConnectError::Unverified { .. }
             | ConnectError::VersionHint(_) => false,
             ConnectError::Protocol(_)
             | ConnectError::Version(_)
             | ConnectError::ServerTooOld(_) => true,
             ConnectError::Certificate { .. } => true,
         }
+    }
+
+    /// Whether the next attempt waits by [`slow_backoff`] instead of
+    /// [`backoff`]: a certificate nobody vouched for does not heal within
+    /// seconds, and each attempt would only hand the path another handshake.
+    pub fn retries_slowly(&self) -> bool {
+        matches!(self, ConnectError::Unverified { .. })
     }
 
     /// What the user reads (`crate::problem`); `Display` stays technical
@@ -568,6 +608,17 @@ impl ConnectError {
                  Server-Betreiber beheben – ICU versucht es weiter.",
                 technical,
             ),
+            ConnectError::NotYetValid(_) => Problem::new(
+                "Das Zertifikat des Servers gilt erst ab später. Meist geht die Uhr dieses \
+                 Rechners nach – bitte die Systemuhr prüfen. ICU versucht es weiter.",
+                technical,
+            ),
+            ConnectError::Unverified { issue, .. } => match issue {
+                CertIssue::NameMismatch => Problem::new(problem::SERVER_NAME_UNVERIFIED, technical),
+                CertIssue::RevokedByServer | CertIssue::Untrusted => {
+                    Problem::new(problem::SERVER_UNVERIFIED, technical)
+                }
+            },
             ConnectError::Protocol(_) => Problem::new(problem::UPDATE_NEEDED, technical),
             ConnectError::Version(_) | ConnectError::VersionHint(_) => Problem::new(
                 problem::code_text(icu_proto::error::VERSION_UNSUPPORTED),
@@ -609,6 +660,15 @@ impl std::fmt::Display for ConnectError {
             }
             ConnectError::Transport(s) => write!(f, "transport: {s}"),
             ConnectError::ServerCert(s) => f.write_str(s),
+            ConnectError::NotYetValid(s) => write!(f, "Serverzertifikat noch nicht gültig: {s}"),
+            ConnectError::Unverified {
+                server_name,
+                detail,
+                ..
+            } => write!(
+                f,
+                "Zertifikat für „{server_name}“ ungültig (Server nicht ausgewiesen): {detail}"
+            ),
             ConnectError::Protocol(s) => write!(f, "protocol: {s}"),
             ConnectError::Version(s) => write!(f, "version: {s}"),
             ConnectError::VersionHint(s) => write!(f, "version (unbestätigt): {s}"),
@@ -642,6 +702,13 @@ pub fn backoff(attempt: u32) -> Duration {
     })
 }
 
+/// Backoff schedule after a certificate the server did not vouch for
+/// ([`ConnectError::retries_slowly`]): 15, 30, 60, 120, 240, 300, 300, …
+/// seconds. „Neu verbinden“ tries at once.
+pub fn slow_backoff(attempt: u32) -> Duration {
+    Duration::from_secs((15u64 << attempt.min(5)).min(300))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,6 +717,9 @@ mod tests {
     fn backoff_schedule() {
         let s: Vec<u64> = (0..7).map(|a| backoff(a).as_secs()).collect();
         assert_eq!(s, vec![1, 2, 4, 8, 15, 15, 15]);
+        let s: Vec<u64> = (0..8).map(|a| slow_backoff(a).as_secs()).collect();
+        assert_eq!(s, vec![15, 30, 60, 120, 240, 300, 300, 300]);
+        assert_eq!(slow_backoff(u32::MAX).as_secs(), 300);
     }
 
     #[test]
@@ -678,10 +748,79 @@ mod tests {
         let expired = certificate_error("x", &rustls::CertificateError::Expired);
         assert!(matches!(expired, ConnectError::ServerCert(_)));
         assert!(!expired.is_fatal());
+        assert!(!expired.retries_slowly());
         assert!(!certificate_error("x", &rustls::CertificateError::Revoked).is_fatal());
-        let wrong_name = certificate_error("x", &rustls::CertificateError::NotValidForName);
-        assert!(matches!(wrong_name, ConnectError::Certificate { .. }));
-        assert!(wrong_name.is_fatal());
+    }
+
+    /// Our own verdict on the server's certificate comes before the server
+    /// proved anything (review 2026-09-27, C-1): a wrong CA or name is
+    /// retried slowly, never fatal, and does not ask for a new invitation.
+    #[test]
+    fn a_certificate_the_server_did_not_vouch_for_is_retried_slowly() {
+        for ce in [
+            rustls::CertificateError::NotValidForName,
+            rustls::CertificateError::UnknownIssuer,
+            rustls::CertificateError::BadSignature,
+            rustls::CertificateError::BadEncoding,
+        ] {
+            let e = certificate_error("icu.example.org", &ce);
+            assert!(
+                matches!(e, ConnectError::Unverified { .. }),
+                "{ce:?}: {e:?}"
+            );
+            assert!(!e.is_fatal(), "{ce:?}");
+            assert!(e.retries_slowly(), "{ce:?}");
+            let p = e.problem();
+            crate::problem::tests::assert_readable(&p);
+            assert!(p.text.contains("anderem Weg"), "{}", p.text);
+            assert!(!p.text.contains("neue Einladung"), "{}", p.text);
+            assert!(p.technical.unwrap().contains("icu.example.org"));
+        }
+    }
+
+    /// A server leaf that is not valid yet reads as this machine's clock
+    /// being behind, and is retried like an expired one — with the real
+    /// verifier, the way a rotation an hour ago meets a slow clock.
+    #[test]
+    fn a_server_certificate_from_the_future_asks_to_check_the_clock() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["icu.example.org".into()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2030, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2031, 1, 1);
+        let leaf = params.signed_by(&key, &issuer).unwrap();
+
+        let verifier = server_verifier(
+            ca.der(),
+            None,
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .unwrap();
+        let before = UnixTime::since_unix_epoch(Duration::from_secs(1_893_456_000 - 3600));
+        let err = verifier
+            .verify_server_cert(
+                leaf.der(),
+                &[],
+                &ServerName::try_from("icu.example.org").unwrap(),
+                &[],
+                before,
+            )
+            .unwrap_err();
+        let rustls::Error::InvalidCertificate(ce) = err else {
+            panic!("{err:?}");
+        };
+        let e = certificate_error("icu.example.org", &ce);
+        assert!(matches!(e, ConnectError::NotYetValid(_)), "{e:?}");
+        assert!(!e.is_fatal());
+        assert!(!e.retries_slowly(), "heals with the clock");
+        let p = e.problem();
+        crate::problem::tests::assert_readable(&p);
+        assert!(p.text.contains("Systemuhr"), "{}", p.text);
     }
 
     /// A TLS alert from the server, as quinn reports it.
@@ -807,7 +946,7 @@ mod tests {
             assert!(p.technical.is_some(), "{e}");
         }
         let untrusted = certificate_error("x", &rustls::CertificateError::UnknownIssuer).problem();
-        assert_eq!(untrusted.text, crate::problem::CREDENTIALS_STALE);
+        assert_eq!(untrusted.text, crate::problem::SERVER_UNVERIFIED);
         assert!(untrusted.technical.unwrap().contains("UnknownIssuer"));
     }
 
