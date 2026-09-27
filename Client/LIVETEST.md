@@ -163,7 +163,7 @@ Bekannte Abweichungen von Linux (Paritäts-Audit 2026-09-26), gezielt prüfen:
 - [x] **Loopback ohne Wiedergabe**: bei fehlgeschlagener WASAPI-Wiedergabe wird die Referenz geschlossen und die DSP wartet nicht auf einen stillstehenden Loopback; das Öffnen wird mit Backoff wiederholt.
 - [x] **Tastenkombinationen**: Windows wertet einen Portal-Trigger aus, wenn `key` leer ist; Modifier- und Release-Semantik durch Regressionstests geprüft, Desktop-Prüfung im Gate-Bericht.
 - [ ] **Standardgerät**: gefolgt wird der Rolle „Standardgerät“ (eConsole), nicht „Standardkommunikationsgerät“.
-- [ ] **Abmelden**: `WM_ENDSESSION` hält bis zu 5 s ohne `ShutdownBlockReasonCreate`.
+- [ ] **Abmelden**: `WM_ENDSESSION` hält bis zu 5 s, seit 2026-09-27 mit `ShutdownBlockReasonCreate` („ICU meldet sich vom Server ab …“); `taskkill /PID <pid>` ohne `/F` beendet ICU samt Abmeldung beim Server wie SIGTERM, danach verabschiedet sich ein neu gestartetes ICU beim Abmelden weiterhin (Server-Log `left reason=NO_ERROR`).
 
 
 ### Ergänzender Gate-Lauf auf 10.2.0.201
