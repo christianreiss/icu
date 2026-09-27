@@ -3007,6 +3007,7 @@ pub(super) fn binding_row(
                     portal || (cfg!(windows) && binding.key.trim().is_empty()),
                     binding.trigger.as_deref(),
                 ) {
+                    (true, _) if assigned.as_deref() == Some("") => "—".to_string(),
                     (true, _) if assigned.is_some() => assigned.unwrap_or_default(),
                     (true, Some(t)) => t.to_string(),
                     _ if binding.key.is_empty() => "—".to_string(),

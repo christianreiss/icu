@@ -26,7 +26,12 @@ pub(crate) fn ptt_key_label(hotkeys: &crate::config::HotkeySettings, backend: &s
     let binding = &hotkeys.ptt;
     if backend == "portal" {
         if let Some(assigned) = crate::hotkey::portal_trigger(crate::hotkey::Action::Ptt) {
-            return assigned;
+            // Left blank in the dialog: no key works, whatever was proposed.
+            return if assigned.is_empty() {
+                "—".to_string()
+            } else {
+                assigned
+            };
         }
     }
     if backend == "portal"

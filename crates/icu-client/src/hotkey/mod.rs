@@ -160,16 +160,18 @@ pub const BACKEND_STARTING: &str = "starting";
 static PORTAL_TRIGGERS: std::sync::Mutex<(u64, Vec<(String, String)>)> =
     std::sync::Mutex::new((0, Vec::new()));
 
-/// The key the desktop assigned to `action` in the running portal session;
-/// `None` without one, or when the desktop named no key. The windows show
-/// it instead of the proposed trigger (`ui::ptt_key_label`).
+/// The key the desktop assigned to `action` in the running portal session:
+/// empty when it bound the action without a key (the user left it blank in
+/// the dialog), `None` without a session or when the action is not in it.
+/// The windows show it instead of the proposed trigger
+/// (`ui::ptt_key_label`).
 pub fn portal_trigger(action: Action) -> Option<String> {
     let bound = PORTAL_TRIGGERS.lock().unwrap_or_else(|e| e.into_inner());
     bound
         .1
         .iter()
-        .find(|(id, desc)| id == action.portal_id() && !desc.trim().is_empty())
-        .map(|(_, desc)| desc.clone())
+        .find(|(id, _)| id == action.portal_id())
+        .map(|(_, desc)| desc.trim().to_string())
 }
 
 /// Records what a new portal session bound; returns the session's tag for
@@ -447,7 +449,11 @@ mod tests {
             portal_trigger(Action::Camera).as_deref(),
             Some("Strg+Umschalt+K")
         );
-        assert_eq!(portal_trigger(Action::Mute), None, "no key named");
+        assert_eq!(
+            portal_trigger(Action::Mute).as_deref(),
+            Some(""),
+            "bound without a key"
+        );
         assert_eq!(portal_trigger(Action::Deafen), None, "not bound");
         let second = portal_bound(vec![("camera".into(), "Pause".into())]);
         portal_unbound(first);
