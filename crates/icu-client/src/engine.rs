@@ -4390,6 +4390,10 @@ impl CameraLink {
     /// Sends one encoded frame on the live connection; `Err` when not
     /// connected or when flow control dropped it.
     pub fn send_frame(&self, keyframe: bool, ts: u32, data: &[u8]) -> Result<(), String> {
+        // A frame encoded just before the camera went off stays here.
+        if !self.shared.state.borrow().camera_on {
+            return Err("camera off".into());
+        }
         let Some(sender) = lock(&self.shared.video_tx).clone() else {
             return Err("not connected".into());
         };
@@ -4422,10 +4426,18 @@ impl CameraLink {
 
     /// The tier the camera thread encodes at: [`CameraLink::video_tier`],
     /// or paused while no peer is viewing (`UserFlags::VIEWING`) — the
-    /// server would relay the frames to nobody. Resuming builds a fresh
-    /// encoder, whose first frame is an IDR.
+    /// server would relay the frames to nobody — and while the camera is
+    /// off in the engine. The latter at once: the window's
+    /// `CameraHandle::sync`, which stops sending too, does not run while
+    /// the window is hidden or minimised, and a hotkey switches the camera
+    /// off just the same. Resuming builds a fresh encoder, whose first
+    /// frame is an IDR.
     pub fn send_tier(&self) -> VideoTier {
-        send_tier(self.video_tier(), &self.shared.state.borrow().peers)
+        let state = self.shared.state.borrow();
+        if !state.camera_on {
+            return VideoTier::T4;
+        }
+        send_tier(self.video_tier(), &state.peers)
     }
 
     /// Whether an IDR was requested since the last call (server
