@@ -16,7 +16,7 @@ use std::{
 use openh264::{
     encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, RateControlMode, UsageType},
     formats::{RgbSliceU8, YUVBuffer},
-    OpenH264API,
+    OpenH264API, Timestamp,
 };
 
 use crate::{
@@ -296,13 +296,27 @@ impl FrameSource for SyntheticSource {
     }
 }
 
+/// Frames per second `tier` encodes: the capture rate thinned by its
+/// [`VideoTier::frame_divisor`]; 0 at `T4`.
+pub fn frame_rate(tier: VideoTier) -> f32 {
+    match tier.frame_divisor() {
+        0 => 0.0,
+        n => FPS as f32 / n as f32,
+    }
+}
+
 /// The encoder configuration for one [`VideoTier`]. Never called for `T4`
 /// (paused): `run_sender` simply stops encoding instead of building an
 /// encoder with a zero bitrate.
+///
+/// The frame rate is the tier's own, not the capture rate: openh264's rate
+/// control budgets every frame as bitrate ÷ configured frame rate, so an
+/// encoder told 15 fps and fed a third of that spent a third of the tier's
+/// bitrate (T1 ≈ 50 instead of 100 kbit/s, T3 ≈ 8 instead of 40).
 pub fn encoder(tier: VideoTier) -> Result<Encoder, String> {
     let cfg = EncoderConfig::new()
         .bitrate(BitRate::from_bps(tier.bitrate()))
-        .max_frame_rate(FrameRate::from_hz(FPS as f32))
+        .max_frame_rate(FrameRate::from_hz(frame_rate(tier)))
         .usage_type(UsageType::CameraVideoRealTime)
         .rate_control_mode(RateControlMode::Bitrate);
     Encoder::with_api_config(OpenH264API::from_source(), cfg).map_err(|e| e.to_string())
@@ -399,6 +413,9 @@ pub fn run_sender(
                 continue;
             }
         };
+        // When the picture arrived: the wire timestamp, and what openh264's
+        // rate control measures the real frame spacing with.
+        let captured = start.elapsed();
         if failed > 0 {
             tracing::info!(failed, "camera frames again");
             failed = 0;
@@ -446,9 +463,8 @@ pub fn run_sender(
         if want_idr {
             enc.force_intra_frame();
         }
-        let ts =
-            (start.elapsed().as_secs_f64() * f64::from(crate::audio::SAMPLE_RATE)) as u64 as u32;
-        match enc.encode(buf) {
+        let ts = (captured.as_secs_f64() * f64::from(crate::audio::SAMPLE_RATE)) as u64 as u32;
+        match enc.encode_at(buf, Timestamp::from_millis(captured.as_millis() as u64)) {
             Ok(bs) => {
                 let keyframe = matches!(bs.frame_type(), FrameType::IDR | FrameType::I);
                 if keyframe {
@@ -832,6 +848,61 @@ mod tests {
         );
         assert!(matches!(types[1].0, FrameType::P));
         assert!(types.iter().all(|(_, n)| *n > 0));
+    }
+
+    /// A picture that keeps the rate control busy: a moving gradient under
+    /// fresh noise every frame, so no tier can sit far below its budget.
+    fn busy_frame(i: u32, seed: &mut u32) -> YUVBuffer {
+        let (w, h) = (WIDTH as usize, HEIGHT as usize);
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 17;
+                *seed ^= *seed << 5;
+                let noise = (*seed % 48) as i32 - 24;
+                let base = ((x + y + i as usize * 3) % 200) as i32 + 28;
+                let i = (y * w + x) * 3;
+                for c in 0..3 {
+                    rgb[i + c] = (base + noise + c as i32 * 10).clamp(0, 255) as u8;
+                }
+            }
+        }
+        YUVBuffer::from_rgb_source(RgbSliceU8::new(&rgb, (w, h)))
+    }
+
+    /// kbit/s `enc` spends on 20 s of busy pictures at `fps`, stamped with
+    /// their capture time.
+    fn spent_kbps(enc: &mut Encoder, fps: f32) -> f64 {
+        const SECONDS: f32 = 20.0;
+        let mut seed = 0x9e37_79b9;
+        let mut bytes = 0usize;
+        let frames = (SECONDS * fps) as u32;
+        for i in 0..frames {
+            let yuv = busy_frame(i, &mut seed);
+            let at = Timestamp::from_millis(((i as f32 * 1000.0) / fps) as u64);
+            bytes += enc.encode_at(&yuv, at).unwrap().to_vec().len();
+        }
+        bytes as f64 * 8.0 / SECONDS as f64 / 1000.0
+    }
+
+    /// Every tier spends its own bitrate at its own frame rate. With the
+    /// capture rate configured for all of them, openh264 budgeted each frame
+    /// for 15 fps and the thinned tiers got ½ to ⅕ of theirs (measured with
+    /// this test: T1 50, T2 20, T3 8 kbit/s).
+    #[test]
+    fn each_tier_spends_its_bitrate() {
+        for tier in [VideoTier::T0, VideoTier::T1, VideoTier::T2, VideoTier::T3] {
+            let fps = frame_rate(tier);
+            assert_eq!(fps * tier.frame_divisor() as f32, FPS as f32);
+            let kbps = spent_kbps(&mut encoder(tier).unwrap(), fps);
+            let target = f64::from(tier.bitrate()) / 1000.0;
+            assert!(
+                (0.8 * target..=1.2 * target).contains(&kbps),
+                "{tier:?}: {kbps:.1} kbit/s for a target of {target}"
+            );
+        }
+        assert_eq!(frame_rate(VideoTier::T4), 0.0);
     }
 
     #[test]
