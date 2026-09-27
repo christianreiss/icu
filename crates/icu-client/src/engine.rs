@@ -548,6 +548,11 @@ struct Speaker {
     /// Loss accounting for `LossReport`: (played, lost) at the last report.
     report_base: (u64, u64),
     last_reported_permille: u16,
+    /// When a `LossReport` for this speaker last went out.
+    last_report_at: Option<Instant>,
+    /// The last report window saw none of its traffic: the server has
+    /// forgotten the figure by the time it speaks again.
+    loss_idle: bool,
     /// The frame last queued for this speaker was quiet (below
     /// [`QUIET_RMS`]): the jitter buffer may adjust its depth now without
     /// anyone hearing it (`JitterBuffer::pop_quiet`).
@@ -585,6 +590,8 @@ impl Speaker {
             concealed: 0,
             report_base: (0, 0),
             last_reported_permille: 0,
+            last_report_at: None,
+            loss_idle: false,
             quiet: true,
         })
     }
@@ -3532,7 +3539,7 @@ async fn run_session(
             }
             _ = loss_tick.tick() => {
                 prune_stray_speakers(shared);
-                let (reports, measured) = collect_loss_reports(shared);
+                let (reports, measured) = collect_loss_reports(shared, Instant::now());
                 // After `collect_loss_reports` returned, so the `speakers`
                 // lock it holds is gone: `send_modify` while holding one is
                 // how this engine would deadlock.
@@ -3899,12 +3906,11 @@ fn prune_stray_speakers(shared: &Arc<Shared>) {
 type LossPerSpeaker = Vec<(Session, u16)>;
 
 /// Reads each speaker's jitter buffer and returns `(to_report, measured)`:
-/// the first is what goes on the wire as `LossReport`, still gated on a
-/// ≥10 ‰ change so idle jitter does not chatter at the server; the second is
-/// every speaker's current figure, for the Verbindung window. The gate
-/// mutates `last_reported_permille`, so the caller cannot re-derive one from
-/// the other — hence both.
-fn collect_loss_reports(shared: &Arc<Shared>) -> (LossPerSpeaker, LossPerSpeaker) {
+/// the first is what goes on the wire as `LossReport`
+/// ([`loss_report_due`]); the second is every speaker's current figure, for
+/// the Verbindung window. The gate mutates `last_reported_permille`, so the
+/// caller cannot re-derive one from the other — hence both.
+fn collect_loss_reports(shared: &Arc<Shared>, now: Instant) -> (LossPerSpeaker, LossPerSpeaker) {
     let mut report = Vec::new();
     let mut all = Vec::new();
     let mut speakers = lock(&shared.speakers);
@@ -3915,18 +3921,56 @@ fn collect_loss_reports(shared: &Arc<Shared>) -> (LossPerSpeaker, LossPerSpeaker
         sp.report_base = (st.played, st.lost);
         let total = played + lost;
         if total == 0 {
+            sp.loss_idle = true;
             continue;
         }
+        let resumed = std::mem::take(&mut sp.loss_idle);
         let permille = ((lost * 1000) / total) as u16;
         all.push((*session, permille));
-        // The ≥10 ‰ gate is what keeps `LossReport` off the wire for noise;
-        // it must stay exactly as it was. `all` is display only.
-        if permille.abs_diff(sp.last_reported_permille) >= 10 {
+        if loss_report_due(
+            permille,
+            sp.last_reported_permille,
+            sp.last_report_at,
+            resumed,
+            now,
+        ) {
             sp.last_reported_permille = permille;
+            sp.last_report_at = Some(now);
             report.push((*session, permille));
         }
     }
     (report, all)
+}
+
+/// A change smaller than this does not go out on its own: jitter noise must
+/// not chatter at the server.
+const LOSS_REPORT_STEP: u16 = 10;
+
+/// A figure other than 0 goes out again once the last report is this old:
+/// every second 2-s report tick, i.e. every 4 s, inside the server's
+/// `LOSS_REPORT_TTL_S`.
+const LOSS_REPORT_REFRESH: Duration = Duration::from_secs(3);
+const _: () = assert!(LOSS_REPORT_REFRESH.as_secs() + 2 < pl::LOSS_REPORT_TTL_S);
+
+/// Whether this window's figure for a speaker goes out as `LossReport`
+/// (`PROTOCOL.md` §2.2 Nr. 11): a change of at least [`LOSS_REPORT_STEP`];
+/// and a figure other than 0 also once the last report is
+/// [`LOSS_REPORT_REFRESH`] old, and in the first window with traffic after
+/// one without (`resumed`). The server forgets a report after 6 s and then
+/// tells the speaker 0 ‰: sent only on change, a steady loss expired after
+/// 6 s, and every push-to-talk sentence after a pause started at the FEC
+/// floor.
+fn loss_report_due(
+    permille: u16,
+    last: u16,
+    last_at: Option<Instant>,
+    resumed: bool,
+    now: Instant,
+) -> bool {
+    permille.abs_diff(last) >= LOSS_REPORT_STEP
+        || (permille > 0
+            && (resumed
+                || last_at.is_none_or(|t| now.saturating_duration_since(t) >= LOSS_REPORT_REFRESH)))
 }
 
 /// The cumulative byte counters one `net_tick` reads, so the next tick can
@@ -4644,6 +4688,53 @@ mod tests {
         assert_eq!(video.frames(3), 0, "a stale frame creates no receiver");
         let _ = video.accept_for(new, 3, &frame());
         assert_eq!(video.frames(3), 1);
+    }
+
+    /// Steady loss is reported again every 4 s, so the server's 6-s expiry
+    /// never drops it; after a pause the first window reports it at once;
+    /// a clean line stays quiet.
+    #[test]
+    fn a_steady_loss_is_reported_before_the_server_forgets_it() {
+        let t0 = Instant::now();
+        let mut last = 0u16;
+        let mut last_at = None;
+        let mut sent = Vec::new();
+        // One 2-s window: its figure, or `None` without traffic.
+        let mut idle = false;
+        let mut window = |s: u64, figure: Option<u16>, sent: &mut Vec<(u64, u16)>| {
+            let Some(permille) = figure else {
+                idle = true;
+                return;
+            };
+            let now = t0 + Duration::from_secs(s);
+            let resumed = std::mem::take(&mut idle);
+            if loss_report_due(permille, last, last_at, resumed, now) {
+                last = permille;
+                last_at = Some(now);
+                sent.push((s, permille));
+            }
+        };
+        for s in (0..20).step_by(2) {
+            window(s, Some(if s % 4 == 0 { 50 } else { 52 }), &mut sent);
+        }
+        let times: Vec<u64> = sent.iter().map(|(s, _)| *s).collect();
+        assert_eq!(times, [0, 4, 8, 12, 16], "every 4 s: {sent:?}");
+        sent.clear();
+        // A pause of 10 s: the server has forgotten the figure.
+        for s in (20..30).step_by(2) {
+            window(s, None, &mut sent);
+        }
+        window(30, Some(48), &mut sent);
+        assert_eq!(sent, [(30, 48)], "at once after the pause");
+        sent.clear();
+        window(32, Some(0), &mut sent);
+        assert_eq!(sent, [(32, 0)], "the change to 0");
+        for s in (34..60).step_by(2) {
+            window(s, Some(0), &mut sent);
+        }
+        window(60, None, &mut sent);
+        window(62, Some(0), &mut sent);
+        assert_eq!(sent, [(32, 0)], "a clean line stays quiet");
     }
 
     /// A stream that did not open is tried again 1, 2, 4 … 30 s after the
