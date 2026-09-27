@@ -6,7 +6,9 @@
 //! live, instead of collecting seconds of video in the network and the
 //! server's send queue; its sender hears about it through
 //! `VideoCongestionHint`, and a healthy viewer of the same sender notices
-//! nothing.
+//! nothing. A viewer that acknowledges nothing at all has its frames reset
+//! at their deadline and when their forwarder ends (external review
+//! 2026-09-27).
 
 mod common;
 
@@ -237,5 +239,140 @@ async fn a_viewer_with_a_narrow_downlink_drops_frames_instead_of_lagging() {
         "the sender gets a VideoCongestionHint"
     );
     assert!(carol.conn.close_reason().is_none(), "no disconnect");
+    server.shutdown().await;
+}
+
+/// A UDP relay in front of the server whose server-to-client direction can
+/// be cut: while the returned flag is set, whatever the server sends is lost,
+/// so the viewer acknowledges nothing. Lost, not held back — packets let
+/// through later would still deliver the frame they carry. Returns the
+/// address to connect to.
+async fn cuttable_downlink(server: SocketAddr) -> (SocketAddr, watch::Sender<bool>) {
+    let front = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let back = std::sync::Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    back.connect(server).await.unwrap();
+    let addr = front.local_addr().unwrap();
+    let (client_tx, client_rx) = watch::channel(None::<SocketAddr>);
+    let (cut_tx, cut_rx) = watch::channel(false);
+
+    let (up_front, up_back) = (front.clone(), back.clone());
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_536];
+        while let Ok((n, from)) = up_front.recv_from(&mut buf).await {
+            client_tx.send_replace(Some(from));
+            let _ = up_back.send(&buf[..n]).await;
+        }
+    });
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65_536];
+        while let Ok(n) = back.recv(&mut buf).await {
+            let (cut, client) = (*cut_rx.borrow(), *client_rx.borrow());
+            if let (false, Some(client)) = (cut, client) {
+                let _ = front.send_to(&buf[..n], client).await;
+            }
+        }
+    });
+    (addr, cut_tx)
+}
+
+/// Turns the camera on and waits for the server to echo it.
+async fn camera_on(client: &mut Client) {
+    let session = client.session;
+    client
+        .send_msg(&ControlMsg::SetState {
+            flags: UserFlags(UserFlags::CAMERA_ON),
+        })
+        .await;
+    client
+        .recv_matching(|m| matches!(m, ControlMsg::UserState { session: s, flags } if *s == session && flags.camera_on()))
+        .await
+        .expect("camera on");
+}
+
+/// The last frame before a pause, to a viewer that acknowledges nothing, is
+/// given up at its deadline like any other: reset, so quinn stops
+/// retransmitting it, and counted (external review 2026-09-27). Before, the
+/// deadline was only watched with `VIDEO_UNACKED_PER_PAIR` frames in flight;
+/// a lone frame was retransmitted for as long as the connection lasted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_frame_before_a_pause_is_given_up_at_its_deadline() {
+    let server = TestServer::start_with(|c| c.timing.video_frame_timeout_ms = 300).await;
+    let mut alice = server.client("alice").await;
+    let (link, cut) = cuttable_downlink(server.addr()).await;
+    let bob = viewer_via(&server, link, "bob").await;
+    camera_on(&mut alice).await;
+
+    cut.send_replace(true);
+    alice.send_video(1, 0, true, &[0x41; 1_000]).await;
+    let counters = &server.handle.server().counters;
+    tokio::time::timeout(SOON, async {
+        while Counters::get(&counters.video_dropped_slow_receiver) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the unacknowledged frame is given up at its deadline");
+
+    // Frame 1 was reset, so the first frame bob gets in full is the next
+    // keyframe. A reset stream may still be accepted, and reads as nothing.
+    cut.send_replace(false);
+    alice.send_video(2, 6000, true, &[0x42; 1_000]).await;
+    let seq = tokio::time::timeout(SOON, async {
+        loop {
+            if let Some((header, _)) = bob.recv_video(SOON).await {
+                return header.seq;
+            }
+        }
+    })
+    .await
+    .expect("the pair gets going again with the next keyframe");
+    assert_eq!(seq, 2, "frame 1 arrived after it was given up");
+    server.shutdown().await;
+}
+
+/// Frames still in flight when their forwarder ends are reset as well: a
+/// dropped quinn `SendStream` is finished, not abandoned, and would go on
+/// being retransmitted to a viewer long after the sender left (external
+/// review 2026-09-27).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn frames_in_flight_are_reset_when_the_forwarder_ends() {
+    // A deadline far beyond the test: only the forwarder's end can reset.
+    let server = TestServer::start_with(|c| c.timing.video_frame_timeout_ms = 60_000).await;
+    let mut alice = server.client("alice").await;
+    let (link, cut) = cuttable_downlink(server.addr()).await;
+    let mut bob = viewer_via(&server, link, "bob").await;
+    let session = alice.session;
+    camera_on(&mut alice).await;
+
+    cut.send_replace(true);
+    alice.send_video(1, 0, true, &[0x41; 1_000]).await;
+    let srv = server.handle.server();
+    tokio::time::timeout(SOON, async {
+        while Counters::get(&srv.counters.video_frames_out) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the frame is handed to quinn");
+
+    // The sender leaves: its slots close and the forwarder ends.
+    alice.conn.close(icu_proto::error::SHUTDOWN.into(), b"");
+    tokio::time::timeout(SOON, async {
+        while srv.room.flags(session).is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the server sees alice leave");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    cut.send_replace(false);
+    bob.recv_matching(|m| matches!(m, ControlMsg::UserLeft { session: s, .. } if *s == session))
+        .await
+        .expect("the downlink carries again");
+    assert!(
+        bob.recv_video(Duration::from_secs(2)).await.is_none(),
+        "a frame of a sender that left was still delivered"
+    );
     server.shutdown().await;
 }

@@ -553,6 +553,54 @@ struct InFlight {
     deadline: tokio::time::Instant,
 }
 
+/// How a frame in flight ended.
+enum Settled {
+    /// The receiver acknowledged all of it, or stopped it.
+    Acked,
+    /// Past its deadline; it was reset.
+    Late,
+    /// The connection is gone.
+    Gone,
+}
+
+impl InFlight {
+    /// Waits for the acknowledgement or the deadline, whichever comes first.
+    /// A late frame is reset, or quinn would retransmit it until the receiver
+    /// has all of it.
+    async fn settle(&mut self) -> Settled {
+        tokio::select! {
+            biased;
+            acked = &mut self.acked => match acked {
+                Ok(_) => Settled::Acked,
+                Err(_) => Settled::Gone,
+            },
+            _ = tokio::time::sleep_until(self.deadline) => {
+                let _ = self.send.reset(quinn::VarInt::from_u32(icu_proto::error::RATE_LIMITED));
+                Settled::Late
+            }
+        }
+    }
+}
+
+/// The frames of one pair in flight, oldest first. Whatever is still in here
+/// when the forwarder ends is reset: a dropped [`quinn::SendStream`] is
+/// finished, not abandoned, and quinn would go on (re)transmitting it to a
+/// receiver nothing is forwarded to anymore (external review 2026-09-27). A
+/// stream the receiver acknowledged in full is gone from quinn by then, and
+/// its reset does nothing.
+#[derive(Default)]
+struct InFlightFrames(VecDeque<InFlight>);
+
+impl Drop for InFlightFrames {
+    fn drop(&mut self) {
+        for frame in &mut self.0 {
+            let _ = frame
+                .send
+                .reset(quinn::VarInt::from_u32(icu_proto::error::RATE_LIMITED));
+        }
+    }
+}
+
 /// Writes whatever is in the slot to one receiver, one stream per frame.
 ///
 /// `finish()` only queues a frame; quinn delivers it later. Counting frames
@@ -562,7 +610,9 @@ struct InFlight {
 /// [`VIDEO_UNACKED_PER_PAIR`](icu_proto::limits::VIDEO_UNACKED_PER_PAIR)
 /// frames stay unacknowledged; the next one waits in the slot, where newer
 /// frames replace or drop it. One not acknowledged by its deadline is reset
-/// and the pair waits for a keyframe.
+/// and the pair waits for a keyframe — also the last one before a pause,
+/// with fewer than the limit in flight. Frames still in flight when the
+/// forwarder ends are reset without being counted ([`InFlightFrames`]).
 async fn forward_frames(
     server: Arc<Server>,
     conn: quinn::Connection,
@@ -572,7 +622,7 @@ async fn forward_frames(
     let closed = conn.closed();
     let shutdown = server.shutdown_requested();
     tokio::pin!(closed, shutdown);
-    let mut in_flight: VecDeque<InFlight> = VecDeque::new();
+    let mut in_flight = InFlightFrames::default();
     let lost = |slot: &Slot| {
         Counters::inc(&server.counters.video_dropped_slow_receiver);
         if slot.lost() {
@@ -580,39 +630,40 @@ async fn forward_frames(
         }
     };
     loop {
-        if in_flight.len() >= icu_proto::limits::VIDEO_UNACKED_PER_PAIR {
-            if let Some(oldest) = in_flight.front_mut() {
-                tokio::select! {
-                    biased;
-                    _ = slot.closed() => return,
-                    _ = &mut shutdown => return,
-                    _ = &mut closed => return,
-                    acked = &mut oldest.acked => {
-                        if acked.is_err() {
-                            return;
-                        }
-                    }
-                    _ = tokio::time::sleep_until(oldest.deadline) => {
-                        // Not delivered in time: stop retransmitting it.
-                        let code = quinn::VarInt::from_u32(icu_proto::error::RATE_LIMITED);
-                        let _ = oldest.send.reset(code);
-                        lost(&slot);
-                    }
-                }
+        let frame = if in_flight.0.len() < icu_proto::limits::VIDEO_UNACKED_PER_PAIR {
+            slot.take()
+        } else {
+            None
+        };
+        let Some(frame) = frame else {
+            if slot.is_closed() {
+                return;
             }
-            in_flight.pop_front();
+            // The oldest frame in flight is watched whether or not the limit
+            // is reached: otherwise the last one before a pause would be
+            // retransmitted for as long as the connection lasts. `notify`
+            // (an offer or a close) is awaited alone, never together with
+            // `slot.closed()`: `notify_one` wakes only one of two waiters.
+            let oldest = async {
+                match in_flight.0.front_mut() {
+                    Some(oldest) => oldest.settle().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let settled = tokio::select! {
+                biased;
+                _ = &mut shutdown => return,
+                _ = &mut closed => return,
+                settled = oldest => settled,
+                _ = slot.notify.notified() => continue,
+            };
+            match settled {
+                Settled::Acked => {}
+                Settled::Late => lost(&slot),
+                Settled::Gone => return,
+            }
+            in_flight.0.pop_front();
             continue;
-        }
-        let frame = match slot.take() {
-            Some(frame) => frame,
-            None if slot.is_closed() => return,
-            None => {
-                tokio::select! {
-                    _ = slot.notify.notified() => continue,
-                    _ = &mut closed => return,
-                    _ = &mut shutdown => return,
-                }
-            }
         };
         // Cover both stream credit and write flow control. A peer can keep
         // control/audio alive while refusing video indefinitely; closing a
@@ -655,7 +706,7 @@ async fn forward_frames(
         if send.finish().is_ok() {
             Counters::inc(&server.counters.video_frames_out);
             let acked = Box::pin(send.stopped());
-            in_flight.push_back(InFlight {
+            in_flight.0.push_back(InFlight {
                 send,
                 acked,
                 deadline,

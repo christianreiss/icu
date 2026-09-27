@@ -19,6 +19,7 @@ sudo apt install ./icu-server_<ver>-1_amd64.deb          # Debian 12+
 sudoedit /etc/icu/server.toml                            # server_name, public_host (optional)
 sudo systemctl enable --now icu-server
 sudo firewall-cmd --permanent --add-service=icu && sudo firewall-cmd --reload
+sudo icu-server invite --out admin.txt                   # zuerst sich selbst (§3 „Erster Admin“)
 ```
 
 Das Paket legt die Gruppe `icu` an (`/usr/lib/sysusers.d/icu-server.conf`),
@@ -189,7 +190,7 @@ sudo firewall-cmd --permanent --add-port=4711/udp && sudo firewall-cmd --reload
 Freigeben muss man nur den einen UDP-Port; der Server braucht keinen
 Reverse-Proxy und kein TLS davor, er terminiert QUIC/TLS 1.3 selbst.
 
-**Der Port schweigt ohne Com-Schlüssel** (2026-09-27, wie OpenVPN `tls-auth`,
+**Der Port schweigt ohne Com-Schlüssel** (2026-09-27, nach dem Vorbild von OpenVPN `tls-auth`, ohne dessen Replay-Schutz,
 `PROTOCOL.md` §1): jedes Datagramm trägt ein 16-Byte-HMAC-Tag aus `com.key`,
 und was keins trägt, verwirft der Server, bevor QUIC es sieht — kein
 Handshake, keine Version Negotiation, kein Stateless Reset. Ein Portscan
@@ -316,12 +317,17 @@ her ist. Wer einen Zugang wirklich beenden will, nimmt `revoke` oder
 podman build -f deploy/Dockerfile -t icu-server .
 podman volume create icu-state
 podman run -d --name icu \
+  --memory 1g --restart on-failure \
   -p 4711:4711/udp \
   -v icu-state:/var/lib/icu \
   -v ./server.toml:/etc/icu/server.toml:ro \
   icu-server
 podman exec icu /icu-server invite --name alice
 ```
+
+Die Härtung der systemd-Unit (Sandbox, `MemoryMax=1G`, `Restart=on-failure`)
+gilt im Container nicht: Speichergrenze und Neustart setzt man dort selbst wie
+oben, den Start mit dem Host etwa per Quadlet-Unit.
 
 Das Image erwartet das musl-Binary aus Schritt 1 unter
 `target/x86_64-unknown-linux-musl/release-server/icu-server`. Baut man mit dem
@@ -347,6 +353,10 @@ rootless podman `-v ./state:/var/lib/icu:U` verwenden.
 sudo install -m0755 deploy/checkmk/icu_server /usr/lib/check_mk_agent/local/
 sudo usermod -aG icu root      # oder den Agent-User in die Gruppe icu
 ```
+
+Die Gruppe `icu` ist volle Serververwaltung, kein Lesezugriff: wer den
+Admin-Socket erreicht, kann auch einladen, sperren und widerrufen (§6). Einen
+Socket nur für Monitoring gibt es nicht.
 
 Er ruft `icu-server status --json` auf. `ICU_Server` liefert die
 Momentanwerte `online`, `uptime`, `open_connections` und `handshakes` und aus
