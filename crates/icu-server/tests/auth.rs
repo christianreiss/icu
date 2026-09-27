@@ -139,8 +139,13 @@ async fn revoke_during_a_connection_kicks_with_kicked() {
         .admin(AdminRequest::Revoke { user: "bob".into() })
         .await;
     match response {
-        AdminResponse::Revoke { user_id, closed } => {
+        AdminResponse::Revoke {
+            user_id,
+            name,
+            closed,
+        } => {
             assert_eq!(user_id, 2);
+            assert_eq!(name, "bob", "the answer names whom the selector hit");
             assert_eq!(closed, 1, "the live connection is closed immediately");
         }
         other => panic!("revoke failed: {other:?}"),
@@ -226,8 +231,13 @@ async fn disabling_an_online_user_kicks_immediately() {
         .admin(AdminRequest::Disable { user: "bob".into() })
         .await;
     match response {
-        AdminResponse::Disable { user_id, closed } => {
+        AdminResponse::Disable {
+            user_id,
+            name,
+            closed,
+        } => {
             assert_eq!(user_id, 2);
+            assert_eq!(name, "bob", "the answer names whom the selector hit");
             assert_eq!(closed, 1, "the live connection is closed immediately");
         }
         other => panic!("disable failed: {other:?}"),

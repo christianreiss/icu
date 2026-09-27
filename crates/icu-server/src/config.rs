@@ -44,7 +44,8 @@ pub struct ServerSection {
     /// SNI in the server certificate; also part of the CA's CN, which is
     /// where clients take their SNI from. Unset in a config file: the name
     /// an existing CA carries, else the host's FQDN if it resolves to an
-    /// address of this host ([`Config::load`]).
+    /// address of this host ([`Config::resolve`]). Set, it must match the
+    /// name an existing CA carries (`open_ca` in `lib.rs`).
     pub server_name: String,
     /// `host:port` clients dial. Written into every client certificate as
     /// URI SAN `icu://<public_host>` (`PROTOCOL.md` §2.3).
@@ -388,18 +389,34 @@ pub const MAX_VALIDITY_DAYS: u32 = 36_500;
 pub const MAX_TIMING_MS: u64 = 3_600_000;
 
 impl Config {
-    /// Loads and validates a configuration file.
+    /// Loads and validates a configuration file: [`Config::read`], then
+    /// [`Config::resolve`].
     pub fn load(path: &Path) -> Result<Config> {
+        Config::read(path)?.resolve()
+    }
+
+    /// Reads and parses a configuration file without validating it, and
+    /// leaves an unset `server_name` unset. Enough for a CLI command that
+    /// only talks to the running server: working out the name reads `ca.crt`
+    /// in the state directory, which under `DynamicUser` only root can, so
+    /// resolving it up front refused `status` to members of the socket's
+    /// group and to Checkmk. [`Config::resolve`] completes it where the
+    /// configuration is actually used.
+    pub fn read(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .context(format!("cannot read config {}", path.display()))?;
-        let mut config: Config =
-            toml::from_str(&text).context(format!("cannot parse config {}", path.display()))?;
-        if config.server.server_name.trim().is_empty() {
-            config.server.server_name = default_server_name(&config.paths.state_dir)?;
+        toml::from_str(&text).context(format!("cannot parse config {}", path.display()))
+    }
+
+    /// Fills an unset `server_name` ([`default_server_name`]) and validates
+    /// the result: what `run` and the offline CLI need.
+    pub fn resolve(mut self) -> Result<Config> {
+        if self.server.server_name.trim().is_empty() {
+            self.server.server_name = default_server_name(&self.paths.state_dir)?;
         }
-        config.validate()?;
-        config.validate_lifetimes()?;
-        Ok(config)
+        self.validate()?;
+        self.validate_lifetimes()?;
+        Ok(self)
     }
 
     /// Certificate lifetimes of at least a day. A certificate that expires

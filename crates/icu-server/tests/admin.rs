@@ -91,6 +91,48 @@ async fn status_reports_uptime_online_and_relay_counters() {
     server.shutdown().await;
 }
 
+/// `status` once `open_connections` has become `n`.
+async fn status_with_open(socket: &std::path::Path, n: u64) -> serde_json::Value {
+    tokio::time::timeout(common::SOON, async {
+        loop {
+            let status = admin::request(socket, &AdminRequest::Status)
+                .await
+                .expect("status");
+            if status["open_connections"] == serde_json::json!(n) {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("open_connections never became {n}"))
+}
+
+/// S8 (readiness review 2026-09-27): besides the counter `connections`,
+/// `status` says what is open right now, so a monitor has a gauge to graph
+/// and a counter to form a rate from.
+#[tokio::test]
+async fn status_reports_open_connections_beside_the_counter() {
+    let server = TestServer::start().await;
+    let socket = server.socket();
+    let alice = server.client("alice").await;
+    let _bob = server.client("bob").await;
+    let two = status_with_open(&socket, 2).await;
+    assert_eq!(two["online"], serde_json::json!(2));
+    assert_eq!(two["handshakes"], serde_json::json!(0));
+    assert_eq!(two["roomless_sessions"], serde_json::json!(0));
+    let total = two["connections"].as_u64().expect("the counter stays");
+    assert!(total >= 4, "two registrations and two logins: {total}");
+    drop(alice);
+    let one = status_with_open(&socket, 1).await;
+    assert_eq!(
+        one["connections"].as_u64(),
+        Some(total),
+        "a counter does not go down"
+    );
+    server.shutdown().await;
+}
+
 /// §10: promote/demote over the socket push `UserAdminChanged` live to the
 /// target's own open connection, without a reconnect — mirrors
 /// `rename_over_the_socket_broadcasts_to_the_room`'s live-propagation shape.
@@ -286,7 +328,7 @@ async fn mute_and_deafen_over_the_socket_keep_each_other() {
     ] {
         assert!(matches!(
             server.handle.admin(request).await,
-            AdminResponse::Ok
+            AdminResponse::User { user_id: 2, .. }
         ));
     }
     let restriction = |users: &[icu_server::admin::AdminUser]| {
@@ -302,7 +344,7 @@ async fn mute_and_deafen_over_the_socket_keep_each_other() {
             .handle
             .admin(AdminRequest::Unmute { user: bob() })
             .await,
-        AdminResponse::Ok
+        AdminResponse::User { user_id: 2, .. }
     ));
     let AdminResponse::Users(users) = server.handle.admin(AdminRequest::Users).await else {
         panic!("users")
@@ -431,4 +473,243 @@ async fn reserved_example_names_are_refused_only_where_they_are_new() {
     )
     .unwrap();
     icu_server::Config::load(&file).expect("the configuration loads");
+}
+
+/// Whether this process runs as root, which reads through every mode bit
+/// the tests below set up.
+fn root() -> bool {
+    let root = rustix::process::geteuid().is_root();
+    if root {
+        eprintln!("skipped: root is not held back by file modes");
+    }
+    root
+}
+
+/// Sets a file's mode and puts the old one back when dropped, so the
+/// temporary directory goes away even after a failed assertion.
+struct Mode(std::path::PathBuf, u32);
+
+impl Mode {
+    fn set(path: &std::path::Path, mode: u32) -> Mode {
+        use std::os::unix::fs::PermissionsExt;
+        let old = std::fs::metadata(path).unwrap().permissions().mode();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        Mode(path.to_path_buf(), old)
+    }
+}
+
+impl Drop for Mode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}
+
+/// S1 (readiness review 2026-09-27): with the packaged configuration —
+/// `server_name` unset — `status` and `users` need nothing but the admin
+/// socket. Working the name out reads `ca.crt` in the state directory,
+/// which under `DynamicUser` only root can; done up front, it refused every
+/// command to members of the socket's group, Checkmk included.
+#[tokio::test]
+async fn status_and_users_need_only_the_socket() {
+    if root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, run) = (dir.path().join("state"), dir.path().join("run"));
+    let mut config = icu_server::Config::for_test(&state);
+    config.paths.runtime_dir = run.clone();
+    let handle = icu_server::run(config).await.expect("server");
+    let file = dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
+            state.to_str().unwrap(),
+            run.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    // `/var/lib/private` as a member of the socket's group sees it.
+    let hidden = Mode::set(&state, 0o000);
+    for command in ["status", "users"] {
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+            .arg("--config")
+            .arg(&file)
+            .args([command, "--json"])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["ok"], serde_json::json!(true), "{command}");
+    }
+    drop(hidden);
+    handle.shutdown().await;
+}
+
+/// The CLI does the work itself only when no server runs: socket missing or
+/// refusing. A socket it may not use is reported as such, with the fix —
+/// falling back hid it behind the state lock's "is a server running?".
+#[tokio::test]
+async fn a_socket_the_cli_may_not_use_is_reported_not_bypassed() {
+    if root() {
+        return;
+    }
+    let server = TestServer::start().await;
+    let socket = server.socket();
+    let locked = Mode::set(&socket, 0o000);
+    let config = icu_server::Config::for_test(server.dir.path());
+    let error = icu_server::cli::dispatch(&config, AdminRequest::Status)
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        error.contains(&socket.display().to_string()) && error.contains("admin_socket_group"),
+        "{error}"
+    );
+    assert!(!error.contains("cannot lock"), "no fallback: {error}");
+    drop(locked);
+    server.shutdown().await;
+}
+
+/// A stale socket file, as a crash leaves it, refuses connections: no
+/// server, so the CLI does the work itself.
+#[tokio::test]
+async fn a_stale_socket_file_means_no_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = icu_server::Config::for_test(dir.path());
+    drop(std::os::unix::net::UnixListener::bind(config.admin_socket()).unwrap());
+    assert!(config.admin_socket().exists(), "the file stays behind");
+    let value = icu_server::cli::dispatch(&config, AdminRequest::Status)
+        .await
+        .expect("offline status");
+    assert_eq!(value["ok"], serde_json::json!(true));
+}
+
+/// S2 (readiness review 2026-09-27): clients take the server name from the
+/// CA's CN. A `server_name` other than that is refused — by `run` and the
+/// offline CLI alike, before any server certificate is issued for it: the
+/// next one would have locked every client out.
+#[tokio::test]
+async fn a_server_name_other_than_the_cas_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = icu_server::Config::for_test(dir.path());
+    icu_server::ca::Ca::load_or_create(dir.path(), &config.tls, "icu.home.arpa").unwrap();
+    let leaf = std::fs::read(dir.path().join("server.crt")).unwrap();
+    // A leaf that needs repair would be the first thing issued.
+    std::fs::remove_file(dir.path().join("server.key")).unwrap();
+    config.server.server_name = "voice.home.arpa".into();
+    let started = icu_server::run(config.clone()).await.err();
+    let offline = icu_server::Server::offline(config.clone()).err();
+    for error in [started, offline] {
+        let error = error.expect("refused").to_string();
+        assert!(
+            error.contains("\"voice.home.arpa\"") && error.contains("\"icu.home.arpa\""),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(dir.path().join("server.crt")).unwrap(),
+        leaf,
+        "nothing was issued"
+    );
+    // DNS names compare without regard to case, as clients check them.
+    config.server.server_name = "ICU.Home.Arpa".into();
+    let handle = icu_server::run(config)
+        .await
+        .expect("the CA's own name starts");
+    handle.shutdown().await;
+}
+
+/// S5 (readiness review 2026-09-27): a name may be all digits. `revoke 1`
+/// with a user called "1" around is refused instead of hitting user 1 —
+/// often the owner; `revoke` is final. The explicit forms reach each of
+/// them, and every answer names whom the selector hit.
+#[tokio::test]
+async fn an_ambiguous_selector_is_refused_and_answers_name_the_user() {
+    let server = TestServer::start().await;
+    server.enroll("owner").await;
+    server.enroll("1").await;
+    let revoke = |user: &str| AdminRequest::Revoke { user: user.into() };
+
+    let refused = server.handle.admin(revoke("1")).await;
+    let AdminResponse::Error { error, detail } = &refused else {
+        panic!("{refused:?}")
+    };
+    assert_eq!(error, "AMBIGUOUS_USER");
+    assert!(
+        detail.contains("user_id 1 (\"owner\")") && detail.contains("user_id 2 (\"1\")"),
+        "{detail}"
+    );
+    let AdminResponse::Users(users) = server.handle.admin(AdminRequest::Users).await else {
+        panic!("users")
+    };
+    assert!(users.iter().all(|u| !u.revoked), "nobody was touched");
+
+    let revoked = server.handle.admin(revoke("name:1")).await;
+    assert!(
+        matches!(&revoked, AdminResponse::Revoke { user_id: 2, name, .. } if name == "1"),
+        "{revoked:?}"
+    );
+    let promoted = admin::request(
+        &server.socket(),
+        &AdminRequest::Promote {
+            user: "id:1".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        promoted,
+        serde_json::json!({"ok": true, "user_id": 1, "name": "owner"})
+    );
+    server.shutdown().await;
+}
+
+/// S6 (readiness review 2026-09-27): a `promote` and a `demote` at once
+/// leave room and store agreeing, and the last `UserAdminChanged` the target
+/// got says what the store holds. The pushes used to go out after the store
+/// lock, so the loser of the race could overwrite the room's view. A stress
+/// test: the race window is short, so a run without the fix only fails
+/// sometimes; with it, never.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_role_changes_leave_room_and_store_agreeing() {
+    let server = TestServer::start().await;
+    let _alice = server.client("alice").await;
+    let mut bob = server.client("bob").await;
+    let shared = server.handle.server().clone();
+    for _ in 0..100 {
+        let tasks = [true, false].map(|promote| {
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                let user = "bob".to_string();
+                let request = if promote {
+                    AdminRequest::Promote { user }
+                } else {
+                    AdminRequest::Demote { user }
+                };
+                admin::handle(&shared, request).await
+            })
+        });
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let stored = shared.store.lock().await.is_admin(bob.user_id);
+        let shown = shared.room.flags(bob.session).expect("bob").is_admin();
+        assert_eq!(stored, shown, "room and store disagree");
+    }
+    let stored = shared.store.lock().await.is_admin(bob.user_id);
+    let mut last = None;
+    while let Some(msg) = bob.recv_timeout(common::BRIEFLY).await {
+        if let ControlMsg::UserAdminChanged { is_admin } = msg {
+            last = Some(is_admin);
+        }
+    }
+    assert_eq!(last, Some(stored), "bob's last word is the store's");
+    server.shutdown().await;
 }

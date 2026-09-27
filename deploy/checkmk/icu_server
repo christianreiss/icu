@@ -7,10 +7,22 @@
 #
 # Output format: <status> <item> <metrics> <text>
 # 0 = OK, 1 = WARN, 2 = CRIT, 3 = UNKNOWN.
+#
+# `status --json` has counters since the server started (`connections`,
+# everything under `relay`) and values for right now (`online`,
+# `open_connections`, `handshakes`). Counters are turned into per-second
+# rates against the previous run, which is kept in $STATE; the first run,
+# and the first after a server restart, has none yet.
 
 BIN=${ICU_SERVER_BIN:-/usr/bin/icu-server}
 CONFIG=${ICU_SERVER_CONFIG:-/etc/icu/server.toml}
 SOCKET=${ICU_ADMIN_SOCKET:-/run/icu/admin.sock}
+STATE=${ICU_CHECK_STATE:-${MK_VARDIR:-/var/lib/check_mk_agent}/icu_server.state}
+# ICU_Video goes WARN once more than this share (percent) of the video frames
+# for viewers was dropped because a viewer's downlink is too narrow, in this
+# many runs in a row.
+SLOW_WARN_PCT=${ICU_SLOW_WARN_PCT:-10}
+SLOW_WARN_RUNS=${ICU_SLOW_WARN_RUNS:-3}
 
 if [ ! -x "$BIN" ]; then
     echo "3 ICU_Server - icu-server binary not found at $BIN"
@@ -33,19 +45,26 @@ fi
 
 # Small JSON fields, read without a JSON parser: the values are plain integers.
 field() {
-    echo "$JSON" | sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p" | head -1
+    v=$(echo "$JSON" | sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p" | head -1)
+    echo "${v:-0}"
 }
 nested() {
-    echo "$JSON" | sed -n "s/.*\"$1\":{\([^}]*\)}.*/\1/p" | head -1 |
-        sed -n "s/.*\"$2\":\([0-9]*\).*/\1/p" | head -1
+    v=$(echo "$JSON" | sed -n "s/.*\"$1\":{\([^}]*\)}.*/\1/p" | head -1 |
+        sed -n "s/.*\"$2\":\([0-9]*\).*/\1/p" | head -1)
+    echo "${v:-0}"
 }
 
 ONLINE=$(field online)
 MAX=$(field max_users)
 UPTIME=$(field uptime_s)
+OPEN=$(field open_connections)
+HANDSHAKES=$(field handshakes)
 CONNECTIONS=$(field connections)
 IN=$(nested relay datagrams_in)
 OUT=$(nested relay datagrams_out)
+# Unique keys, but past the nested `dropped` object, which `nested` stops at.
+VOUT=$(field video_frames_out)
+SLOW=$(field video_slow_receiver)
 
 # Days until the server leaf and the CA expire; negative once expired.
 days() {
@@ -54,22 +73,92 @@ days() {
 LEAF_DAYS=$(days server_cert_days_left)
 CA_DAYS=$(days ca_days_left)
 
-[ -n "$ONLINE" ] || ONLINE=0
-[ -n "$MAX" ] || MAX=0
-[ -n "$UPTIME" ] || UPTIME=0
-[ -n "$CONNECTIONS" ] || CONNECTIONS=0
-[ -n "$IN" ] || IN=0
-[ -n "$OUT" ] || OUT=0
+# The previous run: time, uptime, the counters, and how many runs in a row
+# dropped too much video. Anything but eight numbers counts as none.
+NOW=$(date +%s)
+PREV=$(cat "$STATE" 2>/dev/null)
+case "$PREV" in *[!0-9\ ]* | '') PREV= ;; esac
+# shellcheck disable=SC2086 # split into its fields on purpose
+set -- $PREV
+RATES=0
+STREAK=0
+WRITE=1
+if [ $# -eq 8 ]; then
+    P_NOW=$1 P_UPTIME=$2 P_CONN=$3 P_IN=$4 P_OUT=$5 P_VOUT=$6 P_SLOW=$7 P_STREAK=$8
+    if [ "$NOW" -le "$P_NOW" ]; then
+        # Within the same second: keep the older sample as the base.
+        WRITE=0
+        STREAK=$P_STREAK
+    elif [ "$UPTIME" -ge "$P_UPTIME" ] && [ "$CONNECTIONS" -ge "$P_CONN" ] &&
+        [ "$IN" -ge "$P_IN" ] && [ "$OUT" -ge "$P_OUT" ] &&
+        [ "$VOUT" -ge "$P_VOUT" ] && [ "$SLOW" -ge "$P_SLOW" ]; then
+        RATES=1
+    fi
+fi
+
+rate() {
+    awk -v d="$1" -v t="$2" 'BEGIN { printf "%.2f", d / t }'
+}
+
+if [ "$RATES" -eq 1 ]; then
+    DT=$((NOW - P_NOW))
+    CONN_RATE=$(rate $((CONNECTIONS - P_CONN)) "$DT")
+    IN_RATE=$(rate $((IN - P_IN)) "$DT")
+    OUT_RATE=$(rate $((OUT - P_OUT)) "$DT")
+    DVOUT=$((VOUT - P_VOUT))
+    DSLOW=$((SLOW - P_SLOW))
+    VOUT_RATE=$(rate "$DVOUT" "$DT")
+    SLOW_RATE=$(rate "$DSLOW" "$DT")
+    SLOW_PCT=0
+    if [ $((DVOUT + DSLOW)) -gt 0 ]; then
+        SLOW_PCT=$((DSLOW * 100 / (DVOUT + DSLOW)))
+    fi
+    if [ "$DSLOW" -gt 0 ] && [ "$SLOW_PCT" -ge "$SLOW_WARN_PCT" ]; then
+        STREAK=$((P_STREAK + 1))
+    fi
+fi
+
+NOTE=
+if [ "$WRITE" -eq 1 ]; then
+    if ! { printf '%s %s %s %s %s %s %s %s\n' "$NOW" "$UPTIME" "$CONNECTIONS" \
+        "$IN" "$OUT" "$VOUT" "$SLOW" "$STREAK" >"$STATE.$$" &&
+        mv -f "$STATE.$$" "$STATE"; } 2>/dev/null; then
+        rm -f "$STATE.$$" 2>/dev/null
+        NOTE=" (no rates: cannot write $STATE)"
+    fi
+fi
 
 # WARN when the room is full: nobody else can join.
 STATUS=0
-TEXT="up ${UPTIME}s, ${ONLINE}/${MAX} online, ${CONNECTIONS} connections, relay ${IN} in / ${OUT} out"
+METRICS="online=$ONLINE;;;0;$MAX|uptime=$UPTIME|open_connections=$OPEN|handshakes=$HANDSHAKES"
+TEXT="up ${UPTIME}s, ${ONLINE}/${MAX} online, ${OPEN} connections open"
+if [ "$RATES" -eq 1 ]; then
+    METRICS="$METRICS|connects_per_s=$CONN_RATE|datagrams_in_per_s=$IN_RATE|datagrams_out_per_s=$OUT_RATE"
+    TEXT="$TEXT, $CONN_RATE connects/s, relay $IN_RATE/s in / $OUT_RATE/s out"
+else
+    TEXT="$TEXT, rates from the next run on$NOTE"
+fi
 if [ "$MAX" -gt 0 ] && [ "$ONLINE" -ge "$MAX" ]; then
     STATUS=1
     TEXT="room is full — $TEXT"
 fi
+echo "$STATUS ICU_Server $METRICS $TEXT"
 
-echo "$STATUS ICU_Server online=$ONLINE;;;0;$MAX|uptime=$UPTIME|connections=$CONNECTIONS|datagrams_in=$IN|datagrams_out=$OUT $TEXT"
+# Video to viewers: frames forwarded, and dropped because a viewer's downlink
+# is too narrow (`video_slow_receiver`). Some of that is normal; a large
+# share for several runs means somebody watches with far too little
+# bandwidth, and the sender should be sending less.
+if [ "$RATES" -eq 1 ]; then
+    ST=0
+    TEXT="$VOUT_RATE frames/s to viewers, $SLOW_RATE/s dropped for slow viewers ($SLOW_PCT %)"
+    if [ "$STREAK" -ge "$SLOW_WARN_RUNS" ]; then
+        ST=1
+        TEXT="$TEXT, at least $SLOW_WARN_PCT % for $STREAK runs in a row — a viewer's downlink is too narrow for the video"
+    fi
+    echo "$ST ICU_Video video_out_per_s=$VOUT_RATE|video_slow_drops_per_s=$SLOW_RATE|video_slow_pct=$SLOW_PCT;$SLOW_WARN_PCT $TEXT"
+else
+    echo "0 ICU_Video - rates from the next run on$NOTE"
+fi
 
 # Certificates: WARN below 30 days, CRIT below 7. The server renews its own
 # leaf 30 days ahead and re-issues the CA certificate under the same key a

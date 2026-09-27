@@ -41,52 +41,62 @@ pub enum AdminRequest {
     Users,
     /// Revoke every certificate of a user and kick it.
     Revoke {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous ([`Store::resolve`]).
         user: String,
     },
     /// Grant admin rights.
     Promote {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous ([`Store::resolve`]).
         user: String,
     },
     /// Revoke admin rights.
     Demote {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous ([`Store::resolve`]).
         user: String,
     },
     /// Reversibly block login without touching certificates.
     Disable {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous ([`Store::resolve`]).
         user: String,
     },
     /// Restore login after `Disable`.
     Enable {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous ([`Store::resolve`]).
         user: String,
     },
     /// Close a user's live connections; they may connect again.
     Kick {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous ([`Store::resolve`]).
         user: String,
     },
     /// Enforce mute: the user's microphone stays off until `unmute`.
     Mute {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous ([`Store::resolve`]).
         user: String,
     },
     /// Lift an enforced mute.
     Unmute {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous ([`Store::resolve`]).
         user: String,
     },
     /// Enforce deafen: the user receives no audio until `undeafen`.
     Deafen {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous ([`Store::resolve`]).
         user: String,
     },
     /// Lift an enforced deafen.
     Undeafen {
-        /// `user_id`, name or fingerprint.
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous ([`Store::resolve`]).
         user: String,
     },
     /// Uptime, online count and relay counters.
@@ -123,15 +133,26 @@ pub enum AdminResponse {
     Revoke {
         /// The affected user.
         user_id: UserId,
+        /// Their name, so the CLI can say whom the selector hit.
+        name: String,
         /// How many live connections were closed.
         closed: usize,
     },
-    /// `promote`, `demote`, `enable`, `rotate-server-cert`
+    /// `rotate-server-cert`, `renew-ca`
     Ok,
+    /// `promote`, `demote`, `enable`, `mute`, `unmute`, `deafen`, `undeafen`
+    User {
+        /// The affected user.
+        user_id: UserId,
+        /// Their name, so the CLI can say whom the selector hit.
+        name: String,
+    },
     /// `kick`
     Kick {
         /// The affected user.
         user_id: UserId,
+        /// Their name, so the CLI can say whom the selector hit.
+        name: String,
         /// How many live connections were closed.
         closed: usize,
     },
@@ -139,6 +160,8 @@ pub enum AdminResponse {
     Disable {
         /// The affected user.
         user_id: UserId,
+        /// Their name, so the CLI can say whom the selector hit.
+        name: String,
         /// How many live connections were closed.
         closed: usize,
     },
@@ -206,13 +229,26 @@ impl AdminResponse {
                 "admin_confirmed": admin_confirmed,
             }),
             AdminResponse::Users(users) => json!({"ok": true, "users": users}),
-            AdminResponse::Revoke { user_id, closed } => {
-                json!({"ok": true, "user_id": user_id, "closed": closed})
-            }
             AdminResponse::Ok => json!({"ok": true}),
-            AdminResponse::Disable { user_id, closed }
-            | AdminResponse::Kick { user_id, closed } => {
-                json!({"ok": true, "user_id": user_id, "closed": closed})
+            AdminResponse::User { user_id, name } => {
+                json!({"ok": true, "user_id": user_id, "name": name})
+            }
+            AdminResponse::Revoke {
+                user_id,
+                name,
+                closed,
+            }
+            | AdminResponse::Disable {
+                user_id,
+                name,
+                closed,
+            }
+            | AdminResponse::Kick {
+                user_id,
+                name,
+                closed,
+            } => {
+                json!({"ok": true, "user_id": user_id, "name": name, "closed": closed})
             }
             AdminResponse::Status(value) => {
                 let mut out = json!({"ok": true});
@@ -283,8 +319,12 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
             AdminResponse::Users(users)
         }
         AdminRequest::Revoke { user } => match resolve(server, user).await {
-            Ok(user_id) => match revoke_user(server, None, user_id).await {
-                Ok(closed) => AdminResponse::Revoke { user_id, closed },
+            Ok((user_id, name)) => match revoke_user(server, None, user_id).await {
+                Ok(closed) => AdminResponse::Revoke {
+                    user_id,
+                    name,
+                    closed,
+                },
                 Err(e) => store_err(e, "REVOKE_FAILED"),
             },
             Err(response) => response,
@@ -292,8 +332,8 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
         AdminRequest::Promote { user } | AdminRequest::Demote { user } => {
             let is_admin = matches!(request, AdminRequest::Promote { .. });
             match resolve(server, user).await {
-                Ok(user_id) => match set_role(server, None, user_id, is_admin).await {
-                    Ok(()) => AdminResponse::Ok,
+                Ok((user_id, name)) => match set_role(server, None, user_id, is_admin).await {
+                    Ok(()) => AdminResponse::User { user_id, name },
                     Err(e) => store_err(e, "PROMOTE_FAILED"),
                 },
                 Err(response) => response,
@@ -302,17 +342,25 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
         AdminRequest::Enable { user } | AdminRequest::Disable { user } => {
             let disabled = matches!(request, AdminRequest::Disable { .. });
             match resolve(server, user).await {
-                Ok(user_id) => match set_disabled(server, None, user_id, disabled).await {
-                    Ok(closed) if disabled => AdminResponse::Disable { user_id, closed },
-                    Ok(_) => AdminResponse::Ok,
+                Ok((user_id, name)) => match set_disabled(server, None, user_id, disabled).await {
+                    Ok(closed) if disabled => AdminResponse::Disable {
+                        user_id,
+                        name,
+                        closed,
+                    },
+                    Ok(_) => AdminResponse::User { user_id, name },
                     Err(e) => store_err(e, "DISABLE_FAILED"),
                 },
                 Err(response) => response,
             }
         }
         AdminRequest::Kick { user } => match resolve(server, user).await {
-            Ok(user_id) => match kick(server, None, user_id).await {
-                Ok(closed) => AdminResponse::Kick { user_id, closed },
+            Ok((user_id, name)) => match kick(server, None, user_id).await {
+                Ok(closed) => AdminResponse::Kick {
+                    user_id,
+                    name,
+                    closed,
+                },
                 Err(e) => store_err(e, "KICK_FAILED"),
             },
             Err(response) => response,
@@ -321,7 +369,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
         | AdminRequest::Unmute { user }
         | AdminRequest::Deafen { user }
         | AdminRequest::Undeafen { user } => match resolve(server, user).await {
-            Ok(user_id) => {
+            Ok((user_id, name)) => {
                 // One side of the pair changes, the other stays as it is at
                 // the moment of the write: computed under the store lock, so
                 // a `mute` and a `deafen` at once cannot undo each other.
@@ -332,7 +380,7 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     _ => (muted, false),
                 };
                 match set_restriction(server, None, user_id, update).await {
-                    Ok(_) => AdminResponse::Ok,
+                    Ok(_) => AdminResponse::User { user_id, name },
                     Err(e) => store_err(e, "RESTRICT_FAILED"),
                 }
             }
@@ -425,15 +473,35 @@ pub async fn renew_ca(server: &Arc<Server>) -> Result<()> {
     crate::endpoint::reload_tls(server).await
 }
 
-/// Resolves a CLI selector; an unknown one comes back as the response to
-/// send.
-async fn resolve(server: &Arc<Server>, user: &str) -> std::result::Result<UserId, AdminResponse> {
-    server
-        .store
-        .lock()
-        .await
-        .resolve(user)
-        .ok_or_else(|| AdminResponse::err("NO_SUCH_USER", format!("no user {user:?}")))
+/// Resolves a CLI selector to exactly one user and the name they have now
+/// ([`Store::resolve`]); an unknown or ambiguous one comes back as the
+/// response to send. Ambiguous is an error, never a guess: `revoke` is final.
+async fn resolve(
+    server: &Arc<Server>,
+    user: &str,
+) -> std::result::Result<(UserId, String), AdminResponse> {
+    let store = server.store.lock().await;
+    let name = |id: UserId| store.user(id).map(|u| u.name.clone()).unwrap_or_default();
+    match store.resolve(user).as_slice() {
+        [id] => Ok((*id, name(*id))),
+        [] => Err(AdminResponse::err(
+            "NO_SUCH_USER",
+            format!("no user {user:?}"),
+        )),
+        ids => {
+            let who: Vec<String> = ids
+                .iter()
+                .map(|id| format!("user_id {id} ({:?})", name(*id)))
+                .collect();
+            Err(AdminResponse::err(
+                "AMBIGUOUS_USER",
+                format!(
+                    "{user:?} matches {}; say id:<user_id> or name:<name>",
+                    who.join(" and ")
+                ),
+            ))
+        }
+    }
 }
 
 /// Who asks for an in-band admin action: the user and the certificate the
@@ -503,6 +571,11 @@ pub async fn revoke_user(
 /// reconnect, then a `UserState` broadcast per session whose `ADMIN` bit
 /// flipped, which is what moves the badge on everybody else's roster. Behind
 /// `promote`/`demote` and `AdminSetRole`.
+///
+/// Store write, room flag and pushes happen under the store lock, like
+/// [`set_restriction`]: a `promote` and a `demote` at once cannot leave the
+/// room showing one role while the store holds the other, nor arrive the
+/// wrong way round.
 pub async fn set_role(
     server: &Arc<Server>,
     actor: Option<&Actor>,
@@ -510,21 +583,22 @@ pub async fn set_role(
     is_admin: bool,
 ) -> Result<()> {
     change(server, actor, target, |store| {
-        store.set_admin(target, is_admin)
-    })
-    .await?;
-    for s in server.room.sessions_of_user(target) {
-        server
-            .room
-            .send_to(s, &ControlMsg::UserAdminChanged { is_admin });
-    }
-    for s in server.room.set_admin_flag(target, is_admin) {
-        if let Some(flags) = server.room.flags(s) {
+        store.set_admin(target, is_admin)?;
+        for s in server.room.sessions_of_user(target) {
             server
                 .room
-                .broadcast(&ControlMsg::UserState { session: s, flags });
+                .send_to(s, &ControlMsg::UserAdminChanged { is_admin });
         }
-    }
+        for s in server.room.set_admin_flag(target, is_admin) {
+            if let Some(flags) = server.room.flags(s) {
+                server
+                    .room
+                    .broadcast(&ControlMsg::UserState { session: s, flags });
+            }
+        }
+        Ok(())
+    })
+    .await?;
     tracing::info!(
         actor = actor.map(|a| a.user_id),
         target,
@@ -633,7 +707,13 @@ fn store_err(e: Error, failed: &str) -> AdminResponse {
     }
 }
 
+/// `status`: everything under `relay` and `enroll`, and `connections`, are
+/// counters since the start — a monitor forms rates from them; `online`,
+/// `open_connections`, `handshakes` and `roomless_sessions` are what is open
+/// right now (S8, readiness review 2026-09-27: `connections` used to be
+/// graphed as if it were the latter).
 fn status(server: &Arc<Server>) -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
     let c = &server.counters;
     json!({
         "uptime_s": server.uptime().as_secs(),
@@ -641,6 +721,9 @@ fn status(server: &Arc<Server>) -> serde_json::Value {
         "max_users": server.config.server.max_users,
         "server_time_ms": unix_millis(),
         "connections": Counters::get(&c.connections),
+        "open_connections": server.open_connections.load(Relaxed),
+        "handshakes": server.handshakes.load(Relaxed),
+        "roomless_sessions": crate::lock(&server.roomless).len(),
         "tls": tls_status(server),
         "relay": {
             "datagrams_in": Counters::get(&c.datagrams_in),
@@ -735,14 +818,39 @@ fn chgrp(path: &std::path::Path, group: &str) -> Result<()> {
     Ok(())
 }
 
+/// First pause after a failed `accept` on the admin socket; it doubles with
+/// every further failure, up to [`ACCEPT_BACKOFF_MAX`].
+const ACCEPT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(10);
+/// Longest pause between two `accept` attempts that fail.
+const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
+
 async fn serve(server: Arc<Server>, listener: UnixListener) {
+    let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
         let stream = tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
+                Ok((stream, _)) => {
+                    backoff = ACCEPT_BACKOFF_MIN;
+                    stream
+                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "admin accept failed");
-                    return;
+                    // Out of file descriptors (EMFILE, ENFILE), a connection
+                    // aborted before it was taken (ECONNABORTED): the
+                    // listener is fine. Returning here left the socket dead
+                    // until a restart — CLI and Checkmk locked out while
+                    // voice went on. The pause keeps a persistent error from
+                    // spinning; the pending connection is still there.
+                    tracing::warn!(
+                        error = %e,
+                        retry_ms = backoff.as_millis() as u64,
+                        "admin accept failed"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = server.shutdown_requested() => return,
+                    }
+                    backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                    continue;
                 }
             },
             _ = server.shutdown_requested() => return,
@@ -792,6 +900,12 @@ pub async fn request(
     let stream = UnixStream::connect(socket)
         .await
         .context(format!("cannot connect to {}", socket.display()))?;
+    exchange(stream, request).await
+}
+
+/// Sends one request over an already connected admin socket and reads the
+/// answer.
+pub async fn exchange(stream: UnixStream, request: &AdminRequest) -> Result<serde_json::Value> {
     let (read, mut write) = stream.into_split();
     write_line(&mut write, request).await?;
     let mut lines = BufReader::new(read).lines();
@@ -863,10 +977,20 @@ mod tests {
 
         let revoke = AdminResponse::Revoke {
             user_id: 1,
+            name: "alice".into(),
             closed: 1,
         }
         .to_json();
-        assert_eq!(revoke, json!({"ok": true, "user_id": 1, "closed": 1}));
+        assert_eq!(
+            revoke,
+            json!({"ok": true, "user_id": 1, "name": "alice", "closed": 1})
+        );
+        let promote = AdminResponse::User {
+            user_id: 2,
+            name: "1".into(),
+        }
+        .to_json();
+        assert_eq!(promote, json!({"ok": true, "user_id": 2, "name": "1"}));
 
         let status = AdminResponse::Status(json!({"uptime_s": 3600, "online": 3})).to_json();
         assert_eq!(status["ok"], json!(true));
