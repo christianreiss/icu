@@ -1,0 +1,12 @@
+# gitleaks configuration for packaging/release.sh: the default rules plus
+# ICU's own bearer credential. A passport or registration bundle
+# (PROTOCOL.md §2.3.1) carries a private key; the armor header alone (docs,
+# tests with a dummy body) does not match, a real base64 body does.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "icu-passport"
+description = "ICU passport / registration bundle (bearer credential)"
+regex = '''-----BEGIN ICU PASSPORT-----\s*[A-Za-z0-9+/=]{40,}'''
+keywords = ["begin icu passport"]

@@ -19,7 +19,7 @@ sudo apt install ./icu-server_<ver>-1_amd64.deb          # Debian 12+
 sudoedit /etc/icu/server.toml                            # server_name, public_host (optional)
 sudo systemctl enable --now icu-server
 sudo firewall-cmd --permanent --add-service=icu && sudo firewall-cmd --reload
-sudo icu-server invite --out admin.txt                   # zuerst sich selbst (§3 „Erster Admin“)
+sudo icu-server invite --out /root/icu-admin.icu         # zuerst sich selbst (§3 „Erster Admin“)
 ```
 
 Das Paket legt die Gruppe `icu` an (`/usr/lib/sysusers.d/icu-server.conf`),
@@ -41,7 +41,32 @@ Deinstallieren lässt den State (`/var/lib/private/icu/`, darin `ca.key`) liegen
 
 Bauen aller Pakete (nur podman nötig): `packaging/build.sh`, Ergebnis unter
 `dist/<ver>/`; Veröffentlichen: `packaging/release.sh`. Details in den
-Kommentaren der beiden Skripte.
+Kommentaren der beiden Skripte. Beide prüfen die Abhängigkeiten mit
+`cargo deny` (Advisories, Lizenzen, Quellen), bevor irgendein Build-Skript
+läuft. Sicherheitsmeldungen zu einem schon veröffentlichten Release zeigt
+nur ein neuer Lauf; ohne CI also etwa wöchentlich auf dem letzten Tag:
+`git worktree add /tmp/icu-tag v<ver> && cargo deny --manifest-path /tmp/icu-tag/Cargo.toml --locked check advisories; git worktree remove /tmp/icu-tag`.
+
+**Downloads prüfen** (seit 2026-09-27). Ein Release trägt `SHA256SUMS`, die
+SSH-Signatur `SHA256SUMS.sig` mit dem Release-Schlüssel des Maintainers
+(Namensraum `icu-release`) und je Build eine `BUILDINFO.<teil>` mit Commit,
+Compiler und den Dateien dieses Builds; der Git-Tag ist signiert
+(`git tag -v v<ver>`). Den öffentlichen Schlüssel einmal aus dem Repository
+nehmen (`packaging/allowed_signers`) und aufbewahren; seinen Fingerabdruck
+(`cut -d' ' -f3,4 allowed_signers | ssh-keygen -lf -`) auf einem zweiten Weg
+beim Maintainer abgleichen. Eine Kopie, die neben den Downloads liegt,
+beweist nichts. Dann im Download-Ordner:
+
+```bash
+ssh-keygen -Y verify -f allowed_signers -I icu-release -n icu-release -s SHA256SUMS.sig < SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+Erwartet: `Good "icu-release" signature for icu-release …` und `OK` je
+heruntergeladener Datei. Unter Windows statt `sha256sum`:
+`certutil -hashfile icu-<ver>-windows-x86_64.zip SHA256` mit der Zeile in
+`SHA256SUMS` vergleichen (`ssh-keygen` bringt der OpenSSH-Client von
+Windows mit; dort ungeprüft).
 
 ## 1. Bauen
 
@@ -69,15 +94,19 @@ Sitzung den ganzen Server.
 ### Statisches musl-Binary (Auslieferung)
 
 Fedora hat kein `rust-std-static-x86_64-unknown-linux-musl`, deshalb läuft der
-musl-Build in einem Container. Verifiziert am 2026-09-20 mit podman 5.8.4:
+musl-Build in einem Container. Verifiziert am 2026-09-20 mit podman 5.8.4;
+seit 2026-09-27 wie in `packaging/build.sh`: gepinntes Image (die
+Rust-Version des Workspace), `--locked`, Quellbaum nur lesend, nur `target/`
+beschreibbar:
 
 ```bash
-podman run --rm \
+mkdir -p target
+podman run --rm --security-opt label=disable \
   -e CARGO_TARGET_DIR=/src/target/musl \
-  -v "$PWD":/src:Z -w /src \
-  docker.io/rust:1-alpine \
+  -v "$PWD":/src:ro -v "$PWD/target":/src/target -w /src \
+  docker.io/library/rust:1.98.1-alpine \
   sh -c 'apk add --no-cache musl-dev && \
-         cargo build --profile release-server -p icu-server --target x86_64-unknown-linux-musl'
+         cargo build --profile release-server --locked -p icu-server --target x86_64-unknown-linux-musl'
 ```
 
 Ergebnis: `target/musl/x86_64-unknown-linux-musl/release-server/icu-server`,
@@ -337,7 +366,7 @@ State unter `/var/lib/private` bleibt root vorbehalten). Wer nicht an den
 Socket darf, bekommt das als Fehler mit Pfad und Ursache.
 
 ```bash
-icu-server invite --ttl 24h --out bob.txt  # Registrierungs-Bundle, einmalig, 24 h gültig
+icu-server invite --ttl 24h --out ~/bob.icu  # Registrierungs-Bundle, einmalig, 24 h gültig
 icu-server users                           # Tabelle mit user_id, Cert, online
 icu-server revoke alice                    # alle Certs sperren, sofort kicken
 icu-server revoke id:7                     # ausdrücklich die user_id (name:… für den Namen)
@@ -353,10 +382,15 @@ icu-server restore latest                  # Snapshot zurück, nur bei gestoppte
 **Erster Admin:** Admin wird, wer als Erster eine Registrierung abschließt
 (quittiert), solange es noch keinen bestätigten Admin gibt — nicht das zuerst
 ausgestellte Bundle (`PROTOCOL.md` §2.3). Direkt nach der Installation also
-`icu-server invite --out admin.txt` (geht auch ohne laufenden Server), die Datei
-auf den eigenen Rechner bringen und dort `icu admin.txt --name <name>` ausführen
-oder den Inhalt ins Erststart-Fenster einfügen — bevor weitere Einladungen
-hinausgehen. Solange es keinen bestätigten Admin gibt, weist `invite` darauf
+`sudo icu-server invite --out /root/icu-admin.icu` (geht auch ohne laufenden
+Server), die Datei auf den eigenen Rechner bringen und dort
+`icu icu-admin.icu --name <name>` ausführen oder den Inhalt ins
+Erststart-Fenster einfügen — bevor weitere Einladungen hinausgehen — und
+danach auf beiden Rechnern löschen. Ein Bundle gehört an einen privaten Ort
+(`/root`, das eigene Home), nicht ins aktuelle Verzeichnis: das ist schnell
+ein Git-Checkout oder ein geteilter Ordner, und mit ihm wandert der
+Schlüssel in einen Commit oder ein Archiv (`.gitignore` schließt `*.icu`
+aus, andere Werkzeuge nicht). Solange es keinen bestätigten Admin gibt, weist `invite` darauf
 hin. Das Bundle enthält einen privaten Schlüssel und gilt, bis es
 eingelöst oder abgelaufen ist; es gehört nicht in einen Chat, den andere lesen.
 Weitere Bundles stellt ein Admin auch im Client aus (⚙ → Allgemein →
@@ -413,6 +447,10 @@ podman run -d --name icu \
   icu-server
 podman exec icu /icu-server invite --name alice
 ```
+
+Das Image nimmt das Binary aus §1 (`target/musl/…/release-server/icu-server`,
+vorher bauen); `.dockerignore` lässt nur diese Datei in den Build-Kontext,
+nicht `.git`, `.scratch` oder den Rest von `target/`.
 
 Die Härtung der systemd-Unit (Sandbox, `MemoryMax=1G`, `Restart=on-failure`)
 gilt im Container nicht: Speichergrenze und Neustart setzt man dort selbst wie

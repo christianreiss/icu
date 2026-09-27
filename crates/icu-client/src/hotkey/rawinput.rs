@@ -8,6 +8,14 @@
 //! hands to an elevated window in the foreground (a game run as
 //! administrator) stays invisible to a normal process (UIPI).
 //!
+//! A release can get lost that way, and push-to-talk would stay open. The
+//! reader fails closed (`super::held`): it lets go of every key held when a
+//! window of a higher integrity level comes to the foreground (or one whose
+//! level Windows will not tell), when the desktop switches (UAC, Win+L,
+//! Ctrl+Alt+Del) and when the session is locked or disconnected; of a
+//! device's keys when that device is removed; and of any key held for five
+//! minutes without auto-repeat. The key has to be pressed again then.
+//!
 //! Raw Input is registered per process, not per window: the last
 //! `RegisterRawInputDevices` for keyboards takes them from the window that
 //! had them. winit registers its own window when its event loop starts, so
@@ -22,40 +30,60 @@
 
 use std::{
     collections::HashSet,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     sync::{
         atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering},
         mpsc as std_mpsc, Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use windows::{
     core::w,
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-        System::LibraryLoader::GetModuleHandleW,
+        Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM},
+        Security::{
+            GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+            TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        },
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            RemoteDesktop::{WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION},
+            Threading::{
+                GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        },
         UI::{
+            Accessibility::{SetWinEventHook, HWINEVENTHOOK},
             Input::{
                 GetRawInputData, GetRegisteredRawInputDevices,
                 KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC_EX, VK_PAUSE},
                 RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
-                RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
+                RIDEV_DEVNOTIFY, RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD,
+                RIM_TYPEMOUSE,
             },
             WindowsAndMessaging::{
-                CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW,
-                RegisterClassExW, SetTimer, HWND_MESSAGE, MSG, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1,
-                RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN,
-                RI_MOUSE_BUTTON_5_UP, RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP,
-                RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN,
-                RI_MOUSE_RIGHT_BUTTON_UP, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT,
-                WM_TIMER, WNDCLASSEXW,
+                CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
+                GetWindowThreadProcessId, PostMessageW, RegisterClassExW, SetTimer,
+                EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_FOREGROUND, GIDC_REMOVAL, HWND_MESSAGE,
+                MSG, RI_KEY_BREAK, RI_KEY_E0, RI_KEY_E1, RI_MOUSE_BUTTON_4_DOWN,
+                RI_MOUSE_BUTTON_4_UP, RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP,
+                RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, RI_MOUSE_MIDDLE_BUTTON_DOWN,
+                RI_MOUSE_MIDDLE_BUTTON_UP, RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP,
+                WINDOW_EX_STYLE, WINDOW_STYLE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+                WM_APP, WM_INPUT, WM_INPUT_DEVICE_CHANGE, WM_TIMER, WM_WTSSESSION_CHANGE,
+                WNDCLASSEXW, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK,
+                WTS_SESSION_LOGOFF,
             },
         },
     },
 };
 
-use super::{keys, Action, Dispatch};
+use super::{
+    held::{self, Device, HeldKeys},
+    keys, Action, Dispatch,
+};
 use crate::{config::HotkeySettings, engine::Command};
 
 /// Generic desktop controls (HID usage page 0x01): mouse and keyboard.
@@ -63,7 +91,8 @@ const USAGE_PAGE_GENERIC: u16 = 0x01;
 const USAGE_MOUSE: u16 = 0x02;
 const USAGE_KEYBOARD: u16 = 0x06;
 
-/// How often the reader makes sure the keys are still its own.
+/// How often the reader makes sure the keys are still its own, and lets go
+/// of those held too long ([`held::MAX_HOLD`]).
 const RECLAIM_MS: u32 = 2000;
 
 /// Posted to the reader's window when the mice are wanted, or no longer.
@@ -167,11 +196,13 @@ fn hub() -> Result<Arc<Hub>, String> {
     Ok(hub)
 }
 
-/// The hub the window procedure feeds, and the keys held down (to drop
-/// auto-repeat). Only touched on the reader thread.
+/// The hub the window procedure feeds, the keys held down (to drop
+/// auto-repeat and to let go of them when a release cannot come), and this
+/// process's integrity level. Only touched on the reader thread.
 struct ReaderState {
     hub: Arc<Hub>,
-    held: HashSet<u16>,
+    held: HeldKeys,
+    integrity: Option<u32>,
 }
 
 thread_local! {
@@ -201,10 +232,16 @@ fn reader_thread(hub: Arc<Hub>, ready: std_mpsc::Sender<Result<(), String>>) {
         }
     };
     hub.window.store(hwnd.0 as isize, Ordering::SeqCst);
+    // SAFETY: the pseudo handle of this process needs no closing.
+    let integrity = unsafe { token_integrity(GetCurrentProcess()) };
+    if integrity.is_none() {
+        tracing::warn!("raw input: own integrity level unknown, every foreground change lets go");
+    }
     STATE.with(|s| {
         *s.borrow_mut() = Some(ReaderState {
             hub,
-            held: HashSet::new(),
+            held: HeldKeys::default(),
+            integrity,
         })
     });
     if let Err(e) = register(hwnd, false) {
@@ -212,6 +249,7 @@ fn reader_thread(hub: Arc<Hub>, ready: std_mpsc::Sender<Result<(), String>>) {
         return;
     }
     unsafe { SetTimer(Some(hwnd), 1, RECLAIM_MS, None) };
+    watch_for_lost_releases(hwnd);
     let _ = ready.send(Ok(()));
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
@@ -263,14 +301,14 @@ fn usages(mice: bool) -> &'static [u16] {
 }
 
 /// Takes keyboards — and mice when `mice` — for `hwnd`, in the background
-/// too.
+/// too, with a message when one is removed (`WM_INPUT_DEVICE_CHANGE`).
 fn register(hwnd: HWND, mice: bool) -> Result<(), String> {
     let devices: Vec<RAWINPUTDEVICE> = usages(mice)
         .iter()
         .map(|usage| RAWINPUTDEVICE {
             usUsagePage: USAGE_PAGE_GENERIC,
             usUsage: *usage,
-            dwFlags: RIDEV_INPUTSINK,
+            dwFlags: RIDEV_INPUTSINK | RIDEV_DEVNOTIFY,
             hwndTarget: hwnd,
         })
         .collect();
@@ -338,14 +376,145 @@ fn still_ours_for(hwnd: HWND, usages: &[u16]) -> bool {
     })
 }
 
+/// Has Windows report what swallows a release: the foreground changing
+/// (UIPI, [`win_event`]), the desktop switching, the session being locked or
+/// disconnected (`WM_WTSSESSION_CHANGE`). Each is best effort: without it
+/// the keys still work, and [`held::MAX_HOLD`] remains.
+fn watch_for_lost_releases(hwnd: HWND) {
+    for event in [EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_DESKTOPSWITCH] {
+        // SAFETY: an out-of-context hook calls `win_event` on this thread,
+        // from its message loop; the hook lives as long as the process.
+        let hook = unsafe {
+            SetWinEventHook(
+                event,
+                event,
+                None,
+                Some(win_event),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            )
+        };
+        if hook.is_invalid() {
+            tracing::warn!(event, "raw input: no WinEvent hook");
+        }
+    }
+    // SAFETY: `hwnd` is the reader's window, alive until the process ends.
+    if let Err(e) = unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } {
+        tracing::warn!(%e, "raw input: no session notifications");
+    }
+}
+
+/// A new foreground window, or another desktop: lets go of every key held
+/// if their releases may no longer reach this process.
+unsafe extern "system" fn win_event(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    _object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    let Some((ours, anything_held)) = STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|s| (s.integrity, !s.held.is_empty()))
+    }) else {
+        return;
+    };
+    if !anything_held {
+        return;
+    }
+    if event == EVENT_SYSTEM_DESKTOPSWITCH {
+        let_go("desktop switched", HeldKeys::release_all);
+    } else if held::foreground_hides_input(ours, window_integrity(hwnd)) {
+        let_go(
+            "foreground window above our integrity level",
+            HeldKeys::release_all,
+        );
+    }
+}
+
+/// The integrity level of the process that owns `hwnd`, if Windows tells.
+fn window_integrity(hwnd: HWND) -> Option<u32> {
+    let mut pid = 0u32;
+    // SAFETY: plain queries; the process handle is owned and closed on drop.
+    unsafe {
+        if GetWindowThreadProcessId(hwnd, Some(&mut pid)) == 0 || pid == 0 {
+            return None;
+        }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let process = OwnedHandle::from_raw_handle(process.0);
+        token_integrity(HANDLE(process.as_raw_handle()))
+    }
+}
+
+/// The mandatory-label RID (`SECURITY_MANDATORY_*_RID`) of `process`'s
+/// token.
+///
+/// # Safety
+/// `process` must be a valid process handle with query access.
+unsafe fn token_integrity(process: HANDLE) -> Option<u32> {
+    // SAFETY: the token handle is owned (closed on drop); the label is read
+    // from a buffer of the size Windows asked for, aligned for it, and its
+    // SID points into that buffer.
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+        let token = OwnedHandle::from_raw_handle(token.0);
+        let token = HANDLE(token.as_raw_handle());
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenIntegrityLevel, None, 0, &mut len);
+        if len == 0 {
+            return None;
+        }
+        let mut buffer = vec![0u64; (len as usize).div_ceil(8)];
+        GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            Some(buffer.as_mut_ptr().cast()),
+            len,
+            &mut len,
+        )
+        .ok()?;
+        let label = &*(buffer.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        let count = *GetSidSubAuthorityCount(label.Label.Sid);
+        if count == 0 {
+            return None;
+        }
+        Some(*GetSidSubAuthority(label.Label.Sid, u32::from(count - 1)))
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_INPUT => {
             if let Some(input) = unsafe { read_input(HRAWINPUT(lparam.0 as _)) } {
+                let device = input.header.hDevice.0 as Device;
                 for (code, pressed) in transitions(&input) {
-                    deliver(code, pressed);
+                    deliver(device, code, pressed);
                 }
             }
+        }
+        WM_INPUT_DEVICE_CHANGE => {
+            if wparam.0 as u32 == GIDC_REMOVAL {
+                let device = lparam.0 as Device;
+                let_go("device removed", |held| held.remove_device(device));
+            }
+            return LRESULT(0);
+        }
+        WM_WTSSESSION_CHANGE => {
+            if matches!(
+                wparam.0 as u32,
+                WTS_SESSION_LOCK
+                    | WTS_CONSOLE_DISCONNECT
+                    | WTS_REMOTE_DISCONNECT
+                    | WTS_SESSION_LOGOFF
+            ) {
+                let_go("session locked or disconnected", HeldKeys::release_all);
+            }
+            return LRESULT(0);
         }
         WM_MICE => {
             update_mice(hwnd, wants_mice());
@@ -361,8 +530,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // A release that went to the other window is lost: let go
                 // of every key held, or push-to-talk would stay open and
                 // the next press be taken for auto-repeat.
-                release_all();
+                let_go("raw input taken back", HeldKeys::release_all);
             }
+            let now = Instant::now();
+            let_go("held too long", |held| held.expire(now, held::MAX_HOLD));
             return LRESULT(0);
         }
         _ => {}
@@ -450,30 +621,40 @@ fn wants_mice() -> bool {
     STATE.with(|s| s.borrow().as_ref().is_some_and(|s| s.hub.wants_mice()))
 }
 
-/// Releases every key held (after the keys were someone else's).
-fn release_all() {
+/// Lets go of the keys `pick` takes from the held ones, as if released:
+/// their releases will not come (`why`).
+fn let_go(why: &str, pick: impl FnOnce(&mut HeldKeys) -> Vec<u16>) {
     let released = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let s = s.as_mut()?;
-        let held: Vec<u16> = s.held.drain().collect();
-        Some((s.hub.clone(), held))
+        let codes = pick(&mut s.held);
+        Some((s.hub.clone(), codes))
     });
-    if let Some((hub, held)) = released {
-        for code in held {
-            hub.emit(code, false);
-        }
+    let Some((hub, codes)) = released else {
+        return;
+    };
+    if !codes.is_empty() {
+        tracing::info!(
+            why,
+            keys = codes.len(),
+            "raw input: keys let go without a release"
+        );
+    }
+    for code in codes {
+        hub.emit(code, false);
     }
 }
 
-/// Passes a transition on, without the auto-repeat a held key sends.
-fn deliver(code: u16, pressed: bool) {
+/// Passes a transition on, without the auto-repeat a held key sends and
+/// without a second press of a key another device already holds.
+fn deliver(device: Device, code: u16, pressed: bool) {
     let hub = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let s = s.as_mut()?;
         let changed = if pressed {
-            s.held.insert(code)
+            s.held.press(device, code, Instant::now())
         } else {
-            s.held.remove(&code)
+            s.held.release(device, code)
         };
         changed.then(|| s.hub.clone())
     });
@@ -579,6 +760,18 @@ pub async fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The token reading behind the foreground check (UIPI): this
+    /// process's level is a mandatory RID between low and system; a window
+    /// that does not exist has none, which the check counts as higher.
+    #[test]
+    fn integrity_levels_come_from_the_process_token() {
+        // SAFETY: the pseudo handle of this process.
+        let ours = unsafe { token_integrity(GetCurrentProcess()) }.expect("own integrity level");
+        assert!((0x1000..=0x4000).contains(&ours), "{ours:#x}");
+        assert_eq!(window_integrity(HWND(std::ptr::null_mut())), None);
+        assert!(held::foreground_hides_input(Some(ours), None));
+    }
 
     /// In the VM, inject F12 and Pause through its virtual keyboard during
     /// this test (not SendInput, which is not a physical Raw Input device).
