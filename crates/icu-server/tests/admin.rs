@@ -264,6 +264,110 @@ async fn a_malformed_request_line_is_answered_not_dropped() {
     server.shutdown().await;
 }
 
+/// Reads what the server sends on `stream` until it closes, for at most
+/// `SOON`; `None` when it does not close in that time.
+async fn until_closed(stream: &mut tokio::net::UnixStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    tokio::time::timeout(common::SOON, stream.read_to_end(&mut out))
+        .await
+        .ok()?
+        .ok()?;
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// S-6 (external review 2026-09-27): one request, one answer, then the
+/// server closes — as §5 always said. The connection used to loop over
+/// requests for as long as the client kept it open.
+#[tokio::test]
+async fn the_admin_socket_answers_one_request_and_closes() {
+    use tokio::io::AsyncWriteExt;
+    let server = TestServer::start().await;
+    let mut stream = tokio::net::UnixStream::connect(server.socket())
+        .await
+        .unwrap();
+    stream
+        .write_all(b"\n{\"cmd\":\"status\"}\n{\"cmd\":\"status\"}\n")
+        .await
+        .unwrap();
+    let out = until_closed(&mut stream)
+        .await
+        .expect("closed after the answer");
+    assert_eq!(out.lines().count(), 1, "{out}");
+    let value: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(value["ok"], serde_json::json!(true));
+    server.shutdown().await;
+}
+
+/// S-6: a request line past 64 KiB is refused and the connection closed,
+/// instead of being buffered for as long as it grows.
+#[tokio::test]
+async fn an_overlong_request_line_is_refused() {
+    use tokio::io::AsyncWriteExt;
+    let server = TestServer::start().await;
+    let mut stream = tokio::net::UnixStream::connect(server.socket())
+        .await
+        .unwrap();
+    stream
+        .write_all(&vec![b'x'; admin::MAX_REQUEST_LINE + 1])
+        .await
+        .unwrap();
+    let out = until_closed(&mut stream)
+        .await
+        .expect("answered and closed without a line end");
+    let value: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(value["error"], serde_json::json!("BAD_REQUEST"), "{out}");
+
+    // A line of exactly the limit is still read, and parsed.
+    let mut stream = tokio::net::UnixStream::connect(server.socket())
+        .await
+        .unwrap();
+    let mut line = br#"{"cmd":"status"}"#.to_vec();
+    line.resize(admin::MAX_REQUEST_LINE, b' ');
+    line.push(b'\n');
+    stream.write_all(&line).await.unwrap();
+    let out = until_closed(&mut stream).await.expect("answered");
+    let value: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(value["ok"], serde_json::json!(true), "{out}");
+    server.shutdown().await;
+}
+
+/// S-6: a connection that sends nothing is closed after
+/// `timing.admin_timeout_ms`, and at most `admin::MAX_CONNECTIONS` are
+/// served at once: a member of the socket's group could hold the server's
+/// descriptors, or every slot, for good. The one past the cap waits and is
+/// served once a slot frees.
+#[tokio::test]
+async fn idle_admin_connections_time_out_and_are_capped() {
+    let server = TestServer::start_with(|c| c.timing.admin_timeout_ms = 1500).await;
+    let socket = server.socket();
+    let mut idle = Vec::new();
+    for _ in 0..admin::MAX_CONNECTIONS {
+        idle.push(tokio::net::UnixStream::connect(&socket).await.unwrap());
+    }
+    let started = std::time::Instant::now();
+    let waiting = tokio::spawn({
+        let socket = socket.clone();
+        async move { admin::request(&socket, &AdminRequest::Status).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!waiting.is_finished(), "all slots are taken");
+
+    // The idle ones are closed once their time is up, and the waiting one
+    // gets its slot and its answer.
+    for stream in &mut idle {
+        assert_eq!(
+            until_closed(stream).await.as_deref(),
+            Some(""),
+            "an idle connection is closed without an answer"
+        );
+    }
+    let value = waiting.await.unwrap().expect("served after the cap");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1000));
+    server.shutdown().await;
+}
+
 /// §5: with no server running, the CLI does the work itself under
 /// `flock(state.lock)`.
 #[tokio::test]

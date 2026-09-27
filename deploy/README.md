@@ -456,7 +456,9 @@ an Zuschauer und die, die für zu langsame Zuschauer verworfen wurden
 (`video_slow_receiver`), und geht auf WARN, wenn deren Anteil drei Läufe in
 Folge mindestens 10 % beträgt (`ICU_SLOW_WARN_PCT`, `ICU_SLOW_WARN_RUNS`):
 dann schaut jemand mit viel zu wenig Bandbreite zu. Ist der Server unten, geht
-der Check auf CRIT.
+der Check auf CRIT, ebenso, wenn `status` nicht binnen 10 s antwortet
+(`ICU_CHECK_TIMEOUT`; coreutils `timeout`): ein hängender Server hält so nicht
+den ganzen Agenten auf. Die CLI selbst gibt nach 30 s ohne Antwort auf.
 Dazu kommen `ICU_Server_Certificate` und `ICU_CA_Certificate` (`tls` im
 Status-JSON): WARN unter 30, CRIT unter 7 Tagen Restlaufzeit. Beide erneuert
 der Server selbst (Leaf 30 Tage, CA ein Jahr vor Ablauf), ein WARN heißt also,

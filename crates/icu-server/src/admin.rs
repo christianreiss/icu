@@ -1,5 +1,8 @@
-//! Admin socket: `/run/icu/admin.sock`, one JSON request per line, one JSON
-//! response per line, then close (`Server/IMPLEMENTATION.md` §5).
+//! Admin socket: `/run/icu/admin.sock`, one JSON request line, one JSON
+//! response line, then close (`Server/IMPLEMENTATION.md` §5). A request line
+//! is at most [`MAX_REQUEST_LINE`], at most [`MAX_CONNECTIONS`] are served at
+//! once, and `timing.admin_timeout_ms` bounds the wait for the request and
+//! for the client to take the answer.
 //!
 //! A running server is the only writer of `users.toml`, so
 //! every CLI command except `run` goes through here. Authentication is the
@@ -11,7 +14,7 @@ use icu_proto::{error as ec, ControlMsg, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     task::AbortHandle,
 };
@@ -840,6 +843,21 @@ fn chgrp(path: &std::path::Path, group: &str) -> Result<()> {
     Ok(())
 }
 
+/// Longest request line the admin socket reads (external review 2026-09-27,
+/// S-6). A request is a few hundred bytes; without a cap a line that never
+/// ends was buffered until `MemoryMax` ended the server, and the socket's
+/// group — the Checkmk agent among them — is not trusted that far.
+pub const MAX_REQUEST_LINE: usize = 64 * 1024;
+
+/// Admin connections served at once. Further ones wait in the listen
+/// backlog, where they hold none of the server's file descriptors.
+pub const MAX_CONNECTIONS: usize = 16;
+
+/// How long [`exchange`] waits for the answer. Above the server's own
+/// `timing.admin_timeout_ms`, which only bounds reading the request and
+/// writing the answer, not the work in between.
+pub const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// First pause after a failed `accept` on the admin socket; it doubles with
 /// every further failure, up to [`ACCEPT_BACKOFF_MAX`].
 const ACCEPT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis(10);
@@ -847,8 +865,18 @@ const ACCEPT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis
 const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 
 async fn serve(server: Arc<Server>, listener: UnixListener) {
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
+        // A slot before the accept: past the cap, connections wait in the
+        // backlog instead of costing a descriptor each.
+        let permit = tokio::select! {
+            permit = permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            },
+            _ = server.shutdown_requested() => return,
+        };
         let stream = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
@@ -879,6 +907,7 @@ async fn serve(server: Arc<Server>, listener: UnixListener) {
         };
         let server = server.clone();
         crate::spawn_logged("admin connection", async move {
+            let _permit = permit;
             if let Err(e) = serve_one(server, stream).await {
                 tracing::debug!(error = %e, "admin connection ended");
             }
@@ -886,20 +915,64 @@ async fn serve(server: Arc<Server>, listener: UnixListener) {
     }
 }
 
+/// Serves one connection: one request, one answer, close. Every client is
+/// one-shot — the CLI and through it the Checkmk check — and a connection
+/// looping over requests was one more way to hold a slot for good.
 async fn serve_one(server: Arc<Server>, stream: UnixStream) -> Result<()> {
+    let timeout = server.config.timing.admin_timeout();
     let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<AdminRequest>(&line) {
+    let mut read = BufReader::new(read);
+    let request = tokio::time::timeout(timeout, read_request(&mut read))
+        .await
+        .map_err(|_| Error::msg("no request in time"))??;
+    let response = match request {
+        Request::Closed => return Ok(()),
+        Request::TooLong => AdminResponse::err(
+            "BAD_REQUEST",
+            format!("request line longer than {MAX_REQUEST_LINE} bytes"),
+        ),
+        Request::Line(line) => match serde_json::from_str::<AdminRequest>(&line) {
             Ok(request) => handle(&server, request).await,
             Err(e) => AdminResponse::err("BAD_REQUEST", e),
-        };
-        write_line(&mut write, &response.to_json()).await?;
+        },
+    };
+    tokio::time::timeout(timeout, write_line(&mut write, &response.to_json()))
+        .await
+        .map_err(|_| Error::msg("the answer was not taken in time"))?
+}
+
+/// What came in on an admin connection.
+enum Request {
+    /// The request line, without its line end.
+    Line(String),
+    /// A line longer than [`MAX_REQUEST_LINE`].
+    TooLong,
+    /// The client closed without sending a request.
+    Closed,
+}
+
+/// Reads the first line that is not blank, at most [`MAX_REQUEST_LINE`]
+/// bytes of it. A last line without a line end counts.
+async fn read_request(read: &mut (impl AsyncBufRead + Unpin)) -> Result<Request> {
+    loop {
+        let mut line = Vec::new();
+        let n = read
+            .take(MAX_REQUEST_LINE as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .await?;
+        if n == 0 {
+            return Ok(Request::Closed);
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        } else if line.len() > MAX_REQUEST_LINE {
+            return Ok(Request::TooLong);
+        }
+        let line = String::from_utf8_lossy(&line);
+        if !line.trim().is_empty() {
+            return Ok(Request::Line(line.into_owned()));
+        }
     }
-    Ok(())
 }
 
 /// One JSON document as one line, flushed.
@@ -926,16 +999,28 @@ pub async fn request(
 }
 
 /// Sends one request over an already connected admin socket and reads the
-/// answer.
+/// answer, for at most [`EXCHANGE_TIMEOUT`]: a server that hangs must not
+/// hang the CLI, nor the Checkmk agent behind it.
 pub async fn exchange(stream: UnixStream, request: &AdminRequest) -> Result<serde_json::Value> {
-    let (read, mut write) = stream.into_split();
-    write_line(&mut write, request).await?;
-    let mut lines = BufReader::new(read).lines();
-    let line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| Error::msg("admin socket closed without a response"))?;
-    Ok(serde_json::from_str(&line)?)
+    let answer = async {
+        let (read, mut write) = stream.into_split();
+        write_line(&mut write, request).await?;
+        let mut lines = BufReader::new(read).lines();
+        let line = lines
+            .next_line()
+            .await?
+            .ok_or_else(|| Error::msg("admin socket closed without a response"))?;
+        Ok(serde_json::from_str(&line)?)
+    };
+    tokio::time::timeout(EXCHANGE_TIMEOUT, answer)
+        .await
+        .map_err(|_| {
+            Error::msg(format!(
+                "no answer within {} s; the server may be stuck, and the command \
+                 may or may not have taken effect",
+                EXCHANGE_TIMEOUT.as_secs()
+            ))
+        })?
 }
 
 #[cfg(test)]
