@@ -1584,6 +1584,13 @@ fn dsp_thread(
                         Err(e) => tracing::warn!(%e, "opus encode (pre-roll)"),
                     }
                 }
+                // Muted, the gate ends the spurt with this frame — collected
+                // up to the mute, and partly after it. The `END` packet still
+                // goes out so receivers stop at once, but as silence: nothing
+                // captured while muted may leave the machine.
+                if muted {
+                    frame_acc[..frame_samples].fill(0.0);
+                }
                 match encoder.encode(&frame_acc[..frame_samples]) {
                     Ok(packet) => {
                         let flags = if decision == Decision::SendEnd {

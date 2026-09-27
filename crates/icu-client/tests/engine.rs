@@ -369,6 +369,64 @@ async fn the_transmit_cue_marks_start_and_end_of_sending() {
     server.handle.shutdown().await;
 }
 
+fn rms(x: &[f32]) -> f32 {
+    (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
+}
+
+/// Muting ends the talk spurt with an `END` packet whose frame was
+/// collected up to the mute and partly after it: that packet carries
+/// silence, so nothing captured after the key press leaves the machine.
+/// Usually the server learns of the mute first and drops the packet; here
+/// a burst of camera toggles has used up the `SetState` budget, so the mute
+/// reaches the server a few frames late and the `END` packet reaches bob,
+/// who decodes alice's stream as it arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_end_packet_of_a_mute_carries_no_audio() {
+    let server = TestServer::start().await;
+    let bob = server.raw_client("bob").await;
+    let (engine, _probe, _dir) = tone_sender(&server, "alice", false).await;
+    wait_connected(&engine).await;
+    wait_for(&engine, SOON, |s| s.sending).await;
+
+    let mut decoder = icu_client::dsp::opus::Decoder::new().unwrap();
+    let mut pcm = vec![0.0f32; 5760];
+    let mut talking = Vec::new();
+    let mut end = None;
+    let deadline = tokio::time::Instant::now() + SOON;
+    let mut muted = false;
+    while end.is_none() && tokio::time::Instant::now() < deadline {
+        let Ok(Ok(datagram)) =
+            tokio::time::timeout(Duration::from_secs(1), bob.session.conn.read_datagram()).await
+        else {
+            continue;
+        };
+        let (header, payload) = icu_proto::AudioHeader::decode(&datagram).unwrap();
+        let n = decoder.decode(payload, &mut pcm).unwrap();
+        if header.end() {
+            end = Some(pcm[..n].to_vec());
+        } else {
+            talking.push(rms(&pcm[..n]));
+        }
+        if !muted && talking.len() >= 20 {
+            for _ in 0..30 {
+                engine.command(Command::ToggleCamera);
+            }
+            engine.command(Command::SetMuted(true));
+            muted = true;
+        }
+    }
+    let end = end.expect("an END packet after the mute");
+    let voice = talking[talking.len() / 2];
+    assert!(voice > 0.02, "the tone went out, rms {voice}");
+    let end = rms(&end);
+    assert!(
+        end < 0.01,
+        "the END packet carries audio: rms {end} (voice {voice})"
+    );
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
 /// Alone in the room nothing goes to the server: the test tone holds the
 /// gate open, yet not one datagram leaves until someone joins, and none
 /// once they have left again.
