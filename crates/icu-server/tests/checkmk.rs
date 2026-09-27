@@ -191,3 +191,31 @@ fn a_failed_backup_warns() {
     let lines = check(dir.path(), &with_backup(off));
     assert!(line(&lines, "ICU_Backup").contains("off"), "{lines:?}");
 }
+
+/// S-6 (external review 2026-09-27): a server that does not answer turns
+/// the check CRIT after `ICU_CHECK_TIMEOUT` seconds instead of hanging the
+/// agent with it.
+#[test]
+fn a_hanging_server_is_crit_after_the_timeout() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("icu-server");
+    std::fs::write(&bin, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _socket = std::os::unix::net::UnixListener::bind(dir.path().join("admin.sock")).unwrap();
+    let started = std::time::Instant::now();
+    let out = Command::new("sh")
+        .arg(SCRIPT)
+        .env("ICU_SERVER_BIN", &bin)
+        .env("ICU_ADMIN_SOCKET", dir.path().join("admin.sock"))
+        .env("ICU_CHECK_STATE", dir.path().join("state"))
+        .env("ICU_CHECK_TIMEOUT", "1")
+        .output()
+        .unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.starts_with("2 ICU_Server - icu-server status did not answer within 1s"),
+        "{text}"
+    );
+}

@@ -58,7 +58,9 @@ pub struct ServerSection {
     pub max_users: u16,
     /// Lowest allowed client version, SemVer.
     pub min_client: String,
-    /// Group that owns the admin socket. `None` leaves the group alone.
+    /// Group that owns the admin socket: a name, looked up in `/etc/group`
+    /// and then through the host's `getent`, or a gid. `None` leaves the
+    /// group alone.
     pub admin_socket_group: Option<String>,
 }
 
@@ -111,7 +113,8 @@ pub struct LimitsSection {
     /// `RATE_LIMITED`. Unset: `2 x max_users`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_pending_invites: Option<u32>,
-    /// Bundles one admin may mint per hour in-band (`CreateInviteRequest`).
+    /// Bundles one admin may mint per hour in-band (`CreateInviteRequest`);
+    /// 0 turns in-band invitations off, the host's CLI still issues them.
     pub invites_per_admin_per_hour: u32,
 }
 
@@ -249,6 +252,9 @@ pub struct TimingSection {
     pub handshake_timeout_ms: u64,
     /// How long a video frame may take to arrive, header and payload.
     pub video_frame_timeout_ms: u64,
+    /// How long the admin socket waits for a request line, and for the
+    /// client to take the answer (`Server/IMPLEMENTATION.md` §5).
+    pub admin_timeout_ms: u64,
 }
 
 impl Default for TimingSection {
@@ -263,6 +269,7 @@ impl Default for TimingSection {
             max_idle_timeout_ms: pl::MAX_IDLE_TIMEOUT_S * 1000,
             handshake_timeout_ms: pl::HANDSHAKE_TIMEOUT_S * 1000,
             video_frame_timeout_ms: pl::VIDEO_FRAME_TIMEOUT_S * 1000,
+            admin_timeout_ms: 10_000,
         }
     }
 }
@@ -279,6 +286,10 @@ impl TimingSection {
     /// `video_frame_timeout_ms` as a `Duration`.
     pub fn video_frame_timeout(&self) -> Duration {
         Duration::from_millis(self.video_frame_timeout_ms)
+    }
+    /// `admin_timeout_ms` as a `Duration`.
+    pub fn admin_timeout(&self) -> Duration {
+        Duration::from_millis(self.admin_timeout_ms)
     }
     /// `speaking_silence_ms` as a `Duration`.
     pub fn speaking_silence(&self) -> Duration {
@@ -505,6 +516,7 @@ impl Config {
             ("timing.max_idle_timeout_ms", t.max_idle_timeout_ms),
             ("timing.handshake_timeout_ms", t.handshake_timeout_ms),
             ("timing.video_frame_timeout_ms", t.video_frame_timeout_ms),
+            ("timing.admin_timeout_ms", t.admin_timeout_ms),
         ] {
             if ms > MAX_TIMING_MS {
                 return Err(Error::msg(format!(

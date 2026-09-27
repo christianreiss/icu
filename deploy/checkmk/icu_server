@@ -24,6 +24,9 @@ STATE=${ICU_CHECK_STATE:-${MK_VARDIR:-/var/lib/check_mk_agent}/icu_server.state}
 # many runs in a row.
 SLOW_WARN_PCT=${ICU_SLOW_WARN_PCT:-10}
 SLOW_WARN_RUNS=${ICU_SLOW_WARN_RUNS:-3}
+# Seconds `status` may take. A server that hangs must not hang the whole
+# agent, whose other checks would go stale with it.
+TIMEOUT=${ICU_CHECK_TIMEOUT:-10}
 
 if [ ! -x "$BIN" ]; then
     echo "3 ICU_Server - icu-server binary not found at $BIN"
@@ -38,8 +41,18 @@ if [ ! -S "$SOCKET" ]; then
     exit 0
 fi
 
-JSON=$("$BIN" status --config "$CONFIG" --json 2>&1)
-if [ $? -ne 0 ] || [ -z "$JSON" ]; then
+# coreutils `timeout`; without it the CLI's own limit of 30 s still holds.
+if command -v timeout >/dev/null 2>&1; then
+    JSON=$(timeout "$TIMEOUT" "$BIN" status --config "$CONFIG" --json 2>&1)
+else
+    JSON=$("$BIN" status --config "$CONFIG" --json 2>&1)
+fi
+RC=$?
+if [ "$RC" -eq 124 ]; then
+    echo "2 ICU_Server - icu-server status did not answer within ${TIMEOUT}s, the server may be stuck"
+    exit 0
+fi
+if [ "$RC" -ne 0 ] || [ -z "$JSON" ]; then
     echo "2 ICU_Server - icu-server is not reachable: $(echo "$JSON" | head -1)"
     exit 0
 fi

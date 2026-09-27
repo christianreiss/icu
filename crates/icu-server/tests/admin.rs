@@ -264,6 +264,110 @@ async fn a_malformed_request_line_is_answered_not_dropped() {
     server.shutdown().await;
 }
 
+/// Reads what the server sends on `stream` until it closes, for at most
+/// `SOON`; `None` when it does not close in that time.
+async fn until_closed(stream: &mut tokio::net::UnixStream) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    tokio::time::timeout(common::SOON, stream.read_to_end(&mut out))
+        .await
+        .ok()?
+        .ok()?;
+    Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// S-6 (external review 2026-09-27): one request, one answer, then the
+/// server closes — as §5 always said. The connection used to loop over
+/// requests for as long as the client kept it open.
+#[tokio::test]
+async fn the_admin_socket_answers_one_request_and_closes() {
+    use tokio::io::AsyncWriteExt;
+    let server = TestServer::start().await;
+    let mut stream = tokio::net::UnixStream::connect(server.socket())
+        .await
+        .unwrap();
+    stream
+        .write_all(b"\n{\"cmd\":\"status\"}\n{\"cmd\":\"status\"}\n")
+        .await
+        .unwrap();
+    let out = until_closed(&mut stream)
+        .await
+        .expect("closed after the answer");
+    assert_eq!(out.lines().count(), 1, "{out}");
+    let value: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(value["ok"], serde_json::json!(true));
+    server.shutdown().await;
+}
+
+/// S-6: a request line past 64 KiB is refused and the connection closed,
+/// instead of being buffered for as long as it grows.
+#[tokio::test]
+async fn an_overlong_request_line_is_refused() {
+    use tokio::io::AsyncWriteExt;
+    let server = TestServer::start().await;
+    let mut stream = tokio::net::UnixStream::connect(server.socket())
+        .await
+        .unwrap();
+    stream
+        .write_all(&vec![b'x'; admin::MAX_REQUEST_LINE + 1])
+        .await
+        .unwrap();
+    let out = until_closed(&mut stream)
+        .await
+        .expect("answered and closed without a line end");
+    let value: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(value["error"], serde_json::json!("BAD_REQUEST"), "{out}");
+
+    // A line of exactly the limit is still read, and parsed.
+    let mut stream = tokio::net::UnixStream::connect(server.socket())
+        .await
+        .unwrap();
+    let mut line = br#"{"cmd":"status"}"#.to_vec();
+    line.resize(admin::MAX_REQUEST_LINE, b' ');
+    line.push(b'\n');
+    stream.write_all(&line).await.unwrap();
+    let out = until_closed(&mut stream).await.expect("answered");
+    let value: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(value["ok"], serde_json::json!(true), "{out}");
+    server.shutdown().await;
+}
+
+/// S-6: a connection that sends nothing is closed after
+/// `timing.admin_timeout_ms`, and at most `admin::MAX_CONNECTIONS` are
+/// served at once: a member of the socket's group could hold the server's
+/// descriptors, or every slot, for good. The one past the cap waits and is
+/// served once a slot frees.
+#[tokio::test]
+async fn idle_admin_connections_time_out_and_are_capped() {
+    let server = TestServer::start_with(|c| c.timing.admin_timeout_ms = 1500).await;
+    let socket = server.socket();
+    let mut idle = Vec::new();
+    for _ in 0..admin::MAX_CONNECTIONS {
+        idle.push(tokio::net::UnixStream::connect(&socket).await.unwrap());
+    }
+    let started = std::time::Instant::now();
+    let waiting = tokio::spawn({
+        let socket = socket.clone();
+        async move { admin::request(&socket, &AdminRequest::Status).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!waiting.is_finished(), "all slots are taken");
+
+    // The idle ones are closed once their time is up, and the waiting one
+    // gets its slot and its answer.
+    for stream in &mut idle {
+        assert_eq!(
+            until_closed(stream).await.as_deref(),
+            Some(""),
+            "an idle connection is closed without an answer"
+        );
+    }
+    let value = waiting.await.unwrap().expect("served after the cap");
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1000));
+    server.shutdown().await;
+}
+
 /// §5: with no server running, the CLI does the work itself under
 /// `flock(state.lock)`.
 #[tokio::test]
@@ -490,94 +594,17 @@ async fn reserved_example_names_are_refused_only_where_they_are_new() {
     icu_server::Config::load(&file).expect("the configuration loads");
 }
 
-/// Whether this process runs as root, which reads through every mode bit
-/// the tests below set up.
-fn root() -> bool {
-    let root = rustix::process::geteuid().is_root();
-    if root {
-        eprintln!("skipped: root is not held back by file modes");
-    }
-    root
-}
-
-/// Sets a file's mode and puts the old one back when dropped, so the
-/// temporary directory goes away even after a failed assertion.
-struct Mode(std::path::PathBuf, u32);
-
-impl Mode {
-    fn set(path: &std::path::Path, mode: u32) -> Mode {
-        use std::os::unix::fs::PermissionsExt;
-        let old = std::fs::metadata(path).unwrap().permissions().mode();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-        Mode(path.to_path_buf(), old)
-    }
-}
-
-impl Drop for Mode {
-    fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
-    }
-}
-
-/// S1 (readiness review 2026-09-27): with the packaged configuration —
-/// `server_name` unset — `status` and `users` need nothing but the admin
-/// socket. Working the name out reads `ca.crt` in the state directory,
-/// which under `DynamicUser` only root can; done up front, it refused every
-/// command to members of the socket's group, Checkmk included.
-#[tokio::test]
-async fn status_and_users_need_only_the_socket() {
-    if root() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let (state, run) = (dir.path().join("state"), dir.path().join("run"));
-    let mut config = icu_server::Config::for_test(&state);
-    config.paths.runtime_dir = run.clone();
-    let handle = icu_server::run(config).await.expect("server");
-    let file = dir.path().join("server.toml");
-    std::fs::write(
-        &file,
-        format!(
-            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
-            state.to_str().unwrap(),
-            run.to_str().unwrap()
-        ),
-    )
-    .unwrap();
-    // `/var/lib/private` as a member of the socket's group sees it.
-    let hidden = Mode::set(&state, 0o000);
-    for command in ["status", "users"] {
-        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
-            .arg("--config")
-            .arg(&file)
-            .args([command, "--json"])
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{command}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(value["ok"], serde_json::json!(true), "{command}");
-    }
-    drop(hidden);
-    handle.shutdown().await;
-}
-
 /// The CLI does the work itself only when no server runs: socket missing or
 /// refusing. A socket it may not use is reported as such, with the fix —
 /// falling back hid it behind the state lock's "is a server running?".
 #[tokio::test]
 async fn a_socket_the_cli_may_not_use_is_reported_not_bypassed() {
-    if root() {
+    if common::root() {
         return;
     }
     let server = TestServer::start().await;
     let socket = server.socket();
-    let locked = Mode::set(&socket, 0o000);
+    let locked = common::Mode::set(&socket, 0o000);
     let config = icu_server::Config::for_test(server.dir.path());
     let error = icu_server::cli::dispatch(&config, AdminRequest::Status)
         .await

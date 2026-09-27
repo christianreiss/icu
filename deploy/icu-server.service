@@ -2,8 +2,16 @@
 Description=ICU voice server
 After=network-online.target
 Wants=network-online.target
+# A server that cannot start (unreadable state, bad configuration) gives up
+# after five tries in a minute and shows as failed, instead of looping with
+# Restart= for good.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
+# Started once the binary is executed, not merely forked: a missing or
+# broken binary fails the start instead of showing as running.
+Type=exec
 ExecStart=/usr/bin/icu-server run --config /etc/icu/server.toml
 DynamicUser=yes
 # Private by default, including temporary files created during key rotation.
@@ -16,6 +24,9 @@ UMask=0077
 # stays private: systemd keeps it under /var/lib/private (0700 root).
 Group=icu
 StateDirectory=icu
+# Keys and users.toml: nobody but the service. The admin socket lives in
+# RuntimeDirectory, so the group keeps its way in.
+StateDirectoryMode=0700
 RuntimeDirectory=icu
 RuntimeDirectoryMode=0750
 ConfigurationDirectory=icu
@@ -24,6 +35,7 @@ ProtectHome=yes
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
+PrivateIPC=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallFilter=@system-service
 # Not ~@privileged: it contains @chown, and the server chgrps the admin socket
@@ -46,6 +58,8 @@ CapabilityBoundingSet=
 # Backstop for an open-internet server: the server caps connections itself
 # (limits.max_connections), this caps what a bug could still make it hold.
 MemoryMax=1G
+# A crash must not write the CA and com keys into a core dump.
+LimitCORE=0
 Restart=on-failure
 RestartSec=2
 

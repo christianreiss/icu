@@ -327,7 +327,11 @@ Alle Kommandos außer `run` sprechen über `/run/icu/admin.sock` mit dem
 laufenden Server; eine Änderung wirkt damit sofort und nicht erst nach einem
 Neustart. Sie brauchen root oder Mitgliedschaft in der Gruppe `icu`: die Unit
 läuft mit `Group=icu`, damit gehören `/run/icu` (0750) und der Socket (0660)
-dieser Gruppe. `server.admin_socket_group` bleibt deshalb `icu`. Mehr als den
+dieser Gruppe. `server.admin_socket_group` bleibt deshalb `icu`. Soll eine
+Gruppe aus FreeIPA/SSSD oder LDAP den Socket bekommen, per Drop-in `Group=` auf
+sie setzen und `admin_socket_group` auf denselben Namen (oder die gid): der
+Server fragt Namen, die nicht in `/etc/group` stehen, über `getent` beim NSS
+des Hosts nach. Mehr als den
 Socket brauchen sie nicht, auch ohne `server_name` in der Konfiguration (der
 State unter `/var/lib/private` bleibt root vorbehalten). Wer nicht an den
 Socket darf, bekommt das als Fehler mit Pfad und Ursache.
@@ -368,7 +372,11 @@ connection(s)`.
 
 Läuft **kein** Server (Socket fehlt oder verweigert die Verbindung), erledigt
 die CLI dieselbe Arbeit selbst und hält dabei `flock(/var/lib/icu/state.lock)`;
-dafür braucht sie root. Läuft einer und der Socket fehlt, bricht die CLI mit
+dafür braucht sie root. Was sie dabei schreibt, gehört danach dem Besitzer des
+State-Verzeichnisses, mit genau dem vorgesehenen Modus, auch unter einer
+restriktiven umask wie 027 (vorher blieben die Dateien root-eigen und 0640,
+und der Dienst startete nicht mehr). `invite --out` schreibt die Datei für
+den Aufrufer (0600). Läuft einer und der Socket fehlt, bricht die CLI mit
 `cannot lock … (is a server running?)` ab — das ist Absicht, damit CLI und
 Server einander nie eine Änderung überschreiben.
 
@@ -376,7 +384,8 @@ Server einander nie eine Änderung überschreiben.
 die CRL und wirkt ohne Neustart für jede neue Verbindung. Clients brauchen
 nichts. **Der Server rotiert selbst**, sobald sein Leaf weniger als 30 Tage
 (höchstens ein Drittel von `server_validity_days`) Restlaufzeit hat, geprüft
-beim Start und stündlich. Ein abgelaufenes oder widerrufenes Server-Leaf ist
+beim Start und stündlich — ebenso, wenn es noch nicht gilt, weil die Uhr beim
+Ausstellen vorlief. Ein abgelaufenes oder widerrufenes Server-Leaf ist
 für die Clients kein fataler Fehler: sie versuchen es weiter und verbinden
 sich, sobald das neue Leaf da ist.
 
@@ -452,7 +461,9 @@ an Zuschauer und die, die für zu langsame Zuschauer verworfen wurden
 (`video_slow_receiver`), und geht auf WARN, wenn deren Anteil drei Läufe in
 Folge mindestens 10 % beträgt (`ICU_SLOW_WARN_PCT`, `ICU_SLOW_WARN_RUNS`):
 dann schaut jemand mit viel zu wenig Bandbreite zu. Ist der Server unten, geht
-der Check auf CRIT.
+der Check auf CRIT, ebenso, wenn `status` nicht binnen 10 s antwortet
+(`ICU_CHECK_TIMEOUT`; coreutils `timeout`): ein hängender Server hält so nicht
+den ganzen Agenten auf. Die CLI selbst gibt nach 30 s ohne Antwort auf.
 Dazu kommen `ICU_Server_Certificate` und `ICU_CA_Certificate` (`tls` im
 Status-JSON): WARN unter 30, CRIT unter 7 Tagen Restlaufzeit. Beide erneuert
 der Server selbst (Leaf 30 Tage, CA ein Jahr vor Ablauf), ein WARN heißt also,

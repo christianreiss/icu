@@ -242,13 +242,15 @@ fn create_private_dir(dir: &Path) -> Result<()> {
 
 /// Writes a new file with mode 0600 and flushes it to disk.
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)
         .context(format!("cannot create {}", path.display()))?;
+    // Exactly, whatever the umask, like `store::write_private`.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())

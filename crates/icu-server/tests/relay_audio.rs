@@ -92,12 +92,20 @@ async fn malformed_datagrams_are_dropped_silently() {
 
     let _ = alice.conn.send_datagram(vec![0x01; 10].into()); // too short
     let _ = alice.conn.send_datagram(vec![0x03; 50].into()); // unknown kind
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(bob.recv_audio(BRIEFLY).await.is_none());
 
-    // The connection is unharmed: a valid datagram still goes through.
+    // The connection is unharmed: a valid datagram still goes through, and
+    // it is the first thing bob gets. Read raw, not through `recv_audio`,
+    // which decodes and would take a relayed malformed datagram for none;
+    // a wait for nothing proves nothing either (external review 2026-09-27,
+    // §4.6).
     alice.send_audio(1, 0, &[9; 20]);
-    assert!(bob.recv_audio(SOON).await.is_some());
+    let first = tokio::time::timeout(SOON, bob.conn.read_datagram())
+        .await
+        .expect("a datagram")
+        .expect("the connection lives");
+    let (header, payload) =
+        icu_proto::AudioHeader::decode(&first).expect("the valid one, nothing malformed first");
+    assert_eq!((header.seq, payload), (1, &[9u8; 20][..]));
     assert!(Counters::get(&server.handle.server().counters.dropped_malformed) >= 2);
     server.shutdown().await;
 }

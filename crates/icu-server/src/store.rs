@@ -571,13 +571,6 @@ impl Store {
             .unwrap_or(false)
     }
 
-    /// How many users currently provide working admin capability.
-    fn functional_admin_count(&self) -> usize {
-        self.users()
-            .filter(|(id, _)| self.is_functional_admin(*id))
-            .count()
-    }
-
     /// Whether some functional admin has confirmed their registration. While
     /// none has, whoever confirms a registration first becomes admin, which
     /// `icu-server invite` points out.
@@ -595,12 +588,21 @@ impl Store {
             .any(|(id, u)| id != except && !u.is_pending() && self.is_functional_admin(id))
     }
 
-    /// Rejects an action against `id` that would leave zero functional
-    /// admins. A no-op for anyone who is not currently a functional admin
-    /// (e.g. already disabled or fully revoked), so it never blocks cleanup
-    /// of a non-functional account.
+    /// Rejects an action against `id` that would leave no functional admin
+    /// who has confirmed their registration. Counts exactly who
+    /// [`Store::has_enrolled_admin`] counts, the predicate that decides who
+    /// becomes admin at the first confirmation: a pending admin — the first
+    /// bundle, a provisional redeem, a promoted invitee — may never arrive,
+    /// and counting one let the last confirmed admin step down and leave the
+    /// server to whoever confirmed next (external review 2026-09-27, S-1).
+    ///
+    /// A no-op for anyone who is not a confirmed functional admin: already
+    /// disabled or fully revoked, or still pending. So cleanup of a
+    /// non-functional account is never blocked, and neither is withdrawing
+    /// a leaked first bundle — it used to count as the last admin.
     fn guard_last_admin(&self, id: UserId) -> Result<()> {
-        if self.is_functional_admin(id) && self.functional_admin_count() <= 1 {
+        let confirmed = self.user(id).is_some_and(|u| !u.is_pending());
+        if confirmed && self.is_functional_admin(id) && !self.has_enrolled_admin(id) {
             return Err(Error::coded(
                 ec::LAST_ADMIN,
                 "cannot demote, disable or revoke the last remaining admin",
@@ -774,10 +776,16 @@ impl Store {
     /// becomes admin, and every admin mark on a still pending user — the
     /// first bundle's, or a provisional one from an earlier redeem — is
     /// dropped in the same write, so exactly one admin comes out of it.
+    ///
+    /// A disabled user confirms nothing: disabling blocks the redeem and the
+    /// login that would consume it, and a receipt that arrives after the
+    /// disable — the registration session saw the client's close just
+    /// before — must not make the user admin either. The bundle stays open;
+    /// the first login after an `enable` consumes it.
     pub fn consume_registration(&mut self, id: UserId) -> Result<bool> {
         let open = self
             .user(id)
-            .is_some_and(|u| u.certs.iter().any(|c| c.registration && !c.revoked));
+            .is_some_and(|u| !u.disabled && u.certs.iter().any(|c| c.registration && !c.revoked));
         if !open {
             return Ok(false);
         }
@@ -1005,14 +1013,62 @@ fn first_users(dir: &Path) -> Result<UsersFile> {
 
 /// Writes `contents` atomically: temp file in the same directory, fsync,
 /// rename, fsync of the directory (`Server/IMPLEMENTATION.md` §4). `mode` is
-/// the permission bits of the temp file, and therefore of the result.
+/// the permission bits of the result, whatever the umask; `owner` says whose
+/// it is.
 ///
 /// The fsyncs can take tens of milliseconds on network storage, and every
 /// caller is async code on a runtime worker. `block_in_place` hands that
 /// worker's other tasks — quinn's endpoint driver among them — to another
 /// worker meanwhile, so audio keeps flowing.
-fn write_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
-    blocking(|| write_mode_now(path, contents, mode))
+fn write_mode(path: &Path, contents: &str, mode: u32, owner: Owner) -> Result<()> {
+    blocking(|| write_mode_now(path, contents, mode, owner))
+}
+
+/// Whose a written file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// The owner of the directory it is written into: a state file. Root
+    /// running the offline CLI writes into a state directory the service
+    /// owns (`DynamicUser`), and systemd puts ownership right only when the
+    /// top of `StateDirectory` is off, not for the files inside: a
+    /// root-owned `users.toml` or `ca.crt` — mode 0640 under a hardened
+    /// umask of 027 — kept the server from starting, and `Restart=` looped
+    /// (external review 2026-09-27, S-2).
+    Dir,
+    /// Whoever runs this process: a file outside the state
+    /// (`invite --out`), which root means for root.
+    Process,
+}
+
+/// The owner `(uid, gid)` a file owned by `file` has to be given so that it
+/// belongs to `dir`'s owner, or `None` when it already does or this process
+/// cannot change owners anyway (`root` false): everyone but root writes
+/// files that are theirs already, and the service writes into its own
+/// directory.
+fn owner_to_adopt(root: bool, dir: (u32, u32), file: (u32, u32)) -> Option<(u32, u32)> {
+    (root && dir != file).then_some(dir)
+}
+
+/// Gives `file`, just created in `dir`, the owner of `dir` where it differs
+/// and this process is root ([`Owner::Dir`]).
+fn adopt_dir_owner(file: &File, dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !rustix::process::geteuid().is_root() {
+        return Ok(());
+    }
+    let dir_meta = std::fs::metadata(dir).context(format!("cannot stat {}", dir.display()))?;
+    let file_meta = file.metadata()?;
+    if let Some((uid, gid)) = owner_to_adopt(
+        true,
+        (dir_meta.uid(), dir_meta.gid()),
+        (file_meta.uid(), file_meta.gid()),
+    ) {
+        std::os::unix::fs::fchown(file, Some(uid), Some(gid)).context(format!(
+            "cannot give a file in {} the directory's owner",
+            dir.display()
+        ))?;
+    }
+    Ok(())
 }
 
 /// Takes `flock(state.lock)` in `dir`, without waiting: held for as long as
@@ -1027,6 +1083,9 @@ pub(crate) fn lock_state(dir: &Path) -> Result<File> {
         .truncate(false)
         .open(&lock_path)
         .context(format!("cannot open {}", lock_path.display()))?;
+    // Created by root through the offline CLI, a root-owned lock file would
+    // keep the service from opening it at its next start.
+    adopt_dir_owner(&lock, dir)?;
     rustix::fs::flock(
         lock.as_fd(),
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
@@ -1049,7 +1108,7 @@ pub(crate) fn blocking<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
-fn write_mode_now(path: &Path, contents: &str, mode: u32) -> Result<()> {
+fn write_mode_now(path: &Path, contents: &str, mode: u32, owner: Owner) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let dir = path
         .parent()
@@ -1062,6 +1121,17 @@ fn write_mode_now(path: &Path, contents: &str, mode: u32) -> Result<()> {
         .permissions(std::fs::Permissions::from_mode(mode))
         .tempfile_in(dir)
         .context(format!("cannot create temporary file in {}", dir.display()))?;
+    if owner == Owner::Dir {
+        adopt_dir_owner(file.as_file(), dir)?;
+    }
+    // The mode above went through open(2), which the umask narrows: root's
+    // 027 on a hardened host made a 0644 file 0640. Set it exactly.
+    file.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(mode))
+        .context(format!(
+            "cannot set the mode of a file in {}",
+            dir.display()
+        ))?;
     file.write_all(contents.as_bytes())?;
     file.as_file().sync_all()?;
     file.persist(path)
@@ -1073,14 +1143,23 @@ fn write_mode_now(path: &Path, contents: &str, mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Writes a world-readable file atomically.
+/// Writes a world-readable state file (mode 0644) atomically, owned like
+/// its directory ([`Owner::Dir`]).
 pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    write_mode(path, contents, 0o644)
+    write_mode(path, contents, 0o644, Owner::Dir)
 }
 
-/// Writes a private file with mode 0600, atomically.
+/// Writes a private state file (mode 0600) atomically, owned like its
+/// directory ([`Owner::Dir`]).
 pub fn write_private(path: &Path, contents: &str) -> Result<()> {
-    write_mode(path, contents, 0o600)
+    write_mode(path, contents, 0o600, Owner::Dir)
+}
+
+/// Writes a private file (mode 0600) atomically for whoever runs this
+/// process, wherever it goes ([`Owner::Process`]): a file outside the
+/// state, such as a registration bundle for `invite --out`.
+pub fn write_private_for_caller(path: &Path, contents: &str) -> Result<()> {
+    write_mode(path, contents, 0o600, Owner::Process)
 }
 
 #[cfg(test)]
@@ -1120,6 +1199,21 @@ mod tests {
             std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// S-2: only root changes owners, and only where the file is not the
+    /// directory owner's already.
+    #[test]
+    fn only_root_hands_a_file_to_the_directory_owner() {
+        let service = (61234, 61234);
+        let root = (0, 0);
+        assert_eq!(owner_to_adopt(true, service, root), Some(service));
+        assert_eq!(owner_to_adopt(true, service, service), None);
+        assert_eq!(
+            owner_to_adopt(true, (61234, 990), (61234, 0)),
+            Some((61234, 990))
+        );
+        assert_eq!(owner_to_adopt(false, service, (1000, 1000)), None);
     }
 
     fn store() -> (tempfile::TempDir, Store) {
@@ -1692,7 +1786,95 @@ mod tests {
             rfc3339(now() - Duration::from_secs(10));
         assert_eq!(s.purge_expired_registrations().unwrap(), 1);
         assert!(s.is_admin(a));
-        assert_eq!(s.functional_admin_count(), 1);
+        assert_eq!(s.users().filter(|(_, u)| u.is_admin).count(), 1);
+    }
+
+    /// External review 2026-09-27, S-1 (a): a first bundle that leaked
+    /// before anyone confirmed can be withdrawn. It counted as the last
+    /// admin, and whoever redeemed it would have been the only one.
+    #[test]
+    fn a_leaked_first_bundle_can_be_revoked() {
+        let (_dir, mut s) = store();
+        let (first, admin) = s.add_registration(named_cert("ra", "neu-0001")).unwrap();
+        assert!(admin, "marked provisionally");
+        assert!(s.revoke(first).unwrap());
+        assert!(s.user(first).unwrap().is_revoked());
+        let err = s
+            .redeem_registration(first, "ra", named_cert("m1", "mallory"))
+            .unwrap_err();
+        assert_eq!(err.code(), Some(ec::AUTH_REVOKED));
+
+        // Disabling and demoting a pending admin are not guarded either.
+        let (second, _) = s.add_registration(named_cert("rb", "neu-0002")).unwrap();
+        s.set_admin(second, true).unwrap();
+        assert!(s.set_disabled(second, true).unwrap());
+        assert!(s.set_admin(second, false).unwrap());
+    }
+
+    /// External review 2026-09-27, S-1 (b): a promoted invitee who has not
+    /// confirmed yet does not let the last confirmed admin step down. The
+    /// server used to end with the admin gone, the promoted invitee's mark
+    /// wiped and a third, never promoted user admin — against "immer genau
+    /// einen Admin" (`PROTOCOL.md` §2.3).
+    #[test]
+    fn a_pending_admin_does_not_count_for_the_last_admin_guard() {
+        let (_dir, mut s) = store();
+        let (alice, _) = s.add_registration(named_cert("ra", "neu-0001")).unwrap();
+        confirm(&mut s, alice, "ra", "a1", "alice");
+        let (pat, _) = s.add_registration(named_cert("rp", "neu-0002")).unwrap();
+        let (quinn, _) = s.add_registration(named_cert("rq", "neu-0003")).unwrap();
+        assert!(
+            s.set_admin(pat, true).unwrap(),
+            "promoting an invitee is allowed"
+        );
+
+        for refused in [
+            s.set_admin(alice, false),
+            s.set_disabled(alice, true),
+            s.revoke(alice),
+        ] {
+            assert_eq!(refused.unwrap_err().code(), Some(ec::LAST_ADMIN));
+        }
+        assert!(s.is_admin(alice) && !s.user(alice).unwrap().disabled);
+
+        // quinn confirming first changes nothing; pat's promotion holds.
+        confirm(&mut s, quinn, "rq", "q1", "quinn");
+        assert!(!s.is_admin(quinn));
+        assert!(s.is_admin(alice));
+        assert!(s.is_admin(pat));
+        confirm(&mut s, pat, "rp", "p1", "pat");
+        assert!(s.is_admin(pat), "the promotion survives the confirmation");
+
+        // Now pat counts, and alice may step down.
+        assert!(s.set_admin(alice, false).unwrap());
+        assert_eq!(
+            s.set_admin(pat, false).unwrap_err().code(),
+            Some(ec::LAST_ADMIN)
+        );
+    }
+
+    /// A receipt that arrives after the user was disabled confirms nothing:
+    /// no admin mark, and the bundle stays open for the first login after
+    /// an `enable`.
+    #[test]
+    fn a_disabled_user_does_not_confirm_a_registration() {
+        let (_dir, mut s) = store();
+        let (first, _) = s.add_registration(named_cert("ra", "neu-0001")).unwrap();
+        let (second, _) = s.add_registration(named_cert("rb", "neu-0002")).unwrap();
+        s.redeem_registration(second, "rb", named_cert("b1", "bob"))
+            .unwrap();
+        s.set_disabled(second, true).unwrap();
+        assert!(!s.consume_registration(second).unwrap());
+        assert!(s.user(second).unwrap().is_pending());
+        assert!(!s.has_confirmed_admin());
+
+        confirm(&mut s, first, "ra", "a1", "alice");
+        assert!(s.is_admin(first));
+        assert!(!s.is_admin(second), "the provisional mark went with it");
+
+        s.set_disabled(second, false).unwrap();
+        assert!(s.consume_registration(second).unwrap());
+        assert!(!s.is_admin(second));
     }
 
     /// Once a confirmed admin exists, later registrations stay plain users.

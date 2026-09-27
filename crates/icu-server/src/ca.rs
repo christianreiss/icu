@@ -343,22 +343,7 @@ impl Ca {
         public_host: &str,
     ) -> Result<(CertificateDer<'static>, String)> {
         let common_name = csr_common_name(csr_der)?;
-        let csr_der = CertificateSigningRequestDer::from(csr_der.to_vec());
-        let mut csr = CertificateSigningRequestParams::from_der(&csr_der).map_err(|e| {
-            Error::coded(
-                icu_proto::error::ENROLL_BAD_CSR,
-                format!("csr not parsable: {e}"),
-            )
-        })?;
-
-        // Only P-256 and P-384 keys (§6.3.3).
-        let alg = csr.public_key.algorithm();
-        if alg != &rcgen::PKCS_ECDSA_P256_SHA256 && alg != &rcgen::PKCS_ECDSA_P384_SHA384 {
-            return Err(Error::coded(
-                icu_proto::error::ENROLL_BAD_CSR,
-                "csr key is neither P-256 nor P-384",
-            ));
-        }
+        let mut csr = parse_csr(csr_der, icu_proto::error::ENROLL_BAD_CSR)?;
 
         // Rebuilt from scratch even though the CN is adopted: this canonicalises
         // the encoding to a UTF8String and drops every other DN attribute.
@@ -544,18 +529,65 @@ pub fn csr_common_name(csr_der: &[u8]) -> Result<String> {
     Ok(cn.to_string())
 }
 
-/// The raw SubjectPublicKeyInfo of a CSR. A registration renewal compares it
-/// with the registration certificate's to insist on a fresh key.
+/// The SubjectPublicKeyInfo a certificate for this CSR carries, exactly as
+/// [`Ca::sign_client_csr`] would write it, after the same checks. A
+/// registration compares it with the registration certificate's to insist
+/// on a fresh key, an expired certificate with its own to insist on the
+/// same one: compared as certified, not as the CSR happens to encode it.
 pub fn csr_public_key(csr_der: &[u8]) -> Result<Vec<u8>> {
-    use x509_parser::prelude::FromDer;
-    let (_, csr) = x509_parser::certification_request::X509CertificationRequest::from_der(csr_der)
-        .map_err(|e| {
-            Error::coded(
-                icu_proto::error::RENEW_REJECTED,
-                format!("csr not parsable: {e}"),
-            )
-        })?;
-    Ok(csr.certification_request_info.subject_pki.raw.to_vec())
+    let csr = parse_csr(csr_der, icu_proto::error::RENEW_REJECTED)?;
+    Ok(rcgen::PublicKeyData::subject_public_key_info(
+        &csr.public_key,
+    ))
+}
+
+/// Parses a CSR for signing, refusing it with `code`: the signature must
+/// verify, and the key must be P-256 signed with SHA-256 or P-384 signed
+/// with SHA-384 (`PROTOCOL.md` §2.3, "nur P-256/P-384").
+///
+/// The curve comes from the key's own SubjectPublicKeyInfo. rcgen 0.14
+/// (`CertificateSigningRequestParams::from_der`) takes the algorithm from the
+/// signature OID alone and rebuilds the key info from it: a P-384 key
+/// signing with SHA-256 was certified as a P-256 key around a 97-byte point,
+/// and the key comparisons ran on bytes that were not the certified key
+/// (external review 2026-09-27, S-3).
+fn parse_csr(csr_der: &[u8], code: u32) -> Result<CertificateSigningRequestParams> {
+    use x509_parser::{
+        oid_registry::{
+            OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_NIST_EC_P384, OID_SIG_ECDSA_WITH_SHA256,
+            OID_SIG_ECDSA_WITH_SHA384,
+        },
+        prelude::FromDer,
+    };
+    let unparsable =
+        |e: &dyn std::fmt::Display| Error::coded(code, format!("csr not parsable: {e}"));
+    let (_, raw) = x509_parser::certification_request::X509CertificationRequest::from_der(csr_der)
+        .map_err(|e| unparsable(&e))?;
+    let key = &raw.certification_request_info.subject_pki.algorithm;
+    let curve = (key.algorithm == OID_KEY_TYPE_EC_PUBLIC_KEY)
+        .then(|| key.parameters.as_ref()?.as_oid().ok())
+        .flatten();
+    let signature = &raw.signature_algorithm.algorithm;
+    let paired = curve.is_some_and(|curve| {
+        (curve == OID_EC_P256 && *signature == OID_SIG_ECDSA_WITH_SHA256)
+            || (curve == OID_NIST_EC_P384 && *signature == OID_SIG_ECDSA_WITH_SHA384)
+    });
+    if !paired {
+        return Err(Error::coded(
+            code,
+            "csr key is neither P-256 signed with SHA-256 nor P-384 signed with SHA-384",
+        ));
+    }
+    let csr = CertificateSigningRequestParams::from_der(&CertificateSigningRequestDer::from(
+        csr_der.to_vec(),
+    ))
+    .map_err(|e| unparsable(&e))?;
+    // Belt and braces: what rcgen made of it is the same pair.
+    let alg = csr.public_key.algorithm();
+    if alg != &rcgen::PKCS_ECDSA_P256_SHA256 && alg != &rcgen::PKCS_ECDSA_P384_SHA384 {
+        return Err(Error::coded(code, "csr key is neither P-256 nor P-384"));
+    }
+    Ok(csr)
 }
 
 /// Runs `f` on a parsed certificate, `None` when the DER does not parse.
@@ -682,6 +714,13 @@ pub fn leaf_validity(der: &[u8]) -> Option<(OffsetDateTime, OffsetDateTime)> {
 /// `None` when it does not parse.
 pub fn leaf_days_left_checked(der: &[u8]) -> Option<i64> {
     leaf_validity(der).map(|(_, not_after)| (not_after - store::now()).whole_days())
+}
+
+/// Whether a certificate is not valid yet: its notBefore lies ahead. Only a
+/// clock that ran ahead when it was issued does that; the CA backdates every
+/// certificate by an hour.
+pub fn leaf_not_yet_valid(der: &[u8]) -> bool {
+    leaf_validity(der).is_some_and(|(not_before, _)| not_before > store::now())
 }
 
 /// [`leaf_days_left_checked`] for reporting: `i64::MAX` when it does not
@@ -1102,6 +1141,72 @@ mod tests {
             let csr = params.serialize_request(&rsa).unwrap();
             let err = ca.sign_client_csr(csr.der(), 365, HOST).unwrap_err();
             assert_eq!(err.code(), Some(icu_proto::error::ENROLL_BAD_CSR));
+        }
+    }
+
+    /// `openssl req -new -sha256 -subj /CN=alice` on a secp384r1 key: a
+    /// P-384 key signing with SHA-256, which neither rcgen nor ring sign.
+    const P384_SHA256_CSR: &str = concat!(
+        "3082010830818f0201003010310e300c06035504030c05616c6963653076",
+        "301006072a8648ce3d020106052b81040022036200048d8bc03a59b0210b",
+        "a983e437873ce8440c467d760b389ec43ee0d6e3859ac0a83639a2545996",
+        "9a8d51c663be367851c303f43e7543c611fc3af14cd90a45f00d01f03499",
+        "1471f36d5f1ca2f3a37095030412b3a3dfd45c402f801727f48237fca000",
+        "300a06082a8648ce3d0403020368003065023031e5ef121272113c8e6a71",
+        "400bcd4bdbb44c1be6370e37bcd21052458e2f9058b90441e60432ae1ea4",
+        "a9fbb2c204ac23023100ed96eaeb7ead8367b7a6a2d52a3729d32744e73f",
+        "cc92e5aa84f28e2cb0b658dc6e988f0d5fbefa2efc9f9b78c9f65884",
+    );
+
+    /// The same the other way round: a prime256v1 key, `-sha384`.
+    const P256_SHA384_CSR: &str = concat!(
+        "3081ca30720201003010310e300c06035504030c05616c69636530593013",
+        "06072a8648ce3d020106082a8648ce3d030107034200041db1b1bef77f42",
+        "d9bb1766e82f26d740f26831811cb88c5a35c2f4895071ad75e242886e09",
+        "b0f245ce2bd474b590faa7b9be1e4502b2ecbea128fade78769179a00030",
+        "0a06082a8648ce3d04030303480030450220447428d6249de1dbd295c539",
+        "03eb2ff4f6478107e28b170b4b3311f48ad5c924022100bd32249bf98855",
+        "2ca095425d3340eb643ac39f6e342c27924c000acdc3562f6c",
+    );
+
+    /// S-3 (external review 2026-09-27): the curve is read from the key,
+    /// and only P-256/SHA-256 and P-384/SHA-384 pass. rcgen took the curve
+    /// from the signature: the P-384 key signing with SHA-256 was certified
+    /// as P-256 around its 97-byte point.
+    #[test]
+    fn a_csr_signing_with_the_other_curves_hash_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        for hex in [P384_SHA256_CSR, P256_SHA384_CSR] {
+            let csr = store::decode_hex(hex).unwrap();
+            assert_eq!(
+                csr_common_name(&csr).unwrap(),
+                "alice",
+                "a valid CSR otherwise"
+            );
+            let err = ca.sign_client_csr(&csr, 365, HOST).unwrap_err();
+            assert_eq!(err.code(), Some(icu_proto::error::ENROLL_BAD_CSR), "{err}");
+            let err = csr_public_key(&csr).unwrap_err();
+            assert_eq!(err.code(), Some(icu_proto::error::RENEW_REJECTED), "{err}");
+        }
+    }
+
+    /// The key a CSR is compared by is the key its certificate carries, for
+    /// both curves.
+    #[test]
+    fn the_csr_key_is_compared_as_certified() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        for alg in [
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+            &rcgen::PKCS_ECDSA_P384_SHA384,
+        ] {
+            let key = KeyPair::generate_for(alg).unwrap();
+            let mut params = CertificateParams::default();
+            params.distinguished_name.push(DnType::CommonName, "alice");
+            let csr = params.serialize_request(&key).unwrap().der().to_vec();
+            let (leaf, _) = ca.sign_client_csr(&csr, 365, HOST).unwrap();
+            assert_eq!(csr_public_key(&csr).unwrap(), leaf_public_key(&leaf));
         }
     }
 

@@ -1,5 +1,8 @@
-//! Admin socket: `/run/icu/admin.sock`, one JSON request per line, one JSON
-//! response per line, then close (`Server/IMPLEMENTATION.md` §5).
+//! Admin socket: `/run/icu/admin.sock`, one JSON request line, one JSON
+//! response line, then close (`Server/IMPLEMENTATION.md` §5). A request line
+//! is at most [`MAX_REQUEST_LINE`], at most [`MAX_CONNECTIONS`] are served at
+//! once, and `timing.admin_timeout_ms` bounds the wait for the request and
+//! for the client to take the answer.
 //!
 //! A running server is the only writer of `users.toml`, so
 //! every CLI command except `run` goes through here. Authentication is the
@@ -11,7 +14,7 @@ use icu_proto::{error as ec, ControlMsg, UserId};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     task::AbortHandle,
 };
@@ -630,21 +633,26 @@ pub async fn set_role(
 /// target's live sessions are closed with `AUTH_DISABLED` — the close itself
 /// is the notification — and how many is returned; enabling closes nothing.
 /// Behind `disable`/`enable` and `AdminSetDisabled`.
+///
+/// Store write and close happen under the store lock, like [`set_role`]:
+/// a `disable` and an `enable` at once used to write in one order and kick
+/// after both, leaving the user enabled but thrown out with the fatal
+/// `AUTH_DISABLED` (external review 2026-09-27, S-5).
 pub async fn set_disabled(
     server: &Arc<Server>,
     actor: Option<&Actor>,
     target: UserId,
     disabled: bool,
 ) -> Result<usize> {
-    change(server, actor, target, |store| {
-        store.set_disabled(target, disabled)
+    let closed = change(server, actor, target, |store| {
+        store.set_disabled(target, disabled)?;
+        Ok(if disabled {
+            kick_user(server, target, ec::AUTH_DISABLED)
+        } else {
+            0
+        })
     })
     .await?;
-    let closed = if disabled {
-        kick_user(server, target, ec::AUTH_DISABLED)
-    } else {
-        0
-    };
     tracing::info!(
         actor = actor.map(|a| a.user_id),
         target,
@@ -812,7 +820,7 @@ pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, AbortHandle)> {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
         .context("cannot chmod the admin socket")?;
     if let Some(group) = &server.config.server.admin_socket_group {
-        if let Err(e) = chgrp(&path, group) {
+        if let Err(e) = crate::store::blocking(|| chgrp(&path, group)) {
             tracing::warn!(group = %group, error = %e, "cannot set the admin socket group");
         }
     }
@@ -822,23 +830,80 @@ pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, AbortHandle)> {
 }
 
 fn chgrp(path: &std::path::Path, group: &str) -> Result<()> {
-    // No `nix`/`users` crate in the dependency set, so resolve the group by
-    // reading /etc/group.
-    let text = std::fs::read_to_string("/etc/group")?;
-    let gid = text
-        .lines()
-        .find_map(|line| {
-            let mut fields = line.split(':');
-            let name = fields.next()?;
-            let _passwd = fields.next()?;
-            let gid = fields.next()?;
-            (name == group).then(|| gid.parse::<u32>().ok())?
-        })
-        .ok_or_else(|| Error::msg(format!("no group {group:?} in /etc/group")))?;
+    let gid = resolve_group(group)?;
     // `Gid::from_raw` is safe in rustix 1; the name is historical.
     rustix::fs::chown(path, None, Some(rustix::fs::Gid::from_raw(gid)))?;
     Ok(())
 }
+
+/// The gid of `group`, like chown(1): a name in `/etc/group`, else a number
+/// as it is, else what the host's `getent group` says. The server is a
+/// static musl binary without NSS, so a group only a directory service
+/// knows — FreeIPA/SSSD, LDAP, systemd-userdb — used to be ignored with a
+/// warning (external review 2026-09-27); `getent` asks the host's NSS for
+/// it. Where there is none (the `scratch` image), a number still works.
+pub fn resolve_group(group: &str) -> Result<u32> {
+    if let Some(gid) = std::fs::read_to_string("/etc/group")
+        .ok()
+        .and_then(|text| group_gid(&text, group))
+    {
+        return Ok(gid);
+    }
+    if let Ok(gid) = group.parse::<u32>() {
+        return Ok(gid);
+    }
+    getent_gid(group)
+}
+
+/// The gid `getent group -- <group>` names: the host's NSS. Starts a
+/// process, which is why the tests that call it live in `tests/cli_binary.rs`.
+pub fn getent_gid(group: &str) -> Result<u32> {
+    let out = std::process::Command::new("getent")
+        .args(["group", "--", group])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| {
+            Error::msg(format!(
+                "no group {group:?} in /etc/group, and no getent to ask the host ({e})"
+            ))
+        })?;
+    out.status
+        .success()
+        .then(|| group_gid(&String::from_utf8_lossy(&out.stdout), group))
+        .flatten()
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "no group {group:?} in /etc/group or through getent"
+            ))
+        })
+}
+
+/// The gid of `group` in `group(5)` lines: `name:password:gid:members`.
+fn group_gid(text: &str, group: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let _passwd = fields.next()?;
+        let gid = fields.next()?;
+        (name == group).then(|| gid.parse::<u32>().ok())?
+    })
+}
+
+/// Longest request line the admin socket reads (external review 2026-09-27,
+/// S-6). A request is a few hundred bytes; without a cap a line that never
+/// ends was buffered until `MemoryMax` ended the server, and the socket's
+/// group — the Checkmk agent among them — is not trusted that far.
+pub const MAX_REQUEST_LINE: usize = 64 * 1024;
+
+/// Admin connections served at once. Further ones wait in the listen
+/// backlog, where they hold none of the server's file descriptors.
+pub const MAX_CONNECTIONS: usize = 16;
+
+/// How long [`exchange`] waits for the answer. Above the server's own
+/// `timing.admin_timeout_ms`, which only bounds reading the request and
+/// writing the answer, not the work in between.
+pub const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// First pause after a failed `accept` on the admin socket; it doubles with
 /// every further failure, up to [`ACCEPT_BACKOFF_MAX`].
@@ -847,8 +912,18 @@ const ACCEPT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis
 const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 
 async fn serve(server: Arc<Server>, listener: UnixListener) {
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
+        // A slot before the accept: past the cap, connections wait in the
+        // backlog instead of costing a descriptor each.
+        let permit = tokio::select! {
+            permit = permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            },
+            _ = server.shutdown_requested() => return,
+        };
         let stream = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
@@ -879,6 +954,7 @@ async fn serve(server: Arc<Server>, listener: UnixListener) {
         };
         let server = server.clone();
         crate::spawn_logged("admin connection", async move {
+            let _permit = permit;
             if let Err(e) = serve_one(server, stream).await {
                 tracing::debug!(error = %e, "admin connection ended");
             }
@@ -886,20 +962,64 @@ async fn serve(server: Arc<Server>, listener: UnixListener) {
     }
 }
 
+/// Serves one connection: one request, one answer, close. Every client is
+/// one-shot — the CLI and through it the Checkmk check — and a connection
+/// looping over requests was one more way to hold a slot for good.
 async fn serve_one(server: Arc<Server>, stream: UnixStream) -> Result<()> {
+    let timeout = server.config.timing.admin_timeout();
     let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<AdminRequest>(&line) {
+    let mut read = BufReader::new(read);
+    let request = tokio::time::timeout(timeout, read_request(&mut read))
+        .await
+        .map_err(|_| Error::msg("no request in time"))??;
+    let response = match request {
+        Request::Closed => return Ok(()),
+        Request::TooLong => AdminResponse::err(
+            "BAD_REQUEST",
+            format!("request line longer than {MAX_REQUEST_LINE} bytes"),
+        ),
+        Request::Line(line) => match serde_json::from_str::<AdminRequest>(&line) {
             Ok(request) => handle(&server, request).await,
             Err(e) => AdminResponse::err("BAD_REQUEST", e),
-        };
-        write_line(&mut write, &response.to_json()).await?;
+        },
+    };
+    tokio::time::timeout(timeout, write_line(&mut write, &response.to_json()))
+        .await
+        .map_err(|_| Error::msg("the answer was not taken in time"))?
+}
+
+/// What came in on an admin connection.
+enum Request {
+    /// The request line, without its line end.
+    Line(String),
+    /// A line longer than [`MAX_REQUEST_LINE`].
+    TooLong,
+    /// The client closed without sending a request.
+    Closed,
+}
+
+/// Reads the first line that is not blank, at most [`MAX_REQUEST_LINE`]
+/// bytes of it. A last line without a line end counts.
+async fn read_request(read: &mut (impl AsyncBufRead + Unpin)) -> Result<Request> {
+    loop {
+        let mut line = Vec::new();
+        let n = read
+            .take(MAX_REQUEST_LINE as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .await?;
+        if n == 0 {
+            return Ok(Request::Closed);
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        } else if line.len() > MAX_REQUEST_LINE {
+            return Ok(Request::TooLong);
+        }
+        let line = String::from_utf8_lossy(&line);
+        if !line.trim().is_empty() {
+            return Ok(Request::Line(line.into_owned()));
+        }
     }
-    Ok(())
 }
 
 /// One JSON document as one line, flushed.
@@ -926,16 +1046,28 @@ pub async fn request(
 }
 
 /// Sends one request over an already connected admin socket and reads the
-/// answer.
+/// answer, for at most [`EXCHANGE_TIMEOUT`]: a server that hangs must not
+/// hang the CLI, nor the Checkmk agent behind it.
 pub async fn exchange(stream: UnixStream, request: &AdminRequest) -> Result<serde_json::Value> {
-    let (read, mut write) = stream.into_split();
-    write_line(&mut write, request).await?;
-    let mut lines = BufReader::new(read).lines();
-    let line = lines
-        .next_line()
-        .await?
-        .ok_or_else(|| Error::msg("admin socket closed without a response"))?;
-    Ok(serde_json::from_str(&line)?)
+    let answer = async {
+        let (read, mut write) = stream.into_split();
+        write_line(&mut write, request).await?;
+        let mut lines = BufReader::new(read).lines();
+        let line = lines
+            .next_line()
+            .await?
+            .ok_or_else(|| Error::msg("admin socket closed without a response"))?;
+        Ok(serde_json::from_str(&line)?)
+    };
+    tokio::time::timeout(EXCHANGE_TIMEOUT, answer)
+        .await
+        .map_err(|_| {
+            Error::msg(format!(
+                "no answer within {} s; the server may be stuck, and the command \
+                 may or may not have taken effect",
+                EXCHANGE_TIMEOUT.as_secs()
+            ))
+        })?
 }
 
 #[cfg(test)]
@@ -989,6 +1121,28 @@ mod tests {
             serde_json::from_str::<AdminRequest>(r#"{"cmd":"invite","name":"bob"}"#).unwrap(),
             AdminRequest::Invite { ttl_s: None, .. }
         ));
+    }
+
+    /// The admin socket's group resolves from `group(5)` lines and as a
+    /// number; through the host's NSS in `tests/cli_binary.rs`.
+    #[test]
+    fn the_socket_group_resolves_by_name_and_number() {
+        let text = "root:x:0:\nicu:x:975:checkmk,chris\nbroken\n";
+        assert_eq!(group_gid(text, "icu"), Some(975));
+        assert_eq!(group_gid(text, "root"), Some(0));
+        assert_eq!(group_gid(text, "ic"), None);
+        assert_eq!(group_gid(text, "broken"), None);
+
+        // Neither starts `getent`: a child forked here would share the
+        // state locks of the tests beside it (`tests/cli_binary.rs`).
+        assert_eq!(resolve_group("root").unwrap(), 0);
+        let mine = rustix::process::getegid().as_raw();
+        assert_eq!(resolve_group(&mine.to_string()).unwrap(), mine);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("admin.sock");
+        std::fs::write(&file, "").unwrap();
+        chgrp(&file, &mine.to_string()).unwrap();
     }
 
     #[test]

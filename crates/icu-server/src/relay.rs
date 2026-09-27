@@ -163,10 +163,11 @@ impl VideoSender {
     }
 
     /// Records one slot offer for `receiver` at `now`, and returns a new
-    /// `VideoCongestionHint` value once the window has closed and the
-    /// worst-receiver drop rate changed by at least
+    /// `VideoCongestionHint` value once the window has closed and the drop
+    /// rate more than a third of the receivers agree on
+    /// ([`crate::loss::agreed`], the rule of `LossHint`) changed by at least
     /// [`icu_proto::limits::VIDEO_CONGESTION_HINT_STEP_PERMILLE`] since the
-    /// last hint sent — mirrors `LossTracker`'s max-across-reporters rule.
+    /// last hint sent. Up to two receivers that is the worst one's.
     ///
     /// Simplification: the window only closes on an incoming frame, so a
     /// sender that stops sending video (camera off) freezes at its last
@@ -189,7 +190,7 @@ impl VideoSender {
         if now.saturating_duration_since(self.window_start) < window {
             return None;
         }
-        let worst = self
+        let rates: Vec<u16> = self
             .congestion
             .values()
             .map(|w| {
@@ -199,16 +200,17 @@ impl VideoSender {
                     .unwrap_or(0)
                     .min(1000) as u16
             })
-            .max()
-            .unwrap_or(0);
+            .collect();
+        let receivers = rates.len();
+        let agreed = crate::loss::agreed(rates, receivers);
         self.congestion.clear();
         self.window_start = now;
 
-        if worst.abs_diff(self.last_hint_permille)
+        if agreed.abs_diff(self.last_hint_permille)
             >= icu_proto::limits::VIDEO_CONGESTION_HINT_STEP_PERMILLE
         {
-            self.last_hint_permille = worst;
-            Some(worst)
+            self.last_hint_permille = agreed;
+            Some(agreed)
         } else {
             None
         }
@@ -873,6 +875,34 @@ mod tests {
         let hint = vs.record_and_maybe_hint_at(2, false, t0 + WINDOW);
         assert_eq!(hint, Some(500), "receiver 1's 500‰ is the worst");
         assert!(vs.congestion.is_empty(), "the window resets once it closes");
+    }
+
+    /// D-1 (external review 2026-09-27): one viewer on a narrow downlink
+    /// among four no longer steps everyone's video down; the relay thins
+    /// that viewer's frames per pair anyway. A second one agreeing does.
+    #[test]
+    fn one_congested_viewer_of_four_does_not_set_the_hint() {
+        let t0 = Instant::now();
+        let mut vs = sender();
+        vs.window_start = t0;
+        // Receiver 1 drops everything, receivers 2 to 4 nothing.
+        vs.record_and_maybe_hint_at(1, true, t0);
+        vs.record_and_maybe_hint_at(2, false, t0);
+        vs.record_and_maybe_hint_at(3, false, t0);
+        assert_eq!(vs.record_and_maybe_hint_at(4, false, t0 + WINDOW), None);
+
+        // Receivers 1 and 2 at 1000‰ and 500‰: two of four, the second
+        // largest goes out.
+        vs.window_start = t0 + WINDOW;
+        let t1 = t0 + WINDOW;
+        vs.record_and_maybe_hint_at(1, true, t1);
+        vs.record_and_maybe_hint_at(2, true, t1);
+        vs.record_and_maybe_hint_at(2, false, t1);
+        vs.record_and_maybe_hint_at(3, false, t1);
+        assert_eq!(
+            vs.record_and_maybe_hint_at(4, false, t1 + WINDOW),
+            Some(500)
+        );
     }
 
     #[test]

@@ -282,6 +282,22 @@ impl Handle {
         if tokio::time::timeout(SHUTDOWN_DRAIN, drained).await.is_err() {
             tracing::info!("connections still draining, not waiting for them");
         }
+        // An aborted task lets go of its clone only once the runtime gets to
+        // it, and some — the certificate check, connection tasks — are not
+        // even on the list. Waiting for them, bounded, is what frees the
+        // state lock by the time this returns: a start in the same process
+        // right after found it still held.
+        let released = async {
+            while Arc::strong_count(&self.server) > 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        if tokio::time::timeout(SHUTDOWN_DRAIN, released)
+            .await
+            .is_err()
+        {
+            tracing::info!("tasks still hold the state, not waiting for them");
+        }
     }
 }
 
@@ -493,7 +509,7 @@ async fn housekeeping(server: Arc<Server>) {
 
         // The expiry of a report is a change: the speaker must learn that it
         // can stop paying for FEC (`PROTOCOL.md` §2.2).
-        let hints = lock(&server.loss).expire(ttl);
+        let hints = lock(&server.loss).expire(ttl, |speaker| server.room.audio_listeners(speaker));
         for (speaker, loss_permille) in hints {
             server
                 .room
@@ -530,13 +546,22 @@ async fn housekeeping(server: Arc<Server>) {
 /// one) days are left, and re-issues the CA certificate under the same key a
 /// year (at most a third of its validity) before it expires. A certificate
 /// that does not parse counts as due.
+///
+/// A server leaf that is not valid yet is due as well (external review
+/// 2026-09-27, S-7): a clock that ran ahead at a start — an RTC off before
+/// NTP — rotates onto a leaf whose notBefore lies ahead, and once the clock
+/// is right, clients refuse it until real time gets there, days or years.
+/// The next hourly check now replaces it. A clock behind by less than the
+/// leaf's validity loses nothing by that rotation: the new leaf is valid
+/// for correct clocks as well.
 async fn check_cert_expiry(server: Arc<Server>) {
     const WARN_DAYS: i64 = 30;
     const CA_RENEW_DAYS: i64 = 365;
-    let (leaf_left, ca_left) = {
+    let (leaf_left, leaf_early, ca_left) = {
         let ca = server.ca.read().await;
         (
             ca::leaf_days_left_checked(ca.server_der()),
+            ca::leaf_not_yet_valid(ca.server_der()),
             ca::leaf_days_left_checked(ca.ca_der()),
         )
     };
@@ -547,11 +572,15 @@ async fn check_cert_expiry(server: Arc<Server>) {
             Err(e) => tracing::error!(error = %e, "automatic CA certificate renewal failed"),
         }
     }
-    if renewal_due(leaf_left, server.config.tls.server_validity_days, WARN_DAYS) {
-        tracing::warn!(
-            days_left = ?leaf_left,
-            "server certificate expires soon, rotating"
-        );
+    if leaf_early || renewal_due(leaf_left, server.config.tls.server_validity_days, WARN_DAYS) {
+        if leaf_early {
+            tracing::warn!("server certificate is not valid yet (the clock ran ahead), rotating");
+        } else {
+            tracing::warn!(
+                days_left = ?leaf_left,
+                "server certificate expires soon, rotating"
+            );
+        }
         match admin::rotate_server_cert(&server).await {
             Ok(()) => tracing::info!("server certificate rotated"),
             Err(e) => tracing::error!(error = %e, "automatic server certificate rotation failed"),

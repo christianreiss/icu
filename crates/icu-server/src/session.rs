@@ -295,9 +295,7 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
         );
     }
     let registration = cert.registration;
-    let expired = info
-        .validity
-        .is_some_and(|(_, not_after)| not_after <= now());
+    let expired = cert_expired(info.validity, now());
     // The handshake forgives expiry only for renewing a real certificate; a
     // registration certificate that ran out is spent (`PROTOCOL.md` §2.3).
     if registration && expired {
@@ -589,7 +587,8 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     seat.abort_tasks();
     let member = server.room.leave(session);
     seat.left = true;
-    for (speaker, loss_permille) in lock(&server.loss).forget(session) {
+    let listeners = |speaker| server.room.audio_listeners(speaker);
+    for (speaker, loss_permille) in lock(&server.loss).forget(session, listeners) {
         server
             .room
             .send_to(speaker, &ControlMsg::LossHint { loss_permille });
@@ -643,7 +642,8 @@ impl Drop for Seat<'_> {
         }
         wire::close(self.conn, ec::SHUTDOWN);
         if self.server.room.leave(self.session).is_some() {
-            lock(&self.server.loss).forget(self.session);
+            let listeners = |speaker| self.server.room.audio_listeners(speaker);
+            lock(&self.server.loss).forget(self.session, listeners);
             self.server.room.broadcast(&ControlMsg::UserLeft {
                 session: self.session,
                 reason: ec::SHUTDOWN as u8,
@@ -1159,7 +1159,9 @@ async fn control_loop(
                 loss_permille,
             } => {
                 let ttl = server.config.timing.loss_report_ttl();
-                let hint = lock(&server.loss).report(speaker, session, loss_permille, ttl);
+                let listeners = |speaker| server.room.audio_listeners(speaker);
+                let hint =
+                    lock(&server.loss).report(speaker, session, loss_permille, ttl, listeners);
                 if let Some(loss_permille) = hint {
                     server
                         .room
@@ -1268,6 +1270,24 @@ fn rate_limited(
     Ok(())
 }
 
+/// Whether a certificate with `validity` (notBefore, notAfter; `None`:
+/// unreadable) has expired at `now`.
+fn cert_expired(
+    validity: Option<(time::OffsetDateTime, time::OffsetDateTime)>,
+    now: time::OffsetDateTime,
+) -> bool {
+    validity.is_some_and(|(_, not_after)| not_after <= now)
+}
+
+/// Whether `last` lies less than `bound` before `now`. A stamp from the
+/// future — written while the clock ran ahead — counts as long past: it
+/// refused every renewal until the clock caught up with it (external review
+/// 2026-09-27, S-7).
+fn within(last: time::OffsetDateTime, bound: time::Duration, now: time::OffsetDateTime) -> bool {
+    let elapsed = now - last;
+    elapsed >= time::Duration::ZERO && elapsed < bound
+}
+
 /// A plain renewal is accepted once less than a third of the presented
 /// certificate's lifetime, and at least 30 days, is left (`PROTOCOL.md` §2.2
 /// Nr. 9; the client asks at the same point).
@@ -1312,10 +1332,15 @@ async fn renew_leaf(
     let user_id = identity.user_id;
     let requested =
         ca::csr_common_name(csr_der).map_err(|e| (ec::RENEW_REJECTED, e.to_string()))?;
+    // Expired as of now, not as of the handshake: a room session outlives
+    // its certificate's notAfter, and one opened just before could renew onto
+    // a new key on the strength of an expired certificate (external review
+    // 2026-09-27).
+    let expired = identity.expired || cert_expired(identity.cert_validity, now());
     // An expired certificate renews onto its own key (`PROTOCOL.md` §2.3.3):
     // the handshake proved that key and nothing else, so a new one would be
     // trusted on the strength of an expired certificate alone.
-    if identity.expired
+    if expired
         && ca::csr_public_key(csr_der).map_err(|e| (ec::RENEW_REJECTED, e.to_string()))?
             != identity.cert_spki
     {
@@ -1338,7 +1363,7 @@ async fn renew_leaf(
     };
     let stored = user.name.clone();
     let rename = requested != stored;
-    if rename && identity.expired {
+    if rename && expired {
         return Err((
             ec::RENEW_REJECTED,
             "an expired certificate renews under the stored name only".into(),
@@ -1355,11 +1380,11 @@ async fn renew_leaf(
 
     let catch_up = !rename && identity.cert_cn != stored;
     // Bounded per presented certificate rather than per user.
-    let per_cert = catch_up || identity.expired;
+    let per_cert = catch_up || expired;
     if per_cert {
         // An hour for an expired certificate: a renewal whose answer got lost
         // must not strand its holder for a day.
-        let (bound, detail) = if identity.expired {
+        let (bound, detail) = if expired {
             (
                 time::Duration::hours(1),
                 "this certificate was renewed within the hour",
@@ -1371,12 +1396,12 @@ async fn renew_leaf(
             )
         };
         if let Some(last) = store.cert_renewed(user_id, &identity.cert_fp) {
-            if now() - last < bound {
+            if within(last, bound, now()) {
                 return Err((ec::RENEW_REJECTED, detail.into()));
             }
         }
     } else if let Some(last) = store.last_renew(user_id) {
-        if now() - last < time::Duration::days(1) / pl::RENEW_PER_DAY {
+        if within(last, time::Duration::days(1) / pl::RENEW_PER_DAY, now()) {
             return Err((ec::RENEW_REJECTED, "at most one renewal per day".into()));
         }
     }
@@ -1393,8 +1418,7 @@ async fn renew_leaf(
         let expires_at = parse_rfc3339(expires).ok()?;
         Some((expires_at, renew_window(issued, expires)))
     });
-    let in_window =
-        identity.expired || window.is_none_or(|(expires, window)| expires - now() <= window);
+    let in_window = expired || window.is_none_or(|(expires, window)| expires - now() <= window);
     if !in_window && !rename && !catch_up {
         let days = window.map(|(_, w)| w.whole_days()).unwrap_or_default();
         return Err((
@@ -1436,7 +1460,7 @@ async fn renew_leaf(
         name = %cn,
         renamed,
         catch_up,
-        expired = identity.expired,
+        expired,
         "certificate renewed"
     );
     Ok(Renewed {
@@ -1497,6 +1521,18 @@ async fn handle_create_invite(
     // expires; an admin certificate in the wrong hands must not be able to
     // fill it.
     let per_hour = server.config.limits.invites_per_admin_per_hour;
+    // Zero means none in-band, only the host's CLI: a bucket of zero would
+    // be rounded up to one an hour (external review 2026-09-27).
+    if per_hour == 0 {
+        server.room.send_to(
+            session,
+            &reject(
+                ec::RATE_LIMITED,
+                "invitations are issued on the server host only here".into(),
+            ),
+        );
+        return;
+    }
     if !lock(&server.invite_budget)
         .entry(user_id)
         .or_insert_with(|| TokenBucket::per_hour(per_hour))
@@ -1702,5 +1738,36 @@ fn peer_close_code(conn: &quinn::Connection) -> u32 {
             }
         }
         _ => ec::TIMEOUT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S-7 (external review 2026-09-27): a renewal stamp from the future
+    /// does not hold renewals back.
+    #[test]
+    fn a_stamp_from_the_future_counts_as_long_past() {
+        let now = now();
+        let hour = time::Duration::hours(1);
+        assert!(within(now - time::Duration::minutes(10), hour, now));
+        assert!(!within(now - time::Duration::minutes(70), hour, now));
+        assert!(!within(now + time::Duration::days(30), hour, now));
+        assert!(within(now, hour, now));
+    }
+
+    /// Expiry is a question about a moment: a certificate that was current
+    /// at the handshake is expired once its notAfter has passed.
+    #[test]
+    fn a_certificate_expires_at_its_not_after() {
+        let now = now();
+        let validity = Some((
+            now - time::Duration::days(2),
+            now - time::Duration::seconds(1),
+        ));
+        assert!(cert_expired(validity, now));
+        assert!(!cert_expired(validity, now - time::Duration::days(1)));
+        assert!(!cert_expired(None, now), "unreadable is not expired");
     }
 }

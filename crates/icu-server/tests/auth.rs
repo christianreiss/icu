@@ -764,6 +764,111 @@ fn crl_serials(crl_der: &[u8], ca: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// The CRL number of a CRL.
+fn crl_number(crl_der: &[u8]) -> u64 {
+    use x509_parser::prelude::FromDer;
+    let (_, crl) =
+        x509_parser::revocation_list::CertificateRevocationList::from_der(crl_der).unwrap();
+    crl.crl_number().unwrap().to_string().parse().unwrap()
+}
+
+/// S-4 (external review 2026-09-27): reloads running at once — the hourly
+/// rotation and a login that retires certificates — publish in CRL number
+/// order: every client sees the numbers rise, and the CRL a joining client
+/// gets is the newest. They used to build under the store lock and publish
+/// after it, in either order. A stress test: without the fix it fails only
+/// when two reloads interleave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_reloads_publish_their_crls_in_order() {
+    const ROUNDS: usize = 10;
+    const AT_ONCE: usize = 8;
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let shared = server.handle.server().clone();
+    for _ in 0..ROUNDS {
+        let reloads: Vec<_> = (0..AT_ONCE)
+            .map(|_| {
+                let shared = shared.clone();
+                tokio::spawn(async move { icu_server::endpoint::reload_tls(&shared).await })
+            })
+            .collect();
+        for reload in reloads {
+            reload.await.unwrap().expect("reload");
+        }
+        let published = crl_number(&shared.crl.read().unwrap());
+        // One past the newest issued: after this many reloads within a
+        // second the clock is far behind.
+        let next = shared.store.lock().await.next_crl_number().unwrap();
+        assert_eq!(published + 1, next, "an older CRL is published");
+    }
+    let mut seen = Vec::new();
+    while seen.len() < ROUNDS * AT_ONCE {
+        let body = tokio::time::timeout(
+            SOON,
+            common::read_frame(&mut alice.recv, icu_proto::MAX_CONTROL_FRAME),
+        )
+        .await
+        .expect("every CrlUpdate arrives")
+        .unwrap();
+        if let ControlMsg::CrlUpdate { crl_der } = ControlMsg::decode(&body).unwrap() {
+            seen.push(crl_number(&crl_der));
+        }
+    }
+    assert!(
+        seen.windows(2).all(|w| w[0] < w[1]),
+        "CRL numbers out of order: {seen:?}"
+    );
+    server.shutdown().await;
+}
+
+/// S-7 (external review 2026-09-27): a renewal stamp from the future —
+/// written while the server's clock ran ahead — used to refuse every
+/// renewal and rename until the clock caught up with it. It counts as long
+/// past now.
+#[tokio::test]
+async fn a_renewal_stamp_from_the_future_does_not_block_a_rename() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let TestServer { dir, handle } = server;
+    handle.shutdown().await;
+    let users = dir.path().join("users.toml");
+    let text = std::fs::read_to_string(&users).unwrap();
+    assert!(!text.contains("last_renew"), "{text}");
+    std::fs::write(
+        &users,
+        text.replace(
+            "name = \"alice\"\n",
+            "name = \"alice\"\nlast_renew = \"2099-01-01T00:00:00Z\"\n",
+        ),
+    )
+    .unwrap();
+    let server = TestServer {
+        handle: icu_server::run(icu_server::config::Config::for_test(dir.path()))
+            .await
+            .expect("restarts"),
+        dir,
+    };
+    let mut client = server.connect(&alice).await.expect("connect");
+    client.hello("alice").await;
+    let (_, csr) = common::csr_with_cn("alicia");
+    client
+        .send_msg(&ControlMsg::RenewRequest { csr_der: csr })
+        .await;
+    let answer = client
+        .recv_matching(|m| {
+            matches!(
+                m,
+                ControlMsg::RenewResponse { .. } | ControlMsg::Error { .. }
+            )
+        })
+        .await;
+    assert!(
+        matches!(answer, Some(ControlMsg::RenewResponse { .. })),
+        "{answer:?}"
+    );
+    server.shutdown().await;
+}
+
 /// The serial of a leaf, lowercase hex.
 fn serial_of(der: &[u8]) -> String {
     icu_server::ca::leaf_serial(der)
@@ -1312,6 +1417,53 @@ async fn an_expiring_server_certificate_is_rotated_automatically() {
     };
     assert!(status["tls"]["server_cert_days_left"].as_i64().unwrap() <= 1);
     assert!(status["tls"]["ca_days_left"].as_i64().unwrap() > 3000);
+    server.shutdown().await;
+}
+
+/// S-7 (external review 2026-09-27): a server leaf that is not valid yet —
+/// issued while the clock ran ahead — is replaced by the next check, here
+/// the one at startup. Clients refused it until real time caught up.
+#[tokio::test]
+async fn a_server_certificate_from_the_future_is_rotated() {
+    let server = TestServer::start().await;
+    let TestServer { dir, handle } = server;
+    handle.shutdown().await;
+
+    let ca_pem = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
+    let ca_key =
+        rcgen::KeyPair::from_pem(&std::fs::read_to_string(dir.path().join("ca.key")).unwrap())
+            .unwrap();
+    let issuer = rcgen::Issuer::from_ca_cert_pem(&ca_pem, ca_key).unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "localhost");
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now + time::Duration::days(2);
+    params.not_after = now + time::Duration::days(300);
+    let early = params.signed_by(&key, &issuer).unwrap();
+    std::fs::write(dir.path().join("server.key"), key.serialize_pem()).unwrap();
+    std::fs::write(dir.path().join("server.crt"), early.pem()).unwrap();
+
+    let server = TestServer {
+        handle: icu_server::run(icu_server::config::Config::for_test(dir.path()))
+            .await
+            .expect("starts with the early leaf"),
+        dir,
+    };
+    let mut rotated = false;
+    for _ in 0..250 {
+        let leaf = server.handle.server().ca.read().await.server_der().to_vec();
+        if leaf != early.der().to_vec() {
+            assert!(!icu_server::ca::leaf_not_yet_valid(&leaf), "valid now");
+            rotated = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(rotated, "the early leaf was replaced");
     server.shutdown().await;
 }
 
