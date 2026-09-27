@@ -27,7 +27,7 @@ async fn participant(server: &TestServer, index: usize, blocked_video: bool) -> 
         transport.max_concurrent_uni_streams(0u32.into());
         config.transport_config(Arc::new(transport));
     }
-    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut endpoint = common::bare_endpoint(&server.com_key());
     endpoint.set_default_client_config(config);
     let conn = endpoint
         .connect(server.addr(), "localhost")

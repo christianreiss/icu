@@ -34,6 +34,12 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn start() -> TestServer {
+        TestServer::start_with_com_key(None).await
+    }
+
+    /// A new server — new CA — that keeps `com_key`, as if only `com.key`
+    /// had come back from a backup; `None` for a fresh key.
+    pub async fn start_with_com_key(com_key: Option<&icu_proto::com::ComKey>) -> TestServer {
         // `RUST_LOG=icu_client::dsp::jitter=debug` traces the jitter
         // buffers; without the variable nothing is installed.
         if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
@@ -43,6 +49,13 @@ impl TestServer {
                 .try_init();
         }
         let dir = tempfile::tempdir().expect("tempdir");
+        if let Some(key) = com_key {
+            std::fs::write(
+                dir.path().join(icu_server::store::COM_KEY_FILE),
+                format!("{}\n", key.to_base64()),
+            )
+            .expect("com.key");
+        }
         let config = Config::for_test(dir.path());
         let handle = icu_server::run(config).await.expect("server starts");
         TestServer { dir, handle }
@@ -167,7 +180,8 @@ impl TestServer {
     pub async fn raw_client(&self, name: &str) -> RawClient {
         let (identity, _paths, _dir) = self.enroll(name).await;
         let (config, cert_failure) = conn::client_config(&identity).expect("client config");
-        let endpoint = icu_client::net::bind_endpoint(self.addr()).expect("endpoint");
+        let endpoint =
+            icu_client::net::bind_endpoint(self.addr(), &identity.com_key).expect("endpoint");
         let session = conn::connect(
             &endpoint,
             config,

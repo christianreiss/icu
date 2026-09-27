@@ -14,7 +14,10 @@ use std::{
 };
 
 use common::TestServer;
-use icu_proto::ControlMsg;
+use icu_proto::{
+    com::{ComKey, ComKeys, ComSocket, Side},
+    ControlMsg,
+};
 use quinn::{
     udp::{RecvMeta, Transmit},
     AsyncUdpSocket, UdpPoller,
@@ -118,12 +121,16 @@ async fn stalled_handshakes_from_one_source_do_not_lock_out_others() {
     let alice = server.enroll("alice").await;
 
     // Any 127/8 address is loopback on Linux: the flood has a source of its
-    // own, the legitimate client keeps 127.0.0.1.
+    // own, the legitimate client keeps 127.0.0.1. The attacker holds the com
+    // key — a revoked member still does (`PROTOCOL.md` §1).
     let runtime = quinn::default_runtime().expect("tokio runtime");
     let socket = std::net::UdpSocket::bind("127.0.0.2:0").expect("bind 127.0.0.2");
-    let socket = Arc::new(RetryOnly(
+    let socket = Arc::new(RetryOnly(Arc::new(ComSocket::new(
         runtime.wrap_udp_socket(socket).expect("wrap socket"),
-    ));
+        &server.com_key(),
+        Side::Client,
+        Arc::default(),
+    ))));
     let mut attacker = quinn::Endpoint::new_with_abstract_socket(
         quinn::EndpointConfig::default(),
         None,
@@ -178,8 +185,7 @@ async fn stalled_handshakes_from_one_source_do_not_lock_out_others() {
 async fn a_client_chain_with_intermediates_is_refused() {
     let server = TestServer::start().await;
     let alice = server.enroll("alice").await;
-    let mut endpoint =
-        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");
+    let mut endpoint = common::bare_endpoint(&server.com_key());
     let chain = vec![alice.cert.clone(), alice.ca.clone(), alice.ca.clone()];
     endpoint.set_default_client_config(common::client_config_with_chain(
         server.ca(),
@@ -206,6 +212,106 @@ async fn a_client_chain_with_intermediates_is_refused() {
     );
 
     // The leaf alone is fine.
+    let mut client = server.connect(&alice).await.expect("connect");
+    assert!(matches!(
+        client.hello("alice").await,
+        ControlMsg::Welcome { .. }
+    ));
+    server.shutdown().await;
+}
+
+/// Waits up to [`common::BRIEFLY`] × 3 for any datagram on `socket`.
+async fn answer(socket: &tokio::net::UdpSocket) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; 2048];
+    let n = tokio::time::timeout(common::BRIEFLY * 3, socket.recv(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    buf.truncate(n);
+    Some(buf)
+}
+
+/// Without the com tag the port stays silent (`PROTOCOL.md` §1): a genuine
+/// QUIC Initial starts no handshake, a packet of an unknown version gets no
+/// Version Negotiation, a short header no Stateless Reset. The same Initial
+/// with the tag is answered, so the silence is the tag's doing.
+#[tokio::test]
+async fn a_datagram_without_the_com_tag_gets_no_answer() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let dropped = || server.handle.server().com_dropped.load(Ordering::Relaxed);
+    let before = dropped();
+
+    // A real Initial, caught from a quinn client without the com key.
+    let catcher = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut plain = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    plain.set_default_client_config(common::client_config(
+        server.ca(),
+        Some(alice),
+        icu_proto::limits::ALPN_MAIN,
+    ));
+    let _connecting = plain
+        .connect(catcher.local_addr().unwrap(), "localhost")
+        .unwrap();
+    let initial = answer(&catcher)
+        .await
+        .expect("the client sends its Initial");
+    assert!(initial.len() >= 1200, "a padded Initial: {}", initial.len());
+
+    // Long header of an unsupported version, padded to 1200 bytes.
+    let mut unknown_version = vec![0xC0, 0x1A, 0x2A, 0x3A, 0x4A, 8];
+    unknown_version.extend([7u8; 8]);
+    unknown_version.push(8);
+    unknown_version.extend([9u8; 8]);
+    unknown_version.resize(1200, 0);
+    // Short header with a connection ID nobody issued.
+    let mut short = vec![0x40];
+    short.extend([0x5Au8; 100]);
+
+    let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for datagram in [&initial, &unknown_version, &short] {
+        probe.send_to(datagram, server.addr()).await.unwrap();
+        assert_eq!(answer(&probe).await, None, "no answer without the tag");
+    }
+    assert_eq!(server.handle.server().handshakes.load(Ordering::Relaxed), 0);
+    assert_eq!(dropped() - before, 3);
+
+    let sealed = ComKeys::new(&server.com_key(), Side::Client).seal(&initial, None);
+    probe.send_to(&sealed, server.addr()).await.unwrap();
+    assert!(
+        answer(&probe).await.is_some(),
+        "the tagged Initial is answered"
+    );
+    plain.close(0u32.into(), b"");
+    server.shutdown().await;
+}
+
+/// A client whose passport carries another com key — another server's, or
+/// one from before a restore — hears nothing: its handshake runs into the
+/// timeout like against a server that is down.
+#[tokio::test]
+async fn a_client_with_another_com_key_hears_nothing() {
+    let server = TestServer::start().await;
+    let alice = server.enroll("alice").await;
+    let before = server.handle.server().com_dropped.load(Ordering::Relaxed);
+
+    let endpoint = common::client_endpoint(
+        server.ca(),
+        &ComKey::generate().unwrap(),
+        Some(alice.clone()),
+        icu_proto::limits::ALPN_MAIN,
+    );
+    let connecting = endpoint.connect(server.addr(), "localhost").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), connecting)
+            .await
+            .is_err(),
+        "no handshake with the wrong key"
+    );
+    assert_eq!(server.handle.server().handshakes.load(Ordering::Relaxed), 0);
+    assert!(server.handle.server().com_dropped.load(Ordering::Relaxed) > before);
+
+    // With the server's key the same identity gets in.
     let mut client = server.connect(&alice).await.expect("connect");
     assert!(matches!(
         client.hello("alice").await,

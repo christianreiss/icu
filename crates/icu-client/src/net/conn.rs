@@ -168,6 +168,8 @@ pub fn client_config_with_crl(
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(pl::max_uni_streams(
         pl::MAX_MAX_USERS,
     )));
+    // The com tag rides on every datagram (`PROTOCOL.md` §1).
+    transport.mtu_discovery_config(Some(icu_proto::com::mtu_discovery()));
     config.transport_config(Arc::new(transport));
     Ok((config, cert_failure))
 }

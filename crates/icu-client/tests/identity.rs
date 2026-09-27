@@ -140,13 +140,6 @@ async fn a_passport_moves_an_identity_to_a_second_installation() {
     let (identity, paths_a, _dir_a) = server.enroll("alice").await;
 
     let armored = identity.to_passport();
-    assert!(
-        matches!(
-            icu_proto::passport::Passport::decode(&armored).unwrap(),
-            icu_proto::passport::Passport::V2(_)
-        ),
-        "a current certificate exports without a separate address"
-    );
     let imported = Identity::from_passport(&armored).expect("passport decodes");
     assert_eq!(imported, identity, "nothing is lost in the armor");
 

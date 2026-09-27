@@ -500,7 +500,7 @@ async fn viewer_with_transport(
     let mut config =
         common::client_config(server.ca(), Some(identity), icu_proto::limits::ALPN_MAIN);
     config.transport_config(std::sync::Arc::new(transport));
-    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut endpoint = common::bare_endpoint(&server.com_key());
     endpoint.set_default_client_config(config);
     let conn = endpoint
         .connect(server.addr(), "localhost")

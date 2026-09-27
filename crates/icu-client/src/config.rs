@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use icu_proto::com::ComKey;
 use serde::{Deserialize, Serialize};
 
 pub use crate::dsp::voice::VoiceStrength;
@@ -586,7 +587,7 @@ fn ca_server_name(ca_der: &[u8]) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// Key, leaf, CA and server coordinates.
+/// Key, leaf, CA, the server's com key and server coordinates.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Identity {
     /// PKCS#8 DER private key.
@@ -595,6 +596,9 @@ pub struct Identity {
     pub leaf_der: Vec<u8>,
     /// Server CA certificate, DER.
     pub ca_der: Vec<u8>,
+    /// The server's com key (`PROTOCOL.md` §1): every datagram carries its
+    /// tag, or the server drops it.
+    pub com_key: ComKey,
     /// Server coordinates.
     pub server: ServerInfo,
 }
@@ -610,6 +614,7 @@ impl std::fmt::Debug for Identity {
             )
             .field("leaf_der", &format_args!("{} bytes", self.leaf_der.len()))
             .field("ca_der", &format_args!("{} bytes", self.ca_der.len()))
+            .field("com_key", &self.com_key)
             .field("server", &self.server)
             .finish()
     }
@@ -618,15 +623,15 @@ impl std::fmt::Debug for Identity {
 impl Identity {
     /// Reads a pasted passport or registration bundle.
     ///
-    /// Versions 2 and 3 carry no address of their own, so their certificates
-    /// must say where the server is; version 1 brings its fields. Either way
-    /// the key has to parse, since the codec only checks the wrapper.
+    /// A passport carries no address of its own, so its certificates must
+    /// say where the server is, and the key has to parse, since the codec
+    /// only checks the wrapper.
     pub fn from_passport(armored: &str) -> Result<Identity, String> {
         Identity::from_passport_with_settings(armored).map(|(identity, _)| identity)
     }
 
-    /// [`Identity::from_passport`], plus the settings a version 3 passport
-    /// carries (`PROTOCOL.md` §2.3.1). Settings that do not read are left
+    /// [`Identity::from_passport`], plus the settings a passport may carry
+    /// (`PROTOCOL.md` §2.3.1). Settings that do not read are left
     /// behind with a log line: the identity is what a passport is for.
     pub fn from_passport_with_settings(
         armored: &str,
@@ -636,41 +641,21 @@ impl Identity {
             tracing::info!(%e, "passport does not decode");
             crate::problem::passport_text(&e)
         })?;
-        let (identity, settings) = match passport {
-            Passport::V1(p) => (
-                Identity {
-                    key_der: p.key_der,
-                    leaf_der: p.leaf_der,
-                    ca_der: p.ca_der,
-                    server: ServerInfo {
-                        host: p.host,
-                        port: p.port,
-                        server_name: p.server_name,
-                        name: p.name,
-                    },
-                },
-                None,
-            ),
-            Passport::V2(p) => (
-                Identity::addressed_by_certs(p.key_der, p.leaf_der, p.ca_der)?,
-                None,
-            ),
-            Passport::V3(p) => {
-                let settings = if p.settings.trim().is_empty() {
-                    None
-                } else {
-                    toml::from_str::<Settings>(&p.settings)
-                        .inspect_err(|e| {
-                            tracing::info!(error = %e, "passport settings unreadable, taking the identity alone");
-                        })
-                        .ok()
-                };
-                (
-                    Identity::addressed_by_certs(p.key_der, p.leaf_der, p.ca_der)?,
-                    settings,
-                )
-            }
+        let settings = if passport.settings.trim().is_empty() {
+            None
+        } else {
+            toml::from_str::<Settings>(&passport.settings)
+                .inspect_err(|e| {
+                    tracing::info!(error = %e, "passport settings unreadable, taking the identity alone");
+                })
+                .ok()
         };
+        let identity = Identity::addressed_by_certs(
+            passport.key_der,
+            passport.leaf_der,
+            passport.ca_der,
+            passport.com_key,
+        )?;
         if identity.key_pair().is_err() {
             return Err(
                 "Dieser Passport ist beschädigt (kein gültiger Schlüssel). Bitte auf \
@@ -681,12 +666,12 @@ impl Identity {
         Ok((identity, settings))
     }
 
-    /// An identity whose certificates say where the server is (passport
-    /// versions 2 and 3).
+    /// An identity whose certificates say where the server is.
     fn addressed_by_certs(
         key_der: Vec<u8>,
         leaf_der: Vec<u8>,
         ca_der: Vec<u8>,
+        com_key: ComKey,
     ) -> Result<Identity, String> {
         let server = ServerInfo::from_certs(&leaf_der, &ca_der).ok_or_else(|| {
             "Dieser Passport ist unvollständig (keine Serveradresse). Bitte auf dem \
@@ -697,73 +682,44 @@ impl Identity {
             key_der,
             leaf_der,
             ca_der,
+            com_key,
             server,
         })
     }
 
-    /// The armored passport for this identity. Version 2 when the
-    /// certificates alone lead to the same host, port and SNI this identity
-    /// uses, otherwise version 1 with the address spelled out — an older
-    /// certificate or CA would send the other device somewhere else.
+    /// The armored passport for this identity, without settings. The
+    /// certificates say where the server is (`PROTOCOL.md` §2.3.1).
     pub fn to_passport(&self) -> String {
-        use icu_proto::passport::{PassportV1, PassportV2};
-        if self.reproducible() {
-            PassportV2 {
-                key_der: self.key_der.clone(),
-                leaf_der: self.leaf_der.clone(),
-                ca_der: self.ca_der.clone(),
-            }
-            .encode()
-        } else {
-            PassportV1 {
-                host: self.server.host.clone(),
-                port: self.server.port,
-                server_name: self.server.server_name.clone(),
-                name: self.server.name.clone(),
-                key_der: self.key_der.clone(),
-                leaf_der: self.leaf_der.clone(),
-                ca_der: self.ca_der.clone(),
-            }
-            .encode()
-        }
+        self.passport(String::new()).encode()
     }
 
     /// The armored passport with this device's settings, their portable part
-    /// ([`Settings::portable`]): version 3 when the certificates lead to this
-    /// identity's server. Otherwise, or when the settings would not fit, the
-    /// passport of [`Identity::to_passport`] without them. The flag says
-    /// whether they are in.
+    /// ([`Settings::portable`]); without them when they would not fit. The
+    /// flag says whether they are in.
     pub fn to_passport_with_settings(&self, settings: &Settings) -> (String, bool) {
-        if self.reproducible() {
-            match toml::to_string_pretty(&settings.portable()) {
-                Ok(text) => {
-                    let passport = icu_proto::passport::PassportV3 {
-                        key_der: self.key_der.clone(),
-                        leaf_der: self.leaf_der.clone(),
-                        ca_der: self.ca_der.clone(),
-                        settings: text,
-                    };
-                    if passport.fits() {
-                        return (passport.encode(), true);
-                    }
-                    tracing::warn!("settings too large for the passport, exporting without them");
+        match toml::to_string_pretty(&settings.portable()) {
+            Ok(text) => {
+                let passport = self.passport(text);
+                if passport.fits() {
+                    return (passport.encode(), true);
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "settings do not serialize, exporting without them")
-                }
+                tracing::warn!("settings too large for the passport, exporting without them");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "settings do not serialize, exporting without them")
             }
         }
         (self.to_passport(), false)
     }
 
-    /// Whether the certificates alone lead to the host, port and SNI this
-    /// identity uses, which passport versions 2 and 3 rely on.
-    fn reproducible(&self) -> bool {
-        ServerInfo::from_certs(&self.leaf_der, &self.ca_der).is_some_and(|d| {
-            d.host == self.server.host
-                && d.port == self.server.port
-                && d.server_name == self.server.server_name
-        })
+    fn passport(&self, settings: String) -> icu_proto::passport::Passport {
+        icu_proto::passport::Passport {
+            key_der: self.key_der.clone(),
+            leaf_der: self.leaf_der.clone(),
+            ca_der: self.ca_der.clone(),
+            com_key: self.com_key.clone(),
+            settings,
+        }
     }
 
     /// The private key as rcgen reads it, for CSRs. One that does not parse
@@ -806,17 +762,19 @@ impl Identity {
         let key_der = key_seal::open(fs::read(dir.join("key.pk8"))?)?;
         let leaf_der = fs::read(dir.join("leaf.der"))?;
         let ca_der = fs::read(dir.join("ca.der"))?;
+        let com_key = load_com_key(&dir)?;
         let server: ServerInfo = toml::from_str(&fs::read_to_string(dir.join("server.toml"))?)
             .map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(Some(Identity {
             key_der,
             leaf_der,
             ca_der,
+            com_key,
             server,
         }))
     }
 
-    /// Writes all four files as one set; the key with mode 0600.
+    /// Writes all five files as one set; the keys with mode 0600.
     ///
     /// Into a fresh `identity.new/` first, then swapped in by renaming
     /// directories, so a crash never leaves a key next to somebody else's
@@ -837,6 +795,11 @@ impl Identity {
         )?;
         write_atomic(&fresh.join("leaf.der"), &self.leaf_der, false)?;
         write_atomic(&fresh.join("ca.der"), &self.ca_der, false)?;
+        write_atomic(
+            &fresh.join(COM_KEY_FILE),
+            &key_seal::seal(self.com_key.as_bytes())?,
+            true,
+        )?;
         let text =
             toml::to_string_pretty(&self.server).map_err(|e| ConfigError::Parse(e.to_string()))?;
         write_atomic(&fresh.join("server.toml"), text.as_bytes(), false)?;
@@ -870,6 +833,27 @@ impl Identity {
         remove_dir_if_present(&dir)?;
         remove_dir_if_present(&paths.invites_dir())
     }
+}
+
+/// `identity/com.key`: the raw key, sealed like `key.pk8` on Windows.
+const COM_KEY_FILE: &str = "com.key";
+
+/// Reads `com.key` from an identity directory. An identity from before the
+/// com key (2026-09-27) has none and cannot reach any server: it reads as
+/// broken, and a new passport is the way back.
+fn load_com_key(dir: &Path) -> Result<ComKey, ConfigError> {
+    let data = match fs::read(dir.join(COM_KEY_FILE)) {
+        Ok(data) => key_seal::open(data)?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(ConfigError::Parse(
+                "identity without com key (older than 2026-09-27), import a new passport".into(),
+            ))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let bytes = <[u8; icu_proto::com::COM_KEY_LEN]>::try_from(data.as_slice())
+        .map_err(|_| ConfigError::Parse(format!("{COM_KEY_FILE}: not a com key")))?;
+    Ok(ComKey::from_bytes(bytes))
 }
 
 /// Serializes `Identity::load`, `save` and `remove` within the process: the
@@ -976,12 +960,9 @@ impl From<io::Error> for ConfigError {
 /// are safe in a file name.
 pub fn save_invite(paths: &Paths, bundle: &str) -> Result<PathBuf, ConfigError> {
     use icu_proto::passport::Passport;
-    let leaf_der = match Passport::decode(bundle) {
-        Ok(Passport::V1(p)) => p.leaf_der,
-        Ok(Passport::V2(p)) => p.leaf_der,
-        Ok(Passport::V3(p)) => p.leaf_der,
-        Err(e) => return Err(ConfigError::Parse(e.to_string())),
-    };
+    let leaf_der = Passport::decode(bundle)
+        .map_err(|e| ConfigError::Parse(e.to_string()))?
+        .leaf_der;
     let name: String = x509_parser::parse_x509_certificate(&leaf_der)
         .ok()
         .and_then(|(_, leaf)| crate::conninfo::cn(leaf.subject()))
@@ -1176,6 +1157,23 @@ pub fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<(), Confi
 mod tests {
     use super::*;
 
+    /// The com key of the test identities.
+    fn com() -> ComKey {
+        ComKey::from_bytes([3; icu_proto::com::COM_KEY_LEN])
+    }
+
+    /// A passport of `key`, `leaf` and `ca` with `settings`.
+    fn passport(key: Vec<u8>, leaf: Vec<u8>, ca: Vec<u8>, settings: &str) -> String {
+        icu_proto::passport::Passport {
+            key_der: key,
+            leaf_der: leaf,
+            ca_der: ca,
+            com_key: com(),
+            settings: settings.into(),
+        }
+        .encode()
+    }
+
     #[test]
     fn settings_roundtrip_through_toml() {
         let dir = tempfile::tempdir().unwrap();
@@ -1307,12 +1305,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(Some(dir.path().to_path_buf()));
         let (leaf, ca, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA x");
-        let bundle = icu_proto::passport::PassportV2 {
-            key_der: key,
-            leaf_der: leaf,
-            ca_der: ca,
-        }
-        .encode();
+        let bundle = passport(key, leaf, ca, "");
         let path = save_invite(&paths, &bundle).unwrap();
         assert_eq!(path, dir.path().join("invites").join("alice.icu"));
         assert_eq!(fs::read_to_string(&path).unwrap(), bundle);
@@ -1335,6 +1328,7 @@ mod tests {
             key_der: key,
             leaf_der: leaf,
             ca_der: ca,
+            com_key: com(),
             server,
         };
         let summary = ImportSummary::of(&incoming, None);
@@ -1353,6 +1347,7 @@ mod tests {
             key_der: key,
             leaf_der: leaf,
             ca_der: ca,
+            com_key: com(),
             server: ServerInfo {
                 host: "2001:db8::1".into(),
                 port: 4711,
@@ -1369,80 +1364,46 @@ mod tests {
         assert!(changed.lines().last().unwrap().contains("anderer Server"));
     }
 
-    /// Export picks the version the certificates can support, and import
-    /// reads either back to the same identity.
+    /// A passport reads back to the same identity, com key included; the
+    /// certificates say where the server is.
     #[test]
-    fn passport_export_falls_back_to_v1_for_old_certificates() {
-        let old_server = ServerInfo {
-            host: "old.example.org".into(),
-            port: 4711,
-            server_name: "old.example.org".into(),
-            name: "alice".into(),
-        };
-        let (leaf, ca, key) = issued(None, "ICU CA");
-        let old = Identity {
-            key_der: key,
-            leaf_der: leaf,
-            ca_der: ca,
-            server: old_server,
-        };
-        let text = old.to_passport();
-        assert!(matches!(
-            icu_proto::passport::Passport::decode(&text).unwrap(),
-            icu_proto::passport::Passport::V1(_)
-        ));
-        assert_eq!(Identity::from_passport(&text).unwrap(), old);
-
+    fn a_passport_reads_back_to_the_same_identity() {
         let (leaf, ca, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA icu.example.org");
         let server = ServerInfo::from_certs(&leaf, &ca).unwrap();
-        let new = Identity {
+        let identity = Identity {
             key_der: key,
             leaf_der: leaf,
             ca_der: ca,
+            com_key: com(),
             server,
         };
-        let text = new.to_passport();
-        assert!(matches!(
-            icu_proto::passport::Passport::decode(&text).unwrap(),
-            icu_proto::passport::Passport::V2(_)
-        ));
-        assert_eq!(Identity::from_passport(&text).unwrap(), new);
-        assert!(!new.is_registration());
+        let text = identity.to_passport();
+        assert_eq!(Identity::from_passport(&text).unwrap(), identity);
+        assert!(!identity.is_registration());
 
-        // Old CA without an SNI in its CN, but the address is in the leaf:
-        // when the stored SNI differs from the URI host, only V1 keeps it.
-        let (leaf, ca, key) = issued(Some("icu://192.0.2.10:4711"), "ICU CA");
-        let mixed = Identity {
-            key_der: key,
-            leaf_der: leaf,
-            ca_der: ca,
-            server: ServerInfo {
-                host: "192.0.2.10".into(),
-                port: 4711,
-                server_name: "icu.example.org".into(),
-                name: "alice".into(),
-            },
+        // Without an address in the certificate there is nowhere to go.
+        let (leaf, ca, key) = issued(None, "ICU CA icu.example.org");
+        assert!(Identity::from_passport(&passport(key, leaf, ca, "")).is_err());
+
+        // Under an old CA without an SNI in its CN, a renewal moves host and
+        // port, never the SNI.
+        let mut server = ServerInfo {
+            host: "192.0.2.10".into(),
+            port: 4711,
+            server_name: "icu.example.org".into(),
+            name: "alice".into(),
         };
-        let text = mixed.to_passport();
-        assert!(matches!(
-            icu_proto::passport::Passport::decode(&text).unwrap(),
-            icu_proto::passport::Passport::V1(_)
-        ));
-        assert_eq!(Identity::from_passport(&text).unwrap(), mixed);
-
-        // A renewal under that CA moves host and port, never the SNI.
-        let mut server = mixed.server.clone();
-        let (leaf, _, _) = issued(Some("icu://198.51.100.7:5000"), "ICU CA");
-        server.update_from_certs(&leaf, &mixed.ca_der);
+        let (leaf, ca, _) = issued(Some("icu://198.51.100.7:5000"), "ICU CA");
+        server.update_from_certs(&leaf, &ca);
         assert_eq!((server.host.as_str(), server.port), ("198.51.100.7", 5000));
         assert_eq!(server.server_name, "icu.example.org");
 
-        let broken = icu_proto::passport::PassportV2 {
-            key_der: vec![1, 2, 3],
-            leaf_der: new.leaf_der.clone(),
-            ca_der: new.ca_der.clone(),
-        }
-        .encode();
+        let broken = passport(
+            vec![1, 2, 3],
+            identity.leaf_der.clone(),
+            identity.ca_der.clone(),
+            "",
+        );
         assert!(Identity::from_passport(&broken).is_err());
     }
 
@@ -1455,6 +1416,7 @@ mod tests {
             key_der: vec![1, 2, 3],
             leaf_der: vec![4, 5],
             ca_der: vec![6],
+            com_key: com(),
             server: ServerInfo {
                 host: "icu.example.org".into(),
                 port: 4711,
@@ -1468,6 +1430,9 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(paths.key()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+            let com_key = paths.identity_dir().join(COM_KEY_FILE);
+            let mode = fs::metadata(com_key).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
 
@@ -1509,6 +1474,14 @@ mod tests {
         assert!(Identity::load(&paths).unwrap().is_none());
         assert!(!paths.identity_dir().with_extension("old").exists());
         Identity::remove(&paths).unwrap();
+
+        // An identity from before the com key does not load.
+        id.save(&paths).unwrap();
+        fs::remove_file(paths.identity_dir().join(COM_KEY_FILE)).unwrap();
+        assert!(matches!(
+            Identity::load(&paths),
+            Err(ConfigError::Parse(e)) if e.contains("com key")
+        ));
     }
 
     /// The window reads the identity (passport export) while the engine
@@ -1522,6 +1495,7 @@ mod tests {
             key_der: vec![n; 32],
             leaf_der: vec![n; 16],
             ca_der: vec![9],
+            com_key: com(),
             server: ServerInfo {
                 host: "icu.example.org".into(),
                 port: 4711,
@@ -1553,12 +1527,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::new(Some(dir.path().to_path_buf()));
         let (leaf, ca, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA x");
-        let bundle = icu_proto::passport::PassportV2 {
-            key_der: key,
-            leaf_der: leaf,
-            ca_der: ca,
-        }
-        .encode();
+        let bundle = passport(key, leaf, ca, "");
         let saved = save_invite(&paths, &bundle).unwrap();
         assert!(saved.exists());
         Identity::remove(&paths).unwrap();
@@ -1684,9 +1653,8 @@ mod tests {
         assert_eq!(here.volume(6), 100.0);
     }
 
-    /// Version 3 carries the settings and reads back to the same identity;
-    /// an identity that needs version 1 exports without them, as does one
-    /// whose settings would not fit.
+    /// A passport carries the settings and reads back to the same identity;
+    /// settings that would not fit stay behind.
     #[test]
     fn passport_export_carries_the_settings_where_it_can() {
         let (leaf, ca, key) = issued(Some("icu://icu.example.org:4711"), "ICU CA icu.example.org");
@@ -1695,6 +1663,7 @@ mod tests {
             key_der: key,
             leaf_der: leaf,
             ca_der: ca,
+            com_key: com(),
             server,
         };
         let mut settings = machine("a");
@@ -1706,27 +1675,10 @@ mod tests {
         }
         let (text, included) = identity.to_passport_with_settings(&settings);
         assert!(included, "a full settings file fits");
-        assert!(matches!(
-            icu_proto::passport::Passport::decode(&text).unwrap(),
-            icu_proto::passport::Passport::V3(_)
-        ));
         let (back, carried) = Identity::from_passport_with_settings(&text).unwrap();
         assert_eq!(back, identity);
         assert_eq!(carried, Some(settings.portable()));
         assert_eq!(Identity::from_passport(&text).unwrap(), identity);
-
-        let old = Identity {
-            server: ServerInfo {
-                server_name: "elsewhere.example.org".into(),
-                ..identity.server.clone()
-            },
-            ..identity.clone()
-        };
-        let (text, included) = old.to_passport_with_settings(&settings);
-        assert!(!included);
-        let (back, carried) = Identity::from_passport_with_settings(&text).unwrap();
-        assert_eq!(back, old);
-        assert_eq!(carried, None);
 
         let mut huge = settings.clone();
         huge.ui.theme = "x".repeat(icu_proto::passport::MAX_PASSPORT_BYTES);
@@ -1744,13 +1696,7 @@ mod tests {
             "[audio]\nframe_ms = \"zwanzig\"\n",
             "  \n",
         ] {
-            let text = icu_proto::passport::PassportV3 {
-                key_der: key.clone(),
-                leaf_der: leaf.clone(),
-                ca_der: ca.clone(),
-                settings: settings.into(),
-            }
-            .encode();
+            let text = passport(key.clone(), leaf.clone(), ca.clone(), settings);
             let (identity, carried) = Identity::from_passport_with_settings(&text).unwrap();
             assert_eq!(identity.server.host, "icu.example.org");
             assert_eq!(carried, None, "{settings:?}");

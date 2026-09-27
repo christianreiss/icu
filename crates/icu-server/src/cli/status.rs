@@ -20,6 +20,10 @@ pub async fn run(config: &Config, json: bool) -> Result<()> {
         get("handshakes"),
         get("connections")
     );
+    println!(
+        "com tag   {} datagrams dropped since start",
+        get("com_dropped")
+    );
     if let Some(relay) = value.get("relay") {
         let r = |key: &str| relay.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
         println!(

@@ -17,6 +17,10 @@ base64.workspace = true
 unicode-normalization.workspace = true
 unicode-security.workspace = true
 unicode-general-category.workspace = true
+# Com-Schluessel (com.rs): Socket-Filter fuer quinn, HMAC, Konstantzeit-Vergleich.
+quinn.workspace = true
+ring.workspace = true
+subtle.workspace = true
 
 [lints.rust]
 missing_docs = "warn"

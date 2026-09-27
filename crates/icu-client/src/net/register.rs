@@ -53,7 +53,7 @@ pub async fn register(
         Some(a) => a,
         None => resolve(&bundle.server.host, bundle.server.port).await?,
     };
-    let endpoint = super::bind_endpoint(addr)?;
+    let endpoint = super::bind_endpoint(addr, &bundle.com_key)?;
     let session = conn::connect(
         &endpoint,
         config,
@@ -177,6 +177,7 @@ async fn exchange(
                     key_der,
                     leaf_der,
                     ca_der: bundle.ca_der.clone(),
+                    com_key: bundle.com_key.clone(),
                     server,
                 });
             }

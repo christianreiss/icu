@@ -2,7 +2,8 @@
 //!
 //! This crate is the single place where the wire format of
 //! [`PROTOCOL.md`](../../../PROTOCOL.md) is defined; server and client compile
-//! the same crate. Nothing here does I/O.
+//! the same crate. Nothing here does I/O except [`com::ComSocket`], a filter
+//! around quinn's UDP socket.
 //!
 //! Layout:
 //!
@@ -14,9 +15,11 @@
 //! * [`limits`] — the numbers from `PROTOCOL.md` §7 as constants
 //! * [`passport`] — the armored identity bundle, also used for registration
 //!   bundles (§2.3)
+//! * [`com`] — the com key: an HMAC tag on every UDP datagram (§1)
 
 #![forbid(unsafe_code)]
 
+pub mod com;
 pub mod control;
 pub mod error;
 pub mod framing;

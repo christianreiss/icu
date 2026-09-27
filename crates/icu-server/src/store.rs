@@ -35,6 +35,8 @@ pub const REDEEMS_PER_BUNDLE: usize = 5;
 
 /// File name of the user database.
 pub const USERS_FILE: &str = "users.toml";
+/// File name of the com key (`PROTOCOL.md` §1), base64, mode 0600.
+pub const COM_KEY_FILE: &str = "com.key";
 /// File name of the lock file.
 pub const LOCK_FILE: &str = "state.lock";
 
