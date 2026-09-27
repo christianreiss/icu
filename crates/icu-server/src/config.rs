@@ -58,7 +58,9 @@ pub struct ServerSection {
     pub max_users: u16,
     /// Lowest allowed client version, SemVer.
     pub min_client: String,
-    /// Group that owns the admin socket. `None` leaves the group alone.
+    /// Group that owns the admin socket: a name, looked up in `/etc/group`
+    /// and then through the host's `getent`, or a gid. `None` leaves the
+    /// group alone.
     pub admin_socket_group: Option<String>,
 }
 

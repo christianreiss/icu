@@ -327,7 +327,11 @@ Alle Kommandos außer `run` sprechen über `/run/icu/admin.sock` mit dem
 laufenden Server; eine Änderung wirkt damit sofort und nicht erst nach einem
 Neustart. Sie brauchen root oder Mitgliedschaft in der Gruppe `icu`: die Unit
 läuft mit `Group=icu`, damit gehören `/run/icu` (0750) und der Socket (0660)
-dieser Gruppe. `server.admin_socket_group` bleibt deshalb `icu`. Mehr als den
+dieser Gruppe. `server.admin_socket_group` bleibt deshalb `icu`. Soll eine
+Gruppe aus FreeIPA/SSSD oder LDAP den Socket bekommen, per Drop-in `Group=` auf
+sie setzen und `admin_socket_group` auf denselben Namen (oder die gid): der
+Server fragt Namen, die nicht in `/etc/group` stehen, über `getent` beim NSS
+des Hosts nach. Mehr als den
 Socket brauchen sie nicht, auch ohne `server_name` in der Konfiguration (der
 State unter `/var/lib/private` bleibt root vorbehalten). Wer nicht an den
 Socket darf, bekommt das als Fehler mit Pfad und Ursache.

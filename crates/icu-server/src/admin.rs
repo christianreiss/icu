@@ -820,7 +820,7 @@ pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, AbortHandle)> {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
         .context("cannot chmod the admin socket")?;
     if let Some(group) = &server.config.server.admin_socket_group {
-        if let Err(e) = chgrp(&path, group) {
+        if let Err(e) = crate::store::blocking(|| chgrp(&path, group)) {
             tracing::warn!(group = %group, error = %e, "cannot set the admin socket group");
         }
     }
@@ -830,22 +830,64 @@ pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, AbortHandle)> {
 }
 
 fn chgrp(path: &std::path::Path, group: &str) -> Result<()> {
-    // No `nix`/`users` crate in the dependency set, so resolve the group by
-    // reading /etc/group.
-    let text = std::fs::read_to_string("/etc/group")?;
-    let gid = text
-        .lines()
-        .find_map(|line| {
-            let mut fields = line.split(':');
-            let name = fields.next()?;
-            let _passwd = fields.next()?;
-            let gid = fields.next()?;
-            (name == group).then(|| gid.parse::<u32>().ok())?
-        })
-        .ok_or_else(|| Error::msg(format!("no group {group:?} in /etc/group")))?;
+    let gid = resolve_group(group)?;
     // `Gid::from_raw` is safe in rustix 1; the name is historical.
     rustix::fs::chown(path, None, Some(rustix::fs::Gid::from_raw(gid)))?;
     Ok(())
+}
+
+/// The gid of `group`, like chown(1): a name in `/etc/group`, else a number
+/// as it is, else what the host's `getent group` says. The server is a
+/// static musl binary without NSS, so a group only a directory service
+/// knows — FreeIPA/SSSD, LDAP, systemd-userdb — used to be ignored with a
+/// warning (external review 2026-09-27); `getent` asks the host's NSS for
+/// it. Where there is none (the `scratch` image), a number still works.
+pub fn resolve_group(group: &str) -> Result<u32> {
+    if let Some(gid) = std::fs::read_to_string("/etc/group")
+        .ok()
+        .and_then(|text| group_gid(&text, group))
+    {
+        return Ok(gid);
+    }
+    if let Ok(gid) = group.parse::<u32>() {
+        return Ok(gid);
+    }
+    getent_gid(group)
+}
+
+/// The gid `getent group -- <group>` names: the host's NSS. Starts a
+/// process, which is why the tests that call it live in `tests/cli_binary.rs`.
+pub fn getent_gid(group: &str) -> Result<u32> {
+    let out = std::process::Command::new("getent")
+        .args(["group", "--", group])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| {
+            Error::msg(format!(
+                "no group {group:?} in /etc/group, and no getent to ask the host ({e})"
+            ))
+        })?;
+    out.status
+        .success()
+        .then(|| group_gid(&String::from_utf8_lossy(&out.stdout), group))
+        .flatten()
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "no group {group:?} in /etc/group or through getent"
+            ))
+        })
+}
+
+/// The gid of `group` in `group(5)` lines: `name:password:gid:members`.
+fn group_gid(text: &str, group: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let _passwd = fields.next()?;
+        let gid = fields.next()?;
+        (name == group).then(|| gid.parse::<u32>().ok())?
+    })
 }
 
 /// Longest request line the admin socket reads (external review 2026-09-27,
@@ -1079,6 +1121,28 @@ mod tests {
             serde_json::from_str::<AdminRequest>(r#"{"cmd":"invite","name":"bob"}"#).unwrap(),
             AdminRequest::Invite { ttl_s: None, .. }
         ));
+    }
+
+    /// The admin socket's group resolves from `group(5)` lines and as a
+    /// number; through the host's NSS in `tests/cli_binary.rs`.
+    #[test]
+    fn the_socket_group_resolves_by_name_and_number() {
+        let text = "root:x:0:\nicu:x:975:checkmk,chris\nbroken\n";
+        assert_eq!(group_gid(text, "icu"), Some(975));
+        assert_eq!(group_gid(text, "root"), Some(0));
+        assert_eq!(group_gid(text, "ic"), None);
+        assert_eq!(group_gid(text, "broken"), None);
+
+        // Neither starts `getent`: a child forked here would share the
+        // state locks of the tests beside it (`tests/cli_binary.rs`).
+        assert_eq!(resolve_group("root").unwrap(), 0);
+        let mine = rustix::process::getegid().as_raw();
+        assert_eq!(resolve_group(&mine.to_string()).unwrap(), mine);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("admin.sock");
+        std::fs::write(&file, "").unwrap();
+        chgrp(&file, &mine.to_string()).unwrap();
     }
 
     #[test]

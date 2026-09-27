@@ -1,6 +1,7 @@
-//! Tests that run the `icu-server` binary as a child process: `status` and
-//! `users` through the socket alone, `backup` and `restore` on a stopped
-//! server (`Server/IMPLEMENTATION.md` §5).
+//! Tests that start child processes: the `icu-server` binary for `status`
+//! and `users` through the socket alone and for `backup` and `restore` on a
+//! stopped server (`Server/IMPLEMENTATION.md` §5), and `getent` for the
+//! admin socket's group.
 //!
 //! In a test binary of their own, and one at a time, on purpose. `flock`
 //! belongs to the open file description, and a child forked while another
@@ -111,4 +112,21 @@ async fn the_cli_backs_up_lists_and_restores() {
         out.contains("pre-restore") || out.contains("replaced"),
         "{out}"
     );
+}
+
+/// External review 2026-09-27: the admin socket's group is looked up in
+/// `/etc/group` and then through the host's NSS (`getent`), so a group only
+/// FreeIPA/SSSD knows works too; it used to be ignored with a warning.
+#[tokio::test]
+async fn the_socket_group_is_asked_of_the_hosts_nss() {
+    let _alone = ALONE.lock().await;
+    let err = icu_server::admin::resolve_group("no-such-group-icu-test")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no-such-group-icu-test"), "{err}");
+    match icu_server::admin::getent_gid("root") {
+        Ok(gid) => assert_eq!(gid, 0),
+        Err(e) if e.to_string().contains("no getent") => eprintln!("skipped: {e}"),
+        Err(e) => panic!("{e}"),
+    }
 }
