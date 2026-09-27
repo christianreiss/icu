@@ -276,12 +276,16 @@ Token-Buckets pro Client (Control 50/s, Audio 110/s, Video 20/s und 400 kbit/s) 
 Description=ICU voice server
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
+Type=exec
 ExecStart=/usr/bin/icu-server run --config /etc/icu/server.toml
 DynamicUser=yes
 Group=icu
 StateDirectory=icu
+StateDirectoryMode=0700
 RuntimeDirectory=icu
 RuntimeDirectoryMode=0750
 ConfigurationDirectory=icu
@@ -295,6 +299,7 @@ SystemCallFilter=@system-service
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
 CapabilityBoundingSet=
+LimitCORE=0
 Restart=on-failure
 RestartSec=2
 
@@ -302,7 +307,7 @@ RestartSec=2
 WantedBy=multi-user.target
 ```
 
-Auszug; vollständig mit Härtung in `deploy/icu-server.service`. CLI-Aufrufe als root oder als Mitglied der Gruppe `icu`: `Group=icu` macht die statische Gruppe (sysusers) zur primären Gruppe des dynamischen Nutzers, damit gehört `/run/icu` `icu-server:icu` (0750) und der Socket (0660) der Gruppe `icu`. Ohne `Group=` gehörte `/run/icu` der dynamischen Gruppe, und Gruppenmitglieder — Admins, der Checkmk-Agent — kamen nicht an den Socket; die CLI fiel dann auf den State zurück und scheiterte am Lock (2026-09-26, in einem systemd-Container nachgeprüft). Der State bleibt privat: `/var/lib/private` ist 0700 root; die CLI liest daraus für Kommandos über den Socket nichts, auch nicht `ca.crt` für ein fehlendes `server_name` (§5, 2026-09-27).
+Auszug; vollständig mit Härtung in `deploy/icu-server.service`. CLI-Aufrufe als root oder als Mitglied der Gruppe `icu`: `Group=icu` macht die statische Gruppe (sysusers) zur primären Gruppe des dynamischen Nutzers, damit gehört `/run/icu` `icu-server:icu` (0750) und der Socket (0660) der Gruppe `icu`. Ohne `Group=` gehörte `/run/icu` der dynamischen Gruppe, und Gruppenmitglieder — Admins, der Checkmk-Agent — kamen nicht an den Socket; die CLI fiel dann auf den State zurück und scheiterte am Lock (2026-09-26, in einem systemd-Container nachgeprüft). Der State bleibt privat: `/var/lib/private` ist 0700 root; die CLI liest daraus für Kommandos über den Socket nichts, auch nicht `ca.crt` für ein fehlendes `server_name` (§5, 2026-09-27). Seit 2026-09-27 (externes Review O-1) zusätzlich: `StateDirectoryMode=0700` (der Socket liegt in `RuntimeDirectory`, die Gruppe erreicht ihn weiter), `LimitCORE=0` (ein SIGSYS oder SIGSEGV schriebe sonst CA- und Com-Schlüssel in systemd-coredump), `PrivateIPC=yes`, `Type=exec` (ein fehlendes oder kaputtes Binary scheitert beim Start, statt als laufend zu gelten) und `StartLimitIntervalSec=60`/`StartLimitBurst=5` (ein Server, der nicht starten kann, gibt nach fünf Versuchen in einer Minute auf und steht als `failed` da, statt mit `Restart=` endlos zu kreisen). `Type=notify` und `RestartPreventExitStatus=78` fehlen bewusst: der Server sendet kein `READY=1` und beendet sich bei jedem Fehler mit Status 1.
 
 ## 9. Abhängigkeiten (gepinnt, Lizenz aus `Research/packaging-licensing.md`)
 
