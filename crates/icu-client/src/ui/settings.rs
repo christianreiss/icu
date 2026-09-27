@@ -1343,9 +1343,15 @@ impl SettingsView {
             if !self.overlay_available {
                 widgets::help_note(
                     ui,
-                    "Diese Arbeitsumgebung erlaubt keine Fenster über Spielen (Wayland \
-                     ohne Layer-Shell, etwa GNOME). Die Kameras erscheinen dann nur in der \
-                     Teilnehmerliste.",
+                    if cfg!(target_os = "linux") {
+                        "Das Overlay braucht eine Wayland-Sitzung, deren Arbeitsumgebung \
+                         Fenster über Spielen erlaubt (Layer-Shell, etwa KDE Plasma oder \
+                         Sway). Hier gibt es das nicht — unter X11 nie, unter GNOME ebenso \
+                         wenig. Die Kameras erscheinen dann nur in der Teilnehmerliste."
+                    } else {
+                        "Das Overlay ließ sich hier nicht starten. Die Kameras erscheinen \
+                         dann nur in der Teilnehmerliste."
+                    },
                 );
                 return;
             }

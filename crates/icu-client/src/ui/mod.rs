@@ -47,6 +47,20 @@ pub(crate) fn ptt_key_label(hotkeys: &crate::config::HotkeySettings, backend: &s
         .to_string()
 }
 
+/// Whether a file dropped onto a window arrives: winit 0.30 delivers
+/// `DroppedFile` on X11 and Windows, not on Wayland — which it uses
+/// whenever `WAYLAND_DISPLAY` is set, unless `WINIT_UNIX_BACKEND=x11`
+/// forces X11. The first-start window promises drag & drop only where it
+/// works.
+pub(crate) fn file_drop_works() -> bool {
+    if !cfg!(target_os = "linux") {
+        return true;
+    }
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    let forced_x11 = std::env::var("WINIT_UNIX_BACKEND").is_ok_and(|v| v == "x11");
+    !wayland || forced_x11
+}
+
 /// Work area in egui screen coordinates, including the taskbar exclusion.
 /// winit supplies the monitor size but not its usable rectangle.
 #[cfg(windows)]
