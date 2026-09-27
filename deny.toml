@@ -8,7 +8,7 @@ targets = [
     { triple = "x86_64-unknown-linux-musl" },
     { triple = "x86_64-pc-windows-gnu" },
 ]
-# Auch die optionalen Features (`mjpeg`, `cpal-fallback`, `glow`), sonst
+# Auch die optionalen Features (`cpal-fallback`, `glow`), sonst
 # prueft der Build nur den Graph der Default-Features.
 all-features = true
 

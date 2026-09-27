@@ -333,7 +333,7 @@ Auszug; vollständig mit Härtung in `deploy/icu-server.service`. CLI-Aufrufe al
 
 Kein libopus, kein Codec, keine GUI auf dem Server.
 
-Lizenz-Allowlist: **eine** `deny.toml` im Workspace-Root, gültig für Server und Client — MIT, Apache-2.0, ISC, BSD-2-Clause, BSD-3-Clause, Zlib, Unicode-3.0; `IJG` ausschließlich hinter dem Client-Feature `mjpeg`. Alles andere bricht den Build.
+Lizenz-Allowlist: **eine** `deny.toml` im Workspace-Root, gültig für Server und Client — MIT, Apache-2.0, ISC, BSD-2-Clause, BSD-3-Clause, Zlib, Unicode-3.0; `IJG` ausschließlich für `mozjpeg`/`mozjpeg-sys`, über die nokhwa (Client-Feature `camera`) Kamerabilder im MJPEG-Format dekodiert. Alles andere bricht den Build.
 
 Lizenz von ICU selbst: **Apache-2.0** (entschieden 2026-09-24 mit der Veröffentlichung auf GitHub, Empfehlung aus `Research/packaging-licensing.md`); `license` steht in `[workspace.package]`, Text in `LICENSE`.
 
