@@ -371,28 +371,52 @@ impl Store {
         None
     }
 
-    /// Resolves a CLI selector: `user_id`, name or certificate fingerprint.
+    /// Every user a CLI selector can mean, ascending: `user_id`, name or
+    /// certificate fingerprint, or explicitly `id:<user_id>` or
+    /// `name:<name>`. Exactly one is a match; more than one is ambiguous and
+    /// must not be guessed at — a name may be all digits, so `revoke 1` could
+    /// mean user 1 or the user called "1", and `revoke` is final. The
+    /// selector as a whole is always also tried as a name, so a user
+    /// literally called `id:3` is not silently passed over for user 3 either.
+    ///
     /// A name matches exactly first, else case-insensitively if that is
     /// unambiguous. Never by `name_key`: that also folds look-alikes, and a
     /// revoke must not land on the wrong account.
-    pub fn resolve(&self, selector: &str) -> Option<UserId> {
-        if let Ok(id) = selector.parse::<UserId>() {
-            if self.user(id).is_some() {
-                return Some(id);
-            }
-        }
-        if let Some((id, _)) = self.users().find(|(_, u)| u.name == selector) {
+    pub fn resolve(&self, selector: &str) -> Vec<UserId> {
+        let by_id = |id: &str| {
+            id.parse::<UserId>()
+                .ok()
+                .filter(|id| self.user(*id).is_some())
+        };
+        let mut found: Vec<UserId> = match selector.split_once(':') {
+            Some(("id", id)) => by_id(id).into_iter().collect(),
+            Some(("name", name)) => self.by_name(name).into_iter().collect(),
+            _ => by_id(selector)
+                .into_iter()
+                .chain(self.by_fingerprint(selector).map(|(id, _, _)| id))
+                .collect(),
+        };
+        found.extend(self.by_name(selector));
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    /// The user called `name`: exactly, else case-insensitively if only one
+    /// matches that way.
+    fn by_name(&self, name: &str) -> Option<UserId> {
+        if let Some((id, _)) = self.users().find(|(_, u)| u.name == name) {
             return Some(id);
         }
-        let lower = selector.to_lowercase();
+        let lower = name.to_lowercase();
         let mut folded = self
             .users()
             .filter(|(_, u)| u.name.to_lowercase() == lower)
             .map(|(id, _)| id);
-        if let (Some(id), None) = (folded.next(), folded.next()) {
-            return Some(id);
+        match (folded.next(), folded.next()) {
+            (Some(id), None) => Some(id),
+            _ => None,
         }
-        self.by_fingerprint(selector).map(|(id, _, _)| id)
     }
 
     /// Whether `name` is already taken, ignoring `except`.
@@ -1246,9 +1270,9 @@ mod tests {
                 server_deafened: false,
             },
         );
-        assert_eq!(s.resolve("Chris"), Some(latin));
-        assert_eq!(s.resolve("chris"), Some(latin));
-        assert_eq!(s.resolve("\u{0421}\u{04BB}ris"), Some(9));
+        assert_eq!(s.resolve("Chris"), vec![latin]);
+        assert_eq!(s.resolve("chris"), vec![latin]);
+        assert_eq!(s.resolve("\u{0421}\u{04BB}ris"), vec![9]);
         // A renewal keeping a name that now collides still goes through.
         let mut renewed = named_cert("cc", "\u{0421}\u{04BB}ris");
         renewed.expires = rfc3339(now() + Duration::from_secs(86400));
@@ -1352,10 +1376,36 @@ mod tests {
     fn resolve_by_id_name_and_fingerprint() {
         let (_dir, mut s) = store();
         let alice = s.add_user(named_cert("9f86d0", "alice"), false).unwrap();
-        assert_eq!(s.resolve("1"), Some(alice));
-        assert_eq!(s.resolve("ALICE"), Some(alice));
-        assert_eq!(s.resolve("9f86d0"), Some(alice));
-        assert_eq!(s.resolve("nobody"), None);
+        assert_eq!(s.resolve("1"), vec![alice]);
+        assert_eq!(s.resolve("ALICE"), vec![alice]);
+        assert_eq!(s.resolve("9f86d0"), vec![alice]);
+        assert_eq!(s.resolve("id:1"), vec![alice]);
+        assert_eq!(s.resolve("name:alice"), vec![alice]);
+        assert!(s.resolve("nobody").is_empty());
+        assert!(s.resolve("id:alice").is_empty());
+        assert!(s.resolve("name:1").is_empty());
+    }
+
+    /// A name may be all digits. `revoke 1` must not pick user 1 over the
+    /// user called "1" (or the other way round): both readings come back,
+    /// and the explicit forms tell them apart.
+    #[test]
+    fn a_selector_naming_two_users_is_ambiguous() {
+        let (_dir, mut s) = store();
+        let owner = s.add_user(named_cert("aa", "owner"), true).unwrap();
+        let one = s.add_user(named_cert("bb", "1"), false).unwrap();
+        assert_ne!(owner, one);
+        assert_eq!(s.resolve("1"), vec![owner, one]);
+        assert_eq!(s.resolve("id:1"), vec![owner]);
+        assert_eq!(s.resolve("name:1"), vec![one]);
+        // The selector as a whole is a name too: a user called "id:1" makes
+        // the explicit form ambiguous again, and `name:` still reaches them.
+        let literal = s.add_user(named_cert("cc", "id:1"), false).unwrap();
+        assert_eq!(s.resolve("id:1"), vec![owner, literal]);
+        assert_eq!(s.resolve("name:id:1"), vec![literal]);
+        // Without a clash a plain selector stays plain.
+        assert_eq!(s.resolve(&one.to_string()), vec![one]);
+        assert_eq!(s.resolve("owner"), vec![owner]);
     }
 
     /// §10: atomic write — the file is valid TOML after every operation and

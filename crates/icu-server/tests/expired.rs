@@ -155,6 +155,36 @@ async fn an_expired_certificate_cannot_rename_or_renew_twice_in_an_hour() {
     server.shutdown().await;
 }
 
+/// An expired certificate renews onto its own key and no other
+/// (`PROTOCOL.md` §2.3.3): the handshake proved that key, nothing more.
+#[tokio::test]
+async fn an_expired_certificate_renews_onto_its_own_key_only() {
+    let (server, alice) = expired_user("alice").await;
+    let mut client = server.connect(&alice).await.expect("connect");
+    client.hello("alice").await;
+    client.recv_msg().await; // RENEW_REQUIRED
+
+    let (_other_key, csr_der) = common::csr_with_cn("alice");
+    client.send_msg(&ControlMsg::RenewRequest { csr_der }).await;
+    assert!(matches!(
+        client.recv_msg().await,
+        ControlMsg::Error {
+            code: ec::RENEW_REJECTED,
+            ..
+        }
+    ));
+    client
+        .send_msg(&ControlMsg::RenewRequest {
+            csr_der: renewal_csr(&alice, "alice"),
+        })
+        .await;
+    assert!(matches!(
+        client.recv_msg().await,
+        ControlMsg::RenewResponse { .. }
+    ));
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_revoked_expired_certificate_stays_out() {
     let (server, alice) = expired_user("alice").await;

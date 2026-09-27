@@ -79,6 +79,14 @@ pub const SEND_WINDOW: u64 = 1024 * 1024;
 /// Video frames one sender may have in flight on the server at a time; a
 /// further stream is stopped with `RATE_LIMITED` right away.
 pub const VIDEO_STREAMS_PER_SENDER: usize = 4;
+/// Video frames the server keeps unacknowledged per sender-receiver pair: a
+/// further frame waits in the pair's slot (one deep) until the receiver has
+/// acknowledged the oldest. Bounds how far a receiver with too narrow a
+/// downlink falls behind to about this many frames, instead of whatever the
+/// stream credit and send window hold. At 15 fps, 2 cover a round trip
+/// (plus ACK delay) of up to about 130 ms without loss; beyond that the pair
+/// drops frames, which `VideoCongestionHint` reports (`PROTOCOL.md` §4).
+pub const VIDEO_UNACKED_PER_PAIR: usize = 2;
 /// Seconds a video frame may take to arrive, header and payload, before the
 /// server stops its stream with `RATE_LIMITED`.
 pub const VIDEO_FRAME_TIMEOUT_S: u64 = 5;

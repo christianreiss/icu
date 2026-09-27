@@ -566,10 +566,17 @@ async fn a_receiver_without_stream_credit_has_a_bounded_frame_wait() {
         bob.recv_video(BRIEFLY).await.is_none(),
         "expired frame is discarded"
     );
+    // Bob never got frame 1, so a delta is useless to him until the next
+    // keyframe (`PROTOCOL.md` §4): it is dropped, the keyframe passes.
     alice.send_video(2, 3200, false, &[0x43; 200]).await;
+    assert!(
+        bob.recv_video(BRIEFLY).await.is_none(),
+        "a delta after the lost frame is dropped"
+    );
+    alice.send_video(3, 6400, true, &[0x44; 200]).await;
     assert_eq!(
         bob.recv_video(SOON).await.expect("viewer recovers").0.seq,
-        2
+        3
     );
     server.shutdown().await;
 }
@@ -674,6 +681,69 @@ async fn the_last_viewer_stopping_retires_its_blocked_slot() {
             .0
             .seq,
         3
+    );
+    server.shutdown().await;
+}
+
+/// Waits until the server has taken in `n` video frames in all, and a moment
+/// longer for the last one's fan-out: frames on separate streams are relayed
+/// by separate tasks, so only this fixes the order they reach the slot in.
+async fn settle(server: &TestServer, n: u64) {
+    let counters = &server.handle.server().counters;
+    tokio::time::timeout(SOON, async {
+        while Counters::get(&counters.video_frames_in) < n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the server takes the frame in");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+/// S4 (readiness review 2026-09-27): a waiting keyframe never gives way to
+/// a delta, and once a frame of a pair is dropped only a keyframe passes
+/// until one is taken in — a delta behind a lost frame is useless to the
+/// receiver's decoder. Bob holds back stream credit, so the forwarder sits
+/// on frame 1 and every later frame meets the one-deep slot.
+#[tokio::test]
+async fn after_a_dropped_frame_only_a_keyframe_passes() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let bob = blocked_viewer(&server).await;
+    let session = alice.session;
+    camera_on(&mut alice, session).await;
+    let frames = [
+        (1, true),  // taken by the forwarder, waits for credit
+        (2, false), // waits in the slot
+        (3, false), // dropped: 2 waits (the old rule dropped 2 instead)
+        (4, true),  // takes 2's place
+        (5, false), // dropped: never replaces a waiting keyframe
+        (6, false), // dropped: the pair waits for a keyframe again
+    ];
+    for (n, (seq, keyframe)) in frames.into_iter().enumerate() {
+        alice
+            .send_video(seq, u32::from(seq) * 3200, keyframe, &[seq as u8; 200])
+            .await;
+        settle(&server, n as u64 + 1).await;
+    }
+    bob.conn.set_max_concurrent_uni_streams(8u32.into());
+    let mut got = Vec::new();
+    while let Some((header, _)) = bob.recv_video(BRIEFLY).await {
+        got.push((header.seq, header.keyframe()));
+    }
+    assert_eq!(got, vec![(1, true), (4, true)]);
+
+    alice.send_video(7, 7 * 3200, false, &[7; 200]).await;
+    assert!(
+        bob.recv_video(BRIEFLY).await.is_none(),
+        "still waiting for a keyframe"
+    );
+    alice.send_video(8, 8 * 3200, true, &[8; 200]).await;
+    assert_eq!(bob.recv_video(SOON).await.expect("keyframe").0.seq, 8);
+    alice.send_video(9, 9 * 3200, false, &[9; 200]).await;
+    assert_eq!(
+        bob.recv_video(SOON).await.expect("deltas pass again").0.seq,
+        9
     );
     server.shutdown().await;
 }

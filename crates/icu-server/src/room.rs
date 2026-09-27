@@ -559,7 +559,8 @@ fn encode(msg: &ControlMsg) -> Option<Bytes> {
 /// (`Server/IMPLEMENTATION.md` §7).
 #[derive(Debug, Default)]
 pub struct Counters {
-    /// Accepted connections, total.
+    /// Accepted connections, total since the start; what is open right now
+    /// is `Server::open_connections`.
     pub connections: AtomicU64,
     /// Audio datagrams received from clients.
     pub datagrams_in: AtomicU64,
@@ -587,7 +588,10 @@ pub struct Counters {
     pub video_dropped_no_receiver: AtomicU64,
     /// Video frames dropped by the frame rate or bitrate limit.
     pub video_dropped_rate: AtomicU64,
-    /// Video frames dropped because the receiver was still busy.
+    /// Video frames dropped because the receiver was still busy: its slot
+    /// was taken, a frame was not written or acknowledged in time, or a
+    /// delta was skipped while the pair waited for a keyframe after such a
+    /// drop (per receiver).
     pub video_dropped_slow_receiver: AtomicU64,
     /// Video frames dropped because the sender's camera is off or it is not
     /// active.
