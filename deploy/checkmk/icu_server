@@ -3,7 +3,8 @@
 #
 # Install as /usr/lib/check_mk_agent/local/icu_server (mode 0755). The agent
 # user needs read/write access to /run/icu/admin.sock, i.e. membership in the
-# group from `server.admin_socket_group`.
+# group from `server.admin_socket_group`. That group is full server admin, not
+# read-only: whoever reaches the socket can invite, disable and revoke.
 #
 # Output format: <status> <item> <metrics> <text>
 # 0 = OK, 1 = WARN, 2 = CRIT, 3 = UNKNOWN.
