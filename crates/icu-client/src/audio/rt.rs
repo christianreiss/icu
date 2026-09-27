@@ -78,19 +78,41 @@ mod imp {
     /// (`register_context`); null until the PipeWire thread has one.
     static CONTEXT_THREAD_UTILS: AtomicPtr<spa_thread_utils> = AtomicPtr::new(std::ptr::null_mut());
 
-    pub fn register_context(context: *mut c_void) {
-        // SAFETY: `context` is a live `pw_context` (the caller's own, on the
-        // PipeWire thread); the object registered under
+    /// Registers `context`'s thread utils; returns what was registered, for
+    /// [`unregister`].
+    pub fn register_context(context: *mut c_void) -> *mut c_void {
+        // SAFETY: `context` is a live, connected `pw_context` (the caller's
+        // own, on the PipeWire thread); the object registered under
         // `SPA_TYPE_INTERFACE_ThreadUtils` is a `spa_thread_utils` by
         // definition of that type, and module-rt keeps it alive as long as
-        // the context, which outlives every engine thread.
+        // the context. The caller unregisters it before the context goes.
         let utils = unsafe {
             pw_context_get_object(
                 context,
                 SPA_TYPE_INTERFACE_ThreadUtils.as_ptr() as *const c_char,
             )
         } as *mut spa_thread_utils;
+        store(utils)
+    }
+
+    pub fn store(utils: *mut spa_thread_utils) -> *mut c_void {
         CONTEXT_THREAD_UTILS.store(utils, Ordering::Release);
+        utils.cast()
+    }
+
+    /// Forgets `utils` again, unless a newer registration replaced it.
+    pub fn unregister(utils: *mut c_void) {
+        let _ = CONTEXT_THREAD_UTILS.compare_exchange(
+            utils.cast(),
+            std::ptr::null_mut(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    #[cfg(test)]
+    pub fn registered() -> *mut c_void {
+        CONTEXT_THREAD_UTILS.load(Ordering::Acquire).cast()
     }
 
     pub fn promote(priority: c_int) -> Result<(), String> {
@@ -180,11 +202,35 @@ mod imp {
     }
 }
 
-/// Remembers the PipeWire context whose module-rt should promote threads.
-/// Called once by the PipeWire backend on its own thread.
+/// The PipeWire context whose module-rt promotes threads, registered by
+/// [`register_context`]. Dropping it forgets the context again; it must go
+/// before the context does, or a thread started later would call into
+/// freed memory.
 #[cfg(target_os = "linux")]
-pub fn register_context(context: *mut std::ffi::c_void) {
-    imp::register_context(context);
+#[must_use = "the context is forgotten when this is dropped"]
+pub struct ContextRegistration(*mut std::ffi::c_void);
+
+#[cfg(target_os = "linux")]
+impl Drop for ContextRegistration {
+    fn drop(&mut self) {
+        imp::unregister(self.0);
+    }
+}
+
+/// The thread utils registered right now; null when none (tests).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn registered_context() -> *mut std::ffi::c_void {
+    imp::registered()
+}
+
+/// Remembers the PipeWire context whose module-rt should promote threads,
+/// until the returned registration is dropped. Called by the PipeWire
+/// backend on its own thread, once the context is connected: a context
+/// that failed to connect is freed right away, and its pointer, left
+/// behind, was what the silent fallback's threads then dereferenced.
+#[cfg(target_os = "linux")]
+pub fn register_context(context: *mut std::ffi::c_void) -> ContextRegistration {
+    ContextRegistration(imp::register_context(context))
 }
 
 /// Asks for real-time priority for the calling thread and logs the outcome.
@@ -208,5 +254,29 @@ pub fn promote_current_thread(name: &str) -> PriorityGuard {
                 "no real-time priority (module-rt/RTKit); running best effort");
             PriorityGuard::default()
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// A registration lasts as long as its guard, and an older guard going
+    /// away does not take a newer registration with it.
+    #[test]
+    fn a_registration_ends_with_its_guard() {
+        // Zeroed utils: a thread promoted meanwhile (another test) finds no
+        // methods and stays best effort instead of calling into garbage.
+        // SAFETY: a plain C struct of pointers and integers; all-zero is
+        // a valid value of it.
+        let mut first_utils: pipewire::spa::sys::spa_thread_utils = unsafe { std::mem::zeroed() };
+        let mut second_utils: pipewire::spa::sys::spa_thread_utils = unsafe { std::mem::zeroed() };
+        let first = ContextRegistration(imp::store(&mut first_utils));
+        assert_eq!(imp::registered(), first.0);
+        let second = ContextRegistration(imp::store(&mut second_utils));
+        drop(first);
+        assert_eq!(imp::registered(), second.0, "still the newer one");
+        drop(second);
+        assert!(imp::registered().is_null(), "nothing left to dereference");
     }
 }
