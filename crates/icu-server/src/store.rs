@@ -1013,14 +1013,62 @@ fn first_users(dir: &Path) -> Result<UsersFile> {
 
 /// Writes `contents` atomically: temp file in the same directory, fsync,
 /// rename, fsync of the directory (`Server/IMPLEMENTATION.md` §4). `mode` is
-/// the permission bits of the temp file, and therefore of the result.
+/// the permission bits of the result, whatever the umask; `owner` says whose
+/// it is.
 ///
 /// The fsyncs can take tens of milliseconds on network storage, and every
 /// caller is async code on a runtime worker. `block_in_place` hands that
 /// worker's other tasks — quinn's endpoint driver among them — to another
 /// worker meanwhile, so audio keeps flowing.
-fn write_mode(path: &Path, contents: &str, mode: u32) -> Result<()> {
-    blocking(|| write_mode_now(path, contents, mode))
+fn write_mode(path: &Path, contents: &str, mode: u32, owner: Owner) -> Result<()> {
+    blocking(|| write_mode_now(path, contents, mode, owner))
+}
+
+/// Whose a written file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// The owner of the directory it is written into: a state file. Root
+    /// running the offline CLI writes into a state directory the service
+    /// owns (`DynamicUser`), and systemd puts ownership right only when the
+    /// top of `StateDirectory` is off, not for the files inside: a
+    /// root-owned `users.toml` or `ca.crt` — mode 0640 under a hardened
+    /// umask of 027 — kept the server from starting, and `Restart=` looped
+    /// (external review 2026-09-27, S-2).
+    Dir,
+    /// Whoever runs this process: a file outside the state
+    /// (`invite --out`), which root means for root.
+    Process,
+}
+
+/// The owner `(uid, gid)` a file owned by `file` has to be given so that it
+/// belongs to `dir`'s owner, or `None` when it already does or this process
+/// cannot change owners anyway (`root` false): everyone but root writes
+/// files that are theirs already, and the service writes into its own
+/// directory.
+fn owner_to_adopt(root: bool, dir: (u32, u32), file: (u32, u32)) -> Option<(u32, u32)> {
+    (root && dir != file).then_some(dir)
+}
+
+/// Gives `file`, just created in `dir`, the owner of `dir` where it differs
+/// and this process is root ([`Owner::Dir`]).
+fn adopt_dir_owner(file: &File, dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !rustix::process::geteuid().is_root() {
+        return Ok(());
+    }
+    let dir_meta = std::fs::metadata(dir).context(format!("cannot stat {}", dir.display()))?;
+    let file_meta = file.metadata()?;
+    if let Some((uid, gid)) = owner_to_adopt(
+        true,
+        (dir_meta.uid(), dir_meta.gid()),
+        (file_meta.uid(), file_meta.gid()),
+    ) {
+        std::os::unix::fs::fchown(file, Some(uid), Some(gid)).context(format!(
+            "cannot give a file in {} the directory's owner",
+            dir.display()
+        ))?;
+    }
+    Ok(())
 }
 
 /// Takes `flock(state.lock)` in `dir`, without waiting: held for as long as
@@ -1035,6 +1083,9 @@ pub(crate) fn lock_state(dir: &Path) -> Result<File> {
         .truncate(false)
         .open(&lock_path)
         .context(format!("cannot open {}", lock_path.display()))?;
+    // Created by root through the offline CLI, a root-owned lock file would
+    // keep the service from opening it at its next start.
+    adopt_dir_owner(&lock, dir)?;
     rustix::fs::flock(
         lock.as_fd(),
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
@@ -1057,7 +1108,7 @@ pub(crate) fn blocking<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
-fn write_mode_now(path: &Path, contents: &str, mode: u32) -> Result<()> {
+fn write_mode_now(path: &Path, contents: &str, mode: u32, owner: Owner) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let dir = path
         .parent()
@@ -1070,6 +1121,17 @@ fn write_mode_now(path: &Path, contents: &str, mode: u32) -> Result<()> {
         .permissions(std::fs::Permissions::from_mode(mode))
         .tempfile_in(dir)
         .context(format!("cannot create temporary file in {}", dir.display()))?;
+    if owner == Owner::Dir {
+        adopt_dir_owner(file.as_file(), dir)?;
+    }
+    // The mode above went through open(2), which the umask narrows: root's
+    // 027 on a hardened host made a 0644 file 0640. Set it exactly.
+    file.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(mode))
+        .context(format!(
+            "cannot set the mode of a file in {}",
+            dir.display()
+        ))?;
     file.write_all(contents.as_bytes())?;
     file.as_file().sync_all()?;
     file.persist(path)
@@ -1081,14 +1143,23 @@ fn write_mode_now(path: &Path, contents: &str, mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Writes a world-readable file atomically.
+/// Writes a world-readable state file (mode 0644) atomically, owned like
+/// its directory ([`Owner::Dir`]).
 pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    write_mode(path, contents, 0o644)
+    write_mode(path, contents, 0o644, Owner::Dir)
 }
 
-/// Writes a private file with mode 0600, atomically.
+/// Writes a private state file (mode 0600) atomically, owned like its
+/// directory ([`Owner::Dir`]).
 pub fn write_private(path: &Path, contents: &str) -> Result<()> {
-    write_mode(path, contents, 0o600)
+    write_mode(path, contents, 0o600, Owner::Dir)
+}
+
+/// Writes a private file (mode 0600) atomically for whoever runs this
+/// process, wherever it goes ([`Owner::Process`]): a file outside the
+/// state, such as a registration bundle for `invite --out`.
+pub fn write_private_for_caller(path: &Path, contents: &str) -> Result<()> {
+    write_mode(path, contents, 0o600, Owner::Process)
 }
 
 #[cfg(test)]
@@ -1128,6 +1199,21 @@ mod tests {
             std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// S-2: only root changes owners, and only where the file is not the
+    /// directory owner's already.
+    #[test]
+    fn only_root_hands_a_file_to_the_directory_owner() {
+        let service = (61234, 61234);
+        let root = (0, 0);
+        assert_eq!(owner_to_adopt(true, service, root), Some(service));
+        assert_eq!(owner_to_adopt(true, service, service), None);
+        assert_eq!(
+            owner_to_adopt(true, (61234, 990), (61234, 0)),
+            Some((61234, 990))
+        );
+        assert_eq!(owner_to_adopt(false, service, (1000, 1000)), None);
     }
 
     fn store() -> (tempfile::TempDir, Store) {

@@ -368,7 +368,11 @@ connection(s)`.
 
 Läuft **kein** Server (Socket fehlt oder verweigert die Verbindung), erledigt
 die CLI dieselbe Arbeit selbst und hält dabei `flock(/var/lib/icu/state.lock)`;
-dafür braucht sie root. Läuft einer und der Socket fehlt, bricht die CLI mit
+dafür braucht sie root. Was sie dabei schreibt, gehört danach dem Besitzer des
+State-Verzeichnisses, mit genau dem vorgesehenen Modus, auch unter einer
+restriktiven umask wie 027 (vorher blieben die Dateien root-eigen und 0640,
+und der Dienst startete nicht mehr). `invite --out` schreibt die Datei für
+den Aufrufer (0600). Läuft einer und der Socket fehlt, bricht die CLI mit
 `cannot lock … (is a server running?)` ab — das ist Absicht, damit CLI und
 Server einander nie eine Änderung überschreiben.
 

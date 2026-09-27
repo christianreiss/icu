@@ -27,7 +27,7 @@ pub async fn run(
         .unwrap_or_default();
     match out {
         // Mode 0600: the bundle is a bearer credential until it is used.
-        Some(path) => crate::store::write_private(path, bundle)?,
+        Some(path) => crate::store::write_private_for_caller(path, bundle)?,
         None => print!("{bundle}"),
     }
     eprintln!(
