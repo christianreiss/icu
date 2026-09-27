@@ -66,6 +66,11 @@ impl AutoThreshold {
     /// completed frame (up to one Opus frame stale — fine here). `prob` is
     /// this block's RNNoise voice probability.
     pub fn update(&mut self, now: Instant, gate_open: bool, prob: f32) {
+        // A probability that is no number would leave the floor, and with
+        // it the threshold, no number for good: `p >= NaN` never holds.
+        if !prob.is_finite() {
+            return;
+        }
         if self.prev_gate_open && !gate_open {
             self.closed_at = Some(now);
         }
@@ -236,6 +241,18 @@ mod tests {
             a.floor < 0.05,
             "post-cooldown quiet sample should be trusted"
         );
+    }
+
+    #[test]
+    fn a_probability_that_is_no_number_is_ignored() {
+        let t0 = Instant::now();
+        let mut a = AutoThreshold::new(t0);
+        let before = a.threshold();
+        a.update(t0 + ms(10), false, f32::NAN);
+        a.update(t0 + ms(20), false, f32::INFINITY);
+        assert_eq!(a.threshold(), before);
+        a.update(t0 + ms(30), false, 0.02);
+        assert!(a.threshold().is_finite());
     }
 
     #[test]

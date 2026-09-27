@@ -87,6 +87,38 @@ async fn keyframe_request_produces_an_idr() {
     server.handle.shutdown().await;
 }
 
+/// The camera switched off in the engine — a hotkey while the window is in
+/// the tray — sends no further frame, although the window, whose
+/// `CameraHandle::sync` stops the thread's sending, never ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switching_the_camera_off_stops_sending_without_the_window() {
+    let server = TestServer::start().await;
+    let (backend, _probe) = FakeBackend::silent();
+    let (engine, _dir) = server.engine("alice", Box::new(backend), false).await;
+    wait_connected(&engine).await;
+    engine.command(Command::SetCamera(true));
+    wait_for(&engine, SOON, |s| s.camera_on).await;
+    let mut camera = CameraHandle::new(engine.camera_link());
+    camera.start_with(Box::new(SyntheticSource::new()));
+    let bob = server.raw_client("bob").await;
+    bob.recv_video(SOON).await.expect("frames flow");
+
+    engine.command(Command::ToggleCamera);
+    wait_for(&engine, SOON, |s| !s.camera_on).await;
+    let stats = engine.stats();
+    let sent = DebugStats::get(&stats.video_sent);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        DebugStats::get(&stats.video_sent),
+        sent,
+        "frames after the camera went off"
+    );
+
+    camera.stop();
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
 /// Frames from a peer are decoded per speaker and exposed to the overlay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn received_video_is_decoded_per_speaker() {

@@ -500,6 +500,12 @@ impl JitterBuffer {
         }
     }
 
+    /// The most slots a loss burst can span with the packet after it
+    /// already here: the queue never holds more than `max_delay`.
+    fn max_gap(&self, frame: Duration) -> i64 {
+        (self.cfg.max_delay.as_micros() / frame.as_micros().max(1)) as i64
+    }
+
     /// Called once per frame period by the playout side; adjustments that
     /// can wait for a quiet frame are made at once.
     pub fn pop(&mut self, now: Instant) -> Pop {
@@ -644,6 +650,21 @@ impl JitterBuffer {
             .next()
             .map(|(k, (p, _))| (*k, p.clone()));
         match later {
+            Some((k, _)) if k - next > self.max_gap(frame) => {
+                // Further ahead than the buffer ever holds: not a loss burst
+                // (that ends the spurt after `max_loss_frames` misses) but a
+                // `seq` that jumped. Walked slot by slot, one packet 32 767
+                // ahead concealed as many frames — 11 minutes of Deep PLC in
+                // the mixer. A new spurt starts at it instead.
+                tracing::debug!(
+                    next = (next & 0xFFFF) as u16,
+                    ahead = k - next,
+                    "jitter seq jump, re-anchoring"
+                );
+                self.end_spurt();
+                self.prefill_since = Some(now);
+                Pop::Silence
+            }
             Some((k, pkt)) => {
                 // A later packet is here: `next` is lost, not late.
                 self.stats.lost += 1;
@@ -812,6 +833,37 @@ mod tests {
         assert_eq!(jb.pop(t0 + ms(620)), Pop::Silence, "prefilling again");
         assert!(matches!(jb.pop(t0 + ms(640)), Pop::Packet(p) if p.seq == 2));
         assert_eq!(jb.stats().lost, lost_before);
+    }
+
+    /// One packet with a `seq` as far ahead as a signed step reaches
+    /// (32 767) is a jump, not a loss burst: the buffer starts a new spurt
+    /// at it instead of concealing every slot in between.
+    #[test]
+    fn a_seq_far_ahead_starts_a_new_spurt() {
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        jb.push(pkt(0, 0, false), t0);
+        jb.push(pkt(1, 960, false), t0 + ms(20));
+        assert!(matches!(jb.pop(t0 + ms(40)), Pop::Packet(p) if p.seq == 0));
+        assert!(matches!(jb.pop(t0 + ms(60)), Pop::Packet(p) if p.seq == 1));
+        let far = 1u16.wrapping_add(32767);
+        jb.push(pkt(far, 2 * 960, false), t0 + ms(70));
+        let mut t = t0 + ms(80);
+        let mut concealed = 0;
+        for pops in 0.. {
+            assert!(pops < 20, "{concealed} frames concealed and counting");
+            match jb.pop(t) {
+                Pop::Packet(p) => {
+                    assert_eq!(p.seq, far);
+                    break;
+                }
+                Pop::Lost { .. } => concealed += 1,
+                Pop::Silence => {}
+            }
+            t += ms(20);
+        }
+        assert_eq!(concealed, 0);
+        assert_eq!(jb.stats().lost, 0);
     }
 
     #[test]

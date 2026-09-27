@@ -369,6 +369,64 @@ async fn the_transmit_cue_marks_start_and_end_of_sending() {
     server.handle.shutdown().await;
 }
 
+fn rms(x: &[f32]) -> f32 {
+    (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt()
+}
+
+/// Muting ends the talk spurt with an `END` packet whose frame was
+/// collected up to the mute and partly after it: that packet carries
+/// silence, so nothing captured after the key press leaves the machine.
+/// Usually the server learns of the mute first and drops the packet; here
+/// a burst of camera toggles has used up the `SetState` budget, so the mute
+/// reaches the server a few frames late and the `END` packet reaches bob,
+/// who decodes alice's stream as it arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_end_packet_of_a_mute_carries_no_audio() {
+    let server = TestServer::start().await;
+    let bob = server.raw_client("bob").await;
+    let (engine, _probe, _dir) = tone_sender(&server, "alice", false).await;
+    wait_connected(&engine).await;
+    wait_for(&engine, SOON, |s| s.sending).await;
+
+    let mut decoder = icu_client::dsp::opus::Decoder::new().unwrap();
+    let mut pcm = vec![0.0f32; 5760];
+    let mut talking = Vec::new();
+    let mut end = None;
+    let deadline = tokio::time::Instant::now() + SOON;
+    let mut muted = false;
+    while end.is_none() && tokio::time::Instant::now() < deadline {
+        let Ok(Ok(datagram)) =
+            tokio::time::timeout(Duration::from_secs(1), bob.session.conn.read_datagram()).await
+        else {
+            continue;
+        };
+        let (header, payload) = icu_proto::AudioHeader::decode(&datagram).unwrap();
+        let n = decoder.decode(payload, &mut pcm).unwrap();
+        if header.end() {
+            end = Some(pcm[..n].to_vec());
+        } else {
+            talking.push(rms(&pcm[..n]));
+        }
+        if !muted && talking.len() >= 20 {
+            for _ in 0..30 {
+                engine.command(Command::ToggleCamera);
+            }
+            engine.command(Command::SetMuted(true));
+            muted = true;
+        }
+    }
+    let end = end.expect("an END packet after the mute");
+    let voice = talking[talking.len() / 2];
+    assert!(voice > 0.02, "the tone went out, rms {voice}");
+    let end = rms(&end);
+    assert!(
+        end < 0.01,
+        "the END packet carries audio: rms {end} (voice {voice})"
+    );
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
 /// Alone in the room nothing goes to the server: the test tone holds the
 /// gate open, yet not one datagram leaves until someone joins, and none
 /// once they have left again.
@@ -739,4 +797,255 @@ async fn a_default_endpoint_change_reopens_the_audio_group_once() {
     wait_for(&engine, SOON, |s| s.banner.is_some()).await;
     wait_for(&engine, SOON, |s| s.banner.is_none()).await;
     drop(engine);
+}
+
+/// A backend whose microphone does not open while `mic` is off — a
+/// desktop without one — recording every open like [`Devices`]. No audio
+/// flows.
+struct NoMic {
+    mic: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    opened: Opened,
+    events: Option<std::sync::mpsc::Receiver<icu_client::audio::BackendEvent>>,
+}
+
+impl icu_client::audio::AudioBackend for NoMic {
+    fn name(&self) -> &'static str {
+        "test"
+    }
+    fn devices(&self) -> Vec<icu_client::audio::DeviceInfo> {
+        Vec::new()
+    }
+    fn open_capture(
+        &mut self,
+        device: Option<&str>,
+        _cb: icu_client::audio::CaptureCallback,
+    ) -> Result<(), icu_client::audio::BackendError> {
+        let kind = icu_client::audio::StreamKind::Capture;
+        self.opened
+            .lock()
+            .unwrap()
+            .push((kind, device.map(str::to_string)));
+        if self.mic.load(std::sync::atomic::Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err("kein Standardgerät".into())
+        }
+    }
+    fn open_reference(
+        &mut self,
+        sink: Option<&str>,
+        _cb: icu_client::audio::CaptureCallback,
+    ) -> Result<(), icu_client::audio::BackendError> {
+        let kind = icu_client::audio::StreamKind::Reference;
+        self.opened
+            .lock()
+            .unwrap()
+            .push((kind, sink.map(str::to_string)));
+        Ok(())
+    }
+    fn open_playback(
+        &mut self,
+        device: Option<&str>,
+        _cb: icu_client::audio::PlaybackCallback,
+    ) -> Result<(), icu_client::audio::BackendError> {
+        let kind = icu_client::audio::StreamKind::Playback;
+        self.opened
+            .lock()
+            .unwrap()
+            .push((kind, device.map(str::to_string)));
+        Ok(())
+    }
+    fn close(&mut self, _stream: icu_client::audio::StreamKind) {}
+    fn take_events(
+        &mut self,
+    ) -> Option<std::sync::mpsc::Receiver<icu_client::audio::BackendEvent>> {
+        self.events.take()
+    }
+}
+
+/// A microphone that does not open is tried again on its own, and the
+/// streams that run are left alone: before, every attempt reopened all
+/// three — a gap in the playback and an AEC restart every 30 s on a desktop
+/// without a microphone. Once one is there, it opens and the banner goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_microphone_that_does_not_open_is_retried_alone() {
+    use icu_client::audio::StreamKind;
+    use std::sync::{atomic::AtomicBool, Arc, Mutex};
+
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let mic = Arc::new(AtomicBool::new(false));
+    let opened: Opened = Arc::new(Mutex::new(Vec::new()));
+    let (_events, events_rx) = std::sync::mpsc::channel();
+    let backend = NoMic {
+        mic: mic.clone(),
+        opened: opened.clone(),
+        events: Some(events_rx),
+    };
+    let mut settings = test_settings();
+    settings.audio.aec = true;
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, settings, paths);
+    cfg.server_addr = Some(server.addr());
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).expect("engine starts");
+    let count = |kind| {
+        opened
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .count()
+    };
+    let banner = engine.snapshot().banner.expect("a banner");
+    assert!(banner.text.contains("Mikrofon"), "{}", banner.text);
+
+    assert!(
+        wait_until(SOON, || count(StreamKind::Capture) >= 2).await,
+        "the microphone is tried again"
+    );
+    assert_eq!(count(StreamKind::Playback), 1, "the playback runs on");
+    assert_eq!(count(StreamKind::Reference), 1, "so does the reference");
+
+    mic.store(true, std::sync::atomic::Ordering::SeqCst);
+    wait_for(&engine, SOON, |s| s.banner.is_none()).await;
+    let tries = count(StreamKind::Capture);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(count(StreamKind::Capture), tries, "open now: no more tries");
+    assert_eq!(count(StreamKind::Playback), 1);
+    assert_eq!(count(StreamKind::Reference), 1);
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// The AEC reference failing is not the microphone failing: no banner
+/// saying so (the settings show the missing reference), and the streams
+/// are reopened as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reference_error_blames_no_microphone() {
+    use icu_client::audio::{BackendEvent, StreamKind};
+    use std::sync::{Arc, Mutex};
+
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let (events, rx) = std::sync::mpsc::channel();
+    let backend = Devices {
+        list: Arc::new(Mutex::new(vec![])),
+        opened: opened.clone(),
+        events: Some(rx),
+    };
+    let mut settings = test_settings();
+    settings.audio.aec = true;
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, settings, paths);
+    cfg.server_addr = Some(server.addr());
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).unwrap();
+    wait_connected(&engine).await;
+    opened.lock().unwrap().clear();
+    events
+        .send(BackendEvent::StreamError {
+            stream: StreamKind::Reference,
+            message: "loopback gone".into(),
+        })
+        .unwrap();
+    wait_for(&engine, SOON, |s| !s.aec_reference).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(engine.snapshot().banner, None);
+    assert!(
+        wait_until(SOON, || opened.lock().unwrap().len() >= 3).await,
+        "reopened after the backoff"
+    );
+    drop(engine);
+}
+
+/// A graph quantum of 8192 samples (forced, pro audio) arrives in one piece
+/// every 170 ms. The DSP thread takes all of it; held to the fixed 100-ms
+/// backlog cap it kept only the newest two blocks of every cycle and threw
+/// the rest of the microphone away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_large_graph_quantum_is_not_trimmed() {
+    let server = TestServer::start().await;
+    let (backend, _probe) = FakeBackend::with_block(
+        Box::new(|start, out| {
+            for (i, s) in out.iter_mut().enumerate() {
+                let t = (start + i as u64) as f32 / 48_000.0;
+                *s = 0.3 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            }
+        }),
+        false,
+        8192,
+    );
+    let (engine, _dir) = server.engine("alice", Box::new(backend), false).await;
+    wait_connected(&engine).await;
+    let stats = engine.stats();
+    let before = DebugStats::get(&stats.dsp_blocks);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let blocks = DebugStats::get(&stats.dsp_blocks) - before;
+    assert_eq!(DebugStats::get(&stats.capture_backlog_dropped), 0);
+    assert!(blocks > 120, "{blocks} blocks in 1.5 s");
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// A mute survives a restart, as in Mumble: the next engine starts muted —
+/// in the window from its first state, at the server from `Hello` on. A
+/// deafen does not: a restart undeafens, back to the mute from before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mute_survives_a_restart() {
+    use icu_client::config::Settings;
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let start = |settings: Settings| {
+        let mut cfg =
+            icu_client::engine::EngineConfig::new(identity.clone(), settings, paths.clone());
+        cfg.server_addr = Some(server.addr());
+        icu_client::engine::Engine::start(cfg, Box::new(FakeBackend::silent().0)).unwrap()
+    };
+
+    let engine = start(test_settings());
+    assert!(!engine.snapshot().muted);
+    wait_connected(&engine).await;
+    engine.command(Command::SetMuted(true));
+    wait_for(&engine, SOON, |s| s.muted).await;
+    engine.shutdown();
+    let saved = Settings::load(&paths).unwrap();
+    assert!(saved.audio.muted, "the mute is kept");
+
+    let engine = start(saved);
+    assert!(engine.snapshot().muted, "muted from the first state");
+    let me = wait_connected(&engine).await.me.unwrap();
+    assert!(me.flags.muted(), "the server knew it from Hello");
+    engine.command(Command::SetMuted(false));
+    wait_for(&engine, SOON, |s| !s.muted).await;
+    engine.command(Command::SetDeafened(true));
+    wait_for(&engine, SOON, |s| s.deafened && s.muted).await;
+    engine.shutdown();
+    assert!(
+        !Settings::load(&paths).unwrap().audio.muted,
+        "deafened from unmuted: the restart undeafens to unmuted"
+    );
+    server.handle.shutdown().await;
+}
+
+/// A settings copy taken before a mute (the settings window, a passport)
+/// does not undo it when it is applied, neither in the engine nor on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_settings_copy_keeps_the_mute() {
+    let server = TestServer::start().await;
+    let (engine, paths, _dir) = server
+        .engine_with_paths("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&engine).await;
+    let mut stale = engine.snapshot().settings;
+    assert!(!stale.audio.muted);
+    engine.command(Command::SetMuted(true));
+    wait_for(&engine, SOON, |s| s.muted && s.settings.audio.muted).await;
+    stale.audio.output_volume = 42.0;
+    engine.command(Command::UpdateSettings(Box::new(stale)));
+    let s = wait_for(&engine, SOON, |s| s.settings.audio.output_volume == 42.0).await;
+    assert!(s.muted && s.settings.audio.muted);
+    engine.shutdown();
+    let saved = icu_client::config::Settings::load(&paths).unwrap();
+    assert_eq!(saved.audio.output_volume, 42.0);
+    assert!(saved.audio.muted, "the stale copy did not unmute the file");
+    server.handle.shutdown().await;
 }

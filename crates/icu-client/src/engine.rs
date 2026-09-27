@@ -61,8 +61,28 @@ use crate::{
 pub const BLOCK: usize = 480;
 /// Capture samples the DSP thread may fall behind (100 ms) before it skips
 /// to the newest two blocks: bounds send latency after a stall of the thread
-/// and keeps its catch-up burst far below an RTTIME limit.
+/// and keeps its catch-up burst far below an RTTIME limit. A graph cycle
+/// larger than that raises it ([`capture_backlog_limit`]).
 pub const MAX_CAPTURE_BACKLOG: usize = 10 * BLOCK;
+
+/// The capture backlog the DSP thread tolerates with the backend delivering
+/// `cycle` samples at a time: [`MAX_CAPTURE_BACKLOG`], or a whole cycle and
+/// two blocks. A quantum above 4320 samples (forced, pro audio) arrives in
+/// one piece; held to the fixed cap, every cycle was trimmed to two blocks
+/// and most of the microphone thrown away.
+fn capture_backlog_limit(cycle: usize) -> usize {
+    MAX_CAPTURE_BACKLOG.max(cycle + 2 * BLOCK)
+}
+
+/// `skipped` capture samples were thrown away ahead of the frame being
+/// collected: that frame is dropped too, and `ts` moves past both, so the
+/// sample clock stays true and receivers see a pause — they start a new
+/// spurt — instead of a delay spike, which their jitter buffers remember
+/// for 20–40 s.
+fn skip_capture(acc: &mut Vec<f32>, ts: &mut u32, skipped: usize) {
+    *ts = ts.wrapping_add((acc.len() + skipped) as u32);
+    acc.clear();
+}
 
 /// How the engine is started.
 #[derive(Debug, Clone)]
@@ -369,6 +389,9 @@ pub enum Command {
     HotkeyBackend(String),
     /// Reopen the audio streams after a backend error (`icu-audio-events`).
     ReopenStreams,
+    /// Try the streams that did not open again, only those
+    /// (`icu-audio-events`, internal).
+    RetryStreams,
     /// The device list changed (`icu-audio-events`, internal): reopen the
     /// streams if a saved device came back or went away.
     DevicesChanged,
@@ -451,7 +474,9 @@ impl DspControl {
     /// through [`DspControl::apply_settings`], so the two never drift.
     fn from_settings(s: &Settings, test_tone: bool) -> DspControl {
         let ctl = DspControl {
-            muted: AtomicBool::new(false),
+            // The one settings-driven field `apply_settings` leaves alone:
+            // after the start only the mute commands move it.
+            muted: AtomicBool::new(s.audio.muted),
             ptt_down: AtomicBool::new(false),
             online: AtomicBool::new(false),
             audience: AtomicBool::new(false),
@@ -545,6 +570,11 @@ struct Speaker {
     /// Loss accounting for `LossReport`: (played, lost) at the last report.
     report_base: (u64, u64),
     last_reported_permille: u16,
+    /// When a `LossReport` for this speaker last went out.
+    last_report_at: Option<Instant>,
+    /// The last report window saw none of its traffic: the server has
+    /// forgotten the figure by the time it speaks again.
+    loss_idle: bool,
     /// The frame last queued for this speaker was quiet (below
     /// [`QUIET_RMS`]): the jitter buffer may adjust its depth now without
     /// anyone hearing it (`JitterBuffer::pop_quiet`).
@@ -565,6 +595,14 @@ fn frame_quiet(samples: &[f32]) -> bool {
 }
 
 impl Speaker {
+    /// A speaker whose session the peer list does not know: audio ahead of
+    /// its `UserJoined`, or a straggler after `UserLeft`. Silent until
+    /// `admit` sets the user's volume — a peer set to 0 % („lokal stumm“)
+    /// was audible at 100 % in between.
+    fn stray(frame_samples: u32) -> Result<Speaker, opus::Error> {
+        Speaker::new(0, 0.0, frame_samples)
+    }
+
     fn new(user_id: UserId, volume: f32, frame_samples: u32) -> Result<Speaker, opus::Error> {
         Ok(Speaker {
             user_id,
@@ -582,6 +620,8 @@ impl Speaker {
             concealed: 0,
             report_base: (0, 0),
             last_reported_permille: 0,
+            last_report_at: None,
+            loss_idle: false,
             quiet: true,
         })
     }
@@ -603,7 +643,8 @@ struct Shared {
     /// of a non-negative `f32`, which order like the value): whether the
     /// loudspeaker plays something the AEC reference should carry.
     play_peak: AtomicU32,
-    cues: Mutex<VecDeque<f32>>,
+    /// Cues for the mixer, bounded and without repeats (`cues::CueQueue`).
+    cues: Mutex<crate::cues::CueQueue>,
     /// A transmit cue the DSP thread asks the mixer to play
     /// ([`TX_CUE_START`], [`TX_CUE_STOP`], 0 = none): the DSP thread neither
     /// renders nor takes the cue lock.
@@ -627,9 +668,13 @@ struct Shared {
     cap_prod: Arc<Mutex<HeapProd<f32>>>,
     ref_prod: Arc<Mutex<HeapProd<f32>>>,
     play_cons: Arc<Mutex<HeapCons<f32>>>,
-    /// Largest block the playback callback has asked for; the mixer keeps
-    /// at least that much plus a block queued, whatever the graph quantum.
+    /// Largest block the playback callback has asked for since the mixer
+    /// last took it ([`RecentRequest`]); the mixer keeps at least that much
+    /// plus a block queued, whatever the graph quantum.
     play_request: Arc<AtomicUsize>,
+    /// The streams the last open could not open (`FAILED_CAPTURE` …); the
+    /// audio events thread has them retried alone ([`StreamRetry`]).
+    failed_streams: AtomicU8,
     /// The engine is shutting down: nothing may be written to `identity/`
     /// any more — a logout deletes it as soon as `Engine::shutdown` returns.
     closing: AtomicBool,
@@ -756,7 +801,8 @@ impl Engine {
             server_name: cfg.identity.server.server_name.clone(),
             me: None,
             peers: Vec::new(),
-            muted: false,
+            // A mute kept from the last run shows from the first frame.
+            muted: settings.audio.muted,
             deafened: false,
             ptt_down: false,
             sending: false,
@@ -819,9 +865,9 @@ impl Engine {
             output_gain: AtomicF32::new(mixer::volume_gain(settings.audio.output_volume)),
             normalize_incoming: AtomicBool::new(settings.audio.normalize_incoming),
             play_peak: AtomicU32::new(0),
-            // Room for a second of cues, so queueing one in the mixer
-            // thread never allocates.
-            cues: Mutex::new(VecDeque::with_capacity(48_000)),
+            // Allocated once, so queueing one in the mixer thread never
+            // allocates.
+            cues: Mutex::new(crate::cues::CueQueue::new()),
             pending_tx_cue: AtomicU8::new(0),
             reference_open: AtomicBool::new(false),
             cycle: Arc::new(CycleClock::default()),
@@ -832,6 +878,7 @@ impl Engine {
             ref_prod: Arc::new(Mutex::new(ref_prod)),
             play_cons: Arc::new(Mutex::new(play_cons)),
             play_request: Arc::new(AtomicUsize::new(0)),
+            failed_streams: AtomicU8::new(0),
             closing: AtomicBool::new(false),
             net: Mutex::new(NetworkTracker::new()),
             video_tier: AtomicU8::new(VideoTier::T0.as_u8()),
@@ -884,6 +931,8 @@ impl Engine {
                     // together when a device vanishes.
                     let mut backoff = Duration::from_secs(1);
                     let mut last_error: Option<Instant> = None;
+                    // A stream that never opened is retried alone.
+                    let mut retry = StreamRetry::default();
                     let pending = Arc::new(AtomicBool::new(false));
                     let schedule_reopen = |delay: Duration| {
                         if pending.swap(true, Ordering::Relaxed) {
@@ -899,7 +948,16 @@ impl Engine {
                                 let _ = tx.send(Command::ReopenStreams);
                             });
                     };
-                    while let Ok(ev) = events.recv() {
+                    loop {
+                        let missing = shared.failed_streams.load(Ordering::Relaxed) != 0;
+                        if retry.due(Instant::now(), missing) {
+                            let _ = reopen_tx.send(Command::RetryStreams);
+                        }
+                        let ev = match events.recv_timeout(RETRY_POLL) {
+                            Ok(ev) => ev,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        };
                         match ev {
                             BackendEvent::DefaultDeviceChanged => {
                                 schedule_reopen(Duration::from_millis(100));
@@ -921,15 +979,23 @@ impl Engine {
                             }
                             BackendEvent::StreamError { stream, message } => {
                                 tracing::warn!(?stream, %message, "audio stream error");
-                                shared.state.send_modify(|s| {
-                                    s.banner = Some(crate::problem::audio(
-                                        match stream {
-                                            StreamKind::Playback => "Der Lautsprecher",
-                                            _ => "Das Mikrofon",
-                                        },
-                                        &format!("{stream:?}: {message}"),
-                                    ))
-                                });
+                                // The AEC reference is no device of its own:
+                                // like a reference that does not open, it
+                                // shows in the settings, not as a banner
+                                // about the microphone.
+                                let device = match stream {
+                                    StreamKind::Capture => Some("Das Mikrofon"),
+                                    StreamKind::Playback => Some("Der Lautsprecher"),
+                                    StreamKind::Reference => None,
+                                };
+                                if let Some(device) = device {
+                                    shared.state.send_modify(|s| {
+                                        s.banner = Some(crate::problem::audio(
+                                            device,
+                                            &format!("{stream:?}: {message}"),
+                                        ))
+                                    });
+                                }
                                 if let Some(backend) = backend.upgrade() {
                                     lock(&backend).close(stream);
                                 }
@@ -1073,6 +1139,10 @@ impl Engine {
     }
 }
 
+/// How often the audio events thread looks whether a stream that did not
+/// open is due for a retry ([`StreamRetry`]).
+const RETRY_POLL: Duration = Duration::from_millis(250);
+
 /// How long [`Engine::shutdown`] waits for the network task: the close
 /// handshake (≤ 0.5 s), the last settings write (≤ [`SETTINGS_FLUSH_WAIT`]).
 const NET_STOP_WAIT: Duration = Duration::from_secs(3);
@@ -1113,6 +1183,101 @@ fn effective_device(
     }
 }
 
+/// [`Shared::failed_streams`]: the microphone did not open.
+const FAILED_CAPTURE: u8 = 1;
+/// [`Shared::failed_streams`]: the AEC reference did not open, or was
+/// closed with a playback that did not ([`reference_needs_playback`]).
+const FAILED_REFERENCE: u8 = 2;
+/// [`Shared::failed_streams`]: the playback did not open.
+const FAILED_PLAYBACK: u8 = 4;
+
+/// Opens the microphone into the capture ring.
+fn open_capture_stream(
+    backend: &mut dyn AudioBackend,
+    input: Option<&str>,
+    shared: &Arc<Shared>,
+) -> Result<(), crate::audio::BackendError> {
+    let stats = shared.stats.clone();
+    let cap_prod = shared.cap_prod.clone();
+    let cycle = shared.cycle.clone();
+    backend.open_capture(
+        input,
+        Box::new(move |block| {
+            // A failed `try_lock` (stream reopen in flight) loses the block
+            // like a full ring does; count both.
+            let pushed = cap_prod
+                .try_lock()
+                .map(|mut p| p.push_slice(block))
+                .unwrap_or(0);
+            if pushed < block.len() {
+                DebugStats::inc(&stats.capture_overruns);
+            }
+            cycle.capture_pushed(block.len());
+        }),
+    )
+}
+
+/// Opens the AEC reference into its ring.
+fn open_reference_stream(
+    backend: &mut dyn AudioBackend,
+    output: Option<&str>,
+    shared: &Arc<Shared>,
+) -> Result<(), crate::audio::BackendError> {
+    let ref_prod = shared.ref_prod.clone();
+    let cycle = shared.cycle.clone();
+    let stats = shared.stats.clone();
+    backend.open_reference(
+        output,
+        Box::new(move |block| {
+            let pushed = ref_prod
+                .try_lock()
+                .map(|mut p| p.push_slice(block))
+                .unwrap_or(0);
+            if pushed < block.len() {
+                DebugStats::inc(&stats.reference_overruns);
+            }
+            cycle.reference_pushed();
+        }),
+    )?;
+    shared.cycle.set_slack(backend.reference_slack());
+    Ok(())
+}
+
+/// Opens the playback from the playback ring.
+fn open_playback_stream(
+    backend: &mut dyn AudioBackend,
+    output: Option<&str>,
+    shared: &Arc<Shared>,
+) -> Result<(), crate::audio::BackendError> {
+    let play_cons = shared.play_cons.clone();
+    let play_request = shared.play_request.clone();
+    let stats = shared.stats.clone();
+    // The new device may run a smaller quantum; let the mixer's lead shrink
+    // back to it instead of keeping the old device's for the session.
+    play_request.store(0, Ordering::Relaxed);
+    backend.open_playback(
+        output,
+        Box::new(move |out| {
+            play_request.fetch_max(out.len(), Ordering::Relaxed);
+            let n = match play_cons.try_lock() {
+                Ok(mut c) => c.pop_slice(out),
+                Err(_) => 0,
+            };
+            if n < out.len() {
+                // The mixer always queues (silence included): a gap.
+                DebugStats::inc(&stats.playback_underruns);
+            }
+            out[n..].fill(0.0);
+        }),
+    )
+}
+
+/// WASAPI loopback has no clock while the endpoint is idle: without ICU's
+/// own playback it can stop delivering, stalling every outgoing block.
+fn reference_needs_playback(backend: &dyn AudioBackend) -> bool {
+    cfg!(windows) && backend.name() == "wasapi"
+}
+
 fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Arc<Shared>) {
     // Replace stale device errors with the outcome of this attempt. Keep
     // unrelated storage/network errors; failed opens below report a fresh one.
@@ -1131,99 +1296,164 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
     if output.is_none() && settings.audio.output_device.is_some() {
         tracing::info!(saved = ?settings.audio.output_device, "speaker missing, using the default");
     }
-    let stats = shared.stats.clone();
-    let cap_prod = shared.cap_prod.clone();
-    let cycle = shared.cycle.clone();
-    if let Err(e) = backend.open_capture(
-        input.as_deref(),
-        Box::new(move |block| {
-            // A failed `try_lock` (stream reopen in flight) loses the block
-            // like a full ring does; count both.
-            let pushed = cap_prod
-                .try_lock()
-                .map(|mut p| p.push_slice(block))
-                .unwrap_or(0);
-            if pushed < block.len() {
-                DebugStats::inc(&stats.capture_overruns);
-            }
-            cycle.capture_pushed(block.len());
-        }),
-    ) {
+    let mut failed = 0;
+    if let Err(e) = open_capture_stream(backend, input.as_deref(), shared) {
         tracing::warn!(error = %e, "cannot open capture");
+        failed |= FAILED_CAPTURE;
         shared
             .state
             .send_modify(|s| s.banner = Some(crate::problem::audio("Das Mikrofon", &e)));
     }
     let mut reference_open = false;
     if settings.audio.aec {
-        let ref_prod = shared.ref_prod.clone();
-        let cycle = shared.cycle.clone();
-        let stats = shared.stats.clone();
-        match backend.open_reference(
-            output.as_deref(),
-            Box::new(move |block| {
-                let pushed = ref_prod
-                    .try_lock()
-                    .map(|mut p| p.push_slice(block))
-                    .unwrap_or(0);
-                if pushed < block.len() {
-                    DebugStats::inc(&stats.reference_overruns);
-                }
-                cycle.reference_pushed();
-            }),
-        ) {
-            Ok(()) => {
-                reference_open = true;
-                shared.cycle.set_slack(backend.reference_slack());
+        match open_reference_stream(backend, output.as_deref(), shared) {
+            Ok(()) => reference_open = true,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot open AEC reference");
+                failed |= FAILED_REFERENCE;
             }
-            Err(e) => tracing::warn!(error = %e, "cannot open AEC reference"),
         }
     }
     shared
         .reference_open
         .store(reference_open, Ordering::Relaxed);
-    let active_input = input.clone();
-    let active_output = output.clone();
+    if let Err(e) = open_playback_stream(backend, output.as_deref(), shared) {
+        tracing::warn!(error = %e, "cannot open playback");
+        failed |= FAILED_PLAYBACK;
+        if reference_open && reference_needs_playback(backend) {
+            backend.close(StreamKind::Reference);
+            reference_open = false;
+            shared.reference_open.store(false, Ordering::Relaxed);
+            failed |= FAILED_REFERENCE;
+        }
+        shared
+            .state
+            .send_modify(|s| s.banner = Some(crate::problem::audio("Der Lautsprecher", &e)));
+    }
+    shared.failed_streams.store(failed, Ordering::Relaxed);
+    // Published last: whoever sees the devices of this attempt sees every
+    // one of its streams opened.
     shared.state.send_modify(|s| {
         s.aec_reference = reference_open;
-        s.active_input = active_input;
-        s.active_output = active_output;
+        s.active_input = input;
+        s.active_output = output;
     });
-    let play_cons = shared.play_cons.clone();
-    let play_request = shared.play_request.clone();
-    let stats = shared.stats.clone();
-    // The new device may run a smaller quantum; let the mixer's lead shrink
-    // back to it instead of keeping the old device's for the session.
-    play_request.store(0, Ordering::Relaxed);
-    match backend.open_playback(
-        output.as_deref(),
-        Box::new(move |out| {
-            play_request.fetch_max(out.len(), Ordering::Relaxed);
-            let n = match play_cons.try_lock() {
-                Ok(mut c) => c.pop_slice(out),
-                Err(_) => 0,
-            };
-            if n < out.len() {
-                // The mixer always queues (silence included): a gap.
-                DebugStats::inc(&stats.playback_underruns);
+}
+
+/// Opens what [`open_streams`] could not, and only that
+/// ([`Shared::failed_streams`]): the streams that run are left alone. A
+/// desktop without a microphone used to reopen all three every 30 s — a
+/// gap in the playback and an AEC restart each time. On the devices the
+/// last open chose; a device that came or went reopens everything
+/// (`Command::DevicesChanged`). A microphone or reference that opens
+/// restarts the DSP's rings together, so the reference lag reads true
+/// again.
+fn retry_failed_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Arc<Shared>) {
+    let failed = shared.failed_streams.load(Ordering::Relaxed);
+    if failed == 0 {
+        return;
+    }
+    let (input, output) = {
+        let s = shared.state.borrow();
+        (s.active_input.clone(), s.active_output.clone())
+    };
+    let mut still = 0;
+    let mut restart_dsp = false;
+    if failed & FAILED_CAPTURE != 0 {
+        match open_capture_stream(backend, input.as_deref(), shared) {
+            Ok(()) => {
+                tracing::info!("microphone opened on a retry");
+                restart_dsp = true;
             }
-            out[n..].fill(0.0);
-        }),
-    ) {
-        Ok(()) => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot open playback");
-            // WASAPI loopback has no clock while the endpoint is idle. Without
-            // playback it can stop delivering, stalling every outgoing block.
-            #[cfg(windows)]
-            if backend.name() == "wasapi" {
-                backend.close(StreamKind::Reference);
-                shared.reference_open.store(false, Ordering::Relaxed);
-                shared.state.send_modify(|s| s.aec_reference = false);
+            Err(e) => {
+                tracing::debug!(error = %e, "microphone still does not open");
+                still |= FAILED_CAPTURE;
             }
-            shared
-                .state
-                .send_modify(|s| s.banner = Some(crate::problem::audio("Der Lautsprecher", &e)));
+        }
+    }
+    if failed & FAILED_PLAYBACK != 0 {
+        match open_playback_stream(backend, output.as_deref(), shared) {
+            Ok(()) => tracing::info!("playback opened on a retry"),
+            Err(e) => {
+                tracing::debug!(error = %e, "playback still does not open");
+                still |= FAILED_PLAYBACK;
+            }
+        }
+    }
+    let mut reference_open = shared.reference_open.load(Ordering::Relaxed);
+    if failed & FAILED_REFERENCE != 0 && settings.audio.aec {
+        if still & FAILED_PLAYBACK != 0 && reference_needs_playback(backend) {
+            still |= FAILED_REFERENCE;
+        } else {
+            match open_reference_stream(backend, output.as_deref(), shared) {
+                Ok(()) => {
+                    tracing::info!("AEC reference opened on a retry");
+                    reference_open = true;
+                    restart_dsp = true;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "AEC reference still does not open");
+                    still |= FAILED_REFERENCE;
+                }
+            }
+        }
+    }
+    if restart_dsp {
+        shared.dsp.reinit_aec.store(true, Ordering::Relaxed);
+    }
+    shared
+        .reference_open
+        .store(reference_open, Ordering::Relaxed);
+    shared.failed_streams.store(still, Ordering::Relaxed);
+    shared.state.send_modify(|s| {
+        s.aec_reference = reference_open;
+        if still & (FAILED_CAPTURE | FAILED_PLAYBACK) == 0
+            && s.banner
+                .as_ref()
+                .is_some_and(crate::problem::Problem::is_audio)
+        {
+            s.banner = None;
+        }
+    });
+}
+
+/// When the streams that did not open are tried again
+/// ([`Command::RetryStreams`]): 1, 2, 4 … 30 s after the failure was
+/// noticed, starting over once nothing is missing.
+#[derive(Debug)]
+struct StreamRetry {
+    backoff: Duration,
+    next: Option<Instant>,
+}
+
+impl Default for StreamRetry {
+    fn default() -> Self {
+        StreamRetry {
+            backoff: Duration::from_secs(1),
+            next: None,
+        }
+    }
+}
+
+impl StreamRetry {
+    /// Whether a retry is due at `now`, `missing` saying whether a stream
+    /// is missing.
+    fn due(&mut self, now: Instant, missing: bool) -> bool {
+        if !missing {
+            *self = StreamRetry::default();
+            return false;
+        }
+        match self.next {
+            None => {
+                self.next = Some(now + self.backoff);
+                false
+            }
+            Some(at) if now >= at => {
+                self.backoff = (self.backoff * 2).min(Duration::from_secs(30));
+                self.next = Some(now + self.backoff);
+                true
+            }
+            Some(_) => false,
         }
     }
 }
@@ -1351,11 +1581,13 @@ fn dsp_thread(
             // the reference lag `dsp::refalign` reads off their occupancy
             // difference stays valid.
             let backlog = cap.occupied_len();
-            if backlog > MAX_CAPTURE_BACKLOG {
+            if backlog > capture_backlog_limit(shared.cycle.capture_len()) {
                 let excess = backlog - 2 * BLOCK;
                 cap.skip(excess);
                 reference.skip(excess);
                 DebugStats::add(&stats.capture_backlog_dropped, excess as u64);
+                skip_capture(&mut frame_acc, &mut ts, excess);
+                prev_frame_valid = false;
             }
             let mut waited = 0u32;
             let mut ready_since: Option<Instant> = None;
@@ -1408,6 +1640,10 @@ fn dsp_thread(
                 }
             }
         }
+        // Whatever the capture path delivered, the AEC and the denoiser only
+        // ever see numbers within ±4 (`dsp::sanitize`).
+        crate::dsp::sanitize(&mut block);
+        crate::dsp::sanitize(&mut ref_block);
         let t_block = Instant::now();
         DebugStats::inc(&stats.dsp_blocks);
 
@@ -1583,6 +1819,13 @@ fn dsp_thread(
                         }
                         Err(e) => tracing::warn!(%e, "opus encode (pre-roll)"),
                     }
+                }
+                // Muted, the gate ends the spurt with this frame — collected
+                // up to the mute, and partly after it. The `END` packet still
+                // goes out so receivers stop at once, but as silence: nothing
+                // captured while muted may leave the machine.
+                if muted {
+                    frame_acc[..frame_samples].fill(0.0);
                 }
                 match encoder.encode(&frame_acc[..frame_samples]) {
                     Ok(packet) => {
@@ -1767,6 +2010,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
     let mut indicator_changes: Vec<(Session, Option<bool>)> =
         Vec::with_capacity(pl::MAX_MAX_USERS as usize);
     let mut stalled_since: Option<Instant> = None;
+    let mut request = RecentRequest::new(Instant::now());
     // 120 ms, the longest frame Opus allows: a peer picks its frame length.
     let mut fec_scratch = vec![0.0f32; 5760];
     loop {
@@ -1776,7 +2020,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
         // Keep two blocks (20 ms) ahead of the playback callback, or one
         // callback plus a block when the graph quantum is larger than that.
         let lead = (2 * BLOCK)
-            .max(shared.play_request.load(Ordering::Relaxed) + BLOCK)
+            .max(request.get(&shared.play_request, Instant::now()) + BLOCK)
             .min(play.capacity().get() - BLOCK);
         if play.occupied_len() >= lead {
             // If nobody consumes (no playback stream), keep the jitter buffers
@@ -1885,17 +2129,18 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
         let cue = {
             let mut cues = shared.cues.lock().unwrap();
             match shared.pending_tx_cue.swap(0, Ordering::Relaxed) {
-                TX_CUE_START => cues.extend(tx_start.iter().copied()),
-                TX_CUE_STOP => cues.extend(tx_stop.iter().copied()),
+                TX_CUE_START => {
+                    cues.push(Cue::TxStart, &tx_start);
+                }
+                TX_CUE_STOP => {
+                    cues.push(Cue::TxStop, &tx_stop);
+                }
                 _ => {}
             }
-            if cues.is_empty() {
-                None
-            } else {
-                for s in cue_buf.iter_mut() {
-                    *s = cues.pop_front().unwrap_or(0.0);
-                }
+            if cues.fill(&mut cue_buf) {
                 Some((cue_buf.as_slice(), 1.0))
+            } else {
+                None
             }
         };
         // The mic test, like the cues: unity gain, heard even when deafened.
@@ -1957,6 +2202,36 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
     }
 }
 
+/// How long a playback request sets the mixer's lead ([`RecentRequest`]).
+const PLAY_REQUEST_WINDOW: Duration = Duration::from_secs(2);
+
+/// The largest playback request of the current and the previous
+/// [`PLAY_REQUEST_WINDOW`]: the callback raises [`Shared::play_request`],
+/// the mixer takes it every window. A graph quantum that grew for a while —
+/// another client asking for 8192 samples — used to hold the lead at ~190 ms
+/// until the next reopen; now it follows the quantum back within 2–4 s.
+struct RecentRequest {
+    prev: usize,
+    since: Instant,
+}
+
+impl RecentRequest {
+    fn new(now: Instant) -> RecentRequest {
+        RecentRequest {
+            prev: 0,
+            since: now,
+        }
+    }
+
+    fn get(&mut self, current: &AtomicUsize, now: Instant) -> usize {
+        if now.saturating_duration_since(self.since) >= PLAY_REQUEST_WINDOW {
+            self.prev = current.swap(0, Ordering::Relaxed);
+            self.since = now;
+        }
+        self.prev.max(current.load(Ordering::Relaxed))
+    }
+}
+
 /// How long a speaker counts as talking after its last datagram: two
 /// 20-ms frames plus a little arrival jitter.
 const SPEAKING_HOLD: Duration = Duration::from_millis(60);
@@ -2008,7 +2283,8 @@ async fn net_task(
     let (settings_tx, settings_rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(settings_writer(cfg.paths.clone(), settings_rx));
     let mut local = LocalState {
-        flags: UserFlags::NONE,
+        // `Hello` carries a mute kept from the last run.
+        flags: UserFlags::NONE.with_bit(UserFlags::MUTED, cfg.settings.audio.muted),
         settings: cfg.settings.clone(),
         settings_tx,
         paths: cfg.paths.clone(),
@@ -2245,7 +2521,7 @@ fn end_session(shared: &Arc<Shared>) {
     *lock(&shared.conn) = None;
     shared.dsp.online.store(false, Ordering::Relaxed);
     shared.dsp.audience.store(false, Ordering::Relaxed);
-    lock(&shared.speakers).clear();
+    drop_speakers(shared);
     lock(&shared.video).reset();
     shared.state.send_modify(|s| {
         s.peers.clear();
@@ -2310,6 +2586,21 @@ fn store_identity(
         identity.save_keeping_previous(paths)
     } else {
         identity.save(paths)
+    }
+}
+
+/// Runs `f`, which may block for seconds — opening an audio device waits up
+/// to 5 s per stream (WASAPI) — through `block_in_place`: the connection's
+/// other tasks on this worker (the datagram reader stamping arrival times,
+/// quinn's driver) move to another thread meanwhile, instead of waiting
+/// behind it. Still in order with every other command: this task waits.
+/// Outside a multi-thread runtime `f` just runs.
+fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }
 
@@ -2680,9 +2971,12 @@ impl LocalState {
                 tracing::info!("reopening audio streams after a stream error");
                 self.reopen_streams(shared);
             }
+            Command::RetryStreams => self.retry_streams(shared),
             Command::DevicesChanged => {
                 // A saved device came back or went away: follow it. Anything
-                // else in the list changing leaves the streams alone.
+                // else in the list changing leaves the running streams alone
+                // and tries the ones that did not open — the device they
+                // were missing may be the one that came.
                 let want = wanted_devices(&self.settings, &lock(&self.backend).devices());
                 let active = {
                     let s = shared.state.borrow();
@@ -2691,6 +2985,8 @@ impl LocalState {
                 if want != active {
                     tracing::info!(?want, ?active, "audio devices changed, reopening");
                     self.reopen_streams(shared);
+                } else {
+                    self.retry_streams(shared);
                 }
             }
             Command::RequestRename(_) => {
@@ -2736,7 +3032,8 @@ impl LocalState {
     }
 
     /// Takes mute and deafen into the flags, the send gate, the mixer and the
-    /// window. Deafen implies mute.
+    /// window. Deafen implies mute. The user's own mute is kept for the next
+    /// start (`AudioSettings::muted`).
     fn apply_mute_deafen(&mut self, muted: bool, deafened: bool, shared: &Arc<Shared>) {
         let muted = muted || deafened;
         self.flags = self
@@ -2745,10 +3042,30 @@ impl LocalState {
             .with_bit(UserFlags::DEAFENED, deafened);
         shared.dsp.muted.store(muted, Ordering::Relaxed);
         shared.deafened.store(deafened, Ordering::Relaxed);
+        let own = self.own_mute();
+        let kept = (self.settings.audio.muted != own).then(|| {
+            self.settings.audio.muted = own;
+            let _ = self.settings_tx.send(self.settings.clone());
+            self.settings.clone()
+        });
         shared.state.send_modify(|s| {
             s.muted = muted;
             s.deafened = deafened;
+            if let Some(settings) = kept {
+                s.settings = settings;
+            }
         });
+    }
+
+    /// The mute the next start begins with: the current one — or, while
+    /// deafened, the one from before deafening, since a restart undeafens
+    /// and undeafening restores that one.
+    fn own_mute(&self) -> bool {
+        if self.flags.deafened() {
+            self.muted_before_deafen
+        } else {
+            self.flags.muted()
+        }
     }
 
     /// Takes a changed `self.settings` into effect. Everything that follows
@@ -2758,6 +3075,9 @@ impl LocalState {
     /// here, in one place, so none of them can drift from the settings. Returns whether `SetState` is due:
     /// the overlay switch is part of `VIEWING`.
     fn commit_settings(&mut self, shared: &Arc<Shared>, reopen: bool) -> bool {
+        // The mute is the engine's: a settings window's copy taken before a
+        // mute hotkey, or a passport's, must not undo it on disk.
+        self.settings.audio.muted = self.own_mute();
         shared.dsp.apply_settings(&self.settings);
         shared
             .output_gain
@@ -2998,15 +3318,28 @@ impl LocalState {
     }
 
     fn reopen_streams(&mut self, shared: &Arc<Shared>) {
-        let mut backend = lock(&self.backend);
-        shared.reference_open.store(false, Ordering::Relaxed);
-        backend.close(StreamKind::Capture);
-        backend.close(StreamKind::Reference);
-        backend.close(StreamKind::Playback);
-        shared.dsp.reinit_aec.store(true, Ordering::Relaxed);
-        open_streams(&mut **backend, &self.settings, shared);
-        let devices = backend.devices();
-        shared.state.send_modify(|s| s.devices = devices);
+        blocking(|| {
+            let mut backend = lock(&self.backend);
+            shared.reference_open.store(false, Ordering::Relaxed);
+            backend.close(StreamKind::Capture);
+            backend.close(StreamKind::Reference);
+            backend.close(StreamKind::Playback);
+            shared.dsp.reinit_aec.store(true, Ordering::Relaxed);
+            open_streams(&mut **backend, &self.settings, shared);
+            let devices = backend.devices();
+            shared.state.send_modify(|s| s.devices = devices);
+        });
+    }
+
+    /// [`retry_failed_streams`], if anything is missing.
+    fn retry_streams(&mut self, shared: &Arc<Shared>) {
+        if shared.failed_streams.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        blocking(|| {
+            let mut backend = lock(&self.backend);
+            retry_failed_streams(&mut **backend, &self.settings, shared);
+        });
     }
 
     fn cue(&self, shared: &Arc<Shared>, cue: Cue) {
@@ -3018,7 +3351,7 @@ impl LocalState {
         };
         if enabled {
             let samples = crate::cues::render(cue);
-            shared.cues.lock().unwrap().extend(samples);
+            shared.cues.lock().unwrap().push(cue, &samples);
         }
     }
 }
@@ -3200,7 +3533,7 @@ async fn run_session(
     // session's datagram reader may have been mid-insert when it was aborted.
     // Likewise the video: the previous connection's decode thread may still
     // deliver queued frames, which the new generation drops.
-    lock(&shared.speakers).clear();
+    drop_speakers(shared);
     let video_generation = lock(&shared.video).reset();
     forget_network_feedback(shared);
     let peers: Vec<Peer> = welcome
@@ -3461,7 +3794,7 @@ async fn run_session(
             }
             _ = loss_tick.tick() => {
                 prune_stray_speakers(shared);
-                let (reports, measured) = collect_loss_reports(shared);
+                let (reports, measured) = collect_loss_reports(shared, Instant::now());
                 // After `collect_loss_reports` returned, so the `speakers`
                 // lock it holds is gone: `send_modify` while holding one is
                 // how this engine would deadlock.
@@ -3646,8 +3979,16 @@ impl crate::video::VideoSink for SessionVideo {
 fn admit(shared: &Arc<Shared>, settings: &Settings, user: &UserInfo) -> Peer {
     let volume = settings.volume(user.user_id);
     let frame_samples = shared.dsp.frame_samples.load(Ordering::Relaxed);
-    let mut speakers = lock(&shared.speakers);
     let mut peer = Peer::new(user.clone(), volume);
+    // Built before the lock is taken: the real-time mixer takes it for
+    // every block, and a decoder with Deep PLC is no quick allocation.
+    // Wasted when the session's audio came first and made one already.
+    let fresh = if lock(&shared.speakers).contains_key(&user.session) {
+        None
+    } else {
+        Speaker::new(user.user_id, volume, frame_samples).ok()
+    };
+    let mut speakers = lock(&shared.speakers);
     match speakers.get_mut(&user.session) {
         Some(sp) => {
             sp.user_id = user.user_id;
@@ -3658,12 +3999,19 @@ fn admit(shared: &Arc<Shared>, settings: &Settings, user: &UserInfo) -> Peer {
             }
         }
         None => {
-            if let Ok(sp) = Speaker::new(user.user_id, volume, frame_samples) {
+            if let Some(sp) = fresh {
                 speakers.insert(user.session, sp);
             }
         }
     }
     peer
+}
+
+/// Forgets every speaker. Their decoders are destroyed after the lock is
+/// released: the real-time mixer takes it for every block.
+fn drop_speakers(shared: &Shared) {
+    let gone = std::mem::take(&mut *lock(&shared.speakers));
+    drop(gone);
 }
 
 /// Handles commands while a connection is being established. Returns `Quit`
@@ -3772,7 +4120,7 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                 if !speakers.contains_key(&header.speaker) {
                     // Unknown session (UserJoined may still be in flight).
                     drop(speakers);
-                    let Ok(fresh) = Speaker::new(0, 100.0, frame_samples) else {
+                    let Ok(fresh) = Speaker::stray(frame_samples) else {
                         continue;
                     };
                     speakers = lock(&shared.speakers);
@@ -3815,25 +4163,28 @@ fn prune_stray_speakers(shared: &Arc<Shared>) {
         .iter()
         .map(|p| p.info.session)
         .collect();
-    let mut speakers = lock(&shared.speakers);
-    speakers.retain(|session, sp| {
-        known.contains(session)
-            || sp
-                .last_packet
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
-    });
+    // Destroyed after the lock is released (`drop_speakers`).
+    let gone: Vec<Speaker> = lock(&shared.speakers)
+        .extract_if(|session, sp| {
+            !known.contains(session)
+                && !sp
+                    .last_packet
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+        })
+        .map(|(_, sp)| sp)
+        .collect();
+    drop(gone);
 }
 
 /// `(session, loss per mille)` for every speaker with traffic this tick.
 type LossPerSpeaker = Vec<(Session, u16)>;
 
 /// Reads each speaker's jitter buffer and returns `(to_report, measured)`:
-/// the first is what goes on the wire as `LossReport`, still gated on a
-/// ≥10 ‰ change so idle jitter does not chatter at the server; the second is
-/// every speaker's current figure, for the Verbindung window. The gate
-/// mutates `last_reported_permille`, so the caller cannot re-derive one from
-/// the other — hence both.
-fn collect_loss_reports(shared: &Arc<Shared>) -> (LossPerSpeaker, LossPerSpeaker) {
+/// the first is what goes on the wire as `LossReport`
+/// ([`loss_report_due`]); the second is every speaker's current figure, for
+/// the Verbindung window. The gate mutates `last_reported_permille`, so the
+/// caller cannot re-derive one from the other — hence both.
+fn collect_loss_reports(shared: &Arc<Shared>, now: Instant) -> (LossPerSpeaker, LossPerSpeaker) {
     let mut report = Vec::new();
     let mut all = Vec::new();
     let mut speakers = lock(&shared.speakers);
@@ -3844,18 +4195,56 @@ fn collect_loss_reports(shared: &Arc<Shared>) -> (LossPerSpeaker, LossPerSpeaker
         sp.report_base = (st.played, st.lost);
         let total = played + lost;
         if total == 0 {
+            sp.loss_idle = true;
             continue;
         }
+        let resumed = std::mem::take(&mut sp.loss_idle);
         let permille = ((lost * 1000) / total) as u16;
         all.push((*session, permille));
-        // The ≥10 ‰ gate is what keeps `LossReport` off the wire for noise;
-        // it must stay exactly as it was. `all` is display only.
-        if permille.abs_diff(sp.last_reported_permille) >= 10 {
+        if loss_report_due(
+            permille,
+            sp.last_reported_permille,
+            sp.last_report_at,
+            resumed,
+            now,
+        ) {
             sp.last_reported_permille = permille;
+            sp.last_report_at = Some(now);
             report.push((*session, permille));
         }
     }
     (report, all)
+}
+
+/// A change smaller than this does not go out on its own: jitter noise must
+/// not chatter at the server.
+const LOSS_REPORT_STEP: u16 = 10;
+
+/// A figure other than 0 goes out again once the last report is this old:
+/// every second 2-s report tick, i.e. every 4 s, inside the server's
+/// `LOSS_REPORT_TTL_S`.
+const LOSS_REPORT_REFRESH: Duration = Duration::from_secs(3);
+const _: () = assert!(LOSS_REPORT_REFRESH.as_secs() + 2 < pl::LOSS_REPORT_TTL_S);
+
+/// Whether this window's figure for a speaker goes out as `LossReport`
+/// (`PROTOCOL.md` §2.2 Nr. 11): a change of at least [`LOSS_REPORT_STEP`];
+/// and a figure other than 0 also once the last report is
+/// [`LOSS_REPORT_REFRESH`] old, and in the first window with traffic after
+/// one without (`resumed`). The server forgets a report after 6 s and then
+/// tells the speaker 0 ‰: sent only on change, a steady loss expired after
+/// 6 s, and every push-to-talk sentence after a pause started at the FEC
+/// floor.
+fn loss_report_due(
+    permille: u16,
+    last: u16,
+    last_at: Option<Instant>,
+    resumed: bool,
+    now: Instant,
+) -> bool {
+    permille.abs_diff(last) >= LOSS_REPORT_STEP
+        || (permille > 0
+            && (resumed
+                || last_at.is_none_or(|t| now.saturating_duration_since(t) >= LOSS_REPORT_REFRESH)))
 }
 
 /// The cumulative byte counters one `net_tick` reads, so the next tick can
@@ -3902,7 +4291,9 @@ async fn handle_control(
             });
         }
         ControlMsg::UserLeft { session, .. } => {
-            lock(&shared.speakers).remove(&session);
+            // Destroyed after the lock is released (`drop_speakers`).
+            let gone = lock(&shared.speakers).remove(&session);
+            drop(gone);
             shared.video.lock().unwrap().remove(session);
             local.cue(shared, Cue::Leave);
             if local.settings.ui.notify_join {
@@ -4253,6 +4644,10 @@ impl CameraLink {
     /// Sends one encoded frame on the live connection; `Err` when not
     /// connected or when flow control dropped it.
     pub fn send_frame(&self, keyframe: bool, ts: u32, data: &[u8]) -> Result<(), String> {
+        // A frame encoded just before the camera went off stays here.
+        if !self.shared.state.borrow().camera_on {
+            return Err("camera off".into());
+        }
         let Some(sender) = lock(&self.shared.video_tx).clone() else {
             return Err("not connected".into());
         };
@@ -4285,10 +4680,18 @@ impl CameraLink {
 
     /// The tier the camera thread encodes at: [`CameraLink::video_tier`],
     /// or paused while no peer is viewing (`UserFlags::VIEWING`) — the
-    /// server would relay the frames to nobody. Resuming builds a fresh
-    /// encoder, whose first frame is an IDR.
+    /// server would relay the frames to nobody — and while the camera is
+    /// off in the engine. The latter at once: the window's
+    /// `CameraHandle::sync`, which stops sending too, does not run while
+    /// the window is hidden or minimised, and a hotkey switches the camera
+    /// off just the same. Resuming builds a fresh encoder, whose first
+    /// frame is an IDR.
     pub fn send_tier(&self) -> VideoTier {
-        send_tier(self.video_tier(), &self.shared.state.borrow().peers)
+        let state = self.shared.state.borrow();
+        if !state.camera_on {
+            return VideoTier::T4;
+        }
+        send_tier(self.video_tier(), &state.peers)
     }
 
     /// Whether an IDR was requested since the last call (server
@@ -4533,6 +4936,19 @@ mod tests {
         );
     }
 
+    /// A large graph quantum arrives in one piece and is not trimmed; a
+    /// stall's backlog is, and the skipped time moves `ts` on.
+    #[test]
+    fn the_capture_backlog_follows_the_quantum() {
+        assert_eq!(capture_backlog_limit(240), MAX_CAPTURE_BACKLOG);
+        assert_eq!(capture_backlog_limit(8192), 8192 + 2 * BLOCK);
+        let mut acc = vec![0.0; BLOCK];
+        let mut ts = 1000u32;
+        skip_capture(&mut acc, &mut ts, 3 * BLOCK);
+        assert!(acc.is_empty());
+        assert_eq!(ts, 1000 + 4 * BLOCK as u32);
+    }
+
     /// Whichever way `run_session` returns, its reader tasks end with it.
     #[tokio::test]
     async fn dropping_the_session_tasks_aborts_them() {
@@ -4573,6 +4989,101 @@ mod tests {
         assert_eq!(video.frames(3), 0, "a stale frame creates no receiver");
         let _ = video.accept_for(new, 3, &frame());
         assert_eq!(video.frames(3), 1);
+    }
+
+    /// Steady loss is reported again every 4 s, so the server's 6-s expiry
+    /// never drops it; after a pause the first window reports it at once;
+    /// a clean line stays quiet.
+    #[test]
+    fn a_steady_loss_is_reported_before_the_server_forgets_it() {
+        let t0 = Instant::now();
+        let mut last = 0u16;
+        let mut last_at = None;
+        let mut sent = Vec::new();
+        // One 2-s window: its figure, or `None` without traffic.
+        let mut idle = false;
+        let mut window = |s: u64, figure: Option<u16>, sent: &mut Vec<(u64, u16)>| {
+            let Some(permille) = figure else {
+                idle = true;
+                return;
+            };
+            let now = t0 + Duration::from_secs(s);
+            let resumed = std::mem::take(&mut idle);
+            if loss_report_due(permille, last, last_at, resumed, now) {
+                last = permille;
+                last_at = Some(now);
+                sent.push((s, permille));
+            }
+        };
+        for s in (0..20).step_by(2) {
+            window(s, Some(if s % 4 == 0 { 50 } else { 52 }), &mut sent);
+        }
+        let times: Vec<u64> = sent.iter().map(|(s, _)| *s).collect();
+        assert_eq!(times, [0, 4, 8, 12, 16], "every 4 s: {sent:?}");
+        sent.clear();
+        // A pause of 10 s: the server has forgotten the figure.
+        for s in (20..30).step_by(2) {
+            window(s, None, &mut sent);
+        }
+        window(30, Some(48), &mut sent);
+        assert_eq!(sent, [(30, 48)], "at once after the pause");
+        sent.clear();
+        window(32, Some(0), &mut sent);
+        assert_eq!(sent, [(32, 0)], "the change to 0");
+        for s in (34..60).step_by(2) {
+            window(s, Some(0), &mut sent);
+        }
+        window(60, None, &mut sent);
+        window(62, Some(0), &mut sent);
+        assert_eq!(sent, [(32, 0)], "a clean line stays quiet");
+    }
+
+    /// A stream that did not open is tried again 1, 2, 4 … 30 s after the
+    /// failure was noticed, and the schedule starts over once nothing is
+    /// missing.
+    #[test]
+    fn a_missing_stream_is_retried_with_backoff() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut r = StreamRetry::default();
+        assert!(!r.due(t0, false));
+        assert!(!r.due(t0, true), "noticed");
+        let mut tries = Vec::new();
+        for s in 0..120 {
+            if r.due(at(s), true) {
+                tries.push(s);
+            }
+        }
+        assert_eq!(tries, [1, 3, 7, 15, 31, 61, 91]);
+        assert!(!r.due(at(120), false), "open now");
+        assert!(!r.due(at(121), true));
+        assert!(r.due(at(122), true), "the next failure starts at 1 s again");
+    }
+
+    /// The mixer's lead follows a graph quantum back down once the large
+    /// requests have stopped for two windows.
+    #[test]
+    fn the_playback_lead_follows_the_quantum_down() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let callback = AtomicUsize::new(0);
+        let mut r = RecentRequest::new(t0);
+        callback.fetch_max(8192, Ordering::Relaxed);
+        assert_eq!(r.get(&callback, at(10)), 8192);
+        callback.fetch_max(256, Ordering::Relaxed);
+        assert_eq!(r.get(&callback, at(2100)), 8192, "the last window's");
+        callback.fetch_max(256, Ordering::Relaxed);
+        assert_eq!(r.get(&callback, at(4200)), 256, "followed it down");
+        callback.fetch_max(1024, Ordering::Relaxed);
+        assert_eq!(r.get(&callback, at(4300)), 1024, "up again at once");
+    }
+
+    /// Audio of a session nobody announced plays at 0 % until `admit`
+    /// knows whose it is.
+    #[test]
+    fn a_stray_speaker_is_silent() {
+        let sp = Speaker::stray(960).unwrap();
+        assert_eq!(mixer::volume_gain(sp.volume), 0.0);
     }
 
     /// A lost automatic renewal is retried on the next connect; a lost

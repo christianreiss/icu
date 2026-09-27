@@ -603,6 +603,11 @@ impl eframe::App for App {
         // then counts as visible: better a frame too many than a black tile.
         let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
         let visible = !self.hidden && !minimized;
+        if !visible {
+            if let Some(release) = self.view.release_ptt() {
+                let _ = self.cmd.send(release);
+            }
+        }
         if visible != self.window_visible {
             self.window_visible = visible;
             let _ = self.cmd.send(Command::SetWindowVisible(visible));
@@ -706,6 +711,15 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        // Ahead of the engine's `Quit` on the same channel, so the kept
+        // mute is the user's, not the open setup's.
+        if let Some(unmute) = self
+            .setup
+            .as_mut()
+            .and_then(|v| v.release_mute(&self.state))
+        {
+            let _ = self.cmd.send(unmute);
+        }
         #[cfg(feature = "camera")]
         {
             self.camera = None;
@@ -1032,6 +1046,13 @@ pub struct MainOutput {
 }
 
 impl MainView {
+    /// Lets go of the on-screen speak button: the window went to the tray
+    /// or was minimised while it was held. `ui` does not run then, so the
+    /// release never arrived and the microphone stayed open.
+    pub fn release_ptt(&mut self) -> Option<Command> {
+        std::mem::take(&mut self.ptt_held).then_some(Command::Ptt(false))
+    }
+
     /// Draws the whole window into `root`.
     pub fn ui(&mut self, root: &mut egui::Ui, state: &AppState, env: &MainEnv<'_>) -> MainOutput {
         let mut out = MainOutput::default();
@@ -2978,6 +2999,19 @@ mod tests {
             },
             100.0,
         )
+    }
+
+    /// The speak button held when the window goes away is released once,
+    /// and a view not holding it sends nothing.
+    #[test]
+    fn a_held_speak_button_is_released_when_the_window_goes() {
+        let mut view = MainView {
+            ptt_held: true,
+            ..MainView::default()
+        };
+        assert!(matches!(view.release_ptt(), Some(Command::Ptt(false))));
+        assert!(view.release_ptt().is_none());
+        assert!(MainView::default().release_ptt().is_none());
     }
 
     #[test]

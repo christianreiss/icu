@@ -130,6 +130,11 @@ impl CycleClock {
         self.cap_ns.store(self.now_ns(), Ordering::Release);
     }
 
+    /// Samples of the last capture push: one graph cycle.
+    pub fn capture_len(&self) -> usize {
+        self.cap_len.load(Ordering::Relaxed) as usize
+    }
+
     /// Reference callback pushed a block.
     pub fn reference_pushed(&self) {
         self.ref_ns.store(self.now_ns(), Ordering::Release);

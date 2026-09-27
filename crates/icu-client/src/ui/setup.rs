@@ -162,10 +162,17 @@ impl SetupView {
         self.capture = None;
         self.draft.ui.setup_done = true;
         let mut cmds: Vec<Command> = self.sync.commit(&self.draft).into_iter().collect();
-        if std::mem::take(&mut self.muted_by_setup) && state.muted {
-            cmds.push(Command::SetMuted(false));
-        }
+        cmds.extend(self.release_mute(state));
         cmds
+    }
+
+    /// Unmutes the microphone if the setup muted it and it still is — at
+    /// the end of the setup, and when ICU quits with the setup open: the
+    /// engine keeps a mute for the next start (`AudioSettings::muted`), and
+    /// the setup's own must not be taken for the user's.
+    pub fn release_mute(&mut self, state: &AppState) -> Option<Command> {
+        (std::mem::take(&mut self.muted_by_setup) && state.muted)
+            .then_some(Command::SetMuted(false))
     }
 
     /// Draws the current step with the stepper above and the bar below.

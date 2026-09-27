@@ -2528,7 +2528,6 @@ dependencies = [
  "windows-core",
  "x509-parser",
  "zbus",
- "zune-jpeg",
 ]
 
 [[package]]

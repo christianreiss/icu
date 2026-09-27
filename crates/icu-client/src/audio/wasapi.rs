@@ -507,13 +507,11 @@ fn run_stream(
     let mut stream = match Stream::open(&spec) {
         Ok(stream) => stream,
         Err(e) => {
-            let _ = ready.send(Err(e.clone()));
-            // Initial failure also needs recovery (audio service restarting,
-            // or no endpoint yet). The engine applies its bounded backoff.
-            let _ = events.send(BackendEvent::StreamError {
-                stream: spec.kind,
-                message: e,
-            });
+            // The engine hears of it from `open`, and retries this stream
+            // alone (audio service restarting, no endpoint yet, a desktop
+            // without a microphone). A `StreamError` here reopened all
+            // three streams every 30 s: a gap in the playback each time.
+            let _ = ready.send(Err(e));
             return;
         }
     };

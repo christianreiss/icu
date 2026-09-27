@@ -137,6 +137,10 @@ pub struct AudioSettings {
     /// Bring the own voice to a common loudness right before the encoder
     /// (`dsp::normalize::Profile::OUTBOUND` plus a peak limiter).
     pub normalize_outgoing: bool,
+    /// Muted by the user: a mute survives a restart, as in Mumble. Written
+    /// by the engine alone (`engine::LocalState::own_mute`); deafen is not
+    /// kept, a restart undeafens.
+    pub muted: bool,
 }
 
 impl Default for AudioSettings {
@@ -162,6 +166,7 @@ impl Default for AudioSettings {
             output_volume: 100.0,
             normalize_incoming: true,
             normalize_outgoing: true,
+            muted: false,
         }
     }
 }

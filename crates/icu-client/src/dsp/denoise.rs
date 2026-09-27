@@ -34,11 +34,13 @@ impl Denoiser {
     }
 
     /// Denoises `block` (±1.0, 480 samples) in place and returns the voice
-    /// probability.
+    /// probability. Samples that are no number go in as silence
+    /// ([`super::sanitized`]): RNNoise has no guard of its own, and a NaN
+    /// reaching its inverse FFT is undefined behaviour.
     pub fn process(&mut self, block: &mut [f32]) -> f32 {
         debug_assert_eq!(block.len(), FRAME);
         for (d, s) in self.scratch_in.iter_mut().zip(block.iter()) {
-            *d = s * 32768.0;
+            *d = super::sanitized(*s) * 32768.0;
         }
         let prob = self
             .state
