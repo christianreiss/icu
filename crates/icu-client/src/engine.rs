@@ -595,6 +595,14 @@ fn frame_quiet(samples: &[f32]) -> bool {
 }
 
 impl Speaker {
+    /// A speaker whose session the peer list does not know: audio ahead of
+    /// its `UserJoined`, or a straggler after `UserLeft`. Silent until
+    /// `admit` sets the user's volume — a peer set to 0 % („lokal stumm“)
+    /// was audible at 100 % in between.
+    fn stray(frame_samples: u32) -> Result<Speaker, opus::Error> {
+        Speaker::new(0, 0.0, frame_samples)
+    }
+
     fn new(user_id: UserId, volume: f32, frame_samples: u32) -> Result<Speaker, opus::Error> {
         Ok(Speaker {
             user_id,
@@ -3934,7 +3942,7 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                 if !speakers.contains_key(&header.speaker) {
                     // Unknown session (UserJoined may still be in flight).
                     drop(speakers);
-                    let Ok(fresh) = Speaker::new(0, 100.0, frame_samples) else {
+                    let Ok(fresh) = Speaker::stray(frame_samples) else {
                         continue;
                     };
                     speakers = lock(&shared.speakers);
@@ -4872,6 +4880,14 @@ mod tests {
         assert!(!r.due(at(120), false), "open now");
         assert!(!r.due(at(121), true));
         assert!(r.due(at(122), true), "the next failure starts at 1 s again");
+    }
+
+    /// Audio of a session nobody announced plays at 0 % until `admit`
+    /// knows whose it is.
+    #[test]
+    fn a_stray_speaker_is_silent() {
+        let sp = Speaker::stray(960).unwrap();
+        assert_eq!(mixer::volume_gain(sp.volume), 0.0);
     }
 
     /// A lost automatic renewal is retried on the next connect; a lost
