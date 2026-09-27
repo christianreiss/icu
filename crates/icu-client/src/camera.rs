@@ -430,6 +430,47 @@ pub fn encoder(tier: VideoTier) -> Result<Encoder, String> {
     Encoder::with_api_config(OpenH264API::from_source(), cfg).map_err(|e| e.to_string())
 }
 
+/// Thins the capture to a tier's frame rate by capture time, not by count.
+/// Counting assumed a 15 fps camera; one that runs faster — a mode offered
+/// only at 30 fps — multiplied the bitrate, since openh264 budgets every
+/// frame for the configured rate and its frame skipping does not catch up
+/// (measured: 30 fps into T0 gave 298 instead of 150 kbit/s). A slower one
+/// (low light) has every picture encoded.
+#[derive(Debug, Default)]
+struct Pacer {
+    /// When the next picture is due; `None` before the first.
+    due: Option<Duration>,
+    /// The previous picture's capture time.
+    last: Option<Duration>,
+    /// Smoothed spacing of the pictures; half of it is the tolerance a
+    /// picture may come early and still count as due.
+    spacing: Duration,
+}
+
+impl Pacer {
+    /// Whether the picture captured at `at` is encoded at `rate` fps.
+    fn take(&mut self, at: Duration, rate: f32) -> bool {
+        if let Some(last) = self.last {
+            let d = at.saturating_sub(last);
+            self.spacing = if self.spacing.is_zero() {
+                d
+            } else {
+                (self.spacing * 7 + d) / 8
+            };
+        }
+        self.last = Some(at);
+        if self.due.is_some_and(|due| at + self.spacing / 2 < due) {
+            return false;
+        }
+        // One interval on from when it was due — the rate stays exact
+        // whatever the jitter — but never behind the picture itself, or a
+        // slow stretch would be caught up in a burst.
+        let interval = Duration::from_secs_f32(1.0 / rate);
+        self.due = Some((self.due.unwrap_or(at) + interval).max(at));
+        true
+    }
+}
+
 /// Failed frames in a row after which the capture thread gives up (about
 /// 5 s at one attempt per 200 ms): the device stopped delivering — unplugged,
 /// or taken by another program — and is opened anew by
@@ -485,7 +526,7 @@ pub fn run_sender(
     let start = Instant::now();
     let mut last_idr = Instant::now() - IDR_INTERVAL;
     let mut yuv: Option<YUVBuffer> = None;
-    let mut frame_index: u32 = 0;
+    let mut pacer = Pacer::default();
     // Failed frames in a row: the first one is a warning, the rest of the
     // streak only debug lines — a camera that sends nothing usable would
     // otherwise log five warnings a second.
@@ -542,7 +583,7 @@ pub fn run_sender(
                 None
             });
             last_idr = Instant::now() - IDR_INTERVAL;
-            frame_index = 0;
+            pacer = Pacer::default();
         }
 
         let Some(enc) = enc.as_mut() else {
@@ -553,9 +594,8 @@ pub fn run_sender(
             continue;
         };
 
-        frame_index += 1;
-        if !frame_index.is_multiple_of(tier.frame_divisor()) {
-            continue; // thin the fixed-FPS capture down to this tier's rate
+        if !pacer.take(captured, frame_rate(tier)) {
+            continue; // thin the capture down to this tier's rate
         }
 
         // Asserts length and even sides: `frame.is_valid()` above.
@@ -1115,6 +1155,52 @@ mod tests {
         let cif = fit_capture(solid(352, 288, 77));
         assert_eq!((cif.width, cif.height), (320, 240));
         assert!(cif.is_valid());
+    }
+
+    /// How many of `seconds` of pictures at `fps` (± `jitter_ms`) the pacer
+    /// encodes at `rate`.
+    fn paced(fps: f32, jitter_ms: f32, rate: f32, seconds: f32) -> usize {
+        let mut pacer = Pacer::default();
+        (0..(seconds * fps) as u32)
+            .filter(|&i| {
+                let wobble = if i % 2 == 0 { jitter_ms } else { -jitter_ms };
+                let ms = (i as f32 * 1000.0 / fps + wobble).max(0.0);
+                pacer.take(Duration::from_secs_f32(ms / 1000.0), rate)
+            })
+            .count()
+    }
+
+    /// Each tier gets its own rate from a 15 fps camera, jitter or not; a
+    /// faster camera does not raise it, a slower one has every picture sent.
+    #[test]
+    fn the_pacer_holds_each_tier_to_its_rate() {
+        for tier in [VideoTier::T0, VideoTier::T1, VideoTier::T2, VideoTier::T3] {
+            let rate = frame_rate(tier);
+            let want = (rate * 20.0) as usize;
+            for (fps, jitter) in [(15.0, 0.0), (15.0, 12.0), (30.0, 0.0), (30.0, 6.0)] {
+                let got = paced(fps, jitter, rate, 20.0);
+                assert!(
+                    got.abs_diff(want) <= 1,
+                    "{tier:?} from {fps} fps ±{jitter} ms: {got} frames, want {want}"
+                );
+            }
+        }
+        assert_eq!(paced(5.0, 0.0, frame_rate(VideoTier::T0), 20.0), 100);
+        // 30 fps into T0 now spends T0's bitrate, not twice it.
+        let mut enc = encoder(VideoTier::T0).unwrap();
+        let mut pacer = Pacer::default();
+        let mut seed = 0x9e37_79b9;
+        let mut bytes = 0usize;
+        for i in 0..600u32 {
+            let at = Duration::from_millis(u64::from(i) * 1000 / 30);
+            let yuv = busy_frame(i, &mut seed);
+            if pacer.take(at, frame_rate(VideoTier::T0)) {
+                let ts = Timestamp::from_millis(at.as_millis() as u64);
+                bytes += enc.encode_at(&yuv, ts).unwrap().to_vec().len();
+            }
+        }
+        let kbps = bytes as f64 * 8.0 / 20.0 / 1000.0;
+        assert!((120.0..=180.0).contains(&kbps), "{kbps:.1} kbit/s");
     }
 
     #[test]
