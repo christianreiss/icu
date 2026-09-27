@@ -633,21 +633,26 @@ pub async fn set_role(
 /// target's live sessions are closed with `AUTH_DISABLED` — the close itself
 /// is the notification — and how many is returned; enabling closes nothing.
 /// Behind `disable`/`enable` and `AdminSetDisabled`.
+///
+/// Store write and close happen under the store lock, like [`set_role`]:
+/// a `disable` and an `enable` at once used to write in one order and kick
+/// after both, leaving the user enabled but thrown out with the fatal
+/// `AUTH_DISABLED` (external review 2026-09-27, S-5).
 pub async fn set_disabled(
     server: &Arc<Server>,
     actor: Option<&Actor>,
     target: UserId,
     disabled: bool,
 ) -> Result<usize> {
-    change(server, actor, target, |store| {
-        store.set_disabled(target, disabled)
+    let closed = change(server, actor, target, |store| {
+        store.set_disabled(target, disabled)?;
+        Ok(if disabled {
+            kick_user(server, target, ec::AUTH_DISABLED)
+        } else {
+            0
+        })
     })
     .await?;
-    let closed = if disabled {
-        kick_user(server, target, ec::AUTH_DISABLED)
-    } else {
-        0
-    };
     tracing::info!(
         actor = actor.map(|a| a.user_id),
         target,
