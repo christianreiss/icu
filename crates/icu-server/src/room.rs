@@ -382,6 +382,17 @@ impl Room {
         Some((flags, flipped))
     }
 
+    /// How many sessions hear `speaker`: everybody else who is not deafened,
+    /// as [`Room::audio_fanout`] picks them. What a `LossHint` is agreed on
+    /// (`crate::loss::agreed`).
+    pub fn audio_listeners(&self, speaker: Session) -> usize {
+        self.lock()
+            .members
+            .values()
+            .filter(|m| m.session != speaker && !m.flags.deafened())
+            .count()
+    }
+
     /// Connections to hand a video frame to: everybody else who is viewing
     /// (`PROTOCOL.md` §4). A user's own deafen only concerns audio; one an
     /// admin enforces cuts video as well (`PROTOCOL.md` §2.2 Nr. 33).

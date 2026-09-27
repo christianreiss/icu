@@ -589,7 +589,8 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     seat.abort_tasks();
     let member = server.room.leave(session);
     seat.left = true;
-    for (speaker, loss_permille) in lock(&server.loss).forget(session) {
+    let listeners = |speaker| server.room.audio_listeners(speaker);
+    for (speaker, loss_permille) in lock(&server.loss).forget(session, listeners) {
         server
             .room
             .send_to(speaker, &ControlMsg::LossHint { loss_permille });
@@ -643,7 +644,8 @@ impl Drop for Seat<'_> {
         }
         wire::close(self.conn, ec::SHUTDOWN);
         if self.server.room.leave(self.session).is_some() {
-            lock(&self.server.loss).forget(self.session);
+            let listeners = |speaker| self.server.room.audio_listeners(speaker);
+            lock(&self.server.loss).forget(self.session, listeners);
             self.server.room.broadcast(&ControlMsg::UserLeft {
                 session: self.session,
                 reason: ec::SHUTDOWN as u8,
@@ -1159,7 +1161,9 @@ async fn control_loop(
                 loss_permille,
             } => {
                 let ttl = server.config.timing.loss_report_ttl();
-                let hint = lock(&server.loss).report(speaker, session, loss_permille, ttl);
+                let listeners = |speaker| server.room.audio_listeners(speaker);
+                let hint =
+                    lock(&server.loss).report(speaker, session, loss_permille, ttl, listeners);
                 if let Some(loss_permille) = hint {
                     server
                         .room

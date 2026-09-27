@@ -493,7 +493,7 @@ async fn housekeeping(server: Arc<Server>) {
 
         // The expiry of a report is a change: the speaker must learn that it
         // can stop paying for FEC (`PROTOCOL.md` §2.2).
-        let hints = lock(&server.loss).expire(ttl);
+        let hints = lock(&server.loss).expire(ttl, |speaker| server.room.audio_listeners(speaker));
         for (speaker, loss_permille) in hints {
             server
                 .room

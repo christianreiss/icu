@@ -137,7 +137,8 @@ pub enum ControlMsg {
         /// Loss in per mille.
         loss_permille: u16,
     },
-    /// 12, S→C. Maximum of all reports for this speaker.
+    /// 12, S→C. The largest loss more than a third of this speaker's
+    /// listeners reported at least; up to two listeners the maximum.
     LossHint {
         /// Loss in per mille.
         loss_permille: u16,
@@ -164,8 +165,8 @@ pub enum ControlMsg {
         /// The new display name.
         name: String,
     },
-    /// 16, S→C. Worst video-drop rate among this sender's receivers, measured
-    /// over the last 2 s. Mirrors `LossHint`'s max-across-reporters rule.
+    /// 16, S→C. Video-drop rate more than a third of this sender's receivers
+    /// agree on, measured over the last 2 s; the rule of `LossHint`.
     VideoCongestionHint {
         /// Per mille of frames displaced in a receiver's slot before delivery.
         drop_permille: u16,

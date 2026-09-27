@@ -185,7 +185,7 @@ async fn a_loss_report_becomes_a_loss_hint_for_the_speaker() {
         "{hint:?}"
     );
 
-    // The maximum over all receivers wins.
+    // Two listeners: the maximum wins.
     carol
         .send_msg(&ControlMsg::LossReport {
             speaker: alice.session,
@@ -197,6 +197,43 @@ async fn a_loss_report_becomes_a_loss_hint_for_the_speaker() {
         .await;
     assert!(
         matches!(hint, Some(ControlMsg::LossHint { loss_permille: 90 })),
+        "{hint:?}"
+    );
+    server.shutdown().await;
+}
+
+/// D-1 (external review 2026-09-27): with four listeners, one reporting
+/// 1000‰ — a bad line or a lie — does not raise the speaker's FEC; a second
+/// one agreeing does, with the lower of the two values. Listeners without a
+/// report count as no loss.
+#[tokio::test]
+async fn one_lossy_listener_of_four_does_not_set_the_loss_hint() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let mut bob = server.client("bob").await;
+    let mut carol = server.client("carol").await;
+    let _dave = server.client("dave").await;
+    let _erin = server.client("erin").await;
+    let speaker = alice.session;
+    let report = |loss_permille| ControlMsg::LossReport {
+        speaker,
+        loss_permille,
+    };
+
+    bob.send_msg(&report(1000)).await;
+    let hint = alice
+        .recv_matching(|m| matches!(m, ControlMsg::LossHint { .. }))
+        .await;
+    assert!(
+        matches!(hint, Some(ControlMsg::LossHint { loss_permille: 0 })),
+        "{hint:?}"
+    );
+    carol.send_msg(&report(60)).await;
+    let hint = alice
+        .recv_matching(|m| matches!(m, ControlMsg::LossHint { .. }))
+        .await;
+    assert!(
+        matches!(hint, Some(ControlMsg::LossHint { loss_permille: 60 })),
         "{hint:?}"
     );
     server.shutdown().await;
