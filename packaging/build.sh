@@ -71,7 +71,7 @@ fi
 COMMIT=$(git rev-parse HEAD)
 
 mkdir -p "$OUT" "$WORK"
-rm -rf "$STAGE" "$WORK"/rustc-*
+rm -rf "$STAGE" "$WORK"/rustc-* "$WORK/musl-version"
 mkdir -p "$STAGE"
 podman volume exists "$CARGO_CACHE" || podman volume create "$CARGO_CACHE" >/dev/null
 
@@ -101,14 +101,34 @@ fi
 
 log "server: static musl binary"
 # Profile release-server: release with panic = "unwind", so a panic ends one
-# connection instead of the whole server (Cargo.toml).
+# connection instead of the whole server (Cargo.toml). The binary contains
+# musl libc: the libc.a of the Rust musl target (self-contained; the link
+# trace `-Wl,-t` in this image names it, not Alpine's musl-dev), whose
+# version.lo carries the musl version.
 run -e CARGO_TARGET_DIR=/src/target/musl "$RUST_ALPINE" sh -euc '
     apk add --no-cache musl-dev >/dev/null
     rustc -V > target/pkg/rustc-server
+    libc=$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl/lib/self-contained/libc.a
+    ar p "$libc" version.lo | grep -a -o -E "[0-9]+\.[0-9]+\.[0-9]+" | head -1 > target/pkg/musl-version
     cargo build --profile release-server --locked -p icu-server --target x86_64-unknown-linux-musl'
 SERVER_BIN=target/musl/x86_64-unknown-linux-musl/release-server/icu-server
 file "$SERVER_BIN" | grep -q 'static-pie linked' \
     || { echo "$SERVER_BIN is not static-pie" >&2; exit 1; }
+# musl is MIT: its notice goes along, in the text of exactly this version
+# (packaging/notices/musl-<version>-COPYRIGHT, from the musl release tag).
+MUSL_VERSION=$(cat "$WORK/musl-version")
+MUSL_NOTICE=packaging/notices/musl-$MUSL_VERSION-COPYRIGHT
+[ -n "$MUSL_VERSION" ] || { echo "musl version not found in the target's libc.a" >&2; exit 1; }
+[ -f "$MUSL_NOTICE" ] \
+    || { echo "no notice for musl $MUSL_VERSION: add its COPYRIGHT as $MUSL_NOTICE" >&2; exit 1; }
+{
+    printf '\n%s\n%s\nUsed by:\n  - musl libc %s (statically linked into icu-server)\n\n' \
+        '------------------------------------------------------------------------------' \
+        'MIT License (MIT)' "$MUSL_VERSION"
+    cat "$MUSL_NOTICE"
+} >> "$LICENSES_FILE"
+grep -q "musl libc $MUSL_VERSION" "$LICENSES_FILE" \
+    || { echo "THIRD-PARTY-LICENSES lacks musl libc" >&2; exit 1; }
 
 for d in $DISTS; do
     log "client: build image for $d"
@@ -180,6 +200,7 @@ mv -- "$STAGE"/* "$OUT"/
     echo "commit $COMMIT"
     if [ "${ALLOW_DIRTY:-0}" = 1 ]; then echo DIRTY; fi
     for f in "$WORK"/rustc-*; do echo "rustc ${f##*/rustc-}: $(cat "$f")"; done
+    echo "musl server: $MUSL_VERSION"
     printf 'artifact %s\n' "${packages[@]}"
 } > "$OUT/BUILDINFO.linux"
 packaging/checksums.sh "$OUT"
