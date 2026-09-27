@@ -41,7 +41,11 @@ Deinstallieren lässt den State (`/var/lib/private/icu/`, darin `ca.key`) liegen
 
 Bauen aller Pakete (nur podman nötig): `packaging/build.sh`, Ergebnis unter
 `dist/<ver>/`; Veröffentlichen: `packaging/release.sh`. Details in den
-Kommentaren der beiden Skripte.
+Kommentaren der beiden Skripte. Beide prüfen die Abhängigkeiten mit
+`cargo deny` (Advisories, Lizenzen, Quellen), bevor irgendein Build-Skript
+läuft. Sicherheitsmeldungen zu einem schon veröffentlichten Release zeigt
+nur ein neuer Lauf; ohne CI also etwa wöchentlich auf dem letzten Tag:
+`git worktree add /tmp/icu-tag v<ver> && cargo deny --manifest-path /tmp/icu-tag/Cargo.toml --locked check advisories; git worktree remove /tmp/icu-tag`.
 
 **Downloads prüfen** (seit 2026-09-27). Ein Release trägt `SHA256SUMS`, die
 SSH-Signatur `SHA256SUMS.sig` mit dem Release-Schlüssel des Maintainers
@@ -90,15 +94,19 @@ Sitzung den ganzen Server.
 ### Statisches musl-Binary (Auslieferung)
 
 Fedora hat kein `rust-std-static-x86_64-unknown-linux-musl`, deshalb läuft der
-musl-Build in einem Container. Verifiziert am 2026-09-20 mit podman 5.8.4:
+musl-Build in einem Container. Verifiziert am 2026-09-20 mit podman 5.8.4;
+seit 2026-09-27 wie in `packaging/build.sh`: gepinntes Image (die
+Rust-Version des Workspace), `--locked`, Quellbaum nur lesend, nur `target/`
+beschreibbar:
 
 ```bash
-podman run --rm \
+mkdir -p target
+podman run --rm --security-opt label=disable \
   -e CARGO_TARGET_DIR=/src/target/musl \
-  -v "$PWD":/src:Z -w /src \
-  docker.io/rust:1-alpine \
+  -v "$PWD":/src:ro -v "$PWD/target":/src/target -w /src \
+  docker.io/library/rust:1.98.1-alpine \
   sh -c 'apk add --no-cache musl-dev && \
-         cargo build --profile release-server -p icu-server --target x86_64-unknown-linux-musl'
+         cargo build --profile release-server --locked -p icu-server --target x86_64-unknown-linux-musl'
 ```
 
 Ergebnis: `target/musl/x86_64-unknown-linux-musl/release-server/icu-server`,
@@ -430,6 +438,10 @@ podman run -d --name icu \
   icu-server
 podman exec icu /icu-server invite --name alice
 ```
+
+Das Image nimmt das Binary aus §1 (`target/musl/…/release-server/icu-server`,
+vorher bauen); `.dockerignore` lässt nur diese Datei in den Build-Kontext,
+nicht `.git`, `.scratch` oder den Rest von `target/`.
 
 Die Härtung der systemd-Unit (Sandbox, `MemoryMax=1G`, `Restart=on-failure`)
 gilt im Container nicht: Speichergrenze und Neustart setzt man dort selbst wie

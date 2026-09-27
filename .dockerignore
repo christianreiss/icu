@@ -1,0 +1,5 @@
+# Build context of deploy/Dockerfile (podman and docker read this file):
+# only the static server binary, never .git, .scratch (test credentials),
+# the rest of target or dist.
+*
+!target/musl/x86_64-unknown-linux-musl/release-server/icu-server

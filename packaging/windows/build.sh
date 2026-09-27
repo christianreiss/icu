@@ -47,6 +47,10 @@ if [ "${NO_AEC:-0}" != 1 ]; then
     features=aec,$features
 fi
 
+# First, before any build script or proc macro of a dependency runs.
+log "supply chain: cargo deny"
+cargo deny --locked check
+
 log "cargo build --release --target $TARGET ($features)"
 # build/win-aec/meson hands webrtc-audio-processing's meson the mingw cross
 # file (Research/aec.md, A1).
@@ -69,8 +73,7 @@ log "resources: icon, version and manifest"
 x86_64-w64-mingw32-objdump -h "$EXE" | grep -q '\.rsrc' \
     || die "icu.exe has no resource section (x86_64-w64-mingw32-windres missing?)"
 
-log "supply chain and Windows third-party licenses"
-cargo deny --locked check
+log "Windows third-party licenses"
 mkdir -p "$WORK"
 cargo about generate --locked --fail --target "$TARGET" \
     --manifest-path crates/icu-client/Cargo.toml --no-default-features \
@@ -81,11 +84,51 @@ cargo about generate --locked --fail --target "$TARGET" \
         'SIL Open Font License 1.1 (OFL-1.1)'
     cat crates/icu-client/assets/fonts/inter/LICENSE.txt
 } >> "$WORK/THIRD-PARTY-LICENSES.txt"
-for dependency in windows opusic-sys openh264; do
+# Statically linked native code that no crate declares
+# (Research/packaging-licensing.md item 11): the mingw-w64 CRT and
+# winpthreads, libgcc and libstdc++ (GCC Runtime Library Exception), and
+# with `aec` abseil, which meson fetches as a subproject of
+# webrtc-audio-processing. The texts in packaging/windows/notices/ come from
+# Fedora's mingw64-crt 13.0.0 and mingw64-libstdc++ 15.2.1
+# (/usr/share/licenses) and, for winpthreads, from mingw-w64 v13.0.0
+# (mingw-w64-libraries/winpthreads/COPYING): Fedora ships only the CRT's.
+notice() {  # notice <license> <used by> <file>...
+    local license=$1 used=$2
+    shift 2
+    printf '\n%s\n%s\nUsed by:\n  - %s\n\n' \
+        '------------------------------------------------------------------------------' \
+        "$license" "$used"
+    cat "$@"
+}
+absl=()
+if [ "${NO_AEC:-0}" != 1 ]; then
+    mapfile -t absl < <(find "target/$TARGET/release/build" -maxdepth 6 \
+        -path '*/out/webrtc-audio-processing/subprojects/abseil-cpp-*/LICENSE' | sort)
+    versions=$(printf '%s\n' "${absl[@]}" | sed -n 's|.*/abseil-cpp-\([^/]*\)/LICENSE$|\1|p' | sort -u)
+    [ -n "$versions" ] || die "abseil LICENSE not found in the AEC build"
+    [ "$(echo "$versions" | wc -l)" = 1 ] || die "several abseil builds (${versions//$'\n'/ }):" \
+        "cargo clean --release --target $TARGET -p webrtc-audio-processing-sys"
+fi
+N=packaging/windows/notices
+{
+    notice 'Zope Public License 2.1 (ZPL-2.1) and public domain' \
+        'mingw-w64 runtime (CRT), statically linked' \
+        "$N/mingw-w64-crt-COPYING" "$N/mingw-w64-crt-DISCLAIMER.PD"
+    notice 'MIT License (MIT) and BSD 3-Clause (BSD-3-Clause)' \
+        'winpthreads (mingw-w64), statically linked' "$N/winpthreads-COPYING"
+    notice 'GPL-3.0-or-later WITH GCC-exception-3.1 (GPLv3: https://www.gnu.org/licenses/gpl-3.0.txt)' \
+        'libgcc and libstdc++ (GCC), statically linked' "$N/gcc-COPYING.RUNTIME"
+    if [ ${#absl[@]} -gt 0 ]; then
+        notice 'Apache License 2.0 (Apache-2.0)' \
+            "abseil-cpp $versions (through webrtc-audio-processing), statically linked" "${absl[0]}"
+    fi
+} >> "$WORK/THIRD-PARTY-LICENSES.txt"
+for dependency in windows opusic-sys openh264 mingw-w64 winpthreads libstdc++; do
     grep -q "$dependency" "$WORK/THIRD-PARTY-LICENSES.txt" || die "license missing: $dependency"
 done
 if [ "${NO_AEC:-0}" != 1 ]; then
     grep -q webrtc-audio-processing "$WORK/THIRD-PARTY-LICENSES.txt" || die "AEC license missing"
+    grep -q abseil-cpp "$WORK/THIRD-PARTY-LICENSES.txt" || die "abseil license missing"
 fi
 
 log "zip"

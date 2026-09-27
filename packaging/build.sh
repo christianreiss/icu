@@ -42,9 +42,14 @@ log() { printf '\n==> %s\n' "$*"; }
 
 # Label relabeling (:Z) of the whole repo is slow and races between
 # containers; disable SELinux separation for these throwaway build containers.
+# Build scripts and proc macros run in here: the source (with .git) is
+# mounted read-only, target/ is the one writable place, and .scratch/ (test
+# credentials) is hidden behind an empty tmpfs.
 run() {
+    local hide=()
+    if [ -d "$ROOT/.scratch" ]; then hide=(--mount 'type=tmpfs,destination=/src/.scratch,notmpcopyup'); fi
     podman run --rm --security-opt label=disable \
-        -v "$ROOT":/src -w /src \
+        -v "$ROOT":/src:ro -v "$ROOT/target":/src/target "${hide[@]}" -w /src \
         -v "$CARGO_CACHE":/cargo -e CARGO_HOME=/cargo \
         "$@"
 }
@@ -69,6 +74,25 @@ mkdir -p "$OUT" "$WORK"
 rm -rf "$STAGE" "$WORK"/rustc-*
 mkdir -p "$STAGE"
 podman volume exists "$CARGO_CACHE" || podman volume create "$CARGO_CACHE" >/dev/null
+
+# First, before any build script or proc macro of a dependency runs (host
+# tests, container builds): cargo deny and cargo about only read metadata.
+log "supply chain: cargo deny (advisories, bans, licenses, sources) + cargo about"
+LICENSES_FILE=$WORK/THIRD-PARTY-LICENSES
+podman build -q -f packaging/containers/client-debian.Containerfile \
+    -t "$(dist_image debian13)" packaging/containers >/dev/null
+run -e CARGO_TARGET_DIR=/src/target/pkg-debian13 "$(dist_image debian13)" bash -euc '
+    cargo deny --locked check
+    cargo about generate --locked --fail packaging/about.hbs -o target/pkg/THIRD-PARTY-LICENSES'
+# Fonts embedded in the client binary are not crates; add their license.
+{
+    printf '\n%s\n%s\nUsed by:\n  - Inter (crates/icu-client/assets/fonts/inter, embedded)\n\n' \
+        '------------------------------------------------------------------------------' \
+        'SIL Open Font License 1.1 (OFL-1.1)'
+    cat crates/icu-client/assets/fonts/inter/LICENSE.txt
+} >> "$LICENSES_FILE"
+grep -q 'webrtc-audio-processing' "$LICENSES_FILE" \
+    || { echo "THIRD-PARTY-LICENSES lacks webrtc-audio-processing" >&2; exit 1; }
 
 if [ "${SKIP_TESTS:-0}" != 1 ]; then
     log "cargo test --workspace"
@@ -118,23 +142,6 @@ for d in $DISTS; do
             esac
         } > "/src/target/pkg/depends-$DIST.yaml"'
 done
-
-log "supply chain: cargo deny (advisories, bans, licenses, sources) + cargo about"
-LICENSES_FILE=$WORK/THIRD-PARTY-LICENSES
-podman image exists "$(dist_image debian13)" || podman build -q \
-    -f packaging/containers/client-debian.Containerfile -t "$(dist_image debian13)" packaging/containers >/dev/null
-run -e CARGO_TARGET_DIR=/src/target/pkg-debian13 "$(dist_image debian13)" bash -euc '
-    cargo deny --locked check
-    cargo about generate --locked --fail packaging/about.hbs -o target/pkg/THIRD-PARTY-LICENSES'
-# Fonts embedded in the client binary are not crates; add their license.
-{
-    printf '\n%s\n%s\nUsed by:\n  - Inter (crates/icu-client/assets/fonts/inter, embedded)\n\n' \
-        '------------------------------------------------------------------------------' \
-        'SIL Open Font License 1.1 (OFL-1.1)'
-    cat crates/icu-client/assets/fonts/inter/LICENSE.txt
-} >> "$LICENSES_FILE"
-grep -q 'webrtc-audio-processing' "$LICENSES_FILE" \
-    || { echo "THIRD-PARTY-LICENSES lacks webrtc-audio-processing" >&2; exit 1; }
 
 # nfpm expands ${VAR} only in a few fields, not in contents paths, so the
 # templates are rendered here. Paths in them are relative to the repo root.

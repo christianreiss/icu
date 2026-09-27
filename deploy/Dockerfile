@@ -3,12 +3,20 @@
 # `FROM scratch` — the binary is fully static (musl, rustls/ring, no libc, no
 # CA bundle: the server is its own CA), so the image needs nothing else.
 #
-# Build the binary first, outside this Dockerfile (see deploy/README.md):
+# Build the binary first, outside this Dockerfile, as packaging/build.sh
+# does (same pinned image = the workspace's Rust version, Cargo.lock as it
+# is, source read-only, output in target/musl):
 #
-#   podman run --rm -v "$PWD":/src:Z -w /src docker.io/rust:1-alpine \
+#   mkdir -p target
+#   podman run --rm --security-opt label=disable -v "$PWD":/src:ro \
+#     -v "$PWD/target":/src/target -w /src -e CARGO_TARGET_DIR=/src/target/musl \
+#     docker.io/library/rust:1.98.1-alpine \
 #     sh -c 'apk add --no-cache musl-dev && \
-#            cargo build --profile release-server -p icu-server --target x86_64-unknown-linux-musl'
+#            cargo build --profile release-server --locked -p icu-server --target x86_64-unknown-linux-musl'
 #   podman build -f deploy/Dockerfile -t icu-server .
+#
+# The build context is the repository, but .dockerignore lets in only that
+# binary: no .git, no .scratch, no target or dist.
 #
 # Then run it with the state and config mounted:
 #
@@ -25,13 +33,13 @@
 # cannot create them under the root-owned /, so without these the admin
 # socket (/run/icu/admin.sock) is missing and a fresh named volume on
 # /var/lib/icu is not writable: no `invite`, no first admin.
-FROM docker.io/library/alpine:3 AS dirs
+FROM docker.io/library/alpine:3.24 AS dirs
 RUN mkdir -p /out/run/icu /out/var/lib/icu
 
 FROM scratch
 
 COPY --from=dirs --chown=65532:65532 /out/ /
-COPY target/x86_64-unknown-linux-musl/release-server/icu-server /icu-server
+COPY target/musl/x86_64-unknown-linux-musl/release-server/icu-server /icu-server
 
 # State, runtime and configuration. Declare the state volume so an accidental
 # `podman rm` does not take the CA with it.
