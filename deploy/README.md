@@ -43,6 +43,27 @@ Bauen aller Pakete (nur podman nötig): `packaging/build.sh`, Ergebnis unter
 `dist/<ver>/`; Veröffentlichen: `packaging/release.sh`. Details in den
 Kommentaren der beiden Skripte.
 
+**Downloads prüfen** (seit 2026-09-27). Ein Release trägt `SHA256SUMS`, die
+SSH-Signatur `SHA256SUMS.sig` mit dem Release-Schlüssel des Maintainers
+(Namensraum `icu-release`) und je Build eine `BUILDINFO.<teil>` mit Commit,
+Compiler und den Dateien dieses Builds; der Git-Tag ist signiert
+(`git tag -v v<ver>`). Den öffentlichen Schlüssel einmal aus dem Repository
+nehmen (`packaging/allowed_signers`) und aufbewahren; seinen Fingerabdruck
+(`cut -d' ' -f3,4 allowed_signers | ssh-keygen -lf -`) auf einem zweiten Weg
+beim Maintainer abgleichen. Eine Kopie, die neben den Downloads liegt,
+beweist nichts. Dann im Download-Ordner:
+
+```bash
+ssh-keygen -Y verify -f allowed_signers -I icu-release -n icu-release -s SHA256SUMS.sig < SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+Erwartet: `Good "icu-release" signature for icu-release …` und `OK` je
+heruntergeladener Datei. Unter Windows statt `sha256sum`:
+`certutil -hashfile icu-<ver>-windows-x86_64.zip SHA256` mit der Zeile in
+`SHA256SUMS` vergleichen (`ssh-keygen` bringt der OpenSSH-Client von
+Windows mit; dort ungeprüft).
+
 ## 1. Bauen
 
 ### Host-Build (Entwicklung, Tests)

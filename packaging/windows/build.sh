@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Builds the portable Windows client into dist/<version>/:
-# icu-<version>-windows-x86_64.zip (icu.exe, licenses, a short readme),
-# then rewrites SHA256SUMS over everything in dist/<version>/.
+# icu-<version>-windows-x86_64.zip (icu.exe, licenses, a short readme) and
+# BUILDINFO.windows (commit, compiler, features, the ZIP), then rewrites
+# SHA256SUMS over the BUILDINFO files there and what they list
+# (packaging/checksums.sh).
 #
 #   packaging/windows/build.sh
 #
 # Environment:
-#   ALLOW_DIRTY=1   build from a dirty working tree (never for a release)
+#   ALLOW_DIRTY=1   build from a dirty working tree (never for a release:
+#                   BUILDINFO says DIRTY, packaging/release.sh refuses it)
 #   NO_AEC=1        build without the echo canceller (feature `aec`)
 #
 # Cross-built on Fedora for x86_64-pc-windows-gnu (Research/cross-compile.md):
@@ -33,6 +36,7 @@ die() { echo "windows: $*" >&2; exit 1; }
 if [ "${ALLOW_DIRTY:-0}" != 1 ] && [ -n "$(git status --porcelain)" ]; then
     die "working tree is dirty; commit first or set ALLOW_DIRTY=1"
 fi
+COMMIT=$(git rev-parse HEAD)
 
 # openh264 asks for libstdc++ dynamically; this copy links it statically
 # (build/win-static/README.md).
@@ -91,6 +95,13 @@ cp "$WORK/THIRD-PARTY-LICENSES.txt" "$WORK/$NAME/THIRD-PARTY-LICENSES.txt"
 sed "s/@VERSION@/$VERSION/" packaging/windows/README.txt | sed 's/$/\r/' > "$WORK/$NAME/LIESMICH.txt"
 (cd "$WORK" && rm -f "$ROOT/$OUT/$NAME.zip" && zip -qr9 "$ROOT/$OUT/$NAME.zip" "$NAME")
 
-(cd "$OUT" && rm -f SHA256SUMS && sha256sum -- $(ls *.rpm *.deb *.zip 2>/dev/null) > SHA256SUMS)
+{
+    echo "commit $COMMIT"
+    if [ "${ALLOW_DIRTY:-0}" = 1 ]; then echo DIRTY; fi
+    echo "rustc windows: $(rustc -V)"
+    echo "features $features"
+    echo "artifact $NAME.zip"
+} > "$OUT/BUILDINFO.windows"
+packaging/checksums.sh "$OUT"
 log "done: $OUT/$NAME.zip"
 ls -l "$OUT/$NAME.zip"

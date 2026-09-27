@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# Builds the icu-server and icu (client) rpm/deb packages into dist/<version>/.
+# Builds the icu-server and icu (client) rpm/deb packages into dist/<version>/,
+# with BUILDINFO.linux (commit, compilers, the packages of this run) and
+# SHA256SUMS over the BUILDINFO files there and what they list
+# (packaging/checksums.sh): packages of an earlier run or release iteration
+# stay in the directory but are neither listed nor published.
 #
 #   packaging/build.sh                 # everything, then smoke tests
 #   DISTS="fc43" packaging/build.sh    # subset of client distros
@@ -10,7 +14,8 @@
 #   SERVER_DISTS="debian12 alma10"    smoke-tested with the server package only
 #   SKIP_TESTS=1       skip `cargo test --workspace` on the host
 #   SKIP_SMOKE=1       skip packaging/smoke.sh
-#   ALLOW_DIRTY=1      build from a dirty working tree (never for a release)
+#   ALLOW_DIRTY=1      build from a dirty working tree (never for a release:
+#                      BUILDINFO says DIRTY, packaging/release.sh refuses it)
 #
 # Needs only podman on the host (plus cargo for the tests). The server is one
 # static musl binary for both formats; the client is built per distro because
@@ -30,6 +35,8 @@ VERSION=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Ca
 [ -n "$VERSION" ] || { echo "cannot read version from Cargo.toml" >&2; exit 1; }
 OUT=dist/$VERSION
 WORK=target/pkg
+# nfpm writes here first, so this run's packages are known by name.
+STAGE=$WORK/out
 
 log() { printf '\n==> %s\n' "$*"; }
 
@@ -56,7 +63,11 @@ if [ "${ALLOW_DIRTY:-0}" != 1 ] && [ -n "$(git status --porcelain)" ]; then
     exit 1
 fi
 
+COMMIT=$(git rev-parse HEAD)
+
 mkdir -p "$OUT" "$WORK"
+rm -rf "$STAGE" "$WORK"/rustc-*
+mkdir -p "$STAGE"
 podman volume exists "$CARGO_CACHE" || podman volume create "$CARGO_CACHE" >/dev/null
 
 if [ "${SKIP_TESTS:-0}" != 1 ]; then
@@ -69,6 +80,7 @@ log "server: static musl binary"
 # connection instead of the whole server (Cargo.toml).
 run -e CARGO_TARGET_DIR=/src/target/musl "$RUST_ALPINE" sh -euc '
     apk add --no-cache musl-dev >/dev/null
+    rustc -V > target/pkg/rustc-server
     cargo build --profile release-server --locked -p icu-server --target x86_64-unknown-linux-musl'
 SERVER_BIN=target/musl/x86_64-unknown-linux-musl/release-server/icu-server
 file "$SERVER_BIN" | grep -q 'static-pie linked' \
@@ -88,6 +100,7 @@ for d in $DISTS; do
     # Runtime dependencies: every linked library (as rpm soname provides or
     # the owning deb package) plus what winit/wgpu dlopen at runtime.
     run -e CARGO_TARGET_DIR="/src/target/pkg-$d" -e DIST="$d" "$(dist_image "$d")" bash -euc '
+        rustc -V > "/src/target/pkg/rustc-$DIST"
         cargo build --release --locked -p icu-client
         bin=$CARGO_TARGET_DIR/release/icu
         libs=$(ldd "$bin" | awk "/=> \\//{print \$1\" \"\$3}" | grep -v -e ld-linux -e linux-vdso)
@@ -134,7 +147,7 @@ render() {  # render <template> <out> VAR=value...
 }
 nfpm() {  # nfpm <config> <format>
     podman run --rm --security-opt label=disable -v "$ROOT":/src -w /src \
-        "$NFPM_IMAGE" package -f "$1" -p "$2" -t "$OUT/"
+        "$NFPM_IMAGE" package -f "$1" -p "$2" -t "$STAGE/"
 }
 
 log "nfpm: icu-server"
@@ -154,7 +167,15 @@ for d in $DISTS; do
     nfpm "$cfg" "$(dist_format "$d")"
 done
 
-(cd "$OUT" && rm -f SHA256SUMS && sha256sum -- $(ls *.rpm *.deb *.zip 2>/dev/null) > SHA256SUMS)
+mapfile -t packages < <(cd "$STAGE" && ls)
+mv -- "$STAGE"/* "$OUT"/
+{
+    echo "commit $COMMIT"
+    if [ "${ALLOW_DIRTY:-0}" = 1 ]; then echo DIRTY; fi
+    for f in "$WORK"/rustc-*; do echo "rustc ${f##*/rustc-}: $(cat "$f")"; done
+    printf 'artifact %s\n' "${packages[@]}"
+} > "$OUT/BUILDINFO.linux"
+packaging/checksums.sh "$OUT"
 
 if [ "${SKIP_SMOKE:-0}" != 1 ]; then
     VERSION=$VERSION RELEASE=$RELEASE DISTS=$DISTS SERVER_DISTS=${SERVER_DISTS-"debian12 alma10"} \
