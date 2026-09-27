@@ -1,5 +1,23 @@
 # Windows release gate — 2026-09-26
 
+> **Covers commit** (stated 2026-09-27, external review P-1): the native
+> Windows 10 and 11 runs below used the package built from **`41d4b50`**
+> (tray fixes `6644440`; the Windows 11 download/SmartScreen/enrollment run
+> used the `6644440` package with the setup-only update of `41d4b50`), with
+> passports of that time (before version 4); the Linux test counts come from
+> the same branch (base `180fa55`, merged as `91efdbc`). Later, on
+> 2026-09-27, only the automated suites ran natively on both VMs for the
+> readiness fixes (`feba687`: library, `ui_layout`, `windows_console`;
+> `Client/IMPLEMENTATION.md` §14).
+>
+> **Not gated yet:** no native Windows run at all covers the com key and
+> `ComSocket` with passport version 4 (`d9c9986`), the video slot rework
+> (`8568d82`) or anything later, and no Windows client has enrolled with a
+> version-4 passport; the desktop checks (enrollment, tray, SmartScreen, Raw
+> Input) have not been repeated since `41d4b50`. Re-run one Windows v4
+> enrollment and the unit suites on the commit to be tagged and update this
+> note.
+
 ## Scope and verdict
 
 Windows feature parity was checked against the Linux client at `180fa55`.

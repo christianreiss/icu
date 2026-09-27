@@ -1,5 +1,23 @@
 # Server production gate — 26–27 September 2026
 
+> **Covers commit** (stated 2026-09-27, external review P-1): the main gate
+> below — test suite, static musl binary, rpm/deb `packaging/smoke.sh` on
+> Debian 12 and AlmaLinux 10, `FROM scratch` container, systemd service test
+> on biest.eulie.de with Checkmk and a manual backup/restore — ran on
+> **`c449264`** (`ab79478` is formatting only; branch base `180fa55`, merged
+> as `37462c1`). The full-room media soak ran on `38e34bc`; the second-round
+> follow-up (test suite, Clippy, media soak with junk traffic) on `fa26a64`
+> (on top of `8568d82`) — tests only, no smoke, service or Checkmk run.
+>
+> **Not gated yet:** the wire and state changes of 2026-09-27 — the com key in
+> the state and `ComSocket` tagging every datagram (`75a4bb2`, merged
+> `d9c9986`), passport version 4 (same commit), the video slot and deadline
+> rework (`8568d82`, `a0a3101`) and the automatic state backup (`c540f2d`) —
+> have not been through `packaging/smoke.sh`, the systemd service gate or
+> Checkmk against a real service. “No state schema or wire change” further
+> down holds for `c449264` only. Re-run those gates on the commit to be tagged
+> and update this note.
+
 ## Decision
 
 **Server software: passes the tested gates below after hardening. Actual public
