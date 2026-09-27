@@ -8,7 +8,9 @@ targets = [
     { triple = "x86_64-unknown-linux-musl" },
     { triple = "x86_64-pc-windows-gnu" },
 ]
-all-features = false
+# Auch die optionalen Features (`mjpeg`, `cpal-fallback`, `glow`), sonst
+# prueft der Build nur den Graph der Default-Features.
+all-features = true
 
 [licenses]
 version = 2
@@ -33,15 +35,6 @@ allow = [
 ]
 confidence-threshold = 0.9
 
-# `IJG` gilt ausschliesslich fuer den MJPEG-Fallback des Clients
-# (Feature `mjpeg`, Crate `jpeg-encoder`). cargo-deny kann eine Ausnahme nicht
-# an ein Cargo-Feature binden; deshalb ein Crate-Pin statt eines globalen
-# Allow-Eintrags. Wird `mjpeg` nicht gebaut, ist das Crate nicht im Graph und
-# die Ausnahme wirkungslos.
-[[licenses.exceptions]]
-name = "jpeg-encoder"
-allow = ["IJG"]
-
 # target-lexicon ist reine Build-Abhaengigkeit (system-deps -> cfg-expr) und
 # landet nicht im Binary; LLVM-exception erweitert Apache-2.0 nur.
 [[licenses.exceptions]]
@@ -62,32 +55,47 @@ allow = ["IJG"]
 # webrtc-audio-processing 2.1 traegt `license-file = COPYING` statt eines
 # SPDX-Ausdrucks; der Text ist woertlich die Google-BSD-3-Clause
 # (Research/aec.md E6).
+# `hash` ist der XxHash32 der Datei, wie cargo-deny ihn rechnet (Zeilenenden
+# auf `\n` normalisiert). Passt er nicht, ignoriert cargo-deny die
+# Klarstellung stillschweigend und prueft das Crate wie ohne sie; `hash = 0`
+# galt deshalb nie. Aendert eine neue Version die Datei, gilt dasselbe: den
+# Text pruefen, dann den Hash neu setzen.
 [[licenses.clarify]]
 name = "webrtc-audio-processing"
 expression = "BSD-3-Clause"
-license-files = [{ path = "COPYING", hash = 0 }]
+license-files = [{ path = "COPYING", hash = 0x3d3ea952 }]
 
 [[licenses.clarify]]
 name = "webrtc-audio-processing-config"
 expression = "BSD-3-Clause"
-license-files = [{ path = "COPYING", hash = 0 }]
+license-files = [{ path = "COPYING", hash = 0x7e861f0d }]
 
 [[licenses.clarify]]
 name = "webrtc-audio-processing-sys"
 expression = "BSD-3-Clause"
-license-files = [{ path = "COPYING", hash = 0 }]
+license-files = [{ path = "COPYING", hash = 0x7e861f0d }]
 
 # ring ist "Apache-2.0 AND ISC" mit zusaetzlichen Dateien ohne SPDX-Header;
 # beide Lizenzen stehen in der Allowlist.
 [[licenses.clarify]]
 name = "ring"
 expression = "Apache-2.0 AND ISC"
-license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+license-files = [{ path = "LICENSE", hash = 0x0d99693a }]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
+# Ein TLS-/Krypto-Stack: rustls auf ring, ohne Default-Provider
+# (Research/review-specs-2026-09-20.md A7, Cargo.toml). aws-lc-sys (C,
+# bindgen) bricht den statischen musl-Server, OpenSSL gehoert nicht in den
+# Graph. Kommt eins davon ueber ein Default-Feature zurueck, bricht der Build.
+deny = [
+    { crate = "aws-lc-rs", reason = "rustls laeuft auf ring (A7)" },
+    { crate = "aws-lc-sys", reason = "rustls laeuft auf ring (A7)" },
+    { crate = "openssl", reason = "kein zweiter TLS-Stack neben rustls (A7)" },
+    { crate = "openssl-sys", reason = "kein zweiter TLS-Stack neben rustls (A7)" },
+]
 
 [advisories]
 version = 2
