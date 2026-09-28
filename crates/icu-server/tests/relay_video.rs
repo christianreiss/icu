@@ -61,6 +61,51 @@ async fn video_reaches_the_other_clients_with_the_speaker_set() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn display_reports_reach_only_the_current_camera_sender() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let mut bob = viewer(&server, "bob").await;
+    let mut carol = server.client("carol").await;
+    let alice_session = alice.session;
+    camera_on(&mut alice, alice_session).await;
+
+    // A peer without VIEWING cannot claim to display Alice's picture.
+    carol
+        .send_msg(&ControlMsg::VideoDisplayed {
+            speaker: alice_session,
+        })
+        .await;
+    assert!(alice
+        .recv_matching(
+            |m| matches!(m, ControlMsg::VideoViewer { viewer } if *viewer == carol.session)
+        )
+        .await
+        .is_none());
+
+    bob.send_msg(&ControlMsg::VideoDisplayed {
+        speaker: alice_session,
+    })
+    .await;
+    assert!(
+        matches!(alice.recv_matching(|m| matches!(m, ControlMsg::VideoViewer { viewer } if *viewer == bob.session)).await,
+        Some(ControlMsg::VideoViewer { viewer }) if viewer == bob.session)
+    );
+
+    // A duplicate cannot flood the sender's control queue.
+    bob.send_msg(&ControlMsg::VideoDisplayed {
+        speaker: alice_session,
+    })
+    .await;
+    assert!(alice
+        .recv_matching(
+            |m| matches!(m, ControlMsg::VideoViewer { viewer } if *viewer == bob.session)
+        )
+        .await
+        .is_none());
+    server.shutdown().await;
+}
+
 /// §6.5: without `camera_on` a frame is not relayed.
 #[tokio::test]
 async fn video_without_camera_on_is_dropped() {

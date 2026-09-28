@@ -2,8 +2,9 @@
 //! (`docs/reference/server.md` §6.4).
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -1101,6 +1102,7 @@ async fn control_loop(
     };
     let mut control = TokenBucket::per_second(server.config.limits.control_msgs_per_s);
     let mut set_state = TokenBucket::per_second(server.config.limits.set_state_per_s);
+    let mut last_video_report: HashMap<Session, Instant> = HashMap::new();
     let mut violations = ViolationCounter::new(
         pl::RATE_VIOLATIONS_FATAL,
         server.config.timing.rate_violation_window(),
@@ -1151,6 +1153,20 @@ async fn control_loop(
                     server
                         .room
                         .broadcast(&ControlMsg::UserState { session, flags });
+                }
+            }
+            ControlMsg::VideoDisplayed { speaker } => {
+                if server.room.video_display_eligible(session, speaker) {
+                    let now = Instant::now();
+                    if last_video_report
+                        .get(&speaker)
+                        .is_none_or(|last| now.duration_since(*last) >= Duration::from_secs(1))
+                    {
+                        last_video_report.insert(speaker, now);
+                        server
+                            .room
+                            .send_to(speaker, &ControlMsg::VideoViewer { viewer: session });
+                    }
                 }
             }
             ControlMsg::Ping { nonce } => {

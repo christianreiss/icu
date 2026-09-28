@@ -294,6 +294,7 @@ fn state() -> AppState {
             flags: UserFlags(UserFlags::ADMIN | UserFlags::VIEWING | UserFlags::PTT),
         }),
         peers,
+        video_viewers: Vec::new(),
         muted: false,
         deafened: false,
         ptt_down: false,
@@ -387,6 +388,7 @@ fn main_window(
     let mut view = MainView::default();
     let harness = harness(MAIN, theme_name, false, move |root| {
         let env = MainEnv {
+            fresh_video: &[],
             cmd: &cmd,
             video_tier: icu_client::video::VideoTier::T0,
             video: &|_| None,

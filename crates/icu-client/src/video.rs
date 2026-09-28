@@ -600,7 +600,8 @@ impl VideoTextures {
     /// simply went quiet for [`FRESH`] drops out of `seqs`, its texture is
     /// released here, and its row falls back to the initials circle — which
     /// is also why the eviction runs before the uploads and not after.
-    pub fn refresh(&mut self, ctx: &egui::Context) {
+    pub fn refresh(&mut self, ctx: &egui::Context) -> Vec<Session> {
+        let mut fresh = Vec::new();
         let seqs = self.frames.seqs();
         self.shown
             .retain(|session, _| seqs.iter().any(|(s, _)| s == session));
@@ -611,6 +612,7 @@ impl VideoTextures {
             let Some((seq, frame)) = self.frames.picture(session) else {
                 continue;
             };
+            fresh.push(session);
             // The decoder writes alpha 255 for every pixel, so premultiplied
             // is both correct and one multiply per pixel cheaper.
             let image =
@@ -630,6 +632,7 @@ impl VideoTextures {
                 }
             }
         }
+        fresh
     }
 
     /// One session's picture, for `crate::ui::widgets::avatar`.

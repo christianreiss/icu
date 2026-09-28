@@ -16,16 +16,16 @@ use std::{
         Arc,
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use icu_proto::Session;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use crate::{
     config::{Corner, Expand, OverlaySettings, TileSize},
-    engine::{AppState, VideoFrames},
+    engine::{AppState, Command, VideoFrames},
 };
 
 #[cfg(target_os = "linux")]
@@ -101,13 +101,14 @@ impl OverlayHandle {
     pub fn start(
         state: watch::Receiver<AppState>,
         frames: VideoFrames,
+        cmd: mpsc::UnboundedSender<Command>,
     ) -> Result<OverlayHandle, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let stop_t = stop.clone();
         let thread = std::thread::Builder::new()
             .name("icu-overlay".into())
-            .spawn(move || platform::run(Scene::new(state, frames), stop_t, ready_tx))
+            .spawn(move || platform::run(Scene::new(state, frames, cmd), stop_t, ready_tx))
             .map_err(|e| e.to_string())?;
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => Ok(OverlayHandle {
@@ -403,6 +404,9 @@ struct Scene {
     labels: Option<Labels>,
     state: watch::Receiver<AppState>,
     frames: VideoFrames,
+    cmd: mpsc::UnboundedSender<Command>,
+    visible_frames: Vec<(Session, u64)>,
+    reported: HashMap<Session, (u64, Instant)>,
     width: u32,
     height: u32,
     /// Pixels per layout pixel. The Windows window is sized in physical
@@ -430,7 +434,11 @@ struct Update {
 }
 
 impl Scene {
-    fn new(state: watch::Receiver<AppState>, frames: VideoFrames) -> Scene {
+    fn new(
+        state: watch::Receiver<AppState>,
+        frames: VideoFrames,
+        cmd: mpsc::UnboundedSender<Command>,
+    ) -> Scene {
         let settings = state.borrow().settings.overlay.clone();
         Scene {
             settings,
@@ -438,6 +446,9 @@ impl Scene {
             labels: Labels::new(),
             state,
             frames,
+            cmd,
+            visible_frames: Vec::new(),
+            reported: HashMap::new(),
             width: 0,
             height: 0,
             scale: 1.0,
@@ -536,6 +547,12 @@ impl Scene {
         // Camera tiles first, then the plates of whoever talks without a
         // camera; each group in name order.
         let frames = self.frames.latest();
+        let seqs = self.frames.seqs();
+        self.visible_frames = peers
+            .iter()
+            .filter(|(session, _, _, camera)| *camera && frames.iter().any(|(s, _)| s == session))
+            .filter_map(|(session, _, _, _)| seqs.iter().find(|(s, _)| s == session).copied())
+            .collect();
         peers.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.1.cmp(&b.1)));
         // A fresh map each tick: whoever isn't a camera tile this time
         // (left, or turned their camera off) just isn't carried forward,
@@ -626,6 +643,25 @@ impl Scene {
         };
         compose(canvas, &geometry, &self.tiles, self.labels.as_mut());
     }
+
+    /// Called only after the platform accepts a frame for presentation.
+    fn report_displayed(&mut self) {
+        let now = Instant::now();
+        self.reported
+            .retain(|session, _| self.visible_frames.iter().any(|(s, _)| s == session));
+        for (session, seq) in &self.visible_frames {
+            if new_display_report(self.reported.get(session).copied(), *seq, now) {
+                self.reported.insert(*session, (*seq, now));
+                let _ = self.cmd.send(Command::VideoDisplayed(*session));
+            }
+        }
+    }
+}
+
+fn new_display_report(last: Option<(u64, Instant)>, seq: u64, now: Instant) -> bool {
+    last.is_none_or(|(last_seq, at)| {
+        last_seq != seq && now.duration_since(at) >= Duration::from_secs(1)
+    })
 }
 
 /// `px` layout pixels at `scale` physical pixels each.
@@ -1010,6 +1046,15 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_overlay_frame_does_not_renew_a_viewer_report() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(4);
+        assert!(!new_display_report(Some((7, old)), 7, now));
+        assert!(new_display_report(Some((7, old)), 8, now));
+        assert!(!new_display_report(Some((7, now)), 8, now));
+    }
 
     const CAMERA_D: u32 = 120;
     const PLATE_D: u32 = 72;

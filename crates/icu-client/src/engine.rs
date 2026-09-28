@@ -193,6 +193,8 @@ pub struct AppState {
     pub me: Option<UserInfo>,
     /// Everyone else.
     pub peers: Vec<Peer>,
+    /// Peers that reported presenting one of our frames within three seconds.
+    pub video_viewers: Vec<Session>,
     /// Local mute.
     pub muted: bool,
     /// Local deafen.
@@ -300,6 +302,8 @@ pub struct AppState {
 /// Commands from UI, tray and hotkeys.
 #[derive(Debug, Clone)]
 pub enum Command {
+    /// A frame from this peer was presented by the main window or overlay.
+    VideoDisplayed(Session),
     /// Mute/unmute.
     SetMuted(bool),
     /// Deafen/undeafen.
@@ -882,6 +886,7 @@ impl Engine {
             server_name: cfg.identity.server.server_name.clone(),
             me: None,
             peers: Vec::new(),
+            video_viewers: Vec::new(),
             // A mute kept from the last run shows from the first frame.
             muted: settings.audio.muted,
             deafened: false,
@@ -2426,6 +2431,8 @@ async fn net_task(
         flags: UserFlags::NONE
             .with_bit(UserFlags::MUTED, cfg.settings.audio.muted)
             .with_bit(UserFlags::CAMERA_ON, cfg.settings.camera.enabled),
+        video_viewers: HashMap::new(),
+        last_display_report: HashMap::new(),
         settings: cfg.settings.clone(),
         settings_tx,
         paths: cfg.paths.clone(),
@@ -2666,6 +2673,7 @@ fn end_session(shared: &Arc<Shared>) {
     lock(&shared.video).reset();
     shared.state.send_modify(|s| {
         s.peers.clear();
+        s.video_viewers.clear();
         s.conn_info = None;
         s.conn_stats = None;
         s.server_rtt_ms = None;
@@ -2754,6 +2762,8 @@ fn reconnect_with_new_identity() -> SessionEnd {
 
 struct LocalState {
     flags: UserFlags,
+    video_viewers: HashMap<Session, Instant>,
+    last_display_report: HashMap<Session, Instant>,
     settings: Settings,
     /// Every committed change of `settings`, for `settings_writer`.
     settings_tx: mpsc::UnboundedSender<Settings>,
@@ -3144,6 +3154,7 @@ impl LocalState {
                 self.replace_identity(*identity, settings.map(|s| *s), shared);
             }
             Command::CreateInvite { .. }
+            | Command::VideoDisplayed(_)
             | Command::SetUserAdmin { .. }
             | Command::SetUserDisabled { .. }
             | Command::RevokeUser { .. }
@@ -3703,6 +3714,8 @@ async fn run_session(
         _ => None,
     };
     local.name = welcome.you.name.clone();
+    local.video_viewers.clear();
+    local.last_display_report.clear();
     {
         let me = welcome.you.clone();
         tracing::info!(peers = peers.len(), "welcome: initial peer list");
@@ -3724,6 +3737,7 @@ async fn run_session(
             s.conn = ConnStatus::Connected;
             s.me = Some(me);
             s.peers = peers;
+            s.video_viewers.clear();
             shared
                 .dsp
                 .audience
@@ -3864,6 +3878,17 @@ async fn run_session(
                 let Some(cmd) = cmd else { break SessionEnd::Quit };
                 match cmd {
                     Command::Quit => break SessionEnd::Quit,
+                    Command::VideoDisplayed(speaker) => {
+                        let now = Instant::now();
+                        let eligible = local.flags.viewing()
+                            && shared.state.borrow().peers.iter().any(|p| p.info.session == speaker && p.info.flags.camera_on());
+                        if eligible && local.last_display_report.get(&speaker).is_none_or(|last| now.duration_since(*last) >= Duration::from_secs(1)) {
+                            local.last_display_report.insert(speaker, now);
+                            if conn::write_msg(&mut send, &ControlMsg::VideoDisplayed { speaker }).await.is_err() {
+                                break send_failed(&connection);
+                            }
+                        }
+                    }
                     Command::RequestRename(name) => {
                         let name = icu_proto::normalize_name(&name);
                         if local.pending_renew.is_some() {
@@ -4011,6 +4036,11 @@ async fn run_session(
                 }
             }
             _ = video_tick.tick() => {
+                let viewers = fresh_video_viewers(&mut local.video_viewers, Instant::now());
+                local.last_display_report.retain(|_, at| at.elapsed() < Duration::from_secs(3));
+                if shared.state.borrow().video_viewers != viewers {
+                    shared.state.send_modify(|s| s.video_viewers = viewers);
+                }
                 let requests = shared.video.lock().unwrap().take_keyframe_requests();
                 for speaker in requests {
                     if conn::write_msg(&mut send, &ControlMsg::KeyframeRequest { speaker }).await.is_err() {
@@ -4532,6 +4562,8 @@ async fn handle_control(
             });
         }
         ControlMsg::UserLeft { session, .. } => {
+            local.video_viewers.remove(&session);
+            local.last_display_report.remove(&session);
             // Destroyed after the lock is released (`drop_speakers`).
             let gone = lock(&shared.speakers).remove(&session);
             drop(gone);
@@ -4558,6 +4590,16 @@ async fn handle_control(
             });
         }
         ControlMsg::UserState { session, flags } => {
+            if shared
+                .state
+                .borrow()
+                .me
+                .as_ref()
+                .is_some_and(|me| me.session == session)
+                && !flags.camera_on()
+            {
+                local.video_viewers.clear();
+            }
             // While its audio arrives, the local path decides the indicator
             // (`local_indicator`); read before `send_modify`, never under it.
             let local = lock(&shared.speakers)
@@ -4684,6 +4726,20 @@ async fn handle_control(
         ControlMsg::VideoCongestionHint { drop_permille } => {
             lock(&shared.net).set_video_drop_hint(drop_permille);
         }
+        ControlMsg::VideoViewer { viewer } => {
+            if shared
+                .state
+                .borrow()
+                .peers
+                .iter()
+                .any(|p| p.info.session == viewer)
+            {
+                local.video_viewers.insert(viewer, Instant::now());
+                let mut viewers: Vec<_> = local.video_viewers.keys().copied().collect();
+                viewers.sort_unstable();
+                shared.state.send_modify(|s| s.video_viewers = viewers);
+            }
+        }
         ControlMsg::UserRenamed { session, name } => {
             let me_session = shared.state.borrow().me.as_ref().map(|m| m.session);
             if me_session == Some(session) {
@@ -4776,6 +4832,7 @@ async fn handle_control(
         | ControlMsg::AdminSetDisabled { .. }
         | ControlMsg::AdminRevokeUser { .. }
         | ControlMsg::PeerCertificateRequest { .. }
+        | ControlMsg::VideoDisplayed { .. }
         | ControlMsg::UserListRequest
         | ControlMsg::AdminKick { .. }
         | ControlMsg::AdminSetRestriction { .. } => {
@@ -4970,6 +5027,13 @@ pub(crate) fn send_tier(tier: VideoTier, peers: &[Peer]) -> VideoTier {
     }
 }
 
+fn fresh_video_viewers(reports: &mut HashMap<Session, Instant>, now: Instant) -> Vec<Session> {
+    reports.retain(|_, at| now.duration_since(*at) < Duration::from_secs(3));
+    let mut viewers: Vec<_> = reports.keys().copied().collect();
+    viewers.sort_unstable();
+    viewers
+}
+
 /// Read side of the received video (M4): the overlay's tiles take everything
 /// at once with [`VideoFrames::latest`], the participant list picks per
 /// session with [`VideoFrames::seqs`] and [`VideoFrames::picture`].
@@ -5016,6 +5080,24 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn video_viewers_expire_without_new_display_reports() {
+        use super::{fresh_video_viewers, HashMap, Instant};
+        use std::time::Duration;
+
+        let now = Instant::now();
+        let mut reports = HashMap::from([
+            (3, now - Duration::from_millis(2999)),
+            (2, now - Duration::from_secs(3)),
+            (1, now - Duration::from_secs(4)),
+        ]);
+        assert_eq!(fresh_video_viewers(&mut reports, now), vec![3]);
+        assert_eq!(
+            fresh_video_viewers(&mut reports, now + Duration::from_millis(1)),
+            Vec::<u16>::new()
+        );
+    }
+
     #[test]
     fn ptt_users_off_air_speech_does_not_feed_the_noise_floor() {
         use super::{floor_sample_is_speech, Mode};

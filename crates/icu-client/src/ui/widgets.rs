@@ -245,7 +245,7 @@ pub enum RecDot {
     /// A quiet grey dot: the camera is on, but nothing leaves this client —
     /// nobody is watching, no connection, or the network paused video.
     Idle,
-    /// A pulsing red dot: somebody is seeing this client's picture right now.
+    /// A pulsing red dot: another client recently reported presenting a frame.
     Live,
 }
 

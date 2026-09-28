@@ -295,7 +295,7 @@ Ablauf und Regeln normativ in `protocol.md` §2.3; hier nur die Umsetzung.
 
 #### Öffentliche Sitzungszertifikate
 
-Minor 3 ergänzt `PeerCertificateRequest`/`PeerCertificateResponse` (Nr. 38/39). Der reguläre Control-Handler verwendet das bestehende Ratenlimit. `Room::certificate` liest ausschließlich das öffentliche Leaf aus `quinn::Connection::peer_identity` einer aktuell anwesenden Sitzung. Maximal 8192 DER-Bytes, Antwort nur an den Anfragenden. Fehlende/zu große Zertifikate ergeben `None`; Raumlose Registrierungs- und Renewal-Sitzungen erhalten diesen Zugriff nicht. Server und Clients gemeinsam aktualisieren; Mindest-Minor ist 3.
+Minor 3 ergänzt `PeerCertificateRequest`/`PeerCertificateResponse` (Nr. 38/39). Der reguläre Control-Handler verwendet das bestehende Ratenlimit. `Room::certificate` liest ausschließlich das öffentliche Leaf aus `quinn::Connection::peer_identity` einer aktuell anwesenden Sitzung. Maximal 8192 DER-Bytes, Antwort nur an den Anfragenden. Fehlende/zu große Zertifikate ergeben `None`; Raumlose Registrierungs- und Renewal-Sitzungen erhalten diesen Zugriff nicht. Minor 4 ergänzt `VideoDisplayed`/`VideoViewer` (Nr. 40/41); der Server prüft aktuelle Anzeige- und Kameraberechtigung und leitet höchstens einen Bericht pro Sekunde je Paar weiter. Server und Clients gemeinsam aktualisieren; Mindest-Minor ist 4.
 
 
 ### 6.5 Relay (`relay.rs`)
