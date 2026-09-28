@@ -55,6 +55,31 @@ const DIM_MUL: u32 = 128;
 /// Frame interval: 15 fps.
 const TICK: Duration = Duration::from_millis(1000 / 15);
 
+/// A camera tile's resting scale — its normal, not-speaking size.
+const REST_SCALE: f32 = 1.0;
+/// How much larger a camera tile grows while its person is speaking.
+const SPEAK_SCALE: f32 = 1.2;
+/// Fraction of the remaining gap to the target scale closed per tick;
+/// the same both growing and shrinking, so both directions ease equally
+/// (at 15 fps, ~5-8 ticks / 300-500 ms to settle).
+const SCALE_EASE: f32 = 0.35;
+
+/// Eases `current` toward `target` by `factor` of the remaining distance —
+/// used once per tick per tile so its size animates smoothly both ways
+/// instead of snapping.
+fn ease(current: f32, target: f32, factor: f32) -> f32 {
+    current + (target - current) * factor
+}
+
+/// The camera diameter a tile's slot reserves: always the *speaking* size,
+/// so the reserved slot never needs to resize as a tile's drawn size
+/// animates between resting and speaking. Rounds up, not to nearest — the
+/// reserved slot must never end up a fraction of a pixel smaller than the
+/// exact (unrounded) size a tile can actually draw at `SPEAK_SCALE`.
+fn speak_diameter(base: u32) -> u32 {
+    (base as f32 * SPEAK_SCALE).ceil() as u32
+}
+
 /// Owns the overlay thread.
 pub struct OverlayHandle {
     stop: Arc<AtomicBool>,
@@ -114,6 +139,10 @@ struct Tile {
     name: String,
     speaking: bool,
     dim: bool,
+    /// Current eased size multiplier ([`REST_SCALE`]..=[`SPEAK_SCALE`]) —
+    /// always [`REST_SCALE`] for a plate, which has no "stopped speaking"
+    /// state to shrink into (it only exists while speaking).
+    scale: f32,
 }
 
 /// A name rasterized once as an alpha mask, width × height.
@@ -352,6 +381,11 @@ struct Scene {
     /// pixels and sets this from the monitor's DPI each frame; a Wayland
     /// compositor scales the surface itself (1).
     scale: f32,
+    /// Each camera tile's current eased size multiplier, by session —
+    /// carried across ticks so it can ease smoothly rather than snap;
+    /// rebuilt fresh every [`Scene::update`], which also prunes anyone no
+    /// longer shown as a camera tile.
+    anim: HashMap<Session, f32>,
 }
 
 /// What [`Scene::update`] found.
@@ -379,6 +413,7 @@ impl Scene {
             width: 0,
             height: 0,
             scale: 1.0,
+            anim: HashMap::new(),
         }
     }
 
@@ -413,10 +448,14 @@ impl Scene {
         scaled(px, self.scale)
     }
 
-    /// A tile's full round shape: its circle plus its outside label ring.
+    /// A tile's reserved slot: its circle plus its outside label ring, at
+    /// the size it will ever need. A camera tile reserves its *speaking*
+    /// size — larger than it draws at rest — so the slot never has to
+    /// resize as its drawn size eases between resting and speaking; a
+    /// plate has no such animation and reserves its bare diameter.
     fn tile_geom(&self, tile: &Tile) -> CircleGeom {
         let diameter = match tile.face {
-            Face::Camera(_) => self.camera_diameter(),
+            Face::Camera(_) => speak_diameter(self.camera_diameter()),
             Face::Plate => self.plate_diameter(),
         };
         circle_geometry(diameter, self.label_px())
@@ -470,24 +509,44 @@ impl Scene {
         // camera; each group in name order.
         let frames = self.frames.latest();
         peers.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.1.cmp(&b.1)));
+        // A fresh map each tick: whoever isn't a camera tile this time
+        // (left, or turned their camera off) just isn't carried forward,
+        // pruning stale entries for free.
+        let mut anim = HashMap::with_capacity(self.anim.len());
         self.tiles = peers
             .into_iter()
-            .map(|(session, name, speaking, camera)| Tile {
-                face: if camera {
-                    Face::Camera(
-                        frames
-                            .iter()
-                            .find(|(s, _)| *s == session)
-                            .map(|(_, f)| (f.width, f.height, f.rgba.clone())),
-                    )
+            .map(|(session, name, speaking, camera)| {
+                // Only a camera tile animates: a plate has no "stopped
+                // speaking" state to shrink into, it only exists while
+                // speaking.
+                let scale = if camera {
+                    let target = if speaking { SPEAK_SCALE } else { REST_SCALE };
+                    let prev = self.anim.get(&session).copied().unwrap_or(REST_SCALE);
+                    let next = ease(prev, target, SCALE_EASE);
+                    anim.insert(session, next);
+                    next
                 } else {
-                    Face::Plate
-                },
-                name,
-                speaking,
-                dim: camera && self.settings.dim_non_speaking && !speaking,
+                    REST_SCALE
+                };
+                Tile {
+                    face: if camera {
+                        Face::Camera(
+                            frames
+                                .iter()
+                                .find(|(s, _)| *s == session)
+                                .map(|(_, f)| (f.width, f.height, f.rgba.clone())),
+                        )
+                    } else {
+                        Face::Plate
+                    },
+                    name,
+                    speaking,
+                    dim: camera && self.settings.dim_non_speaking && !speaking,
+                    scale,
+                }
             })
             .collect();
+        self.anim = anim;
 
         let shown = self.settings.enabled && !self.tiles.is_empty();
         if !shown {
@@ -563,44 +622,62 @@ fn layout(s: &OverlaySettings) -> (Corner, [u32; 2], TileSize, Expand) {
     (s.corner, s.offset, s.size, s.expand)
 }
 
-/// A tile's round shape and outside label ring, derived purely from its
-/// circle's diameter and the label font size, so the sizing pass
-/// ([`Scene::update`]) and the draw pass ([`compose`]) can't drift apart.
+/// A circle's border ring and outside label band, in continuous pixels —
+/// everything [`compose`] needs to actually paint a tile at whatever size
+/// it's currently drawn at (see [`Tile::scale`]).
 #[derive(Clone, Copy)]
-struct CircleGeom {
+struct Radii {
     r: f32,
     r_outer: f32,
     r_label_inner: f32,
     r_label_outer: f32,
+}
+
+/// The border ring around a circle of `diameter`, and the label band
+/// around that sized for `name_px` text.
+fn radii(diameter: f32, name_px: u32) -> Radii {
+    let r = diameter / 2.0;
+    let r_outer = r + BORDER as f32;
+    let thickness = (name_px + 2 * LABEL_PAD_V) as f32;
+    let r_label_inner = r_outer + LABEL_GAP as f32;
+    let r_label_outer = r_label_inner + thickness;
+    Radii {
+        r,
+        r_outer,
+        r_label_inner,
+        r_label_outer,
+    }
+}
+
+/// A tile's reserved slot: its round shape and outside label ring at the
+/// largest size it will ever draw, derived purely from its circle's
+/// diameter and the label font size, so the sizing pass ([`Scene::update`])
+/// and the draw pass ([`compose`]) can't drift apart. A tile may draw
+/// smaller than this (see [`Tile::scale`]), but never larger, so the slot
+/// never needs to change size.
+#[derive(Clone, Copy)]
+struct CircleGeom {
+    radii: Radii,
     /// Half the outer bounding box's width.
     half_w: u32,
     outer_w: u32,
     outer_h: u32,
 }
 
-/// The border ring around a circle of `diameter`, and the label band
-/// around that sized for `name_px` text.
 fn circle_geometry(diameter: u32, name_px: u32) -> CircleGeom {
-    let r = diameter as f32 / 2.0;
-    let r_outer = r + BORDER as f32;
-    let thickness = (name_px + 2 * LABEL_PAD_V) as f32;
-    let r_label_inner = r_outer + LABEL_GAP as f32;
-    let r_label_outer = r_label_inner + thickness;
+    let radii = radii(diameter as f32, name_px);
     // The label band can bulge sideways past the circle itself at wide
     // angles; the tile's reserved box must be wide enough for that, sized
     // for the widest angle a name is ever allowed (truncation keeps
     // shorter names from needing it, but the slot stays constant).
     let band_half_angle = MAX_LABEL_HALF_ANGLE + LABEL_BAND_PAD_ANGLE;
-    let bulge = r_label_outer * band_half_angle.sin();
-    let half_w = r_outer.max(bulge).ceil() as u32;
+    let bulge = radii.r_label_outer * band_half_angle.sin();
+    let half_w = radii.r_outer.max(bulge).ceil() as u32;
     CircleGeom {
-        r,
-        r_outer,
-        r_label_inner,
-        r_label_outer,
+        radii,
         half_w,
         outer_w: half_w * 2,
-        outer_h: (r_outer + r_label_outer).ceil() as u32,
+        outer_h: (radii.r_outer + radii.r_label_outer).ceil() as u32,
     }
 }
 
@@ -696,7 +773,18 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
             Face::Camera(_) => g.camera_diameter,
             Face::Plate => g.plate_diameter,
         };
-        let geom = circle_geometry(diameter, g.name_px);
+        // The reserved slot (fixed: sized for a camera tile's *speaking*
+        // size, see `Scene::tile_geom`) decides position and the loop
+        // bounds below; `draw` (animated via `tile.scale`, `== reserve`'s
+        // own radii for a plate, which never animates) decides what's
+        // actually painted, from the same fixed center — so a tile grows
+        // and shrinks concentrically without moving or resizing its slot.
+        let reserve_diameter = match tile.face {
+            Face::Camera(_) => speak_diameter(diameter),
+            Face::Plate => diameter,
+        };
+        let geom = circle_geometry(reserve_diameter, g.name_px);
+        let draw = radii(diameter as f32 * tile.scale, g.name_px);
         let outer_w = geom.outer_w;
         let outer_h = geom.outer_h;
         // In a row the tiles line up at the edge the surface hangs from; in
@@ -714,7 +802,7 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
             (g.width.saturating_sub(outer_w)) / 2
         };
         let cx = tx as f32 + geom.half_w as f32;
-        let cy = ty as f32 + geom.r_outer;
+        let cy = ty as f32 + geom.radii.r_outer;
         let [fr, fg, fb] = g.frame_color;
         let border = if tile.speaking && g.speaking_frame {
             [fb, fg, fr, 0xff] // B G R A premultiplied
@@ -735,18 +823,18 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
                 let dx = (tx + x) as f32 + 0.5 - cx;
                 let dy = (ty + y) as f32 + 0.5 - cy;
                 let dist = (dx * dx + dy * dy).sqrt();
-                let px = if dist <= geom.r {
+                let px = if dist <= draw.r {
                     Some(match &tile.face {
                         Face::Camera(Some((fw, fh, rgba))) => {
-                            sample_camera_circle(*fw, *fh, rgba, dx, dy, geom.r, mul)
+                            sample_camera_circle(*fw, *fh, rgba, dx, dy, draw.r, mul)
                         }
                         Face::Camera(None) => [0x20, 0x20, 0x20, 0xff],
                         Face::Plate => [0x1c, 0x1c, 0x1c, 0xff],
                     })
-                } else if dist <= geom.r_outer {
+                } else if dist <= draw.r_outer {
                     Some(border)
-                } else if dist > geom.r_label_inner
-                    && dist <= geom.r_label_outer
+                } else if dist > draw.r_label_inner
+                    && dist <= draw.r_label_outer
                     && dx.atan2(dy).abs() <= band_half_angle
                 {
                     Some([0x1c, 0x1c, 0x1c, 0xff])
@@ -785,7 +873,7 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
                 g.height,
                 cx,
                 cy,
-                geom.r_label_inner,
+                draw.r_label_inner,
                 MAX_LABEL_HALF_ANGLE,
                 &tile.name,
                 g.name_px,
@@ -810,11 +898,13 @@ mod tests {
     const NAME_PX: u32 = 12;
 
     fn geometry(tiles: &[Tile], horizontal: bool) -> Geometry {
+        // Mirrors `compose`'s own reservation math: a camera tile's slot
+        // is sized for its *speaking* diameter, never its resting one.
         let geoms: Vec<CircleGeom> = tiles
             .iter()
             .map(|t| {
                 let d = match t.face {
-                    Face::Camera(_) => CAMERA_D,
+                    Face::Camera(_) => speak_diameter(CAMERA_D),
                     Face::Plate => PLATE_D,
                 };
                 circle_geometry(d, NAME_PX)
@@ -853,12 +943,14 @@ mod tests {
                 name: "Anna".into(),
                 speaking: false,
                 dim: true,
+                scale: REST_SCALE,
             },
             Tile {
                 face: Face::Plate,
                 name: "Eva-Maria Schulte-Wiedenbrück von Hohenfels".into(),
                 speaking: true,
                 dim: false,
+                scale: REST_SCALE,
             },
         ]
     }
@@ -941,5 +1033,108 @@ mod tests {
             "label wider than its room: {}",
             long.width
         );
+    }
+
+    /// `ease` closes the gap to its target every step, in both directions,
+    /// without ever overshooting, and is a no-op once already there —
+    /// the property a speaking-size animation that must never snap or
+    /// bounce depends on.
+    #[test]
+    fn ease_smooths_toward_target_without_overshoot() {
+        let mut v = REST_SCALE;
+        let mut prev = v;
+        for _ in 0..30 {
+            v = ease(v, SPEAK_SCALE, SCALE_EASE);
+            assert!(v >= prev, "grew backward: {prev} -> {v}");
+            assert!(v <= SPEAK_SCALE + 1e-6, "overshot the target: {v}");
+            prev = v;
+        }
+        assert!((v - SPEAK_SCALE).abs() < 0.01, "never converged: {v}");
+
+        let mut v = SPEAK_SCALE;
+        let mut prev = v;
+        for _ in 0..30 {
+            v = ease(v, REST_SCALE, SCALE_EASE);
+            assert!(v <= prev, "shrank backward: {prev} -> {v}");
+            assert!(v >= REST_SCALE - 1e-6, "overshot the target: {v}");
+            prev = v;
+        }
+        assert!((v - REST_SCALE).abs() < 0.01, "never converged: {v}");
+
+        assert_eq!(ease(SPEAK_SCALE, SPEAK_SCALE, SCALE_EASE), SPEAK_SCALE);
+    }
+
+    /// A speaking-sized tile draws visibly larger than a resting one, but
+    /// both reserve the exact same slot — the animation must never resize
+    /// or clip against the overlay window.
+    #[test]
+    fn scale_changes_the_drawn_circle_but_not_its_slot() {
+        let mut labels = Labels::new().expect("embedded font");
+        let tile = |scale: f32| {
+            vec![Tile {
+                face: Face::Camera(None),
+                name: "Anna".into(),
+                speaking: scale > REST_SCALE,
+                dim: false,
+                scale,
+            }]
+        };
+        let (rest, speak) = (tile(REST_SCALE), tile(SPEAK_SCALE));
+        let (g_rest, g_speak) = (geometry(&rest, false), geometry(&speak, false));
+        assert_eq!(
+            (g_rest.width, g_rest.height),
+            (g_speak.width, g_speak.height),
+            "the reserved slot must not depend on the tile's current scale"
+        );
+
+        let max_opaque_row_span = |canvas: &[u8], width: u32, height: u32| {
+            (0..height)
+                .map(|y| {
+                    (0..width)
+                        .filter(|&x| {
+                            canvas[(y as usize * width as usize + x as usize) * 4 + 3] == 0xff
+                        })
+                        .count()
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        let mut canvas_rest = vec![0u8; (g_rest.width * g_rest.height * 4) as usize];
+        compose(&mut canvas_rest, &g_rest, &rest, Some(&mut labels));
+        let mut canvas_speak = vec![0u8; (g_speak.width * g_speak.height * 4) as usize];
+        compose(&mut canvas_speak, &g_speak, &speak, Some(&mut labels));
+
+        let span_rest = max_opaque_row_span(&canvas_rest, g_rest.width, g_rest.height);
+        let span_speak = max_opaque_row_span(&canvas_speak, g_speak.width, g_speak.height);
+        assert!(
+            span_speak > span_rest,
+            "speaking tile should draw wider: rest {span_rest}, speaking {span_speak}"
+        );
+    }
+
+    /// However a camera tile is currently scaled, it never draws past the
+    /// slot reserved for its speaking size — the invariant that keeps the
+    /// animation from ever resizing the overlay window or clipping.
+    #[test]
+    fn speaking_size_never_exceeds_its_reserved_slot() {
+        for base in [72u32, 120, 144, 216, 240, 360] {
+            let reserved = circle_geometry(speak_diameter(base), NAME_PX);
+            for &scale in &[REST_SCALE, 1.05, SPEAK_SCALE] {
+                let drawn = radii(base as f32 * scale, NAME_PX);
+                assert!(
+                    drawn.r_outer <= reserved.radii.r_outer + 1e-3,
+                    "base {base} scale {scale}: drawn r_outer {} > reserved {}",
+                    drawn.r_outer,
+                    reserved.radii.r_outer
+                );
+                assert!(
+                    drawn.r_label_outer <= reserved.radii.r_label_outer + 1e-3,
+                    "base {base} scale {scale}: drawn r_label_outer {} > reserved {}",
+                    drawn.r_label_outer,
+                    reserved.radii.r_label_outer
+                );
+            }
+        }
+        assert_eq!(speak_diameter(100), (100.0 * SPEAK_SCALE).ceil() as u32);
     }
 }
