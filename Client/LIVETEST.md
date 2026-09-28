@@ -242,3 +242,37 @@ sie speichert kein Mikrofon-Audio. Ein Stillstand oder mehr als 100 ppm
 Abweichung der gelieferten Samples lässt den Lauf fehlschlagen. Verlorene
 Pakete und VM-Stalls können diese Messung verfälschen: ein abgebrochener
 Lauf ist keine Messung des Hardware-Taktdrifts.
+
+## 8. Installer (NSIS)
+
+Stand 2026-09-28: `packaging/windows/installer.sh` (NSIS, `packaging/windows/installer.nsi`)
+baut zusätzlich zur ZIP ein per-Benutzer-Setup ohne Administratorrechte,
+`dist/<ver>/icu-<ver>-windows-x86_64-setup.exe` (`Research/packaging-licensing.md`).
+Fedora-seitig geprüft (nicht hier, weil automatisierbar): `makensis -WX`
+kompiliert fehlerfrei, `file` bestätigt eine PE32+-Datei, `BUILDINFO.windows-installer`
+zeigt auf `HEAD`. Was echte Windows-Hardware/-VM braucht:
+
+- [ ] **Kein UAC** (offen): Setup startet ohne Erhöhungsdialog (kein Schild-Icon
+  auf dem Setup-Symbol, keine UAC-Abfrage).
+- [ ] **Installation** (offen): landet unter `%LOCALAPPDATA%\Programs\ICU`;
+  Startmenü-Eintrag startet ICU; Desktop-Verknüpfung nur, wenn im Components-Schritt
+  angehakt.
+- [ ] **Taskleisten-Gruppierung** (offen): angepinnt an die Taskleiste zeigt beim
+  Start **eine** Gruppe. Die Verknüpfung selbst trägt kein AppUserModelId (dieser
+  NSIS-3.11-Build unterstützt den Parameter an `CreateShortcut` nicht,
+  `Research/packaging-licensing.md`); prüfen, ob `SetCurrentProcessExplicitAppUserModelID("ICU")`
+  im laufenden Prozess (main.rs) dafür allein ausreicht.
+- [ ] **Dateizuordnung/Toast** (offen): `.icu`-Zuordnung und Toasts funktionieren nach
+  Installation identisch zur portablen ZIP.
+- [ ] **Laufende Instanz** (offen): Setup gegen eine laufende (Tray-)Instanz
+  gestartet → deutsche Fehlermeldung „ICU läuft noch …", kein Absturz, keine
+  beschädigte Installation.
+- [ ] **Deinstallation** (offen): über Einstellungen → Apps (kein Admin nötig,
+  erscheint unter dem Benutzerkonto) entfernt exe/Verknüpfungen/Registry;
+  `%APPDATA%\icu` und `%LOCALAPPDATA%\icu\data` bleiben standardmäßig stehen
+  (Ja/Nein-Dialog, Vorgabe „Nein"); Entfernen separat mit einem Wegwerf-Profil
+  testen (löscht den DPAPI-Schlüssel/die Identität unwiderruflich).
+- [ ] **Upgrade** (offen): erneute Installation über eine bestehende Version
+  funktioniert bei geschlossenem ICU.
+- [ ] **SmartScreen** (offen): Verhalten unverändert zum portablen `icu.exe`
+  (unsigniert, „Weitere Informationen" → „Trotzdem ausführen").
