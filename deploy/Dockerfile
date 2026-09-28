@@ -28,16 +28,21 @@
 # /run/icu/admin.sock:
 #
 #   podman exec <container> /icu-server invite --name alice
+#
+# `/icu-cli` is the same binary under its admin name, so the interactive
+# shell is `podman exec -it <container> /icu-cli`.
 
 # A scratch image has no /run and no /var/lib. The server runs as 65532 and
 # cannot create them under the root-owned /, so without these the admin
 # socket (/run/icu/admin.sock) is missing and a fresh named volume on
 # /var/lib/icu is not writable: no `invite`, no first admin.
 FROM docker.io/library/alpine:3.24 AS dirs
-RUN mkdir -p /out/run/icu /out/var/lib/icu
+RUN mkdir -p /out/run/icu /out/var/lib/icu && ln -s /icu-server /out/icu-cli
 
 FROM scratch
 
+# Brings /run, /var/lib and the /icu-cli symlink along; it dangles in this
+# stage and points at the binary the next COPY puts in place.
 COPY --from=dirs --chown=65532:65532 /out/ /
 COPY target/musl/x86_64-unknown-linux-musl/release-server/icu-server /icu-server
 

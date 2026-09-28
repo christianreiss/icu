@@ -27,6 +27,7 @@ set -eux
 eval "$PREP"
 $INSTALL /pkgs/$SERVER_PKG ${CLIENT_PKG:+/pkgs/$CLIENT_PKG}
 icu-server --version
+icu-cli --version
 getent group icu
 test "$(stat -c %G /etc/icu/server.toml)" = icu
 test "$(stat -c %a /etc/icu/server.toml)" = 640
@@ -48,7 +49,7 @@ grep -q "# local edit" /etc/icu/server.toml
 mkdir -p /var/lib/private/icu && touch /var/lib/private/icu/ca.key
 $REMOVE icu-server ${CLIENT_PKG:+icu}
 test -f /var/lib/private/icu/ca.key
-test ! -e /usr/bin/icu-server && test ! -e /usr/bin/icu
+test ! -e /usr/bin/icu-server && test ! -e /usr/bin/icu-cli && test ! -e /usr/bin/icu
 '
 
 smoke() {  # smoke <dist> <with_client: 0|1>

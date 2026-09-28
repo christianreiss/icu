@@ -133,6 +133,7 @@ Atomare Schreibvorgänge verwenden exklusiv erzeugte, zufällig benannte Dateien
 | `icu-server backup [--list]` | Snapshot jetzt (Anlass `manual`, auch ohne Änderung seit dem neuesten), gibt den Pfad aus; über den Socket oder offline (§4 „State-Backups“). Die Antwort trägt nur den Pfad: die Socket-Gruppe darf den Server bedienen, aber nicht `ca.key` lesen. `--list` zeigt die Snapshots mit Zeit, Anlass, Nutzerzahl und Serverversion; es liest das Backup-Verzeichnis selbst, braucht also root. (2026-09-27) |
 | `icu-server restore <verzeichnis\|latest>` | Spielt einen Snapshot zurück, nur bei gestopptem Server: nimmt `flock(state.lock)` selbst und geht nie über Socket oder `Server::offline`, die den Ziel-State öffnen und beschreiben würden. Prüft den Snapshot gegen sein `MANIFEST` (SHA-256 je Datei, Format, `schema`; ein Verzeichnis ohne `MANIFEST`, etwa eine Handkopie des State-Verzeichnisses, wird so genommen) und lädt ihn in einem Scratch-Verzeichnis `.icu-restore-*`, wie der Server es täte: `users.toml` samt Schema, CA-Paar, CA-Name gegen ein gesetztes `server_name`, Com-Schlüssel. Erst dann: den aktuellen State als Snapshot `pre-restore` sichern (ein Restore lässt sich also zurücknehmen), die Dateien atomar ersetzen (`server.crt.retired` behält, was es listet; ein fehlendes Server-Leaf stellt der Server neu aus), offline `rotate-server-cert` (vorher Runbook-Pflicht nach jedem Restore), Snapshot `restore`, Besitzer angleichen. `latest` ist der neueste Snapshot außer `pre-restore`, zweimal `restore latest` spielt also dasselbe zurück. Ein fehlendes State-Verzeichnis legt es an (neuer Host); `server_name` kommt dann aus der CA des Snapshots. (2026-09-27) |
 | `icu-server shell` | Interaktive Admin-Shell im Cisco-IOS-Stil: persistenter Prompt, TAB-Vervollständigung, `?`-Kontexthilfe, Präfix-Abkürzungen (`sh us` → `show users`), Befehlshistorie. Details in §5.1. |
+| `icu-cli [kommando]` | Zweiter Name desselben Binaries (Symlink `/usr/bin/icu-cli` → `icu-server`, im Container `/icu-cli`): alle Kommandos dieser Tabelle außer `run`, `restore` und `setup`, und ohne Kommando die Shell aus §5.1. |
 
 **Nutzer-Selektor** (`<name|user_id|fingerprint>` oben): Name, `user_id` oder voller Fingerprint, ausdrücklich auch `id:<user_id>` oder `name:<name>` (`Store::resolve`, 2026-09-27). Ein Name darf nur aus Ziffern bestehen; vorher gewann die `user_id`, und `revoke 1` traf bei einem Nutzer namens „1“ den Nutzer mit ID 1, oft den Eigentümer (Readiness-Review 2026-09-27, S5). Jetzt zählt jede Lesart, auch der ganze Selektor als Name (ein Nutzer namens `id:3` wird also nicht still übergangen): trifft mehr als eine verschiedene Nutzer, lehnt der Server mit `AMBIGUOUS_USER` ab und nennt alle Treffer mit `user_id` und Namen. Die Antwort nennt den getroffenen Nutzer (`user_id`, `name`), die CLI gibt ihn aus („revoked alice (user_id 3), closed 1 connection(s)“); ein noch laufender älterer Server ohne `name` in der Antwort bekommt nur die `user_id` angezeigt.
 
@@ -168,9 +169,11 @@ Fehlerform einheitlich `{"ok":false,"error":"<kurzform>","detail":"<text>"}`; ei
 Admin-Client: jeder Befehl geht wie bei den einzelnen CLI-Kommandos über
 `cli::dispatch` — ein Request, eine Response, dann Schluss (§5 oben); die
 Shell hält keinen Dauerzustand über den Admin-Socket und ändert nichts am
-Protokoll. `run` und `restore` sind absichtlich nicht Teil der Shell:
-`restore` braucht einen gestoppten Server und nimmt `flock` direkt, was mit
-einer laufenden Sitzung auf demselben Socket nicht zusammengeht.
+Protokoll. `run`, `restore` und `setup` sind absichtlich nicht Teil der
+Shell: `restore` braucht einen gestoppten Server und nimmt `flock` direkt,
+was mit einer laufenden Sitzung auf demselben Socket nicht zusammengeht,
+`run` ist der Dienst selbst, und `setup` richtet den Host ein, bevor es
+überhaupt einen Socket gibt.
 
 Verben (Cisco-artig, mit TAB-Vervollständigung und eindeutigen
 Präfix-Abkürzungen wie bei Cisco IOS, z. B. `sh us` für `show users`):
@@ -199,6 +202,19 @@ Zeile abzuschicken, was an der Stelle gültig wäre — Nutzernamen werden dabei
 aus einer Momentaufnahme der letzten `users`-Antwort vervollständigt, nicht
 live pro Tastendruck: sie wird beim Start geholt, nach jedem ändernden
 Befehl neu geholt und mit `refresh`/`r` von Hand.
+
+**`icu-cli`** (2026-09-28) ist kein zweites Programm, sondern derselbe
+Prozess unter einem zweiten Namen: das Paket legt `/usr/bin/icu-cli` als
+Symlink auf `icu-server`, und `main.rs` sieht nur auf `argv[0]`
+(`is_cli_name`). Ohne Kommando startet es die Shell, mit einem Kommando tut
+es genau das, was `icu-server <kommando>` täte. Gewählt gegen ein zweites
+`[[bin]]`, weil das Release-Binary statisch gegen musl gelinkt ist und das
+Paket sonst doppelt so groß würde. `run`, `restore` und `setup` gibt es dort
+nicht: sie sind zwar noch geparst, antworten aber nur mit dem Hinweis auf
+`icu-server …` und Exit 2, statt mit clap's „unrecognized subcommand"
+(`#[command(hide = true)]`, also nicht in `icu-cli --help`). Prompt
+(`icu-server> `) und Historie bleiben dieselben — es ist dieselbe Shell,
+nicht eine zweite.
 
 Befehlshistorie liegt unter `$XDG_STATE_HOME/icu-server/shell_history`
 (sonst `~/.local/state/icu-server/shell_history`), Modus 0600, je Nutzer,

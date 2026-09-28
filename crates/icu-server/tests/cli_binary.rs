@@ -284,3 +284,98 @@ async fn the_socket_group_is_asked_of_the_hosts_nss() {
         Err(e) => panic!("{e}"),
     }
 }
+
+/// `icu-cli` is the same binary under a second name — a symlink the package
+/// installs beside it (`Server/IMPLEMENTATION.md` §5.1). Without a command it
+/// is the shell, with one it is the matching `icu-server` command, and the
+/// three that need a stopped or unconfigured server are not there.
+#[tokio::test]
+async fn the_icu_cli_alias_is_the_admin_surface() {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let _alone = ALONE.lock().await;
+    if common::root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, run) = (dir.path().join("state"), dir.path().join("run"));
+    let mut config = icu_server::Config::for_test(&state);
+    config.paths.runtime_dir = run.clone();
+    let handle = icu_server::run(config).await.expect("server");
+    let file = dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
+            state.to_str().unwrap(),
+            run.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    // Only argv[0] tells the two names apart, so the link is the test.
+    let icu_cli = dir.path().join("icu-cli");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_icu-server"), &icu_cli).unwrap();
+
+    let mut child = tokio::process::Command::new(&icu_cli)
+        .arg("--config")
+        .arg(&file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"show status\nexit\n")
+        .await
+        .unwrap();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("shell did not exit")
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("uptime"), "{stdout}");
+
+    let out = tokio::process::Command::new(&icu_cli)
+        .arg("--config")
+        .arg(&file)
+        .arg("users")
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("fingerprint"), "{stdout}");
+
+    for (verb, args) in [
+        ("run", vec!["run"]),
+        ("restore", vec!["restore", "latest"]),
+        ("setup", vec!["setup"]),
+    ] {
+        let out = tokio::process::Command::new(&icu_cli)
+            .arg("--config")
+            .arg(&file)
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{verb}: {stderr}");
+        assert!(stderr.contains(&format!("icu-server {verb}")), "{stderr}");
+    }
+
+    handle.shutdown().await;
+}

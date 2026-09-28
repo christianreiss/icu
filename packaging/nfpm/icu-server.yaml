@@ -24,6 +24,11 @@ contents:
   - src: ${SERVER_BIN}
     dst: /usr/bin/icu-server
     file_info: {mode: 0755}
+  # Second name for the admin side (Server/IMPLEMENTATION.md §5.1): the same
+  # binary, which looks at argv[0]. Relative, so the link stays inside /usr/bin.
+  - src: icu-server
+    dst: /usr/bin/icu-cli
+    type: symlink
   - src: deploy/icu-server.service
     dst: /usr/lib/systemd/system/icu-server.service
     file_info: {mode: 0644}

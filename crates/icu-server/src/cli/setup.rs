@@ -30,7 +30,12 @@ use crate::{
 
 /// Runs the interactive wizard against `config_path`, then writes it.
 pub async fn run(config_path: &Path) -> Result<()> {
-    run_with(config_path, &mut std::io::stdin().lock(), &mut std::io::stdout()).await
+    run_with(
+        config_path,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout(),
+    )
+    .await
 }
 
 /// The actual wizard, over injectable streams so it can be tested without a
@@ -249,11 +254,7 @@ fn render(config: &Config) -> String {
         .map(|a| format!("{:?}", a.to_string()))
         .collect::<Vec<_>>()
         .join(", ");
-    let admin_group = config
-        .server
-        .admin_socket_group
-        .as_deref()
-        .unwrap_or("icu");
+    let admin_group = config.server.admin_socket_group.as_deref().unwrap_or("icu");
     format!(
         "# ICU server configuration, written by `icu-server setup`.\n\
          # Reference: /usr/share/doc/icu-server/README.md\n\
