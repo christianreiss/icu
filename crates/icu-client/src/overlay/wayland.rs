@@ -196,6 +196,7 @@ impl App {
         layer.wl_surface().damage_buffer(0, 0, w, h);
         if buffer.attach_to(layer.wl_surface()).is_ok() {
             layer.commit();
+            self.scene.report_displayed();
         }
     }
 }

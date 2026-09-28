@@ -17,13 +17,14 @@ use crate::{
 /// without a minor bump: client and server are always deployed in lockstep in
 /// this project (`docs/reference/protocol.md` §2.2). Minor 2 appended
 /// `Welcome.server_minor` (2026-09-26). Minor 3 adds peer certificate lookup
-/// and requires a coordinated client/server update.
-pub const MINOR: u16 = 3;
+/// and requires a coordinated client/server update. Minor 4 adds video
+/// display reports and likewise requires a coordinated update.
+pub const MINOR: u16 = 4;
 
 /// Lowest protocol minor this build talks to, in both directions: the server
 /// closes a `Hello` below it with `VERSION_UNSUPPORTED`, the client a
 /// `Welcome` whose `server_minor` is below it (`docs/reference/protocol.md` §8).
-pub const MIN_PEER_MINOR: u16 = 3;
+pub const MIN_PEER_MINOR: u16 = 4;
 
 /// Peer-assisted audio measurements and hints (bit 0).
 pub const CAP_AUDIO_FEEDBACK: u32 = 1;
@@ -350,6 +351,16 @@ pub enum ControlMsg {
         /// Public leaf DER; at most `MAX_CERTIFICATE_DER` bytes.
         certificate_der: Option<Vec<u8>>,
     },
+    /// 40, C→S. A fresh frame from `speaker` was presented on this client.
+    VideoDisplayed {
+        /// Exact session whose frame was presented.
+        speaker: Session,
+    },
+    /// 41, S→C. The authenticated `viewer` presented a frame from us.
+    VideoViewer {
+        /// Authenticated reporting session.
+        viewer: Session,
+    },
 }
 
 impl ControlMsg {
@@ -414,6 +425,8 @@ impl ControlMsg {
             ControlMsg::UserRestrictionChanged { .. } => "UserRestrictionChanged",
             ControlMsg::PeerCertificateRequest { .. } => "PeerCertificateRequest",
             ControlMsg::PeerCertificateResponse { .. } => "PeerCertificateResponse",
+            ControlMsg::VideoDisplayed { .. } => "VideoDisplayed",
+            ControlMsg::VideoViewer { .. } => "VideoViewer",
         }
     }
 
@@ -433,6 +446,7 @@ impl ControlMsg {
                 | ControlMsg::AdminSetDisabled { .. }
                 | ControlMsg::AdminRevokeUser { .. }
                 | ControlMsg::PeerCertificateRequest { .. }
+                | ControlMsg::VideoDisplayed { .. }
                 | ControlMsg::UserListRequest
                 | ControlMsg::AdminKick { .. }
                 | ControlMsg::AdminSetRestriction { .. }
@@ -611,6 +625,8 @@ mod tests {
                 session: 7,
                 certificate_der: Some(vec![1, 2, 3]),
             },
+            ControlMsg::VideoDisplayed { speaker: 7 },
+            ControlMsg::VideoViewer { viewer: 8 },
         ]
     }
 
@@ -618,7 +634,7 @@ mod tests {
     #[test]
     fn roundtrip_all_control_variants() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 40, "40 append-only control variants");
+        assert_eq!(variants.len(), 42, "42 append-only control variants");
         for msg in variants {
             let frame = msg.encode().unwrap();
             let body = framing::split_frame(&frame, MAX_CONTROL_FRAME)
@@ -647,8 +663,8 @@ mod tests {
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
     #[test]
     fn unknown_variant_is_an_error() {
-        // Discriminant 40 does not exist yet.
-        let body = [40u8, 0, 0];
+        // Discriminant 42 does not exist yet.
+        let body = [42u8, 0, 0];
         let err = ControlMsg::decode(&body).unwrap_err();
         assert!(
             matches!(err, ProtoError::UnknownVariant),

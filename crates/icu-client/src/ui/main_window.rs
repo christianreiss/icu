@@ -41,7 +41,7 @@ const DOCK_GAP: f32 = 8.0;
 /// out).
 type Toggle = (
     &'static str,
-    &'static str,
+    String,
     bool,
     widgets::Role,
     widgets::RecDot,
@@ -296,7 +296,11 @@ impl App {
         #[cfg(feature = "tray")]
         let tray = crate::tray::Tray::start(cmd.clone(), cc.egui_ctx.clone(), tray_waker(cc)).ok();
         #[cfg(feature = "overlay")]
-        let overlay = match crate::overlay::OverlayHandle::start(state_rx.clone(), frames.clone()) {
+        let overlay = match crate::overlay::OverlayHandle::start(
+            state_rx.clone(),
+            frames.clone(),
+            cmd.clone(),
+        ) {
             Ok(h) => {
                 tracing::info!("overlay thread started (layer shell available)");
                 Some(h)
@@ -653,7 +657,7 @@ impl eframe::App for App {
         // textures nobody is looking at. `ui` already asks for a repaint
         // every 33 ms against a 15 fps decoder, so every picture is uploaded
         // exactly once.
-        self.videos.refresh(&ctx);
+        let fresh_video = self.videos.refresh(&ctx);
         #[cfg(feature = "camera")]
         let self_video = {
             let on = self.state.camera_on;
@@ -672,6 +676,7 @@ impl eframe::App for App {
             cmd: &self.cmd,
             video_tier: VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8),
             video: &|session| videos.get(session),
+            fresh_video: &fresh_video,
             self_video,
             settings_open: self.settings.is_some(),
             user_open: self.user.as_ref().map(|v| v.user_id()),
@@ -1087,6 +1092,8 @@ pub struct MainEnv<'a> {
     pub video_tier: VideoTier,
     /// Somebody's live picture, by session; `None` draws the initials.
     pub video: &'a dyn Fn(icu_proto::Session) -> Option<egui::load::SizedTexture>,
+    /// Sessions with a newly uploaded frame on this repaint.
+    pub fresh_video: &'a [icu_proto::Session],
     /// The own camera's preview, while it is on.
     pub self_video: Option<egui::load::SizedTexture>,
     /// The settings window is open, which the gear shows.
@@ -1395,12 +1402,28 @@ impl MainView {
                     state.camera_on,
                     state.conn == ConnStatus::Connected,
                     &state.peers,
+                    &state.video_viewers,
                     env.video_tier,
                 );
+                let camera_label = match rec {
+                    widgets::RecDot::Off => "Kamera".to_string(),
+                    widgets::RecDot::Idle => "Video: 0".to_string(),
+                    widgets::RecDot::Live => {
+                        let n = state
+                            .peers
+                            .iter()
+                            .filter(|p| {
+                                p.info.flags.viewing()
+                                    && state.video_viewers.contains(&p.info.session)
+                            })
+                            .count();
+                        format!("Video: {n}")
+                    }
+                };
                 let toggles: [Toggle; 4] = [
                     (
                         icon::MICROPHONE_SLASH,
-                        "Stumm",
+                        "Stumm".into(),
                         state.muted,
                         widgets::Role::Danger,
                         widgets::RecDot::Off,
@@ -1411,7 +1434,7 @@ impl MainView {
                     ),
                     (
                         icon::SPEAKER_SLASH,
-                        "Taub",
+                        "Taub".into(),
                         state.deafened,
                         widgets::Role::Danger,
                         widgets::RecDot::Off,
@@ -1422,16 +1445,16 @@ impl MainView {
                     ),
                     (
                         icon::VIDEO_CAMERA,
-                        "Kamera",
+                        camera_label,
                         state.camera_on,
                         widgets::Role::Accent,
                         rec,
-                        rec_hint,
+                        rec_hint.clone(),
                         cfg!(feature = "camera").then(|| Command::SetCamera(!state.camera_on)),
                     ),
                     (
                         icon::SQUARES_FOUR,
-                        "Overlay",
+                        "Overlay".into(),
                         state.settings.overlay.enabled,
                         widgets::Role::Accent,
                         widgets::RecDot::Off,
@@ -1460,7 +1483,7 @@ impl MainView {
                             for (glyph, label, active, role, rec, hint, cmd) in toggles {
                                 let size = egui::vec2(col, TILE_H);
                                 let mut tile =
-                                    widgets::tile(ui, glyph, label, active, role, rec, size);
+                                    widgets::tile(ui, glyph, &label, active, role, rec, size);
                                 if let Some(hint) = hint {
                                     tile = tile.on_hover_text(hint);
                                 }
@@ -1523,9 +1546,14 @@ impl MainView {
                                     participant_for(state, me.user_id, env.video, env.self_video)
                                 {
                                     let active = env.user_open == Some(me.user_id);
-                                    if let Some(id) =
-                                        participant_row(ui, participant, &columns, active, &send)
-                                    {
+                                    if let Some(id) = participant_row(
+                                        ui,
+                                        participant,
+                                        &columns,
+                                        active,
+                                        env.fresh_video,
+                                        &send,
+                                    ) {
                                         out.open_user = Some(id);
                                     }
                                 }
@@ -1540,9 +1568,14 @@ impl MainView {
                                     continue;
                                 };
                                 let active = env.user_open == Some(p.info.user_id);
-                                if let Some(id) =
-                                    participant_row(ui, participant, &columns, active, &send)
-                                {
+                                if let Some(id) = participant_row(
+                                    ui,
+                                    participant,
+                                    &columns,
+                                    active,
+                                    env.fresh_video,
+                                    &send,
+                                ) {
                                     out.open_user = Some(id);
                                 }
                             }
@@ -1686,14 +1719,14 @@ fn speak_row(
 /// One row's worth of participant, local or remote. `mode` is `Some` only
 /// for the local user (it is a client-local setting); `volume` is `Some`
 /// only for everyone else (there is no local playback volume for oneself).
-/// The camera tile's dot and hover text: whether this client's picture is
-/// going out right now, and to whom. Follows [`crate::engine::send_tier`], the
-/// rule the camera thread encodes by, so the dot never claims an audience the
-/// encoder does not have.
+/// The camera tile's dot and hover text: whether another client recently
+/// reported presenting this client's picture. The send tier still gates the
+/// claim while the camera is paused.
 fn camera_feedback(
     camera_on: bool,
     connected: bool,
     peers: &[crate::engine::Peer],
+    confirmed: &[icu_proto::Session],
     tier: VideoTier,
 ) -> (widgets::RecDot, Option<String>) {
     use widgets::RecDot;
@@ -1723,9 +1756,20 @@ fn camera_feedback(
             Some("Video pausiert — das Netz trägt es gerade nicht.".into()),
         );
     }
+    let displayed: Vec<&str> = peers
+        .iter()
+        .filter(|p| confirmed.contains(&p.info.session) && p.info.flags.viewing())
+        .map(|p| p.info.name.as_str())
+        .collect();
+    if displayed.is_empty() {
+        return (
+            RecDot::Idle,
+            Some("Ein Fenster ist offen, aber noch kein Bild wurde als angezeigt bestätigt".into()),
+        );
+    }
     (
         RecDot::Live,
-        Some(format!("Sichtbar für: {}", viewers.join(", "))),
+        Some(format!("Angezeigt bei: {}", displayed.join(", "))),
     )
 }
 
@@ -1928,6 +1972,7 @@ fn participant_row(
     p: Participant<'_>,
     columns: &[Badge],
     active: bool,
+    fresh_video: &[icu_proto::Session],
     send: &impl Fn(Command),
 ) -> Option<icu_proto::UserId> {
     let tok = theme::tokens(ui.visuals());
@@ -1960,6 +2005,12 @@ fn participant_row(
                         hint.push_str(s);
                     }
                     let avatar = widgets::avatar(ui, p.name, p.user_id, p.speaking, 30.0, p.video);
+                    if p.mode.is_none()
+                        && fresh_video.contains(&p.session)
+                        && ui.is_rect_visible(avatar.rect)
+                    {
+                        send(Command::VideoDisplayed(p.session));
+                    }
                     ui.add_space(2.0);
                     // The name gets what the icons on the right leave — ping
                     // 22, volume 28, an 18 slot for the mode and one per badge
@@ -3036,24 +3087,28 @@ mod tests {
             peer(3, "Bob", UserFlags::VIEWING),
         ];
         assert_eq!(
-            camera_feedback(false, true, &watching, VideoTier::T0),
+            camera_feedback(false, true, &watching, &[], VideoTier::T0),
             (RecDot::Off, None)
         );
         assert_eq!(
-            camera_feedback(true, false, &watching, VideoTier::T0).0,
+            camera_feedback(true, false, &watching, &[], VideoTier::T0).0,
             RecDot::Idle
         );
         let away = [peer(2, "Carl", UserFlags::CAMERA_ON)];
-        let (dot, hint) = camera_feedback(true, true, &away, VideoTier::T0);
+        let (dot, hint) = camera_feedback(true, true, &away, &[], VideoTier::T0);
         assert_eq!(dot, RecDot::Idle);
         assert!(hint.unwrap().starts_with("Niemand schaut zu"));
         assert_eq!(
-            camera_feedback(true, true, &watching, VideoTier::T4).0,
+            camera_feedback(true, true, &watching, &[1, 3], VideoTier::T4).0,
             RecDot::Idle
         );
         assert_eq!(
-            camera_feedback(true, true, &watching, VideoTier::T1),
-            (RecDot::Live, Some("Sichtbar für: Anna, Bob".into()))
+            camera_feedback(true, true, &watching, &[1, 3], VideoTier::T1),
+            (RecDot::Live, Some("Angezeigt bei: Anna, Bob".into()))
+        );
+        assert_eq!(
+            camera_feedback(true, true, &watching, &[], VideoTier::T1).0,
+            RecDot::Idle
         );
     }
 }

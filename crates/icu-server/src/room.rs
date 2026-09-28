@@ -428,6 +428,19 @@ impl Room {
             .collect()
     }
 
+    /// Only a current relay recipient may attest to displaying a sender's video.
+    pub fn video_display_eligible(&self, viewer: Session, speaker: Session) -> bool {
+        let state = self.lock();
+        state
+            .members
+            .get(&speaker)
+            .is_some_and(|m| m.flags.camera_on())
+            && state
+                .members
+                .get(&viewer)
+                .is_some_and(|m| viewer != speaker && m.flags.viewing() && !m.forced.deafened())
+    }
+
     /// Applies a client requested state change. Returns the new flags when
     /// something actually changed.
     pub fn apply_client_state(&self, session: Session, requested: UserFlags) -> Option<UserFlags> {

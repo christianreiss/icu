@@ -88,8 +88,9 @@ pub(super) fn run(
             if let Some(dib) = surface.as_mut() {
                 scene.draw(dib.pixels());
                 let at = position(&scene, w, h);
-                if let Err(e) = dib.present(hwnd, at) {
-                    tracing::warn!(%e, "overlay update");
+                match dib.present(hwnd, at) {
+                    Ok(()) => scene.report_displayed(),
+                    Err(e) => tracing::warn!(%e, "overlay update"),
                 }
                 if !visible {
                     unsafe {
