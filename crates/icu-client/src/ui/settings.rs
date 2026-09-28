@@ -1341,13 +1341,13 @@ impl SettingsView {
                     widgets::setting_row(
                         ui,
                         cfg!(feature = "camera"),
-                        "Beim Start einschalten",
+                        "Kamera einschalten",
                         None,
                         |ui| {
                             widgets::named_toggle(
                                 ui,
                                 &mut self.draft.camera.enabled,
-                                "Beim Start einschalten",
+                                "Kamera einschalten",
                             )
                         },
                     );

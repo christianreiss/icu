@@ -661,12 +661,7 @@ fn run_headless(engine: Engine, debug_stats: bool) -> Result<(), String> {
     // The camera follows `camera_on` like in the window (a hotkey may switch
     // it), retried with backoff when it will not start.
     #[cfg(feature = "camera")]
-    let mut camera = {
-        if engine.snapshot().settings.camera.enabled {
-            engine.command(icu_client::engine::Command::SetCamera(true));
-        }
-        icu_client::camera::CameraHandle::new(engine.camera_link())
-    };
+    let mut camera = icu_client::camera::CameraHandle::new(engine.camera_link());
     let stats = engine.stats();
     let mut state = engine.state();
     let mut last_report = std::time::Instant::now();

@@ -1132,3 +1132,66 @@ async fn peer_certificate_matches_the_authenticated_session_and_expires_with_it(
     carol.shutdown();
     server.handle.shutdown().await;
 }
+
+/// Buttons, hotkeys and the settings panel share the camera switch; both
+/// media switches and their detailed settings survive quitting and restarting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn camera_and_overlay_survive_a_restart() {
+    use icu_client::config::{Corner, Expand, Settings, TileSize};
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let start = |settings: Settings| {
+        let mut cfg =
+            icu_client::engine::EngineConfig::new(identity.clone(), settings, paths.clone());
+        cfg.server_addr = Some(server.addr());
+        icu_client::engine::Engine::start(cfg, Box::new(FakeBackend::silent().0)).unwrap()
+    };
+
+    let engine = start(test_settings());
+    wait_connected(&engine).await;
+    let mut settings = engine.snapshot().settings;
+    settings.camera.device = Some("2".into());
+    settings.camera.enabled = true;
+    settings.overlay.corner = Corner::BottomLeft;
+    settings.overlay.offset = [72, 96];
+    settings.overlay.size = TileSize::Large;
+    settings.overlay.expand = Expand::Horizontal;
+    settings.overlay.voice_plates = false;
+    settings.overlay.speaking_frame = false;
+    settings.overlay.dim_non_speaking = false;
+    settings.overlay.frame_color = [12, 34, 56];
+    engine.command(Command::UpdateSettings(Box::new(settings)));
+    wait_for(&engine, SOON, |s| s.camera_on).await;
+    engine.command(Command::SetOverlay(true));
+    let expected = wait_for(&engine, SOON, |s| s.settings.overlay.enabled)
+        .await
+        .settings;
+    engine.shutdown();
+
+    let saved = Settings::load(&paths).unwrap();
+    assert_eq!(saved.camera, expected.camera);
+    assert_eq!(saved.overlay, expected.overlay);
+    let engine = start(saved);
+    assert!(engine.snapshot().camera_on, "on from the first state");
+    assert!(wait_connected(&engine).await.me.unwrap().flags.camera_on());
+    engine.command(Command::ToggleCamera);
+    engine.command(Command::SetOverlay(false));
+    wait_for(&engine, SOON, |s| {
+        !s.camera_on && !s.settings.overlay.enabled
+    })
+    .await;
+    engine.shutdown();
+
+    let saved = Settings::load(&paths).unwrap();
+    assert!(!saved.camera.enabled);
+    assert!(!saved.overlay.enabled);
+    assert_eq!(saved.camera.device, expected.camera.device);
+    let engine = start(saved);
+    assert!(!engine.snapshot().camera_on);
+    assert!(!wait_connected(&engine).await.me.unwrap().flags.camera_on());
+    engine.command(Command::SetCamera(true));
+    wait_for(&engine, SOON, |s| s.camera_on && s.settings.camera.enabled).await;
+    engine.shutdown();
+    assert!(Settings::load(&paths).unwrap().camera.enabled);
+    server.handle.shutdown().await;
+}

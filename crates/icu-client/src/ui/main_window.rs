@@ -310,9 +310,6 @@ impl App {
         let (camera, self_video) = {
             let handle = crate::camera::CameraHandle::new(camera_link);
             let preview = crate::camera::CameraPreview::new(handle.preview_source());
-            if state.settings.camera.enabled {
-                let _ = cmd.send(Command::SetCamera(true));
-            }
             (Some(handle), Some(preview))
         };
         let videos = crate::video::VideoTextures::new(frames);

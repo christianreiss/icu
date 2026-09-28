@@ -241,7 +241,7 @@ impl Default for HotkeySettings {
 pub struct CameraSettings {
     /// Camera index or name.
     pub device: Option<String>,
-    /// Start with the camera on.
+    /// Last camera switch state, restored on startup.
     pub enabled: bool,
 }
 

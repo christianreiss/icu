@@ -920,7 +920,7 @@ impl Engine {
             aec_no_echo: false,
             aec_reference_silent: false,
             mic_test: false,
-            camera_on: false,
+            camera_on: settings.camera.enabled,
             hotkey_backend: String::new(),
             settings: settings.clone(),
             hotkey_retries: 0,
@@ -2422,8 +2422,10 @@ async fn net_task(
     let (settings_tx, settings_rx) = mpsc::unbounded_channel();
     let writer = tokio::spawn(settings_writer(cfg.paths.clone(), settings_rx));
     let mut local = LocalState {
-        // `Hello` carries a mute kept from the last run.
-        flags: UserFlags::NONE.with_bit(UserFlags::MUTED, cfg.settings.audio.muted),
+        // `Hello` carries the switches kept from the last run.
+        flags: UserFlags::NONE
+            .with_bit(UserFlags::MUTED, cfg.settings.audio.muted)
+            .with_bit(UserFlags::CAMERA_ON, cfg.settings.camera.enabled),
         settings: cfg.settings.clone(),
         settings_tx,
         paths: cfg.paths.clone(),
@@ -3081,9 +3083,8 @@ impl LocalState {
                 shared.state.send_modify(|s| s.mic_test = on);
             }
             Command::SetCamera(on) => {
-                self.flags = self.flags.with_bit(UserFlags::CAMERA_ON, on);
-                shared.state.send_modify(|s| s.camera_on = on);
-                set_state = true;
+                self.settings.camera.enabled = on;
+                set_state = self.commit_settings(shared, false);
             }
             Command::SetOverlay(on) => {
                 self.settings.overlay.enabled = on;
@@ -3212,8 +3213,9 @@ impl LocalState {
     /// the settings — the DSP atomics, the master gain, the streams (when
     /// `reopen` says a device or the AEC switch changed), the published
     /// state and the file (debounced, `settings_writer`) — is re-derived
-    /// here, in one place, so none of them can drift from the settings. Returns whether `SetState` is due:
-    /// the overlay switch is part of `VIEWING`.
+    /// here, in one place, so none of them can drift from the settings.
+    /// Returns whether `SetState` is due: the camera switch and the overlay
+    /// (through `VIEWING`) are part of the advertised flags.
     fn commit_settings(&mut self, shared: &Arc<Shared>, reopen: bool) -> bool {
         // The mute is the engine's: a settings window's copy taken before a
         // mute hotkey, or a passport's, must not undo it on disk.
@@ -3228,10 +3230,17 @@ impl LocalState {
         if reopen {
             self.reopen_streams(shared);
         }
+        let camera_changed = self.flags.camera_on() != self.settings.camera.enabled;
+        self.flags = self
+            .flags
+            .with_bit(UserFlags::CAMERA_ON, self.settings.camera.enabled);
         let settings = self.settings.clone();
-        shared.state.send_modify(|s| s.settings = settings);
+        shared.state.send_modify(|s| {
+            s.camera_on = settings.camera.enabled;
+            s.settings = settings;
+        });
         let _ = self.settings_tx.send(self.settings.clone());
-        self.update_viewing()
+        self.update_viewing() || camera_changed
     }
 
     /// Replaces the settings and takes them into effect. The streams are
