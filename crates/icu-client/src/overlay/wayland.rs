@@ -1,5 +1,5 @@
 //! Wayland layer-shell overlay (Spike 4b): own thread, own Wayland
-//! connection, calloop with a 15 fps timer, layer `Overlay`, empty input
+//! connection, calloop with a 30/15 fps GPU/software timer, layer `Overlay`, empty input
 //! region, exclusive zone −1, the scene drawn into a wl_shm buffer.
 
 use std::{
@@ -99,8 +99,9 @@ fn setup(scene: Scene) -> Result<(Connection, EventLoop<'static, App>, App), Str
     event_loop
         .handle()
         .insert_source(Timer::from_duration(TICK), move |_, _, app| {
+            let started = std::time::Instant::now();
             app.tick();
-            TimeoutAction::ToDuration(TICK)
+            TimeoutAction::ToDuration(app.scene.interval().saturating_sub(started.elapsed()))
         })
         .map_err(|e| format!("timer: {e}"))?;
     let app = App {
@@ -192,7 +193,9 @@ impl App {
         else {
             return;
         };
-        self.scene.draw(canvas);
+        if !self.scene.draw(canvas) {
+            return;
+        }
         layer.wl_surface().damage_buffer(0, 0, w, h);
         if buffer.attach_to(layer.wl_surface()).is_ok() {
             layer.commit();

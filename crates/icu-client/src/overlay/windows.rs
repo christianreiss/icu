@@ -37,7 +37,7 @@ use windows::{
     },
 };
 
-use super::{dpi_scale, scaled, Scene, TICK};
+use super::{dpi_scale, scaled, Scene};
 use crate::config::Corner;
 
 /// Runs the overlay until `stop`; reports on `ready` whether it came up.
@@ -56,8 +56,9 @@ pub(super) fn run(
     let _ = ready.send(Ok(()));
     let mut surface: Option<Dib> = None;
     let mut visible = false;
-    let mut ticks = 0u32;
+    let mut raised_at = std::time::Instant::now();
     while !stop.load(Ordering::Relaxed) {
+        let tick_started = std::time::Instant::now();
         let mut msg = MSG::default();
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
             unsafe { DispatchMessageW(&msg) };
@@ -86,7 +87,10 @@ pub(super) fn run(
                 }
             }
             if let Some(dib) = surface.as_mut() {
-                scene.draw(dib.pixels());
+                if !scene.draw(dib.pixels()) {
+                    std::thread::sleep(scene.interval().saturating_sub(tick_started.elapsed()));
+                    continue;
+                }
                 let at = position(&scene, w, h);
                 match dib.present(hwnd, at) {
                     Ok(()) => scene.report_displayed(),
@@ -101,8 +105,8 @@ pub(super) fn run(
                 }
                 // Another topmost window (a game going borderless) may
                 // have come up above; about once a second, go back on top.
-                ticks = ticks.wrapping_add(1);
-                if ticks.is_multiple_of(15) {
+                if raised_at.elapsed() >= std::time::Duration::from_secs(1) {
+                    raised_at = std::time::Instant::now();
                     unsafe {
                         let _ = SetWindowPos(
                             hwnd,
@@ -117,7 +121,7 @@ pub(super) fn run(
                 }
             }
         }
-        std::thread::sleep(TICK);
+        std::thread::sleep(scene.interval().saturating_sub(tick_started.elapsed()));
     }
     drop(surface);
     unsafe {

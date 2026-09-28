@@ -3,7 +3,7 @@
 //! tile with the name, and for everyone without one a name plate while they
 //! talk — so the overlay answers „wer spricht?" in a voice-only round too.
 //!
-//! What is shown and how it is drawn (premultiplied BGRA, 15 fps) lives
+//! What is shown and how it is drawn (GPU 30 fps, CPU fallback 15 fps) lives
 //! here; the window is the platform's: a wlr layer-shell surface on Linux
 //! (`wayland`), a layered topmost window on Windows (`windows`). Without
 //! layer shell (GNOME) `start` fails, the Overlay tile is left out and the
@@ -36,6 +36,8 @@ use wayland as platform;
 mod windows;
 #[cfg(target_os = "windows")]
 use self::windows as platform;
+
+mod gpu;
 
 const GAP: u32 = 8;
 const BORDER: u32 = 3;
@@ -78,6 +80,15 @@ const SCALE_EASE: f32 = 0.35;
 /// instead of snapping.
 fn ease(current: f32, target: f32, factor: f32) -> f32 {
     current + (target - current) * factor
+}
+
+/// Linear attack/release envelope, independent of rendering cadence.
+fn fade(value: f32, speaking: bool, dt: f32) -> f32 {
+    if speaking {
+        (value + dt / 0.15).min(1.0)
+    } else {
+        (value - dt / 0.7).max(0.0)
+    }
 }
 
 /// The camera diameter a tile's slot reserves: always the *speaking* size,
@@ -292,11 +303,12 @@ fn blend_white(dst: &mut [u8], a: u32) {
 }
 
 /// Blends `ink` (B, G, R) into one premultiplied BGRA pixel's color
-/// channels by coverage `a` (0-255), leaving alpha untouched — the paper
+/// channels by coverage `a` (0-255), including source-over alpha. The paper
 /// label's backdrop is already opaque, so there's nothing to composite
 /// there. The curved outside name uses this instead of [`blend_white`] so
 /// it reads as dark ink on its cream backdrop.
 fn blend_ink(dst: &mut [u8], ink: [u8; 3], a: u32) {
+    dst[3] = (a + u32::from(dst[3]) * (255 - a) / 255) as u8;
     for (c, ink_c) in dst.iter_mut().zip(ink) {
         *c = ((u32::from(ink_c) * a + u32::from(*c) * (255 - a)) / 255) as u8;
     }
@@ -416,8 +428,14 @@ struct Scene {
     /// Each camera tile's current eased size multiplier, by session —
     /// carried across ticks so it can ease smoothly rather than snap;
     /// rebuilt fresh every [`Scene::update`], which also prunes anyone no
-    /// longer shown as a camera tile.
+    /// longer shown in the overlay.
     anim: HashMap<Session, f32>,
+    gpu: Option<gpu::Renderer>,
+    glow: HashMap<Session, f32>,
+    intensities: Vec<f32>,
+    last_update: Instant,
+    membership: Vec<(Session, String, bool)>,
+    presented_frames: Option<Vec<(Session, u64)>>,
 }
 
 /// What [`Scene::update`] found.
@@ -453,6 +471,18 @@ impl Scene {
             height: 0,
             scale: 1.0,
             anim: HashMap::new(),
+            gpu: match gpu::Renderer::new() {
+                Ok(renderer) => Some(renderer),
+                Err(error) => {
+                    tracing::info!(%error, "overlay uses software renderer");
+                    None
+                }
+            },
+            glow: HashMap::new(),
+            intensities: Vec::new(),
+            last_update: Instant::now(),
+            membership: Vec::new(),
+            presented_frames: None,
         }
     }
 
@@ -488,16 +518,21 @@ impl Scene {
     }
 
     /// A tile's reserved slot: its circle plus its outside label ring, at
-    /// the size it will ever need. A camera tile reserves its *speaking*
-    /// size — larger than it draws at rest — so the slot never has to
-    /// resize as its drawn size eases between resting and speaking; a
-    /// plate has no such animation and reserves its bare diameter.
+    /// the size it will ever need. Camera tiles reserve their speaking size;
+    /// voice plates reserve their fixed resting size.
     fn tile_geom(&self, tile: &Tile) -> CircleGeom {
         let diameter = match tile.face {
             Face::Camera(_) => speak_diameter(self.camera_diameter()),
             Face::Plate => self.plate_diameter(),
         };
-        circle_geometry(diameter, self.label_px())
+        let mut geom = circle_geometry(diameter, self.label_px());
+        if self.gpu.is_some() {
+            let pad = scaled(gpu::HALO, self.scale);
+            geom.half_w += pad;
+            geom.outer_w += pad * 2;
+            geom.outer_h += pad * 2;
+        }
+        geom
     }
 
     /// Whether the surface hangs from its bottom edge: the tiles of a
@@ -519,7 +554,18 @@ impl Scene {
     }
 
     /// Takes the tiles and settings from the state and works out the size.
+    fn interval(&self) -> Duration {
+        if self.gpu.is_some() {
+            gpu::GPU_TICK
+        } else {
+            TICK
+        }
+    }
+
     fn update(&mut self) -> Update {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_update).as_secs_f32();
+        self.last_update = now;
         // Only what a tile needs leaves the state: the whole `AppState`
         // (device list, user list, invite text) is not worth cloning at
         // 15 Hz.
@@ -542,10 +588,10 @@ impl Scene {
             (state.settings.overlay.clone(), peers)
         };
         let layout_changed = layout(&settings) != layout(&self.settings);
+        let settings_changed = self.settings != settings;
         self.settings = settings;
 
-        // Camera tiles first, then the plates of whoever talks without a
-        // camera; each group in name order.
+        // Camera tiles first, then the smaller plates; each group in name order.
         let frames = self.frames.latest();
         let seqs = self.frames.seqs();
         self.visible_frames = peers
@@ -554,25 +600,48 @@ impl Scene {
             .filter_map(|(session, _, _, _)| seqs.iter().find(|(s, _)| s == session).copied())
             .collect();
         peers.sort_by(|a, b| b.3.cmp(&a.3).then_with(|| a.1.cmp(&b.1)));
-        // A fresh map each tick: whoever isn't a camera tile this time
-        // (left, or turned their camera off) just isn't carried forward,
-        // pruning stale entries for free.
+        let membership: Vec<_> = peers
+            .iter()
+            .map(|(s, n, _, c)| (*s, n.clone(), *c))
+            .collect();
+        if settings_changed || membership != self.membership {
+            if let Some(renderer) = self.gpu.as_mut() {
+                renderer.invalidate();
+            }
+            self.membership = membership;
+        }
+        // A fresh map each tick prunes members who left or are hidden.
         let mut anim = HashMap::with_capacity(self.anim.len());
+        let mut glow = HashMap::new();
+        self.intensities.clear();
         self.tiles = peers
             .into_iter()
             .map(|(session, name, speaking, camera)| {
-                // Only a camera tile animates: a plate has no "stopped
-                // speaking" state to shrink into, it only exists while
-                // speaking.
                 let scale = if camera {
                     let target = if speaking { SPEAK_SCALE } else { REST_SCALE };
                     let prev = self.anim.get(&session).copied().unwrap_or(REST_SCALE);
-                    let next = ease(prev, target, SCALE_EASE);
+                    let factor = if self.gpu.is_some() {
+                        1.0 - (1.0 - SCALE_EASE).powf(dt / TICK.as_secs_f32())
+                    } else {
+                        SCALE_EASE
+                    };
+                    let next = ease(prev, target, factor);
                     anim.insert(session, next);
                     next
                 } else {
                     REST_SCALE
                 };
+                let intensity = fade(
+                    self.glow.get(&session).copied().unwrap_or(0.0),
+                    speaking && self.settings.speaking_frame,
+                    dt,
+                );
+                glow.insert(session, intensity);
+                self.intensities.push(if self.settings.speaking_frame {
+                    intensity
+                } else {
+                    0.0
+                });
                 Tile {
                     face: if camera {
                         Face::Camera(
@@ -592,6 +661,7 @@ impl Scene {
             })
             .collect();
         self.anim = anim;
+        self.glow = glow;
 
         let shown = self.settings.enabled && !self.tiles.is_empty();
         if !shown {
@@ -629,7 +699,7 @@ impl Scene {
 
     /// Draws the tiles into `canvas`, premultiplied BGRA of
     /// `self.width × self.height`.
-    fn draw(&mut self, canvas: &mut [u8]) {
+    fn draw(&mut self, canvas: &mut [u8]) -> bool {
         let geometry = Geometry {
             width: self.width,
             height: self.height,
@@ -641,7 +711,36 @@ impl Scene {
             speaking_frame: self.settings.speaking_frame,
             frame_color: self.settings.frame_color,
         };
+
+        if let Some(mut renderer) = self.gpu.take() {
+            let result = renderer.draw(
+                &mut gpu::RenderScene {
+                    geometry,
+                    scale: self.scale,
+                    tiles: &self.tiles,
+                    intensities: &self.intensities,
+                    labels: &mut self.labels,
+                    visible_frames: &self.visible_frames,
+                },
+                canvas,
+            );
+            match result {
+                Ok(frames) => {
+                    self.gpu = Some(renderer);
+                    self.presented_frames = frames;
+                    return self.presented_frames.is_some();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "overlay falling back to software");
+                    self.presented_frames = None;
+                    // Recompute native buffer dimensions on the next tick.
+                    return false;
+                }
+            }
+        }
+        self.presented_frames = Some(self.visible_frames.clone());
         compose(canvas, &geometry, &self.tiles, self.labels.as_mut());
+        true
     }
 
     /// Called only after the platform accepts a frame for presentation.
@@ -649,7 +748,7 @@ impl Scene {
         let now = Instant::now();
         self.reported
             .retain(|session, _| self.visible_frames.iter().any(|(s, _)| s == session));
-        for (session, seq) in &self.visible_frames {
+        for (session, seq) in self.presented_frames.as_deref().unwrap_or(&[]) {
             if new_display_report(self.reported.get(session).copied(), *seq, now) {
                 self.reported.insert(*session, (*seq, now));
                 let _ = self.cmd.send(Command::VideoDisplayed(*session));
