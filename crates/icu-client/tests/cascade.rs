@@ -21,6 +21,7 @@ use icu_client::dsp::{
     testsignal::{rms, voice, Rng, SR},
     vad,
     vad_auto::AutoThreshold,
+    voice::VoiceStrength,
 };
 
 const BLOCK: usize = 480;
@@ -91,6 +92,9 @@ struct Stream {
     /// Per block: level after the first half (post denoise, what the meter
     /// shows) and after the second half (what goes to the encoder), dBFS.
     levels: Vec<(f32, f32)>,
+    /// Every block after the second half, gate or not: what the mic test
+    /// plays.
+    sent: Vec<f32>,
 }
 
 /// The sender: everything the DSP thread does after the AEC, with the
@@ -112,6 +116,7 @@ fn send(mic: &Mic, settings: &SendSettings, loss_permille: u16) -> Stream {
         gains: Vec::new(),
         voice: Vec::new(),
         levels: Vec::new(),
+        sent: Vec::with_capacity(mic.samples.len()),
     };
     let mut block = vec![0.0f32; BLOCK];
     for b in 0..mic.samples.len() / BLOCK {
@@ -129,6 +134,7 @@ fn send(mic: &Mic, settings: &SendSettings, loss_permille: u16) -> Stream {
         stream
             .levels
             .push((a.level.rms_db, meter::to_db(rms(&block))));
+        stream.sent.extend_from_slice(&block);
         acc.extend_from_slice(&block);
         if acc.len() >= FRAME {
             let was_open = gate.is_open();
@@ -648,4 +654,88 @@ fn a_level_jump_does_not_dip() {
         worst_over <= 3.0,
         "voice stays {worst_over:.1} dB hot a second after a +15 dB jump"
     );
+}
+
+/// Levels in dB of the loud vowel blocks from `from_s` on; `lag` shifts
+/// the signal against the mask.
+fn loud_levels(x: &[f32], loud: &[bool], lag: usize, from_s: f32) -> Vec<f32> {
+    let from = (from_s * SR as f32) as usize / BLOCK;
+    let end = (x.len() / BLOCK).saturating_sub(lag).min(loud.len());
+    (from..end)
+        .filter(|&b| loud[b])
+        .map(|b| meter::to_db(rms(&x[(b + lag) * BLOCK..(b + lag + 1) * BLOCK])))
+        .collect()
+}
+
+/// p90 − p10 of block levels: how uneven the voice is.
+fn spread_db(mut levels: Vec<f32>) -> f32 {
+    levels.sort_by(f32::total_cmp);
+    let at = |q: f32| levels[((levels.len() - 1) as f32 * q).round() as usize];
+    at(0.9) - at(0.1)
+}
+
+/// (h) Stimmoptimierung off and at each Stärke, on the same voice: every
+/// step evens the voice out further, both in what the mic test plays and at
+/// the listener, whose receive normalizer takes out level but not
+/// evenness; and no preset moves the steady level by more than 3 dB, so
+/// comparing them compares evenness, not loudness.
+#[test]
+fn voice_optimizer_presets_differ_through_the_chain() {
+    // Words alternate 12 dB apart, 0.4 s each.
+    let words = microphone(20.0, 21, -55.0, |t| {
+        Some(if (t / 0.4) as u32 % 2 == 0 {
+            -24.0
+        } else {
+            -36.0
+        })
+    });
+    let steady = microphone(20.0, 22, -55.0, |_| Some(-30.0));
+    let presets = [
+        ("aus", None),
+        ("Leicht", Some(VoiceStrength::Light)),
+        ("Mittel", Some(VoiceStrength::Medium)),
+        ("Stark", Some(VoiceStrength::Strong)),
+    ];
+    let mut rows = Vec::new();
+    for (name, strength) in presets {
+        let settings = SendSettings {
+            voice_opt: strength.is_some(),
+            voice_strength: strength.unwrap_or_default(),
+            ..SendSettings::default()
+        };
+        let stream = send(&words, &settings, 0);
+        let sent_lag = lag_blocks(&words.samples, &stream.sent);
+        let sent = spread_db(loud_levels(&stream.sent, &words.loud, sent_lag, 6.0));
+        let (part, _) = receive(&stream, |_| Loss::None, 100.0);
+        let heard = mix(&[&part]);
+        let lag = lag_blocks(&words.samples, &heard);
+        let listener = spread_db(loud_levels(&heard, &words.loud, lag, 6.0));
+        let calm = send(&steady, &settings, 0);
+        let calm_lag = lag_blocks(&steady.samples, &calm.sent);
+        let level = voiced_level_db(&calm.sent, &steady.loud, calm_lag, 6.0, 20.0);
+        eprintln!(
+            "{name}: spread sent {sent:.1} dB, heard {listener:.1} dB; \
+             steady level sent {level:.1} dBFS"
+        );
+        rows.push((name, sent, listener, level));
+    }
+    for w in rows.windows(2) {
+        let ((a, a_sent, a_heard, _), (b, b_sent, b_heard, _)) = (w[0], w[1]);
+        assert!(
+            a_sent - b_sent >= 1.5,
+            "{a} → {b}: mic test spread {a_sent:.1} → {b_sent:.1} dB"
+        );
+        assert!(
+            a_heard - b_heard >= 1.5,
+            "{a} → {b}: listener spread {a_heard:.1} → {b_heard:.1} dB"
+        );
+    }
+    let off = rows[0].3;
+    for (name, _, _, level) in &rows[1..] {
+        assert!(
+            (level - off).abs() <= 3.0,
+            "{name} moves the steady level {:+.1} dB against off",
+            level - off
+        );
+    }
 }

@@ -23,7 +23,7 @@ const LIMITER_RELEASE_S: f32 = 0.050;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum VoiceStrength {
-    /// −18 dBFS, 2:1, +3 dB.
+    /// −20 dBFS, 2:1, +3 dB.
     Light,
     /// −24 dBFS, 3:1, +6 dB.
     #[default]
@@ -36,7 +36,7 @@ impl VoiceStrength {
     /// `(threshold_db, ratio, makeup_db)`.
     fn params(self) -> (f32, f32, f32) {
         match self {
-            VoiceStrength::Light => (-18.0, 2.0, 3.0),
+            VoiceStrength::Light => (-20.0, 2.0, 3.0),
             VoiceStrength::Medium => (-24.0, 3.0, 6.0),
             VoiceStrength::Strong => (-30.0, 4.0, 9.0),
         }
