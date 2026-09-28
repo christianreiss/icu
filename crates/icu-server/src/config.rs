@@ -326,7 +326,7 @@ fn reserved_name(host: &str) -> bool {
 /// `server_name` for a config file that leaves it unset: the name an existing
 /// CA carries — it is baked in there for good, and a changed hostname must not
 /// move it — else the host's FQDN, confirmed by DNS ([`verify_fqdn`]).
-fn default_server_name(state_dir: &Path) -> Result<String> {
+pub(crate) fn default_server_name(state_dir: &Path) -> Result<String> {
     if let Some(name) = crate::ca::ca_server_name(state_dir)? {
         return Ok(name);
     }
@@ -422,6 +422,21 @@ fn verify_fqdn(
             "it resolves to {addrs}, none of them a routable address of this host"
         ))
     }
+}
+
+/// Whether `value` is a valid `host:port` for a client certificate's
+/// `icu://<public_host>` URI SAN: ASCII, no whitespace, and a trailing
+/// `:port` a client's last-colon split can recover — an IPv6 literal needs
+/// brackets, or the split lands inside it. Shared between [`Config::validate`]
+/// and `cli::setup`'s interactive prompt, so both agree on what is valid.
+pub(crate) fn valid_public_host(value: &str) -> bool {
+    if !value.is_ascii() || value.contains(char::is_whitespace) {
+        return false;
+    }
+    value.rsplit_once(':').is_some_and(|(host, port)| {
+        let bare_v6 = host.contains(':') && !(host.starts_with('[') && host.ends_with(']'));
+        !host.is_empty() && !bare_v6 && port.parse::<u16>().is_ok()
+    })
 }
 
 /// Longest certificate lifetime a configuration may ask for: 100 years. The
@@ -552,12 +567,7 @@ impl Config {
         // Goes into every client certificate as `icu://<public_host>`, and a
         // client splits it at the last colon.
         let public_host = self.public_host();
-        // An IPv6 literal needs brackets, or the split lands inside it.
-        let port_ok = public_host.rsplit_once(':').is_some_and(|(host, port)| {
-            let bare_v6 = host.contains(':') && !(host.starts_with('[') && host.ends_with(']'));
-            !host.is_empty() && !bare_v6 && port.parse::<u16>().is_ok()
-        });
-        if !public_host.is_ascii() || public_host.contains(char::is_whitespace) || !port_ok {
+        if !valid_public_host(&public_host) {
             return Err(Error::msg(format!(
                 "server.public_host {public_host:?} must be ASCII host:port"
             )));

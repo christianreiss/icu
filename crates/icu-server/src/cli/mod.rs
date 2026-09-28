@@ -8,6 +8,7 @@
 
 pub mod backup;
 pub mod invite;
+pub mod setup;
 pub mod status;
 pub mod users;
 

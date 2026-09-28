@@ -179,6 +179,98 @@ async fn the_shell_runs_a_piped_session_against_a_real_server() {
     handle.shutdown().await;
 }
 
+/// `icu-server setup` on a fresh, nonexistent config path: piped answers
+/// (declining the first-admin invite, to keep this self-contained) produce a
+/// `server.toml` the server itself loads and validates.
+#[tokio::test]
+async fn setup_writes_a_config_from_piped_answers() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let _alone = ALONE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("server.toml");
+    assert!(!file.exists());
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+        .arg("--config")
+        .arg(&file)
+        .arg("setup")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"icu.home.arpa\n4711\nicu.home.arpa:4711\n8\nicu\nn\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let config = icu_server::Config::load(&file).unwrap();
+    assert_eq!(config.server.server_name, "icu.home.arpa");
+    assert_eq!(config.server.public_host, "icu.home.arpa:4711");
+    assert_eq!(config.server.max_users, 8);
+    assert_eq!(config.server.admin_socket_group.as_deref(), Some("icu"));
+}
+
+/// `icu-server setup`, answering "yes" to the first-admin invite: the
+/// printed bundle shows up, and the state directory now carries a CA — the
+/// same offline bootstrap `icu-server invite` alone already performs.
+#[tokio::test]
+async fn setup_can_issue_the_first_admin_invite() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let _alone = ALONE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (state, run) = (dir.path().join("state"), dir.path().join("run"));
+    let file = dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
+            state.to_str().unwrap(),
+            run.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+        .arg("--config")
+        .arg(&file)
+        .arg("setup")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"icu.home.arpa\n4711\nicu.home.arpa:4711\n8\nicu\ny\n24h\n\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("BEGIN ICU"), "{stdout}");
+    assert!(state.join("ca.crt").exists());
+    assert!(state.join("com.key").exists());
+}
+
 #[tokio::test]
 async fn the_socket_group_is_asked_of_the_hosts_nss() {
     let _alone = ALONE.lock().await;

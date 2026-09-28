@@ -16,11 +16,21 @@ und Debian 12+) und der Client `icu` je Distro (Fedora 42, Fedora 43, Debian 13)
 ```bash
 sudo dnf install ./icu-server-<ver>-1.x86_64.rpm        # Fedora, AlmaLinux 10+
 sudo apt install ./icu-server_<ver>-1_amd64.deb          # Debian 12+
-sudoedit /etc/icu/server.toml                            # server_name, public_host (optional)
+sudo icu-server setup                                    # interaktiv: server_name, public_host, …, erstes Admin-Bundle
 sudo systemctl enable --now icu-server
 sudo firewall-cmd --permanent --add-service=icu && sudo firewall-cmd --reload
-sudo icu-server invite --out /root/icu-admin.icu         # zuerst sich selbst (§3 „Erster Admin“)
 ```
+
+`icu-server setup` fragt der Reihe nach `server_name`, `public_host`, den
+UDP-Port, `max_users` und `admin_socket_group` ab (Vorgabe: der bisherige
+Wert aus `/etc/icu/server.toml`, sonst der erkannte FQDN bzw. Default),
+schreibt die Datei und bietet an, gleich das erste Admin-Bundle auszustellen
+(§3 „Erster Admin“) — dabei entstehen CA, Com-Schlüssel und State-Verzeichnis
+genau wie sonst beim ersten `icu-server invite`. Wer die Datei lieber von
+Hand pflegt, überspringt `setup` und bearbeitet sie wie unten (`sudoedit`)
+weiter; `setup` lässt sich jederzeit erneut ausführen, ohne etwas
+Bestehendes stillschweigend zu überschreiben (die aktuellen Werte sind die
+Vorgabe an jeder Frage).
 
 Das Paket legt die Gruppe `icu` an (`/usr/lib/sysusers.d/icu-server.conf`),
 installiert die Unit nach `/usr/lib/systemd/system/`, eine Beispielkonfiguration
@@ -134,6 +144,9 @@ ldd    target/musl/x86_64-unknown-linux-musl/release-server/icu-server   # stati
 ```
 
 ## 2. Installieren von Hand (systemd)
+
+Die Konfigurationsdatei entweder mit `icu-server setup` interaktiv anlegen
+(sobald das Binary installiert ist, s.o.) oder wie hier von Hand:
 
 ```bash
 sudo install -m0755 target/musl/x86_64-unknown-linux-musl/release-server/icu-server \

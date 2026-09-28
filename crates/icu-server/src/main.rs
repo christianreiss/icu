@@ -127,6 +127,11 @@ enum Command {
     /// completion, `?` for context help. `run` and `restore` are not
     /// available here.
     Shell,
+    /// Interactive first-time bootstrap: prompts for server_name,
+    /// public_host, the UDP port, max_users and admin_socket_group, writes
+    /// the config, and can issue the first admin invite. Works on a config
+    /// file that does not exist yet.
+    Setup,
 }
 
 fn main() -> ExitCode {
@@ -151,6 +156,11 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    // `setup` may be writing the config file for the first time, so it
+    // cannot go through the shared read below.
+    if let Command::Setup = cli.command {
+        return cli::setup::run(&cli.config).await;
+    }
     // Resolved and validated only where it is used: `run` here, the offline
     // CLI in `cli::dispatch`. A command that reaches the running server needs
     // nothing but the socket path.
@@ -231,6 +241,7 @@ async fn run(cli: Cli) -> Result<()> {
         // and could write, the very state being replaced.
         Command::Restore { snapshot } => cli::backup::restore(&config, &snapshot).await,
         Command::Shell => icu_server::shell::run(&config).await,
+        Command::Setup => unreachable!("handled above"),
     }
 }
 
