@@ -297,6 +297,7 @@ fn state() -> AppState {
         video_viewers: Vec::new(),
         muted: false,
         deafened: false,
+        system_muted: false,
         ptt_down: false,
         sending: false,
         voice: false,

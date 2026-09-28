@@ -1517,10 +1517,20 @@ impl MainView {
         let own = state
             .me
             .as_ref()
-            .map(|_| [state.deafened, state.muted, state.camera_on, state.is_admin]);
+            .map(|_| [
+                state.deafened,
+                state.muted || state.system_muted,
+                state.camera_on,
+                state.is_admin,
+            ]);
         let columns = badge_columns(own.into_iter().chain(state.peers.iter().map(|p| {
             let f = p.info.flags;
-            [f.deafened(), f.muted(), f.camera_on(), f.is_admin()]
+            [
+                f.deafened(),
+                f.muted() || f.system_muted(),
+                f.camera_on(),
+                f.is_admin(),
+            ]
         })));
         let list = egui::CentralPanel::default().show(root, |ui| {
             // The people get a card of their own, the same surface as the
@@ -1875,7 +1885,7 @@ pub(super) fn participant_for<'a>(
         name: &p.info.name,
         user_id: p.info.user_id,
         speaking: p.speaking,
-        muted: p.info.flags.muted(),
+        muted: p.info.flags.muted() || p.info.flags.system_muted(),
         deafened: p.info.flags.deafened(),
         camera: p.info.flags.camera_on(),
         mode: None,

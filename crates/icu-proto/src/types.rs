@@ -173,8 +173,7 @@ pub fn name_key(name: &str) -> String {
 /// Per-user state bits (`docs/reference/protocol.md` §2.1).
 ///
 /// bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4 admin,
-/// bit5 viewing, bit6–7 reserved. Reserved bits are written as 0 by the
-/// sender and ignored by the receiver.
+/// bit5 viewing, bit6 ptt, bit7 system_muted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct UserFlags(pub u8);
@@ -199,12 +198,20 @@ impl UserFlags {
     /// bit6 — the user talks by Push-to-Talk; cleared means voice
     /// activation. Display only, so peers can show the mode.
     pub const PTT: u8 = 1 << 6;
-    /// bit7 — reserved, sender writes 0.
-    pub const RESERVED: u8 = 0x80;
+    /// bit7 — the OS mutes the recording device (display only, independent
+    /// of `MUTED`).
+    pub const SYSTEM_MUTED: u8 = 1 << 7;
+    /// No reserved bits are left.
+    pub const RESERVED: u8 = 0;
     /// Bits a client may set through `SetState`: everything but `SPEAKING`,
     /// `ADMIN` and the reserved range.
     pub const CLIENT_SETTABLE: u8 =
-        Self::MUTED | Self::DEAFENED | Self::CAMERA_ON | Self::VIEWING | Self::PTT;
+        Self::MUTED
+            | Self::DEAFENED
+            | Self::CAMERA_ON
+            | Self::VIEWING
+            | Self::PTT
+            | Self::SYSTEM_MUTED;
     /// Bits the server keeps regardless of what a client requests.
     const SERVER_AUTHORITATIVE: u8 = Self::SPEAKING | Self::ADMIN;
 
@@ -238,6 +245,11 @@ impl UserFlags {
     /// Whether the user talks by Push-to-Talk rather than voice activation.
     pub fn ptt(self) -> bool {
         self.0 & Self::PTT != 0
+    }
+
+    /// Whether the OS mutes the user's recording device.
+    pub fn system_muted(self) -> bool {
+        self.0 & Self::SYSTEM_MUTED != 0
     }
 
     /// Returns a copy with `SPEAKING` set or cleared.
@@ -519,6 +531,7 @@ mod tests {
         assert_eq!(out.0 & UserFlags::RESERVED, 0);
         assert!(out.speaking(), "server authoritative bit is kept");
         assert!(out.muted() && out.deafened() && out.camera_on() && out.viewing() && out.ptt());
+        assert!(out.system_muted());
 
         // A client clearing everything does not clear SPEAKING.
         let out = current.apply_client_request(UserFlags::NONE);

@@ -1108,6 +1108,8 @@ fn badges(flags: icu_proto::UserFlags, admin: bool) -> String {
     }
     if flags.muted() {
         out.push("stumm");
+    } else if flags.system_muted() {
+        out.push("System stumm");
     }
     if flags.deafened() {
         out.push("taub");

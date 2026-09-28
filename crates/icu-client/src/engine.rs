@@ -199,6 +199,8 @@ pub struct AppState {
     pub muted: bool,
     /// Local deafen.
     pub deafened: bool,
+    /// The OS mutes the recording device (`UserFlags::SYSTEM_MUTED`).
+    pub system_muted: bool,
     /// PTT key held.
     pub ptt_down: bool,
     /// Gate open (audio is going out).
@@ -912,6 +914,7 @@ impl Engine {
             user_list: Vec::new(),
             user_action_error: None,
             restricted_muted: false,
+            system_muted: false,
             restricted_deafened: false,
             devices: backend.devices(),
             active_input: None,
@@ -3996,6 +3999,17 @@ async fn run_session(
             }
             _ = tuning_tick.tick() => {
                 blocking(|| tune_capture(shared, local));
+                let system_muted = blocking(|| {
+                    lock(&local.backend)
+                        .capture_level()
+                        .ok()
+                        .flatten()
+                        .is_some_and(|l| l.muted)
+                });
+                local.flags = local.flags.with_bit(UserFlags::SYSTEM_MUTED, system_muted);
+                shared.state.send_if_modified(|s| {
+                    std::mem::replace(&mut s.system_muted, system_muted) != system_muted
+                });
             }
             _ = loss_tick.tick() => {
                 let now = Instant::now();

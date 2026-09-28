@@ -37,8 +37,9 @@ Framing auf dem Control-Stream in beide Richtungen:
 ### 2.1 Typen
 
 ```
-UserFlags: u8      bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4 admin, bit5 viewing, bit6 ptt, bit7 reserviert
+UserFlags: u8      bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4 admin, bit5 viewing, bit6 ptt, bit7 system_muted
                    bit6 (`ptt`, 2026-09-25) setzt der Client per Hello.initial/SetState, solange er Push-to-Talk nutzt; gelöscht = Sprachaktivierung. Reine Anzeige für die Teilnehmerliste.
+                   bit7 (`system_muted`, 2026-09-28) setzt der Client, solange das Betriebssystem das Aufnahmegerät stummschaltet. Reine Anzeige, unabhängig von `muted`.
                    bit5 (`viewing`, 2026-09-24) setzt der Client per Hello.initial/SetState, solange er Video anzeigt (Overlay an oder Hauptfenster sichtbar). Der Server relayt Video nur an Teilnehmer mit bit5 (§4); ein Sender pausiert seine Kamera (kein Encode, kein Upload), solange kein anderer Teilnehmer bit5 trägt, und beginnt beim Fortsetzen mit einem IDR.
                    bit2 ist serverseitig autoritativ: der Server leitet es aus dem Audio-Datagram-Fluss ab (erstes Datagram nach ≥ 500 ms Stille → 1; END-Flag oder 500 ms ohne Datagram → 0) und broadcastet UserState; ein von Clients in SetState gesendetes bit2 wird ignoriert.
                    bit4 ist ebenfalls serverseitig autoritativ und spiegelt Store::is_admin: reitet kostenlos auf Welcome/UserJoined/UserState statt einer eigenen Variante; ein von Clients in SetState gesendetes bit4 wird ignoriert. AdminSetRole broadcastet zusätzlich zum bisherigen Unicast UserAdminChanged ein UserState für jede betroffene Sitzung, damit das Abzeichen bei jedem Betrachter live kippt.
@@ -68,7 +69,7 @@ UserInfo { user_id: UserId, session: Session, name: Name, flags: UserFlags }
 AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64000 }
 ```
 
-**Reservierte Felder und Bits** — eine Regel für alle Stellen (`UserFlags` bit7, Audio-`flags` bit1–7, Video-`flags` bit1–7, Video-Byte 11): der Sender schreibt 0, der Empfänger ignoriert den Inhalt und verwirft deswegen nie eine Nachricht. „= 0“ in den Tabellen ist eine Sendevorschrift, keine Empfangsprüfung; sonst wäre kein additives Minor möglich.
+**Reservierte Felder und Bits** — eine Regel für alle Stellen (Audio-`flags` bit1–7, Video-`flags` bit1–7, Video-Byte 11): der Sender schreibt 0, der Empfänger ignoriert den Inhalt und verwirft deswegen nie eine Nachricht. „= 0“ in den Tabellen ist eine Sendevorschrift, keine Empfangsprüfung; sonst wäre kein additives Minor möglich.
 
 ### 2.2 Messages `ControlMsg`
 
