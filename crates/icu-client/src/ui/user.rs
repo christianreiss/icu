@@ -114,23 +114,46 @@ impl UserView {
             info.map(|i| &i.server_cert),
             info.map(|i| &i.client_cert),
         ];
-        let page = egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
+        let draw_page = |ui: &mut Ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(GUTTER, 4.0);
             ui.label(theme::strong_text("Verbindungspfad").size(18.0));
-            ui.columns(3, |cols| {
-                person(&mut cols[0], &p, if own { "Du · ausgewählt" } else { "Ausgewählter Nutzer" }, certs[0]);
-                server(&mut cols[1], state, certs[1]);
-                person(&mut cols[2], &me, "Du · lokal", certs[2]);
-            });
-            path_links(ui, p.rtt_ms, me.rtt_ms, own);
-            if own {
-                ui.label(RichText::new("Beide Außenkarten zeigen dich und dieselbe Verbindung zum Server.").small());
-            } else {
-                let (loss, _) = loss_word(p.loss_permille);
-                ui.label(format!("{} Empfang von {} bei dir · Audio-Paketverlust {}", icon::SPEAKER_HIGH, p.name, loss));
-            }
+            ui.add_space(8.0);
+            let cards = path_cards(ui, &p, &me, state, certs, own);
+            ui.add_space(8.0);
+            path_links(ui, cards, p.rtt_ms, me.rtt_ms, own);
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                    if own {
+                        ui.label(
+                            RichText::new(
+                                "Beide Außenkarten zeigen dich und dieselbe Verbindung zum Server.",
+                            )
+                            .small(),
+                        );
+                    } else {
+                        let (loss, tone) = loss_word(p.loss_permille);
+                        let tok = theme::tokens(ui.visuals());
+                        let color = match tone {
+                            Tone::Good => tok.connected,
+                            Tone::Warn => tok.connecting,
+                            Tone::Bad => tok.error,
+                            _ => tok.muted_text,
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Empfang").color(tok.muted_text));
+                            ui.add(egui::Label::new(format!("{} bei dir", p.name)).wrap());
+                            ui.separator();
+                            ui.label(RichText::new("Audio-Paketverlust").color(tok.muted_text));
+                            ui.label(RichText::new(loss).color(color));
+                        });
+                    }
+                });
+            ui.add_space(8.0);
             widgets::group_card(ui, "Zertifikate & Vertrauen", |ui| {
-                egui::Frame::new().inner_margin(10).show(ui, |ui| {
+                egui::Frame::new().inner_margin(12).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(GUTTER, 4.0);
                     ui.vertical_centered(|ui| {
                         let ca = info.map(|i| &i.ca_cert);
                         let name = ca.map_or("unbekannt", |c| c.subject.as_str());
@@ -139,13 +162,12 @@ impl UserView {
                         }
                         ui.label(RichText::new("Vertrauensanker aus deinem Passport").small());
                     });
-                    issuer_links(ui);
-                    ui.columns(3, |cols| {
-                        for (i, (pick, label)) in [(Certificate::Peer, if own { "Dein Zertifikat" } else { "Nutzerzertifikat" }), (Certificate::Server, "Serverzertifikat"), (Certificate::Own, "Dein Zertifikat")].into_iter().enumerate() {
-                            cols[i].vertical_centered(|ui| {
-                                if ui.selectable_label(self.selected == Some(pick), format!("{} {}", icon::CERTIFICATE, label)).clicked() { self.toggle(pick); }
-                            });
-                        }
+                    issuer_links(ui, cards.map(|r| r.center().x));
+                    aligned_row(ui, "certificate-selectors", cards, |ui, i| {
+                        let (pick, label) = [(Certificate::Peer, if own { "Dein Zertifikat" } else { "Nutzerzertifikat" }), (Certificate::Server, "Serverzertifikat"), (Certificate::Own, "Dein Zertifikat")][i];
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                            if ui.selectable_label(self.selected == Some(pick), format!("{} {}", icon::CERTIFICATE, label)).clicked() { self.toggle(pick); }
+                        });
                     });
                     if !own {
                         let error = peer_result.and_then(|r| r.as_ref().err()).map(String::as_str);
@@ -155,46 +177,66 @@ impl UserView {
                                 if ui.button("Erneut laden").clicked() {
                                     send(Command::RequestPeerCertificate(p.session));
                                     self.requested = Some((p.session, Instant::now()));
-            ui.ctx().request_repaint_after(Duration::from_secs(8));
+                                    ui.ctx().request_repaint_after(Duration::from_secs(8));
                                 }
                             });
                         } else if peer_result.is_none() {
                             ui.label("Nutzerzertifikat wird geladen …");
-
                         }
                     }
-                });
-            });
-            if let Some(selected) = self.selected {
-                ui.add_space(6.0);
-                let (title, cert) = match selected {
-                    Certificate::Peer => ("Nutzerzertifikat", certs[0]),
-                    Certificate::Server => ("Serverzertifikat", certs[1]),
-                    Certificate::Own => ("Dein Zertifikat", certs[2]),
-                    Certificate::Ca => ("CA · Vertrauensanker", info.map(|i| &i.ca_cert)),
-                };
-                widgets::group_card(ui, title, |ui| {
-                    egui::Frame::new().inner_margin(12).show(ui, |ui| {
-                        if selected != Certificate::Ca {
-                            ui.label(if selected == Certificate::Server { "Serveridentität im TLS-Handshake geprüft" } else { "Nutzersitzung vom Server authentifiziert" });
-                        }
-                        if selected == Certificate::Server { ui.label(format!("Geprüfter Servername: {}", state.server_name)); }
-                        if let Some(cert) = cert { trust_details(ui, cert, selected == Certificate::Ca); }
+                    if let Some(selected) = self.selected {
+                        ui.add_space(6.0);
+                        let (title, cert) = match selected {
+                            Certificate::Peer => ("Nutzerzertifikat", certs[0]),
+                            Certificate::Server => ("Serverzertifikat", certs[1]),
+                            Certificate::Own => ("Dein Zertifikat", certs[2]),
+                            Certificate::Ca => ("CA · Vertrauensanker", info.map(|i| &i.ca_cert)),
+                        };
+                        widgets::group_card(ui, title, |ui| {
+                            egui::Frame::new().inner_margin(12).show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 8.0;
+                                if selected != Certificate::Ca {
+                                    ui.label(if selected == Certificate::Server {
+                                        "Serveridentität im TLS-Handshake geprüft"
+                                    } else {
+                                        "Nutzersitzung vom Server authentifiziert"
+                                    });
+                                }
+                                if selected == Certificate::Server {
+                                    ui.label(format!("Geprüfter Servername: {}", state.server_name));
+                                }
+                                if let Some(cert) = cert {
+                                    trust_details(ui, cert, selected == Certificate::Ca);
+                                }
+                            });
+                            certificate_details(ui, cert, &mut self.copied);
+                        });
+                    }
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("{} QUIC · TLS 1.3 · mTLS", icon::LOCK_KEY)).small());
+                        if ui.link("Alle Verbindungsdetails").clicked() { out.open_connection = true; }
                     });
-                    certificate_details(ui, cert, &mut self.copied);
+                    ui.label(RichText::new("Beide Strecken sind transportverschlüsselt. Der Server kann die weitergeleiteten Medien lesen.").small());
+                });
+            });
+            if let Some(v) = p.volume {
+                volume_card(ui, &p, v, send);
+            }
+            if let Some(m) = p.moderation {
+                widgets::group_card(ui, "Moderation", |ui| {
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            moderation_menu(ui, p.user_id, m, send);
+                        });
                 });
             }
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(format!("{} QUIC · TLS 1.3 · mTLS", icon::LOCK_KEY)).small());
-                if ui.link("Alle Verbindungsdetails").clicked() { out.open_connection = true; }
-            });
-            ui.label(RichText::new("Beide Strecken sind transportverschlüsselt. Der Server kann die weitergeleiteten Medien lesen.").small());
-            if let Some(v) = p.volume { volume_card(ui, &p, v, send); }
-            if let Some(m) = p.moderation {
-                ui.add_space(6.0);
-                widgets::group_card(ui, "Moderation", |ui| moderation_menu(ui, p.user_id, m, send));
-            }
-        });
+        };
+        let page = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, draw_page);
         out.overflow = page.content_size.y - page.inner_rect.height();
         super::grow_to_fit(ui.ctx(), out.overflow);
         out
@@ -209,69 +251,219 @@ impl UserView {
     }
 }
 
-fn node(ui: &mut Ui, title: &str, content: impl FnOnce(&mut Ui)) {
-    widgets::group_card(ui, title, |ui| {
-        egui::Frame::new().inner_margin(12).show(ui, |ui| {
-            ui.set_min_height(140.0);
-            content(ui);
-        });
-    });
+const GUTTER: f32 = 12.0;
+const PADDING: f32 = 12.0;
+
+/// Render a row across the same three column bounds. The next row starts
+/// below the tallest cell, including any wrapped text, in this very frame.
+fn aligned_row(
+    ui: &mut Ui,
+    id: &str,
+    columns: [egui::Rect; 3],
+    mut content: impl FnMut(&mut Ui, usize),
+) {
+    let top = ui.cursor().top();
+    let mut bottom = top;
+    for (i, column) in columns.into_iter().enumerate() {
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(column.left() + PADDING, top),
+            egui::pos2(column.right() - PADDING, ui.max_rect().bottom()),
+        );
+        let mut cell = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt((id, i))
+                .max_rect(rect)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        cell.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+        content(&mut cell, i);
+        bottom = bottom.max(cell.min_rect().bottom());
+    }
+    ui.allocate_space(egui::vec2(ui.available_width(), bottom - top));
 }
 
-fn person(ui: &mut Ui, p: &Participant<'_>, title: &str, cert: Option<&CertInfo>) {
+fn path_cards(
+    ui: &mut Ui,
+    peer: &Participant<'_>,
+    me: &Participant<'_>,
+    state: &AppState,
+    certs: [Option<&CertInfo>; 3],
+    own: bool,
+) -> [egui::Rect; 3] {
+    let width = (ui.available_width() - 2.0 * GUTTER) / 3.0;
+    let origin = ui.cursor().min;
+    let mut cards = std::array::from_fn(|i| {
+        egui::Rect::from_min_size(
+            origin + egui::vec2(i as f32 * (width + GUTTER), 0.0),
+            egui::vec2(width, 0.0),
+        )
+    });
+    // Reserve paint order before drawing the cells, then fill the complete
+    // equal-height card backgrounds once all shared rows have been measured.
+    let backgrounds: [_; 3] = std::array::from_fn(|_| ui.painter().add(egui::Shape::Noop));
     let tok = theme::tokens(ui.visuals());
-    node(ui, title, |ui| {
-        ui.horizontal(|ui| {
-            widgets::avatar(ui, p.name, p.user_id, p.speaking, 38.0, p.video);
-            ui.add(egui::Label::new(theme::strong_text(p.name).size(15.0)).wrap());
-        });
-        ui.label(RichText::new(if p.is_admin { "Admin" } else { "Mitglied" }).small());
-        let (color, word) = status_word(p, &tok);
-        widgets::status_pill(ui, color, word);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!(
-                "{} {}",
-                if p.muted {
-                    icon::MICROPHONE_SLASH
-                } else {
-                    icon::MICROPHONE
-                },
-                if p.ptt { "PTT" } else { "Sprachaktivierung" }
-            ));
-            if p.camera {
-                ui.label(format!("{} Kamera", icon::VIDEO_CAMERA));
-            }
-            if p.viewing {
-                ui.label(format!("{} Schaut zu", icon::EYE));
-            }
-        });
-        ui.label(RichText::new(format!("Nutzer #{} · Sitzung {}", p.user_id, p.session)).small())
-            .on_hover_text(p.client_rtt_ms.map_or_else(
-                || "Vom Server gemeldete Sitzung".into(),
-                |ms| format!("Eigene Ping/Pong-Messung: {ms} ms"),
-            ));
-        certificate_status(ui, cert);
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.add_space(PADDING);
+        for row in 0..7 {
+            aligned_row(ui, &format!("path-row-{row}"), cards, |ui, i| {
+                let person = [Some(peer), None, Some(me)][i];
+                match row {
+                    0 => {
+                        ui.label(theme::caps_text(
+                            [
+                                if own {
+                                    "Du · ausgewählt"
+                                } else {
+                                    "Ausgewählter Nutzer"
+                                },
+                                "Server · Vermittler",
+                                "Du · lokal",
+                            ][i],
+                        ));
+                    }
+                    1 => {
+                        ui.horizontal_top(|ui| {
+                            if let Some(p) = person {
+                                widgets::avatar(ui, p.name, p.user_id, p.speaking, 38.0, p.video);
+                            } else {
+                                let (r, _) = ui.allocate_exact_size(
+                                    egui::vec2(44.0, 44.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(
+                                    r.center(),
+                                    19.0,
+                                    tok.muted_text.gamma_multiply(0.12),
+                                );
+                                ui.painter().text(
+                                    r.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    icon::HARD_DRIVES,
+                                    egui::FontId::proportional(24.0),
+                                    tok.muted_text,
+                                );
+                            }
+                            ui.vertical(|ui| {
+                                // Align first name baselines even if another
+                                // name wraps to several lines next to its icon.
+                                ui.add_space(12.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        theme::strong_text(
+                                            person.map_or(state.server_name.as_str(), |p| p.name),
+                                        )
+                                        .size(15.0),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        });
+                    }
+                    2 => {
+                        ui.label(
+                            RichText::new(person.map_or("Medienvermittlung", |p| {
+                                if p.is_admin {
+                                    "Admin"
+                                } else {
+                                    "Mitglied"
+                                }
+                            }))
+                            .small()
+                            .color(tok.muted_text),
+                        );
+                    }
+                    3 => {
+                        let (color, word) =
+                            person.map_or((tok.connected, "Verbunden"), |p| status_word(p, &tok));
+                        widgets::status_pill(ui, color, word);
+                    }
+                    4 => {
+                        if let Some(p) = person {
+                            ui.spacing_mut().interact_size.y =
+                                ui.text_style_height(&egui::TextStyle::Body);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(format!(
+                                    "{} {}",
+                                    if p.muted {
+                                        icon::MICROPHONE_SLASH
+                                    } else {
+                                        icon::MICROPHONE
+                                    },
+                                    if p.ptt { "PTT" } else { "Sprachaktivierung" }
+                                ));
+                                if p.camera {
+                                    ui.label(format!("{} Kamera", icon::VIDEO_CAMERA));
+                                }
+                                if p.viewing {
+                                    ui.label(format!("{} Schaut zu", icon::EYE));
+                                }
+                            });
+                        } else {
+                            ui.add(egui::Label::new(&state.server).wrap());
+                        }
+                    }
+                    5 => {
+                        if let Some(p) = person {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "Nutzer #{} · Sitzung {}",
+                                        p.user_id, p.session
+                                    ))
+                                    .small()
+                                    .color(tok.muted_text),
+                                )
+                                .wrap(),
+                            )
+                            .on_hover_text(
+                                p.client_rtt_ms.map_or_else(
+                                    || "Vom Server gemeldete Sitzung".into(),
+                                    |ms| format!("Eigene Ping/Pong-Messung: {ms} ms"),
+                                ),
+                            );
+                        }
+                    }
+                    6 => {
+                        certificate_status(ui, certs[i]);
+                    }
+                    _ => unreachable!(),
+                }
+            });
+        }
+        ui.add_space(PADDING - 8.0);
     });
+    let bottom = ui.min_rect().bottom();
+    for (i, card) in cards.iter_mut().enumerate() {
+        card.max.y = bottom;
+        ui.painter().set(
+            backgrounds[i],
+            egui::epaint::RectShape::new(
+                *card,
+                egui::CornerRadius::same(theme::R_CARD),
+                ui.visuals().faint_bg_color,
+                egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+                egui::StrokeKind::Inside,
+            ),
+        );
+    }
+    cards
 }
 
-fn server(ui: &mut Ui, state: &AppState, cert: Option<&CertInfo>) {
-    node(ui, "Server · Vermittler", |ui| {
-        ui.label(RichText::new(icon::HARD_DRIVES).size(30.0));
-        ui.add(egui::Label::new(theme::strong_text(&state.server_name).size(15.0)).wrap());
-        ui.add(egui::Label::new(RichText::new(&state.server).small()).wrap());
-        widgets::status_pill(ui, theme::tokens(ui.visuals()).connected, "Verbunden");
-        certificate_status(ui, cert);
-    });
-}
-
-fn path_links(ui: &mut Ui, remote: Option<u16>, local: Option<u16>, own: bool) {
+fn path_links(
+    ui: &mut Ui,
+    cards: [egui::Rect; 3],
+    remote: Option<u16>,
+    local: Option<u16>,
+    own: bool,
+) {
     let tok = theme::tokens(ui.visuals());
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 16.0), egui::Sense::hover());
-    let w = rect.width() / 3.0;
-    for (a, b) in [(0.5, 1.5), (1.5, 2.5)] {
-        let start = egui::pos2(rect.left() + w * a, rect.center().y);
-        let end = egui::pos2(rect.left() + w * b, rect.center().y);
+    let centers = cards.map(|r| r.center().x);
+    for i in 0..2 {
+        let start = egui::pos2(centers[i], rect.center().y);
+        let end = egui::pos2(centers[i + 1], rect.center().y);
         let stroke = egui::Stroke::new(1.5, tok.dim_text);
         ui.painter().line_segment([start, end], stroke);
         for (p, direction) in [(start, 1.0), (end, -1.0)] {
@@ -281,41 +473,70 @@ fn path_links(ui: &mut Ui, remote: Option<u16>, local: Option<u16>, own: bool) {
             }
         }
     }
-    ui.columns(2, |cols| {
-        for (i, ms) in [remote, local].into_iter().enumerate() {
-            cols[i].vertical_centered(|ui| {
-                let number = ms.map_or("unbekannt".into(), |v| format!("{v} ms"));
-                ui.horizontal(|ui| {
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(widgets::SIGNAL_BARS_W, 20.0),
-                        egui::Sense::hover(),
-                    );
-                    if let Some(ms) = ms {
-                        widgets::signal_bars(ui, rect, main_window::rtt_bars(ms));
-                    }
-                    ui.label(format!("{} RTT zum Server · {number}", icon::LOCK_KEY))
-                        .on_hover_text(if own {
-                            "Dieselbe Verbindung"
-                        } else {
-                            ping_word(ms)
-                        });
-                });
-            });
+    let top = ui.cursor().top();
+    let mut bottom = top;
+    for (i, ms) in [remote, local].into_iter().enumerate() {
+        let bounds = egui::Rect::from_min_max(
+            egui::pos2(centers[i], top),
+            egui::pos2(centers[i + 1], ui.max_rect().bottom()),
+        );
+        let mut cell = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt(("rtt", i))
+                .max_rect(bounds)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+        );
+        let number = ms.map_or("unbekannt".into(), |v| format!("{v} ms"));
+        let text = format!("{} RTT zum Server · {number}", icon::LOCK_KEY);
+        let bars_width = widgets::SIGNAL_BARS_W + 8.0;
+        let galley = cell.painter().layout(
+            text,
+            egui::TextStyle::Body.resolve(cell.style()),
+            cell.visuals().text_color(),
+            (bounds.width() - bars_width).max(1.0),
+        );
+        let (r, response) = cell.allocate_exact_size(
+            egui::vec2(bars_width + galley.size().x, galley.size().y.max(20.0)),
+            egui::Sense::hover(),
+        );
+        if let Some(ms) = ms {
+            widgets::signal_bars(
+                &cell,
+                egui::Rect::from_min_size(
+                    r.left_center() - egui::vec2(0.0, 10.0),
+                    egui::vec2(widgets::SIGNAL_BARS_W, 20.0),
+                ),
+                main_window::rtt_bars(ms),
+            );
         }
-    });
+        cell.painter().galley(
+            egui::pos2(r.left() + bars_width, r.center().y - galley.size().y / 2.0),
+            galley,
+            cell.visuals().text_color(),
+        );
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Label,
+                true,
+                format!("RTT zum Server · {number}"),
+            )
+        });
+        response.on_hover_text(if own {
+            "Dieselbe Verbindung"
+        } else {
+            ping_word(ms)
+        });
+        bottom = bottom.max(cell.min_rect().bottom());
+    }
+    ui.allocate_space(egui::vec2(ui.available_width(), bottom - top));
 }
 
-fn issuer_links(ui: &mut Ui) {
+fn issuer_links(ui: &mut Ui, xs: [f32; 3]) {
     let (r, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
     let stroke = egui::Stroke::new(1.0, theme::tokens(ui.visuals()).dim_text);
     ui.painter()
         .line_segment([r.center_top(), r.center()], stroke);
-    let xs = [
-        r.left() + r.width() / 6.0,
-        r.center().x,
-        r.right() - r.width() / 6.0,
-    ];
     ui.painter().line_segment(
         [
             egui::pos2(xs[0], r.center().y),
@@ -425,7 +646,9 @@ fn volume_card(ui: &mut Ui, p: &Participant<'_>, mut v: f32, send: &impl Fn(Comm
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                 ui.horizontal(|ui| {
+                    ui.label("Wiedergabelautstärke");
                     widgets::chip(ui, &format!("{v:.0} %"), 46.0);
                     // One click to silence somebody for yourself, and back.
                     let muted = v <= 0.0;

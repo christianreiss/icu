@@ -89,7 +89,18 @@ fn harness<'a, F: FnMut(&mut egui::Ui) + 'static>(
     panel: bool,
     body: F,
 ) -> Harness<'a, Window<F>> {
+    harness_scaled(size, theme_name, panel, 1.0, body)
+}
+
+fn harness_scaled<'a, F: FnMut(&mut egui::Ui) + 'static>(
+    size: [f32; 2],
+    theme_name: &'static str,
+    panel: bool,
+    pixels_per_point: f32,
+    body: F,
+) -> Harness<'a, Window<F>> {
     let mut harness = Harness::builder()
+        .with_pixels_per_point(pixels_per_point)
         .with_size(egui::vec2(size[0], size[1]))
         .with_theme(egui_theme(theme_name))
         .build_eframe(move |cc| {
@@ -568,10 +579,12 @@ fn user_window_fits() {
             });
             h.run();
             let what = format!("user/{label}/{theme_name}");
-            // The local user has no volume or moderation card and fits
-            // exactly; a peer's volume card, plus this admin's moderation
-            // card, are worth the window growing for.
-            overflows.check_window(&what, &h, USER, label == "peer", *overflow.borrow());
+            // Self fits the initial size. The shared card rows and peer
+            // controls may grow the window, still within a 1080p desktop.
+            overflows.check_window(&what, &h, USER, label != "self", *overflow.borrow());
+            if label == "member" {
+                assert!(h.ctx.content_rect().height() <= 780.0);
+            }
             shot(&mut h, &what.replace('/', "-"));
         }
     }
@@ -1231,6 +1244,9 @@ fn user_path_details_and_missing_data() {
             ("normal", 900.0, false, false),
             ("narrow-long", 760.0, false, true),
             ("missing", 760.0, true, false),
+            ("pending", 760.0, false, false),
+            ("invalid", 760.0, false, false),
+            ("expiring", 760.0, false, false),
         ] {
             let mut s = state();
             s.is_admin = false;
@@ -1243,6 +1259,18 @@ fn user_path_details_and_missing_data() {
                 s.peers[0].rtt_ms = None;
                 s.peers[0].recv_loss_permille = None;
                 s.server_rtt_ms = None;
+            }
+            match case {
+                "pending" => s.peers[0].certificate = None,
+                "invalid" => {
+                    let mut c = cert("Anna", "ICU CA", 365);
+                    c.signature_valid = Some(false);
+                    s.peers[0].certificate = Some(Ok(Arc::new(c)));
+                }
+                "expiring" => {
+                    s.peers[0].certificate = Some(Ok(Arc::new(cert("Anna", "ICU CA", 7))))
+                }
+                _ => {}
             }
             let mut view = UserView::new(2);
             let height = if width < 900.0 { 520.0 } else { 640.0 };
@@ -1273,6 +1301,110 @@ fn user_path_details_and_missing_data() {
                 h.get_by_label(&format!("{glyph} {label}")).click();
                 h.run();
             }
+        }
+    }
+}
+
+/// All cards share their bounds and row baselines even when one column
+/// wraps. Inspect rendered geometry rather than duplicating layout formulas.
+#[test]
+fn user_path_cards_align_with_wrapping_and_scaling() {
+    fn rects(shapes: &[egui::epaint::ClippedShape], out: &mut Vec<egui::Rect>) {
+        fn visit(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(r)
+                    if r.rect.width() > 150.0
+                        && r.rect.height() > 100.0
+                        && r.rect.top() < 100.0 =>
+                {
+                    out.push(r.rect)
+                }
+                egui::Shape::Vec(children) => children.iter().for_each(|s| visit(s, out)),
+                _ => {}
+            }
+        }
+        for shape in shapes {
+            visit(&shape.shape, out);
+        }
+    }
+    for theme_name in THEMES {
+        for (case, width, scale) in [
+            ("wide", 900.0, 1.0),
+            ("narrow", 760.0, 1.0),
+            ("125", 760.0, 1.25),
+            ("150", 760.0, 1.5),
+        ] {
+            let mut s = state();
+            s.peers[0].info.name = "Alexandra-Christiane mit einem langen Anzeigenamen".into();
+            s.peers[0].info.flags =
+                UserFlags(UserFlags::CAMERA_ON | UserFlags::VIEWING | UserFlags::MUTED);
+            s.peers[0].speaking = false;
+            s.server_name = "voice-server-mit-langem-namen.example.org".into();
+            s.server = "voice-server-mit-langem-namen.example.org:4711".into();
+            let mut view = UserView::new(2);
+            let mut h = harness_scaled([width, 980.0], theme_name, true, scale, move |ui| {
+                view.ui(ui, &s, &|_| None, &|_| {});
+                assert!(ui.min_rect().right() <= ui.max_rect().right() + 0.5);
+            });
+            h.run();
+            let mut cards = Vec::new();
+            rects(&h.output().shapes, &mut cards);
+            cards.retain(|r| r.width() < width / 2.0);
+            cards.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            assert_eq!(cards.len(), 3, "{case}/{theme_name}: {cards:?}");
+            for r in &cards[1..] {
+                assert!((r.width() - cards[0].width()).abs() < 0.5);
+                assert!((r.top() - cards[0].top()).abs() < 0.5);
+                assert!((r.bottom() - cards[0].bottom()).abs() < 0.5);
+            }
+            let roles = ["Mitglied", "Medienvermittlung", "Admin"]
+                .map(|label| h.get_by_label(label).rect());
+            for r in &roles[1..] {
+                assert!((r.top() - roles[0].top()).abs() < 0.5);
+            }
+            let certs: Vec<_> = h
+                .get_all_by_label_contains("CA-Signatur geprüft")
+                .map(|n| n.rect())
+                .collect();
+            assert_eq!(certs.len(), 3);
+            for r in &certs[1..] {
+                assert!((r.top() - certs[0].top()).abs() < 0.5);
+            }
+            for (i, role) in roles.iter().enumerate() {
+                assert!(cards[i].contains_rect(*role));
+            }
+            let mut name_top = None;
+            for (i, name) in [
+                "Alexandra-Christiane mit einem langen Anzeigenamen",
+                "voice-server-mit-langem-namen.example.org",
+                "Chris",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let name = h.get_by_label(name).rect();
+                let top = *name_top.get_or_insert(name.top());
+                assert!(
+                    (name.top() - top).abs() < 0.5,
+                    "{case}: name baselines differ"
+                );
+                assert!(
+                    cards[i].contains_rect(name),
+                    "{case}: name escapes card {i}"
+                );
+                assert!(
+                    name.bottom() < roles[i].top(),
+                    "{case}: name overlaps role {i}"
+                );
+            }
+            let selectors = ["Nutzerzertifikat", "Serverzertifikat", "Dein Zertifikat"];
+            for (i, label) in selectors.into_iter().enumerate() {
+                let selector = h
+                    .get_by_label(&format!("{} {label}", egui_phosphor::regular::CERTIFICATE))
+                    .rect();
+                assert!((selector.center().x - cards[i].center().x).abs() < 1.0);
+            }
+            shot(&mut h, &format!("user-grid-{case}-{theme_name}"));
         }
     }
 }
