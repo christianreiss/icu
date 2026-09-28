@@ -13,7 +13,10 @@ pub mod command;
 mod helper;
 mod history;
 
-use std::sync::{Arc, Mutex};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 
@@ -31,7 +34,7 @@ const PROMPT: &str = "icu-server> ";
 
 type ShellEditor = Editor<ShellHelper, DefaultHistory>;
 
-pub async fn run(config: &Config) -> Result<()> {
+pub async fn run(config_path: &Path, config: &Config) -> Result<()> {
     let users = Arc::new(Mutex::new(fetch_users(config).await.unwrap_or_else(|e| {
         eprintln!("icu-server: cannot reach the admin socket yet: {e}");
         Vec::new()
@@ -101,6 +104,20 @@ pub async fn run(config: &Config) -> Result<()> {
                 Err(e) => println!("% cannot refresh users: {e}"),
             },
             Action::ShowBackups => show_backups(config),
+            // Local and read-only, like `show backups`: no admin request, and
+            // a failing check must not end the session the way it ends the
+            // one-shot CLI.
+            Action::Doctor { raw_json } => {
+                let report = cli::doctor::diagnose(config_path).await;
+                if raw_json {
+                    match serde_json::to_string(&report.to_json()) {
+                        Ok(text) => println!("{text}"),
+                        Err(e) => println!("% {e}"),
+                    }
+                } else {
+                    report.print();
+                }
+            }
             Action::Admin { request, raw_json } => {
                 run_admin(config, request, raw_json, &users).await
             }

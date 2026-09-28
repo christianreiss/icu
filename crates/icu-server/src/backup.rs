@@ -50,18 +50,18 @@ const FORMAT: u32 = 1;
 const TEMP_PREFIX: &str = ".icu-";
 
 /// A file of the state directory a snapshot carries.
-struct StateFile {
-    name: &'static str,
+pub struct StateFile {
+    pub name: &'static str,
     /// Mode 0600 when put back.
-    secret: bool,
+    pub secret: bool,
     /// Without it a snapshot cannot be restored. The server leaf is
     /// disposable: the server issues a new one when it is missing.
-    required: bool,
+    pub required: bool,
 }
 
 /// Everything in the state directory that is state; `state.lock` and
 /// leftovers are not.
-const STATE_FILES: [StateFile; 7] = [
+pub const STATE_FILES: [StateFile; 7] = [
     StateFile {
         name: "ca.crt",
         secret: false,

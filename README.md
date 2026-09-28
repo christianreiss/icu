@@ -23,7 +23,9 @@ Benutzer (Startmenü-Eintrag, Deinstallation über Einstellungen/Systemsteuerung
 keine Administratorrechte; SmartScreen warnt bei beiden gleich), der Server `icu-server` für
 Fedora, AlmaLinux 10+ (`.rpm`) und Debian 12+ (`.deb`) (Einrichtung:
 `deploy/README.md` §0), sowie eine interaktive Admin-Shell
-(`icu-server shell`, kurz `icu-cli`, `Server/IMPLEMENTATION.md` §5.1).
+(`icu-server shell`, kurz `icu-cli`, `Server/IMPLEMENTATION.md` §5.1) und
+eine Nur-Lese-Diagnose für Konfiguration, State, Zertifikate und Ports
+(`icu-server doctor`, §5).
 
 ## Nicht-Ziele
 

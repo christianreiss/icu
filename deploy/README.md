@@ -387,6 +387,8 @@ icu-server revoke alice                    # alle Certs sperren, sofort kicken
 icu-server revoke id:7                     # ausdrücklich die user_id (name:… für den Namen)
 icu-server status                          # Uptime, online, offene Verbindungen, Zähler
 icu-server status --json                   # dasselbe für Monitoring
+icu-server doctor                          # Nur-Lese-Diagnose: Konfiguration, State, Zertifikate, Socket, Ports
+icu-server doctor --json                   # dasselbe als JSON (Exit 1, sobald eine Prüfung `fail` ist)
 icu-server rotate-server-cert              # neues Server-Leaf derselben CA
 icu-server renew-ca                        # CA-Zertifikat neu, selber Schlüssel
 icu-server backup                          # State-Snapshot jetzt (sonst nach jeder Änderung von selbst)
@@ -408,7 +410,19 @@ Nutzernamen, `?` als Kontexthilfe, eindeutige Präfixe (`sh us` für
 ```bash
 icu-cli                                    # Shell: icu-server> sh us
 icu-cli status                             # dasselbe wie icu-server status
+icu-cli doctor                             # dasselbe wie icu-server doctor
 ```
+
+`doctor` ist das Gegenstück zu `status` vor dem Start: `status` sagt, wie der
+laufende Server dasteht, `doctor` sagt, warum er nicht startet oder was an
+diesem Host nicht stimmt. Es läuft vor dem ersten Start, gegen einen laufenden
+Server und als Mitglied der Gruppe `icu` — und schreibt dabei nie, nimmt nie
+`flock(state.lock)` und öffnet nie den State; was von hier aus nicht prüfbar
+ist (der State hinter `/var/lib/private`, 0700 root), meldet es als `skip` mit
+Grund statt abzubrechen. Deshalb ist es auch der einzige Befehl, der eine
+`server.toml` noch diagnostiziert, die gar nicht parst. Es ersetzt den
+Checkmk-Check nicht und wird von ihm nicht aufgerufen: der Check bleibt auf
+`status --json`.
 
 **Erster Admin:** Admin wird, wer als Erster eine Registrierung abschließt
 (quittiert), solange es noch keinen bestätigten Admin gibt — nicht das zuerst
@@ -515,7 +529,14 @@ sudo usermod -aG icu root      # oder den Agent-User in die Gruppe icu
 
 Die Gruppe `icu` ist volle Serververwaltung, kein Lesezugriff: wer den
 Admin-Socket erreicht, kann auch einladen, sperren und widerrufen (§6). Einen
-Socket nur für Monitoring gibt es nicht.
+Socket nur für Monitoring gibt es nicht. (`icu-server doctor` weist in seinem
+Befund `socket.group` genau darauf hin.)
+
+Der Check ruft nur `status --json` auf; `doctor` gehört nicht dazu. Es ist
+eine Diagnose für einen Menschen — vor dem Start, oder wenn der Check auf CRIT
+geht und die Frage „warum“ lautet —, keine wiederkehrende Messung: es liest
+Dateirechte, Zertifikate auf der Platte und bindet testweise die Listen-Ports,
+was ein Agent alle 60 s nicht tun sollte.
 
 Er ruft `icu-server status --json` auf. `ICU_Server` liefert die
 Momentanwerte `online`, `uptime`, `open_connections` und `handshakes` und aus

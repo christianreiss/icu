@@ -379,3 +379,170 @@ async fn the_icu_cli_alias_is_the_admin_surface() {
 
     handle.shutdown().await;
 }
+
+/// `doctor` before anything exists: it reports, exits clean, and — the part
+/// that matters — leaves the state directory exactly as it found it. Routing
+/// it through `cli::dispatch` instead of the socket would take `flock`,
+/// create the directory and write a first `users.toml`; this is the test
+/// that would catch that.
+#[tokio::test]
+async fn doctor_diagnoses_without_a_server_and_writes_nothing() {
+    let _alone = ALONE.lock().await;
+    if common::root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, run) = (dir.path().join("state"), dir.path().join("run"));
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&run).unwrap();
+    let file = dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
+            state.to_str().unwrap(),
+            run.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let before = listing(&state);
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+        .arg("--config")
+        .arg(&file)
+        .arg("doctor")
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("no server is running"), "{stdout}");
+    // No socket, so the listen ports are genuinely testable.
+    assert!(stdout.contains("listen."), "{stdout}");
+    assert_eq!(
+        listing(&state),
+        before,
+        "doctor touched the state directory"
+    );
+}
+
+/// Against a running server `doctor` reads its `status` over the socket, and
+/// leaves the listen ports alone: they are the running server's, and binding
+/// them would report the server's own port as a defect.
+#[tokio::test]
+async fn doctor_reads_a_running_server_and_skips_its_ports() {
+    let _alone = ALONE.lock().await;
+    if common::root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, run) = (dir.path().join("state"), dir.path().join("run"));
+    let mut config = icu_server::Config::for_test(&state);
+    config.paths.runtime_dir = run.clone();
+    let handle = icu_server::run(config).await.expect("server");
+    let file = dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
+            state.to_str().unwrap(),
+            run.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+        .arg("--config")
+        .arg(&file)
+        .args(["doctor", "--json"])
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json");
+    assert_eq!(report["ok"], serde_json::json!(true));
+    let checks = report["checks"].as_array().expect("checks");
+    let severity = |id: &str| {
+        checks
+            .iter()
+            .find(|c| c["id"] == serde_json::json!(id))
+            .unwrap_or_else(|| panic!("no {id} in {stdout}"))["severity"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(severity("server.live"), "ok");
+    assert_eq!(severity("tls.ca"), "ok");
+    assert_eq!(severity("listen"), "skip");
+    assert!(
+        !checks
+            .iter()
+            .any(|c| c["id"].as_str().is_some_and(|id| id.starts_with("listen."))),
+        "the running server's ports were test-bound: {stdout}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// The one command that has to survive a configuration the others die on:
+/// the shared `Config::read` in `main` would end the process before `doctor`
+/// ever ran.
+#[tokio::test]
+async fn doctor_still_reports_on_a_configuration_that_does_not_parse() {
+    let _alone = ALONE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("server.toml");
+    std::fs::write(&file, "[server]\nnot_a_key = 1\n").unwrap();
+
+    for path in [&file, &dir.path().join("absent.toml")] {
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+            .arg("--config")
+            .arg(path)
+            .arg("doctor")
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "{stdout}");
+        assert!(stdout.contains("fail"), "{stdout}");
+        assert!(stdout.contains("config.file"), "{stdout}");
+        // `status` on the same file gets no further than the shared read.
+        let status = tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+            .arg("--config")
+            .arg(path)
+            .arg("status")
+            .output()
+            .await
+            .unwrap();
+        assert!(status.stdout.is_empty(), "{:?}", status.stdout);
+    }
+}
+
+/// The state directory as a sorted list of names and modes.
+fn listing(dir: &std::path::Path) -> Vec<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            let mode = e
+                .metadata()
+                .map(|m| m.permissions().mode() & 0o777)
+                .unwrap_or(0);
+            format!("{} {mode:04o}", e.file_name().to_string_lossy())
+        })
+        .collect();
+    found.sort();
+    found
+}

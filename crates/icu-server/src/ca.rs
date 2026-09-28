@@ -45,10 +45,10 @@ pub const CA_COMMON_NAME: &str = "ICU CA";
 pub use icu_proto::limits::REGISTRATION_OU;
 
 /// File names under the state directory.
-const CA_CRT: &str = "ca.crt";
-const CA_KEY: &str = "ca.key";
-const SERVER_CRT: &str = "server.crt";
-const SERVER_KEY: &str = "server.key";
+pub const CA_CRT: &str = "ca.crt";
+pub const CA_KEY: &str = "ca.key";
+pub const SERVER_CRT: &str = "server.crt";
+pub const SERVER_KEY: &str = "server.key";
 /// Replaced server leaves that are not on the CRL yet, PEM one after the
 /// other. Gone again once the store has them ([`Ca::retired_recorded`]).
 const SERVER_RETIRED: &str = "server.crt.retired";
@@ -834,6 +834,13 @@ fn random_serial() -> SerialNumber {
     // A leading zero bit keeps the DER INTEGER positive without a pad byte.
     raw[0] &= 0x7F;
     SerialNumber::from_slice(&raw)
+}
+
+/// The DER of the first certificate in a PEM slice, for read-only
+/// inspection from outside (`cli::doctor` looks at `ca.crt` and
+/// `server.crt` without opening the CA, which would take the state lock).
+pub fn cert_der(pem: &[u8]) -> Result<Vec<u8>> {
+    read_cert_pem(pem).map(|der| der.to_vec())
 }
 
 fn read_cert_pem(bytes: &[u8]) -> Result<CertificateDer<'static>> {

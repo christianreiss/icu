@@ -151,6 +151,15 @@ enum AdminCommand {
     /// completion, `?` for context help. `run`, `restore` and `setup` are
     /// not available here.
     Shell,
+    /// Read-only diagnosis of configuration, state, certificates, admin
+    /// socket, listen ports and snapshots. Works before the first start,
+    /// against a running server, and as a member of the socket group; it
+    /// never writes and never takes the state lock.
+    Doctor {
+        /// Print raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `icu-cli`: the admin half of `icu-server` under a shorter name.
@@ -248,10 +257,15 @@ fn main() -> ExitCode {
 }
 
 async fn run(config_path: &Path, command: Command) -> Result<()> {
-    // `setup` may be writing the config file for the first time, so it
-    // cannot go through the shared read below.
+    // `setup` may be writing the config file for the first time, and
+    // `doctor` is the one command you run *because* the configuration does
+    // not parse. Both would be lost to the shared read below, which ends the
+    // process before the command ever starts.
     if let Command::Setup = command {
         return cli::setup::run(config_path).await;
+    }
+    if let Command::Admin(AdminCommand::Doctor { json }) = command {
+        return cli::doctor::run(config_path, json).await;
     }
     // Resolved and validated only where it is used: `run` here, the offline
     // CLI in `cli::dispatch`. A command that reaches the running server needs
@@ -270,12 +284,12 @@ async fn run(config_path: &Path, command: Command) -> Result<()> {
         // Never through the socket or the offline server: that would open,
         // and could write, the very state being replaced.
         Command::Restore { snapshot } => cli::backup::restore(&config, &snapshot).await,
-        Command::Admin(command) => run_admin(&config, command).await,
+        Command::Admin(command) => run_admin(config_path, &config, command).await,
         Command::Setup => unreachable!("handled above"),
     }
 }
 
-async fn run_admin(config: &Config, command: AdminCommand) -> Result<()> {
+async fn run_admin(config_path: &Path, config: &Config, command: AdminCommand) -> Result<()> {
     match command {
         AdminCommand::Invite { name, ttl, out } => {
             cli::invite::run(config, name.as_deref(), &ttl, out.as_deref()).await
@@ -339,7 +353,8 @@ async fn run_admin(config: &Config, command: AdminCommand) -> Result<()> {
             .await
         }
         AdminCommand::Backup { list } => cli::backup::run(config, list).await,
-        AdminCommand::Shell => icu_server::shell::run(config).await,
+        AdminCommand::Shell => icu_server::shell::run(config_path, config).await,
+        AdminCommand::Doctor { .. } => unreachable!("handled above"),
     }
 }
 

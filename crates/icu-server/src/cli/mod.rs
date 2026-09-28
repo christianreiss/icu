@@ -7,6 +7,7 @@
 //! `flock(state.lock)` while it does.
 
 pub mod backup;
+pub mod doctor;
 pub mod invite;
 pub mod setup;
 pub mod status;
