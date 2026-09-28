@@ -198,8 +198,9 @@ pub struct AppState {
     pub ptt_down: bool,
     /// Gate open (audio is going out).
     pub sending: bool,
-    /// The voice detector heard speech in the last state push (~30 ms),
-    /// muted or not: the main window warns about talking while muted.
+    /// The voice detector heard speech within the VAD hangover, muted or
+    /// not: the main window warns about talking while muted, held through
+    /// the gaps between words like an open gate (`voice_held`).
     pub voice: bool,
     /// Microphone level after processing.
     pub level: Level,
@@ -1526,6 +1527,8 @@ fn dsp_thread(
     let mut last_state_push = Instant::now();
     // Speech heard since the last push into the UI state.
     let mut voice_since_push = false;
+    // The last block the voice detector heard speech in (`voice_held`).
+    let mut last_voice: Option<Instant> = None;
     let mut last_aec_stats = Instant::now();
     // Reference energy since the last stats push, folded with the
     // statistics into the user hints (`dsp::aec::Diagnosis`).
@@ -1722,6 +1725,7 @@ fn dsp_thread(
                 let speaking = floor_sample_is_speech(
                     gate.mode(),
                     gate.is_open(),
+                    gate.is_muted(),
                     p,
                     auto_threshold.threshold(),
                 );
@@ -1735,6 +1739,9 @@ fn dsp_thread(
         let voice = vad::is_voice(threshold, prob, level);
         voice_in_frame |= voice;
         voice_since_push |= voice;
+        if voice {
+            last_voice = Some(t_block);
+        }
         // Voice optimizer, outbound normalization and limiter.
         chain.finish(&mut block, voice, &send);
 
@@ -1861,7 +1868,9 @@ fn dsp_thread(
             let ptt = ctl.ptt_down.load(Ordering::Relaxed);
             let p = ctl.vad_prob.load();
             let vad_threshold = ctl.vad_effective_threshold.load();
-            let voice = std::mem::take(&mut voice_since_push);
+            let hangover = Duration::from_millis(ctl.hangover_ms.load(Ordering::Relaxed) as u64);
+            let voice = std::mem::take(&mut voice_since_push)
+                || voice_held(last_voice, last_state_push, hangover);
             shared.state.send_modify(|s| {
                 s.level = level;
                 s.vad_prob = p;
@@ -1901,9 +1910,27 @@ fn collect_block(
 /// key is down: the user talking to the room with the key up would feed
 /// the floor with speech, drive the threshold up within a second and leave
 /// the VAD — and with it the leveler — blind when the key goes down. So
-/// there a block that clears the current threshold is speech too.
-fn floor_sample_is_speech(mode: Mode, gate_open: bool, prob: f32, threshold: f32) -> bool {
-    gate_open || (mode == Mode::Ptt && prob >= threshold)
+/// there a block that clears the current threshold is speech too. The same
+/// holds in either mode while mute keeps the gate shut (`gate_muted`):
+/// talking while muted raised the threshold until the voice detector no
+/// longer heard it, and the "Stumm — du sprichst" cue went out mid-sentence.
+fn floor_sample_is_speech(
+    mode: Mode,
+    gate_open: bool,
+    gate_muted: bool,
+    prob: f32,
+    threshold: f32,
+) -> bool {
+    gate_open || ((mode == Mode::Ptt || gate_muted) && prob >= threshold)
+}
+
+/// Whether the voice detector still counts as hearing speech at `now`
+/// ([`AppState::voice`]): its last voiced block is at most `hold` — the VAD
+/// hangover — old. Speech dips below the threshold between words; without
+/// the hold the talking-while-muted cue flickered at the push rate where an
+/// open gate stays open.
+fn voice_held(last_voice: Option<Instant>, now: Instant, hold: Duration) -> bool {
+    last_voice.is_some_and(|t| now.saturating_duration_since(t) <= hold)
 }
 
 /// The gate mode the `vad_mode` atomic encodes.
@@ -4770,13 +4797,70 @@ mod tests {
     fn ptt_users_off_air_speech_does_not_feed_the_noise_floor() {
         use super::{floor_sample_is_speech, Mode};
         // VAD mode: the gate decides.
-        assert!(floor_sample_is_speech(Mode::Vad, true, 0.1, 0.3));
-        assert!(!floor_sample_is_speech(Mode::Vad, false, 0.9, 0.3));
+        assert!(floor_sample_is_speech(Mode::Vad, true, false, 0.1, 0.3));
+        assert!(!floor_sample_is_speech(Mode::Vad, false, false, 0.9, 0.3));
         // PTT mode, key up: a block over the threshold is speech all the
         // same; a quiet one feeds the floor.
-        assert!(floor_sample_is_speech(Mode::Ptt, false, 0.9, 0.3));
-        assert!(!floor_sample_is_speech(Mode::Ptt, false, 0.1, 0.3));
-        assert!(floor_sample_is_speech(Mode::Ptt, true, 0.1, 0.3));
+        assert!(floor_sample_is_speech(Mode::Ptt, false, false, 0.9, 0.3));
+        assert!(!floor_sample_is_speech(Mode::Ptt, false, false, 0.1, 0.3));
+        assert!(floor_sample_is_speech(Mode::Ptt, true, false, 0.1, 0.3));
+    }
+
+    /// Talking while muted in voice activation: the shut gate is no sign of
+    /// silence, so the speech stays out of the floor and the voice detector
+    /// keeps hearing it — the "Stumm — du sprichst" cue stays on.
+    #[test]
+    fn muted_speech_does_not_feed_the_noise_floor() {
+        use super::{floor_sample_is_speech, vad_auto::AutoThreshold, Mode};
+        use std::time::{Duration, Instant};
+        assert!(floor_sample_is_speech(Mode::Vad, false, true, 0.9, 0.3));
+        assert!(!floor_sample_is_speech(Mode::Vad, false, true, 0.1, 0.3));
+        let t0 = Instant::now();
+        let mut auto = AutoThreshold::new(t0);
+        let start = auto.threshold();
+        // Three seconds of steady speech, one 10-ms block at a time.
+        for i in 0..300u64 {
+            let t = t0 + Duration::from_millis(10 * i);
+            let th = auto.threshold();
+            auto.update(
+                t,
+                floor_sample_is_speech(Mode::Vad, false, true, 0.95, th),
+                0.95,
+            );
+        }
+        assert_eq!(
+            auto.threshold(),
+            start,
+            "the floor did not absorb the speech"
+        );
+        assert!(0.95 >= auto.threshold(), "still heard as voice");
+    }
+
+    #[test]
+    fn the_voice_cue_holds_through_the_hangover() {
+        use super::voice_held;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let hold = Duration::from_millis(1000);
+        assert!(!voice_held(None, t0, hold));
+        assert!(voice_held(Some(t0), t0, hold));
+        assert!(
+            voice_held(Some(t0), t0 + Duration::from_millis(400), hold),
+            "between words"
+        );
+        assert!(voice_held(Some(t0), t0 + hold, hold));
+        assert!(!voice_held(
+            Some(t0),
+            t0 + Duration::from_millis(1001),
+            hold
+        ));
+        // A block stamped after the push took `now`.
+        assert!(voice_held(Some(t0 + Duration::from_millis(5)), t0, hold));
+        assert!(!voice_held(
+            Some(t0),
+            t0 + Duration::from_millis(1),
+            Duration::ZERO
+        ));
     }
 
     #[test]
