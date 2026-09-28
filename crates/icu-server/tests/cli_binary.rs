@@ -179,6 +179,83 @@ async fn the_shell_runs_a_piped_session_against_a_real_server() {
     handle.shutdown().await;
 }
 
+/// The shell's `invite` command with an out-file: like `icu-server invite
+/// --out`, the bundle is written (mode 0600) instead of printed, and the
+/// summary line still appears.
+#[tokio::test]
+async fn the_shell_invite_writes_an_out_file() {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let _alone = ALONE.lock().await;
+    if common::root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, run) = (dir.path().join("state"), dir.path().join("run"));
+    let mut config = icu_server::Config::for_test(&state);
+    config.paths.runtime_dir = run.clone();
+    let handle = icu_server::run(config).await.expect("server");
+    let file = dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
+            state.to_str().unwrap(),
+            run.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let out_path = dir.path().join("bob.icu");
+
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+        .arg("--config")
+        .arg(&file)
+        .arg("shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("invite bob 1h {}\nexit\n", out_path.display()).as_bytes())
+        .await
+        .unwrap();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("shell did not exit")
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains(&format!("bundle written to {}", out_path.display())),
+        "{stdout}"
+    );
+    assert!(stdout.contains("registration for bob"), "{stdout}");
+    assert!(
+        !stdout.contains("BEGIN ICU PASSPORT"),
+        "the bundle must not also be printed: {stdout}"
+    );
+
+    let bundle = std::fs::read_to_string(&out_path).unwrap();
+    assert!(bundle.contains("BEGIN ICU PASSPORT"), "{bundle}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+    }
+
+    handle.shutdown().await;
+}
+
 /// `icu-server setup` on a fresh, nonexistent config path: piped answers
 /// (declining the first-admin invite, to keep this self-contained) produce a
 /// `server.toml` the server itself loads and validates.

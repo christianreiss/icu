@@ -963,9 +963,34 @@ impl SettingsView {
         });
     }
 
+    /// Takes a file dropped onto the window while the import area is open:
+    /// an `.icu` invite or passport, read as text — the same funnel a paste
+    /// uses (mirrors `EnrollApp::take_dropped`, `ui/main_window.rs`).
+    /// Anything unreadable is left for the field's own verdict.
+    fn take_dropped(&mut self, ctx: &egui::Context) {
+        // A passport decodes to at most 8 KiB; anything much larger is not
+        // one and is not read into memory.
+        const MAX_DROP: u64 = 64 * 1024;
+        let dropped = ctx.input(|i| {
+            i.raw.dropped_files.iter().find_map(|f| {
+                let path = f.path();
+                let small = std::fs::metadata(path).is_ok_and(|m| m.len() <= MAX_DROP);
+                small.then(|| std::fs::read_to_string(path).ok()).flatten()
+            })
+        });
+        if let Some(text) = dropped {
+            self.passport_import = text;
+            self.preview_passport();
+        }
+    }
+
     /// The paste field for a passport and, as soon as it reads as one,
     /// where it leads and the button that takes it: no separate „Prüfen".
+    /// A file dropped here works the same as pasting it.
     fn import_area(&mut self, ui: &mut Ui, cmds: &mut Vec<Command>) {
+        let ctx = ui.ctx().clone();
+        self.take_dropped(&ctx);
+        let dragging = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let mut edited = false;
         widgets::card_note(ui, |ui| {
             // A passport with settings runs to some 50 lines: the field stops
@@ -978,7 +1003,11 @@ impl SettingsView {
                         egui::TextEdit::multiline(&mut self.passport_import)
                             .desired_rows(3)
                             .desired_width(f32::INFINITY)
-                            .hint_text("Passport hier einfügen (Strg+V)")
+                            .hint_text(if dragging {
+                                "Datei loslassen, um sie zu öffnen"
+                            } else {
+                                "Passport hier einfügen (Strg+V) oder eine Datei hierher ziehen"
+                            })
                             .font(egui::TextStyle::Monospace),
                     );
                     if std::mem::take(&mut self.focus_import) {

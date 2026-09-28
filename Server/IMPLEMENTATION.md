@@ -188,7 +188,7 @@ Präfix-Abkürzungen wie bei Cisco IOS, z. B. `sh us` für `show users`):
 | `show users [--json]` | wie `icu-server users` |
 | `show backups` | wie `icu-server backup --list` |
 | `doctor [--json]` | wie `icu-server doctor`, lokal und nur lesend: kein Admin-Request, und ein `fail` beendet die Sitzung nicht, wie es die einmalige CLI beendet |
-| `invite [name] [ttl]` | wie `icu-server invite`, Bundle nur auf stdout |
+| `invite [name] [ttl] [out-file]` | wie `icu-server invite --out`; mit einer Ausgabedatei landet das Bundle dort (Modus 0600) statt auf stdout |
 | `kick`/`disable`/`revoke <user>` | wie die gleichnamigen CLI-Kommandos, fragen vorher `[y/N]` (schließen Verbindungen bzw. `revoke` ist unumkehrbar) |
 | `mute`/`unmute`/`deafen`/`undeafen`/`promote`/`demote`/`enable <user>` | wie die gleichnamigen CLI-Kommandos |
 | `rotate-server-cert` / `renew-ca` / `backup` | wie die gleichnamigen CLI-Kommandos |

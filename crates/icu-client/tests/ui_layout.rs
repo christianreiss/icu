@@ -37,6 +37,22 @@ use icu_proto::{AudioParams, UserFlags, UserInfo, UserSummary};
 #[cfg(unix)]
 mod common;
 
+/// A dropped file for tests: `egui::DroppedFile` is a trait (egui 0.36), the
+/// same shape egui-winit's native backend implements for a real OS drop.
+#[cfg(unix)]
+#[derive(Debug)]
+struct TestDroppedFile(std::path::PathBuf);
+
+#[cfg(unix)]
+impl egui::DroppedFile for TestDroppedFile {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
 /// What the windows open with (`ui::main_window`).
 const MAIN: [f32; 2] = icu_client::ui::main_window::MAIN_SIZE;
 const SETTINGS: [f32; 2] = icu_client::ui::main_window::SETTINGS_SIZE;
@@ -767,6 +783,44 @@ fn settings_import_of_an_invitation_takes_no_settings() {
         })
         .expect("a ReplaceIdentity");
     assert!(settings.is_none(), "an invitation brought settings");
+}
+
+/// A passport or invite dropped onto the settings import area works the
+/// same as pasting it: no separate "browse" affordance is needed, and both
+/// ways in end at the same "Übernehmen" confirmation.
+#[cfg(unix)]
+#[test]
+fn settings_import_area_accepts_a_dropped_file() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let bundle = rt.block_on(async {
+        let server = common::TestServer::start().await;
+        server.invite_bundle("dave").await
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("dave.icu");
+    std::fs::write(&file, &bundle).unwrap();
+
+    let s = state();
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(dir.path().to_path_buf())),
+    );
+    view.open_import();
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let cmds_out = cmds.clone();
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        cmds_out.borrow_mut().extend(view.ui(ui, &s, false).cmds);
+    });
+    h.input_mut().dropped_files =
+        vec![Arc::new(TestDroppedFile(file.clone())) as Arc<dyn egui::DroppedFile + Send + Sync>];
+    h.run();
+    // The drop reached the same preview a paste would: the confirm button
+    // is there, and nothing prompted for the field to be filled by hand.
+    h.get_by_role_and_label(
+        egui::accesskit::Role::Button,
+        &format!("{}  Übernehmen", egui_phosphor::regular::CHECK),
+    );
 }
 
 /// Switches and sliders carry the name of their row for a screen reader,

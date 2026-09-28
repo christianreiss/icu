@@ -10,6 +10,8 @@
 //! literal keywords, never to an argument: a user named `k` is never mistaken
 //! for `kick`.
 
+use std::path::PathBuf;
+
 use crate::{admin::AdminUser, AdminRequest};
 
 /// What kind of argument a command takes.
@@ -33,6 +35,9 @@ pub enum Action {
         /// `show status`/`show users --json`: print the raw response
         /// instead of the formatted view.
         raw_json: bool,
+        /// `invite ... <out-file>`: write the returned bundle there (mode
+        /// 0600, like `icu-server invite --out`) instead of printing it.
+        out: Option<PathBuf>,
     },
     /// `show backups`: a local, read-only listing (`crate::backup::list`),
     /// no admin request involved.
@@ -90,6 +95,7 @@ fn admin(request: AdminRequest) -> Result<Action, String> {
     Ok(Action::Admin {
         request,
         raw_json: false,
+        out: None,
     })
 }
 
@@ -114,6 +120,7 @@ const SHOW_CHILDREN: &[(&str, Node)] = &[
                 Ok(Action::Admin {
                     request: AdminRequest::Status,
                     raw_json: wants_json(args),
+                    out: None,
                 })
             },
         }),
@@ -128,6 +135,7 @@ const SHOW_CHILDREN: &[(&str, Node)] = &[
                 Ok(Action::Admin {
                     request: AdminRequest::Users,
                     raw_json: wants_json(args),
+                    out: None,
                 })
             },
         }),
@@ -168,10 +176,13 @@ pub const TOP: &[(&str, Node)] = &[
     (
         "invite",
         Node::Leaf(Leaf {
-            help: "Issue a registration bundle: [name] [ttl, e.g. 24h].",
+            help: "Issue a registration bundle: [name] [ttl, e.g. 24h] [out-file]. \
+                   With an out-file, writes the bundle there (mode 0600) instead of \
+                   printing it.",
             args: &[
                 ArgKind::FreeText("[name]"),
                 ArgKind::FreeText("[ttl, e.g. 24h]"),
+                ArgKind::FreeText("[out-file]"),
             ],
             confirm: false,
             build: |args| {
@@ -179,9 +190,18 @@ pub const TOP: &[(&str, Node)] = &[
                 let ttl_s =
                     crate::cli::invite::parse_duration(if ttl.is_empty() { "24h" } else { ttl })
                         .map_err(|e| e.to_string())?;
-                admin(AdminRequest::Invite {
-                    name: args.first().cloned().unwrap_or_default(),
-                    ttl_s: Some(ttl_s),
+                let out = args
+                    .get(2)
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from);
+                Ok(Action::Admin {
+                    request: AdminRequest::Invite {
+                        name: args.first().cloned().unwrap_or_default(),
+                        ttl_s: Some(ttl_s),
+                    },
+                    raw_json: false,
+                    out,
                 })
             },
         }),
@@ -628,7 +648,8 @@ mod tests {
             action,
             Action::Admin {
                 request: AdminRequest::Users,
-                raw_json: false
+                raw_json: false,
+                out: None,
             }
         );
         assert!(confirm.is_none());
@@ -641,7 +662,8 @@ mod tests {
             action,
             Action::Admin {
                 request: AdminRequest::Users,
-                raw_json: false
+                raw_json: false,
+                out: None,
             }
         );
     }
@@ -653,7 +675,8 @@ mod tests {
             action,
             Action::Admin {
                 request: AdminRequest::Status,
-                raw_json: true
+                raw_json: true,
+                out: None,
             }
         );
     }
@@ -681,6 +704,7 @@ mod tests {
                     user: "alice".to_string()
                 },
                 raw_json: false,
+                out: None,
             }
         );
         assert!(confirm.unwrap().starts_with("kick alice"));
@@ -750,6 +774,7 @@ mod tests {
                     ttl_s: Some(86400),
                 },
                 raw_json: false,
+                out: None,
             }
         );
     }
@@ -765,6 +790,7 @@ mod tests {
                     ttl_s: Some(604800),
                 },
                 raw_json: false,
+                out: None,
             }
         );
     }
@@ -775,6 +801,22 @@ mod tests {
             resolve_line("invite bob soon"),
             Err(ResolveError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn invite_takes_an_out_file() {
+        let (action, _) = resolve_line("invite bob 7d /tmp/bob.icu").unwrap();
+        assert_eq!(
+            action,
+            Action::Admin {
+                request: AdminRequest::Invite {
+                    name: "bob".to_string(),
+                    ttl_s: Some(604800),
+                },
+                raw_json: false,
+                out: Some(PathBuf::from("/tmp/bob.icu")),
+            }
+        );
     }
 
     #[test]

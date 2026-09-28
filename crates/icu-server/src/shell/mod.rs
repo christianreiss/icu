@@ -14,7 +14,7 @@ mod helper;
 mod history;
 
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -118,9 +118,11 @@ pub async fn run(config_path: &Path, config: &Config) -> Result<()> {
                     report.print();
                 }
             }
-            Action::Admin { request, raw_json } => {
-                run_admin(config, request, raw_json, &users).await
-            }
+            Action::Admin {
+                request,
+                raw_json,
+                out,
+            } => run_admin(config, request, raw_json, out, &users).await,
         }
     }
 
@@ -178,11 +180,12 @@ async fn run_admin(
     config: &Config,
     request: AdminRequest,
     raw_json: bool,
+    out: Option<PathBuf>,
     users: &Arc<Mutex<Vec<AdminUser>>>,
 ) {
     let mutating = is_mutating(&request);
     match cli::dispatch(config, request).await {
-        Ok(value) => print_response(&value, raw_json),
+        Ok(value) => print_response(&value, raw_json, out.as_deref()),
         Err(e) => println!("% {e}"),
     }
     if mutating {
@@ -192,7 +195,7 @@ async fn run_admin(
     }
 }
 
-fn print_response(value: &serde_json::Value, raw_json: bool) {
+fn print_response(value: &serde_json::Value, raw_json: bool, out: Option<&Path>) {
     if let Err(e) = cli::require_ok(value) {
         println!("% {e}");
         return;
@@ -208,7 +211,17 @@ fn print_response(value: &serde_json::Value, raw_json: bool) {
         return;
     }
     if let Some(bundle) = value.get("bundle").and_then(|v| v.as_str()) {
-        println!("{bundle}");
+        match out {
+            // Mode 0600: the bundle is a bearer credential until it is used.
+            Some(path) => match crate::store::write_private_for_caller(path, bundle) {
+                Ok(()) => println!("bundle written to {}", path.display()),
+                Err(e) => {
+                    println!("% cannot write {}: {e}", path.display());
+                    return;
+                }
+            },
+            None => println!("{bundle}"),
+        }
         println!(
             "registration for {} (user_id {}), valid until {}",
             value.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
