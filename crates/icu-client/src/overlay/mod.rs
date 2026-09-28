@@ -39,19 +39,28 @@ use self::windows as platform;
 
 const GAP: u32 = 8;
 const BORDER: u32 = 3;
-/// Gap between a tile's border ring and its outside name-label band.
-const LABEL_GAP: u32 = 4;
+/// Gap between a tile's border ring and its outside name-label band: flush,
+/// so the paper tag reads as attached to the tile rather than floating near
+/// it.
+const LABEL_GAP: u32 = 0;
 /// Vertical padding inside the label band, above/below the glyphs' ascent
 /// span, that sets the band's radial thickness.
 const LABEL_PAD_V: u32 = 4;
-/// Half the total arc a name may curve across before it's cut with „…" —
-/// past this the letters would start reading upside down near the ends.
-const MAX_LABEL_HALF_ANGLE: f32 = 62.0 * std::f32::consts::PI / 180.0;
-/// Extra angle the opaque label band extends past the text itself, so
-/// antialiased glyph edges never poke out past an opaque backing.
-const LABEL_BAND_PAD_ANGLE: f32 = 6.0 * std::f32::consts::PI / 180.0;
+/// The max arc a name may curve across, starting at 6 o'clock and sweeping
+/// counterclockwise, before it's cut with „…" — past this the letters would
+/// start reading upside down.
+const MAX_LABEL_ANGLE: f32 = 124.0 * std::f32::consts::PI / 180.0;
 /// Brightness multiplier (out of 256) applied to dimmed, non-speaking tiles.
 const DIM_MUL: u32 = 128;
+/// The name label's paper-tag backdrop: a warm, opaque cream, in
+/// premultiplied BGRA — deliberately not a UI-theme color, since it must
+/// read the same over any tile picture or background.
+const PAPER_FILL: [u8; 4] = [0xd0, 0xe8, 0xf2, 0xff];
+/// The name label's ink: dark and slightly warm (R > G > B), chosen to
+/// stay visually distinct from the neutral grays used elsewhere on a tile
+/// (border, plate fill) so tests can tell "ink" apart from "some dark
+/// pixel".
+const LABEL_INK: [u8; 3] = [0x1a, 0x22, 0x2b];
 /// Frame interval: 15 fps.
 const TICK: Duration = Duration::from_millis(1000 / 15);
 
@@ -281,6 +290,17 @@ fn blend_white(dst: &mut [u8], a: u32) {
     }
 }
 
+/// Blends `ink` (B, G, R) into one premultiplied BGRA pixel's color
+/// channels by coverage `a` (0-255), leaving alpha untouched — the paper
+/// label's backdrop is already opaque, so there's nothing to composite
+/// there. The curved outside name uses this instead of [`blend_white`] so
+/// it reads as dark ink on its cream backdrop.
+fn blend_ink(dst: &mut [u8], ink: [u8; 3], a: u32) {
+    for (c, ink_c) in dst.iter_mut().zip(ink) {
+        *c = ((u32::from(ink_c) * a + u32::from(*c) * (255 - a)) / 255) as u8;
+    }
+}
+
 /// Blends a white `label` into `canvas` (premultiplied BGRA, `stride`
 /// bytes per row) at `x`, `y`, clipped to the canvas.
 fn blend_label(canvas: &mut [u8], stride: usize, x: u32, y: u32, label: &Label) {
@@ -303,8 +323,10 @@ fn blend_label(canvas: &mut [u8], stride: usize, x: u32, y: u32, label: &Label) 
 /// row indices) sits at radius `r_inner`, closest to the circle, and it
 /// extends further outward as the row index grows toward its baseline and
 /// descent — the normal top-then-bottom reading order, just bent around
-/// the circle instead of running straight. `theta = 0` is straight down;
-/// it increases clockwise, matching left→right reading.
+/// the circle instead of running straight. `theta = 0` is straight down
+/// (6 o'clock); it increases counterclockwise, so a name's first glyph
+/// sits at `theta = 0` and later ones climb the circle's right side.
+#[allow(clippy::too_many_arguments)]
 fn blit_rotated_glyph(
     canvas: &mut [u8],
     stride: usize,
@@ -313,6 +335,7 @@ fn blit_rotated_glyph(
     r_inner: f32,
     theta: f32,
     glyph: &Label,
+    ink: [u8; 3],
 ) {
     let (canvas_w, canvas_h) = canvas_size;
     let (cx, cy) = center;
@@ -364,7 +387,7 @@ fn blit_rotated_glyph(
             }
             let i = wy as usize * stride + wx as usize * 4;
             if let Some(px) = canvas.get_mut(i..i + 4) {
-                blend_white(px, a);
+                blend_ink(px, ink, a);
             }
         }
     }
@@ -672,12 +695,21 @@ struct CircleGeom {
 fn circle_geometry(diameter: u32, name_px: u32) -> CircleGeom {
     let radii = radii(diameter as f32, name_px);
     // The label band can bulge sideways past the circle itself at wide
-    // angles; the tile's reserved box must be wide enough for that, sized
-    // for the widest angle a name is ever allowed (truncation keeps
-    // shorter names from needing it, but the slot stays constant).
-    let band_half_angle = MAX_LABEL_HALF_ANGLE + LABEL_BAND_PAD_ANGLE;
-    let bulge = radii.r_label_outer * band_half_angle.sin();
-    let half_w = radii.r_outer.max(bulge).ceil() as u32;
+    // angles, all to the right since the label starts at 6 o'clock and
+    // only ever sweeps counterclockwise from there; the tile's reserved
+    // box (kept symmetric, so a tile never has to move) must be wide
+    // enough for that on its wider side, sized for the widest angle a name
+    // is ever allowed (truncation keeps shorter names from needing it, but
+    // the slot stays constant). Two shapes can reach furthest right: the
+    // flat band itself (widest at 90° if the sweep passes it, else at its
+    // end angle) and its rounded end cap (a circle of radius `half_thick`,
+    // half the band's thickness, centered on the band's midline at the end
+    // angle) — reserve whichever of the two reaches further.
+    let half_thick = (radii.r_label_outer - radii.r_label_inner) / 2.0;
+    let mid_r = radii.r_label_inner + half_thick;
+    let flat_bulge = radii.r_label_outer * MAX_LABEL_ANGLE.min(std::f32::consts::FRAC_PI_2).sin();
+    let cap_bulge = mid_r * MAX_LABEL_ANGLE.sin() + half_thick;
+    let half_w = radii.r_outer.max(flat_bulge).max(cap_bulge).ceil() as u32;
     CircleGeom {
         radii,
         half_w,
@@ -719,12 +751,33 @@ fn sample_camera_circle(
     }
 }
 
-/// Draws `name`, curved along the arc up to `max_half_angle` either side of
-/// straight down from `(cx, cy)`, its ascent following the circle at
-/// radius `r_inner`, cut with „…" to fit — the tile's outside label,
-/// replacing the old strip drawn over the picture. Kerning is dropped
-/// (each glyph is its own rigid rotation), and layout uses exact arc
-/// length (`theta = s / r_inner`), not an approximation.
+/// The name actually shown for a tile — cut with „…" so it fits `max_angle`
+/// of arc starting at 6 o'clock and sweeping counterclockwise — and the
+/// angle it actually needs there. Empty (angle `0.0`) for an empty name or
+/// one that cuts down to nothing, so [`compose`] knows to paint no paper
+/// backdrop at all rather than a bare, textless tag.
+fn label_extent(
+    labels: &mut Labels,
+    name: &str,
+    px: u32,
+    r_inner: f32,
+    max_angle: f32,
+) -> (String, f32) {
+    let max_arc = max_angle * r_inner;
+    let shown = labels.cut(name, px, max_arc);
+    if shown.is_empty() {
+        return (shown, 0.0);
+    }
+    let angle = (labels.advance(&shown, px) / r_inner).min(max_angle);
+    (shown, angle)
+}
+
+/// Draws `shown` (already cut to fit, see [`label_extent`]) curved from
+/// straight down (`(cx, cy)`, 6 o'clock) counterclockwise, its ascent
+/// following the circle at radius `r_inner`, in `ink` — the tile's outside
+/// label, replacing the old strip drawn over the picture. Kerning is
+/// dropped (each glyph is its own rigid rotation), and layout uses exact
+/// arc length (`theta = s / r_inner`), not an approximation.
 #[allow(clippy::too_many_arguments)]
 fn draw_curved_label(
     canvas: &mut [u8],
@@ -734,18 +787,12 @@ fn draw_curved_label(
     cx: f32,
     cy: f32,
     r_inner: f32,
-    max_half_angle: f32,
-    name: &str,
+    shown: &str,
     px: u32,
+    ink: [u8; 3],
     labels: &mut Labels,
 ) {
-    let max_arc = 2.0 * max_half_angle * r_inner;
-    let shown = labels.cut(name, px, max_arc);
-    let total_w = labels.advance(&shown, px);
-    if total_w <= 0.0 {
-        return;
-    }
-    let mut caret = -total_w / 2.0;
+    let mut caret = 0.0f32;
     for c in shown.chars() {
         let glyph_w = labels.advance(&c.to_string(), px);
         let theta = (caret + glyph_w / 2.0) / r_inner;
@@ -759,6 +806,7 @@ fn draw_curved_label(
             r_inner,
             theta,
             glyph,
+            ink,
         );
     }
 }
@@ -788,7 +836,6 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
     let stride = g.width as usize * 4;
     let mut x0 = 0u32;
     let mut y0 = 0u32;
-    let band_half_angle = MAX_LABEL_HALF_ANGLE + LABEL_BAND_PAD_ANGLE;
     for tile in tiles {
         let diameter = match tile.face {
             Face::Camera(_) => g.camera_diameter,
@@ -831,11 +878,53 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
             [0x30, 0x30, 0x30, 0xff]
         };
         let mul = if tile.dim { DIM_MUL } else { 256 };
+        let dim = |c: [u8; 4]| {
+            [
+                ((u32::from(c[0]) * mul) >> 8) as u8,
+                ((u32::from(c[1]) * mul) >> 8) as u8,
+                ((u32::from(c[2]) * mul) >> 8) as u8,
+                c[3],
+            ]
+        };
+        let paper = dim(PAPER_FILL);
+        let ink = {
+            let [b, g, r] = LABEL_INK;
+            let [b, g, r, _] = dim([b, g, r, 0xff]);
+            [b, g, r]
+        };
 
-        // Pass 1: the circle (fill + border ring) and the opaque label
-        // band behind it; everything else stays transparent — that's what
-        // makes the tile round instead of a square with a circle painted
-        // on it.
+        // The name actually shown, and the arc it sweeps from 6 o'clock —
+        // computed once so Pass 1's backdrop and Pass 3's glyphs can never
+        // disagree about how much room the name needs. Neither draws
+        // anything (backdrop included) for an empty or unrenderable name.
+        let (shown, sweep) = match labels.as_deref_mut() {
+            Some(labels) => label_extent(
+                labels,
+                &tile.name,
+                g.name_px,
+                draw.r_label_inner,
+                MAX_LABEL_ANGLE,
+            ),
+            None => (String::new(), 0.0),
+        };
+        // The label band's midline radius and half-thickness, and the
+        // rounded caps at its two ends (see `circle_geometry`): full
+        // circles of that half-thickness, centered on the midline at
+        // `theta = 0` (6 o'clock, where the name starts) and `theta =
+        // sweep` (where it ends) — offsets from the tile's own center,
+        // same convention as `dx`/`dy` below.
+        let mid_r = (draw.r_label_inner + draw.r_label_outer) / 2.0;
+        let half_thick = (draw.r_label_outer - draw.r_label_inner) / 2.0;
+        let (sin_e, cos_e) = sweep.sin_cos();
+        let cap_start = (0.0f32, mid_r);
+        let cap_end = (mid_r * sin_e, mid_r * cos_e);
+
+        // Pass 1: the circle (fill + border ring) and the paper label
+        // backdrop behind it, flush against the border ring and shaped
+        // like a rounded tag — flat along the band, rounded where it
+        // starts (6 o'clock) and ends; everything else stays transparent,
+        // which is what makes the tile round instead of a square with a
+        // circle painted on it.
         for y in 0..outer_h {
             for x in 0..outer_w {
                 // `cx`/`cy` are absolute canvas coordinates (they already
@@ -854,11 +943,16 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
                     })
                 } else if dist <= draw.r_outer {
                     Some(border)
-                } else if dist > draw.r_label_inner
-                    && dist <= draw.r_label_outer
-                    && dx.atan2(dy).abs() <= band_half_angle
-                {
-                    Some([0x1c, 0x1c, 0x1c, 0xff])
+                } else if sweep > 0.0 && dist > draw.r_label_inner && dist <= draw.r_label_outer {
+                    let theta = dx.atan2(dy);
+                    let in_band = if theta >= 0.0 && theta <= sweep {
+                        true
+                    } else {
+                        let cap = if theta < 0.0 { cap_start } else { cap_end };
+                        let (cdx, cdy) = (dx - cap.0, dy - cap.1);
+                        cdx * cdx + cdy * cdy <= half_thick * half_thick
+                    };
+                    in_band.then_some(paper)
                 } else {
                     None
                 };
@@ -885,21 +979,24 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
             }
         }
 
-        // Pass 3: the name, curved along the outside of the circle.
-        if let Some(labels) = labels.as_deref_mut() {
-            draw_curved_label(
-                canvas,
-                stride,
-                g.width,
-                g.height,
-                cx,
-                cy,
-                draw.r_label_inner,
-                MAX_LABEL_HALF_ANGLE,
-                &tile.name,
-                g.name_px,
-                labels,
-            );
+        // Pass 3: the name, curved along the outside of the circle, on top
+        // of the paper backdrop Pass 1 just drew for it.
+        if sweep > 0.0 {
+            if let Some(labels) = labels.as_deref_mut() {
+                draw_curved_label(
+                    canvas,
+                    stride,
+                    g.width,
+                    g.height,
+                    cx,
+                    cy,
+                    draw.r_label_inner,
+                    &shown,
+                    g.name_px,
+                    ink,
+                    labels,
+                );
+            }
         }
 
         if g.horizontal {
@@ -1028,14 +1125,35 @@ mod tests {
                 opaque > 100,
                 "expected a solidly opaque tile fill, found {opaque} fully-opaque pixels"
             );
-            // White text pixels exist (only the labels are near-white).
+            // White text pixels exist (only the plate's initials, drawn on
+            // its dark fill, are near-white — the curved names are ink).
             let white = canvas
                 .as_chunks::<4>()
                 .0
                 .iter()
                 .filter(|p| p[0] > 230 && p[1] > 230 && p[2] > 230)
                 .count();
-            assert!(white > 40, "no name text drawn ({white} white pixels)");
+            assert!(white > 40, "no plate initials drawn ({white} white pixels)");
+            // The paper backdrop is drawn (flush against each tile, sized
+            // to its own name) and the curved name is ink on top of it —
+            // distinct from the neutral grays used elsewhere on a tile.
+            let paper = canvas
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[..3] == PAPER_FILL[..3])
+                .count();
+            assert!(
+                paper > 40,
+                "no paper label backdrop drawn ({paper} matching pixels)"
+            );
+            let ink = canvas
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[2] > p[1] && p[1] > p[0] && p[2] < 80)
+                .count();
+            assert!(ink > 20, "no ink name text drawn ({ink} matching pixels)");
             if let Ok(dir) = std::env::var("ICU_UI_SHOTS") {
                 let rgba: Vec<u8> = canvas
                     .as_chunks::<4>()
@@ -1059,6 +1177,48 @@ mod tests {
             long.width <= 136,
             "label wider than its room: {}",
             long.width
+        );
+    }
+
+    /// A name's curved label starts at 6 o'clock (straight down from the
+    /// tile's center) and sweeps counterclockwise from there, climbing the
+    /// circle's right side — never to the left of center.
+    #[test]
+    fn label_starts_at_six_and_sweeps_counterclockwise() {
+        let mut labels = Labels::new().expect("embedded font");
+        let tiles = vec![Tile {
+            face: Face::Camera(None),
+            name: "Anna".into(),
+            speaking: false,
+            dim: false,
+            scale: REST_SCALE,
+        }];
+        let g = geometry(&tiles, true);
+        let mut canvas = vec![0u8; (g.width * g.height * 4) as usize];
+        compose(&mut canvas, &g, &tiles, Some(&mut labels));
+        let geom = circle_geometry(speak_diameter(CAMERA_D), NAME_PX);
+        let cx = geom.half_w as f32; // the lone tile sits at x0 == 0
+        let is_ink = |p: &[u8]| p[2] > p[1] && p[1] > p[0] && p[2] < 80;
+        let (mut ink_left, mut ink_right) = (0u32, 0u32);
+        for y in 0..g.height {
+            for x in 0..g.width {
+                let p = &canvas[(y as usize * g.width as usize + x as usize) * 4..][..4];
+                if is_ink(p) {
+                    if (x as f32) < cx {
+                        ink_left += 1;
+                    } else {
+                        ink_right += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            ink_left <= 2,
+            "name ink drawn left of 6 o'clock ({ink_left} px) — must sweep counterclockwise only"
+        );
+        assert!(
+            ink_right > 20,
+            "no name ink drawn right of center ({ink_right} px)"
         );
     }
 
