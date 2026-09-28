@@ -646,9 +646,10 @@ impl eframe::App for App {
         let settings_test = self.settings_window(&ctx);
         let setup_test = self.setup_window(&ctx);
         self.connection_window(&ctx);
-        // The mic test belongs to the Audio page and to the setup's steps
-        // that offer it; off both, it stops. One check for both windows, or
-        // the one not showing it would stop the other's every frame.
+        // The mic test belongs to the Audio and Klang pages and to the
+        // setup's steps that offer it; off all of them, it stops. One check
+        // for both windows, or the one not showing it would stop the other's
+        // every frame.
         if self.state.mic_test && !(settings_test || setup_test) {
             let _ = self.cmd.send(Command::SetMicTest(false));
         }

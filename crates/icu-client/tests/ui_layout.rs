@@ -906,6 +906,48 @@ fn switches_and_sliders_are_named_and_keyboard_driven() {
     assert!(back < after && back > before, "one step back: {back}");
 }
 
+/// The mic test runs on the Klang page too, where Stimmoptimierung and its
+/// Stärke are switched: until 2026-09-28 the tab change stopped it, and the
+/// presets could only be compared in silence. Other pages still stop it.
+#[test]
+fn mic_test_stays_on_the_klang_page() {
+    let test = format!("{}  Testen", egui_phosphor::regular::HEADPHONES);
+    let s = state();
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let on_test_page = Rc::new(RefCell::new(false));
+    let (cmds_out, page_out, state_in) = (cmds.clone(), on_test_page.clone(), s.clone());
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "light", true, move |ui| {
+        let out = view.ui(ui, &state_in, false);
+        *page_out.borrow_mut() = out.mic_test_page;
+        cmds_out.borrow_mut().extend(out.cmds);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Klang")
+        .click();
+    h.run();
+    assert!(*on_test_page.borrow(), "Klang stops the mic test");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, &test)
+        .click();
+    h.run();
+    assert!(
+        cmds.borrow()
+            .iter()
+            .any(|c| matches!(c, Command::SetMicTest(true))),
+        "„Testen“ on Klang starts no mic test"
+    );
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Allgemein")
+        .click();
+    h.run();
+    assert!(
+        !*on_test_page.borrow(),
+        "Allgemein keeps the mic test running"
+    );
+}
+
 /// No way to read keys: the banner says what to do and switches to voice
 /// activation with one click, on the Tastenkürzel page and in the setup.
 #[test]

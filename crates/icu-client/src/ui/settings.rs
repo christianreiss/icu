@@ -191,8 +191,9 @@ pub struct SettingsOutput {
     /// (`CameraHandle::set_preview`): the Kamera page is on screen and the
     /// user asked for it.
     pub camera_preview: bool,
-    /// The Audio page, home of the mic test, is on screen; anywhere else a
-    /// running test is stopped.
+    /// The Audio or Klang page, both with the mic test, is on screen (the
+    /// Klang switches are compared while listening); anywhere else a running
+    /// test is stopped.
     pub mic_test_page: bool,
     /// How much taller the page is than the window shows (negative:
     /// shorter).
@@ -456,7 +457,7 @@ impl SettingsView {
                         ui.set_max_width(ui.available_width().min(CONTENT_MAX_W));
                         match self.tab {
                             Tab::Audio => self.audio_tab(ui, state, &mut cmds),
-                            Tab::Sound => self.sound_tab(ui, state),
+                            Tab::Sound => self.sound_tab(ui, state, &mut cmds),
                             Tab::Hotkeys => self.hotkeys_tab(ui, state, &mut cmds),
                             Tab::Camera => self.camera_tab(ui, state),
                             Tab::General => self.general_tab(ui, state, &mut cmds),
@@ -476,7 +477,7 @@ impl SettingsView {
             debug_window_open: self.debug_window_open,
             logout: std::mem::take(&mut self.logout_requested),
             camera_preview: self.tab == Tab::Camera && self.camera_preview,
-            mic_test_page: self.tab == Tab::Audio,
+            mic_test_page: matches!(self.tab, Tab::Audio | Tab::Sound),
             overflow,
             open_setup: std::mem::take(&mut self.open_setup),
         }
@@ -691,13 +692,15 @@ impl SettingsView {
 
     /// What the voice goes through on the way out and in, and the cue
     /// sounds: switches that are right by default and rarely touched.
-    fn sound_tab(&mut self, ui: &mut Ui, state: &AppState) {
+    fn sound_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         let adv = self.draft.ui.show_advanced;
         widgets::page_header(
             ui,
             "Klang",
             "Wie deine Stimme aufbereitet wird und wie die anderen bei dir ankommen.",
-            |_| {},
+            // The test keeps running across Audio and Klang, so every switch
+            // below is heard the moment it flips.
+            |ui| mic_test_button(ui, state.mic_test, cmds),
         );
         widgets::group_card(ui, "Aufbereitung", |ui| {
             widgets::setting_row(
