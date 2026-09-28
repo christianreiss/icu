@@ -132,6 +132,15 @@ enum Command {
     /// the config, and can issue the first admin invite. Works on a config
     /// file that does not exist yet.
     Setup,
+    /// Read-only diagnosis of configuration, state, certificates, admin
+    /// socket, listen ports and snapshots. Works before the first start,
+    /// against a running server, and as a member of the socket group; it
+    /// never writes and never takes the state lock.
+    Doctor {
+        /// Print raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -156,10 +165,15 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    // `setup` may be writing the config file for the first time, so it
-    // cannot go through the shared read below.
+    // `setup` may be writing the config file for the first time, and
+    // `doctor` is the one command you run *because* the config does not
+    // parse: both would be lost to the shared read below, which ends the
+    // process before the command starts.
     if let Command::Setup = cli.command {
         return cli::setup::run(&cli.config).await;
+    }
+    if let Command::Doctor { json } = cli.command {
+        return cli::doctor::run(&cli.config, json).await;
     }
     // Resolved and validated only where it is used: `run` here, the offline
     // CLI in `cli::dispatch`. A command that reaches the running server needs
@@ -240,8 +254,8 @@ async fn run(cli: Cli) -> Result<()> {
         // Never through the socket or the offline server: that would open,
         // and could write, the very state being replaced.
         Command::Restore { snapshot } => cli::backup::restore(&config, &snapshot).await,
-        Command::Shell => icu_server::shell::run(&config).await,
-        Command::Setup => unreachable!("handled above"),
+        Command::Shell => icu_server::shell::run(&cli.config, &config).await,
+        Command::Setup | Command::Doctor { .. } => unreachable!("handled above"),
     }
 }
 

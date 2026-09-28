@@ -37,6 +37,13 @@ pub enum Action {
     /// `show backups`: a local, read-only listing (`crate::backup::list`),
     /// no admin request involved.
     ShowBackups,
+    /// `doctor`: the local, read-only diagnosis (`crate::cli::doctor`). Like
+    /// `ShowBackups` it never becomes an admin request — most of what it
+    /// looks at is on this host, not in the server.
+    Doctor {
+        /// `doctor --json`: print the raw report instead of the lines.
+        raw_json: bool,
+    },
     /// `refresh`/`r`: re-fetch the user list used for completion.
     Refresh,
     /// `help`: list every top-level command.
@@ -144,6 +151,19 @@ pub const TOP: &[(&str, Node)] = &[
             help: "Read-only status and listings.",
             children: SHOW_CHILDREN,
         },
+    ),
+    (
+        "doctor",
+        Node::Leaf(Leaf {
+            help: "Diagnose configuration, state, certificates, socket and ports.",
+            args: &[ArgKind::FreeText("[--json]")],
+            confirm: false,
+            build: |args| {
+                Ok(Action::Doctor {
+                    raw_json: wants_json(args),
+                })
+            },
+        }),
     ),
     (
         "invite",
@@ -638,6 +658,19 @@ mod tests {
         );
     }
 
+    /// `doctor` is local and read-only, so it resolves to its own action
+    /// rather than an admin request; `--json` rides along like `show status`.
+    #[test]
+    fn doctor_resolves_locally() {
+        let (action, confirm) = resolve_line("doctor").unwrap();
+        assert_eq!(action, Action::Doctor { raw_json: false });
+        assert!(confirm.is_none());
+        let (action, _) = resolve_line("doctor --json").unwrap();
+        assert_eq!(action, Action::Doctor { raw_json: true });
+        let (action, _) = resolve_line("doc").unwrap();
+        assert_eq!(action, Action::Doctor { raw_json: false });
+    }
+
     #[test]
     fn user_selector_is_never_prefix_matched() {
         let (action, confirm) = resolve_line("kick alice").unwrap();
@@ -687,10 +720,12 @@ mod tests {
 
     #[test]
     fn ambiguous_abbreviation_lists_every_match() {
-        // "d" prefixes deafen, demote and disable.
+        // "d" prefixes doctor, deafen, demote and disable, in `help` order.
+        // Named rather than counted: which verbs a half-typed one could still
+        // become is the point, and `disable` is not a thing to guess at.
         match resolve_line("d alice") {
             Err(ResolveError::Ambiguous { matches, .. }) => {
-                assert_eq!(matches.len(), 3);
+                assert_eq!(matches, ["doctor", "deafen", "demote", "disable"]);
             }
             other => panic!("expected Ambiguous, got {other:?}"),
         }
