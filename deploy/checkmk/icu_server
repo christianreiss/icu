@@ -2,18 +2,28 @@
 # Checkmk local check for the ICU voice server.
 #
 # Install as /usr/lib/check_mk_agent/local/icu_server (mode 0755). The agent
-# user needs read/write access to /run/icu/admin.sock, i.e. membership in the
-# group from `server.admin_socket_group`. That group is full server admin, not
-# read-only: whoever reaches the socket can invite, disable and revoke.
+# user needs read/write access to a socket under /run/icu:
+#
+#   * /run/icu/monitor.sock — read-only, answers `status` and nothing else.
+#     Set `server.monitor_socket_group` (e.g. `icu-monitor`) and put the
+#     agent user in that group. This is the one to use.
+#   * /run/icu/admin.sock — the fallback when no monitoring socket is
+#     configured. Its group (`server.admin_socket_group`, normally `icu`) is
+#     full server administration: whoever reaches it can invite, disable and
+#     revoke.
+#
+# `icu-server status` picks whichever of the two the caller may open, so this
+# check needs no switch for it.
 #
 # Output format: <status> <item> <metrics> <text>
 # 0 = OK, 1 = WARN, 2 = CRIT, 3 = UNKNOWN.
 #
 # `status --json` has counters since the server started (`connections`,
-# everything under `relay`) and values for right now (`online`,
-# `open_connections`, `handshakes`). Counters are turned into per-second
-# rates against the previous run, which is kept in $STATE; the first run,
-# and the first after a server restart, has none yet.
+# `com_dropped`, everything under `relay` and `enroll`) and values for right
+# now (`online`, `open_connections`, `handshakes`, `roomless_sessions`).
+# Counters are turned into per-second rates against the previous run, which
+# is kept in $STATE; the first run, and the first after a server restart,
+# has none yet.
 
 BIN=${ICU_SERVER_BIN:-/usr/bin/icu-server}
 CONFIG=${ICU_SERVER_CONFIG:-/etc/icu/server.toml}
@@ -24,6 +34,19 @@ STATE=${ICU_CHECK_STATE:-${MK_VARDIR:-/var/lib/check_mk_agent}/icu_server.state}
 # many runs in a row.
 SLOW_WARN_PCT=${ICU_SLOW_WARN_PCT:-10}
 SLOW_WARN_RUNS=${ICU_SLOW_WARN_RUNS:-3}
+# ICU_Server goes WARN, then CRIT, once this share (percent) of
+# `limits.max_connections` or `limits.max_handshakes` is in use. A server at
+# its connection limit turns away everyone who tries to reconnect.
+CONN_WARN_PCT=${ICU_CONN_WARN_PCT:-80}
+CONN_CRIT_PCT=${ICU_CONN_CRIT_PCT:-95}
+# ICU_Relay goes WARN once datagrams are dropped for abuse (rate limits,
+# oversized video) at more than this rate, this many runs in a row.
+DROP_WARN_PER_S=${ICU_DROP_WARN_PER_S:-20}
+DROP_WARN_RUNS=${ICU_DROP_WARN_RUNS:-3}
+# ICU_Enroll goes WARN once registrations fail at more than this rate, this
+# many runs in a row: a brute force against bundles, or a broken client.
+ENROLL_WARN_PER_S=${ICU_ENROLL_WARN_PER_S:-1}
+ENROLL_WARN_RUNS=${ICU_ENROLL_WARN_RUNS:-3}
 # Seconds `status` may take. A server that hangs must not hang the whole
 # agent, whose other checks would go stale with it.
 TIMEOUT=${ICU_CHECK_TIMEOUT:-10}
@@ -33,9 +56,12 @@ if [ ! -x "$BIN" ]; then
     exit 0
 fi
 
-# Without the admin socket there is no running server. `status` would still
+# Without the admin socket there is no running server: the server creates it
+# whether or not a monitoring socket is configured. `status` would still
 # succeed by reading the state files directly (the CLI fallback of §5), and
 # report an uptime of 0 — which is exactly the wrong answer for monitoring.
+# Only the existence is tested here, never the access: a monitor reaches
+# /run/icu but not this socket, and that is the point.
 if [ ! -S "$SOCKET" ]; then
     echo "2 ICU_Server - no admin socket at $SOCKET, the server is not running"
     exit 0
@@ -57,7 +83,9 @@ if [ "$RC" -ne 0 ] || [ -z "$JSON" ]; then
     exit 0
 fi
 
-# Small JSON fields, read without a JSON parser: the values are plain integers.
+# Small JSON fields, read without a JSON parser: the values are plain
+# integers. `field` is greedy and takes the last match, so it is only for
+# keys that occur once in the whole document.
 field() {
     v=$(echo "$JSON" | sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p" | head -1)
     echo "${v:-0}"
@@ -67,18 +95,41 @@ nested() {
         sed -n "s/.*\"$2\":\([0-9]*\).*/\1/p" | head -1)
     echo "${v:-0}"
 }
+text_field() {
+    echo "$JSON" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1
+}
 
 ONLINE=$(field online)
 MAX=$(field max_users)
 UPTIME=$(field uptime_s)
 OPEN=$(field open_connections)
 HANDSHAKES=$(field handshakes)
+ROOMLESS=$(field roomless_sessions)
 CONNECTIONS=$(field connections)
+VERSION=$(text_field version)
+# Ceilings from `limits` (since 2026-09-28). An older server has none, and
+# the headroom thresholds are then simply left out.
+MAX_CONN=$(field max_connections)
+MAX_HS=$(field max_handshakes)
 IN=$(nested relay datagrams_in)
 OUT=$(nested relay datagrams_out)
 # Unique keys, but past the nested `dropped` object, which `nested` stops at.
 VOUT=$(field video_frames_out)
 SLOW=$(field video_slow_receiver)
+# Datagrams turned away before QUIC saw them: no com tag, or the wrong key.
+COM=$(field com_dropped)
+MALFORMED=$(field malformed)
+# Dropped because somebody exceeded a limit. `"rate"` does not match inside
+# `"video_rate"` — the pattern wants a quote right before it.
+D_RATE=$(field rate)
+D_CTRL=$(field control_rate_limited)
+D_VRATE=$(field video_rate)
+ABUSE=$((D_RATE + D_CTRL + D_VRATE))
+# `enroll` only through `nested`: "failed" is also a key of `backup`, and
+# "ok" is the `"ok":true` of the answer, which sorts after `enroll`.
+EATT=$(nested enroll attempts)
+EFAIL=$(nested enroll failed)
+EOK=$(nested enroll ok)
 
 # Days until the server leaf and the CA expire; negative once expired.
 days() {
@@ -88,30 +139,48 @@ LEAF_DAYS=$(days server_cert_days_left)
 CA_DAYS=$(days ca_days_left)
 
 # The previous run: time, uptime, the counters, and how many runs in a row
-# dropped too much video. Anything but eight numbers counts as none.
+# each of the three streaks has been running. Anything but the expected
+# count of numbers counts as none; a state file from an older version of
+# this check therefore costs exactly one run without rates.
+STATE_FIELDS=15
 NOW=$(date +%s)
 PREV=$(cat "$STATE" 2>/dev/null)
 case "$PREV" in *[!0-9\ ]* | '') PREV= ;; esac
 # shellcheck disable=SC2086 # split into its fields on purpose
 set -- $PREV
 RATES=0
-STREAK=0
+SLOW_STREAK=0
+DROP_STREAK=0
+ENROLL_STREAK=0
 WRITE=1
-if [ $# -eq 8 ]; then
-    P_NOW=$1 P_UPTIME=$2 P_CONN=$3 P_IN=$4 P_OUT=$5 P_VOUT=$6 P_SLOW=$7 P_STREAK=$8
+if [ $# -eq "$STATE_FIELDS" ]; then
+    P_NOW=$1 P_UPTIME=$2 P_CONN=$3 P_IN=$4 P_OUT=$5 P_VOUT=$6 P_SLOW=$7
+    P_COM=$8 P_MALFORMED=$9
+    shift 9
+    P_ABUSE=$1 P_EATT=$2 P_EFAIL=$3 P_SLOW_STREAK=$4 P_DROP_STREAK=$5 P_ENROLL_STREAK=$6
     if [ "$NOW" -le "$P_NOW" ]; then
         # Within the same second: keep the older sample as the base.
         WRITE=0
-        STREAK=$P_STREAK
+        SLOW_STREAK=$P_SLOW_STREAK
+        DROP_STREAK=$P_DROP_STREAK
+        ENROLL_STREAK=$P_ENROLL_STREAK
     elif [ "$UPTIME" -ge "$P_UPTIME" ] && [ "$CONNECTIONS" -ge "$P_CONN" ] &&
         [ "$IN" -ge "$P_IN" ] && [ "$OUT" -ge "$P_OUT" ] &&
-        [ "$VOUT" -ge "$P_VOUT" ] && [ "$SLOW" -ge "$P_SLOW" ]; then
+        [ "$VOUT" -ge "$P_VOUT" ] && [ "$SLOW" -ge "$P_SLOW" ] &&
+        [ "$COM" -ge "$P_COM" ] && [ "$MALFORMED" -ge "$P_MALFORMED" ] &&
+        [ "$ABUSE" -ge "$P_ABUSE" ] && [ "$EATT" -ge "$P_EATT" ] &&
+        [ "$EFAIL" -ge "$P_EFAIL" ]; then
         RATES=1
     fi
 fi
 
 rate() {
     awk -v d="$1" -v t="$2" 'BEGIN { printf "%.2f", d / t }'
+}
+# Whether the first number is at least as large as the second, both with two
+# decimals; `[` cannot compare those.
+at_least() {
+    awk -v a="$1" -v b="$2" 'BEGIN { exit !(a >= b) }'
 }
 
 if [ "$RATES" -eq 1 ]; then
@@ -128,32 +197,77 @@ if [ "$RATES" -eq 1 ]; then
         SLOW_PCT=$((DSLOW * 100 / (DVOUT + DSLOW)))
     fi
     if [ "$DSLOW" -gt 0 ] && [ "$SLOW_PCT" -ge "$SLOW_WARN_PCT" ]; then
-        STREAK=$((P_STREAK + 1))
+        SLOW_STREAK=$((P_SLOW_STREAK + 1))
+    fi
+    COM_RATE=$(rate $((COM - P_COM)) "$DT")
+    MALFORMED_RATE=$(rate $((MALFORMED - P_MALFORMED)) "$DT")
+    ABUSE_RATE=$(rate $((ABUSE - P_ABUSE)) "$DT")
+    if at_least "$ABUSE_RATE" "$DROP_WARN_PER_S"; then
+        DROP_STREAK=$((P_DROP_STREAK + 1))
+    fi
+    EATT_RATE=$(rate $((EATT - P_EATT)) "$DT")
+    EFAIL_RATE=$(rate $((EFAIL - P_EFAIL)) "$DT")
+    if at_least "$EFAIL_RATE" "$ENROLL_WARN_PER_S"; then
+        ENROLL_STREAK=$((P_ENROLL_STREAK + 1))
     fi
 fi
 
 NOTE=
 if [ "$WRITE" -eq 1 ]; then
-    if ! { printf '%s %s %s %s %s %s %s %s\n' "$NOW" "$UPTIME" "$CONNECTIONS" \
-        "$IN" "$OUT" "$VOUT" "$SLOW" "$STREAK" >"$STATE.$$" &&
+    if ! { printf '%s %s %s %s %s %s %s %s %s %s %s %s %s %s %s\n' "$NOW" "$UPTIME" \
+        "$CONNECTIONS" "$IN" "$OUT" "$VOUT" "$SLOW" "$COM" "$MALFORMED" "$ABUSE" \
+        "$EATT" "$EFAIL" "$SLOW_STREAK" "$DROP_STREAK" "$ENROLL_STREAK" >"$STATE.$$" &&
         mv -f "$STATE.$$" "$STATE"; } 2>/dev/null; then
         rm -f "$STATE.$$" 2>/dev/null
         NOTE=" (no rates: cannot write $STATE)"
     fi
 fi
 
-# WARN when the room is full: nobody else can join.
+# WARN when the room is full: nobody else can join. WARN, then CRIT, when
+# connections or handshakes run out: both turn away everyone who reconnects.
 STATUS=0
-METRICS="online=$ONLINE;;;0;$MAX|uptime=$UPTIME|open_connections=$OPEN|handshakes=$HANDSHAKES"
 TEXT="up ${UPTIME}s, ${ONLINE}/${MAX} online, ${OPEN} connections open"
+[ -z "$VERSION" ] || TEXT="$TEXT, version $VERSION"
+
+# `<gauge>=<value>;<warn>;<crit>;0;<max>`, or without the thresholds where
+# the server does not report the ceiling.
+headroom() {
+    name=$1 value=$2 ceiling=$3
+    if [ "$ceiling" -le 0 ]; then
+        echo "$name=$value"
+        return
+    fi
+    echo "$name=$value;$((ceiling * CONN_WARN_PCT / 100));$((ceiling * CONN_CRIT_PCT / 100));0;$ceiling"
+}
+# Raises $STATUS and appends to $TEXT when a gauge is close to its ceiling.
+pressure() {
+    what=$1 value=$2 ceiling=$3
+    [ "$ceiling" -gt 0 ] || return 0
+    pct=$((value * 100 / ceiling))
+    if [ "$pct" -ge "$CONN_CRIT_PCT" ]; then
+        STATUS=2
+    elif [ "$pct" -ge "$CONN_WARN_PCT" ]; then
+        [ "$STATUS" -ge 1 ] || STATUS=1
+    else
+        return 0
+    fi
+    TEXT="$value of $ceiling $what in use ($pct %) — $TEXT"
+}
+
+METRICS="online=$ONLINE;;;0;$MAX|uptime=$UPTIME"
+METRICS="$METRICS|$(headroom open_connections "$OPEN" "$MAX_CONN")"
+METRICS="$METRICS|$(headroom handshakes "$HANDSHAKES" "$MAX_HS")"
+METRICS="$METRICS|roomless_sessions=$ROOMLESS"
 if [ "$RATES" -eq 1 ]; then
     METRICS="$METRICS|connects_per_s=$CONN_RATE|datagrams_in_per_s=$IN_RATE|datagrams_out_per_s=$OUT_RATE"
     TEXT="$TEXT, $CONN_RATE connects/s, relay $IN_RATE/s in / $OUT_RATE/s out"
 else
     TEXT="$TEXT, rates from the next run on$NOTE"
 fi
+pressure handshakes "$HANDSHAKES" "$MAX_HS"
+pressure connections "$OPEN" "$MAX_CONN"
 if [ "$MAX" -gt 0 ] && [ "$ONLINE" -ge "$MAX" ]; then
-    STATUS=1
+    [ "$STATUS" -ge 1 ] || STATUS=1
     TEXT="room is full — $TEXT"
 fi
 echo "$STATUS ICU_Server $METRICS $TEXT"
@@ -165,13 +279,44 @@ echo "$STATUS ICU_Server $METRICS $TEXT"
 if [ "$RATES" -eq 1 ]; then
     ST=0
     TEXT="$VOUT_RATE frames/s to viewers, $SLOW_RATE/s dropped for slow viewers ($SLOW_PCT %)"
-    if [ "$STREAK" -ge "$SLOW_WARN_RUNS" ]; then
+    if [ "$SLOW_STREAK" -ge "$SLOW_WARN_RUNS" ]; then
         ST=1
-        TEXT="$TEXT, at least $SLOW_WARN_PCT % for $STREAK runs in a row — a viewer's downlink is too narrow for the video"
+        TEXT="$TEXT, at least $SLOW_WARN_PCT % for $SLOW_STREAK runs in a row — a viewer's downlink is too narrow for the video"
     fi
     echo "$ST ICU_Video video_out_per_s=$VOUT_RATE|video_slow_drops_per_s=$SLOW_RATE|video_slow_pct=$SLOW_PCT;$SLOW_WARN_PCT $TEXT"
 else
     echo "0 ICU_Video - rates from the next run on$NOTE"
+fi
+
+# What the server threw away. `com_dropped` is datagrams without a valid com
+# tag: on a server in the open internet that is ordinary port noise, and it
+# is graphed but never judged. The abuse drops are: `rate` (a client over its
+# datagram budget), `control_rate_limited` and `video_rate` — a few are
+# normal at the edges, a sustained stream of them is somebody hammering.
+if [ "$RATES" -eq 1 ]; then
+    ST=0
+    TEXT="$COM_RATE/s without a com tag, $ABUSE_RATE/s over a limit, $MALFORMED_RATE/s malformed"
+    if [ "$DROP_STREAK" -ge "$DROP_WARN_RUNS" ]; then
+        ST=1
+        TEXT="$TEXT, at least $DROP_WARN_PER_S/s over a limit for $DROP_STREAK runs in a row"
+    fi
+    echo "$ST ICU_Relay com_dropped_per_s=$COM_RATE|abuse_drops_per_s=$ABUSE_RATE;$DROP_WARN_PER_S|malformed_per_s=$MALFORMED_RATE $TEXT"
+else
+    echo "0 ICU_Relay - rates from the next run on$NOTE"
+fi
+
+# Registrations. A lasting stream of failures is either a brute force against
+# invitation bundles or a client rollout that cannot register.
+if [ "$RATES" -eq 1 ]; then
+    ST=0
+    TEXT="$EATT_RATE attempts/s, $EFAIL_RATE failed/s ($EOK ok, $EFAIL failed since start)"
+    if [ "$ENROLL_STREAK" -ge "$ENROLL_WARN_RUNS" ]; then
+        ST=1
+        TEXT="$TEXT, at least $ENROLL_WARN_PER_S failed/s for $ENROLL_STREAK runs in a row"
+    fi
+    echo "$ST ICU_Enroll enroll_per_s=$EATT_RATE|enroll_failed_per_s=$EFAIL_RATE;$ENROLL_WARN_PER_S $TEXT"
+else
+    echo "0 ICU_Enroll - rates from the next run on$NOTE"
 fi
 
 # Certificates: WARN below 30 days, CRIT below 7. The server renews its own
@@ -194,15 +339,25 @@ cert_line ICU_CA_Certificate "$CA_DAYS" "CA certificate"
 # the snapshot after a change, or the one at the start. The reason is in the
 # journal and in `icu-server status --json`. A server from before the
 # backups reports none, and gets no line.
+#
+# `last_ok_unix` is set whenever the state was found backed up, including the
+# start, where an unchanged state needs no new snapshot. Still 0 on a server
+# that has been up a while therefore means no snapshot has ever been
+# confirmed. Its *age* is deliberately not judged: snapshots follow changes,
+# so a quiet server legitimately has old ones.
+BACKUP_NEVER_AFTER=${ICU_BACKUP_NEVER_AFTER:-300}
 case "$JSON" in
 *'"backup":{'*)
     BK_FAILED=$(nested backup failed)
     BK_KEEP=$(nested backup keep)
+    BK_LAST=$(nested backup last_ok_unix)
     if [ "$BK_FAILED" -ne 0 ]; then
         WHY=$(echo "$JSON" | sed -n 's/.*"backup":{[^}]*"error":"\([^"]*\)".*/\1/p' | head -1)
         echo "1 ICU_Backup - the last state backup failed: ${WHY:-see the journal}"
     elif [ "$BK_KEEP" -eq 0 ]; then
         echo "0 ICU_Backup - automatic state backups are off (backup.keep = 0)"
+    elif [ "$BK_LAST" -eq 0 ] && [ "$UPTIME" -ge "$BACKUP_NEVER_AFTER" ]; then
+        echo "1 ICU_Backup - no state backup has ever been confirmed, ${UPTIME}s after the start"
     else
         echo "0 ICU_Backup - state backed up after every change, the newest $BK_KEEP kept"
     fi

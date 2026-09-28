@@ -1,3 +1,8 @@
 # Group for the ICU admin socket (server.admin_socket_group); the service
 # itself runs as a DynamicUser with this as its primary group (Group=icu).
+# Membership is full server administration.
 g icu -
+# Group for the read-only monitoring socket (server.monitor_socket_group).
+# It is not configured out of the box; set it in server.toml and put the
+# monitoring agent in here instead of in `icu`.
+g icu-monitor -

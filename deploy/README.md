@@ -520,17 +520,29 @@ rootless podman `-v ./state:/var/lib/icu:U` verwenden.
 
 ## 5. Monitoring
 
-`checkmk/icu_server` ist ein Checkmk-Local-Check. Installation:
+`checkmk/icu_server` ist ein Checkmk-Local-Check. Das Paket legt ihn unter
+`/usr/share/icu-server/checkmk/icu_server` ab (aus dem Git-Baum:
+`deploy/checkmk/icu_server`); in das Verzeichnis des Agenten kopiert man ihn
+selbst. Installation:
 
 ```bash
-sudo install -m0755 deploy/checkmk/icu_server /usr/lib/check_mk_agent/local/
-sudo usermod -aG icu root      # oder den Agent-User in die Gruppe icu
+sudo install -m0755 /usr/share/icu-server/checkmk/icu_server /usr/lib/check_mk_agent/local/
+sudo sed -i 's/^#monitor_socket_group/monitor_socket_group/' /etc/icu/server.toml
+sudo systemctl restart icu-server
+sudo usermod -aG icu-monitor root   # oder der Benutzer, unter dem der Agent läuft
 ```
 
-Die Gruppe `icu` ist volle Serververwaltung, kein Lesezugriff: wer den
-Admin-Socket erreicht, kann auch einladen, sperren und widerrufen (§6). Einen
-Socket nur für Monitoring gibt es nicht. (`icu-server doctor` weist in seinem
-Befund `socket.group` genau darauf hin.)
+**Der Monitoring-Socket** (2026-09-28). `server.monitor_socket_group` schaltet
+einen zweiten Unix-Socket `/run/icu/monitor.sock` frei (0660, Gruppe aus dem
+Wert, Paketvorgabe `icu-monitor`). Er beantwortet `status` und sonst nichts:
+jede andere Anfrage bekommt `{"ok":false,"error":"FORBIDDEN"}`. Der Agent
+gehört in diese Gruppe und **nicht** in `icu` — die ist volle Serververwaltung:
+wer den Admin-Socket erreicht, kann einladen, sperren und widerrufen (§6).
+`icu-server status` sucht sich den Socket selbst: erst der Admin-Socket, und
+wenn der den Aufrufer nicht durchlässt, der Monitoring-Socket. Der Check
+braucht dafür keine Einstellung. Ohne `monitor_socket_group` entsteht kein
+zweiter Socket, und alles bleibt wie vorher — dann muss der Agent wieder in
+`icu`. (`icu-server doctor` weist in seinem Befund `socket.group` darauf hin.)
 
 Der Check ruft nur `status --json` auf; `doctor` gehört nicht dazu. Es ist
 eine Diagnose für einen Menschen — vor dem Start, oder wenn der Check auf CRIT
@@ -538,33 +550,58 @@ geht und die Frage „warum“ lautet —, keine wiederkehrende Messung: es lies
 Dateirechte, Zertifikate auf der Platte und bindet testweise die Listen-Ports,
 was ein Agent alle 60 s nicht tun sollte.
 
-Er ruft `icu-server status --json` auf. `ICU_Server` liefert die
-Momentanwerte `online`, `uptime`, `open_connections` und `handshakes` und aus
-den Zählern Raten gegen den vorigen Lauf (`connects_per_s`,
-`datagrams_in_per_s`, `datagrams_out_per_s`); der erste Lauf und der erste
-nach einem Server-Neustart haben noch keine. Die Metriken `connections`,
-`datagrams_in` und `datagrams_out` von vorher (Summen seit Start, als
-Momentanwert gegraphed) gibt es nicht mehr. Den vorigen Lauf merkt sich der
-Check in `$MK_VARDIR/icu_server.state` (sonst
+Er ruft `icu-server status --json` auf und liefert sieben Services. Den
+vorigen Lauf merkt sich der Check in `$MK_VARDIR/icu_server.state` (sonst
 `/var/lib/check_mk_agent/icu_server.state`, oder `ICU_CHECK_STATE`); ist das
-nicht schreibbar, sagt der Text es. `ICU_Video` zeigt Video-Frames je Sekunde
-an Zuschauer und die, die für zu langsame Zuschauer verworfen wurden
-(`video_slow_receiver`), und geht auf WARN, wenn deren Anteil drei Läufe in
-Folge mindestens 10 % beträgt (`ICU_SLOW_WARN_PCT`, `ICU_SLOW_WARN_RUNS`):
-dann schaut jemand mit viel zu wenig Bandbreite zu. Ist der Server unten, geht
-der Check auf CRIT, ebenso, wenn `status` nicht binnen 10 s antwortet
-(`ICU_CHECK_TIMEOUT`; coreutils `timeout`): ein hängender Server hält so nicht
-den ganzen Agenten auf. Die CLI selbst gibt nach 30 s ohne Antwort auf.
-Dazu kommen `ICU_Server_Certificate` und `ICU_CA_Certificate` (`tls` im
-Status-JSON): WARN unter 30, CRIT unter 7 Tagen Restlaufzeit. Beide erneuert
-der Server selbst (Leaf 30 Tage, CA ein Jahr vor Ablauf), ein WARN heißt also,
-dass das gescheitert ist (Journal; von Hand `rotate-server-cert` bzw.
-`renew-ca`).
+nicht schreibbar, sagt der Text es. Der erste Lauf, der erste nach einem
+Server-Neustart und der erste nach einem Update dieses Checks haben noch keine
+Raten. Ist der Server unten, geht `ICU_Server` auf CRIT, ebenso, wenn `status`
+nicht binnen 10 s antwortet (`ICU_CHECK_TIMEOUT`; coreutils `timeout`): ein
+hängender Server hält so nicht den ganzen Agenten auf. Die CLI selbst gibt
+nach 30 s ohne Antwort auf.
+
+* **`ICU_Server`** — Momentanwerte `online`, `uptime`, `open_connections`,
+  `handshakes`, `roomless_sessions` und aus den Zählern Raten gegen den
+  vorigen Lauf (`connects_per_s`, `datagrams_in_per_s`,
+  `datagrams_out_per_s`); dazu die Serverversion im Text. WARN, wenn der Raum
+  voll ist. WARN ab 80 %, CRIT ab 95 % von `limits.max_connections` bzw.
+  `limits.max_handshakes` (`ICU_CONN_WARN_PCT`, `ICU_CONN_CRIT_PCT`): ein
+  Server an seiner Verbindungsgrenze weist jeden ab, der sich neu verbindet.
+  Ein Server, der die Grenzen noch nicht meldet (vor 2026-09-28), wird nur
+  gezeichnet. Die Metriken `connections`, `datagrams_in` und `datagrams_out`
+  von früher (Summen seit Start, als Momentanwert gegraphed) gibt es nicht
+  mehr.
+* **`ICU_Video`** — Video-Frames je Sekunde an Zuschauer und die, die für zu
+  langsame Zuschauer verworfen wurden (`video_slow_receiver`); WARN, wenn
+  deren Anteil drei Läufe in Folge mindestens 10 % beträgt
+  (`ICU_SLOW_WARN_PCT`, `ICU_SLOW_WARN_RUNS`): dann schaut jemand mit viel zu
+  wenig Bandbreite zu.
+* **`ICU_Relay`** — verworfene Datagramme je Sekunde. `com_dropped` (kein
+  gültiges Com-Tag) wird nur gezeichnet, nie bewertet: im offenen Internet ist
+  das gewöhnliches Portrauschen. WARN, wenn die Summe aus `rate`,
+  `control_rate_limited` und `video_rate` drei Läufe in Folge über 20/s liegt
+  (`ICU_DROP_WARN_PER_S`, `ICU_DROP_WARN_RUNS`).
+* **`ICU_Enroll`** — Registrierungsversuche und Fehlschläge je Sekunde. WARN,
+  wenn die Fehlerrate drei Läufe in Folge über 1/s liegt
+  (`ICU_ENROLL_WARN_PER_S`, `ICU_ENROLL_WARN_RUNS`): ein Brute-Force auf
+  Einladungs-Bundles oder ein Client-Rollout, der sich nicht registrieren
+  kann.
+* **`ICU_Server_Certificate`**, **`ICU_CA_Certificate`** (`tls` im
+  Status-JSON): WARN unter 30, CRIT unter 7 Tagen Restlaufzeit. Beide erneuert
+  der Server selbst (Leaf 30 Tage, CA ein Jahr vor Ablauf), ein WARN heißt
+  also, dass das gescheitert ist (Journal; von Hand `rotate-server-cert` bzw.
+  `renew-ca`).
+* **`ICU_Backup`** — WARN, wenn der letzte Snapshot scheiterte, und WARN, wenn
+  nach 300 s Laufzeit (`ICU_BACKUP_NEVER_AFTER`) noch nie einer bestätigt
+  wurde. Das *Alter* des letzten wird bewusst nicht bewertet: gesichert wird
+  nach einer Änderung, ein ruhiger Server hat legitim tagealte Snapshots.
 
 ## 6. Grenzen
 
 * **Kein Prometheus in v1.** `status --json` ist die Schnittstelle.
 * **Keine Rechteverwaltung.** Wer den Admin-Socket lesen darf, darf alles.
+  Die einzige Abstufung ist der Monitoring-Socket (§5): `status` und sonst
+  nichts. Zwischen „alles“ und „nur Zahlen“ gibt es keine Stufen.
 * **Ein Raum, ein Port, ein Prozess.** Zwei Server auf derselben State-Datei
   sind durch `flock` ausgeschlossen, nicht durch Koordination.
 * Der Unix-Socket-Pfad muss kürzer als 108 Byte sein (`SUN_LEN`). Kann der

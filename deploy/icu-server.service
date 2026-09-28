@@ -18,17 +18,23 @@ DynamicUser=yes
 UMask=0077
 # The static group `icu` (sysusers) as the service's primary group, with a
 # dynamic user: /run/icu then belongs to icu-server:icu, so members of `icu`
-# (admins, the Checkmk agent) can reach /run/icu/admin.sock (0660, group
+# (admins) can reach /run/icu/admin.sock (0660, group
 # `server.admin_socket_group` = icu). Without it RuntimeDirectory belonged to
-# the dynamic group and nobody else got through the 0750 directory. The state
+# the dynamic group and nobody else got through the directory. The state
 # stays private: systemd keeps it under /var/lib/private (0700 root).
 Group=icu
 StateDirectory=icu
-# Keys and users.toml: nobody but the service. The admin socket lives in
-# RuntimeDirectory, so the group keeps its way in.
+# Keys and users.toml: nobody but the service. The sockets live in
+# RuntimeDirectory, so the groups keep their way in.
 StateDirectoryMode=0700
 RuntimeDirectory=icu
-RuntimeDirectoryMode=0750
+# 0755, not 0750: since 2026-09-28 a second socket `monitor.sock` may belong
+# to a group of its own (`server.monitor_socket_group`, e.g. `icu-monitor`)
+# so that a Checkmk agent needs no admin rights. Through a 0750 directory
+# owned by `icu` that group would never get to it. The directory holds
+# nothing but the two socket files; each one's own 0660 and group is the
+# gate.
+RuntimeDirectoryMode=0755
 ConfigurationDirectory=icu
 ProtectSystem=strict
 ProtectHome=yes

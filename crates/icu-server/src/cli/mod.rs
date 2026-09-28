@@ -5,6 +5,11 @@
 //! restart. Only when no server is running — socket missing or connection
 //! refused — does the CLI open the state itself, holding
 //! `flock(state.lock)` while it does.
+//!
+//! `status` has a second way in: where the admin socket refuses the caller,
+//! it tries the read-only monitoring socket. That is what lets a Checkmk
+//! agent in `monitor_socket_group` alone — without the admin rights the
+//! group `icu` carries — run the shipped local check unchanged.
 
 pub mod backup;
 pub mod doctor;
@@ -24,8 +29,13 @@ use crate::{admin, config::Config, error::Result, AdminRequest};
 /// someone outside the socket's group, a server that hangs up without an
 /// answer — is reported as it is: the offline path would only fail later on
 /// the state lock or the state directory, and hide the real cause.
+///
+/// The one exception is `status` behind `EACCES`: there a server is plainly
+/// running, so the monitoring socket is tried before the error is reported.
+/// It never leads into the offline path — that branch stays reserved for a
+/// socket that is missing or refuses.
 pub async fn dispatch(config: &Config, request: AdminRequest) -> Result<serde_json::Value> {
-    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+    use std::io::ErrorKind::{ConnectionRefused, NotFound, PermissionDenied};
     let socket = config.admin_socket();
     match tokio::net::UnixStream::connect(&socket).await {
         Ok(stream) => {
@@ -37,9 +47,27 @@ pub async fn dispatch(config: &Config, request: AdminRequest) -> Result<serde_js
             tracing::debug!(error = %e, "no server on the admin socket, using the state directly");
         }
         Err(e) => {
+            // A monitor may hold nothing but `monitor_socket_group`. Only
+            // `status` goes there, and only its failure is swallowed: the
+            // caller sees the admin socket's error, which names the right
+            // cause when no monitoring socket is configured at all.
+            if e.kind() == PermissionDenied && request == AdminRequest::Status {
+                let monitor = config.monitor_socket();
+                match tokio::net::UnixStream::connect(&monitor).await {
+                    Ok(stream) => {
+                        return admin::exchange(stream, &request).await.map_err(|e| {
+                            e.context(format!("monitor socket {}", monitor.display()))
+                        });
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "no monitor socket either");
+                    }
+                }
+            }
             return Err(crate::Error::msg(format!(
                 "cannot connect to the admin socket {}: {e}. It takes root or \
-                 membership in its group (server.admin_socket_group)",
+                 membership in its group (server.admin_socket_group); a monitor \
+                 needs only server.monitor_socket_group and `status`",
                 socket.display()
             )));
         }

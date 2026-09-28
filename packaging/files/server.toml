@@ -17,7 +17,12 @@ listen = ["0.0.0.0:4711", "[::]:4711"]
 max_users = 16
 # Lowest client version; older clients are refused at Hello (VERSION_UNSUPPORTED).
 min_client = "0.1.0"
+# Members may invite, disable and revoke: full server administration.
 admin_socket_group = "icu"
+# Read-only socket /run/icu/monitor.sock for monitoring (Checkmk). It
+# answers `status` and refuses everything else, so the agent needs no admin
+# rights. Uncomment, then: usermod -aG icu-monitor <agent user>.
+#monitor_socket_group = "icu-monitor"
 
 [log]
 level = "info"

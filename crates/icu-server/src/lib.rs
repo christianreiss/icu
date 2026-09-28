@@ -215,6 +215,7 @@ pub struct Handle {
     addrs: Vec<SocketAddr>,
     tasks: Vec<AbortHandle>,
     admin_socket: Option<std::path::PathBuf>,
+    monitor_socket: Option<std::path::PathBuf>,
 }
 
 impl Handle {
@@ -243,6 +244,12 @@ impl Handle {
         self.admin_socket.as_deref()
     }
 
+    /// Path of the read-only monitoring socket. `None` when
+    /// `server.monitor_socket_group` is unset, or it could not be created.
+    pub fn monitor_socket(&self) -> Option<&std::path::Path> {
+        self.monitor_socket.as_deref()
+    }
+
     /// Runs one admin command through exactly the code path the Unix socket
     /// uses. This is how an in-process test issues a registration bundle.
     pub async fn admin(&self, request: AdminRequest) -> AdminResponse {
@@ -267,7 +274,10 @@ impl Handle {
         for task in &self.tasks {
             task.abort();
         }
-        if let Some(path) = &self.admin_socket {
+        for path in [&self.admin_socket, &self.monitor_socket]
+            .into_iter()
+            .flatten()
+        {
             let _ = std::fs::remove_file(path);
         }
         // Dropping the Arc releases the Store and with it `flock(state.lock)`,
@@ -369,6 +379,22 @@ pub async fn run(config: Config) -> Result<Handle> {
         }
     };
 
+    // The read-only monitoring socket beside it, only where one is
+    // configured (`server.monitor_socket_group`). As little fatal as the
+    // admin socket: without it monitoring falls back to the admin socket,
+    // which is what every installation did until now.
+    let monitor_socket = match admin::listen_monitor(server.clone()).await {
+        Ok(Some((path, task))) => {
+            tasks.push(task);
+            Some(path)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "monitor socket unavailable");
+            None
+        }
+    };
+
     // Built with plain `--release`, the containment of `spawn_logged` and
     // `session::Seat` is gone: a panic aborts the process.
     if cfg!(panic = "abort") {
@@ -389,6 +415,7 @@ pub async fn run(config: Config) -> Result<Handle> {
         addrs,
         tasks,
         admin_socket,
+        monitor_socket,
     })
 }
 
