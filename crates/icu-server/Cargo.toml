@@ -42,6 +42,7 @@ time.workspace = true
 rustix.workspace = true
 socket2.workspace = true
 tempfile.workspace = true
+rustyline.workspace = true
 
 [dev-dependencies]
 postcard.workspace = true

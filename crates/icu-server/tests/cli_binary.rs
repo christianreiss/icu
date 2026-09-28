@@ -117,6 +117,68 @@ async fn the_cli_backs_up_lists_and_restores() {
 /// External review 2026-09-27: the admin socket's group is looked up in
 /// `/etc/group` and then through the host's NSS (`getent`), so a group only
 /// FreeIPA/SSSD knows works too; it used to be ignored with a warning.
+/// `icu-server shell` piped a scripted session: rustyline reads a
+/// non-interactive line source off a non-tty, so no PTY is needed here.
+/// Smoke-tests the wiring end to end (binary → `shell::run` → the real
+/// admin socket) without exercising TAB completion or `?`, which need a
+/// terminal.
+#[tokio::test]
+async fn the_shell_runs_a_piped_session_against_a_real_server() {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let _alone = ALONE.lock().await;
+    if common::root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, run) = (dir.path().join("state"), dir.path().join("run"));
+    let mut config = icu_server::Config::for_test(&state);
+    config.paths.runtime_dir = run.clone();
+    let handle = icu_server::run(config).await.expect("server");
+    let file = dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
+            state.to_str().unwrap(),
+            run.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+        .arg("--config")
+        .arg(&file)
+        .arg("shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"show status\nsh us\nexit\n")
+        .await
+        .unwrap();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("shell did not exit")
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("uptime"), "{stdout}");
+    assert!(stdout.contains("online"), "{stdout}");
+
+    handle.shutdown().await;
+}
+
 #[tokio::test]
 async fn the_socket_group_is_asked_of_the_hosts_nss() {
     let _alone = ALONE.lock().await;
