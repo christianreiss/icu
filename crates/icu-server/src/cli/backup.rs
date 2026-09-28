@@ -4,7 +4,7 @@
 //! with none running, directly; `--list` shows the snapshots there are.
 //! `restore` works only while no server runs (`crate::backup::restore`).
 
-use crate::{backup, cli, config::Config, error::Result, AdminRequest};
+use crate::{backup, cli, config::Config, display, error::Result, AdminRequest};
 
 /// Takes a snapshot and prints where it went, or lists the snapshots.
 pub async fn run(config: &Config, list: bool) -> Result<()> {
@@ -14,7 +14,8 @@ pub async fn run(config: &Config, list: bool) -> Result<()> {
     let value = cli::dispatch(config, AdminRequest::Backup).await?;
     cli::require_ok(&value)?;
     println!(
-        "state backed up to {}",
+        "{} {}",
+        display::Style::current().good("state backed up to"),
         value.get("path").and_then(|v| v.as_str()).unwrap_or("?")
     );
     Ok(())
@@ -22,26 +23,7 @@ pub async fn run(config: &Config, list: bool) -> Result<()> {
 
 fn print_list(config: &Config) -> Result<()> {
     let dir = config.backup_dir();
-    let snapshots = backup::list(&dir)?;
-    if snapshots.is_empty() {
-        println!("no snapshots in {}", dir.display());
-        return Ok(());
-    }
-    println!(
-        "{:<20} {:<21} {:<12} {:>5}  version",
-        "snapshot", "created", "reason", "users"
-    );
-    for path in snapshots {
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        match backup::read_manifest(&path) {
-            Ok(m) => println!(
-                "{name:<20} {:<21} {:<12} {:>5}  {}",
-                m.created, m.reason, m.users, m.server_version
-            ),
-            Err(e) => println!("{name:<20} (unreadable: {e})"),
-        }
-    }
-    println!("in {}", dir.display());
+    print!("{}", display::backups(display::Style::current(), &dir)?);
     Ok(())
 }
 

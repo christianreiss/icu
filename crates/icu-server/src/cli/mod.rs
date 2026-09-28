@@ -18,7 +18,7 @@ pub mod setup;
 pub mod status;
 pub mod users;
 
-use crate::{admin, config::Config, error::Result, AdminRequest};
+use crate::{admin, config::Config, display::Style, error::Result, AdminRequest};
 
 /// Sends a command to the running server, or executes it locally when none is
 /// running.
@@ -107,7 +107,7 @@ pub fn require_ok(value: &serde_json::Value) -> Result<()> {
 pub async fn simple(config: &Config, request: AdminRequest, done: &str) -> Result<()> {
     let value = dispatch(config, request).await?;
     require_ok(&value)?;
-    println!("{done}");
+    println!("{}", Style::current().good(done));
     Ok(())
 }
 
@@ -122,7 +122,11 @@ pub async fn for_user(
 ) -> Result<()> {
     let value = dispatch(config, request).await?;
     require_ok(&value)?;
-    println!("{verb} {}{rest}", who(&value, selector));
+    println!(
+        "{}{}",
+        Style::current().good(&format!("{verb} {}", who(&value, selector))),
+        rest
+    );
     Ok(())
 }
 
@@ -137,8 +141,8 @@ pub async fn with_closed(
     let value = dispatch(config, request).await?;
     require_ok(&value)?;
     println!(
-        "{verb} {}, closed {} connection(s)",
-        who(&value, selector),
+        "{}, closed {} connection(s)",
+        Style::current().good(&format!("{verb} {}", who(&value, selector))),
         value.get("closed").and_then(|v| v.as_u64()).unwrap_or(0)
     );
     Ok(())

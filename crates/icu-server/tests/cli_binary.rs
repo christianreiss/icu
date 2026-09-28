@@ -437,6 +437,25 @@ async fn the_icu_cli_alias_is_the_admin_surface() {
     );
     assert!(stdout.contains("fingerprint"), "{stdout}");
 
+    let plain = tokio::process::Command::new(&icu_cli)
+        .arg("--config")
+        .arg(&file)
+        .args(["users", "--color=never"])
+        .output()
+        .await
+        .unwrap();
+    assert!(plain.status.success());
+    assert!(!plain.stdout.contains(&0x1b));
+    let colored = tokio::process::Command::new(&icu_cli)
+        .arg("--config")
+        .arg(&file)
+        .args(["users", "--color=always"])
+        .output()
+        .await
+        .unwrap();
+    assert!(colored.status.success());
+    assert!(colored.stdout.windows(2).any(|bytes| bytes == b"\x1b["));
+
     // `doctor` is admin-side too, flag and all: it needs neither a stopped
     // nor a configured server, so it is not one of the three below.
     let out = tokio::process::Command::new(&icu_cli)
@@ -450,6 +469,17 @@ async fn the_icu_cli_alias_is_the_admin_surface() {
     assert!(out.status.success(), "{stdout}");
     let report: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json");
     assert_eq!(report["ok"], serde_json::json!(true));
+
+    let json_colored = tokio::process::Command::new(&icu_cli)
+        .arg("--config")
+        .arg(&file)
+        .args(["doctor", "--json", "--color=always"])
+        .output()
+        .await
+        .unwrap();
+    assert!(json_colored.status.success());
+    assert!(!json_colored.stdout.contains(&0x1b));
+    let _: serde_json::Value = serde_json::from_slice(&json_colored.stdout).unwrap();
 
     for (verb, args) in [
         ("run", vec!["run"]),

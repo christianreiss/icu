@@ -26,6 +26,7 @@ pub mod backup;
 pub mod ca;
 pub mod cli;
 pub mod config;
+pub mod display;
 pub mod endpoint;
 pub mod error;
 pub mod limits;

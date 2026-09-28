@@ -24,6 +24,7 @@ use crate::{
     admin::AdminUser,
     cli,
     config::Config,
+    display::{self, Style},
     error::{Error, Result},
     shell::command::Action,
     AdminRequest,
@@ -50,7 +51,11 @@ pub async fn run(config_path: &Path, config: &Config) -> Result<()> {
         let _ = editor.load_history(path);
     }
 
-    println!("icu-server admin shell. `help` or `?` for commands, `exit` to leave.");
+    println!(
+        "{}  {}",
+        Style::current().heading("ICU admin"),
+        Style::current().subtle("help or ? for commands · exit to leave")
+    );
 
     loop {
         let (returned, line) = read_line(editor, PROMPT.to_string()).await?;
@@ -78,7 +83,7 @@ pub async fn run(config_path: &Path, config: &Config) -> Result<()> {
         let (action, confirm) = match command::resolve_line(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                println!("% {e}");
+                println!("{} {e}", Style::current().bad("error:"));
                 continue;
             }
         };
@@ -88,7 +93,7 @@ pub async fn run(config_path: &Path, config: &Config) -> Result<()> {
             editor = returned;
             let yes = matches!(answer, Ok(l) if l.trim().to_ascii_lowercase().starts_with('y'));
             if !yes {
-                println!("cancelled");
+                println!("{}", Style::current().subtle("cancelled"));
                 continue;
             }
         }
@@ -101,7 +106,10 @@ pub async fn run(config_path: &Path, config: &Config) -> Result<()> {
                     println!("{} user(s)", list.len());
                     *users.lock().expect("shell user cache poisoned") = list;
                 }
-                Err(e) => println!("% cannot refresh users: {e}"),
+                Err(e) => println!(
+                    "{} cannot refresh users: {e}",
+                    Style::current().bad("error:")
+                ),
             },
             Action::ShowBackups => show_backups(config),
             // Local and read-only, like `show backups`: no admin request, and
@@ -112,7 +120,7 @@ pub async fn run(config_path: &Path, config: &Config) -> Result<()> {
                 if raw_json {
                     match serde_json::to_string(&report.to_json()) {
                         Ok(text) => println!("{text}"),
-                        Err(e) => println!("% {e}"),
+                        Err(e) => println!("{} {e}", Style::current().bad("error:")),
                     }
                 } else {
                     report.print();
@@ -186,7 +194,7 @@ async fn run_admin(
     let mutating = is_mutating(&request);
     match cli::dispatch(config, request).await {
         Ok(value) => print_response(&value, raw_json, out.as_deref()),
-        Err(e) => println!("% {e}"),
+        Err(e) => println!("{} {e}", Style::current().bad("error:")),
     }
     if mutating {
         if let Ok(list) = fetch_users(config).await {
@@ -197,7 +205,7 @@ async fn run_admin(
 
 fn print_response(value: &serde_json::Value, raw_json: bool, out: Option<&Path>) {
     if let Err(e) = cli::require_ok(value) {
-        println!("% {e}");
+        println!("{} {e}", Style::current().bad("error:"));
         return;
     }
     if raw_json {
@@ -207,7 +215,13 @@ fn print_response(value: &serde_json::Value, raw_json: bool, out: Option<&Path>)
         return;
     }
     if let Some(users) = value.get("users").and_then(|v| v.as_array()) {
-        print_users_table(users);
+        match serde_json::from_value::<Vec<AdminUser>>(serde_json::Value::Array(users.clone())) {
+            Ok(users) => print!("{}", display::users(Style::current(), &users)),
+            Err(e) => println!(
+                "{} invalid user response: {e}",
+                Style::current().bad("error:")
+            ),
+        }
         return;
     }
     if let Some(bundle) = value.get("bundle").and_then(|v| v.as_str()) {
@@ -216,7 +230,11 @@ fn print_response(value: &serde_json::Value, raw_json: bool, out: Option<&Path>)
             Some(path) => match crate::store::write_private_for_caller(path, bundle) {
                 Ok(()) => println!("bundle written to {}", path.display()),
                 Err(e) => {
-                    println!("% cannot write {}: {e}", path.display());
+                    println!(
+                        "{} cannot write {}: {e}",
+                        Style::current().bad("error:"),
+                        path.display()
+                    );
                     return;
                 }
             },
@@ -231,118 +249,32 @@ fn print_response(value: &serde_json::Value, raw_json: bool, out: Option<&Path>)
         return;
     }
     if value.get("uptime_s").is_some() {
-        print_status(value);
+        print!("{}", display::status(Style::current(), value));
         return;
     }
     if let Some(path) = value.get("path").and_then(|v| v.as_str()) {
-        println!("state backed up to {path}");
+        println!("{} {path}", Style::current().good("state backed up to"));
         return;
     }
     if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
         let id = value.get("user_id").and_then(|v| v.as_u64()).unwrap_or(0);
         match value.get("closed").and_then(|v| v.as_u64()) {
-            Some(closed) => println!("ok: {name} (user_id {id}), closed {closed} connection(s)"),
-            None => println!("ok: {name} (user_id {id})"),
+            Some(closed) => println!(
+                "{} {name} (user_id {id}), closed {closed} connection(s)",
+                Style::current().good("ok:")
+            ),
+            None => println!("{} {name} (user_id {id})", Style::current().good("ok:")),
         }
         return;
     }
-    println!("ok");
-}
-
-fn print_users_table(users: &[serde_json::Value]) {
-    let flag = |v: &serde_json::Value, key: &str| {
-        if v.get(key).and_then(|v| v.as_bool()) == Some(true) {
-            "yes"
-        } else {
-            "no"
-        }
-    };
-    println!(
-        "{:>4}  {:<20} {:<14} {:<21} {:<21} {:<8} {:<6} {:<9} {:<8} online",
-        "id", "name", "fingerprint", "issued", "expires", "revoked", "admin", "disabled", "pending"
-    );
-    for u in users {
-        println!(
-            "{:>4}  {:<20} {:<14} {:<21} {:<21} {:<8} {:<6} {:<9} {:<8} {}",
-            u.get("user_id").and_then(|v| v.as_u64()).unwrap_or(0),
-            u.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
-            u.get("fingerprint").and_then(|v| v.as_str()).unwrap_or(""),
-            u.get("issued").and_then(|v| v.as_str()).unwrap_or(""),
-            u.get("expires").and_then(|v| v.as_str()).unwrap_or(""),
-            flag(u, "revoked"),
-            flag(u, "is_admin"),
-            flag(u, "disabled"),
-            flag(u, "pending"),
-            flag(u, "online"),
-        );
-    }
-}
-
-fn print_status(value: &serde_json::Value) {
-    let get = |key: &str| value.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
-    println!("uptime    {} s", get("uptime_s"));
-    println!("online    {}/{}", get("online"), get("max_users"));
-    println!(
-        "connects  {} open, {} in handshake, {} since start",
-        get("open_connections"),
-        get("handshakes"),
-        get("connections")
-    );
-    println!(
-        "com tag   {} datagrams dropped since start",
-        get("com_dropped")
-    );
-    if let Some(relay) = value.get("relay") {
-        let r = |key: &str| relay.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
-        println!(
-            "datagrams in {} out {}   video in {} out {}   control in {}",
-            r("datagrams_in"),
-            r("datagrams_out"),
-            r("video_frames_in"),
-            r("video_frames_out"),
-            r("control_in")
-        );
-        if let Some(dropped) = relay.get("dropped").and_then(|v| v.as_object()) {
-            let mut items: Vec<String> = dropped
-                .iter()
-                .filter(|(_, v)| v.as_u64().unwrap_or(0) > 0)
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect();
-            items.sort();
-            println!(
-                "dropped   {}",
-                if items.is_empty() {
-                    "none".to_string()
-                } else {
-                    items.join(" ")
-                }
-            );
-        }
-    }
+    println!("{}", Style::current().good("ok"));
 }
 
 fn show_backups(config: &Config) {
     let dir = config.backup_dir();
-    match crate::backup::list(&dir) {
-        Ok(list) if list.is_empty() => println!("no snapshots in {}", dir.display()),
-        Ok(list) => {
-            println!(
-                "{:<20} {:<21} {:<12} {:>5}  version",
-                "snapshot", "created", "reason", "users"
-            );
-            for path in list {
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                match crate::backup::read_manifest(&path) {
-                    Ok(m) => println!(
-                        "{name:<20} {:<21} {:<12} {:>5}  {}",
-                        m.created, m.reason, m.users, m.server_version
-                    ),
-                    Err(e) => println!("{name:<20} (unreadable: {e})"),
-                }
-            }
-            println!("in {}", dir.display());
-        }
-        Err(e) => println!("% {e}"),
+    match display::backups(Style::current(), &dir) {
+        Ok(text) => print!("{text}"),
+        Err(e) => println!("{} {e}", Style::current().bad("error:")),
     }
 }
 
@@ -351,18 +283,33 @@ fn print_help_for(remainder: &str, users: &[AdminUser]) {
     let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
     let candidates = command::candidates_at(&refs, users);
     if candidates.is_empty() {
-        println!("  (no further completions)");
+        println!("  {}", Style::current().subtle("(no further completions)"));
         return;
     }
     for c in candidates {
-        println!("  {:<20} {}", c.text, c.help);
+        println!(
+            "  {}{} {}",
+            Style::current().heading(&c.text),
+            " ".repeat(20usize.saturating_sub(c.text.chars().count())),
+            c.help
+        );
     }
 }
 
 fn print_top_help() {
-    println!("commands (TAB-completion and unique abbreviations work everywhere, e.g. `sh us`):");
+    println!("{}", Style::current().heading("Commands"));
+    println!(
+        "{}",
+        Style::current()
+            .subtle("TAB completion and unique abbreviations work everywhere, e.g. sh us")
+    );
     for (word, node) in command::TOP {
-        println!("  {:<20} {}", word, node.help());
+        println!(
+            "  {}{} {}",
+            Style::current().heading(word),
+            " ".repeat(20usize.saturating_sub(word.chars().count())),
+            node.help()
+        );
     }
     println!("`<user>` is a name, user_id or fingerprint (`id:<id>`/`name:<name>` if ambiguous).");
     println!("append `?` to a line for context help. `run` and `restore` are not available here.");

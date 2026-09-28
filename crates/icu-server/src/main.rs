@@ -12,7 +12,7 @@ use std::{
 };
 
 use clap::{Parser, Subcommand};
-use icu_server::{cli, config::Config, error::Result, AdminRequest};
+use icu_server::{cli, config::Config, display, error::Result, AdminRequest};
 
 /// ICU voice server.
 #[derive(Debug, Parser)]
@@ -21,6 +21,10 @@ struct Cli {
     /// Path of the configuration file.
     #[arg(long, global = true, default_value = "/etc/icu/server.toml")]
     config: PathBuf,
+
+    /// Color for human-readable output (JSON is always unstyled).
+    #[arg(long, global = true, value_enum, default_value_t)]
+    color: display::ColorChoice,
 
     #[command(subcommand)]
     command: Command,
@@ -175,6 +179,10 @@ struct CliAlias {
     #[arg(long, global = true, default_value = "/etc/icu/server.toml")]
     config: PathBuf,
 
+    /// Color for human-readable output (JSON is always unstyled).
+    #[arg(long, global = true, value_enum, default_value_t)]
+    color: display::ColorChoice,
+
     /// Without a command: the interactive admin shell.
     #[command(subcommand)]
     command: Option<CliCommand>,
@@ -220,7 +228,7 @@ fn main() -> ExitCode {
         .next()
         .is_some_and(|arg0| is_cli_name(&arg0));
     let prog = if alias { "icu-cli" } else { "icu-server" };
-    let (config_path, command) = if alias {
+    let (config_path, command, color) = if alias {
         let cli = CliAlias::parse();
         let command = match cli.command {
             None => Command::Admin(AdminCommand::Shell),
@@ -231,11 +239,12 @@ fn main() -> ExitCode {
             }
             Some(CliCommand::Setup) => return server_only("setup", "setup"),
         };
-        (cli.config, command)
+        (cli.config, command, cli.color)
     } else {
         let cli = Cli::parse();
-        (cli.config, cli.command)
+        (cli.config, cli.command, cli.color)
     };
+    display::configure(color);
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

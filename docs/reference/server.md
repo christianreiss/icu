@@ -201,6 +201,16 @@ nicht: sie sind zwar noch geparst, antworten aber nur mit dem Hinweis auf
 (`icu-server> `) und Historie bleiben dieselben — es ist dieselbe Shell,
 nicht eine zweite.
 
+Menschliche Ausgaben der Shell und der einzelnen Admin-Kommandos nutzen
+dieselben Statusgruppen und Nutzer-/Backup-Ansichten. Bei schmalem Terminal
+werden Tabellen zu mehrzeiligen Einträgen; alle Felder bleiben sichtbar.
+Farbe erscheint standardmäßig nur auf einem Terminal (`TERM=dumb` oder
+`NO_COLOR` schalten sie ab). `--color=always` erzwingt sie,
+`--color=never` unterdrückt sie; die Option gilt auch nach einem Kommando,
+z. B. `icu-cli users --color=never`. JSON-Antworten und Passport-Daten
+bleiben immer unverändert und enthalten keine Farbsequenzen. Die Farbe
+ergänzt die ausgeschriebenen Zustände und Befunde, ersetzt sie nicht.
+
 Befehlshistorie liegt unter `$XDG_STATE_HOME/icu-server/shell_history`
 (sonst `~/.local/state/icu-server/shell_history`), Modus 0600, je Nutzer,
 nicht je Serverkonfiguration — die Shell läuft interaktiv unter wer auch
