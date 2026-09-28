@@ -131,6 +131,7 @@ Atomare Schreibvorgänge verwenden exklusiv erzeugte, zufällig benannte Dateien
 | `icu-server renew-ca` | Neues CA-Zertifikat auf demselben Schlüssel und Subject, sofort in Kraft; Clients brauchen nichts, weil der Vertrauensanker Subject + Schlüssel ist (`PROTOCOL.md` §2.3.3). |
 | `icu-server backup [--list]` | Snapshot jetzt (Anlass `manual`, auch ohne Änderung seit dem neuesten), gibt den Pfad aus; über den Socket oder offline (§4 „State-Backups“). Die Antwort trägt nur den Pfad: die Socket-Gruppe darf den Server bedienen, aber nicht `ca.key` lesen. `--list` zeigt die Snapshots mit Zeit, Anlass, Nutzerzahl und Serverversion; es liest das Backup-Verzeichnis selbst, braucht also root. (2026-09-27) |
 | `icu-server restore <verzeichnis\|latest>` | Spielt einen Snapshot zurück, nur bei gestopptem Server: nimmt `flock(state.lock)` selbst und geht nie über Socket oder `Server::offline`, die den Ziel-State öffnen und beschreiben würden. Prüft den Snapshot gegen sein `MANIFEST` (SHA-256 je Datei, Format, `schema`; ein Verzeichnis ohne `MANIFEST`, etwa eine Handkopie des State-Verzeichnisses, wird so genommen) und lädt ihn in einem Scratch-Verzeichnis `.icu-restore-*`, wie der Server es täte: `users.toml` samt Schema, CA-Paar, CA-Name gegen ein gesetztes `server_name`, Com-Schlüssel. Erst dann: den aktuellen State als Snapshot `pre-restore` sichern (ein Restore lässt sich also zurücknehmen), die Dateien atomar ersetzen (`server.crt.retired` behält, was es listet; ein fehlendes Server-Leaf stellt der Server neu aus), offline `rotate-server-cert` (vorher Runbook-Pflicht nach jedem Restore), Snapshot `restore`, Besitzer angleichen. `latest` ist der neueste Snapshot außer `pre-restore`, zweimal `restore latest` spielt also dasselbe zurück. Ein fehlendes State-Verzeichnis legt es an (neuer Host); `server_name` kommt dann aus der CA des Snapshots. (2026-09-27) |
+| `icu-server shell` | Interaktive Admin-Shell im Cisco-IOS-Stil: persistenter Prompt, TAB-Vervollständigung, `?`-Kontexthilfe, Präfix-Abkürzungen (`sh us` → `show users`), Befehlshistorie. Details in §5.1. |
 
 **Nutzer-Selektor** (`<name|user_id|fingerprint>` oben): Name, `user_id` oder voller Fingerprint, ausdrücklich auch `id:<user_id>` oder `name:<name>` (`Store::resolve`, 2026-09-27). Ein Name darf nur aus Ziffern bestehen; vorher gewann die `user_id`, und `revoke 1` traf bei einem Nutzer namens „1“ den Nutzer mit ID 1, oft den Eigentümer (Readiness-Review 2026-09-27, S5). Jetzt zählt jede Lesart, auch der ganze Selektor als Name (ein Nutzer namens `id:3` wird also nicht still übergangen): trifft mehr als eine verschiedene Nutzer, lehnt der Server mit `AMBIGUOUS_USER` ab und nennt alle Treffer mit `user_id` und Namen. Die Antwort nennt den getroffenen Nutzer (`user_id`, `name`), die CLI gibt ihn aus („revoked alice (user_id 3), closed 1 connection(s)“); ein noch laufender älterer Server ohne `name` in der Antwort bekommt nur die `user_id` angezeigt.
 
@@ -159,6 +160,51 @@ Admin-Socket: `/run/icu/admin.sock` (`RuntimeDirectory=icu`, `RuntimeDirectoryMo
 Fehlerform einheitlich `{"ok":false,"error":"<kurzform>","detail":"<text>"}`; ein unbekannter Selektor ist `NO_SUCH_USER`, ein mehrdeutiger `AMBIGUOUS_USER`. `user_id` und `name` in den Antworten sind 2026-09-27 dazugekommen (nur Felder ergänzt, keine umbenannt).
 
 **Kein `rename` mehr** (entfallen 2026-09-22): der Name steht im Zertifikat, und der Server kann keinen Schlüssel für einen Nutzer erzeugen — umbenennen kann sich also nur der Nutzer selbst, über ein Renewal (`PROTOCOL.md` §2.2 Nr. 9). Muss ein Admin trotzdem eingreifen (anstößiger Name, Tippfehler, von Hand verkorkster Bestand): Server stoppen, `UserRecord.name` in `users.toml` editieren, Server starten. Der nächste Connect dieses Nutzers ist dann ein CN-Mismatch, und sein Client zieht selbsttätig nach — Notausgang und Nachzügler-Mechanismus sind dasselbe. Als härtere Mittel bleiben `revoke` plus neues Bundle.
+
+### 5.1 Shell
+
+`icu-server shell` (`crates/icu-server/src/shell/`) ist keine eigene Art
+Admin-Client: jeder Befehl geht wie bei den einzelnen CLI-Kommandos über
+`cli::dispatch` — ein Request, eine Response, dann Schluss (§5 oben); die
+Shell hält keinen Dauerzustand über den Admin-Socket und ändert nichts am
+Protokoll. `run` und `restore` sind absichtlich nicht Teil der Shell:
+`restore` braucht einen gestoppten Server und nimmt `flock` direkt, was mit
+einer laufenden Sitzung auf demselben Socket nicht zusammengeht.
+
+Verben (Cisco-artig, mit TAB-Vervollständigung und eindeutigen
+Präfix-Abkürzungen wie bei Cisco IOS, z. B. `sh us` für `show users`):
+
+| Befehl | Wirkung |
+| --- | --- |
+| `show status [--json]` | wie `icu-server status` |
+| `show users [--json]` | wie `icu-server users` |
+| `show backups` | wie `icu-server backup --list` |
+| `invite [name] [ttl]` | wie `icu-server invite`, Bundle nur auf stdout |
+| `kick`/`disable`/`revoke <user>` | wie die gleichnamigen CLI-Kommandos, fragen vorher `[y/N]` (schließen Verbindungen bzw. `revoke` ist unumkehrbar) |
+| `mute`/`unmute`/`deafen`/`undeafen`/`promote`/`demote`/`enable <user>` | wie die gleichnamigen CLI-Kommandos |
+| `rotate-server-cert` / `renew-ca` / `backup` | wie die gleichnamigen CLI-Kommandos |
+| `refresh` (Kurzform `r`) | holt die Nutzerliste für die Vervollständigung neu |
+| `help` / `?` | listet alle Befehle |
+| `exit` / `quit` | verlässt die Shell |
+
+Präfix-Abkürzung gilt nur für literale Schlüsselwörter, nie für einen
+Nutzer-Selektor oder Freitext: ein Nutzer namens `k` wird nie mit `kick`
+verwechselt. Ein Treffer, der genau passt, gewinnt immer sofort (die
+Kurzform `r` bleibt also `refresh`, obwohl sie auch Präfix von `revoke`,
+`renew-ca` und `rotate-server-cert` ist); sonst gewinnt ein eindeutiges
+Präfix, mehrdeutige Eingaben nennen alle Treffer (wie `AMBIGUOUS_USER` beim
+Nutzer-Selektor). Ein Leerzeichen vor `?` oder am Zeilenende zeigt, ohne die
+Zeile abzuschicken, was an der Stelle gültig wäre — Nutzernamen werden dabei
+aus einer Momentaufnahme der letzten `users`-Antwort vervollständigt, nicht
+live pro Tastendruck: sie wird beim Start geholt, nach jedem ändernden
+Befehl neu geholt und mit `refresh`/`r` von Hand.
+
+Befehlshistorie liegt unter `$XDG_STATE_HOME/icu-server/shell_history`
+(sonst `~/.local/state/icu-server/shell_history`), Modus 0600, je Nutzer,
+nicht je Serverkonfiguration — die Shell läuft interaktiv unter wer auch
+immer in der Socket-Gruppe ist oder root über SSH, nicht unter dem
+`DynamicUser` des Dienstes. Fehlt `$HOME`, läuft die Shell ohne
+persistente Historie weiter, statt den Start zu verweigern.
 
 ## 6. Ablauf
 

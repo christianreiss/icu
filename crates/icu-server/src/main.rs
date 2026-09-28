@@ -123,6 +123,10 @@ enum Command {
         /// Snapshot directory, or `latest` for the newest one.
         snapshot: String,
     },
+    /// Cisco-style interactive admin shell: persistent prompt, TAB
+    /// completion, `?` for context help. `run` and `restore` are not
+    /// available here.
+    Shell,
 }
 
 fn main() -> ExitCode {
@@ -226,6 +230,7 @@ async fn run(cli: Cli) -> Result<()> {
         // Never through the socket or the offline server: that would open,
         // and could write, the very state being replaced.
         Command::Restore { snapshot } => cli::backup::restore(&config, &snapshot).await,
+        Command::Shell => icu_server::shell::run(&config).await,
     }
 }
 

@@ -41,6 +41,9 @@ pem = "4.0.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "signal"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+# icu-server shell: Cisco-style admin REPL (TAB completion, history). Pure
+# Rust, no C toolchain step, safe for the static-musl release-server build.
+rustyline = "14"
 toml = "0.8"
 serde_json = "1"
 tracing = "0.1"

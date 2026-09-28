@@ -33,6 +33,7 @@ pub mod registration;
 pub mod relay;
 pub mod room;
 pub mod session;
+pub mod shell;
 pub mod store;
 pub mod wire;
 

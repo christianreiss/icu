@@ -27,7 +27,7 @@ use crate::{
 };
 
 /// One admin command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum AdminRequest {
     /// Issue a registration bundle (`PROTOCOL.md` §2.3).
