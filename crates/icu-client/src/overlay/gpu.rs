@@ -449,9 +449,9 @@ impl Renderer {
             groups.push(group);
             boxes.push((tx, ty, geom.outer_w, geom.outer_h));
             if scene.geometry.horizontal {
-                x += geom.outer_w + GAP;
+                x += geom.outer_w + scene.geometry.gap;
             } else {
-                y += geom.outer_h + GAP;
+                y += geom.outer_h + scene.geometry.gap;
             }
         }
         self.labels.truncate(scene.tiles.len());
@@ -591,6 +591,7 @@ mod tests {
                         },
                     ];
                     let pad = scaled(HALO, dpi);
+                    let gap = scaled(GAP, dpi);
                     let geoms = [camera, plate, plate].map(|d| {
                         let mut g =
                             circle_geometry(speak_diameter(scaled(d, dpi)), scaled(font, dpi));
@@ -601,13 +602,13 @@ mod tests {
                     });
                     let (width, height) = if horizontal {
                         (
-                            geoms.iter().map(|g| g.outer_w).sum::<u32>() + 2 * GAP,
+                            geoms.iter().map(|g| g.outer_w).sum::<u32>() + 2 * gap,
                             geoms.iter().map(|g| g.outer_h).max().unwrap(),
                         )
                     } else {
                         (
                             geoms.iter().map(|g| g.outer_w).max().unwrap(),
-                            geoms.iter().map(|g| g.outer_h).sum::<u32>() + 2 * GAP,
+                            geoms.iter().map(|g| g.outer_h).sum::<u32>() + 2 * gap,
                         )
                     };
                     let geometry = Geometry {
@@ -620,6 +621,7 @@ mod tests {
                         bottom,
                         speaking_frame: true,
                         frame_color: [46, 155, 255],
+                        gap,
                     };
                     let mut scene = RenderScene {
                         geometry,
@@ -672,9 +674,9 @@ mod tests {
                             assert_eq!(halo[3] > 0, index == 1);
                         }
                         if horizontal {
-                            x += geom.outer_w + GAP;
+                            x += geom.outer_w + gap;
                         } else {
-                            y += geom.outer_h + GAP;
+                            y += geom.outer_h + gap;
                         }
                     }
                     assert!(canvas
@@ -745,6 +747,7 @@ mod tests {
                     bottom: false,
                     speaking_frame: true,
                     frame_color: [46, 155, 255],
+                    gap: GAP,
                 },
                 scale: 1.,
                 tiles: &video_sets[0],
@@ -873,15 +876,16 @@ mod tests {
                 g.outer_h += HALO * 4;
                 g
             });
+            let gap = scaled(GAP, 2.);
             let w = if horizontal {
-                geoms[0].outer_w + geoms[1].outer_w + GAP
+                geoms[0].outer_w + geoms[1].outer_w + gap
             } else {
                 geoms[0].outer_w.max(geoms[1].outer_w)
             };
             let h = if horizontal {
                 geoms[0].outer_h.max(geoms[1].outer_h)
             } else {
-                geoms[0].outer_h + geoms[1].outer_h + GAP
+                geoms[0].outer_h + geoms[1].outer_h + gap
             };
             let mut scene = RenderScene {
                 geometry: Geometry {
@@ -894,6 +898,7 @@ mod tests {
                     bottom: true,
                     speaking_frame: true,
                     frame_color: [46, 155, 255],
+                    gap,
                 },
                 scale: 2.,
                 tiles: &tiles,

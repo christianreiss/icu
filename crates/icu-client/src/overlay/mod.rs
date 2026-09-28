@@ -39,7 +39,10 @@ use self::windows as platform;
 
 mod gpu;
 
-const GAP: u32 = 8;
+/// Base spacing between adjacent tiles, in layout pixels — run through
+/// [`scaled`] like every other overlay dimension so it tracks DPI and tile
+/// size instead of sitting fixed while everything around it grows/shrinks.
+const GAP: u32 = 3;
 const BORDER: u32 = 3;
 /// Gap between a tile's border ring and its outside name-label band: flush,
 /// so the paper tag reads as attached to the tile rather than floating near
@@ -660,13 +663,14 @@ impl Scene {
         // arc, not its actual name's length, so a row/column stays aligned
         // regardless of who has a long name (same principle as before:
         // only the text itself gets truncated with „…").
+        let gap = scaled(GAP, self.scale);
         let (width, height) = match self.effective_expand() {
             Expand::Vertical => (
                 geoms.iter().map(|g| g.outer_w).max().unwrap_or(0),
-                geoms.iter().map(|g| g.outer_h).sum::<u32>() + n.saturating_sub(1) * GAP,
+                geoms.iter().map(|g| g.outer_h).sum::<u32>() + n.saturating_sub(1) * gap,
             ),
             Expand::Horizontal => (
-                geoms.iter().map(|g| g.outer_w).sum::<u32>() + n.saturating_sub(1) * GAP,
+                geoms.iter().map(|g| g.outer_w).sum::<u32>() + n.saturating_sub(1) * gap,
                 geoms.iter().map(|g| g.outer_h).max().unwrap_or(0),
             ),
         };
@@ -693,6 +697,7 @@ impl Scene {
             bottom: self.anchored_bottom(),
             speaking_frame: self.settings.speaking_frame,
             frame_color: self.settings.frame_color,
+            gap: scaled(GAP, self.scale),
         };
 
         if let Some(mut renderer) = self.gpu.take() {
@@ -959,6 +964,8 @@ struct Geometry {
     bottom: bool,
     speaking_frame: bool,
     frame_color: [u8; 3],
+    /// Spacing between adjacent tiles, already scaled — see [`GAP`].
+    gap: u32,
 }
 
 /// Draws the tiles into `canvas` (premultiplied BGRA, `width × height`):
@@ -1132,9 +1139,9 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
         }
 
         if g.horizontal {
-            x0 += outer_w + GAP;
+            x0 += outer_w + g.gap;
         } else {
-            y0 += outer_h + GAP;
+            y0 += outer_h + g.gap;
         }
     }
 }
@@ -1238,6 +1245,7 @@ mod tests {
             bottom: true,
             speaking_frame: true,
             frame_color: [0x2e, 0x9b, 0xff],
+            gap: GAP,
         }
     }
 
