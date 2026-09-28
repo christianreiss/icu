@@ -1,6 +1,15 @@
 //! Thin clap wrapper around [`icu_server`] (`Server/IMPLEMENTATION.md` §5).
+//!
+//! One binary, two names (§5.1): as `icu-server` it is everything below, as
+//! `icu-cli` — a symlink the package puts beside it — only the admin side,
+//! and without a command the interactive shell. `argv[0]` is all that tells
+//! the two apart.
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use clap::{Parser, Subcommand};
 use icu_server::{cli, config::Config, error::Result, AdminRequest};
@@ -17,10 +26,31 @@ struct Cli {
     command: Command,
 }
 
+/// Everything `icu-server` takes. Flat: the flattened variant is spliced in
+/// where it stands, so the help stays the single list it always was.
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the server. Creates CA and server certificate on first run.
     Run,
+    #[command(flatten)]
+    Admin(AdminCommand),
+    /// Put a snapshot back while the server is stopped, then issue a new
+    /// server certificate. The state it replaces is kept as a snapshot.
+    Restore {
+        /// Snapshot directory, or `latest` for the newest one.
+        snapshot: String,
+    },
+    /// Interactive first-time bootstrap: prompts for server_name,
+    /// public_host, the UDP port, max_users and admin_socket_group, writes
+    /// the config, and can issue the first admin invite. Works on a config
+    /// file that does not exist yet.
+    Setup,
+}
+
+/// The admin side, the part `icu-cli` carries too: every command that reaches
+/// a running server over the admin socket, plus the shell that repeats them.
+#[derive(Debug, Subcommand)]
+enum AdminCommand {
     /// Issue a registration bundle and print it. While no admin has
     /// registered, whoever completes a registration first becomes admin.
     Invite {
@@ -117,55 +147,117 @@ enum Command {
         #[arg(long)]
         list: bool,
     },
-    /// Put a snapshot back while the server is stopped, then issue a new
-    /// server certificate. The state it replaces is kept as a snapshot.
-    Restore {
-        /// Snapshot directory, or `latest` for the newest one.
-        snapshot: String,
-    },
     /// Cisco-style interactive admin shell: persistent prompt, TAB
-    /// completion, `?` for context help. `run` and `restore` are not
-    /// available here.
+    /// completion, `?` for context help. `run`, `restore` and `setup` are
+    /// not available here.
     Shell,
-    /// Interactive first-time bootstrap: prompts for server_name,
-    /// public_host, the UDP port, max_users and admin_socket_group, writes
-    /// the config, and can issue the first admin invite. Works on a config
-    /// file that does not exist yet.
+}
+
+/// `icu-cli`: the admin half of `icu-server` under a shorter name.
+#[derive(Debug, Parser)]
+#[command(
+    name = "icu-cli",
+    version,
+    about = "ICU admin CLI: the icu-server admin commands and the interactive shell.",
+    long_about = None
+)]
+struct CliAlias {
+    /// Path of the configuration file.
+    #[arg(long, global = true, default_value = "/etc/icu/server.toml")]
+    config: PathBuf,
+
+    /// Without a command: the interactive admin shell.
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+/// The alias' commands. `run`, `restore` and `setup` are in here only so that
+/// naming one gets a pointer instead of clap's bare "unrecognized
+/// subcommand"; `hide` keeps them out of `icu-cli --help`.
+#[derive(Debug, Subcommand)]
+enum CliCommand {
+    #[command(flatten)]
+    Admin(AdminCommand),
+    #[command(hide = true)]
+    Run,
+    #[command(hide = true)]
+    Restore {
+        #[arg(hide = true)]
+        snapshot: Option<String>,
+    },
+    #[command(hide = true)]
     Setup,
 }
 
+/// Which name the binary was invoked under (`icu-cli` is a symlink to
+/// `icu-server`, so nothing but `argv[0]` distinguishes them).
+fn is_cli_name(arg0: &OsStr) -> bool {
+    Path::new(arg0)
+        .file_stem()
+        .is_some_and(|stem| stem == "icu-cli")
+}
+
+/// `run`, `restore` and `setup` stay `icu-server`-only (§5.1): the first *is*
+/// the service, the second needs it stopped and takes `flock` itself, which a
+/// session on the same socket cannot coexist with, and the third configures
+/// the host before there is a socket at all.
+fn server_only(verb: &str, usage: &str) -> ExitCode {
+    eprintln!("icu-cli: `{verb}` is only available as `icu-server {usage}`");
+    ExitCode::from(2)
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let alias = std::env::args_os()
+        .next()
+        .is_some_and(|arg0| is_cli_name(&arg0));
+    let prog = if alias { "icu-cli" } else { "icu-server" };
+    let (config_path, command) = if alias {
+        let cli = CliAlias::parse();
+        let command = match cli.command {
+            None => Command::Admin(AdminCommand::Shell),
+            Some(CliCommand::Admin(command)) => Command::Admin(command),
+            Some(CliCommand::Run) => return server_only("run", "run"),
+            Some(CliCommand::Restore { .. }) => {
+                return server_only("restore", "restore <snapshot>")
+            }
+            Some(CliCommand::Setup) => return server_only("setup", "setup"),
+        };
+        (cli.config, command)
+    } else {
+        let cli = Cli::parse();
+        (cli.config, cli.command)
+    };
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            eprintln!("icu-server: cannot start the tokio runtime: {e}");
+            eprintln!("{prog}: cannot start the tokio runtime: {e}");
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(cli)) {
+    match runtime.block_on(run(&config_path, command)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("icu-server: {e}");
+            eprintln!("{prog}: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run(config_path: &Path, command: Command) -> Result<()> {
     // `setup` may be writing the config file for the first time, so it
     // cannot go through the shared read below.
-    if let Command::Setup = cli.command {
-        return cli::setup::run(&cli.config).await;
+    if let Command::Setup = command {
+        return cli::setup::run(config_path).await;
     }
     // Resolved and validated only where it is used: `run` here, the offline
     // CLI in `cli::dispatch`. A command that reaches the running server needs
     // nothing but the socket path.
-    let config = Config::read(&cli.config)?;
-    match cli.command {
+    let config = Config::read(config_path)?;
+    match command {
         Command::Run => {
             let config = config.resolve()?;
             icu_server::init_tracing(&config.log);
@@ -175,73 +267,79 @@ async fn run(cli: Cli) -> Result<()> {
             handle.shutdown().await;
             Ok(())
         }
-        Command::Invite { name, ttl, out } => {
-            cli::invite::run(&config, name.as_deref(), &ttl, out.as_deref()).await
+        // Never through the socket or the offline server: that would open,
+        // and could write, the very state being replaced.
+        Command::Restore { snapshot } => cli::backup::restore(&config, &snapshot).await,
+        Command::Admin(command) => run_admin(&config, command).await,
+        Command::Setup => unreachable!("handled above"),
+    }
+}
+
+async fn run_admin(config: &Config, command: AdminCommand) -> Result<()> {
+    match command {
+        AdminCommand::Invite { name, ttl, out } => {
+            cli::invite::run(config, name.as_deref(), &ttl, out.as_deref()).await
         }
-        Command::Users { json } => cli::users::run(&config, json).await,
-        Command::Revoke { user } => {
+        AdminCommand::Users { json } => cli::users::run(config, json).await,
+        AdminCommand::Revoke { user } => {
             let request = AdminRequest::Revoke { user: user.clone() };
-            cli::with_closed(&config, request, &user, "revoked").await
+            cli::with_closed(config, request, &user, "revoked").await
         }
-        Command::Promote { user } => {
+        AdminCommand::Promote { user } => {
             let request = AdminRequest::Promote { user: user.clone() };
-            cli::for_user(&config, request, &user, "promoted", " to admin").await
+            cli::for_user(config, request, &user, "promoted", " to admin").await
         }
-        Command::Demote { user } => {
+        AdminCommand::Demote { user } => {
             let request = AdminRequest::Demote { user: user.clone() };
-            cli::for_user(&config, request, &user, "demoted", "").await
+            cli::for_user(config, request, &user, "demoted", "").await
         }
-        Command::Disable { user } => {
+        AdminCommand::Disable { user } => {
             let request = AdminRequest::Disable { user: user.clone() };
-            cli::with_closed(&config, request, &user, "disabled").await
+            cli::with_closed(config, request, &user, "disabled").await
         }
-        Command::Enable { user } => {
+        AdminCommand::Enable { user } => {
             let request = AdminRequest::Enable { user: user.clone() };
-            cli::for_user(&config, request, &user, "enabled", "").await
+            cli::for_user(config, request, &user, "enabled", "").await
         }
-        Command::Kick { user } => {
+        AdminCommand::Kick { user } => {
             let request = AdminRequest::Kick { user: user.clone() };
-            cli::with_closed(&config, request, &user, "kicked").await
+            cli::with_closed(config, request, &user, "kicked").await
         }
-        Command::Mute { user } => {
+        AdminCommand::Mute { user } => {
             let request = AdminRequest::Mute { user: user.clone() };
-            cli::for_user(&config, request, &user, "muted", "").await
+            cli::for_user(config, request, &user, "muted", "").await
         }
-        Command::Unmute { user } => {
+        AdminCommand::Unmute { user } => {
             let request = AdminRequest::Unmute { user: user.clone() };
-            cli::for_user(&config, request, &user, "unmuted", "").await
+            cli::for_user(config, request, &user, "unmuted", "").await
         }
-        Command::Deafen { user } => {
+        AdminCommand::Deafen { user } => {
             let request = AdminRequest::Deafen { user: user.clone() };
-            cli::for_user(&config, request, &user, "deafened", "").await
+            cli::for_user(config, request, &user, "deafened", "").await
         }
-        Command::Undeafen { user } => {
+        AdminCommand::Undeafen { user } => {
             let request = AdminRequest::Undeafen { user: user.clone() };
-            cli::for_user(&config, request, &user, "undeafened", "").await
+            cli::for_user(config, request, &user, "undeafened", "").await
         }
-        Command::Status { json } => cli::status::run(&config, json).await,
-        Command::RotateServerCert => {
+        AdminCommand::Status { json } => cli::status::run(config, json).await,
+        AdminCommand::RotateServerCert => {
             cli::simple(
-                &config,
+                config,
                 AdminRequest::RotateServerCert,
                 "new server certificate issued and in use",
             )
             .await
         }
-        Command::RenewCa => {
+        AdminCommand::RenewCa => {
             cli::simple(
-                &config,
+                config,
                 AdminRequest::RenewCa,
                 "CA certificate re-issued under the same key; clients need nothing",
             )
             .await
         }
-        Command::Backup { list } => cli::backup::run(&config, list).await,
-        // Never through the socket or the offline server: that would open,
-        // and could write, the very state being replaced.
-        Command::Restore { snapshot } => cli::backup::restore(&config, &snapshot).await,
-        Command::Shell => icu_server::shell::run(&config).await,
-        Command::Setup => unreachable!("handled above"),
+        AdminCommand::Backup { list } => cli::backup::run(config, list).await,
+        AdminCommand::Shell => icu_server::shell::run(config).await,
     }
 }
 
@@ -258,5 +356,21 @@ async fn wait_for_signal() {
     tokio::select! {
         _ = term.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cli_name;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn the_alias_is_recognised_by_argv0_alone() {
+        for name in ["icu-cli", "./icu-cli", "/usr/bin/icu-cli"] {
+            assert!(is_cli_name(OsStr::new(name)), "{name}");
+        }
+        for name in ["icu-server", "/usr/bin/icu-server", "icu", "icu-client"] {
+            assert!(!is_cli_name(OsStr::new(name)), "{name}");
+        }
     }
 }

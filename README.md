@@ -21,7 +21,7 @@ ZIP für Windows 10/11 (SmartScreen beim ersten Start: „Weitere Informationen�
 „Trotzdem ausführen“), der Server `icu-server` für
 Fedora, AlmaLinux 10+ (`.rpm`) und Debian 12+ (`.deb`) (Einrichtung:
 `deploy/README.md` §0), sowie eine interaktive Admin-Shell
-(`icu-server shell`, `Server/IMPLEMENTATION.md` §5.1).
+(`icu-server shell`, kurz `icu-cli`, `Server/IMPLEMENTATION.md` §5.1).
 
 ## Nicht-Ziele
 

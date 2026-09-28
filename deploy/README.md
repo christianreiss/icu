@@ -35,7 +35,8 @@ Vorgabe an jeder Frage).
 Das Paket legt die Gruppe `icu` an (`/usr/lib/sysusers.d/icu-server.conf`),
 installiert die Unit nach `/usr/lib/systemd/system/`, eine Beispielkonfiguration
 nach `/etc/icu/server.toml` (bleibt bei Updates erhalten), den firewalld-Dienst
-`icu` und den Checkmk-Check nach `/usr/share/icu-server/checkmk/`. Der Dienst
+`icu`, den Checkmk-Check nach `/usr/share/icu-server/checkmk/` und
+`/usr/bin/icu-cli` als Symlink auf `icu-server` (§3 „Bedienen“). Der Dienst
 wird **nicht** automatisch gestartet: erst `server_name` prüfen. Ohne
 `server_name` nimmt der Server den FQDN des Hosts (`hostname --fqdn`), aber
 nur, wenn der Name per DNS auf eine Adresse dieses Hosts zeigt, die weder
@@ -151,6 +152,7 @@ Die Konfigurationsdatei entweder mit `icu-server setup` interaktiv anlegen
 ```bash
 sudo install -m0755 target/musl/x86_64-unknown-linux-musl/release-server/icu-server \
   /usr/bin/icu-server
+sudo ln -sfn icu-server /usr/bin/icu-cli   # zweiter Name für die Admin-Seite (§3)
 sudo install -m0644 deploy/icu-server.service /etc/systemd/system/
 sudo groupadd --system icu            # Gruppe für den Admin-Socket
 sudo install -d -m0755 /etc/icu
@@ -392,6 +394,22 @@ icu-server backup --list                   # Snapshots anzeigen (root)
 icu-server restore latest                  # Snapshot zurück, nur bei gestopptem Server (§2 „Backup und Restore“)
 ```
 
+**`icu-cli` und die Admin-Shell.** `/usr/bin/icu-cli` ist ein Symlink auf
+dasselbe Binary und nimmt jedes Kommando von oben — `icu-cli users`,
+`icu-cli revoke alice` — außer `run`, `restore` und `setup`, die einen
+gestoppten oder noch nicht eingerichteten Server brauchen. Ohne Kommando
+öffnet es die interaktive Admin-Shell im Cisco-IOS-Stil (`icu-server shell`
+tut dasselbe): persistenter Prompt, TAB-Vervollständigung von Kommandos und
+Nutzernamen, `?` als Kontexthilfe, eindeutige Präfixe (`sh us` für
+`show users`), Befehlshistorie unter
+`~/.local/state/icu-server/shell_history`. Details:
+`Server/IMPLEMENTATION.md` §5.1.
+
+```bash
+icu-cli                                    # Shell: icu-server> sh us
+icu-cli status                             # dasselbe wie icu-server status
+```
+
 **Erster Admin:** Admin wird, wer als Erster eine Registrierung abschließt
 (quittiert), solange es noch keinen bestätigten Admin gibt — nicht das zuerst
 ausgestellte Bundle (`PROTOCOL.md` §2.3). Direkt nach der Installation also
@@ -459,6 +477,7 @@ podman run -d --name icu \
   -v ./server.toml:/etc/icu/server.toml:ro \
   icu-server
 podman exec icu /icu-server invite --name alice
+podman exec -it icu /icu-cli                  # Admin-Shell im Container
 ```
 
 Das Image nimmt das Binary aus §1 (`target/musl/…/release-server/icu-server`,
