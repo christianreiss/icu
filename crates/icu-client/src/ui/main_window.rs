@@ -1622,14 +1622,10 @@ fn speak_row(
         },
         threshold: (!ptt).then_some(state.vad_threshold),
         key: ptt.then_some(key.as_str()),
-        talking_muted: state.muted && (state.voice || (ptt && state.ptt_down)),
         clipping: !offline && state.level.peak_db >= CLIP_DB,
     };
     // Built only while hovered: three floats formatted per frame otherwise.
     let tooltip = |ui: &mut egui::Ui| {
-        if speak.talking_muted {
-            ui.label("Du bist stummgeschaltet — niemand hört dich.");
-        }
         if speak.clipping {
             ui.label("Übersteuert — leiser sprechen oder das Mikrofon herunterregeln.");
         }
@@ -1866,10 +1862,7 @@ pub(super) fn participant_for<'a>(
         loss_permille: p.recv_loss_permille,
         session: p.info.session,
         moderation: state.is_admin.then(|| {
-            let row = state
-                .user_list
-                .iter()
-                .find(|u| u.user_id == p.info.user_id);
+            let row = state.user_list.iter().find(|u| u.user_id == p.info.user_id);
             Moderation {
                 muted: row.is_some_and(|u| u.muted),
                 deafened: row.is_some_and(|u| u.deafened),
@@ -1878,7 +1871,12 @@ pub(super) fn participant_for<'a>(
         // The flag arrives with `UserState`, so the picture goes the
         // moment somebody switches off — not three seconds later when the
         // last frame goes stale.
-        video: p.info.flags.camera_on().then(|| video(p.info.session)).flatten(),
+        video: p
+            .info
+            .flags
+            .camera_on()
+            .then(|| video(p.info.session))
+            .flatten(),
     })
 }
 
