@@ -5,9 +5,9 @@
 //! else registers itself for the user, under `~/.local/share`. Switched
 //! with `[ui] register_uri_handler` (the name is older than the file type:
 //! until 2026-09-24 this registered `icu://` links, which no longer exist).
-//! On Windows the association goes under `HKCU\Software\Classes` (`.icu` →
-//! `ICU.Invite`, opened with `"icu.exe" "%1"`), which needs no administrator
-//! and follows the exe wherever the ZIP was unpacked.
+//! On Windows the installer owns the machine-wide association. A portable
+//! exe registers under `HKCU\Software\Classes` (`.icu` → `ICU.Invite`, opened
+//! with `"icu.exe" "%1"`), which needs no administrator and follows the ZIP.
 
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
@@ -184,13 +184,16 @@ fn remove_stale_entry(data: &Path, exe: &Path) -> Result<bool, String> {
 #[cfg(target_os = "windows")]
 const PROG_ID: &str = "ICU.Invite";
 
-/// Registers this exe for `.icu` files for the current user; returns the
-/// exe. Idempotent: only differing values are written, and Explorer is
-/// told only when something changed.
+/// Registers a portable exe for `.icu` files for the current user; returns
+/// the exe. The machine-wide installer owns its association. Idempotent:
+/// only differing values are written, and Explorer is told only when needed.
 #[cfg(target_os = "windows")]
 pub fn register() -> Result<std::path::PathBuf, String> {
     use crate::winreg::set_class_string;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if crate::winreg::is_machine_installed_exe(&exe) {
+        return Ok(exe);
+    }
     let shown = exe.display().to_string();
     let mut changed = false;
     for (key, name, value) in [

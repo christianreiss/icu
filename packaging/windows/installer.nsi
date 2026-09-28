@@ -1,15 +1,11 @@
-; Per-user NSIS installer for icu.exe. Built by packaging/windows/installer.sh
+; Machine-wide NSIS installer for icu.exe. Built by packaging/windows/installer.sh
 ; from the exact files packaging/windows/build.sh already staged for the
 ; portable ZIP (target/pkg/windows/icu-<ver>-windows-x86_64/); do not invoke
 ; makensis on this file directly outside that script — VERSION, VIVERSION,
 ; STAGE, OUTFILE, ICON and NOTICE are passed in as -D command-line defines.
 ;
-; RequestExecutionLevel user embeds an asInvoker manifest: this is what
-; stops Windows' installer-name heuristic (files matching *setup*.exe etc.)
-; from popping a UAC prompt anyway, matching the no-admin portable .exe and
-; the HKCU-only registry writes crates/icu-client/src/winreg.rs already
-; makes at runtime (.icu file association, ICU.Invite ProgID, toast
-; AppUserModelId "ICU").
+; The installer needs elevation for Program Files and HKLM. The portable exe
+; stays unelevated and registers its own .icu association per user.
 ;
 ; This host only has the amd64-unicode NSIS stubs installed (Fedora package
 ; mingw64-nsis, no mingw32-nsis), so the target must be selected explicitly.
@@ -37,9 +33,9 @@ Target amd64-unicode
 
 Name "ICU"
 OutFile "${OUTFILE}"
-InstallDir "$LOCALAPPDATA\Programs\ICU"
-InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "InstallLocation"
-RequestExecutionLevel user
+InstallDir "$PROGRAMFILES64\ICU"
+InstallDirRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "InstallLocation"
+RequestExecutionLevel admin
 ; Keeps the compiled stub under the zlib/libpng license only (see
 ; packaging/windows/notices/nsis-COPYING): the LZMA module is Common Public
 ; License 1.0 and the bzip2 module has its own license; neither is linked
@@ -68,6 +64,16 @@ ShowUnInstDetails show
 
 !insertmacro MUI_LANGUAGE "German"
 !insertmacro MUI_LANGUAGE "English"
+
+Function .onInit
+  SetShellVarContext all
+  SetRegView 64
+FunctionEnd
+
+Function un.onInit
+  SetShellVarContext all
+  SetRegView 64
+FunctionEnd
 
 VIProductVersion "${VIVERSION}"
 VIAddVersionKey "ProductName"     "ICU"
@@ -118,16 +124,23 @@ Section "ICU (erforderlich)" SEC_APP
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
-  WriteRegStr   HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "DisplayName" "ICU"
-  WriteRegStr   HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "UninstallString" '"$INSTDIR\uninstall.exe"'
-  WriteRegStr   HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
-  WriteRegStr   HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "InstallLocation" "$INSTDIR"
-  WriteRegStr   HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "DisplayIcon" "$INSTDIR\icu.exe"
-  WriteRegStr   HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "DisplayVersion" "${VERSION}"
-  WriteRegStr   HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "Publisher" "ICU"
-  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "NoModify" 1
-  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "NoRepair" 1
-  WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "EstimatedSize" "$0"
+  WriteRegStr   HKLM "Software\Classes\.icu" "" "ICU.Invite"
+  WriteRegStr   HKLM "Software\Classes\.icu" "Content Type" "application/x-icu"
+  WriteRegStr   HKLM "Software\Classes\ICU.Invite" "" "ICU-Einladung oder -Passport"
+  WriteRegStr   HKLM "Software\Classes\ICU.Invite\DefaultIcon" "" '"$INSTDIR\icu.exe",0'
+  WriteRegStr   HKLM "Software\Classes\ICU.Invite\shell\open\command" "" '"$INSTDIR\icu.exe" "%1"'
+  System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
+
+  WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "DisplayName" "ICU"
+  WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "UninstallString" '"$INSTDIR\uninstall.exe"'
+  WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
+  WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "InstallLocation" "$INSTDIR"
+  WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "DisplayIcon" "$INSTDIR\icu.exe"
+  WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "DisplayVersion" "${VERSION}"
+  WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "Publisher" "ICU"
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "NoModify" 1
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "NoRepair" 1
+  WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "EstimatedSize" "$0"
 SectionEnd
 
 ; Unchecked by default: matches the "no automatic clutter, pin manually"
@@ -148,22 +161,11 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\ICU.lnk"
   Delete "$DESKTOP\ICU.lnk"
 
-  DeleteRegKey HKCU "Software\Classes\.icu"
-  DeleteRegKey HKCU "Software\Classes\ICU.Invite"
-  DeleteRegKey HKCU "Software\Classes\AppUserModelId\ICU"
-  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU"
+  DeleteRegKey HKLM "Software\Classes\.icu"
+  DeleteRegKey HKLM "Software\Classes\ICU.Invite"
+  DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU"
 
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)' ; SHCNE_ASSOCCHANGED
 
-  ; Default "Nein": the private key under %APPDATA%\icu is DPAPI-encrypted
-  ; and is the user's identity/passport (docs/research/packaging-licensing.md,
-  ; packaging/windows/README.txt) — an uninstall must not silently strand it.
-  MessageBox MB_YESNO|MB_ICONQUESTION \
-    "Auch Einstellungen, Protokoll und Identität entfernen?$\n$\n\
-    %APPDATA%\icu und %LOCALAPPDATA%\icu\data werden dann unwiderruflich \
-    gelöscht. Der private Schlüssel darin meldet dich bei deinem Zugang an \
-    – wie ein Passwort behandeln." /SD IDNO IDNO keep_data
-    RMDir /r "$APPDATA\icu"
-    RMDir /r "$LOCALAPPDATA\icu"
-  keep_data:
+  ; User profiles belong to their users. Keep settings, logs and DPAPI keys.
 SectionEnd

@@ -5,9 +5,9 @@ Entpacken, icu.exe starten. Keine Installation, keine Administratorrechte.
 Einen Eintrag im Startmenü legt ICU ohne Installation nicht an. Wer ihn
 möchte: icu.exe dorthin legen, wo es bleiben soll, dann Rechtsklick auf
 icu.exe → „An „Start“ anheften“. Alternativ gibt es auf der Release-Seite
-ein Setup (icu-<Version>-windows-x86_64-setup.exe), das pro Benutzer ohne
-Administratorrechte installiert, einen Startmenü-Eintrag anlegt und sich
-über Einstellungen → Apps sauber deinstallieren lässt.
+ein Setup (icu-<Version>-windows-x86_64-setup.exe), das nach einer UAC-Abfrage
+für alle Benutzer unter C:\Program Files\ICU installiert, einen gemeinsamen
+Startmenü-Eintrag anlegt und sich über Einstellungen → Apps deinstallieren lässt.
 
 Beim ersten Start warnt Windows („Der Computer wurde durch Windows
 geschützt“), weil icu.exe nicht signiert ist: „Weitere Informationen“, dann
@@ -29,6 +29,8 @@ Passwort behandeln.
 Windows N/KN ohne „Media Feature Pack“: ICU startet nicht (Kamera braucht
 Media Foundation).
 
-Deinstallieren: icu.exe löschen, die Ordner oben löschen, und unter
+Beim Deinstallieren des Setups bleiben Einstellungen, Protokoll und Identität
+in den Benutzerprofilen erhalten. Für das portable ZIP: icu.exe löschen, die
+Ordner oben löschen, und unter
 HKEY_CURRENT_USER\Software\Classes die Schlüssel .icu, ICU.Invite und
 AppUserModelId\ICU entfernen.

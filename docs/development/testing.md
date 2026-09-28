@@ -182,36 +182,44 @@ enthält die damaligen Kommandos und Resultate; offene Checks stehen oben.
 ## 8. Installer (NSIS)
 
 Stand 2026-09-28: `packaging/windows/installer.sh` (NSIS, `packaging/windows/installer.nsi`)
-baut zusätzlich zur ZIP ein per-Benutzer-Setup ohne Administratorrechte,
+baut zusätzlich zur ZIP ein Setup für alle Benutzer mit UAC,
 `dist/<ver>/icu-<ver>-windows-x86_64-setup.exe` (`docs/research/packaging-licensing.md`).
 Fedora-seitig geprüft (nicht hier, weil automatisierbar): `makensis -WX`
 kompiliert fehlerfrei, `file` bestätigt eine PE32+-Datei, `BUILDINFO.windows-installer`
-zeigt auf `HEAD`. Was echte Windows-Hardware/-VM braucht:
+zeigt auf `HEAD`.
 
-- [ ] **Kein UAC** (offen): Setup startet ohne Erhöhungsdialog (kein Schild-Icon
-  auf dem Setup-Symbol, keine UAC-Abfrage).
-- [ ] **Installation** (offen): landet unter `%LOCALAPPDATA%\Programs\ICU`;
-  Startmenü-Eintrag startet ICU; Desktop-Verknüpfung nur, wenn im Components-Schritt
-  angehakt.
-- [ ] **Taskleisten-Gruppierung** (offen): angepinnt an die Taskleiste zeigt beim
-  Start **eine** Gruppe. Die Verknüpfung selbst trägt kein AppUserModelId (dieser
-  NSIS-3.11-Build unterstützt den Parameter an `CreateShortcut` nicht,
-  `docs/research/packaging-licensing.md`); prüfen, ob `SetCurrentProcessExplicitAppUserModelID("ICU")`
-  im laufenden Prozess (main.rs) dafür allein ausreicht.
-- [ ] **Dateizuordnung/Toast** (offen): `.icu`-Zuordnung und Toasts funktionieren nach
-  Installation identisch zur portablen ZIP.
-- [ ] **Laufende Instanz** (offen): Setup gegen eine laufende (Tray-)Instanz
-  gestartet → deutsche Fehlermeldung „ICU läuft noch …", kein Absturz, keine
-  beschädigte Installation.
-- [ ] **Deinstallation** (offen): über Einstellungen → Apps (kein Admin nötig,
-  erscheint unter dem Benutzerkonto) entfernt exe/Verknüpfungen/Registry;
-  `%APPDATA%\icu` und `%LOCALAPPDATA%\icu\data` bleiben standardmäßig stehen
-  (Ja/Nein-Dialog, Vorgabe „Nein"); Entfernen separat mit einem Wegwerf-Profil
-  testen (löscht den DPAPI-Schlüssel/die Identität unwiderruflich).
-- [ ] **Upgrade** (offen): erneute Installation über eine bestehende Version
-  funktioniert bei geschlossenem ICU.
-- [ ] **SmartScreen** (offen): Verhalten unverändert zum portablen `icu.exe`
-  (unsigniert, „Weitere Informationen" → „Trotzdem ausführen").
+Automatisierter Lauf auf `win10-test` (2026-09-28): x64-Setup mit
+`requireAdministrator`-Manifest installierte per `/S` unter
+`C:\Program Files\ICU`, legte den gemeinsamen Startmenü-Eintrag und die
+HKLM-Dateizuordnung an; erneute Installation und Deinstallation per `/S`
+liefen mit Exitcode 0. Danach waren EXE, Verknüpfung und HKLM-Einträge weg;
+die bestehende portable Testinstallation und ihr HKCU-Eintrag blieben stehen.
+Anschließend wurde das Setup interaktiv auf demselben Desktop geprüft:
+
+- [x] **UAC**: Das Setup zeigt die Abfrage für einen unbekannten Herausgeber;
+  Abbruch ließ `Program Files` und den HKLM-Uninstall-Eintrag unangetastet.
+- [x] **Installation**: Der Assistent zeigte `C:\Program Files\ICU`, installierte
+  dort und legte den gemeinsamen Startmenü-Eintrag an. Die optionale
+  Desktop-Verknüpfung war standardmäßig abgewählt. Der gemeinsame Shortcut
+  startete `C:\Program Files\ICU\icu.exe` in der Desktop-Sitzung.
+- [x] **Dateizuordnung**: Nach vorübergehendem Sichern und Entfernen der alten
+  HKCU-Zuordnung ergab `assoc .icu` den HKLM-ProgID `ICU.Invite`; ShellExecute
+  einer Testdatei erreichte den installierten Client. Dessen Start erzeugte
+  keinen HKCU-Eintrag. Danach wurden die alten HKCU-Werte wiederhergestellt.
+- [x] **Laufende Instanz**: Bei offenem ICU zeigte das Setup „ICU läuft noch …",
+  brach ab und ließ EXE und HKLM-Einträge bestehen.
+- [x] **Deinstallation**: Der grafische Uninstaller forderte UAC an und entfernte
+  EXE, gemeinsamen Shortcut und HKLM-Einträge. `%APPDATA%\icu` und
+  `%LOCALAPPDATA%\icu\data` blieben erhalten; der alte Client wurde neu gestartet.
+- [x] **Upgrade**: Erneute stille Installation über dieselbe Version bei
+  geschlossenem ICU endete mit Exitcode 0.
+- [ ] **Toasts und Taskleiste**: Verhalten mit dem gemeinsamen Shortcut auf
+  dem Desktop noch prüfen.
+- [x] **SmartScreen/Download-Reputation**: Mit `ZoneId=3` erschien „Open File —
+  Security Warning" für den unbekannten Herausgeber und danach UAC. Ein Download
+  desselben Setups in Edge wurde als „isn't commonly downloaded" angehalten;
+  nach „Keep" schloss Edge den Download ab. Ein blauer SmartScreen-Dialog
+  erschien bei diesem Test nicht.
 
 ## Empfangsfeedback und Mikrofonregelung (2026-09-28)
 
