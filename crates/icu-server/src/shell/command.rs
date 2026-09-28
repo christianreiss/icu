@@ -141,6 +141,21 @@ const SHOW_CHILDREN: &[(&str, Node)] = &[
         }),
     ),
     (
+        "invites",
+        Node::Leaf(Leaf {
+            help: "List open invitations (pending, not revoked, not expired).",
+            args: &[ArgKind::FreeText("[--json]")],
+            confirm: false,
+            build: |args| {
+                Ok(Action::Admin {
+                    request: AdminRequest::Invites,
+                    raw_json: wants_json(args),
+                    out: None,
+                })
+            },
+        }),
+    ),
+    (
         "backups",
         Node::Leaf(Leaf {
             help: "List state snapshots (needs read access to the backup directory).",
@@ -294,6 +309,16 @@ pub const TOP: &[(&str, Node)] = &[
             args: &[ArgKind::UserSelector],
             confirm: true,
             build: |args| admin(AdminRequest::Revoke { user: user(args) }),
+        }),
+    ),
+    (
+        "cancel-invite",
+        Node::Leaf(Leaf {
+            help: "Cancel a pending invitation. Refuses if the selector is not \
+                   an open invite.",
+            args: &[ArgKind::UserSelector],
+            confirm: true,
+            build: |args| admin(AdminRequest::CancelInvite { user: user(args) }),
         }),
     ),
     (
@@ -656,6 +681,45 @@ mod tests {
     }
 
     #[test]
+    fn show_invites_resolves_to_its_own_request() {
+        let (action, confirm) = resolve_line("show invites").unwrap();
+        assert_eq!(
+            action,
+            Action::Admin {
+                request: AdminRequest::Invites,
+                raw_json: false,
+                out: None,
+            }
+        );
+        assert!(confirm.is_none());
+        let (action, _) = resolve_line("show invites --json").unwrap();
+        assert_eq!(
+            action,
+            Action::Admin {
+                request: AdminRequest::Invites,
+                raw_json: true,
+                out: None,
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_invite_resolves_and_asks_for_confirmation() {
+        let (action, confirm) = resolve_line("cancel-invite bob").unwrap();
+        assert_eq!(
+            action,
+            Action::Admin {
+                request: AdminRequest::CancelInvite {
+                    user: "bob".to_string()
+                },
+                raw_json: false,
+                out: None,
+            }
+        );
+        assert!(confirm.unwrap().starts_with("cancel-invite bob"));
+    }
+
+    #[test]
     fn abbreviations_resolve_like_cisco() {
         let (action, _) = resolve_line("sh us").unwrap();
         assert_eq!(
@@ -836,7 +900,7 @@ mod tests {
     fn show_group_candidates_are_its_children() {
         let cands = candidates_at(&["show", ""], &[]);
         let texts: Vec<&str> = cands.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(texts, ["status", "users", "backups"]);
+        assert_eq!(texts, ["status", "users", "invites", "backups"]);
     }
 
     #[test]

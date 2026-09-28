@@ -123,11 +123,29 @@ fn styled_state(style: Style, user: &AdminUser) -> String {
 
 /// Render all user fields; a narrow terminal gets records instead of a wide table.
 pub fn users(style: Style, users: &[AdminUser]) -> String {
-    let mut out = format!("{}\n", style.heading(&format!("Users ({})", users.len())));
+    user_table(style, "Users", "No users on record.", users)
+}
+
+/// Like [`users`], filtered to open invitations
+/// (`UserRecord::is_open_invite`): same row shape, a heading and an
+/// empty-state line that say "invitations" instead of "users".
+pub fn invites(style: Style, invites: &[AdminUser]) -> String {
+    user_table(style, "Open invitations", "No open invitations.", invites)
+}
+
+/// Shared renderer behind [`users`] and [`invites`]: only the heading and the
+/// empty-state line differ between the two listings, everything about a row
+/// stays the same.
+fn user_table(style: Style, heading: &str, empty: &str, users: &[AdminUser]) -> String {
+    let mut out = format!(
+        "{}\n",
+        style.heading(&format!("{heading} ({})", users.len()))
+    );
     if users.is_empty() {
         out.push_str(&style.subtle("id  name  state  role  expires  fingerprint"));
         out.push('\n');
-        out.push_str("No users on record.\n");
+        out.push_str(empty);
+        out.push('\n');
         return out;
     }
     if style.width >= 115 {

@@ -172,6 +172,7 @@ fn is_mutating(request: &AdminRequest) -> bool {
         request,
         AdminRequest::Invite { .. }
             | AdminRequest::Revoke { .. }
+            | AdminRequest::CancelInvite { .. }
             | AdminRequest::Promote { .. }
             | AdminRequest::Demote { .. }
             | AdminRequest::Disable { .. }
@@ -219,6 +220,16 @@ fn print_response(value: &serde_json::Value, raw_json: bool, out: Option<&Path>)
             Ok(users) => print!("{}", display::users(Style::current(), &users)),
             Err(e) => println!(
                 "{} invalid user response: {e}",
+                Style::current().bad("error:")
+            ),
+        }
+        return;
+    }
+    if let Some(invites) = value.get("invites").and_then(|v| v.as_array()) {
+        match serde_json::from_value::<Vec<AdminUser>>(serde_json::Value::Array(invites.clone())) {
+            Ok(invites) => print!("{}", display::invites(Style::current(), &invites)),
+            Err(e) => println!(
+                "{} invalid invite response: {e}",
                 Style::current().bad("error:")
             ),
         }

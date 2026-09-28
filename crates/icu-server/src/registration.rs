@@ -80,7 +80,7 @@ pub async fn issue(
     // expires, but must not hold a place until then.
     let pending = store
         .users()
-        .filter(|(_, u)| u.is_pending() && !u.is_revoked())
+        .filter(|(_, u)| u.is_open_invite(now()))
         .count();
     let cap = server.config.max_pending_invites();
     if pending >= cap {

@@ -217,6 +217,22 @@ impl UserRecord {
             && (self.certs.iter().all(|c| c.registration)
                 || self.certs.iter().any(|c| c.registration && !c.revoked))
     }
+
+    /// Whether this is an invitation still worth listing or cancelling:
+    /// [`Self::is_pending`], not revoked, and its registration certificate has
+    /// not expired yet. An expired one is gone in every way that matters
+    /// already — [`Store::purge_expired_registrations`] just has not dropped
+    /// it from the store yet (at startup or the next `invite`) — so `invites`
+    /// and `cancel-invite` must not still show or act on it as if it were
+    /// open.
+    pub fn is_open_invite(&self, now: OffsetDateTime) -> bool {
+        self.is_pending()
+            && !self.is_revoked()
+            && self
+                .certs
+                .iter()
+                .any(|c| c.registration && !c.revoked && !c.expired(now))
+    }
 }
 
 /// `users.toml`

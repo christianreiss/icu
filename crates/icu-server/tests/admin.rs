@@ -69,6 +69,123 @@ async fn users_lists_online_state_and_the_newest_certificate() {
     server.shutdown().await;
 }
 
+/// `invites` lists a still-open invitation and leaves out a user who already
+/// confirmed theirs.
+#[tokio::test]
+async fn invites_lists_open_invitations_only() {
+    let server = TestServer::start().await;
+    let socket = server.socket();
+    let _bundle = server.invite("bob").await;
+    server.enroll("alice").await;
+
+    let response = admin::request(&socket, &AdminRequest::Invites)
+        .await
+        .expect("invites");
+    let invites = response["invites"].as_array().expect("invites array");
+    assert_eq!(invites.len(), 1, "{invites:?}");
+    assert_eq!(invites[0]["name"], serde_json::json!("bob"));
+    assert_eq!(invites[0]["pending"], serde_json::json!(true));
+
+    // Both are still on record: `invites` is a filtered view, not a
+    // different store of its own.
+    let users = admin::request(&socket, &AdminRequest::Users)
+        .await
+        .expect("users");
+    assert_eq!(users["users"].as_array().expect("users array").len(), 2);
+    server.shutdown().await;
+}
+
+/// `cancel-invite`, like plain `revoke` (`registration.rs`'s
+/// `a_revoked_invitation_frees_its_place`), immediately frees the pending
+/// slot it held and kills the bundle for good.
+#[tokio::test]
+async fn cancel_invite_frees_the_pending_slot() {
+    let server = TestServer::start_with(|c| c.limits.max_pending_invites = Some(1)).await;
+    let socket = server.socket();
+    let bundle = server.invite("guest").await;
+
+    let full = admin::request(
+        &socket,
+        &AdminRequest::Invite {
+            name: "guest2".into(),
+            ttl_s: None,
+        },
+    )
+    .await
+    .expect("invite");
+    assert_eq!(full["error"], serde_json::json!("RATE_LIMITED"), "{full:?}");
+
+    let cancelled = admin::request(
+        &socket,
+        &AdminRequest::CancelInvite {
+            user: "guest".into(),
+        },
+    )
+    .await
+    .expect("cancel-invite");
+    assert_eq!(cancelled["ok"], serde_json::json!(true), "{cancelled:?}");
+    assert_eq!(cancelled["name"], serde_json::json!("guest"));
+
+    assert!(
+        server.register(&bundle, "mallory").await.is_err(),
+        "the cancelled bundle is dead"
+    );
+    let again = admin::request(
+        &socket,
+        &AdminRequest::Invite {
+            name: "guest2".into(),
+            ttl_s: None,
+        },
+    )
+    .await
+    .expect("invite");
+    assert_eq!(again["ok"], serde_json::json!(true), "{again:?}");
+
+    let invites = admin::request(&socket, &AdminRequest::Invites)
+        .await
+        .expect("invites");
+    let names: Vec<&str> = invites["invites"]
+        .as_array()
+        .expect("invites array")
+        .iter()
+        .map(|u| u["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["guest2"],
+        "the cancelled one is gone, not just full"
+    );
+    server.shutdown().await;
+}
+
+/// `cancel-invite` refuses a selector that no longer names an open
+/// invitation — here, a confirmed member — instead of falling back to a full
+/// `revoke` the way a typo could with the plain `revoke` command; the target
+/// keeps working.
+#[tokio::test]
+async fn cancel_invite_refuses_a_confirmed_user() {
+    let server = TestServer::start().await;
+    let socket = server.socket();
+    let alice = server.enroll("alice").await;
+
+    let response = admin::request(
+        &socket,
+        &AdminRequest::CancelInvite {
+            user: "alice".into(),
+        },
+    )
+    .await
+    .expect("cancel-invite");
+    assert_eq!(response["ok"], serde_json::json!(false), "{response:?}");
+    assert_eq!(response["error"], serde_json::json!("NO_SUCH_USER"));
+
+    // Untouched: alice's certificate still connects.
+    let mut client = server.connect(&alice).await.expect("still valid");
+    let welcome = client.hello("alice").await;
+    assert!(matches!(welcome, ControlMsg::Welcome { .. }));
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn status_reports_uptime_online_and_relay_counters() {
     let server = TestServer::start().await;

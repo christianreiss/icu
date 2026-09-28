@@ -28,7 +28,7 @@ use tokio::{
 use crate::{
     error::{Context, Error, Result},
     room::Counters,
-    store::{parse_rfc3339, unix_millis, Store},
+    store::{now, parse_rfc3339, unix_millis, Store},
     Server,
 };
 
@@ -48,8 +48,20 @@ pub enum AdminRequest {
     },
     /// List all users.
     Users,
+    /// List open invitations: [`crate::store::UserRecord::is_open_invite`] —
+    /// not yet confirmed, not revoked, not expired.
+    Invites,
     /// Revoke every certificate of a user and kick it.
     Revoke {
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous ([`Store::resolve`]).
+        user: String,
+    },
+    /// Cancel a pending invitation. Refused as `NO_SUCH_USER` if the selector
+    /// does not currently name an open invite — a confirmed user, one already
+    /// revoked, or one that expired — so this can never fall back to revoking
+    /// a real member by mistake the way a typo'd `revoke` selector could.
+    CancelInvite {
         /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
         /// that is ambiguous ([`Store::resolve`]).
         user: String,
@@ -140,7 +152,11 @@ pub enum AdminResponse {
     },
     /// `users`
     Users(Vec<AdminUser>),
-    /// `revoke`
+    /// `invites`
+    Invites(Vec<AdminUser>),
+    /// `revoke`, and `cancel-invite` on success (same shape: a selector was
+    /// resolved and revoked, whether the command that asked for it was
+    /// `revoke` or `cancel-invite`).
     Revoke {
         /// The affected user.
         user_id: UserId,
@@ -246,6 +262,7 @@ impl AdminResponse {
                 "admin_confirmed": admin_confirmed,
             }),
             AdminResponse::Users(users) => json!({"ok": true, "users": users}),
+            AdminResponse::Invites(invites) => json!({"ok": true, "invites": invites}),
             AdminResponse::Ok => json!({"ok": true}),
             AdminResponse::User { user_id, name } => {
                 json!({"ok": true, "user_id": user_id, "name": name})
@@ -311,30 +328,22 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
         AdminRequest::Users => {
             let store = server.store.lock().await;
             let online = server.room.online_users();
-            let mut users = Vec::new();
-            for (user_id, record) in store.users() {
-                let newest = record
-                    .certs
-                    .iter()
-                    .max_by_key(|c| parse_rfc3339(&c.issued).ok());
-                users.push(AdminUser {
-                    user_id,
-                    name: record.name.clone(),
-                    fingerprint: newest
-                        .map(|c| c.fingerprint.chars().take(12).collect())
-                        .unwrap_or_default(),
-                    issued: newest.map(|c| c.issued.clone()).unwrap_or_default(),
-                    expires: newest.map(|c| c.expires.clone()).unwrap_or_default(),
-                    revoked: record.is_revoked(),
-                    online: online.contains(&user_id),
-                    is_admin: record.is_admin,
-                    disabled: record.disabled,
-                    pending: record.is_pending(),
-                    muted: record.server_muted,
-                    deafened: record.server_deafened,
-                });
-            }
+            let users = store
+                .users()
+                .map(|(user_id, record)| admin_user(user_id, record, &online))
+                .collect();
             AdminResponse::Users(users)
+        }
+        AdminRequest::Invites => {
+            let store = server.store.lock().await;
+            let online = server.room.online_users();
+            let now = now();
+            let invites = store
+                .users()
+                .filter(|(_, record)| record.is_open_invite(now))
+                .map(|(user_id, record)| admin_user(user_id, record, &online))
+                .collect();
+            AdminResponse::Invites(invites)
         }
         AdminRequest::Revoke { user } => match resolve(server, user).await {
             Ok((user_id, name)) => match revoke_user(server, None, user_id).await {
@@ -344,6 +353,17 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                     closed,
                 },
                 Err(e) => store_err(e, "REVOKE_FAILED"),
+            },
+            Err(response) => response,
+        },
+        AdminRequest::CancelInvite { user } => match resolve(server, user).await {
+            Ok((user_id, name)) => match cancel_invite(server, None, user_id).await {
+                Ok(closed) => AdminResponse::Revoke {
+                    user_id,
+                    name,
+                    closed,
+                },
+                Err(e) => store_err(e, "CANCEL_INVITE_FAILED"),
             },
             Err(response) => response,
         },
@@ -422,6 +442,36 @@ pub async fn handle(server: &Arc<Server>, request: AdminRequest) -> AdminRespons
                 Err(e) => AdminResponse::err("BACKUP_FAILED", e),
             }
         }
+    }
+}
+
+/// One row of `users` or `invites`: the newest certificate's fingerprint,
+/// issue and expiry, plus every state flag `Store` tracks. Shared so the two
+/// listings can never drift apart on how a row is built.
+fn admin_user(
+    user_id: UserId,
+    record: &crate::store::UserRecord,
+    online: &std::collections::BTreeSet<UserId>,
+) -> AdminUser {
+    let newest = record
+        .certs
+        .iter()
+        .max_by_key(|c| parse_rfc3339(&c.issued).ok());
+    AdminUser {
+        user_id,
+        name: record.name.clone(),
+        fingerprint: newest
+            .map(|c| c.fingerprint.chars().take(12).collect())
+            .unwrap_or_default(),
+        issued: newest.map(|c| c.issued.clone()).unwrap_or_default(),
+        expires: newest.map(|c| c.expires.clone()).unwrap_or_default(),
+        revoked: record.is_revoked(),
+        online: online.contains(&user_id),
+        is_admin: record.is_admin,
+        disabled: record.disabled,
+        pending: record.is_pending(),
+        muted: record.server_muted,
+        deafened: record.server_deafened,
     }
 }
 
@@ -589,6 +639,43 @@ pub async fn revoke_user(
     change(server, actor, target, |store| store.revoke(target)).await?;
     let closed = kick_user(server, target, ec::KICKED);
     tracing::info!(actor = actor.map(|a| a.user_id), target, closed, "revoked");
+    crate::endpoint::reload_tls_logged(server).await;
+    Ok(closed)
+}
+
+/// Like [`revoke_user`], but only for a still-open invitation
+/// ([`crate::store::UserRecord::is_open_invite`]): the check and the revoke
+/// happen under the same store lock via `change`, so nothing between
+/// `resolve`'s lock and this one — a redeem completing, say — can slip a real
+/// member through. Refused as `NO_SUCH_USER` (reused rather than a new code:
+/// this is admin-socket-local, like `AMBIGUOUS_USER`, never a wire message)
+/// when the target is not currently an open invite. Behind `cancel-invite`.
+pub async fn cancel_invite(
+    server: &Arc<Server>,
+    actor: Option<&Actor>,
+    target: UserId,
+) -> Result<usize> {
+    change(server, actor, target, |store| {
+        let open = store
+            .user(target)
+            .is_some_and(|record| record.is_open_invite(now()));
+        if !open {
+            return Err(Error::coded(
+                ec::NO_SUCH_USER,
+                "not an open invitation (already confirmed, revoked or expired); \
+                 use revoke for a confirmed user",
+            ));
+        }
+        store.revoke(target)
+    })
+    .await?;
+    let closed = kick_user(server, target, ec::KICKED);
+    tracing::info!(
+        actor = actor.map(|a| a.user_id),
+        target,
+        closed,
+        "invitation cancelled"
+    );
     crate::endpoint::reload_tls_logged(server).await;
     Ok(closed)
 }
@@ -1160,6 +1247,15 @@ mod tests {
             serde_json::from_str::<AdminRequest>(r#"{"cmd":"revoke","user":"alice"}"#).unwrap(),
             AdminRequest::Revoke { .. }
         ));
+        assert!(matches!(
+            serde_json::from_str::<AdminRequest>(r#"{"cmd":"invites"}"#).unwrap(),
+            AdminRequest::Invites
+        ));
+        assert!(matches!(
+            serde_json::from_str::<AdminRequest>(r#"{"cmd":"cancel-invite","user":"bob"}"#)
+                .unwrap(),
+            AdminRequest::CancelInvite { .. }
+        ));
         // A label-less invite is the normal case now that the name comes
         // from the client's CSR.
         assert!(matches!(
@@ -1237,6 +1333,9 @@ mod tests {
         }
         .to_json();
         assert_eq!(promote, json!({"ok": true, "user_id": 2, "name": "1"}));
+
+        let invites = AdminResponse::Invites(Vec::new()).to_json();
+        assert_eq!(invites, json!({"ok": true, "invites": []}));
 
         let backup = AdminResponse::Backup {
             path: "/var/lib/icu/backups/20260927T120000Z".into(),

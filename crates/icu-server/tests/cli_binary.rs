@@ -67,6 +67,79 @@ async fn status_and_users_need_only_the_socket() {
     handle.shutdown().await;
 }
 
+/// End-to-end through the real binary, not just `admin::handle` in-process
+/// (`tests/admin.rs` already covers the socket contract): `icu-server
+/// invites --json` lists an open invitation, `icu-server cancel-invite
+/// <name>` cancels it, and a second cancel of the same name is refused.
+#[tokio::test]
+async fn invites_and_cancel_invite_over_the_binary() {
+    let _alone = ALONE.lock().await;
+    if common::root() {
+        return;
+    }
+    let server = TestServer::start().await;
+    let _bundle = server.invite("bob").await;
+
+    let file = server.dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
+            server.dir.path().to_str().unwrap(),
+            server.dir.path().to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let run_cli = |args: &'static [&'static str]| {
+        let file = file.clone();
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+                .arg("--config")
+                .arg(&file)
+                .args(args)
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+
+    let out = run_cli(&["invites", "--json"]).await;
+    assert!(
+        out.status.success(),
+        "invites: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["ok"], serde_json::json!(true));
+    let invites = value["invites"].as_array().unwrap();
+    assert_eq!(invites.len(), 1, "{invites:?}");
+    assert_eq!(invites[0]["name"], serde_json::json!("bob"));
+
+    let out = run_cli(&["cancel-invite", "bob"]).await;
+    assert!(
+        out.status.success(),
+        "cancel-invite: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("bob"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = run_cli(&["invites", "--json"]).await;
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["invites"].as_array().unwrap().len(), 0);
+
+    // Nothing open left under that name: a second cancel is refused, not a
+    // silent no-op.
+    let out = run_cli(&["cancel-invite", "bob"]).await;
+    assert!(!out.status.success());
+
+    server.shutdown().await;
+}
+
 /// The binary: `backup` offline, `backup --list`, `restore latest`.
 #[tokio::test]
 async fn the_cli_backs_up_lists_and_restores() {

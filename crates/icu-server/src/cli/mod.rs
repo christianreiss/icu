@@ -14,6 +14,7 @@
 pub mod backup;
 pub mod doctor;
 pub mod invite;
+pub mod invites;
 pub mod setup;
 pub mod status;
 pub mod users;
@@ -75,7 +76,7 @@ pub async fn dispatch(config: &Config, request: AdminRequest) -> Result<serde_js
     let server = crate::Server::offline(config.clone().resolve()?)?;
     let changes = !matches!(
         request,
-        AdminRequest::Users | AdminRequest::Status | AdminRequest::Backup
+        AdminRequest::Users | AdminRequest::Invites | AdminRequest::Status | AdminRequest::Backup
     );
     let response = admin::handle(&server, request).await.to_json();
     // No server runs to notice the change: the snapshot is taken here.

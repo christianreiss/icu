@@ -74,8 +74,23 @@ enum AdminCommand {
         #[arg(long)]
         json: bool,
     },
+    /// List open invitations: not yet confirmed, not revoked, not expired.
+    Invites {
+        /// Print raw JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Revoke every certificate of a user and kick it.
     Revoke {
+        /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
+        /// that is ambiguous.
+        user: String,
+    },
+    /// Cancel a pending invitation. Refuses if the selector does not
+    /// currently name an open invite (a confirmed user, already revoked, or
+    /// expired) — unlike `revoke`, a typo'd selector here can never fall back
+    /// to revoking a real member.
+    CancelInvite {
         /// `user_id`, name or fingerprint; `id:<user_id>` or `name:<name>` where
         /// that is ambiguous.
         user: String,
@@ -304,9 +319,14 @@ async fn run_admin(config_path: &Path, config: &Config, command: AdminCommand) -
             cli::invite::run(config, name.as_deref(), &ttl, out.as_deref()).await
         }
         AdminCommand::Users { json } => cli::users::run(config, json).await,
+        AdminCommand::Invites { json } => cli::invites::run(config, json).await,
         AdminCommand::Revoke { user } => {
             let request = AdminRequest::Revoke { user: user.clone() };
             cli::with_closed(config, request, &user, "revoked").await
+        }
+        AdminCommand::CancelInvite { user } => {
+            let request = AdminRequest::CancelInvite { user: user.clone() };
+            cli::with_closed(config, request, &user, "cancelled the invitation for").await
         }
         AdminCommand::Promote { user } => {
             let request = AdminRequest::Promote { user: user.clone() };
