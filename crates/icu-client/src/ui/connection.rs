@@ -77,7 +77,7 @@ pub(super) struct Row {
     /// certificate subjects and cipher lists all get long enough for that.
     block: bool,
     /// Add a copy button. Only meaningful with [`Self::block`].
-    copy: bool,
+    copy: Option<String>,
 }
 
 impl Row {
@@ -88,7 +88,7 @@ impl Row {
             tone: Tone::Plain,
             mono: false,
             block: false,
-            copy: false,
+            copy: None,
         }
     }
 
@@ -114,9 +114,9 @@ impl Row {
     }
 
     /// A full-width, copyable, monospace block — used for fingerprints.
-    fn copyable(mut self) -> Row {
+    fn copyable(mut self, original: &str) -> Row {
         self.block = true;
-        self.copy = true;
+        self.copy = Some(original.to_owned());
         self.mono = true;
         self
     }
@@ -371,77 +371,8 @@ impl ConnectionView {
         });
     }
 
-    /// The rows (and closing note) of one section, without its own card.
     fn draw_rows(&mut self, ui: &mut Ui, section: &Section) {
-        for (i, row) in section.rows.iter().enumerate() {
-            if i > 0 {
-                hairline(ui);
-            }
-            if row.block {
-                self.block_row(ui, row);
-            } else {
-                plain_row(ui, row);
-            }
-        }
-        if let Some(note) = &section.note {
-            if !section.rows.is_empty() {
-                hairline(ui);
-            }
-            let tok = theme::tokens(ui.visuals());
-            egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(12, 7))
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(note).size(11.5).color(tok.dim_text)).wrap(),
-                    );
-                });
-        }
-    }
-
-    /// Label on one line, the value wrapping underneath at full width, and
-    /// optionally a copy button beside the label.
-    fn block_row(&mut self, ui: &mut Ui, row: &Row) {
-        let tok = theme::tokens(ui.visuals());
-        egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(12, 6))
-            .show(ui, |ui| {
-                // `ui.horizontal`, not `widgets::ltr`: the latter is
-                // `with_layout`, which claims the parent's entire remaining
-                // height (`Client/IMPLEMENTATION.md` §16) — inside a
-                // non-shrinking `ScrollArea` that is the whole viewport, and
-                // the card balloons to fill it.
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(row.label.as_ref()).size(12.5));
-                    if row.copy {
-                        widgets::rtl(ui, 22.0, |ui| {
-                            if widgets::icon_button(ui, icon::COPY, 22.0, false)
-                                .on_hover_text("In die Zwischenablage")
-                                .clicked()
-                            {
-                                ui.ctx().copy_text(row.value.replace('\n', ""));
-                                self.copied = Some((row.label.to_string(), Instant::now()));
-                            }
-                            if self.copied.as_ref().is_some_and(|(l, t)| {
-                                *l == row.label && t.elapsed() < COPY_FEEDBACK
-                            }) {
-                                ui.label(
-                                    RichText::new(format!("{} Kopiert", icon::CHECK))
-                                        .size(11.0)
-                                        .color(tok.connected),
-                                );
-                            }
-                        });
-                    }
-                });
-                ui.add_space(2.0);
-                let mut text = RichText::new(&row.value)
-                    .size(if row.mono { 11.0 } else { 12.5 })
-                    .color(tone_color(row.tone, &tok).unwrap_or(tok.muted_text));
-                if row.mono {
-                    text = text.monospace();
-                }
-                ui.add(egui::Label::new(text).wrap());
-            });
+        draw_rows(ui, section, &mut self.copied);
     }
 
     /// „Bericht kopieren", under the last card.
@@ -910,18 +841,22 @@ fn cert_section(title: &str, cert: Option<&CertInfo>) -> Section {
     let Some(c) = cert else {
         return Section::new(title).note("Erst verfügbar, sobald die Verbindung steht.");
     };
-    let validity = if c.expires_in_days < 0 {
+    let now = crate::net::conn::unix_now();
+    let days = c
+        .valid_until
+        .map_or(c.expires_in_days, |end| (end - now).div_euclid(86400));
+    let validity = if c.valid_until.is_some_and(|end| end <= now) || days < 0 {
         Row::new("Gültig bis", format!("{} — abgelaufen", c.not_after)).tone(Tone::Bad)
-    } else if c.expires_in_days < CERT_WARN_DAYS {
+    } else if days < CERT_WARN_DAYS {
         Row::new(
             "Gültig bis",
-            format!("{} — noch {} Tage", c.not_after, c.expires_in_days),
+            format!("{} — noch {} Tage", c.not_after, days),
         )
         .tone(Tone::Warn)
     } else {
         Row::new(
             "Gültig bis",
-            format!("{} — noch {} Tage", c.not_after, c.expires_in_days),
+            format!("{} — noch {} Tage", c.not_after, days),
         )
     };
     Section::new(title)
@@ -930,7 +865,10 @@ fn cert_section(title: &str, cert: Option<&CertInfo>) -> Section {
         .row(Row::mono("Signatur", &c.sig_alg))
         .row(Row::new("Gültig ab", &c.not_before))
         .row(validity)
-        .row(Row::new("Fingerabdruck (SHA-256)", wrap_fingerprint(&c.fingerprint)).copyable())
+        .row(
+            Row::new("Fingerabdruck (SHA-256)", wrap_fingerprint(&c.fingerprint))
+                .copyable(&c.fingerprint),
+        )
 }
 
 fn audio_section(state: &AppState, stats: &DebugStats, jitter: &str) -> Section {
@@ -1327,6 +1265,93 @@ pub(crate) fn wrap_fingerprint(fp: &str) -> String {
         return fp.to_string();
     }
     format!("{}\n{}", pairs[..16].join(":"), pairs[16..].join(":"))
+}
+
+/// The rows (and closing note) of one section, without its own card.
+fn draw_rows(ui: &mut Ui, section: &Section, copied: &mut Option<(String, Instant)>) {
+    for (i, row) in section.rows.iter().enumerate() {
+        if i > 0 {
+            hairline(ui);
+        }
+        if row.block {
+            block_row(ui, row, copied);
+        } else {
+            plain_row(ui, row);
+        }
+    }
+    if let Some(note) = &section.note {
+        if !section.rows.is_empty() {
+            hairline(ui);
+        }
+        let tok = theme::tokens(ui.visuals());
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(12, 7))
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(note).size(11.5).color(tok.dim_text)).wrap());
+            });
+    }
+}
+
+/// Label on one line, the value wrapping underneath at full width, and
+/// optionally a copy button beside the label.
+fn block_row(ui: &mut Ui, row: &Row, copied: &mut Option<(String, Instant)>) {
+    let tok = theme::tokens(ui.visuals());
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            // `ui.horizontal`, not `widgets::ltr`: the latter is
+            // `with_layout`, which claims the parent's entire remaining
+            // height (`Client/IMPLEMENTATION.md` §16) — inside a
+            // non-shrinking `ScrollArea` that is the whole viewport, and
+            // the card balloons to fill it.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(row.label.as_ref()).size(12.5));
+                if let Some(copy_value) = &row.copy {
+                    widgets::rtl(ui, 22.0, |ui| {
+                        let copy = widgets::icon_button(ui, icon::COPY, 22.0, false)
+                            .on_hover_text("In die Zwischenablage");
+                        copy.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled(),
+                                "Fingerabdruck kopieren",
+                            )
+                        });
+                        if copy.clicked() {
+                            ui.ctx().copy_text(copy_value.clone());
+                            *copied = Some((row.label.to_string(), Instant::now()));
+                        }
+                        if copied
+                            .as_ref()
+                            .is_some_and(|(l, t)| *l == row.label && t.elapsed() < COPY_FEEDBACK)
+                        {
+                            ui.label(
+                                RichText::new(format!("{} Kopiert", icon::CHECK))
+                                    .size(11.0)
+                                    .color(tok.connected),
+                            );
+                        }
+                    });
+                }
+            });
+            ui.add_space(2.0);
+            let mut text = RichText::new(&row.value)
+                .size(if row.mono { 11.0 } else { 12.5 })
+                .color(tone_color(row.tone, &tok).unwrap_or(tok.muted_text));
+            if row.mono {
+                text = text.monospace();
+            }
+            ui.add(egui::Label::new(text).wrap());
+        });
+}
+
+/// The same certificate fields and copy behaviour in both windows.
+pub(super) fn certificate_details(
+    ui: &mut Ui,
+    cert: Option<&CertInfo>,
+    copied: &mut Option<(String, Instant)>,
+) {
+    draw_rows(ui, &cert_section("Zertifikat", cert), copied);
 }
 
 #[cfg(test)]

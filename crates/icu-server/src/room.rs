@@ -287,6 +287,18 @@ impl Room {
             .collect()
     }
 
+    /// Public leaf of the authenticated live session. Registration and
+    /// renew-only sessions never enter this room.
+    pub fn certificate(&self, session: Session) -> Option<Vec<u8>> {
+        let conn = self.lock().members.get(&session)?.conn.clone();
+        let identity = conn.peer_identity()?;
+        let chain = identity
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .ok()?;
+        let leaf = chain.first()?;
+        (leaf.len() <= ControlMsg::MAX_CERTIFICATE_DER).then(|| leaf.to_vec())
+    }
+
     /// Closes the connection with this `stable_id` if it is in the room, so
     /// that its `UserLeft` carries `code`. Returns whether it was.
     pub fn close_connection(&self, stable_id: usize, code: u32) -> bool {

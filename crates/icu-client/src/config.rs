@@ -1524,7 +1524,9 @@ mod tests {
         cn: &str,
         leaf: impl FnOnce(&mut rcgen::CertificateParams),
     ) -> icu_proto::passport::Passport {
-        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SanType, SigningKey};
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SanType, SigningKey,
+        };
         let ca_key = KeyPair::generate().unwrap();
         let ca_key_pem = ca_key.serialize_pem();
         let mut ca_params = CertificateParams::default();

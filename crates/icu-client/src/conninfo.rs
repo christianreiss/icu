@@ -49,6 +49,57 @@ pub struct CertInfo {
     pub fingerprint: String,
     /// Signature algorithm short name, e.g. `ecdsa-with-SHA256`.
     pub sig_alg: String,
+    /// Public DER retained for rechecking when a new CRL arrives.
+    pub der: Vec<u8>,
+    /// Signature against the installed CA, not a direct peer handshake.
+    pub signature_valid: Option<bool>,
+    /// Exact validity boundaries, so a long-open window stays accurate.
+    pub valid_from: Option<i64>,
+    /// Exact expiry timestamp.
+    pub valid_until: Option<i64>,
+    /// Evidence from the latest locally stored signed CRL.
+    pub revocation: Revocation,
+}
+
+/// Signed CRL evidence. Time bounds are evaluated when displayed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Revocation {
+    #[default]
+    /// No usable signed CRL available.
+    Unknown,
+    /// Signed CRL contents, including its freshness interval.
+    Checked {
+        /// Leaf serial occurs in this CRL.
+        revoked: bool,
+        /// CRL issuance timestamp.
+        this_update: i64,
+        /// CRL expiry timestamp, absent if not advertised.
+        next_update: Option<i64>,
+    },
+}
+
+impl Revocation {
+    /// Human-readable revocation evidence at the supplied Unix time.
+    pub fn label(&self, now: i64) -> &'static str {
+        match self {
+            Self::Unknown => "Widerruf nicht geprüft",
+            Self::Checked { this_update, .. } if *this_update > now => "CRL noch nicht gültig",
+            Self::Checked {
+                revoked: true,
+                next_update,
+                ..
+            } if next_update.is_none_or(|end| end <= now) => "Widerrufen laut veralteter CRL",
+            Self::Checked { revoked: true, .. } => "Widerrufen laut CRL",
+            Self::Checked {
+                this_update,
+                next_update,
+                ..
+            } if *this_update > now || next_update.is_none_or(|end| end <= now) => {
+                "CRL nicht aktuell"
+            }
+            Self::Checked { .. } => "Nicht widerrufen laut CRL",
+        }
+    }
 }
 
 impl Default for CertInfo {
@@ -62,22 +113,70 @@ impl Default for CertInfo {
             valid_days: 0,
             fingerprint: UNKNOWN.to_string(),
             sig_alg: UNKNOWN.to_string(),
+            der: Vec::new(),
+            signature_valid: None,
+            valid_from: None,
+            valid_until: None,
+            revocation: Revocation::Unknown,
         }
     }
 }
 
 impl CertInfo {
+    /// Recheck public certificate evidence against this identity's CA.
+    /// All parsing happens in the engine, never in the render loop.
+    pub fn check_trust(&mut self, ca_der: &[u8], crl_der: Option<&[u8]>) {
+        use x509_parser::prelude::FromDer;
+        self.signature_valid = self.valid_from.map(|_| leaf_signed_by(&self.der, ca_der));
+        self.revocation = Revocation::Unknown;
+        let Some(crl_der) = crl_der.filter(|der| crate::crl::verify(der, ca_der).is_ok()) else {
+            return;
+        };
+        if self.signature_valid != Some(true) {
+            return;
+        }
+        let Ok((_, leaf)) = x509_parser::parse_x509_certificate(&self.der) else {
+            return;
+        };
+        let Ok((_, crl)) =
+            x509_parser::revocation_list::CertificateRevocationList::from_der(crl_der)
+        else {
+            return;
+        };
+        self.revocation = Revocation::Checked {
+            revoked: crl
+                .iter_revoked_certificates()
+                .any(|r| r.raw_serial() == leaf.raw_serial()),
+            this_update: crl.last_update().timestamp(),
+            next_update: crl.next_update().map(|t| t.timestamp()),
+        };
+    }
+
+    /// Human-readable certificate validity at the supplied Unix time.
+    pub fn validity_label(&self, now: i64) -> &'static str {
+        match (self.valid_from, self.valid_until) {
+            (Some(start), _) if start > now => "Noch nicht gültig",
+            (_, Some(end)) if end <= now => "Abgelaufen",
+            (Some(_), Some(end)) if end - now < 30 * 86400 => "Läuft bald ab",
+            (Some(_), Some(_)) => "Zeitlich gültig",
+            _ => "Gültigkeit unbekannt",
+        }
+    }
+
     /// Parses one DER certificate. Never fails: whatever cannot be read
     /// stays `unbekannt`, and the fingerprint is computed over the raw bytes
     /// regardless, since it does not depend on the structure parsing.
     pub fn from_der(der: &[u8]) -> CertInfo {
         let mut out = CertInfo {
             fingerprint: fingerprint(der),
+            der: der.to_vec(),
             ..CertInfo::default()
         };
         let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) else {
             return out;
         };
+        out.valid_from = Some(cert.validity().not_before.timestamp());
+        out.valid_until = Some(cert.validity().not_after.timestamp());
         out.subject = common_name(cert.subject());
         out.issuer = common_name(cert.issuer());
         out.not_before = fmt_date(cert.validity().not_before.timestamp());
@@ -245,7 +344,7 @@ impl ConnInfo {
         identity: &Identity,
         client_string: &str,
     ) -> ConnInfo {
-        ConnInfo {
+        let mut info = ConnInfo {
             remote: conn.remote_address(),
             local_ip: conn.local_ip(),
             alpn: alpn(conn),
@@ -259,7 +358,16 @@ impl ConnInfo {
             server_cert: server_cert(conn),
             client_cert: CertInfo::from_der(&identity.leaf_der),
             ca_cert: CertInfo::from_der(&identity.ca_der),
-        }
+        };
+        info.check_trust(&identity.ca_der, None);
+        info
+    }
+
+    /// Refresh all session certificates after a CRL change.
+    pub fn check_trust(&mut self, ca: &[u8], crl: Option<&[u8]>) {
+        self.server_cert.check_trust(ca, crl);
+        self.client_cert.check_trust(ca, crl);
+        self.ca_cert.check_trust(ca, None);
     }
 }
 
@@ -491,5 +599,95 @@ mod tests {
             ..ConnStats::default()
         };
         assert_eq!(s.loss_percent(), 2.0);
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertificateRevocationListParams, DnType, IsCa,
+        KeyIdMethod, KeyPair, KeyUsagePurpose, RevokedCertParams, SerialNumber,
+    };
+
+    #[test]
+    fn certificate_evidence_checks_signatures_dates_and_revocation() {
+        let key = KeyPair::generate().unwrap();
+        let mut ca = CertificateParams::default();
+        ca.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        ca.distinguished_name.push(DnType::CommonName, "Room CA");
+        let root = ca.self_signed(&key).unwrap();
+        let issuer = rcgen::Issuer::from_ca_cert_der(root.der(), key).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let mut params = CertificateParams::default();
+        params.serial_number = Some(SerialNumber::from_slice(&[7]));
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(60);
+        let leaf = params
+            .signed_by(&KeyPair::generate().unwrap(), &issuer)
+            .unwrap();
+        let mut cert = CertInfo::from_der(leaf.der());
+        cert.check_trust(root.der(), None);
+        assert_eq!(cert.signature_valid, Some(true));
+        assert_eq!(cert.validity_label(now.unix_timestamp()), "Zeitlich gültig");
+        assert_eq!(
+            cert.validity_label((now - time::Duration::days(2)).unix_timestamp()),
+            "Noch nicht gültig"
+        );
+        assert_eq!(
+            cert.validity_label((now + time::Duration::days(60)).unix_timestamp()),
+            "Abgelaufen"
+        );
+        assert_eq!(cert.revocation, Revocation::Unknown);
+        for revoked in [false, true] {
+            let crl = CertificateRevocationListParams {
+                this_update: now,
+                next_update: now + time::Duration::days(1),
+                crl_number: SerialNumber::from_slice(&[1]),
+                issuing_distribution_point: None,
+                revoked_certs: if revoked {
+                    vec![RevokedCertParams {
+                        serial_number: SerialNumber::from_slice(&[7]),
+                        revocation_time: now,
+                        reason_code: None,
+                        invalidity_date: None,
+                    }]
+                } else {
+                    vec![]
+                },
+                key_identifier_method: KeyIdMethod::Sha256,
+            }
+            .signed_by(&issuer)
+            .unwrap();
+            cert.check_trust(root.der(), Some(crl.der()));
+            assert_eq!(
+                cert.revocation.label(now.unix_timestamp()),
+                if revoked {
+                    "Widerrufen laut CRL"
+                } else {
+                    "Nicht widerrufen laut CRL"
+                }
+            );
+            if !revoked {
+                assert_eq!(
+                    cert.revocation
+                        .label((now + time::Duration::days(2)).unix_timestamp()),
+                    "CRL nicht aktuell"
+                );
+            }
+        }
+        let other = CertificateParams::default()
+            .self_signed(&KeyPair::generate().unwrap())
+            .unwrap();
+        cert.check_trust(other.der(), None);
+        assert_eq!(cert.signature_valid, Some(false));
+        let mut malformed = CertInfo::from_der(b"bad certificate");
+        malformed.check_trust(root.der(), None);
+        assert_eq!(malformed.signature_valid, None);
+        assert_eq!(
+            malformed.validity_label(now.unix_timestamp()),
+            "Gültigkeit unbekannt"
+        );
     }
 }

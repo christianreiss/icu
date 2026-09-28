@@ -487,3 +487,9 @@ für das Windows-Target mit den tatsächlich gewählten Features aus. Fehlende
 Lizenztexte brechen den Bau ab; die eingebettete Inter-Lizenz wird ergänzt.
 Die Toolversionen entsprechen dem Linux-Baucontainer (cargo-deny 0.20.2,
 cargo-about 0.9.2).
+
+## Nutzerpfad, Zertifikate und Vertrauen (2026-09-28)
+
+Die Nutzeransicht (`ui/user.rs`) zeigt links den ausgewählten Nutzer, mittig den Server und rechts den lokalen Nutzer. Standard 900×640, Minimum 760×520; lange Inhalte umbrechen, Details dürfen scrollen. Phosphor-Icons, Sprachstatus, RTT je Serverstrecke und Audio-Empfangsverlust stehen direkt im Pfad. Lautstärke und berechtigte Moderation bleiben erhalten. Die CA-Verzweigung öffnet Zertifikatsdetails im selben Fenster; Felder und Fingerabdruck-Kopieren teilen sich den Renderer mit der Verbindungsansicht.
+
+`RequestPeerCertificate` fragt einmal pro Sitzung an, mit sichtbarem Lade-/Fehlerzustand und manuellem Wiederholen nach acht Sekunden. `Peer.certificate` hält geprüfte öffentliche Daten, wird beim Verlassen/Neuverbinden verworfen und bei CRL-Updates neu geprüft. Parsing läuft in der Engine. Gültigkeits- und CRL-Zeitgrenzen werden bei der Anzeige ausgewertet. Bei Auswahl des eigenen Nutzers markieren beide Außenkarten dieselbe Verbindung. Signaturprüfung ersetzt keine direkte Peer-Authentifizierung; die Sitzungszuordnung stammt vom Server.

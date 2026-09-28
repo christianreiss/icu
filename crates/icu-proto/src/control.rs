@@ -16,13 +16,14 @@ use crate::{
 /// A minor 0 does not exist. New mandatory variants (like `UserRtt`) ship
 /// without a minor bump: client and server are always deployed in lockstep in
 /// this project (`PROTOCOL.md` §2.2). Minor 2 appended
-/// `Welcome.server_minor` (2026-09-26).
-pub const MINOR: u16 = 2;
+/// `Welcome.server_minor` (2026-09-26). Minor 3 adds peer certificate lookup
+/// and requires a coordinated client/server update.
+pub const MINOR: u16 = 3;
 
 /// Lowest protocol minor this build talks to, in both directions: the server
 /// closes a `Hello` below it with `VERSION_UNSUPPORTED`, the client a
 /// `Welcome` whose `server_minor` is below it (`PROTOCOL.md` §8).
-pub const MIN_PEER_MINOR: u16 = 2;
+pub const MIN_PEER_MINOR: u16 = 3;
 
 /// Capability bits. All zero in v1, reserved for later extensions.
 pub const CAPS: u32 = 0;
@@ -320,6 +321,19 @@ pub enum ControlMsg {
         /// Enforced deafen.
         deafened: bool,
     },
+    /// 36, C→S. Public certificate of an online room session, on demand.
+    PeerCertificateRequest {
+        /// Exact online session whose public leaf is requested.
+        session: Session,
+    },
+    /// 37, S→C. The leaf used to authenticate that session; `None` if gone
+    /// or unavailable. Never contains a private key or a registration leaf.
+    PeerCertificateResponse {
+        /// Echoes the requested session.
+        session: Session,
+        /// Public leaf DER; at most `MAX_CERTIFICATE_DER` bytes.
+        certificate_der: Option<Vec<u8>>,
+    },
 }
 
 impl ControlMsg {
@@ -327,6 +341,9 @@ impl ControlMsg {
     pub const MAX_CLIENT_STRING: usize = 64;
     /// Maximum CSR size in bytes (`PROTOCOL.md` §2.2, §2.3).
     pub const MAX_CSR_DER: usize = 2 * 1024;
+
+    /// Certificate payload bound, leaving room in the 16 KiB control frame.
+    pub const MAX_CERTIFICATE_DER: usize = 8 * 1024;
 
     /// Encodes the message as a complete control frame.
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
@@ -377,6 +394,8 @@ impl ControlMsg {
             ControlMsg::AdminSetRestriction { .. } => "AdminSetRestriction",
             ControlMsg::AdminSetRestrictionOk { .. } => "AdminSetRestrictionOk",
             ControlMsg::UserRestrictionChanged { .. } => "UserRestrictionChanged",
+            ControlMsg::PeerCertificateRequest { .. } => "PeerCertificateRequest",
+            ControlMsg::PeerCertificateResponse { .. } => "PeerCertificateResponse",
         }
     }
 
@@ -394,6 +413,7 @@ impl ControlMsg {
                 | ControlMsg::AdminSetRole { .. }
                 | ControlMsg::AdminSetDisabled { .. }
                 | ControlMsg::AdminRevokeUser { .. }
+                | ControlMsg::PeerCertificateRequest { .. }
                 | ControlMsg::UserListRequest
                 | ControlMsg::AdminKick { .. }
                 | ControlMsg::AdminSetRestriction { .. }
@@ -553,6 +573,11 @@ mod tests {
                 muted: true,
                 deafened: true,
             },
+            ControlMsg::PeerCertificateRequest { session: 7 },
+            ControlMsg::PeerCertificateResponse {
+                session: 7,
+                certificate_der: Some(vec![1, 2, 3]),
+            },
         ]
     }
 
@@ -560,7 +585,7 @@ mod tests {
     #[test]
     fn roundtrip_all_control_variants() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 36, "v1 has exactly 36 control variants");
+        assert_eq!(variants.len(), 38, "v1 has exactly 38 control variants");
         for msg in variants {
             let frame = msg.encode().unwrap();
             let body = framing::split_frame(&frame, MAX_CONTROL_FRAME)
@@ -589,8 +614,8 @@ mod tests {
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
     #[test]
     fn unknown_variant_is_an_error() {
-        // Discriminant 36 does not exist yet.
-        let body = [36u8, 0, 0];
+        // Discriminant 38 does not exist yet.
+        let body = [38u8, 0, 0];
         let err = ControlMsg::decode(&body).unwrap_err();
         assert!(
             matches!(err, ProtoError::UnknownVariant),
@@ -680,5 +705,24 @@ mod tests {
             name: "alice".into()
         }
         .is_client_to_server());
+    }
+}
+
+#[cfg(test)]
+mod certificate_tests {
+    use super::*;
+    #[test]
+    fn certificate_frames_are_bounded_and_directional() {
+        assert!(ControlMsg::PeerCertificateRequest { session: 7 }.is_client_to_server());
+        for certificate_der in [None, Some(vec![0; ControlMsg::MAX_CERTIFICATE_DER])] {
+            let msg = ControlMsg::PeerCertificateResponse {
+                session: 7,
+                certificate_der,
+            };
+            assert!(!msg.is_client_to_server());
+            let frame = msg.encode().unwrap();
+            assert!(frame.len() <= MAX_CONTROL_FRAME + 2);
+            assert_eq!(ControlMsg::decode(&frame[2..]).unwrap(), msg);
+        }
     }
 }

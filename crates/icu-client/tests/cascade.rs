@@ -683,7 +683,7 @@ fn spread_db(mut levels: Vec<f32>) -> f32 {
 fn voice_optimizer_presets_differ_through_the_chain() {
     // Words alternate 12 dB apart, 0.4 s each.
     let words = microphone(20.0, 21, -55.0, |t| {
-        Some(if (t / 0.4) as u32 % 2 == 0 {
+        Some(if ((t / 0.4) as u32).is_multiple_of(2) {
             -24.0
         } else {
             -36.0

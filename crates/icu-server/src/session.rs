@@ -1209,6 +1209,16 @@ async fn control_loop(
                 });
                 server.room.send_to(session, &answer);
             }
+            ControlMsg::PeerCertificateRequest { session: target } => {
+                let certificate_der = server.room.certificate(target);
+                server.room.send_to(
+                    session,
+                    &ControlMsg::PeerCertificateResponse {
+                        session: target,
+                        certificate_der,
+                    },
+                );
+            }
             ControlMsg::UserListRequest => {
                 handle_user_list_request(server, session, &actor).await;
             }

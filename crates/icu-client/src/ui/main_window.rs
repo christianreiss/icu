@@ -66,11 +66,9 @@ pub const CONNECTION_SIZE: [f32; 2] = [720.0, 780.0];
 /// What the setup window opens with: every step fits without a scroll bar;
 /// only a banner about the keys may make it grow (`tests/ui_layout.rs`).
 pub const SETUP_SIZE: [f32; 2] = [600.0, 720.0];
-/// What the per-user window opens with: one person's connection and
-/// encryption at a glance, fitting the local user (no volume or moderation
-/// card) exactly; a peer's volume card, and an admin's moderation card on
-/// top of that, grow it (`tests/ui_layout.rs`).
-pub const USER_SIZE: [f32; 2] = [420.0, 470.0];
+/// Three-column user/server/local path at a glance. Expanded certificate
+/// details and moderation can grow the window (`tests/ui_layout.rs`).
+pub const USER_SIZE: [f32; 2] = [900.0, 640.0];
 
 /// A microphone peak at or above this reads as clipping.
 pub(super) const CLIP_DB: f32 = -1.0;
@@ -884,7 +882,7 @@ impl App {
             USER_ID,
             &title,
             USER_SIZE,
-            Some([360.0, 460.0]),
+            Some([760.0, 520.0]),
             |ui| out = Some(view.ui(ui, state, &video, &send)),
         );
         if let Some(out) = out {
@@ -1866,10 +1864,7 @@ pub(super) fn participant_for<'a>(
         loss_permille: p.recv_loss_permille,
         session: p.info.session,
         moderation: state.is_admin.then(|| {
-            let row = state
-                .user_list
-                .iter()
-                .find(|u| u.user_id == p.info.user_id);
+            let row = state.user_list.iter().find(|u| u.user_id == p.info.user_id);
             Moderation {
                 muted: row.is_some_and(|u| u.muted),
                 deafened: row.is_some_and(|u| u.deafened),
@@ -1878,7 +1873,12 @@ pub(super) fn participant_for<'a>(
         // The flag arrives with `UserState`, so the picture goes the
         // moment somebody switches off — not three seconds later when the
         // last frame goes stale.
-        video: p.info.flags.camera_on().then(|| video(p.info.session)).flatten(),
+        video: p
+            .info
+            .flags
+            .camera_on()
+            .then(|| video(p.info.session))
+            .flatten(),
     })
 }
 
