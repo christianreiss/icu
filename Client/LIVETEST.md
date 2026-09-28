@@ -276,3 +276,26 @@ zeigt auf `HEAD`. Was echte Windows-Hardware/-VM braucht:
   funktioniert bei geschlossenem ICU.
 - [ ] **SmartScreen** (offen): Verhalten unverändert zum portablen `icu.exe`
   (unsigniert, „Weitere Informationen" → „Trotzdem ausführen").
+
+## Empfangsfeedback und Mikrofonregelung (2026-09-28)
+
+Automatisiert: deterministische Controller-/Geräte-Doubles, drei Clients über
+QUIC, SendChain → Opus → zwei unabhängige Decoder und unterschiedliche lokale
+Lautstärken. Linux kann den explizit ignorierten Test
+`capture_level_roundtrip_on_virtual_source` mit `ICU_LEVEL_TEST_SOURCE` ausführen;
+dieser akzeptiert nur eigens angelegte Quellen `icu-feedback-test-*`.
+
+Physische Freigabe bleibt separat offen:
+
+- [ ] Linux und Windows: A spricht zu B und C, leise/normal/laut, unterschiedliche
+  Mikrofonabstände, Headset und Lautsprecher mit AEC; keine hörbaren Sprünge,
+  Pumpen oder zusätzliche Clipping-Artefakte gegenüber abgeschalteter Assistenz.
+- [ ] B/C ändern lokale Lautstärke, einer hat Paketverlust oder verlässt den Raum:
+  A folgt keinem lokalen Lautstärkeregler und keiner beschädigten Audiomessung.
+- [ ] Hardware- und softwarebasierte Endpoint-Regler korrekt angezeigt;
+  unsupported Backend bleibt funktionsfähig. Gain-Grenzen werden eingehalten.
+- [ ] Originalpegel bei Disconnect, Gerätewechsel, Abschalten und normalem Exit
+  wiederhergestellt; manuelle Änderung während des Gesprächs bleibt erhalten.
+  Zweites ICU regelt dasselbe Device nicht gleichzeitig.
+- [ ] Stumm, PTT losgelassen, längere Stille, Hotplug und Fehler-Rückfall testen;
+  Crash-Wiederherstellung ist ausdrücklich nicht garantiert.

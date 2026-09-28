@@ -739,3 +739,94 @@ fn voice_optimizer_presets_differ_through_the_chain() {
         );
     }
 }
+
+/// Two independent decoders report pre-volume levels to the same sender.
+/// The third client has a very different listening volume; it must not steer A.
+#[test]
+fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
+    use icu_client::dsp::feedback::{Measurement, PeerTuner};
+    fn run(assisted: bool, volume: f32, post_gain: f32) -> (f32, f32, f32) {
+        let mic = microphone(40.0, 812, -65.0, |t| {
+            if t % 4.0 < 3.0 {
+                Some(-30.0)
+            } else {
+                None
+            }
+        });
+        let mut chain = SendChain::new();
+        let settings = SendSettings::default();
+        let mut encoder = opus::Encoder::new().unwrap();
+        let mut b = opus::Decoder::new().unwrap();
+        let mut c = opus::Decoder::new().unwrap();
+        let mut bm = Measurement::default();
+        let mut cm = Measurement::default();
+        let mut local = Measurement::default();
+        let mut tuner = PeerTuner::default();
+        let mut rx = Normalizer::new();
+        let mut pcm = Vec::new();
+        let mut decoded = vec![0.0; 5760];
+        let now = Instant::now();
+        let mut last_correction = 0.0;
+        let mut max_peak = 0.0f32;
+        let mut reports = 0;
+        for (i, input) in mic.samples.chunks(BLOCK).enumerate() {
+            let mut block = input.to_vec();
+            chain.tune(tuner.offset_db, 0.0);
+            let a = chain.analyze(&mut block, &settings);
+            let speech = vad::is_voice(0.5, a.prob, a.level);
+            chain.finish(&mut block, speech, &settings);
+            for sample in &mut block {
+                *sample *= post_gain;
+            }
+            local.observe(&block, Some(speech));
+            pcm.extend_from_slice(&block);
+            max_peak = block.iter().fold(max_peak, |p, x| p.max(x.abs()));
+            if pcm.len() == FRAME {
+                let packet = encoder.encode(&pcm).unwrap();
+                let n = b.decode(packet, &mut decoded).unwrap();
+                bm.observe(&decoded[..n], None);
+                rx.process(&mut decoded[..n]);
+                for x in &mut decoded[..n] {
+                    *x *= volume;
+                }
+                let n = c.decode(packet, &mut decoded).unwrap();
+                cm.observe(&decoded[..n], None);
+                pcm.clear();
+            }
+            if (i + 1) % 200 == 0 {
+                let own = local.take();
+                let bl = bm.take();
+                let cl = cm.take();
+                assert_eq!(bl, cl, "playback volume must not enter feedback");
+                let t = now + Duration::from_millis((i + 1) as u64 * 10);
+                if let Some(l) = bl {
+                    reports += 1;
+                    last_correction = l.correction_cdb as f32 / 100.0;
+                    tuner.hint(Some(l.correction_cdb), t);
+                }
+                tuner.tick(own, assisted, t);
+            }
+        }
+        assert!(reports >= 4, "only {reports} eligible windows");
+        (last_correction, tuner.offset_db, max_peak)
+    }
+    let baseline = run(false, 1.0, 1.0);
+    let assisted = run(true, 0.05, 1.0);
+    let loud_listener = run(true, 2.0, 1.0);
+    assert_eq!(assisted, loud_listener);
+    assert!(assisted.1.abs() <= 3.0);
+    assert!(
+        assisted.0.abs() <= baseline.0.abs() + 0.25,
+        "baseline {baseline:?}, assisted {assisted:?}"
+    );
+    assert!(assisted.2 <= 1.0, "no clipping: {assisted:?}");
+    let quiet_baseline = run(false, 1.0, meter::from_db(-6.0));
+    let quiet_assisted = run(true, 1.0, meter::from_db(-6.0));
+    eprintln!("post-processing quiet baseline={quiet_baseline:?} assisted={quiet_assisted:?}");
+    assert!(
+        quiet_assisted.0.abs() <= quiet_baseline.0.abs() - 0.5,
+        "feedback must actually improve a sustained correctable error"
+    );
+    assert!(quiet_assisted.0.abs() <= 2.0, "convergence into dead band");
+    eprintln!("peer cascade baseline={baseline:?} assisted={assisted:?}");
+}

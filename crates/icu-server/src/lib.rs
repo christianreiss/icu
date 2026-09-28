@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admin;
+pub mod audio_feedback;
 pub mod backup;
 pub mod ca;
 pub mod cli;
@@ -80,6 +81,7 @@ pub struct Server {
     pub ip_limits: std::sync::Mutex<IpLimits>,
     /// `LossReport` aggregation per speaker.
     pub loss: std::sync::Mutex<LossTracker>,
+    pub audio_feedback: std::sync::Mutex<audio_feedback::Feedback>,
     /// In-band invitations per admin (`limits.invites_per_admin_per_hour`).
     pub invite_budget:
         std::sync::Mutex<std::collections::HashMap<icu_proto::UserId, limits::TokenBucket>>,
@@ -175,6 +177,7 @@ impl Server {
             room: Room::new(config.server.max_users),
             ip_limits: std::sync::Mutex::new(IpLimits::new(&config.limits)),
             loss: std::sync::Mutex::new(LossTracker::default()),
+            audio_feedback: std::sync::Mutex::new(audio_feedback::Feedback::default()),
             invite_budget: std::sync::Mutex::new(std::collections::HashMap::new()),
             video_budget: std::sync::Mutex::new(std::collections::HashMap::new()),
             handshakes: std::sync::atomic::AtomicUsize::new(0),
@@ -542,6 +545,12 @@ async fn housekeeping(server: Arc<Server>) {
             server
                 .room
                 .send_to(speaker, &icu_proto::ControlMsg::LossHint { loss_permille });
+        }
+
+        let hints = lock(&server.audio_feedback)
+            .tick(Instant::now(), |r, s| server.room.feedback_eligible(r, s));
+        for (speaker, hint) in hints {
+            server.room.send_to(speaker, &hint);
         }
 
         // Hourly (36 000 ticks of 100 ms), and on the first tick: the server

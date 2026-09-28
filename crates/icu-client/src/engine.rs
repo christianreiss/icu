@@ -265,6 +265,8 @@ pub struct AppState {
     pub active_output: Option<String>,
     /// Backend name.
     pub backend: &'static str,
+    /// Current automatic capture and peer-assistance status.
+    pub tuning_status: String,
     /// AEC could be created.
     pub aec_available: bool,
     /// AEC statistics.
@@ -565,6 +567,7 @@ struct Speaker {
     volume: f32,
     /// Loudness normalization, ahead of `volume`.
     norm: Normalizer,
+    feedback: crate::dsp::feedback::Measurement,
     /// Queued samples up to the end of the last concealed or FEC-recovered
     /// frame; `norm` holds while they play.
     concealed: usize,
@@ -623,6 +626,7 @@ impl Speaker {
             indicator: None,
             volume,
             norm: Normalizer::new(),
+            feedback: crate::dsp::feedback::Measurement::default(),
             concealed: 0,
             report_base: (0, 0),
             last_reported_permille: 0,
@@ -631,6 +635,74 @@ impl Speaker {
             quiet: true,
         })
     }
+}
+
+#[derive(Default)]
+struct AudioTuning {
+    outgoing: crate::dsp::feedback::Measurement,
+    capture: crate::dsp::feedback::CaptureWindow,
+    peer: crate::dsp::feedback::PeerTuner,
+    capture_delta: f32,
+    software_gain_db: f32,
+}
+
+fn restore_capture(shared: &Arc<Shared>, backend: &Arc<Mutex<Box<dyn AudioBackend>>>) {
+    let delta = lock(&shared.system_tuner).restore(&mut **lock(backend));
+    *lock(&shared.tuning) = AudioTuning {
+        capture_delta: delta,
+        ..Default::default()
+    };
+}
+
+fn tune_capture(shared: &Arc<Shared>, local: &LocalState) {
+    let a = &local.settings.audio;
+    let enabled = a.auto_level
+        && a.denoise
+        && a.tune_system_mic
+        && !shared.dsp.test_tone.load(Ordering::Relaxed);
+    if !enabled {
+        let delta = lock(&shared.system_tuner).restore(&mut **lock(&local.backend));
+        let mut t = lock(&shared.tuning);
+        t.capture_delta += delta;
+        t.capture = Default::default();
+        let status = format!(
+            "Systemregelung aus · Software {:+.1} dB · Peer {:+.1} dB ({})",
+            t.software_gain_db,
+            t.peer.offset_db,
+            t.peer.status(Instant::now())
+        );
+        drop(t);
+        shared.state.send_modify(|s| s.tuning_status = status);
+        return;
+    }
+    let w = std::mem::take(&mut lock(&shared.tuning).capture);
+    let paused =
+        shared.dsp.muted.load(Ordering::Relaxed) || !shared.dsp.online.load(Ordering::Relaxed);
+    let (delta, status, system_db) = {
+        let mut tuner = lock(&shared.system_tuner);
+        let delta = tuner.tick(
+            &mut **lock(&local.backend),
+            if paused { Default::default() } else { w },
+            Instant::now(),
+        );
+        (delta, tuner.status.clone(), tuner.delta_db())
+    };
+    let (offset, software_db, peer_status) = {
+        let mut t = lock(&shared.tuning);
+        if delta != 0.0 {
+            t.capture_delta += delta;
+            t.outgoing = Default::default();
+            t.capture = Default::default();
+        }
+        (
+            t.peer.offset_db,
+            t.software_gain_db,
+            t.peer.status(Instant::now()),
+        )
+    };
+    shared.state.send_modify(|s| {
+        s.tuning_status = format!("{status} · System {system_db:+.1} dB · Software {software_db:+.1} dB · Peer {offset:+.1} dB ({peer_status})")
+    });
 }
 
 /// Shared between all engine threads.
@@ -693,6 +765,9 @@ struct Shared {
     /// `crate::camera::run_sender`). Video absorbs all of the network
     /// adaptation; this atomic is the only channel for it.
     video_tier: AtomicU8,
+    tuning: Mutex<AudioTuning>,
+    system_tuner: Mutex<crate::audio::level::SystemTuner>,
+    feedback_capable: AtomicBool,
 }
 
 /// Received video, tagged with the connection it belongs to. Session IDs
@@ -837,6 +912,7 @@ impl Engine {
             active_input: None,
             active_output: None,
             backend: backend_name,
+            tuning_status: String::new(),
             aec_available: false,
             aec_stats: AecStats::default(),
             aec_reference: false,
@@ -887,6 +963,9 @@ impl Engine {
             failed_streams: AtomicU8::new(0),
             closing: AtomicBool::new(false),
             net: Mutex::new(NetworkTracker::new()),
+            tuning: Mutex::new(AudioTuning::default()),
+            system_tuner: Mutex::new(crate::audio::level::SystemTuner::default()),
+            feedback_capable: AtomicBool::new(false),
             video_tier: AtomicU8::new(VideoTier::T0.as_u8()),
         });
 
@@ -1142,6 +1221,7 @@ impl Engine {
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_background();
         }
+        restore_capture(&self.shared, &self.backend);
     }
 }
 
@@ -1580,6 +1660,7 @@ fn dsp_thread(
                     a.reinitialize();
                 }
                 chain.restart();
+                *lock(&shared.tuning) = AudioTuning::default();
             }
             // Bound the backlog: after a stall of this thread, everything
             // older than 100 ms is stale — sending it late only adds latency
@@ -1650,6 +1731,8 @@ fn dsp_thread(
         }
         // Whatever the capture path delivered, the AEC and the denoiser only
         // ever see numbers within ±4 (`dsp::sanitize`).
+        let mut raw_capture = [0.0; BLOCK];
+        raw_capture.copy_from_slice(&block);
         crate::dsp::sanitize(&mut block);
         crate::dsp::sanitize(&mut ref_block);
         let t_block = Instant::now();
@@ -1721,6 +1804,12 @@ fn dsp_thread(
             voice_strength: VoiceStrength::from_u32(ctl.voice_strength.load(Ordering::Relaxed)),
             normalize_outgoing: ctl.normalize_outgoing.load(Ordering::Relaxed),
         };
+        if let Ok(mut tuning) = shared.tuning.try_lock() {
+            chain.tune(
+                tuning.peer.offset_db,
+                std::mem::take(&mut tuning.capture_delta),
+            );
+        }
         let Analysis { prob, level } = chain.analyze(&mut block, &send);
         ctl.level_peak.store(level.peak_db);
         ctl.level_rms.store(level.rms_db);
@@ -1749,6 +1838,21 @@ fn dsp_thread(
         }
         // Voice optimizer, outbound normalization and limiter.
         chain.finish(&mut block, voice, &send);
+        if !test_tone
+            && ctl.online.load(Ordering::Relaxed)
+            && !ctl.muted.load(Ordering::Relaxed)
+            && (ctl.vad_mode.load(Ordering::Relaxed) || ctl.ptt_down.load(Ordering::Relaxed))
+        {
+            if let Ok(mut tuning) = shared.tuning.try_lock() {
+                tuning.software_gain_db = chain.gains_db().0;
+                if raw_capture.iter().all(|x| x.is_finite()) {
+                    tuning.outgoing.observe(&block, Some(voice));
+                }
+                tuning
+                    .capture
+                    .observe(&raw_capture, voice, chain.gains_db().0);
+            }
+        }
 
         // Mic test: this block, as the encoder gets it, also to the mixer.
         if ctl.mic_test.load(Ordering::Relaxed) {
@@ -2100,6 +2204,9 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
                             }
                             let n = sp.decoder.decode(&p.payload, &mut fec_scratch).unwrap_or(0);
                             DebugStats::inc(&stats.frames_decoded);
+                            if !deafened && sp.user_id != 0 {
+                                sp.feedback.observe(&fec_scratch[..n], None);
+                            }
                             sp.quiet = frame_quiet(&fec_scratch[..n]);
                             queue_decoded(sp, n, &fec_scratch, false);
                         }
@@ -3356,6 +3463,7 @@ impl LocalState {
 
     fn reopen_streams(&mut self, shared: &Arc<Shared>) {
         blocking(|| {
+            restore_capture(shared, &self.backend);
             let mut backend = lock(&self.backend);
             shared.reference_open.store(false, Ordering::Relaxed);
             backend.close(StreamKind::Capture);
@@ -3617,6 +3725,11 @@ async fn run_session(
         });
     }
     *lock(&shared.conn) = Some(connection.clone());
+    *lock(&shared.tuning) = AudioTuning::default();
+    shared.feedback_capable.store(
+        welcome.caps & icu_proto::CAP_AUDIO_FEEDBACK != 0,
+        Ordering::Relaxed,
+    );
     shared.dsp.online.store(true, Ordering::Relaxed);
     *was_connected = true;
     tracing::info!(
@@ -3679,6 +3792,8 @@ async fn run_session(
 
     let mut ping = tokio::time::interval(Duration::from_secs(5));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut tuning_tick = tokio::time::interval(Duration::from_secs(1));
+    tuning_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut loss_tick = tokio::time::interval(Duration::from_secs(2));
     loss_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut video_tick = tokio::time::interval(Duration::from_millis(200));
@@ -3722,8 +3837,14 @@ async fn run_session(
                     Some(Ok(msg)) => msg,
                     Some(Err(detail)) => break protocol_violation(&connection, detail),
                     None => {
-                        break closed_end(&connection)
-                            .unwrap_or_else(|| connection_lost("control stream ended"))
+                        // FIN on the control stream can beat the QUIC close carrying
+                        // SHUTDOWN. Give that reason a bounded chance to arrive.
+                        break match closed_end(&connection) {
+                            Some(end) => end,
+                            None => tokio::time::timeout(Duration::from_millis(100), connection.closed())
+                                .await.map(SessionEnd::from)
+                                .unwrap_or_else(|_| connection_lost("control stream ended")),
+                        }
                     }
                 };
                 if let Some(end) = handle_control(msg, shared, local, &mut pings).await {
@@ -3839,7 +3960,27 @@ async fn run_session(
                     break send_failed(&connection);
                 }
             }
+            _ = tuning_tick.tick() => {
+                blocking(|| tune_capture(shared, local));
+            }
             _ = loss_tick.tick() => {
+                let now = Instant::now();
+                let enabled = local.settings.audio.auto_level && local.settings.audio.denoise
+                    && local.settings.audio.peer_assistance && !shared.dsp.muted.load(Ordering::Relaxed)
+                    && !shared.dsp.test_tone.load(Ordering::Relaxed);
+                {
+                    let mut t = lock(&shared.tuning);
+                    let measured = t.outgoing.take();
+                    t.peer.tick(measured, enabled, now);
+                }
+                let levels: Vec<_> = lock(&shared.speakers).iter_mut()
+                    .filter_map(|(speaker, sp)| sp.feedback.take().map(|level| (*speaker,level))).collect();
+                if shared.feedback_capable.load(Ordering::Relaxed) && !shared.deafened.load(Ordering::Relaxed) {
+                    for (speaker,level) in levels {
+                        if conn::write_msg(&mut send, &ControlMsg::AudioLevelReport { speaker,level }).await.is_err() { break; }
+                    }
+                }
+
                 prune_stray_speakers(shared);
                 let (reports, measured) = collect_loss_reports(shared, Instant::now());
                 // After `collect_loss_reports` returned, so the `speakers`
@@ -3956,6 +4097,7 @@ async fn run_session(
     *shared.video_tx.lock().unwrap() = None;
     *lock(&shared.conn) = None;
     shared.dsp.online.store(false, Ordering::Relaxed);
+    blocking(|| restore_capture(shared, &local.backend));
     shared.dsp.audience.store(false, Ordering::Relaxed);
     if matches!(end, SessionEnd::Quit) {
         connection.close(quinn::VarInt::from_u32(codes::NO_ERROR), b"bye");
@@ -4510,6 +4652,13 @@ async fn handle_control(
                     .send_modify(|s| s.banner = Some(crate::problem::from_code(code, &detail)));
             }
         }
+        ControlMsg::AudioLevelHint { correction_cdb, .. } => {
+            if shared.feedback_capable.load(Ordering::Relaxed) {
+                lock(&shared.tuning)
+                    .peer
+                    .hint(correction_cdb, Instant::now());
+            }
+        }
         ControlMsg::LossHint { loss_permille } => {
             shared
                 .dsp
@@ -4610,6 +4759,7 @@ async fn handle_control(
         | ControlMsg::SetState { .. }
         | ControlMsg::Ping { .. }
         | ControlMsg::RenewRequest { .. }
+        | ControlMsg::AudioLevelReport { .. }
         | ControlMsg::LossReport { .. }
         | ControlMsg::SetName { .. }
         | ControlMsg::CreateInviteRequest { .. }

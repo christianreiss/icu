@@ -687,6 +687,26 @@ pub fn action_capsule(ui: &mut Ui, buttons: &[CapsuleButton<'_>]) -> Vec<egui::R
 
 /// A pill-shaped on/off switch, 40x23. `name` is what a screen reader
 /// announces for it: the label of the row it sits in.
+pub fn autotune_control(
+    ui: &mut Ui,
+    audio: &mut crate::config::AudioSettings,
+    status: &str,
+) -> egui::Response {
+    let toggle = named_toggle(ui, &mut audio.auto_level, "Pegel automatisch");
+    ui.menu_button("Details",|ui| {
+        ui.set_max_width(320.0);
+        ui.add_enabled_ui(audio.auto_level && audio.denoise, |ui| {
+            ui.checkbox(&mut audio.peer_assistance,"Pegel mit Empfangsfeedback")
+                .on_hover_text("Empfänger bestätigen deinen Sprachpegel vor ihren eigenen Lautstärkereglern.");
+            ui.checkbox(&mut audio.tune_system_mic,"Systemmikrofon automatisch");
+        });
+        ui.label("Systempegel gelten auch für andere Apps. ICU stellt seine Änderungen nach dem Gespräch zurück und respektiert manuelle Änderungen.");
+        if !status.is_empty() {ui.separator();ui.small(status);}
+    }).response.on_hover_text(if status.is_empty() {"Optionen zur automatischen Pegelregelung"} else {status});
+    toggle
+}
+
+/// Named, keyboard-accessible boolean switch.
 pub fn named_toggle(ui: &mut Ui, on: &mut bool, name: &str) -> egui::Response {
     let size = egui::vec2(40.0, 23.0);
     let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());

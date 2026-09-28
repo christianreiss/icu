@@ -493,3 +493,54 @@ cargo-about 0.9.2).
 Die Nutzeransicht (`ui/user.rs`) zeigt links den ausgewählten Nutzer, mittig den Server und rechts den lokalen Nutzer. Standard 900×640, Minimum 760×520; lange Inhalte umbrechen, Details dürfen scrollen. Phosphor-Icons, Sprachstatus, RTT je Serverstrecke und Audio-Empfangsverlust stehen direkt im Pfad. Lautstärke und berechtigte Moderation bleiben erhalten. Die CA-Verzweigung öffnet Zertifikatsdetails im selben Fenster; Felder und Fingerabdruck-Kopieren teilen sich den Renderer mit der Verbindungsansicht.
 
 `RequestPeerCertificate` fragt einmal pro Sitzung an, mit sichtbarem Lade-/Fehlerzustand und manuellem Wiederholen nach acht Sekunden. `Peer.certificate` hält geprüfte öffentliche Daten, wird beim Verlassen/Neuverbinden verworfen und bei CRL-Updates neu geprüft. Parsing läuft in der Engine. Gültigkeits- und CRL-Zeitgrenzen werden bei der Anzeige ausgewertet. Bei Auswahl des eigenen Nutzers markieren beide Außenkarten dieselbe Verbindung. Signaturprüfung ersetzt keine direkte Peer-Authentifizierung; die Sitzungszuordnung stammt vom Server.
+
+## Empfangsfeedback und Systemmikrofon (2026-09-28)
+
+`audio.peer_assistance` und `audio.tune_system_mic` sind standardmäßig aktiv,
+wirken aber nur mit `auto_level && denoise`. Die UI bietet beide Schalter
+separat und zeigt Systemkorrektur, digitale Korrektur und Peer-Zielkorrektur.
+Die Setup-Zusammenfassung nennt die aktiven Funktionen. Manuelle ICU-Verstärkung
+wird nicht überschrieben.
+
+`dsp::feedback::Measurement` nutzt den Schätzer des Empfangsnormalisierers ohne
+Samples zu ändern. Empfänger messen direkt nach regulärem Opus-Decode, vor
+Normalisierung/Lautstärke; PLC/FEC und künstliche Jitter-Ausgaben zählen nicht.
+Der Sender misst denselben Wert vor Opus. Eine Zielkorrektur verlangt drei
+übereinstimmende gültige Fenster, lokale Bestätigung innerhalb 2 dB und bei
+Verstärkung mindestens 3 dB Spitzenreserve. Totband: 2 dB, Schritt: 0,5 dB
+alle 2 s, Zielversatz maximal ±3 dB. Nach 6 s ohne gültigen Hint läuft der
+Versatz in 0,5-dB-Schritten zurück. Kein zweiter digitaler Gain-Regler entsteht:
+`SendChain::tune` verschiebt das Ziel des bestehenden Mikrofon-Levelers.
+
+`audio::level::SystemTuner` überträgt dauerhafte digitale Korrektur langsam auf
+den Systemregler: erst nach 10 s geeigneter Sprache aufwärts, normalerweise
+höchstens alle 5 s; 1 dB oder nächster nativer Schritt bis 3 dB, maximal ±12 dB
+vom Ausgangswert. Für Verstärkung muss ein gemessener Rauschabstand von mindestens
+10 dB und ausreichend Spitzenreserve vorliegen. Raw-Capture-Clipping hat Vorrang
+und erlaubt eine Absenkung pro Sekunde. Stille, Mute und Testton lernen nichts.
+Bestätigte Änderungen verschieben Schätzer und digitale Verstärkung invers;
+Messfenster werden verworfen. Der Limiter und die bisherigen digitalen Grenzen
+bleiben bestehen. Unplausible Reaktion oder Schreibfehler pausieren Systemtuning.
+
+PipeWire bindet den tatsächlich mit dem Capture-Stream verbundenen Source-Node,
+abonniert dessen Props, schreibt `channelVolumes` und liest nach einem passenden
+Core-Sync zurück. Kanalbalance und Mute bleiben erhalten; kein Aufruf von wpctl
+oder pactl. Der konservative Regelbereich beträgt −60…0 dB; Hardwaretyp/-schritt
+sind dort nicht zuverlässig bekannt und werden nicht als echte Hardware-Gain
+beworben. WASAPI verwendet das konkrete geöffnete Capture-Endpoint,
+`IAudioEndpointVolume` einschließlich Range/Step und `QueryHardwareSupport`;
+Volume-Callbacks unterscheiden eigene Änderungen von externen. CPAL bleibt bei
+Softwaretuning. Geräteaufrufe laufen außerhalb der Echtzeit-Callbacks.
+
+Pro Device verhindert ein OS-Dateilock im privaten ICU-Cache mehrere regelnde
+ICU-Prozesse. Externe Änderungen geben die Kontrolle ab, auch bei einem später
+wiederhergestellten identischen Wert (Änderungszähler). Erneutes Aktivieren des
+Schalters oder ein neuer Anruf erlaubt einen neuen Versuch. Bei Disconnect,
+Deaktivierung, Gerätewechsel und geordnetem Ende wird nur dann der Originalwert
+wiederhergestellt, wenn ICU noch seinen eigenen letzten Wert vorfindet. Externe
+Werte werden niemals zurückgesetzt. Ein Prozessabbruch oder verschwundenes Gerät
+kann die Wiederherstellung verhindern; es gibt keine spätere blinde Wiederherstellung.
+
+Diese Regelung kann beschädigte Aufnahme nicht reparieren und garantiert keinen
+Rauschabstandgewinn bei einem softwarebasierten Systemregler. Physische Akustik,
+AEC-Stabilität und herstellerspezifische Hardware benötigen die Tests in LIVETEST.

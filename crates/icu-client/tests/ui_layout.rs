@@ -272,6 +272,7 @@ fn state() -> AppState {
         kind,
     };
     AppState {
+        tuning_status: String::new(),
         conn: ConnStatus::Connected,
         server: "icu.example.org:4711".into(),
         server_name: "icu.example.org".into(),
@@ -1385,4 +1386,44 @@ fn user_path_keeps_volume_moderation_and_certificate_copy() {
         clipboard.borrow().contains(&expected),
         "copy keeps the complete unwrapped SHA-256 fingerprint"
     );
+}
+
+#[test]
+fn autotune_details_keep_controls_accessible_and_independent() {
+    for theme in THEMES {
+        let mut s = state();
+        s.tuning_status =
+            "Eingeregelt · Hardware · System +2.0 dB · Software +0.8 dB · Peer +0.5 dB (aktiv)"
+                .into();
+        let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+        let output = cmds.clone();
+        let mut view = SettingsView::new(
+            &s,
+            Arc::new(DebugStats::default()),
+            Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+        );
+        let mut h = harness(SETTINGS, theme, true, move |ui| {
+            output.borrow_mut().extend(view.ui(ui, &s, false).cmds);
+        });
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Klang")
+            .click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Details")
+            .click();
+        h.run();
+        h.get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Systemmikrofon automatisch",
+        );
+        shot(&mut h, &format!("autotune-details-{theme}"));
+        h.get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Pegel mit Empfangsfeedback",
+        )
+        .click_accesskit();
+        h.run();
+        let settings = last_update(&cmds.borrow()).clone();
+        assert!(!settings.audio.peer_assistance);
+        assert!(settings.audio.tune_system_mic && settings.audio.auto_level);
+    }
 }

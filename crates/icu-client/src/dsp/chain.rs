@@ -191,6 +191,14 @@ impl SendChain {
         }
     }
 
+    /// Peer assistance retargets the microphone controller, within its original bounds.
+    pub fn tune(&mut self, target_offset_db: f32, capture_delta_db: f32) {
+        self.leveler.target_offset(target_offset_db);
+        if capture_delta_db != 0.0 {
+            self.leveler.capture_changed(capture_delta_db);
+        }
+    }
+
     /// Gains of the leveler and the outbound normalizer in dB (tests and
     /// diagnostics).
     pub fn gains_db(&self) -> (f32, f32) {

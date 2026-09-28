@@ -427,4 +427,16 @@ Jeder Milestone endet mit grünen Tests und einem Eintrag in `../Research/verifi
 
 ## Öffentliche Sitzungszertifikate (2026-09-28)
 
-Minor 3 ergänzt `PeerCertificateRequest`/`PeerCertificateResponse` (Nr. 36/37). Der reguläre Control-Handler verwendet das bestehende Ratenlimit. `Room::certificate` liest ausschließlich das öffentliche Leaf aus `quinn::Connection::peer_identity` einer aktuell anwesenden Sitzung. Maximal 8192 DER-Bytes, Antwort nur an den Anfragenden. Fehlende/zu große Zertifikate ergeben `None`; Raumlose Registrierungs- und Renewal-Sitzungen erhalten diesen Zugriff nicht. Server und Clients gemeinsam aktualisieren; Mindest-Minor ist 3.
+Minor 3 ergänzt `PeerCertificateRequest`/`PeerCertificateResponse` (Nr. 38/39). Der reguläre Control-Handler verwendet das bestehende Ratenlimit. `Room::certificate` liest ausschließlich das öffentliche Leaf aus `quinn::Connection::peer_identity` einer aktuell anwesenden Sitzung. Maximal 8192 DER-Bytes, Antwort nur an den Anfragenden. Fehlende/zu große Zertifikate ergeben `None`; Raumlose Registrierungs- und Renewal-Sitzungen erhalten diesen Zugriff nicht. Server und Clients gemeinsam aktualisieren; Mindest-Minor ist 3.
+
+## Audio-Empfangsfeedback (2026-09-28)
+
+`audio_feedback::Feedback` speichert Capability-Bits und höchstens einen gültigen
+Pegelbericht pro aktuellem Sprecher/Empfänger-Paar. Die Control-Session prüft
+Mitgliedschaft, Selbstberichte und Deafen vor der Aufnahme; Housekeeping prüft
+diese Regeln erneut, verwirft nach 6 s und sendet höchstens alle 2 s einen Hint.
+Beide Peers müssen Bit 0 unterstützen. Die Abstimmungsregel ist eine strikte
+Mehrheit um den Median (2 dB Gesamtspanne), unabhängig von der LossHint-Regel.
+Unzureichende oder widersprüchliche Berichte ergeben `None`; alte Peers bekommen
+keine neue Variante. Session-Ende und Abbruch räumen auch die Feedback-Maps auf.
+Wire-Formate und Grenzen stehen in PROTOCOL §2.2; der Server steuert keine Geräte.

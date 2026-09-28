@@ -146,16 +146,10 @@ impl Normalizer {
         self.process_hinted(block, None);
     }
 
-    /// Like [`Normalizer::process`]; `Some(false)` (the VAD hears no voice)
-    /// holds the level estimate. The noise floor keeps tracking either way.
-    pub fn process_hinted(&mut self, block: &mut [f32], voice: Option<bool>) {
-        if block.is_empty() {
-            return;
-        }
-        for s in block.iter_mut() {
-            if !s.is_finite() {
-                *s = 0.0;
-            }
+    /// Measures without changing samples; shared by feedback and actual leveling.
+    pub fn observe(&mut self, block: &[f32], voice: Option<bool>) -> bool {
+        if block.is_empty() || block.iter().any(|x| !x.is_finite()) {
+            return false;
         }
         let rms_db = measure(block).rms_db;
 
@@ -174,7 +168,9 @@ impl Normalizer {
         let floor = self.win_min.min(self.prev_win_min);
 
         let p = self.profile;
-        if voice != Some(false) && rms_db > p.speech_min_db.max(floor + SPEECH_MARGIN_DB) {
+        let eligible =
+            voice != Some(false) && rms_db > p.speech_min_db.max(floor + SPEECH_MARGIN_DB);
+        if eligible {
             let a = if rms_db > self.level_db {
                 alpha(p.rise_s, block.len())
             } else {
@@ -183,9 +179,49 @@ impl Normalizer {
             self.level_db += a * (rms_db - self.level_db);
         }
 
-        let error = p.target_db - self.level_db;
-        let wanted = error.signum() * (error.abs() - p.dead_band_db).max(0.0);
-        let target = from_db(wanted.clamp(p.max_cut_db, p.max_boost_db));
+        eligible
+    }
+
+    /// Unapplied correction with the same limits as the audio processor.
+    pub fn correction_db(&self) -> f32 {
+        let error = self.profile.target_db - self.level_db;
+        (error.signum() * (error.abs() - self.profile.dead_band_db).max(0.0))
+            .clamp(self.profile.max_cut_db, self.profile.max_boost_db)
+    }
+
+    /// Current speech envelope, in dBFS.
+    pub fn level_db(&self) -> f32 {
+        self.level_db
+    }
+
+    /// Retarget the existing controller; never add a second gain stage.
+    pub fn target_offset(&mut self, db: f32) {
+        self.profile.target_db = Profile::MIC_LEVEL.target_db + db.clamp(-3.0, 3.0);
+    }
+
+    /// A confirmed capture gain change shifts both the estimate and its inverse gain.
+    pub fn capture_changed(&mut self, db: f32) {
+        self.level_db += db;
+        self.win_min += db;
+        self.prev_win_min += db;
+        self.gain = from_db(
+            (self.gain_db() - db).clamp(self.profile.max_cut_db, self.profile.max_boost_db),
+        );
+    }
+
+    /// Like [`Normalizer::process`]; `Some(false)` (the VAD hears no voice)
+    /// holds the level estimate. The noise floor keeps tracking either way.
+    pub fn process_hinted(&mut self, block: &mut [f32], voice: Option<bool>) {
+        if block.is_empty() {
+            return;
+        }
+        for s in block.iter_mut() {
+            if !s.is_finite() {
+                *s = 0.0;
+            }
+        }
+        self.observe(block, voice);
+        let target = from_db(self.correction_db());
         let start = self.gain;
         let step = (target - start) / block.len() as f32;
         for (i, s) in block.iter_mut().enumerate() {

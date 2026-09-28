@@ -394,6 +394,17 @@ impl Room {
         Some((flags, flipped))
     }
 
+    /// Only current, non-deafened listeners may describe another member's audio.
+    pub fn feedback_eligible(&self, reporter: Session, speaker: Session) -> bool {
+        let state = self.lock();
+        reporter != speaker
+            && state.members.contains_key(&speaker)
+            && state
+                .members
+                .get(&reporter)
+                .is_some_and(|m| !m.flags.deafened() && !m.forced.deafened())
+    }
+
     /// How many sessions hear `speaker`: everybody else who is not deafened,
     /// as [`Room::audio_fanout`] picks them. What a `LossHint` is agreed on
     /// (`crate::loss::agreed`).

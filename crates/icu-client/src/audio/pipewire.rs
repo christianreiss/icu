@@ -51,6 +51,13 @@ enum Cmd {
         reply: Sender<Result<(), BackendError>>,
     },
     Close(StreamKind),
+    ReadLevel(Sender<Option<super::level::CaptureLevel>>),
+    WriteLevel {
+        expected: super::level::CaptureLevel,
+        channels: Vec<f32>,
+        reply: Sender<Result<super::level::CaptureLevel, BackendError>>,
+        deadline: std::time::Instant,
+    },
     Quit,
 }
 
@@ -106,6 +113,24 @@ impl PipeWireBackend {
             events: Some(ev_rx),
             thread: Some(thread),
         })
+    }
+
+    fn write_level(
+        &self,
+        expected: &super::level::CaptureLevel,
+        channels: Vec<f32>,
+    ) -> Result<super::level::CaptureLevel, BackendError> {
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(Cmd::WriteLevel {
+                expected: expected.clone(),
+                channels,
+                reply,
+                deadline: std::time::Instant::now() + Duration::from_millis(400),
+            })
+            .map_err(|_| super::level::unsupported())?;
+        rx.recv_timeout(Duration::from_millis(500))
+            .map_err(|_| super::level::unsupported())?
     }
 
     fn open(
@@ -178,6 +203,34 @@ impl AudioBackend for PipeWireBackend {
         let _ = self.tx.send(Cmd::Close(stream));
     }
 
+    fn capture_level(&mut self) -> Result<Option<super::level::CaptureLevel>, BackendError> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Cmd::ReadLevel(tx))
+            .map_err(|_| super::level::unsupported())?;
+        rx.recv_timeout(Duration::from_millis(500))
+            .map_err(|_| super::level::unsupported())
+    }
+    fn set_capture_level(
+        &mut self,
+        expected: &super::level::CaptureLevel,
+        db: f32,
+    ) -> Result<super::level::CaptureLevel, BackendError> {
+        let factor = 10.0f32.powf((db - expected.db) / 20.0);
+        self.write_level(
+            expected,
+            expected.channels.iter().map(|v| v * factor).collect(),
+        )
+    }
+    fn restore_capture_level(
+        &mut self,
+        expected: &super::level::CaptureLevel,
+        original: &super::level::CaptureLevel,
+    ) -> Result<(), BackendError> {
+        self.write_level(expected, original.channels.clone())
+            .map(|_| ())
+    }
+
     fn take_events(&mut self) -> Option<Receiver<BackendEvent>> {
         self.events.take()
     }
@@ -243,6 +296,14 @@ fn pw_thread(
     // OS default input/output; watched here so a "system" stream can be
     // reopened when that changes underneath it (mirrors the WASAPI
     // backend's IMMNotificationClient default-endpoint watcher).
+    let sources: Rc<RefCell<HashMap<u32, super::pipewire_level::Source>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let sources_add = sources.clone();
+    let sources_rm = sources.clone();
+    let links: Rc<RefCell<HashMap<u32, (u32, u32)>>> = Rc::new(RefCell::new(HashMap::new()));
+    let links_add = links.clone();
+    let links_rm = links.clone();
+    let registry_sources = registry.clone();
     let dev_add = devices.clone();
     let ev_add = events.clone();
     let dev_rm = devices.clone();
@@ -256,6 +317,17 @@ fn pw_thread(
     let _registry_listener = registry
         .add_listener_local()
         .global(move |obj| {
+            if obj.type_ == pw::types::ObjectType::Link {
+                if let Some(p) = obj.props {
+                    if let (Some(out), Some(input)) = (
+                        p.get("link.output.node").and_then(|v| v.parse().ok()),
+                        p.get("link.input.node").and_then(|v| v.parse().ok()),
+                    ) {
+                        links_add.borrow_mut().insert(obj.id, (out, input));
+                    }
+                }
+                return;
+            }
             if obj.type_ == pw::types::ObjectType::Metadata {
                 let Some(props) = obj.props else { return };
                 if props.get("metadata.name") != Some("default") || default_meta.borrow().is_some()
@@ -299,13 +371,21 @@ fn pw_thread(
             }
             let Some(props) = obj.props else { return };
             let kind = match props.get("media.class") {
-                Some("Audio/Source") => DeviceKind::Input,
+                Some("Audio/Source" | "Audio/Source/Virtual") => DeviceKind::Input,
                 Some("Audio/Sink") => DeviceKind::Output,
                 _ => return,
             };
             let Some(name) = props.get("node.name") else {
                 return;
             };
+            if kind == DeviceKind::Input {
+                if let Ok(node) = registry_sources.bind::<pw::node::Node, _>(obj) {
+                    sources_add.borrow_mut().insert(
+                        obj.id,
+                        super::pipewire_level::Source::new(node, name.to_string()),
+                    );
+                }
+            }
             let description = props
                 .get("node.description")
                 .or_else(|| props.get("node.nick"))
@@ -324,6 +404,8 @@ fn pw_thread(
             let _ = ev_add.send(BackendEvent::DevicesChanged(list));
         })
         .global_remove(move |id| {
+            sources_rm.borrow_mut().remove(&id);
+            links_rm.borrow_mut().remove(&id);
             let removed = {
                 let mut map = lock(&dev_rm);
                 map.remove(&id).map(|_| map.values().cloned().collect())
@@ -368,6 +450,35 @@ fn pw_thread(
     let streams_cmd = streams.clone();
     let core_cmd = core.clone();
     let events_cmd = events.clone();
+    type PendingLevel = (
+        i32,
+        String,
+        Sender<Result<super::level::CaptureLevel, BackendError>>,
+    );
+    let pending_levels: Rc<RefCell<Vec<PendingLevel>>> = Rc::new(RefCell::new(Vec::new()));
+    let pending_done = pending_levels.clone();
+    let sources_done = sources.clone();
+    let _level_sync = core
+        .add_listener_local()
+        .done(move |_, seq| {
+            let mut pending = pending_done.borrow_mut();
+            let Some(index) = pending.iter().position(|(id, _, _)| *id == seq.seq()) else {
+                return;
+            };
+            let (_, name, reply) = pending.swap_remove(index);
+            {
+                let level = sources_done
+                    .borrow()
+                    .values()
+                    .filter_map(|s| s.level.borrow().clone())
+                    .find(|l| l.device == name);
+                for source in sources_done.borrow().values() {
+                    source.finish_write();
+                }
+                let _ = reply.send(level.ok_or_else(super::level::unsupported));
+            }
+        })
+        .register();
     let _receiver = rx.attach(mainloop.loop_(), move |cmd| match cmd {
         Cmd::Open {
             kind,
@@ -391,6 +502,62 @@ fn pw_thread(
                 }
                 Err(e) => reply.send(Err(e)),
             };
+        }
+        Cmd::ReadLevel(reply) => {
+            let id = streams_cmd
+                .borrow()
+                .get(&StreamKind::Capture)
+                .map(|s| s.stream.node_id());
+            let source = id.and_then(|id| {
+                links
+                    .borrow()
+                    .values()
+                    .find(|(_, input)| *input == id)
+                    .map(|(out, _)| *out)
+            });
+            let level = source.and_then(|id| {
+                sources
+                    .borrow()
+                    .get(&id)
+                    .and_then(|s| s.level.borrow().clone())
+            });
+            let _ = reply.send(level);
+        }
+        Cmd::WriteLevel {
+            expected,
+            channels,
+            reply,
+            deadline,
+        } => {
+            if std::time::Instant::now() > deadline {
+                let _ = reply.send(Err(super::level::unsupported()));
+                return;
+            }
+            let sources = sources.borrow();
+            let source = sources.values().find(|s| {
+                s.level
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|l| l.device == expected.device)
+            });
+            let result = source
+                .ok_or_else(super::level::unsupported)
+                .and_then(|s| s.set(&expected, channels));
+            match result {
+                Ok(()) => match core_cmd.sync(0) {
+                    Ok(seq) => {
+                        pending_levels
+                            .borrow_mut()
+                            .push((seq.seq(), expected.device, reply))
+                    }
+                    Err(_) => {
+                        let _ = reply.send(Err(super::level::unsupported()));
+                    }
+                },
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
         }
         Cmd::Close(kind) => {
             streams_cmd.borrow_mut().remove(&kind);
@@ -578,5 +745,42 @@ mod tests {
         );
         assert!(PipeWireBackend::new().is_err());
         assert!(super::super::rt::registered_context().is_null());
+    }
+}
+
+#[cfg(test)]
+mod level_live_tests {
+    use super::*;
+    #[test]
+    #[ignore = "needs a task-owned PipeWire source named icu-feedback-test-*; never changes a real microphone"]
+    fn capture_level_roundtrip_on_virtual_source() {
+        let source = std::env::var("ICU_LEVEL_TEST_SOURCE").expect("explicit virtual source");
+        assert!(source.starts_with("icu-feedback-test-"));
+        let mut backend = PipeWireBackend::new().unwrap();
+        backend
+            .open_capture(Some(&source), Box::new(|_| {}))
+            .unwrap();
+        let start = std::time::Instant::now();
+        let original = loop {
+            if let Some(level) = backend.capture_level().unwrap() {
+                break level;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "source never linked or exposed volume"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(original.device, source);
+        let changed = backend
+            .set_capture_level(&original, original.db - 1.0)
+            .unwrap();
+        let restored = backend.restore_capture_level(&changed, &original);
+        assert!(restored.is_ok(), "restore: {restored:?}");
+        assert!(
+            (changed.db - original.db + 1.0).abs() < 0.05,
+            "acknowledged actual change: {changed:?}"
+        );
+        assert!(backend.capture_level().unwrap().unwrap().same(&original));
     }
 }

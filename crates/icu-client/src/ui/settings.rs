@@ -785,13 +785,7 @@ impl SettingsView {
                     true,
                     "Pegel automatisch",
                     Some("Regelt dein Mikrofon nach, wenn du zu leise oder zu laut bist."),
-                    |ui| {
-                        widgets::named_toggle(
-                            ui,
-                            &mut self.draft.audio.auto_level,
-                            "Pegel automatisch",
-                        )
-                    },
+                    |ui| widgets::autotune_control(ui, &mut self.draft.audio, &state.tuning_status),
                 )
             });
             widgets::setting_row(

@@ -59,3 +59,5 @@ mod tests {
         assert_eq!(block, [0.5, 0.0, 0.0, 0.0, -4.0, 4.0, -0.25]);
     }
 }
+
+pub mod feedback;
