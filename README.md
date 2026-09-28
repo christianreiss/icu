@@ -18,7 +18,9 @@ Minimales Voice-System für eine feste Gruppe. Ein Server, ein Raum, keine Chann
 Pakete unter https://github.com/christianreiss/icu/releases: der Client `icu`
 für Fedora 42/43 (`.rpm`) und Debian 13 (`.deb`) sowie als portables, unsigniertes
 ZIP für Windows 10/11 (SmartScreen beim ersten Start: „Weitere Informationen“ →
-„Trotzdem ausführen“), der Server `icu-server` für
+„Trotzdem ausführen“) oder, alternativ, ein ebenfalls unsigniertes Setup pro
+Benutzer (Startmenü-Eintrag, Deinstallation über Einstellungen/Systemsteuerung,
+keine Administratorrechte; SmartScreen warnt bei beiden gleich), der Server `icu-server` für
 Fedora, AlmaLinux 10+ (`.rpm`) und Debian 12+ (`.deb`) (Einrichtung:
 `deploy/README.md` §0), sowie eine interaktive Admin-Shell
 (`icu-server shell`, `Server/IMPLEMENTATION.md` §5.1).

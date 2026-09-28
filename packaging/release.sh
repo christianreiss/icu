@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Mirrors main and the tags to GitHub and publishes dist/<version>/ as the
-# release v<version>. Run packaging/build.sh (and packaging/windows/build.sh)
-# first, on the tagged commit.
+# release v<version>. Run packaging/build.sh (and packaging/windows/build.sh,
+# packaging/windows/installer.sh) first, on the tagged commit.
 #
 #   git tag -s v0.1.0 -m "ICU 0.1.0" && packaging/build.sh \
-#       && packaging/windows/build.sh && packaging/release.sh
+#       && packaging/windows/build.sh && packaging/windows/installer.sh \
+#       && packaging/release.sh
 #
 # Published are exactly the BUILDINFO.* files and the artifacts they list
 # (packaging/checksums.sh --list), SHA256SUMS and its signature
@@ -128,7 +129,9 @@ host's FQDN, if it resolves to this host) and \`sudo systemctl enable --now icu-
 **Client for Windows 10/11** (portable, unsigned): unzip
 \`icu-$VERSION-windows-x86_64.zip\` and start \`icu.exe\`. SmartScreen warns about
 an unknown publisher on the first start: "More info" → "Run anyway". Details:
-\`README.txt\` in the ZIP.
+\`README.txt\` in the ZIP. Alternatively, \`icu-$VERSION-windows-x86_64-setup.exe\`
+installs per-user (no admin rights, Start Menu entry, uninstall via
+Settings/Control Panel) — same unsigned SmartScreen warning either way.
 
 **Verify** before installing: \`SHA256SUMS.sig\` is an SSH signature of
 \`SHA256SUMS\` by the ICU release key. Take \`allowed_signers\` from

@@ -4,7 +4,10 @@ Entpacken, icu.exe starten. Keine Installation, keine Administratorrechte.
 
 Einen Eintrag im Startmenü legt ICU ohne Installation nicht an. Wer ihn
 möchte: icu.exe dorthin legen, wo es bleiben soll, dann Rechtsklick auf
-icu.exe → „An „Start“ anheften“.
+icu.exe → „An „Start“ anheften“. Alternativ gibt es auf der Release-Seite
+ein Setup (icu-<Version>-windows-x86_64-setup.exe), das pro Benutzer ohne
+Administratorrechte installiert, einen Startmenü-Eintrag anlegt und sich
+über Einstellungen → Apps sauber deinstallieren lässt.
 
 Beim ersten Start warnt Windows („Der Computer wurde durch Windows
 geschützt“), weil icu.exe nicht signiert ist: „Weitere Informationen“, dann
