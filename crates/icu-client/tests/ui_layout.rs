@@ -30,6 +30,7 @@ use icu_client::{
         settings::SettingsView,
         setup::{SetupView, Step},
         theme,
+        user::UserView,
     },
 };
 use icu_proto::{AudioParams, UserFlags, UserInfo, UserSummary};
@@ -58,6 +59,7 @@ const MAIN: [f32; 2] = icu_client::ui::main_window::MAIN_SIZE;
 const SETTINGS: [f32; 2] = icu_client::ui::main_window::SETTINGS_SIZE;
 const CONNECTION: [f32; 2] = icu_client::ui::main_window::CONNECTION_SIZE;
 const SETUP: [f32; 2] = icu_client::ui::main_window::SETUP_SIZE;
+const USER: [f32; 2] = icu_client::ui::main_window::USER_SIZE;
 #[cfg(unix)]
 const ENROLL: [f32; 2] = [560.0, 600.0];
 
@@ -373,6 +375,7 @@ fn main_window(
             video: &|_| None,
             self_video: None,
             settings_open: false,
+            user_open: None,
             overlay_available: true,
         };
         *out.borrow_mut() = view.ui(root, &state, &env).list_overflow;
@@ -521,6 +524,37 @@ fn connection_pages_fit() {
             // The first page fits as the window opens; the long ones grow it.
             let may_grow = page != "Server";
             overflows.check_window(&what, &h, CONNECTION, may_grow, *overflow.borrow());
+            shot(&mut h, &what.replace('/', "-"));
+        }
+    }
+    overflows.assert_none();
+}
+
+/// The per-user window, opened on the local user (id 1, Push-to-Talk, no
+/// moderation card) and on a peer (id 2, admin viewer ⇒ volume and
+/// moderation cards both show).
+#[test]
+fn user_window_fits() {
+    let mut overflows = Overflows::default();
+    for theme_name in THEMES {
+        for (label, user_id) in [("self", 1u32), ("peer", 2u32)] {
+            let s = state();
+            let (cmd, _rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+            let overflow = Rc::new(RefCell::new(0.0));
+            let out = overflow.clone();
+            let mut view = UserView::new(user_id);
+            let mut h = harness(USER, theme_name, true, move |ui| {
+                let send = |c: Command| {
+                    let _ = cmd.send(c);
+                };
+                *out.borrow_mut() = view.ui(ui, &s, &|_| None, &send).overflow;
+            });
+            h.run();
+            let what = format!("user/{label}/{theme_name}");
+            // The local user has no volume or moderation card and fits
+            // exactly; a peer's volume card, plus this admin's moderation
+            // card, are worth the window growing for.
+            overflows.check_window(&what, &h, USER, label == "peer", *overflow.borrow());
             shot(&mut h, &what.replace('/', "-"));
         }
     }

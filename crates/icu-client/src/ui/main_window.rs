@@ -14,11 +14,13 @@ use egui::{Color32, RichText};
 use egui_phosphor::regular as icon;
 
 use super::{
-    connection::{fmt_uptime, opt, wrap_fingerprint, ConnectionView, NONE},
+    connection::{fmt_uptime, wrap_fingerprint, ConnectionView},
     fonts,
     settings::SettingsView,
     setup::SetupView,
-    theme, widgets,
+    theme,
+    user::UserView,
+    widgets,
 };
 use crate::{
     config::{Identity, Paths},
@@ -64,6 +66,11 @@ pub const CONNECTION_SIZE: [f32; 2] = [720.0, 780.0];
 /// What the setup window opens with: every step fits without a scroll bar;
 /// only a banner about the keys may make it grow (`tests/ui_layout.rs`).
 pub const SETUP_SIZE: [f32; 2] = [600.0, 720.0];
+/// What the per-user window opens with: one person's connection and
+/// encryption at a glance, fitting the local user (no volume or moderation
+/// card) exactly; a peer's volume card, and an admin's moderation card on
+/// top of that, grow it (`tests/ui_layout.rs`).
+pub const USER_SIZE: [f32; 2] = [420.0, 470.0];
 
 /// A microphone peak at or above this reads as clipping.
 pub(super) const CLIP_DB: f32 = -1.0;
@@ -148,6 +155,8 @@ struct App {
     settings: Option<SettingsView>,
     /// The Verbindung window, opened from the status pill in the header.
     connection: Option<ConnectionView>,
+    /// The per-user window, opened by clicking someone in the list.
+    user: Option<UserView>,
     /// The setup window: open on a new install until finished or skipped,
     /// later from Einstellungen → Audio → „Assistent“.
     setup: Option<SetupView>,
@@ -317,6 +326,7 @@ impl App {
             cmd,
             settings: None,
             connection: None,
+            user: None,
             setup,
             theme: theme_name,
             debug_stats,
@@ -658,6 +668,8 @@ impl eframe::App for App {
         };
         #[cfg(not(feature = "camera"))]
         let self_video = None;
+        // After `self_video` — resolving the local user needs it.
+        self.user_window(&ctx);
 
         let videos = &self.videos;
         let env = MainEnv {
@@ -666,6 +678,7 @@ impl eframe::App for App {
             video: &|session| videos.get(session),
             self_video,
             settings_open: self.settings.is_some(),
+            user_open: self.user.as_ref().map(|v| v.user_id()),
             overlay_available: self.overlay_available(),
         };
         let out = self.view.ui(root, &self.state, &env);
@@ -688,6 +701,12 @@ impl eframe::App for App {
             self.connection = match self.connection.take() {
                 Some(_) => None,
                 None => Some(ConnectionView::new(self.stats.clone())),
+            };
+        }
+        if let Some(id) = out.open_user {
+            self.user = match &self.user {
+                Some(v) if v.user_id() == id => None,
+                _ => Some(UserView::new(id)),
             };
         }
         self.fit_to_list(&ctx, out.list_overflow);
@@ -829,6 +848,59 @@ impl App {
         }
     }
 
+    /// The per-user window, opened by clicking someone in the list.
+    /// Read-only besides volume and moderation, both posted straight
+    /// through as commands — same shape as [`Self::connection_window`].
+    fn user_window(&mut self, ctx: &egui::Context) {
+        let Some(view) = &mut self.user else {
+            return;
+        };
+        let id = view.user_id();
+        // Plain locals, not `self` fields — see `connection_window`. Only
+        // the title is resolved here, ahead of `immediate_window`, which
+        // needs it before the body closure that draws the rest runs;
+        // `UserView::ui` resolves the same person again for its content.
+        let state = &self.state;
+        let videos = &self.videos;
+        // The local camera's own live preview isn't reused here: `App::ui`
+        // already spent this frame's `CameraPreview::texture` call on the
+        // list's own row, and a second call could skip or repeat a frame.
+        // The window falls back to initials for the local user instead.
+        let video = |s: icu_proto::Session| videos.get(s);
+        let Some(p) = participant_for(state, id, &video, None) else {
+            // Left the room while the window was open.
+            self.user = None;
+            return;
+        };
+        let title = format!("ICU — {}", p.name);
+        let cmd = &self.cmd;
+        let send = |c: Command| {
+            let _ = cmd.send(c);
+        };
+        let mut out = None;
+        let still_open = immediate_window(
+            ctx,
+            USER_ID,
+            &title,
+            USER_SIZE,
+            Some([360.0, 460.0]),
+            |ui| out = Some(view.ui(ui, state, &video, &send)),
+        );
+        if let Some(out) = out {
+            if out.open_connection {
+                self.connection
+                    .get_or_insert_with(|| ConnectionView::new(self.stats.clone()));
+            }
+            if out.left {
+                self.user = None;
+                return;
+            }
+        }
+        if !still_open {
+            self.user = None;
+        }
+    }
+
     /// The settings window, drawn into its own immediate viewport. Returns
     /// whether it shows the Audio page, the home of the mic test.
     fn settings_window(&mut self, ctx: &egui::Context) -> bool {
@@ -949,6 +1021,10 @@ impl App {
 
 /// The setup window's viewport.
 const SETUP_ID: &str = "icu-setup";
+/// The per-user window's viewport. One id for all of them: clicking a
+/// different person retargets the same OS window instead of opening a new
+/// one.
+const USER_ID: &str = "icu-user";
 
 /// One of the app's secondary windows, drawn into its own immediate
 /// viewport with `body` as its central panel. `min_size` makes it
@@ -1003,8 +1079,6 @@ fn immediate_window(
 /// stay in `App`.
 #[derive(Default)]
 pub struct MainView {
-    /// The participant row whose details are unfolded.
-    expanded: Option<icu_proto::UserId>,
     /// The on-screen speak button is being held.
     ptt_held: bool,
 }
@@ -1021,6 +1095,9 @@ pub struct MainEnv<'a> {
     pub self_video: Option<egui::load::SizedTexture>,
     /// The settings window is open, which the gear shows.
     pub settings_open: bool,
+    /// Whose per-user window is currently open, if any — the list
+    /// highlights that person's row.
+    pub user_open: Option<icu_proto::UserId>,
     /// The overlay could start (a layer-shell compositor): without it the
     /// Overlay tile would switch nothing, so it is left out.
     pub overlay_available: bool,
@@ -1043,6 +1120,10 @@ pub struct MainOutput {
     pub list_overflow: f32,
     /// „Beenden“ in the header was clicked.
     pub quit: bool,
+    /// A row or its volume handle was clicked: open that person's window,
+    /// or close it if it's already the one showing (`App::ui` decides
+    /// which, since it alone knows what is currently open).
+    pub open_user: Option<icu_proto::UserId>,
 }
 
 impl MainView {
@@ -1417,17 +1498,6 @@ impl MainView {
                 }
             });
 
-        let expanded = &mut self.expanded;
-        // `UserFlags::VIEWING` only says the window or overlay is up; someone
-        // actually watches video only while another person's camera is on.
-        let cameras = usize::from(state.camera_on)
-            + state
-                .peers
-                .iter()
-                .filter(|p| p.info.flags.camera_on())
-                .count();
-        let watches =
-            |viewing: bool, own_camera: bool| viewing && cameras > usize::from(own_camera);
         let own = state
             .me
             .as_ref()
@@ -1453,79 +1523,32 @@ impl MainView {
                             ui.spacing_mut().item_spacing.y = 4.0;
                             ui.add_space(2.0);
                             if let Some(me) = &state.me {
-                                participant_row(
-                                    ui,
-                                    Participant {
-                                        name: &me.name,
-                                        user_id: me.user_id,
-                                        speaking: state.sending,
-                                        muted: state.muted,
-                                        deafened: state.deafened,
-                                        camera: state.camera_on,
-                                        mode: Some(state.settings.audio.mode.into()),
-                                        ptt: Mode::from(state.settings.audio.mode) == Mode::Ptt,
-                                        volume: None,
-                                        is_admin: state.is_admin,
-                                        viewing: watches(me.flags.viewing(), state.camera_on),
-                                        rtt_ms: state.server_rtt_ms,
-                                        client_rtt_ms: state.rtt_ms.map(|ms| ms.round() as u16),
-                                        loss_permille: None,
-                                        session: me.session,
-                                        video: env.self_video,
-                                        moderation: None,
-                                    },
-                                    &columns,
-                                    expanded,
-                                    &send,
-                                );
+                                if let Some(participant) =
+                                    participant_for(state, me.user_id, env.video, env.self_video)
+                                {
+                                    let active = env.user_open == Some(me.user_id);
+                                    if let Some(id) =
+                                        participant_row(ui, participant, &columns, active, &send)
+                                    {
+                                        out.open_user = Some(id);
+                                    }
+                                }
                             }
                             for p in &state.peers {
-                                participant_row(
-                                    ui,
-                                    Participant {
-                                        name: &p.info.name,
-                                        user_id: p.info.user_id,
-                                        speaking: p.speaking,
-                                        muted: p.info.flags.muted(),
-                                        deafened: p.info.flags.deafened(),
-                                        camera: p.info.flags.camera_on(),
-                                        mode: None,
-                                        ptt: p.info.flags.ptt(),
-                                        volume: Some(p.volume),
-                                        is_admin: p.info.flags.is_admin(),
-                                        viewing: watches(
-                                            p.info.flags.viewing(),
-                                            p.info.flags.camera_on(),
-                                        ),
-                                        rtt_ms: p.rtt_ms,
-                                        client_rtt_ms: None,
-                                        loss_permille: p.recv_loss_permille,
-                                        session: p.info.session,
-                                        moderation: state.is_admin.then(|| {
-                                            let row = state
-                                                .user_list
-                                                .iter()
-                                                .find(|u| u.user_id == p.info.user_id);
-                                            Moderation {
-                                                muted: row.is_some_and(|u| u.muted),
-                                                deafened: row.is_some_and(|u| u.deafened),
-                                            }
-                                        }),
-                                        // The flag arrives with `UserState`, so the
-                                        // picture goes the moment somebody switches
-                                        // off — not three seconds later when the
-                                        // last frame goes stale.
-                                        video: p
-                                            .info
-                                            .flags
-                                            .camera_on()
-                                            .then(|| (env.video)(p.info.session))
-                                            .flatten(),
-                                    },
-                                    &columns,
-                                    expanded,
-                                    &send,
-                                );
+                                let Some(participant) = participant_for(
+                                    state,
+                                    p.info.user_id,
+                                    env.video,
+                                    env.self_video,
+                                ) else {
+                                    continue;
+                                };
+                                let active = env.user_open == Some(p.info.user_id);
+                                if let Some(id) =
+                                    participant_row(ui, participant, &columns, active, &send)
+                                {
+                                    out.open_user = Some(id);
+                                }
                             }
                             if state.peers.is_empty() {
                                 let used = ui.cursor().top() - top;
@@ -1714,52 +1737,54 @@ fn camera_feedback(
     )
 }
 
-struct Participant<'a> {
-    name: &'a str,
-    user_id: icu_proto::UserId,
-    speaking: bool,
-    muted: bool,
-    deafened: bool,
-    camera: bool,
+/// One person's row/window data — the same shape whether they end up in a
+/// list row or the per-user window (`super::user::UserView`).
+pub(super) struct Participant<'a> {
+    pub(super) name: &'a str,
+    pub(super) user_id: icu_proto::UserId,
+    pub(super) speaking: bool,
+    pub(super) muted: bool,
+    pub(super) deafened: bool,
+    pub(super) camera: bool,
     /// `Some` only for the local user.
-    mode: Option<Mode>,
+    pub(super) mode: Option<Mode>,
     /// Talks by Push-to-Talk (`UserFlags::PTT`), voice activation otherwise.
-    ptt: bool,
-    volume: Option<f32>,
-    is_admin: bool,
+    pub(super) ptt: bool,
+    pub(super) volume: Option<f32>,
+    pub(super) is_admin: bool,
     /// Looking at video right now: `UserFlags::VIEWING` while somebody
     /// else's camera is on.
-    viewing: bool,
+    pub(super) viewing: bool,
     /// Server-measured RTT, milliseconds. `None` until the first
     /// `UserRtt` arrives (`PROTOCOL.md` §2.2).
-    rtt_ms: Option<u16>,
+    pub(super) rtt_ms: Option<u16>,
     /// Own `Ping`/`Pong` round trip; `Some` only for the local user.
-    client_rtt_ms: Option<u16>,
+    pub(super) client_rtt_ms: Option<u16>,
     /// What this client loses of this person's audio, per mille; remote
     /// participants only.
-    loss_permille: Option<u16>,
-    session: icu_proto::Session,
+    pub(super) loss_permille: Option<u16>,
+    pub(super) session: icu_proto::Session,
     /// This person's live picture, `None` when there is none to show. Goes
     /// into the avatar's circle in place of the initials.
-    video: Option<egui::load::SizedTexture>,
+    pub(super) video: Option<egui::load::SizedTexture>,
     /// `Some` when the viewer is an admin and this is somebody else: what
     /// an admin currently enforces on them, for the moderation menu.
-    moderation: Option<Moderation>,
+    pub(super) moderation: Option<Moderation>,
 }
 
 /// What an admin enforces on a participant (`AdminSetRestriction`), as the
 /// last `UserListResponse` says.
 #[derive(Clone, Copy)]
-struct Moderation {
-    muted: bool,
-    deafened: bool,
+pub(super) struct Moderation {
+    pub(super) muted: bool,
+    pub(super) deafened: bool,
 }
 
 impl Participant<'_> {
     /// The second line: what this person is doing right now, or nothing.
     /// "Nothing" is the common case and stays empty on purpose — a row per
     /// person saying "Mikrofon frei" is noise, not information.
-    fn subtitle(&self) -> Option<&'static str> {
+    pub(super) fn subtitle(&self) -> Option<&'static str> {
         if self.speaking {
             Some(match self.mode {
                 Some(Mode::Ptt) => "sendet · Push-to-Talk",
@@ -1778,8 +1803,86 @@ impl Participant<'_> {
     }
 }
 
+/// Builds one person's data: the local user when `user_id` matches
+/// `state.me`, otherwise the matching peer — the single source both the
+/// list and the per-user window build a [`Participant`] from, so the two
+/// never drift apart on what a ping, a loss figure or a moderation flag
+/// means. `video` looks up a live picture by session (`MainEnv::video`);
+/// `self_video` is the local camera's own preview, used only for the local
+/// user.
+pub(super) fn participant_for<'a>(
+    state: &'a AppState,
+    user_id: icu_proto::UserId,
+    video: &dyn Fn(icu_proto::Session) -> Option<egui::load::SizedTexture>,
+    self_video: Option<egui::load::SizedTexture>,
+) -> Option<Participant<'a>> {
+    // `UserFlags::VIEWING` only says the window or overlay is up; someone
+    // actually watches video only while another person's camera is on.
+    let cameras = usize::from(state.camera_on)
+        + state
+            .peers
+            .iter()
+            .filter(|p| p.info.flags.camera_on())
+            .count();
+    let watches = |viewing: bool, own_camera: bool| viewing && cameras > usize::from(own_camera);
+
+    if let Some(me) = state.me.as_ref().filter(|me| me.user_id == user_id) {
+        return Some(Participant {
+            name: &me.name,
+            user_id: me.user_id,
+            speaking: state.sending,
+            muted: state.muted,
+            deafened: state.deafened,
+            camera: state.camera_on,
+            mode: Some(state.settings.audio.mode.into()),
+            ptt: Mode::from(state.settings.audio.mode) == Mode::Ptt,
+            volume: None,
+            is_admin: state.is_admin,
+            viewing: watches(me.flags.viewing(), state.camera_on),
+            rtt_ms: state.server_rtt_ms,
+            client_rtt_ms: state.rtt_ms.map(|ms| ms.round() as u16),
+            loss_permille: None,
+            session: me.session,
+            video: self_video,
+            moderation: None,
+        });
+    }
+    let p = state.peers.iter().find(|p| p.info.user_id == user_id)?;
+    Some(Participant {
+        name: &p.info.name,
+        user_id: p.info.user_id,
+        speaking: p.speaking,
+        muted: p.info.flags.muted(),
+        deafened: p.info.flags.deafened(),
+        camera: p.info.flags.camera_on(),
+        mode: None,
+        ptt: p.info.flags.ptt(),
+        volume: Some(p.volume),
+        is_admin: p.info.flags.is_admin(),
+        viewing: watches(p.info.flags.viewing(), p.info.flags.camera_on()),
+        rtt_ms: p.rtt_ms,
+        client_rtt_ms: None,
+        loss_permille: p.recv_loss_permille,
+        session: p.info.session,
+        moderation: state.is_admin.then(|| {
+            let row = state
+                .user_list
+                .iter()
+                .find(|u| u.user_id == p.info.user_id);
+            Moderation {
+                muted: row.is_some_and(|u| u.muted),
+                deafened: row.is_some_and(|u| u.deafened),
+            }
+        }),
+        // The flag arrives with `UserState`, so the picture goes the
+        // moment somebody switches off — not three seconds later when the
+        // last frame goes stale.
+        video: p.info.flags.camera_on().then(|| video(p.info.session)).flatten(),
+    })
+}
+
 /// Signal bars for a server-measured round trip, 1 (bad) to 5 (great).
-fn rtt_bars(ms: u16) -> u8 {
+pub(super) fn rtt_bars(ms: u16) -> u8 {
     match ms {
         0..=40 => 5,
         41..=80 => 4,
@@ -1821,15 +1924,20 @@ fn badge_columns(rows: impl Iterator<Item = [bool; 4]>) -> Vec<Badge> {
     columns.into_iter().map(|(_, badge)| badge).collect()
 }
 
+/// Draws one row. `active` says whether this person's window
+/// (`super::user::UserView`) is currently open — it tints the row and the
+/// volume handle the same way the old inline accordion used to. Returns
+/// this person's id when the row or its volume handle was clicked, so the
+/// caller can open (or close) their window.
 fn participant_row(
     ui: &mut egui::Ui,
     p: Participant<'_>,
     columns: &[Badge],
-    open: &mut Option<icu_proto::UserId>,
+    active: bool,
     send: &impl Fn(Command),
-) {
+) -> Option<icu_proto::UserId> {
     let tok = theme::tokens(ui.visuals());
-    let expanded = *open == Some(p.user_id);
+    let mut clicked = None;
     // Last frame's row rect: the volume handle only shows under the pointer,
     // and in immediate mode the row does not know its own rect until drawn.
     let rect_id = ui.id().with(("row", p.user_id));
@@ -1838,7 +1946,7 @@ fn participant_row(
         .is_some_and(|r| ui.rect_contains_pointer(r));
     let fill = if p.speaking {
         tok.accent_tint
-    } else if expanded || hovered {
+    } else if active || hovered {
         tok.surface_hi
     } else {
         Color32::TRANSPARENT
@@ -1920,7 +2028,7 @@ fn participant_row(
                             } else {
                                 icon::SPEAKER_HIGH
                             };
-                            if widgets::icon_button(ui, glyph, 28.0, expanded)
+                            if widgets::icon_button(ui, glyph, 28.0, active)
                                 .on_hover_ui(|ui| {
                                     ui.label(if vol <= 0.0 {
                                         "Für dich stumm".to_string()
@@ -1930,7 +2038,7 @@ fn participant_row(
                                 })
                                 .clicked()
                             {
-                                *open = if expanded { None } else { Some(p.user_id) };
+                                clicked = Some(p.user_id);
                             }
                         } else {
                             // Own row has no volume handle; keep its column so
@@ -1993,9 +2101,6 @@ fn participant_row(
                         }
                     });
                 });
-                if expanded {
-                    details(ui, &p, &tok, send);
-                }
             });
     });
     let r = row.response.rect;
@@ -2003,8 +2108,8 @@ fn participant_row(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     if row.response.clicked() {
-        *open = if expanded { None } else { Some(p.user_id) };
-        if !expanded && p.moderation.is_some() {
+        clicked = Some(p.user_id);
+        if !active && p.moderation.is_some() {
             send(Command::RequestUserList);
         }
     }
@@ -2016,125 +2121,15 @@ fn participant_row(
             .context_menu(|ui| moderation_menu(ui, p.user_id, m, send));
     }
     ui.data_mut(|d| d.insert_temp(rect_id, r));
-}
-
-/// The unfolded part of a participant row: what the client knows about this
-/// person, and for everyone but oneself the playback volume.
-fn details(ui: &mut egui::Ui, p: &Participant<'_>, tok: &theme::Tokens, send: &impl Fn(Command)) {
-    let ms = |v: Option<u16>| opt(v.map(|v| format!("{v} ms")));
-    let mut status = Vec::new();
-    for (on, word) in [
-        (p.speaking, "spricht"),
-        (p.muted, "stumm"),
-        (p.deafened, "hört nicht zu"),
-        (p.camera, "Kamera an"),
-        (p.viewing, "schaut Video"),
-    ] {
-        if on {
-            status.push(word);
-        }
-    }
-    let status = if status.is_empty() {
-        NONE.to_string()
-    } else {
-        status.join(" · ")
-    };
-    let mut rows = vec![
-        (
-            "Rolle",
-            if p.is_admin { "Admin" } else { "Mitglied" }.to_string(),
-        ),
-        ("Status", status),
-        ("Ping (Server)", ms(p.rtt_ms)),
-    ];
-    match p.mode {
-        Some(mode) => {
-            rows.push((
-                "Modus",
-                match mode {
-                    Mode::Ptt => "Push-to-Talk",
-                    Mode::Vad => "Sprachaktivierung",
-                }
-                .to_string(),
-            ));
-            rows.push(("Ping (eigen)", ms(p.client_rtt_ms)));
-        }
-        None => rows.push(("Verlust", opt(p.loss_permille.map(|l| format!("{l} ‰"))))),
-    }
-    rows.push((
-        "Nutzer · Sitzung",
-        format!("#{} · {}", p.user_id, p.session),
-    ));
-
-    ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        ui.add_space(40.0);
-        egui::Grid::new(("details", p.user_id))
-            .num_columns(2)
-            .spacing([12.0, 2.0])
-            .show(ui, |ui| {
-                for (label, value) in rows {
-                    ui.label(RichText::new(label).size(12.0).color(tok.dim_text));
-                    ui.label(RichText::new(value).monospace().size(12.0));
-                    ui.end_row();
-                }
-            });
-    });
-    if let Some(mut v) = p.volume {
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.add_space(40.0);
-            widgets::rtl(ui, 24.0, |ui| {
-                widgets::chip(ui, &format!("{v:.0} %"), 46.0);
-                // One click to silence somebody for yourself, and back.
-                let muted = v <= 0.0;
-                let glyph = if muted {
-                    icon::SPEAKER_X
-                } else {
-                    icon::SPEAKER_HIGH
-                };
-                if widgets::icon_button(ui, glyph, 24.0, muted)
-                    .on_hover_text(if muted {
-                        "Wieder hören"
-                    } else {
-                        "Für mich stummschalten"
-                    })
-                    .clicked()
-                {
-                    send(Command::SetVolume(
-                        p.user_id,
-                        if muted { 100.0 } else { 0.0 },
-                    ));
-                }
-                let name = format!("Lautstärke {}", p.name);
-                if widgets::named_slider(ui, &mut v, 0.0..=200.0, &name).changed() {
-                    send(Command::SetVolume(p.user_id, v));
-                }
-            });
-        });
-    }
-    if let Some(m) = p.moderation {
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.add_space(40.0);
-            ui.label(RichText::new("Moderation").size(12.0).color(tok.dim_text));
-            widgets::rtl(ui, 30.0, |ui| {
-                let menu = widgets::more_button(ui).on_hover_text("Admin-Aktionen");
-                egui::Popup::menu(&menu)
-                    .align(egui::RectAlign::BOTTOM_END)
-                    .gap(4.0)
-                    .show(|ui| moderation_menu(ui, p.user_id, m, send));
-            });
-        });
-    }
-    ui.add_space(4.0);
+    clicked
 }
 
 /// An admin's actions on somebody else: enforce or lift mute and deafen,
 /// kick, kick and ban. Every one of them is undone in one click (a kicked
 /// person reconnects, a ban is lifted under Einstellungen → Nutzer), so
-/// none asks for confirmation.
-fn moderation_menu(
+/// none asks for confirmation. Shown in the row's right-click menu and, at
+/// full size, in the per-user window (`super::user`).
+pub(super) fn moderation_menu(
     ui: &mut egui::Ui,
     user_id: icu_proto::UserId,
     m: Moderation,
@@ -3005,10 +3000,7 @@ mod tests {
     /// and a view not holding it sends nothing.
     #[test]
     fn a_held_speak_button_is_released_when_the_window_goes() {
-        let mut view = MainView {
-            ptt_held: true,
-            ..MainView::default()
-        };
+        let mut view = MainView { ptt_held: true };
         assert!(matches!(view.release_ptt(), Some(Command::Ptt(false))));
         assert!(view.release_ptt().is_none());
         assert!(MainView::default().release_ptt().is_none());

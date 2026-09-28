@@ -45,8 +45,10 @@ const LOSS_WARN_PERCENT: f32 = 1.0;
 const CERT_WARN_DAYS: i64 = 30;
 
 /// What a value means, which is all a row has to say: the color follows.
+/// `pub(super)`: the per-user window (`super::user`) builds a couple of
+/// rows in the same style instead of reinventing label/value/tone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tone {
+pub(super) enum Tone {
     /// Ordinary reading.
     Plain,
     /// Working as intended, worth confirming (encryption, healthy link).
@@ -59,7 +61,7 @@ enum Tone {
 
 /// One label/value line inside a [`Section`].
 #[derive(Debug, Clone)]
-struct Row {
+pub(super) struct Row {
     /// Almost always a literal; borrowed then, so building the page does
     /// not allocate a label per row per frame.
     label: Cow<'static, str>,
@@ -79,7 +81,7 @@ struct Row {
 }
 
 impl Row {
-    fn new(label: impl Into<Cow<'static, str>>, value: impl Into<String>) -> Row {
+    pub(super) fn new(label: impl Into<Cow<'static, str>>, value: impl Into<String>) -> Row {
         Row {
             label: label.into(),
             value: value.into(),
@@ -91,14 +93,14 @@ impl Row {
     }
 
     /// A numeric or identifier row.
-    fn mono(label: impl Into<Cow<'static, str>>, value: impl Into<String>) -> Row {
+    pub(super) fn mono(label: impl Into<Cow<'static, str>>, value: impl Into<String>) -> Row {
         Row {
             mono: true,
             ..Row::new(label, value)
         }
     }
 
-    fn tone(mut self, tone: Tone) -> Row {
+    pub(super) fn tone(mut self, tone: Tone) -> Row {
         self.tone = tone;
         self
     }
@@ -482,7 +484,7 @@ impl ConnectionView {
 /// A one-pixel rule between rows. `ui.separator()` would add
 /// `item_spacing.y` above and below it, which is most of what makes a
 /// settings row twice as tall as a reading needs to be.
-fn hairline(ui: &mut Ui) {
+pub(super) fn hairline(ui: &mut Ui) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     ui.painter().hline(
@@ -493,7 +495,7 @@ fn hairline(ui: &mut Ui) {
 }
 
 /// Label left, value right, on one line.
-fn plain_row(ui: &mut Ui, row: &Row) {
+pub(super) fn plain_row(ui: &mut Ui, row: &Row) {
     let tok = theme::tokens(ui.visuals());
     egui::Frame::new()
         .inner_margin(egui::Margin::symmetric(12, 4))

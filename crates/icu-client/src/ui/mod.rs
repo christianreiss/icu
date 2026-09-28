@@ -7,6 +7,7 @@ pub mod main_window;
 pub mod settings;
 pub mod setup;
 pub mod theme;
+pub mod user;
 pub mod widgets;
 
 use std::net::SocketAddr;
