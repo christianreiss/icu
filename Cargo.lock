@@ -2594,6 +2594,7 @@ dependencies = [
  "toml 0.8.2",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.2",
  "x509-parser",
 ]
 

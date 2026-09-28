@@ -167,14 +167,18 @@ impl Report {
 
     /// The human view: one aligned line per check, then a tally.
     pub fn print(&self) {
+        let style = crate::display::Style::current();
+        println!("{}", style.heading("Doctor"));
         let width = self.checks.iter().map(|c| c.id.len()).max().unwrap_or(0);
         for check in &self.checks {
-            println!(
-                "{:<4}  {:<width$}  {}",
-                check.severity.as_str(),
-                check.id,
-                check.detail
-            );
+            let severity = format!("{:<4}", check.severity.as_str());
+            let severity = match check.severity {
+                Severity::Ok => style.good(&severity),
+                Severity::Warn => style.caution(&severity),
+                Severity::Fail => style.bad(&severity),
+                Severity::Info | Severity::Skip => style.subtle(&severity),
+            };
+            println!("{}  {:<width$}  {}", severity, check.id, check.detail);
         }
         let tally: Vec<String> = [
             Severity::Ok,

@@ -417,6 +417,11 @@ icu-cli status                             # dasselbe wie icu-server status
 icu-cli doctor                             # dasselbe wie icu-server doctor
 ```
 
+Die interaktive Ausgabe färbt Zustände und Befunde auf Terminals und passt
+Nutzer-/Backup-Listen an die Breite an. `NO_COLOR` oder `--color=never`
+schalten Farben ab; `--color=always` erzwingt sie. Bei Pipes bleibt die
+Ausgabe standardmäßig ohne Farbsequenzen, `--json` immer.
+
 `doctor` ist das Gegenstück zu `status` vor dem Start: `status` sagt, wie der
 laufende Server dasteht, `doctor` sagt, warum er nicht startet oder was an
 diesem Host nicht stimmt. Es läuft vor dem ersten Start, gegen einen laufenden

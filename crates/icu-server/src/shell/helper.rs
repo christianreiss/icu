@@ -5,7 +5,10 @@
 //! `readline()` is on); the user list it completes against is a snapshot,
 //! refreshed by the run loop (`shell::run`), not fetched per keystroke.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex},
+};
 
 use rustyline::{
     completion::{Completer, Pair},
@@ -15,7 +18,7 @@ use rustyline::{
     Context, Helper, Result as RlResult,
 };
 
-use crate::{admin::AdminUser, shell::command};
+use crate::{admin::AdminUser, display::Style, shell::command};
 
 pub struct ShellHelper {
     pub users: Arc<Mutex<Vec<AdminUser>>>,
@@ -48,7 +51,15 @@ impl Hinter for ShellHelper {
     type Hint = String;
 }
 
-impl Highlighter for ShellHelper {}
+impl Highlighter for ShellHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> Cow<'b, str> {
+        Cow::Owned(Style::current().heading(prompt))
+    }
+}
 
 impl Validator for ShellHelper {}
 

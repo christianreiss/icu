@@ -59,7 +59,8 @@ base64 = "0.22"
 sha2 = "0.10"
 rand = "0.9"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
-rustix = { version = "1", features = ["fs", "process", "system"] }
+rustix = { version = "1", features = ["fs", "process", "system", "termios"] }
+unicode-width = "0.2"
 socket2 = "0.6"
 tempfile = "3"
 # Namenspruefung (UTS #39 Confusables, NFC, General Category).
