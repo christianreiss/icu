@@ -14,6 +14,12 @@
 //! itself, and with an explicit output device (same one playback uses) it
 //! follows that sink's monitor instead, so the reference always matches
 //! what is actually being played back.
+//!
+//! The registry's "default" metadata object (`default.audio.sink` /
+//! `default.audio.source`) is watched separately: when it changes, a
+//! `BackendEvent::DefaultDeviceChanged` is sent so the engine reopens any
+//! "system" (no explicit device) stream against the new default, instead of
+//! relying solely on the session manager to relink an already-open stream.
 
 use std::{
     cell::RefCell,
@@ -59,6 +65,14 @@ struct StreamData {
     scratch: Vec<f32>,
     kind: StreamKind,
     events: Sender<BackendEvent>,
+}
+
+/// Keeps the bound "default" metadata proxy and its property listener
+/// alive; dropped only when the pipewire thread ends.
+struct DefaultMetadataState {
+    id: u32,
+    _metadata: pw::metadata::Metadata,
+    _listener: pw::metadata::MetadataListener,
 }
 
 /// The PipeWire backend handle owned by the engine.
@@ -225,13 +239,61 @@ fn pw_thread(
     let _rt = super::rt::register_context(context.as_raw_ptr() as *mut std::ffi::c_void);
 
     // Device list from the registry: every Audio/Source and Audio/Sink node.
+    // The "default" metadata object separately tracks which node id is the
+    // OS default input/output; watched here so a "system" stream can be
+    // reopened when that changes underneath it (mirrors the WASAPI
+    // backend's IMMNotificationClient default-endpoint watcher).
     let dev_add = devices.clone();
     let ev_add = events.clone();
     let dev_rm = devices.clone();
     let ev_rm = events.clone();
+    let registry_meta = registry.clone();
+    let default_meta: Rc<RefCell<Option<DefaultMetadataState>>> = Rc::new(RefCell::new(None));
+    let default_meta_rm = default_meta.clone();
+    let last_default_sink: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let last_default_source: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let ev_default = events.clone();
     let _registry_listener = registry
         .add_listener_local()
         .global(move |obj| {
+            if obj.type_ == pw::types::ObjectType::Metadata {
+                let Some(props) = obj.props else { return };
+                if props.get("metadata.name") != Some("default") || default_meta.borrow().is_some()
+                {
+                    return;
+                }
+                let Ok(metadata) = registry_meta.bind::<pw::metadata::Metadata, _>(obj) else {
+                    return;
+                };
+                let last_sink = last_default_sink.clone();
+                let last_source = last_default_source.clone();
+                let ev_default = ev_default.clone();
+                let listener = metadata
+                    .add_listener_local()
+                    .property(move |_subject, key, _type, value| {
+                        let slot = match key {
+                            Some("default.audio.sink") => &last_sink,
+                            Some("default.audio.source") => &last_source,
+                            _ => return 0,
+                        };
+                        let value = value.map(str::to_string);
+                        let mut last = slot.borrow_mut();
+                        let changed = last.is_some() && *last != value;
+                        *last = value;
+                        drop(last);
+                        if changed {
+                            let _ = ev_default.send(BackendEvent::DefaultDeviceChanged);
+                        }
+                        0
+                    })
+                    .register();
+                *default_meta.borrow_mut() = Some(DefaultMetadataState {
+                    id: obj.id,
+                    _metadata: metadata,
+                    _listener: listener,
+                });
+                return;
+            }
             if obj.type_ != pw::types::ObjectType::Node {
                 return;
             }
@@ -268,6 +330,13 @@ fn pw_thread(
             };
             if let Some(list) = removed {
                 let _ = ev_rm.send(BackendEvent::DevicesChanged(list));
+            }
+            // WirePlumber restarting removes and re-adds the "default"
+            // metadata global under a new id; drop the stale binding so the
+            // `global` handler above rebinds it when it reappears.
+            let mut slot = default_meta_rm.borrow_mut();
+            if slot.as_ref().is_some_and(|s| s.id == id) {
+                *slot = None;
             }
         })
         .register();
