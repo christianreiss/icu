@@ -88,6 +88,12 @@ impl Gate {
         self.muted = muted;
     }
 
+    /// Whether mute (or no connection) holds the gate shut: closed, it then
+    /// says nothing about whether the user is talking.
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
     /// Whether the gate currently lets audio through.
     pub fn is_open(&self) -> bool {
         !matches!(self.state, State::Closed)
