@@ -50,8 +50,9 @@ fn noise(q: vec3<f32>) -> f32 {
                 let side=min(p.image.x,p.image.y);
                 let uv=clamp((d/p.radius.x+1.)*.5,vec2(0.),vec2(.9999));
                 let xy=vec2<i32>((p.image.xy-vec2(side))*.5+uv*side);
-                c=textureLoad(video,xy,0).rgb*p.effect.z;
+                c=textureLoad(video,xy,0).rgb;
             }
+            c*=p.effect.z;
         }
         out=vec4(c,1.);
     }

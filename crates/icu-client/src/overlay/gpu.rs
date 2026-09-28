@@ -259,11 +259,7 @@ impl Renderer {
                 Face::Camera(_) => scene.geometry.camera_diameter,
                 Face::Plate => scene.geometry.plate_diameter,
             };
-            let reserve = if matches!(tile.face, Face::Camera(_)) {
-                speak_diameter(diameter)
-            } else {
-                diameter
-            };
+            let reserve = speak_diameter(diameter);
             let mut geom = circle_geometry(reserve, scene.geometry.name_px);
             geom.half_w += pad;
             geom.outer_w += pad * 2;
@@ -329,6 +325,11 @@ impl Renderer {
                             (cx - tx as f32 - label.width as f32 / 2.).round() as u32,
                             (cy - ty as f32 - label.height as f32 / 2.).round() as u32,
                             label,
+                            [if tile.dim {
+                                (255 * DIM_MUL / 256) as u8
+                            } else {
+                                255
+                            }; 3],
                         );
                     }
                 }
@@ -554,6 +555,156 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires a hardware GPU; run with --ignored --nocapture"]
+    fn hardware_non_video_members() {
+        let mut renderer = Renderer::new().expect("hardware GPU");
+        let mut labels = Labels::new();
+        for (camera, plate, font) in [(120, 72, 12), (240, 144, 15), (360, 216, 18)] {
+            for dpi in [1.0, 1.25, 1.5, 2.0] {
+                for (horizontal, bottom) in [(false, false), (true, false), (true, true)] {
+                    let tiles = [
+                        Tile {
+                            face: Face::Camera(Some((
+                                4,
+                                4,
+                                Arc::new([200, 80, 40, 255].repeat(16)),
+                            ))),
+                            name: "Anna".into(),
+                            speaking: false,
+                            dim: true,
+                            scale: REST_SCALE,
+                        },
+                        Tile {
+                            face: Face::Plate,
+                            name: "Ben ohne Kamera".into(),
+                            speaking: true,
+                            dim: false,
+                            scale: SPEAK_SCALE,
+                        },
+                        Tile {
+                            face: Face::Plate,
+                            name: "Carla".into(),
+                            speaking: false,
+                            dim: true,
+                            scale: REST_SCALE,
+                        },
+                    ];
+                    let pad = scaled(HALO, dpi);
+                    let geoms = [camera, plate, plate].map(|d| {
+                        let mut g =
+                            circle_geometry(speak_diameter(scaled(d, dpi)), scaled(font, dpi));
+                        g.half_w += pad;
+                        g.outer_w += 2 * pad;
+                        g.outer_h += 2 * pad;
+                        g
+                    });
+                    let (width, height) = if horizontal {
+                        (
+                            geoms.iter().map(|g| g.outer_w).sum::<u32>() + 2 * GAP,
+                            geoms.iter().map(|g| g.outer_h).max().unwrap(),
+                        )
+                    } else {
+                        (
+                            geoms.iter().map(|g| g.outer_w).max().unwrap(),
+                            geoms.iter().map(|g| g.outer_h).sum::<u32>() + 2 * GAP,
+                        )
+                    };
+                    let geometry = Geometry {
+                        width,
+                        height,
+                        camera_diameter: scaled(camera, dpi),
+                        plate_diameter: scaled(plate, dpi),
+                        name_px: scaled(font, dpi),
+                        horizontal,
+                        bottom,
+                        speaking_frame: true,
+                        frame_color: [46, 155, 255],
+                    };
+                    let mut scene = RenderScene {
+                        geometry,
+                        scale: dpi,
+                        tiles: &tiles,
+                        intensities: &[0., 1., 0.],
+                        labels: &mut labels,
+                        visible_frames: &[],
+                    };
+                    let mut canvas = vec![0; (width * height * 4) as usize];
+                    renderer.invalidate();
+                    complete(&mut renderer, &mut scene, &mut canvas);
+                    let (mut x, mut y) = (0, 0);
+                    for (index, geom) in geoms.iter().enumerate() {
+                        let tx = if horizontal {
+                            x
+                        } else {
+                            (width - geom.outer_w) / 2
+                        };
+                        let ty = if horizontal && bottom {
+                            height - geom.outer_h
+                        } else {
+                            y
+                        };
+                        let cx = tx + geom.half_w;
+                        let cy = ty + pad + geom.radii.r_outer as u32;
+                        let pixel = |x, y| &canvas[((y * width + x) * 4) as usize..][..4];
+                        if index > 0 {
+                            // Sample inside the face but clear of the initials.
+                            let fill = pixel(cx - scaled(plate, dpi) / 3, cy);
+                            let expected = if index == 1 { 28u8 } else { 14 };
+                            assert!(fill[..3].iter().all(|c| c.abs_diff(expected) <= 1), "plate {index}: {fill:?}, expected {expected}, camera {camera}, dpi {dpi}, horizontal {horizontal}, bottom {bottom}");
+                            assert_eq!(fill[3], 255);
+                            let white = if index == 1 { 255u8 } else { 127 };
+                            let mut initials = 0;
+                            for iy in cy - scaled(plate, dpi) / 4..cy + scaled(plate, dpi) / 4 {
+                                for ix in cx - scaled(plate, dpi) / 4..cx + scaled(plate, dpi) / 4 {
+                                    if pixel(ix, iy)[..3].iter().all(|c| c.abs_diff(white) <= 1) {
+                                        initials += 1;
+                                    }
+                                }
+                            }
+                            assert!(initials > 10, "missing initials for plate {index}");
+                            // The speaking plate's halo is inside its reserved slot;
+                            // the silent plate has none above its full speaking radius.
+                            let halo = pixel(
+                                cx,
+                                cy - (scaled(plate, dpi) as f32 * SPEAK_SCALE / 2.) as u32 - 6,
+                            );
+                            assert_eq!(halo[3] > 0, index == 1);
+                        }
+                        if horizontal {
+                            x += geom.outer_w + GAP;
+                        } else {
+                            y += geom.outer_h + GAP;
+                        }
+                    }
+                    assert!(canvas
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|p| p[..3].iter().all(|c| *c <= p[3])));
+                    if camera == 120 && dpi == 1.0 && !bottom {
+                        if let Ok(dir) = std::env::var("ICU_OVERLAY_SHOTS") {
+                            let mut rgba = canvas.clone();
+                            for p in rgba.as_chunks_mut::<4>().0 {
+                                p.swap(0, 2);
+                            }
+                            let layout = if horizontal { "row" } else { "column" };
+                            image::save_buffer(
+                                std::path::Path::new(&dir)
+                                    .join(format!("non-video-gpu-{layout}.png")),
+                                &rgba,
+                                width,
+                                height,
+                                image::ColorType::Rgba8,
+                            )
+                            .unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Opt-in because CI need not have a hardware adapter. This deliberately
     // fails (does not skip) when explicitly requested without working hardware.
     #[test]
@@ -713,11 +864,11 @@ mod tests {
                     name: "Voice only".into(),
                     speaking: true,
                     dim: false,
-                    scale: REST_SCALE,
+                    scale: SPEAK_SCALE,
                 },
             ];
             let geoms = [240, 144].map(|d| {
-                let mut g = circle_geometry(if d == 240 { speak_diameter(d) } else { d }, 24);
+                let mut g = circle_geometry(speak_diameter(d), 24);
                 g.outer_w += HALO * 4;
                 g.outer_h += HALO * 4;
                 g

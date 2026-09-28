@@ -1439,14 +1439,14 @@ impl SettingsView {
                         ],
                     )
                 });
-                widgets::setting_row(ui, true, "Wer ohne Kamera spricht", None, |ui| {
+                widgets::setting_row(ui, true, "Teilnehmer ohne Kamera", None, |ui| {
                     widgets::named_toggle(
                         ui,
                         &mut self.draft.overlay.voice_plates,
-                        "Wer ohne Kamera spricht",
+                        "Teilnehmer ohne Kamera",
                     )
                 })
-                .on_hover_text("Solange jemand ohne Kamera spricht, steht der Name im Overlay");
+                .on_hover_text("Teilnehmer ohne Kamera bleiben als kleinere Kreise mit Initialen und Namen sichtbar und werden beim Sprechen hervorgehoben");
                 if !adv {
                     return;
                 }

@@ -78,7 +78,7 @@ Beim ersten Start fragt KDE (Portal GlobalShortcuts) nach den Kurzbefehlen. Wer 
 - **Einrichtung** (600×720, beim ersten Start): vier Schritte ohne Scrollbalken, unten „Zurück“/„Weiter“ bzw. „Überspringen“ und „Fertig“; währenddessen steht im Hauptfenster „Stumm“.
 - **Einstellungen** (⚙, 820×680, öffnet auf Audio, dort im Kopf „Assistent“): Audio, Klang, Tastenkürzel, Kamera, Allgemein, Nutzer (nur Admins), Über ICU — keine Seite braucht einen Scrollbalken; mit „Erweitert“ (unten in der Seitenleiste) wächst das Fenster, statt zu scrollen. Eine Änderung per Hotkey oder Tray, während das Fenster offen ist, bleibt erhalten.
 - **Verbindungsfenster** (Klick auf den Verbindungspunkt): Server, Netz, Krypto (Zertifikate Server/Eigenes/CA), Audio, Video, Wer; nur lesend, „Bericht kopieren“.
-- **Overlay** (Kachel „Overlay“, KDE/wlroots): Kamerakacheln mit Namen, und wer ohne Kamera spricht, erscheint solange als Namensschild; klick-durchlässig, Position in ⚙ → Kamera.
+- **Overlay** (Kachel „Overlay“, KDE/wlroots): Kamerakacheln mit Namen und dauerhaft kleinere Kreise mit Initialen und Namen für Teilnehmer ohne Kamera (abschaltbar über „Teilnehmer ohne Kamera“); beide wachsen beim Sprechen sanft um 20 %, werden bei Stille optional abgedunkelt und verwenden dieselbe Sprechhervorhebung. Sprechbeginn und -ende verschieben keine Nachbarn und ändern die Fenstergröße nicht. Gemischte Gruppen, reine Sprachrunden, Kamerawechsel und Verlassen prüfen, jeweils in allen drei Größen, horizontal/vertikal und bei 100/150/200 % Skalierung; klick-durchlässig, Position in ⚙ → Kamera.
 
 ### Was zu hören sein soll
 

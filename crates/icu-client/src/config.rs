@@ -311,8 +311,8 @@ pub struct OverlaySettings {
     pub speaking_frame: bool,
     /// Color of that frame, RGB.
     pub frame_color: [u8; 3],
-    /// Show a name plate for everyone without a camera while they talk, so
-    /// the overlay also answers „wer spricht?" in a voice-only round.
+    /// Show smaller name plates for everyone without a camera, including
+    /// while silent, with the same speaking and dimming rules as video tiles.
     pub voice_plates: bool,
 }
 
