@@ -343,10 +343,6 @@ pub struct Speak<'a> {
     pub threshold: Option<f32>,
     /// The push-to-talk key, shown as a keycap beside the label.
     pub key: Option<&'a str>,
-    /// Muted, yet talking (voice heard, or the PTT key held): the surface
-    /// says so instead of letting people talk into the void (Mumble's
-    /// "mute cue").
-    pub talking_muted: bool,
     /// The microphone clips: the level line turns red.
     pub clipping: bool,
 }
@@ -376,17 +372,6 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         .animate_bool_with_time(response.id, s.open && !s.offline && !s.alone, 0.08);
     let hot = open > 0.5;
     painter.rect_filled(rect, R_ROW, lerp_color(tok.surface_hi, tok.accent, open));
-    if s.talking_muted {
-        let time = ui.input(|i| i.time);
-        let pulse = ((time * 3.0).sin() as f32 * 0.5 + 0.5).clamp(0.0, 1.0);
-        // No repaint request of its own: the main window repaints every
-        // 33 ms anyway, which is plenty for this pulse.
-        painter.rect_filled(
-            rect,
-            R_ROW,
-            tok.error_tint.gamma_multiply(0.6 + 0.4 * pulse),
-        );
-    }
     if s.ptt && !s.offline && !s.alone && response.hovered() {
         painter.rect_filled(rect, R_ROW, tok.hover_overlay);
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -440,9 +425,7 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         );
     }
 
-    let (glyph, label, color) = if s.talking_muted {
-        (icon::MICROPHONE_SLASH, "Stumm — du sprichst", tok.error)
-    } else if s.muted {
+    let (glyph, label, color) = if s.muted {
         (icon::MICROPHONE_SLASH, "Stumm", tok.error)
     } else if s.offline {
         (icon::PLUGS, "Getrennt", tok.muted_text)

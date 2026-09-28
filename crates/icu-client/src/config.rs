@@ -155,7 +155,7 @@ impl Default for AudioSettings {
             auto_level: true,
             denoise: true,
             aec: true,
-            voice_opt: false,
+            voice_opt: true,
             voice_strength: VoiceStrength::Medium,
             release_ms: 150,
             hangover_ms: 1000,
@@ -1463,7 +1463,7 @@ mod tests {
         assert_eq!(s.audio.release_ms, 150);
         assert_eq!(s.audio.hangover_ms, 1000);
         assert!(s.audio.vad_auto);
-        assert!(!s.audio.voice_opt);
+        assert!(s.audio.voice_opt, "voice optimization default on");
         assert!(s.audio.normalize_incoming);
         assert!(s.audio.auto_level);
         assert!(s.audio.normalize_outgoing);

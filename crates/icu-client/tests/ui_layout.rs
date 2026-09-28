@@ -431,6 +431,14 @@ fn main_window_fits() {
             s.restricted_muted = true;
             s
         }),
+        ("muted-talking", {
+            // Muted while the VAD hears speech: the speak surface must stay
+            // put ("Stumm"), no flip-flopping label/pulse/tooltip.
+            let mut s = four();
+            s.muted = true;
+            s.voice = true;
+            s
+        }),
     ];
     for theme_name in THEMES {
         for (name, s) in &cases {

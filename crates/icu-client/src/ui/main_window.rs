@@ -1620,14 +1620,10 @@ fn speak_row(
         },
         threshold: (!ptt).then_some(state.vad_threshold),
         key: ptt.then_some(key.as_str()),
-        talking_muted: state.muted && (state.voice || (ptt && state.ptt_down)),
         clipping: !offline && state.level.peak_db >= CLIP_DB,
     };
     // Built only while hovered: three floats formatted per frame otherwise.
     let tooltip = |ui: &mut egui::Ui| {
-        if speak.talking_muted {
-            ui.label("Du bist stummgeschaltet — niemand hört dich.");
-        }
         if speak.clipping {
             ui.label("Übersteuert — leiser sprechen oder das Mikrofon herunterregeln.");
         }

@@ -1123,7 +1123,7 @@ mod tests {
         assert_eq!(
             lines[3].value,
             "Rauschunterdrückung, Echo-Unterdrückung, Pegel automatisch, Selbst gleich laut \
-             ankommen, Andere gleich laut hören"
+             ankommen, Andere gleich laut hören, Stimmoptimierung (Mittel)"
         );
 
         s.audio.vad_auto = false;
