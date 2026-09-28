@@ -16,7 +16,7 @@
 #   podman build -f deploy/Dockerfile -t icu-server .
 #
 # The build context is the repository, but .dockerignore lets in only that
-# binary: no .git, no .scratch, no target or dist.
+# binary: no .git, no .local, no target or dist.
 #
 # Then run it with the state and config mounted:
 #

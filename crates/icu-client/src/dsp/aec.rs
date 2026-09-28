@@ -1,4 +1,4 @@
-//! AEC3 through `webrtc-audio-processing` (`Research/aec.md`).
+//! AEC3 through `webrtc-audio-processing` (`docs/research/aec.md`).
 //!
 //! 480-sample frames in ±1.0. Per tick: render (reference) first, then
 //! capture. No `stream_delay_ms` (AEC3 ignores it). Behind feature `aec`; the
@@ -37,8 +37,8 @@ pub const ERLE_POOR_DB: f64 = 6.0;
 pub const POOR_REPORTS: u32 = 5;
 pub const NO_PATH_REPORTS: u32 = 15;
 
-/// What the statistics say to the user (`Client/IMPLEMENTATION.md` §6,
-/// `Research/aec.md` "Laufende Selbstdiagnose").
+/// What the statistics say to the user (`docs/reference/client.md` §6,
+/// `docs/research/aec.md` "Laufende Selbstdiagnose").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Verdict {
     /// Echo detected but not removed: check the reference device.
@@ -296,7 +296,7 @@ pub use real::Aec;
 #[cfg(all(test, feature = "aec"))]
 mod tests {
     //! Offline ERLE test lifted from Spike 6
-    //! (`Research/spikes/spike-aec/src/signal.rs`).
+    //! (`experiments/spike-aec/src/signal.rs`).
 
     use super::*;
     use crate::dsp::testsignal::*;

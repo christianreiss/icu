@@ -1,5 +1,5 @@
 //! `settings.toml`, the identity directory and the paths per OS
-//! (`Client/IMPLEMENTATION.md` §5, §11).
+//! (`docs/reference/client.md` §5, §11).
 
 use std::{
     collections::BTreeMap,
@@ -337,7 +337,7 @@ impl Default for OverlaySettings {
 #[serde(default)]
 pub struct UiSettings {
     /// Legacy. The display name lives in the certificate's CN since the name
-    /// moved there (`PROTOCOL.md` §2.1); nothing reads this any more. Kept so
+    /// moved there (`docs/reference/protocol.md` §2.1); nothing reads this any more. Kept so
     /// an existing `settings.toml` still round-trips.
     pub name: Option<String>,
     /// Start in the tray.
@@ -466,7 +466,7 @@ impl Settings {
     /// person: microphone, speakers and camera, the hotkey backend (a matter
     /// of the desktop), the file association, whether the first-run setup
     /// ran here (it picks this machine's devices) and the legacy name. The
-    /// one list of what a passport leaves behind (`PROTOCOL.md` §2.3.1).
+    /// one list of what a passport leaves behind (`docs/reference/protocol.md` §2.3.1).
     fn keep_machine_fields(&mut self, from: &Settings) {
         self.audio.input_device.clone_from(&from.audio.input_device);
         self.audio
@@ -590,7 +590,7 @@ fn clamped(value: f32, min: f32, max: f32, default: f32) -> f32 {
 
 /// `identity/server.toml`: where to connect.
 ///
-/// Derived from the certificates wherever they say it (`PROTOCOL.md` §2.3):
+/// Derived from the certificates wherever they say it (`docs/reference/protocol.md` §2.3):
 /// the leaf's URI SAN `icu://host:port` and the CA's CN `ICU CA <server_name>`.
 /// The file keeps it for identities whose certificates predate that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -603,7 +603,7 @@ pub struct ServerInfo {
     pub server_name: String,
     /// Last known display name, mirrored from the certificate's CN at
     /// registration and after every renewal. Informational: the certificate
-    /// is the authority (`PROTOCOL.md` §2.1).
+    /// is the authority (`docs/reference/protocol.md` §2.1).
     pub name: String,
 }
 
@@ -670,7 +670,7 @@ pub struct Identity {
     pub leaf_der: Vec<u8>,
     /// Server CA certificate, DER.
     pub ca_der: Vec<u8>,
-    /// The server's com key (`PROTOCOL.md` §1): every datagram carries its
+    /// The server's com key (`docs/reference/protocol.md` §1): every datagram carries its
     /// tag, or the server drops it.
     pub com_key: ComKey,
     /// Server coordinates.
@@ -705,7 +705,7 @@ impl Identity {
     }
 
     /// [`Identity::from_passport`], plus the settings a passport may carry
-    /// (`PROTOCOL.md` §2.3.1). Settings that do not read are left
+    /// (`docs/reference/protocol.md` §2.3.1). Settings that do not read are left
     /// behind with a log line: the identity is what a passport is for.
     /// Refused before anything is replaced: what [`Identity::check_importable`]
     /// finds wrong.
@@ -718,7 +718,7 @@ impl Identity {
             crate::problem::passport_text(&e)
         })?;
         // A registration bundle must carry a valid signature by its own CA
-        // (`PROTOCOL.md` §2.3.1): that key never travels inside the bundle,
+        // (`docs/reference/protocol.md` §2.3.1): that key never travels inside the bundle,
         // so this catches tampering with the armored text after the server
         // wrote it — the com key included, which nothing else here checks.
         // A personal export normally carries none; if one is present anyway
@@ -764,7 +764,7 @@ impl Identity {
     /// text. Otherwise the working identity would be replaced by one that
     /// cannot connect, or a forged name could draw lines of its own into
     /// the confirmation (review 2026-09-27, C-2, C-4). An expired own
-    /// certificate passes: the server renews it (`PROTOCOL.md` §2.3.3).
+    /// certificate passes: the server renews it (`docs/reference/protocol.md` §2.3.3).
     fn check_importable(&self, now: i64) -> Result<(), String> {
         let (what, again) = if self.is_registration() {
             ("Diese Einladung", "Bitte beim Admin eine neue anfordern.")
@@ -826,7 +826,7 @@ impl Identity {
     }
 
     /// The armored passport for this identity, without settings. The
-    /// certificates say where the server is (`PROTOCOL.md` §2.3.1).
+    /// certificates say where the server is (`docs/reference/protocol.md` §2.3.1).
     pub fn to_passport(&self) -> String {
         self.passport(String::new()).encode()
     }
@@ -1061,7 +1061,7 @@ static IDENTITY_FILES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// What importing a passport or registration bundle would switch this client
 /// to, shown for the user to confirm before anything is replaced
-/// (`PROTOCOL.md` §2.3.1). A passport brings its own CA and address, so a
+/// (`docs/reference/protocol.md` §2.3.1). A passport brings its own CA and address, so a
 /// forged one would lead to somebody else's server; this is where the user
 /// sees which one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1629,7 +1629,7 @@ mod tests {
         }
     }
 
-    /// The concrete guarantee the signature buys (`PROTOCOL.md` §2.3.1): a
+    /// The concrete guarantee the signature buys (`docs/reference/protocol.md` §2.3.1): a
     /// registration bundle needs one at all, and it must cover every field,
     /// `com_key` included — nothing else here checks that one.
     #[test]

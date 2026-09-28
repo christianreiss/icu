@@ -1,5 +1,5 @@
 //! The default audio chain end to end, offline and deterministic
-//! (`Client/IMPLEMENTATION.md` §6): microphone → `dsp::chain` (mic auto
+//! (`docs/reference/client.md` §6): microphone → `dsp::chain` (mic auto
 //! level, RNNoise, VAD with the auto threshold, outbound normalizer and
 //! limiter) → VAD gate with pre-roll → Opus → decoder (PLC/FEC where a test
 //! loses packets) → receive normalizer → per-user volume → mixer and soft

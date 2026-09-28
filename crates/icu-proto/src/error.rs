@@ -1,4 +1,4 @@
-//! Error codes of the ICU wire protocol (`PROTOCOL.md` §6).
+//! Error codes of the ICU wire protocol (`docs/reference/protocol.md` §6).
 //!
 //! The same numeric space is used in three places: the QUIC `CONNECTION_CLOSE`
 //! code (varint), [`crate::ControlMsg::Error::code`] (u32) and
@@ -63,19 +63,19 @@ pub const AUTH_DISABLED: u32 = 0x17;
 /// `AdminActionError`. Not fatal.
 pub const NO_SUCH_USER: u32 = 0x18;
 /// The same certificate connected again; the newer connection wins and the
-/// older one is closed with this code (`PROTOCOL.md` §7). Fatal, so two
+/// older one is closed with this code (`docs/reference/protocol.md` §7). Fatal, so two
 /// devices sharing a passport do not take turns kicking each other.
 pub const SESSION_REPLACED: u32 = 0x19;
 /// The receipt that ends a registration session: the client closes with this
 /// code once it has stored its new identity, and only then does the server
-/// revoke the bundle (`PROTOCOL.md` §2.3). Deliberately not `NO_ERROR`: quinn
+/// revoke the bundle (`docs/reference/protocol.md` §2.3). Deliberately not `NO_ERROR`: quinn
 /// closes a dropped connection implicitly with code 0, which must not count.
 /// Only ever a client close code. Not fatal.
 pub const REGISTRATION_STORED: u32 = 0x1A;
 /// The presented certificate has expired: the session is renew-only and never
 /// joins the room. Sent right after `Welcome` and in answer to anything but
 /// `RenewRequest`/`Ping`; the client renews with its existing key and
-/// reconnects with the new leaf (`PROTOCOL.md` §2.2). Not fatal.
+/// reconnects with the new leaf (`docs/reference/protocol.md` §2.2). Not fatal.
 pub const RENEW_REQUIRED: u32 = 0x1B;
 /// The server could not carry out an action — as a rule it could not write
 /// its state — and changed nothing; trying again later may work. Only ever
@@ -113,7 +113,7 @@ pub const ALL_CODES: &[u32] = &[
     SERVER_ERROR,
 ];
 
-/// Fatal codes (`PROTOCOL.md` §5/§6): the client must not reconnect.
+/// Fatal codes (`docs/reference/protocol.md` §5/§6): the client must not reconnect.
 ///
 /// `NO_ERROR` is neither fatal nor a reconnect reason — it is listed as `–` in
 /// the table and handled by the caller (a clean close is a clean close).
@@ -174,7 +174,7 @@ pub fn name(code: u32) -> &'static str {
 mod tests {
     use super::*;
 
-    /// `PROTOCOL.md` §6: exactly these codes are fatal.
+    /// `docs/reference/protocol.md` §6: exactly these codes are fatal.
     #[test]
     fn fatal_table_matches_protocol() {
         let expected_fatal: &[u32] = &[

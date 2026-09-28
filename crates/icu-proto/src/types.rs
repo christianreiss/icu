@@ -1,4 +1,4 @@
-//! Shared wire types of the control channel (`PROTOCOL.md` §2.1).
+//! Shared wire types of the control channel (`docs/reference/protocol.md` §2.1).
 
 use serde::{Deserialize, Serialize};
 
@@ -94,7 +94,7 @@ pub fn is_plain_text(text: &str) -> bool {
     })
 }
 
-/// Validates a display name (`PROTOCOL.md` §2.1): 1–32 bytes UTF-8 in NFC,
+/// Validates a display name (`docs/reference/protocol.md` §2.1): 1–32 bytes UTF-8 in NFC,
 /// no control, formatting, private-use, unassigned or separator characters,
 /// single spaces (U+0020) only between words, no leading combining mark, and
 /// a single script (UTS #39; digits and punctuation go with any).
@@ -170,7 +170,7 @@ pub fn name_key(name: &str) -> String {
         .to_lowercase()
 }
 
-/// Per-user state bits (`PROTOCOL.md` §2.1).
+/// Per-user state bits (`docs/reference/protocol.md` §2.1).
 ///
 /// bit0 muted, bit1 deafened, bit2 speaking, bit3 camera_on, bit4 admin,
 /// bit5 viewing, bit6–7 reserved. Reserved bits are written as 0 by the
@@ -256,7 +256,7 @@ impl UserFlags {
 
     /// Applies a client requested state: takes the client settable bits from
     /// `requested`, keeps the server authoritative `SPEAKING`/`ADMIN` bits and
-    /// drops everything reserved (`PROTOCOL.md` §2.1, `Server/IMPLEMENTATION.md`
+    /// drops everything reserved (`docs/reference/protocol.md` §2.1, `docs/reference/server.md`
     /// §6.4).
     pub fn apply_client_request(self, requested: UserFlags) -> UserFlags {
         UserFlags((requested.0 & Self::CLIENT_SETTABLE) | (self.0 & Self::SERVER_AUTHORITATIVE))
@@ -283,7 +283,7 @@ pub struct UserInfo {
 }
 
 /// One row of the admin User Manager list (`ControlMsg::UserListResponse`,
-/// `PROTOCOL.md` §2.2). Lighter than the admin-socket's `AdminUser`: no
+/// `docs/reference/protocol.md` §2.2). Lighter than the admin-socket's `AdminUser`: no
 /// fingerprint/issued/expires, the manager only needs role and status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserSummary {
@@ -302,7 +302,7 @@ pub struct UserSummary {
     /// Whether the user is connected right now.
     pub online: bool,
     /// Invited, but the registration has not been confirmed yet
-    /// (`PROTOCOL.md` §2.3).
+    /// (`docs/reference/protocol.md` §2.3).
     pub pending: bool,
     /// Mute enforced by an admin (`AdminSetRestriction`).
     pub muted: bool,
@@ -310,7 +310,7 @@ pub struct UserSummary {
     pub deafened: bool,
 }
 
-/// Audio parameters announced in `Welcome` (`PROTOCOL.md` §2.1).
+/// Audio parameters announced in `Welcome` (`docs/reference/protocol.md` §2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioParams {
     /// Sample rate in Hz. v1: 48000.
@@ -334,7 +334,7 @@ impl Default for AudioParams {
 /// A minimal SemVer triple, enough for `Welcome.min_client`.
 ///
 /// Deliberately not the `semver` crate: the server dependency list in
-/// `Server/IMPLEMENTATION.md` §9 does not contain it, and only
+/// `docs/reference/server.md` §9 does not contain it, and only
 /// `major.minor.patch` ordering is needed. Pre-release and build metadata are
 /// parsed off and ignored for ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -379,7 +379,7 @@ impl core::fmt::Display for Version {
     }
 }
 
-/// The SemVer out of `Hello.client`, `<name>/<semver> <os>` (`PROTOCOL.md`
+/// The SemVer out of `Hello.client`, `<name>/<semver> <os>` (`docs/reference/protocol.md`
 /// §2.2). The server compares it against `server.min_client`.
 pub fn client_version(client: &str) -> Result<Version, VersionError> {
     let (_, rest) = client.split_once('/').ok_or(VersionError)?;

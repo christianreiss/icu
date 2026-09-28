@@ -1,4 +1,4 @@
-//! Control messages (`PROTOCOL.md` §2.2, §2.3).
+//! Control messages (`docs/reference/protocol.md` §2.2, §2.3).
 //!
 //! Variant order is normative: postcard encodes the discriminant as the varint
 //! of the variant index. New variants go at the end, new fields at the end of a
@@ -12,17 +12,17 @@ use crate::{
 };
 
 /// Protocol minor version of this implementation: the client sends it in
-/// `Hello.minor`, the server in `Welcome.server_minor` (`PROTOCOL.md` §8).
+/// `Hello.minor`, the server in `Welcome.server_minor` (`docs/reference/protocol.md` §8).
 /// A minor 0 does not exist. New mandatory variants (like `UserRtt`) ship
 /// without a minor bump: client and server are always deployed in lockstep in
-/// this project (`PROTOCOL.md` §2.2). Minor 2 appended
+/// this project (`docs/reference/protocol.md` §2.2). Minor 2 appended
 /// `Welcome.server_minor` (2026-09-26). Minor 3 adds peer certificate lookup
 /// and requires a coordinated client/server update.
 pub const MINOR: u16 = 3;
 
 /// Lowest protocol minor this build talks to, in both directions: the server
 /// closes a `Hello` below it with `VERSION_UNSUPPORTED`, the client a
-/// `Welcome` whose `server_minor` is below it (`PROTOCOL.md` §8).
+/// `Welcome` whose `server_minor` is below it (`docs/reference/protocol.md` §8).
 pub const MIN_PEER_MINOR: u16 = 3;
 
 /// Peer-assisted audio measurements and hints (bit 0).
@@ -44,7 +44,7 @@ pub enum ControlMsg {
         /// Initial state bits.
         initial: UserFlags,
         /// Obsolete. The display name lives in the certificate's subject CN
-        /// (`PROTOCOL.md` §2.1); the server ignores this field. Kept because
+        /// (`docs/reference/protocol.md` §2.1); the server ignores this field. Kept because
         /// postcard encodes fields positionally.
         name: String,
     },
@@ -56,7 +56,7 @@ pub enum ControlMsg {
         caps: u32,
         /// The client's own entry, including `user_id` and the stored name.
         /// A client whose own leaf carries a different CN asks for a new
-        /// certificate carrying `you.name` (`PROTOCOL.md` §2.2).
+        /// certificate carrying `you.name` (`docs/reference/protocol.md` §2.2).
         you: UserInfo,
         /// Audio parameters for this room.
         audio: AudioParams,
@@ -67,7 +67,7 @@ pub enum ControlMsg {
         /// Whether `you` may send `CreateInviteRequest`.
         is_admin: bool,
         /// The client authenticated with a registration certificate
-        /// (`PROTOCOL.md` §2.3). `users` is then empty, the session is not in
+        /// (`docs/reference/protocol.md` §2.3). `users` is then empty, the session is not in
         /// the room, and the only message the server accepts besides `Ping` is
         /// a `RenewRequest` with a fresh key.
         registration: bool,
@@ -85,7 +85,7 @@ pub enum ControlMsg {
     UserLeft {
         /// Session of the participant that left.
         session: Session,
-        /// Error code < 256 (`PROTOCOL.md` §6).
+        /// Error code < 256 (`docs/reference/protocol.md` §6).
         reason: u8,
     },
     /// 4, S→C. Broadcast after every change, including to the originator.
@@ -114,14 +114,14 @@ pub enum ControlMsg {
     },
     /// 8, S→C. Non fatal; fatal errors travel in `CONNECTION_CLOSE`.
     Error {
-        /// Error code (`PROTOCOL.md` §6).
+        /// Error code (`docs/reference/protocol.md` §6).
         code: u32,
         /// Human readable detail.
         detail: String,
     },
     /// 9, C→S. Certificate renewal over the authenticated connection, and the
     /// only way to change a display name: the CSR's subject CN is the name the
-    /// client asks for (`PROTOCOL.md` §2.2).
+    /// client asks for (`docs/reference/protocol.md` §2.2).
     RenewRequest {
         /// PKCS#10 CSR, DER, at most 2 KiB. Exactly one subject CN, which must
         /// pass `validate_name` and be free server-wide.
@@ -255,7 +255,7 @@ pub enum ControlMsg {
     AdminActionError {
         /// The targeted user, or `0`.
         user_id: UserId,
-        /// Error code (`PROTOCOL.md` §6).
+        /// Error code (`docs/reference/protocol.md` §6).
         code: u32,
         /// Human readable detail.
         detail: String,
@@ -271,7 +271,7 @@ pub enum ControlMsg {
         rtts: Vec<(Session, u16)>,
     },
     /// 30, S→C. The server's current CRL, DER, signed by its CA
-    /// (`PROTOCOL.md` §1, §2.2). Sent right after `Welcome` and to everyone
+    /// (`docs/reference/protocol.md` §1, §2.2). Sent right after `Welcome` and to everyone
     /// whenever it changes. The client keeps the one with the highest CRL
     /// number whose signature its CA verifies and checks the server leaf
     /// against it on every connect.
@@ -353,9 +353,9 @@ pub enum ControlMsg {
 }
 
 impl ControlMsg {
-    /// Maximum length of `Hello.client` in bytes (`PROTOCOL.md` §2.2).
+    /// Maximum length of `Hello.client` in bytes (`docs/reference/protocol.md` §2.2).
     pub const MAX_CLIENT_STRING: usize = 64;
-    /// Maximum CSR size in bytes (`PROTOCOL.md` §2.2, §2.3).
+    /// Maximum CSR size in bytes (`docs/reference/protocol.md` §2.2, §2.3).
     pub const MAX_CSR_DER: usize = 2 * 1024;
 
     /// Certificate payload bound, leaving room in the 16 KiB control frame.
@@ -630,7 +630,7 @@ mod tests {
     }
 
     /// The discriminant is the variant index as a varint; the numbering in
-    /// `PROTOCOL.md` §2.2 is therefore normative wire format.
+    /// `docs/reference/protocol.md` §2.2 is therefore normative wire format.
     #[test]
     fn variant_discriminants_match_protocol_numbering() {
         for (index, msg) in all_variants().into_iter().enumerate() {

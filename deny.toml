@@ -1,5 +1,5 @@
 # cargo-deny Konfiguration fuer den gesamten ICU-Workspace (Server und Client).
-# Allowlist aus Server/IMPLEMENTATION.md §9 / Client/IMPLEMENTATION.md §12.
+# Allowlist aus docs/reference/server.md §9 / docs/reference/client.md §12.
 # Schema: cargo-deny v2 (`[licenses] version = 2`).
 
 [graph]
@@ -54,7 +54,7 @@ allow = ["IJG"]
 
 # webrtc-audio-processing 2.1 traegt `license-file = COPYING` statt eines
 # SPDX-Ausdrucks; der Text ist woertlich die Google-BSD-3-Clause
-# (Research/aec.md E6).
+# (docs/research/aec.md E6).
 # `hash` ist der XxHash32 der Datei, wie cargo-deny ihn rechnet (Zeilenenden
 # auf `\n` normalisiert). Passt er nicht, ignoriert cargo-deny die
 # Klarstellung stillschweigend und prueft das Crate wie ohne sie; `hash = 0`
@@ -87,7 +87,7 @@ multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
 # Ein TLS-/Krypto-Stack: rustls auf ring, ohne Default-Provider
-# (Research/review-specs-2026-09-20.md A7, Cargo.toml). aws-lc-sys (C,
+# (docs/history/review-specs-2026-09-20.md A7, Cargo.toml). aws-lc-sys (C,
 # bindgen) bricht den statischen musl-Server, OpenSSL gehoert nicht in den
 # Graph. Kommt eins davon ueber ein Default-Feature zurueck, bricht der Build.
 deny = [

@@ -1,4 +1,4 @@
-//! The admin socket and the CLI path (`Server/IMPLEMENTATION.md` §5, §10 row
+//! The admin socket and the CLI path (`docs/reference/server.md` §5, §10 row
 //! "Invite über den Admin-Socket wirkt ohne Serverneustart").
 
 mod common;
@@ -459,7 +459,7 @@ async fn mute_and_deafen_over_the_socket_keep_each_other() {
 
 /// `invite` says whether an admin has registered yet: until one has, not
 /// the first bundle issued but the first one completed makes an admin, and
-/// the CLI points that out (`PROTOCOL.md` §2.3).
+/// the CLI points that out (`docs/reference/protocol.md` §2.3).
 #[tokio::test]
 async fn invite_says_whether_an_admin_has_registered() {
     let server = TestServer::start().await;
@@ -561,7 +561,7 @@ async fn reserved_example_names_are_refused_only_where_they_are_new() {
     )
     .unwrap();
     // A state in use never gets a new com key: every passport carries the
-    // old one (`PROTOCOL.md` §1).
+    // old one (`docs/reference/protocol.md` §1).
     let err = icu_server::run(config.clone())
         .await
         .err()

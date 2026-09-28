@@ -1,5 +1,5 @@
 //! Admin-issued registration bundles and the first admin
-//! (`PROTOCOL.md` §2.3, `Server/IMPLEMENTATION.md` §6.3, §6.4
+//! (`docs/reference/protocol.md` §2.3, `docs/reference/server.md` §6.3, §6.4
 //! `CreateInviteRequest`).
 
 mod common;
@@ -71,7 +71,7 @@ async fn a_bundle_from_an_admin_registers_a_client_with_its_own_name() {
     let mut admin = admin_client(&server).await;
 
     // The label is only the placeholder name; the name in the certificate is
-    // the one the invited person picks (`PROTOCOL.md` §2.3).
+    // the one the invited person picks (`docs/reference/protocol.md` §2.3).
     let (bundle, _expires) = mint(&mut admin, "invited-person", 0).await;
     let registration = common::identity_from_bundle(&bundle);
     assert_eq!(common_name(&registration.cert), "invited-person");
@@ -89,7 +89,7 @@ async fn a_bundle_from_an_admin_registers_a_client_with_its_own_name() {
 }
 
 /// The server signs every bundle it issues with its CA key; a client refuses
-/// one whose signature doesn't verify (`PROTOCOL.md` §2.3.1). This checks
+/// one whose signature doesn't verify (`docs/reference/protocol.md` §2.3.1). This checks
 /// the server's half — the raw bundle carries a valid signature — the
 /// client's refusal of a tampered one is covered in icu-client's own tests.
 #[tokio::test]

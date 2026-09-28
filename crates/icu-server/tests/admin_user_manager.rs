@@ -1,5 +1,5 @@
-//! The in-band admin User Manager path (`PROTOCOL.md` §2.2, variants 19-28;
-//! `Server/IMPLEMENTATION.md` §6.4 rows `AdminSetRole`/`AdminSetDisabled`/
+//! The in-band admin User Manager path (`docs/reference/protocol.md` §2.2, variants 19-28;
+//! `docs/reference/server.md` §6.4 rows `AdminSetRole`/`AdminSetDisabled`/
 //! `AdminRevokeUser`/`UserListRequest`). The socket/CLI path is covered by
 //! `tests/admin.rs`; this file exercises the same store methods reached
 //! directly over the authenticated `icu/1` connection.
@@ -257,7 +257,7 @@ async fn promoting_a_peer_broadcasts_the_admin_bit_to_everyone() {
     server.shutdown().await;
 }
 
-/// `UserRtt` (`PROTOCOL.md` §2.2) arrives within a few seconds once two
+/// `UserRtt` (`docs/reference/protocol.md` §2.2) arrives within a few seconds once two
 /// clients share the room, carrying a server-measured RTT for each — a
 /// mandatory v1 variant, not gated behind any minor negotiation (client and
 /// server ship in lockstep in this project).
@@ -477,7 +477,7 @@ async fn admin_restriction_is_enforced_persisted_and_lifted() {
 
 /// An enforced deafen implies an enforced mute — who hears nobody must not
 /// talk into the room — and cuts video to that user as well
-/// (`PROTOCOL.md` §2.2 Nr. 33).
+/// (`docs/reference/protocol.md` §2.2 Nr. 33).
 #[tokio::test]
 async fn an_enforced_deafen_mutes_and_stops_video() {
     use icu_proto::UserFlags;
@@ -647,7 +647,7 @@ async fn a_failed_write_is_a_server_error_not_a_refusal() {
 
 /// A user list longer than one control frame is shortened, not dropped:
 /// online users and admins first, and a last row with `user_id` 0 saying
-/// how many are left out (`PROTOCOL.md` §2.2 Nr. 27).
+/// how many are left out (`docs/reference/protocol.md` §2.2 Nr. 27).
 #[tokio::test]
 async fn a_user_list_too_long_for_a_frame_is_shortened() {
     let server = TestServer::start().await;

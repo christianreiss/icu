@@ -1,6 +1,6 @@
 //! Tests that start child processes: the `icu-server` binary for `status`
 //! and `users` through the socket alone and for `backup` and `restore` on a
-//! stopped server (`Server/IMPLEMENTATION.md` §5), and `getent` for the
+//! stopped server (`docs/reference/server.md` §5), and `getent` for the
 //! admin socket's group.
 //!
 //! In a test binary of their own, and one at a time, on purpose. `flock`
@@ -363,7 +363,7 @@ async fn the_socket_group_is_asked_of_the_hosts_nss() {
 }
 
 /// `icu-cli` is the same binary under a second name — a symlink the package
-/// installs beside it (`Server/IMPLEMENTATION.md` §5.1). Without a command it
+/// installs beside it (`docs/reference/server.md` §5.1). Without a command it
 /// is the shell, with one it is the matching `icu-server` command, and the
 /// three that need a stopped or unconfigured server are not there.
 #[tokio::test]

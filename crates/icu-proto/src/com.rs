@@ -1,4 +1,4 @@
-//! The com key: an HMAC tag on every UDP datagram (`PROTOCOL.md` §1), like
+//! The com key: an HMAC tag on every UDP datagram (`docs/reference/protocol.md` §1), like
 //! OpenVPN's `tls-auth`.
 //!
 //! Each server has one random 32-byte key; it travels to the clients inside

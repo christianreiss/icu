@@ -1,4 +1,4 @@
-//! The send-side chain behind the AEC (`Client/IMPLEMENTATION.md` §6):
+//! The send-side chain behind the AEC (`docs/reference/client.md` §6):
 //! manual gain → mic auto level → denoise → meter → (the caller's VAD
 //! verdict) → voice optimizer → outbound normalizer and limiter. One struct,
 //! so the engine's DSP thread and the cascade test (`tests/cascade.rs`) run

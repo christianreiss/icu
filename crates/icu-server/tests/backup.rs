@@ -1,4 +1,4 @@
-//! Automatic state snapshots and restoring them (`Server/IMPLEMENTATION.md`
+//! Automatic state snapshots and restoring them (`docs/reference/server.md`
 //! §4, §5 `backup`/`restore`; runbook "Backup und Restore" in
 //! `deploy/README.md`).
 

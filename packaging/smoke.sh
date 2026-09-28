@@ -90,6 +90,7 @@ smoke() {  # smoke <dist> <with_client: 0|1>
         [ -f "$OUT/$f" ] || { echo "missing $OUT/$f" >&2; exit 1; }
     done
     podman run --rm --security-opt label=disable -v "$PWD/$OUT":/pkgs:ro \
+        --label "net.icu.build-run=${ICU_BUILD_RUN_ID:-standalone}" \
         "${cache[@]}" -e SERVER_PKG="$server" -e CLIENT_PKG="$client" "${env[@]}" \
         "$image" bash -c "$CHECKS"
     echo "ok: $d"

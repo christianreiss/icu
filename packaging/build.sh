@@ -43,12 +43,13 @@ log() { printf '\n==> %s\n' "$*"; }
 # Label relabeling (:Z) of the whole repo is slow and races between
 # containers; disable SELinux separation for these throwaway build containers.
 # Build scripts and proc macros run in here: the source (with .git) is
-# mounted read-only, target/ is the one writable place, and .scratch/ (test
+# mounted read-only, target/ is the one writable place, and .local/ (test
 # credentials) is hidden behind an empty tmpfs.
 run() {
     local hide=()
-    if [ -d "$ROOT/.scratch" ]; then hide=(--mount 'type=tmpfs,destination=/src/.scratch,notmpcopyup'); fi
+    if [ -d "$ROOT/.local" ]; then hide=(--mount 'type=tmpfs,destination=/src/.local,notmpcopyup'); fi
     podman run --rm --security-opt label=disable \
+        --label "net.icu.build-run=${ICU_BUILD_RUN_ID:-standalone}" \
         -v "$ROOT":/src:ro -v "$ROOT/target":/src/target "${hide[@]}" -w /src \
         -v "$CARGO_CACHE":/cargo -e CARGO_HOME=/cargo \
         "$@"
@@ -174,6 +175,7 @@ render() {  # render <template> <out> VAR=value...
 }
 nfpm() {  # nfpm <config> <format>
     podman run --rm --security-opt label=disable -v "$ROOT":/src -w /src \
+        --label "net.icu.build-run=${ICU_BUILD_RUN_ID:-standalone}" \
         "$NFPM_IMAGE" package -f "$1" -p "$2" -t "$STAGE/"
 }
 

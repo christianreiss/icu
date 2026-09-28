@@ -1,4 +1,4 @@
-//! Linux audio backend on pipewire-rs 0.10 (`Client/IMPLEMENTATION.md` §6).
+//! Linux audio backend on pipewire-rs 0.10 (`docs/reference/client.md` §6).
 //!
 //! One dedicated thread runs the PipeWire main loop and owns the core, the
 //! registry and up to three streams (capture, AEC reference, playback). The

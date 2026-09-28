@@ -111,7 +111,7 @@ Section "ICU (erforderlich)" SEC_APP
   ; anyway: main.rs already calls
   ; SetCurrentProcessExplicitAppUserModelID("ICU") on the running process,
   ; which is what Explorer groups by. Verify this holds in practice —
-  ; Client/LIVETEST.md §8.
+  ; docs/development/testing.md §8.
   CreateShortCut "$SMPROGRAMS\ICU.lnk" "$INSTDIR\icu.exe" "" "$INSTDIR\icu.exe" 0 \
       SW_SHOWNORMAL "" "ICU"
 
@@ -156,7 +156,7 @@ Section "Uninstall"
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)' ; SHCNE_ASSOCCHANGED
 
   ; Default "Nein": the private key under %APPDATA%\icu is DPAPI-encrypted
-  ; and is the user's identity/passport (Research/packaging-licensing.md,
+  ; and is the user's identity/passport (docs/research/packaging-licensing.md,
   ; packaging/windows/README.txt) — an uninstall must not silently strand it.
   MessageBox MB_YESNO|MB_ICONQUESTION \
     "Auch Einstellungen, Protokoll und Identität entfernen?$\n$\n\

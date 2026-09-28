@@ -1,5 +1,5 @@
 //! Reading and writing length prefixed frames on a QUIC stream
-//! (`PROTOCOL.md` §2).
+//! (`docs/reference/protocol.md` §2).
 
 use icu_proto::{error as ec, framing};
 use quinn::{RecvStream, SendStream};
@@ -24,7 +24,7 @@ pub async fn write_frame(send: &mut SendStream, frame: &[u8]) -> Result<()> {
 }
 
 /// Closes a connection with an ICU error code, the code's name as the reason
-/// (`PROTOCOL.md` §6).
+/// (`docs/reference/protocol.md` §6).
 pub fn close(conn: &quinn::Connection, code: u32) {
     conn.close(quinn::VarInt::from_u32(code), ec::name(code).as_bytes());
 }

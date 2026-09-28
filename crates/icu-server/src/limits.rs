@@ -1,4 +1,4 @@
-//! Token buckets per client and per IP (`Server/IMPLEMENTATION.md` §6.6).
+//! Token buckets per client and per IP (`docs/reference/server.md` §6.6).
 
 use std::{
     collections::HashMap,
@@ -59,7 +59,7 @@ impl TokenBucket {
     }
 
     /// A byte bucket for `kbit_s`, smoothed over `window`
-    /// (`PROTOCOL.md` §7: video bitrate, sliding over 2 s).
+    /// (`docs/reference/protocol.md` §7: video bitrate, sliding over 2 s).
     pub fn bitrate(kbit_s: u32, window: Duration) -> TokenBucket {
         let bytes_per_s = f64::from(kbit_s) * 1000.0 / 8.0;
         TokenBucket::new(bytes_per_s, bytes_per_s * window.as_secs_f64())

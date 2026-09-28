@@ -1,5 +1,5 @@
 //! eframe/egui user interface: main window, settings, setup and enrollment
-//! (`Client/IMPLEMENTATION.md` §10).
+//! (`docs/reference/client.md` §10).
 
 pub mod connection;
 pub mod fonts;

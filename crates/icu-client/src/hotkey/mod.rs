@@ -237,7 +237,7 @@ impl Hotkeys {
 /// keyboard, so it runs only when chosen (`Evdev`) or, under `Auto`, when
 /// the portal is missing or fails — never because the user turned the
 /// portal's dialog down: that is their answer, not a failure
-/// (`Client/IMPLEMENTATION.md` §7).
+/// (`docs/reference/client.md` §7).
 pub async fn start(settings: &HotkeySettings, cmd: UnboundedSender<Command>) -> Hotkeys {
     #[cfg(target_os = "linux")]
     {

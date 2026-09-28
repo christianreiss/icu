@@ -1,5 +1,5 @@
 //! `icu-server shell`: a persistent, Cisco IOS-style admin prompt
-//! (`Server/IMPLEMENTATION.md` §5.1). Every command it runs is its own
+//! (`docs/reference/server.md` §5.1). Every command it runs is its own
 //! `cli::dispatch()` call over the same one-shot admin socket every other
 //! `icu-server` subcommand uses (`crate::cli`, `crate::admin`) — the shell
 //! holds no persistent connection and adds nothing to the wire protocol; it

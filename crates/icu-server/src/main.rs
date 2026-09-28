@@ -1,4 +1,4 @@
-//! Thin clap wrapper around [`icu_server`] (`Server/IMPLEMENTATION.md` §5).
+//! Thin clap wrapper around [`icu_server`] (`docs/reference/server.md` §5).
 //!
 //! One binary, two names (§5.1): as `icu-server` it is everything below, as
 //! `icu-cli` — a symlink the package puts beside it — only the admin side,

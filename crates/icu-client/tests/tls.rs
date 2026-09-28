@@ -1,5 +1,5 @@
 //! TLS hostname/certificate verification (main session), an in-process
-//! server and the fake audio backend (`Client/IMPLEMENTATION.md` §14).
+//! server and the fake audio backend (`docs/reference/client.md` §14).
 //!
 //! Unix only: the in-process server (`common`) is.
 #![cfg(unix)]
@@ -77,7 +77,7 @@ async fn a_wrong_server_name_is_retried_slowly_not_fatal() {
 /// attacker would offer next), and keeps retrying slowly (review
 /// 2026-09-27, C-1). The raw TLS error stays technical detail. The new
 /// server keeps the old com key: with a new one the client would hear
-/// nothing at all (`PROTOCOL.md` §1, §5).
+/// nothing at all (`docs/reference/protocol.md` §1, §5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_server_from_another_ca_is_retried_slowly_not_fatal() {
     let old_server = TestServer::start().await;
@@ -123,7 +123,7 @@ async fn a_server_from_another_ca_is_retried_slowly_not_fatal() {
     drop(dir);
 }
 
-/// `PROTOCOL.md` §2.2 `CrlUpdate`: a connected client stores the server's
+/// `docs/reference/protocol.md` §2.2 `CrlUpdate`: a connected client stores the server's
 /// CRL, verified against its CA.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connected_client_stores_the_servers_crl() {

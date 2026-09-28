@@ -1,5 +1,5 @@
 //! Audio datagram and video stream relay
-//! (`PROTOCOL.md` §3, §4; `Server/IMPLEMENTATION.md` §6.5).
+//! (`docs/reference/protocol.md` §3, §4; `docs/reference/server.md` §6.5).
 //!
 //! The server never decodes media. Audio is forwarded datagram by datagram
 //! with the `speaker` field overwritten in place; video is forwarded frame by
@@ -25,7 +25,7 @@ use quinn::SendDatagramError;
 
 use crate::{limits::TokenBucket, lock, room::Counters, Server};
 
-/// Relays one audio datagram (`PROTOCOL.md` §3).
+/// Relays one audio datagram (`docs/reference/protocol.md` §3).
 ///
 /// Order: check length and `kind`, rate limit, check that the sender is
 /// active and not muted, set `speaker`, then `send_datagram` to every other
@@ -117,14 +117,14 @@ pub fn audio(
 }
 
 /// Rolling per-receiver slot-offer/displacement counts for one congestion
-/// window (`PROTOCOL.md` §2.2).
+/// window (`docs/reference/protocol.md` §2.2).
 #[derive(Default)]
 struct CongestionWindow {
     offers: u32,
     displacements: u32,
 }
 
-/// A user's video allowance (`PROTOCOL.md` §7): frame rate and bytes. Kept
+/// A user's video allowance (`docs/reference/protocol.md` §7): frame rate and bytes. Kept
 /// per user on the [`Server`], not per connection, so reconnecting does not
 /// hand out a fresh burst.
 pub struct VideoBudget {
@@ -236,7 +236,7 @@ impl Drop for VideoSender {
 
 /// One sender-receiver pair: at most
 /// [`VIDEO_UNACKED_PER_PAIR`](icu_proto::limits::VIDEO_UNACKED_PER_PAIR)
-/// frames unacknowledged by the receiver plus one waiting (`PROTOCOL.md` §4).
+/// frames unacknowledged by the receiver plus one waiting (`docs/reference/protocol.md` §4).
 pub struct Slot {
     /// `stable_id` of the receiver connection the forwarder writes to. A
     /// session id can come back after wrapping (`room::allocate_session`);
@@ -363,7 +363,7 @@ impl Slot {
     }
 }
 
-/// Relays one incoming video frame (`PROTOCOL.md` §4).
+/// Relays one incoming video frame (`docs/reference/protocol.md` §4).
 ///
 /// The header is read and checked first — camera on, sender active, frame
 /// rate — and only then the payload (bounded by 512 KiB): a frame that is

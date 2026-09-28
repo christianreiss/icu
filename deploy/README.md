@@ -1,7 +1,7 @@
 # ICU-Server: Bauen und Installieren
 
-Stand 2026-09-20. Normative Grundlage: `../PROTOCOL.md`, Bauplan
-`../Server/IMPLEMENTATION.md`.
+Stand 2026-09-20. Normative Grundlage: `../docs/reference/protocol.md`, Bauplan
+`../docs/reference/server.md`.
 
 Der Server ist ein einziges Binary ohne Laufzeitabhängigkeiten: kein libc,
 kein CA-Bundle (er ist seine eigene CA), kein Codec, keine Datenbank außer zwei
@@ -112,9 +112,13 @@ beschreibbar:
 
 ```bash
 mkdir -p target
+local_mount=()
+if [ -d .local ]; then
+  local_mount=(--mount type=tmpfs,destination=/src/.local,notmpcopyup)
+fi
 podman run --rm --security-opt label=disable \
   -e CARGO_TARGET_DIR=/src/target/musl \
-  -v "$PWD":/src:ro -v "$PWD/target":/src/target -w /src \
+  -v "$PWD":/src:ro -v "$PWD/target":/src/target "${local_mount[@]}" -w /src \
   docker.io/library/rust:1.98.1-alpine \
   sh -c 'apk add --no-cache musl-dev && \
          cargo build --profile release-server --locked -p icu-server --target x86_64-unknown-linux-musl'
@@ -187,7 +191,7 @@ startet weiter und warnt im Journal. `localhost` und IP-Adressen gehen.
 `ca.key` (0600), `ca.crt`, `com.key` (0600), `server.key` (0600), `server.crt`,
 `users.toml` und `state.lock`. **`ca.key` und `com.key` sind die Geheimnisse,
 die zählen** — geht eines verloren, müssen sich alle Nutzer neu registrieren.
-`com.key` ist der Com-Schlüssel (2026-09-27, `PROTOCOL.md` §1): jedes
+`com.key` ist der Com-Schlüssel (2026-09-27, `../docs/reference/protocol.md` §1): jedes
 UDP-Datagramm trägt ein Tag daraus, und jeder Passport trägt ihn. Der Server
 sichert den State selbst (unten, „Backup und Restore“); eine Kopie davon außer
 Haus gehört zur Inbetriebnahme. Eine neue CA legt der Server nur an,
@@ -312,7 +316,7 @@ Freigeben muss man nur den einen UDP-Port; der Server braucht keinen
 Reverse-Proxy und kein TLS davor, er terminiert QUIC/TLS 1.3 selbst.
 
 **Der Port schweigt ohne Com-Schlüssel** (2026-09-27, nach dem Vorbild von OpenVPN `tls-auth`, ohne dessen Replay-Schutz,
-`PROTOCOL.md` §1): jedes Datagramm trägt ein 16-Byte-HMAC-Tag aus `com.key`,
+`../docs/reference/protocol.md` §1): jedes Datagramm trägt ein 16-Byte-HMAC-Tag aus `com.key`,
 und was keins trägt, verwirft der Server, bevor QUIC es sieht — kein
 Handshake, keine Version Negotiation, kein Stateless Reset. Ein Portscan
 bekommt keine Antwort (nmap: `open|filtered`, nicht `closed`). `icu-server status` zählt die verworfenen
@@ -325,7 +329,7 @@ Ohne gültiges Zertifikat der eigenen CA gibt es weder Raumzugang noch Medien.
 Unbekannte Zertifikate scheitern an TLS; ohne Zertifikat darf TLS für die
 lesbare Fehlermeldung `AUTH_REQUIRED` abschließen, danach wird sofort getrennt.
 Dafür gilt
-(`PROTOCOL.md` §7, Werte in `[limits]`/`[timing]` überschreibbar):
+(`../docs/reference/protocol.md` §7, Werte in `[limits]`/`[timing]` überschreibbar):
 
 * Handshakes 10/s pro Quell-IP, IPv6 pro /64, und 100/s global; ab 32
   laufenden Handshakes muss jede neue Quelle ihre Adresse per Retry beweisen.
@@ -360,7 +364,7 @@ Ende-zu-Ende-Verschlüsselung brauchen abgestimmte Änderungen an Clients und
 Protokoll; bloßes Anheben eines Serverlimits genügt nicht.
 
 Die Serverprüfung und reproduzierbaren Tests stehen in
-[`Research/server-production-gate-2026-09-26.md`](../Research/server-production-gate-2026-09-26.md).
+[`docs/history/server-production-gate-2026-09-26.md`](../docs/history/server-production-gate-2026-09-26.md).
 Eine Freigabe des konkreten Internet-Hosts erfordert zusätzlich den Test von
 außerhalb seines Netzes (IPv4/IPv6, Firewall/NAT, Wiederverbindung), ein
 wiederherstellbares State-Backup und Messungen mit den vorgesehenen Clients.
@@ -405,7 +409,7 @@ tut dasselbe): persistenter Prompt, TAB-Vervollständigung von Kommandos und
 Nutzernamen, `?` als Kontexthilfe, eindeutige Präfixe (`sh us` für
 `show users`), Befehlshistorie unter
 `~/.local/state/icu-server/shell_history`. Details:
-`Server/IMPLEMENTATION.md` §5.1.
+`docs/reference/server.md` §5.1.
 
 ```bash
 icu-cli                                    # Shell: icu-server> sh us
@@ -426,7 +430,7 @@ Checkmk-Check nicht und wird von ihm nicht aufgerufen: der Check bleibt auf
 
 **Erster Admin:** Admin wird, wer als Erster eine Registrierung abschließt
 (quittiert), solange es noch keinen bestätigten Admin gibt — nicht das zuerst
-ausgestellte Bundle (`PROTOCOL.md` §2.3). Direkt nach der Installation also
+ausgestellte Bundle (`../docs/reference/protocol.md` §2.3). Direkt nach der Installation also
 `sudo icu-server invite --out /root/icu-admin.icu` (geht auch ohne laufenden
 Server), die Datei auf den eigenen Rechner bringen und dort
 `icu icu-admin.icu --name <name>` ausführen oder den Inhalt ins
@@ -475,7 +479,7 @@ nicht den Daten; auch eine abgelaufene CA-Datei beim Client verankert weiter.
 
 **Abgelaufene Client-Zertifikate** erneuern sich selbst: der Client verbindet
 sich mit dem alten Zertifikat, bekommt eine renew-only-Sitzung und ein neues
-Zertifikat auf denselben Schlüssel (`PROTOCOL.md` §2.3.3) — egal, wie lange es
+Zertifikat auf denselben Schlüssel (`../docs/reference/protocol.md` §2.3.3) — egal, wie lange es
 her ist. Wer einen Zugang wirklich beenden will, nimmt `revoke` oder
 `disable`; ein bloß abgelaufenes Zertifikat sperrt niemanden aus.
 
@@ -496,7 +500,7 @@ podman exec -it icu /icu-cli                  # Admin-Shell im Container
 
 Das Image nimmt das Binary aus §1 (`target/musl/…/release-server/icu-server`,
 vorher bauen); `.dockerignore` lässt nur diese Datei in den Build-Kontext,
-nicht `.git`, `.scratch` oder den Rest von `target/`.
+nicht `.git`, `.local` oder den Rest von `target/`.
 
 Die Härtung der systemd-Unit (Sandbox, `MemoryMax=1G`, `Restart=on-failure`)
 gilt im Container nicht: Speichergrenze und Neustart setzt man dort selbst wie

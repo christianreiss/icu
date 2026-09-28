@@ -1,8 +1,8 @@
 //! A small error type.
 //!
-//! `Server/IMPLEMENTATION.md` §9 pins the dependency set and contains neither
+//! `docs/reference/server.md` §9 pins the dependency set and contains neither
 //! `anyhow` nor `thiserror`, so this is hand written. It carries a message and
-//! optionally an ICU error code (`PROTOCOL.md` §6).
+//! optionally an ICU error code (`docs/reference/protocol.md` §6).
 
 use std::fmt;
 

@@ -1,5 +1,5 @@
 //! One running client per configuration directory
-//! (`Client/IMPLEMENTATION.md` §10).
+//! (`docs/reference/client.md` §10).
 //!
 //! Starting ICU again — the natural way back after „Schließen“ hid the
 //! window to the tray, or a double-click on an `.icu` file — must not

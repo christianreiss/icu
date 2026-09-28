@@ -1,4 +1,4 @@
-//! Mixer and soft limiter (`Client/IMPLEMENTATION.md` §6).
+//! Mixer and soft limiter (`docs/reference/client.md` §6).
 
 /// Knee above which the limiter starts compressing.
 pub const KNEE: f32 = 0.8;

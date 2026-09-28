@@ -1,7 +1,7 @@
 //! ICU wire protocol v1.
 //!
 //! This crate is the single place where the wire format of
-//! [`PROTOCOL.md`](../../../PROTOCOL.md) is defined; server and client compile
+//! [`docs/reference/protocol.md`](docs/reference/protocol.md) is defined; server and client compile
 //! the same crate. Nothing here does I/O except [`com::ComSocket`], a filter
 //! around quinn's UDP socket.
 //!
@@ -12,7 +12,7 @@
 //! * [`framing`] — u16 LE length prefix, 16 KiB / 8 KiB limits
 //! * [`header`] — audio and video headers plus the wrap arithmetic helpers
 //! * [`error`] — error codes and the fatality table
-//! * [`limits`] — the numbers from `PROTOCOL.md` §7 as constants
+//! * [`limits`] — the numbers from `docs/reference/protocol.md` §7 as constants
 //! * [`passport`] — the armored identity bundle, also used for registration
 //!   bundles (§2.3)
 //! * [`com`] — the com key: an HMAC tag on every UDP datagram (§1)
@@ -41,7 +41,7 @@ pub use types::{
 
 /// Everything that can go wrong while decoding or encoding wire data.
 ///
-/// Every variant maps onto an error code from `PROTOCOL.md` §6 via
+/// Every variant maps onto an error code from `docs/reference/protocol.md` §6 via
 /// [`ProtoError::error_code`].
 #[derive(Debug)]
 pub enum ProtoError {
@@ -74,7 +74,7 @@ impl ProtoError {
     ///
     /// All decode failures are `PROTOCOL_VIOLATION`; the caller decides
     /// whether a malformed *datagram* is dropped silently instead (it is,
-    /// `PROTOCOL.md` §3).
+    /// `docs/reference/protocol.md` §3).
     pub fn error_code(&self) -> u32 {
         error::PROTOCOL_VIOLATION
     }

@@ -1,8 +1,8 @@
-//! Network-adaptive video quality ladder (`Client/IMPLEMENTATION.md` §8).
+//! Network-adaptive video quality ladder (`docs/reference/client.md` §8).
 //!
 //! Video absorbs 100 % of the adaptation. Audio's Opus bitrate is never
 //! touched here: at this app's wire costs (Opus ≈ 74 kbit/s vs. video
-//! 150-400 kbit/s, `Research/codec.md`), a single video tier-down step saves
+//! 150-400 kbit/s, `docs/research/codec.md`), a single video tier-down step saves
 //! more than shaving Opus down to its floor ever could, so there is no
 //! scenario where this controller needs to reach for audio bitrate before
 //! video has already given up everything. Audio's only reaction to network
@@ -54,7 +54,7 @@ const LOCAL_DROP_WINDOW: Duration = Duration::from_secs(5);
 /// much slower (6+ clean ticks, with backoff on flapping) — a wrong
 /// step-down only briefly costs video quality, but a wrong step-up
 /// reintroduces the congestion that risks audio's datagrams, which drop
-/// old-favor-new under pressure by design (`Research/transport.md`).
+/// old-favor-new under pressure by design (`docs/research/transport.md`).
 #[derive(Debug)]
 pub struct QualityController {
     tier: VideoTier,

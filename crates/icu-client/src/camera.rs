@@ -1,5 +1,5 @@
 //! Camera capture (nokhwa) and H.264 encoding (openh264) on their own
-//! thread (`Client/IMPLEMENTATION.md` §8). 320×240 capture at 15 fps; the
+//! thread (`docs/reference/client.md` §8). 320×240 capture at 15 fps; the
 //! encoded bitrate and effective frame rate follow the network-adaptive
 //! [`crate::video::VideoTier`] (`crate::quality::QualityController`), IDR
 //! every 2 s and on request.
@@ -36,7 +36,7 @@ pub const FPS: u32 = 15;
 pub const IDR_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Minimum spacing of the IDRs sent because a frame was lost: the same
-/// once per second the receivers may ask for one (`PROTOCOL.md` §2.2
+/// once per second the receivers may ask for one (`docs/reference/protocol.md` §2.2
 /// Nr. 13). An IDR is several P-frames' worth of bytes, and the loss was
 /// most likely congestion.
 const LOSS_IDR_INTERVAL: Duration = Duration::from_secs(1);
@@ -926,7 +926,7 @@ impl CameraPreview {
     /// Uploads the latest picture if the capture thread produced a new one,
     /// and hands back what to draw. `None` while the camera is off or still
     /// opening (a USB webcam needs a few seconds for auto-exposure,
-    /// `Research/camera-video.md`).
+    /// `docs/research/camera-video.md`).
     pub fn texture(&mut self, ctx: &egui::Context) -> Option<egui::load::SizedTexture> {
         let seq = self.slot.seq.load(Ordering::Acquire);
         if seq != self.shown {

@@ -1,4 +1,4 @@
-//! Audio relay (`Server/IMPLEMENTATION.md` §10: fan-out with the `speaker`
+//! Audio relay (`docs/reference/server.md` §10: fan-out with the `speaker`
 //! override, mute/deafen, the derived `speaking` bit, datagram rate limit).
 
 mod common;
@@ -82,7 +82,7 @@ async fn a_muted_sender_is_not_relayed() {
     server.shutdown().await;
 }
 
-/// `PROTOCOL.md` §3: datagrams below 11 or above 410 bytes, and unknown
+/// `docs/reference/protocol.md` §3: datagrams below 11 or above 410 bytes, and unknown
 /// `kind` values, are dropped without touching the connection.
 #[tokio::test]
 async fn malformed_datagrams_are_dropped_silently() {
@@ -110,7 +110,7 @@ async fn malformed_datagrams_are_dropped_silently() {
     server.shutdown().await;
 }
 
-/// `PROTOCOL.md` §2.1: the server derives `speaking` from the datagram flow.
+/// `docs/reference/protocol.md` §2.1: the server derives `speaking` from the datagram flow.
 #[tokio::test]
 async fn speaking_is_derived_from_the_datagram_flow() {
     let server = TestServer::start_with(|config| {
@@ -139,7 +139,7 @@ async fn speaking_is_derived_from_the_datagram_flow() {
     server.shutdown().await;
 }
 
-/// `PROTOCOL.md` §2.1: silence alone ends the talk spurt too.
+/// `docs/reference/protocol.md` §2.1: silence alone ends the talk spurt too.
 #[tokio::test]
 async fn speaking_expires_after_silence() {
     let server = TestServer::start_with(|config| {
@@ -165,7 +165,7 @@ async fn speaking_expires_after_silence() {
     server.shutdown().await;
 }
 
-/// `PROTOCOL.md` §3: the audio datagram rate limit drops datagrams and leaves
+/// `docs/reference/protocol.md` §3: the audio datagram rate limit drops datagrams and leaves
 /// the connection alone.
 #[tokio::test]
 async fn audio_over_the_datagram_rate_limit_is_dropped() {

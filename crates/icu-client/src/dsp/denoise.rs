@@ -1,5 +1,5 @@
 //! RNNoise through `nnnoiseless`. Works on 480-sample blocks scaled to
-//! ±32768 (`Research/aec.md`: the APM uses ±1.0, RNNoise ±32768).
+//! ±32768 (`docs/research/aec.md`: the APM uses ±1.0, RNNoise ±32768).
 
 use nnnoiseless::DenoiseState;
 
@@ -12,7 +12,7 @@ pub struct Denoiser {
     scratch_in: Vec<f32>,
     scratch_out: Vec<f32>,
     /// The first output block after creation is the filter warm-up; it is
-    /// replaced by silence (`audio-io.md` I4).
+    /// replaced by silence (`docs/research/audio-io.md` I4).
     warm: bool,
 }
 
@@ -61,7 +61,7 @@ impl Denoiser {
 mod tests {
     use super::*;
 
-    /// Scale test (`aec.md` A8): a sine survives the ±1 ↔ ±32768 conversion.
+    /// Scale test (`docs/research/aec.md` A8): a sine survives the ±1 ↔ ±32768 conversion.
     #[test]
     fn amplitude_survives_the_scaling() {
         let mut d = Denoiser::new();

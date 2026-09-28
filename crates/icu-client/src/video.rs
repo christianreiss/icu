@@ -1,4 +1,4 @@
-//! Video frames over unidirectional streams (`PROTOCOL.md` §4): send,
+//! Video frames over unidirectional streams (`docs/reference/protocol.md` §4): send,
 //! receive, decode per speaker, `KeyframeRequest` bookkeeping.
 
 use std::{
@@ -32,7 +32,7 @@ const FRESH: Duration = Duration::from_secs(3);
 
 /// A quality tier for the outgoing camera stream, stepped by
 /// `crate::quality::QualityController` in response to measured network
-/// conditions (`Client/IMPLEMENTATION.md` §8). Video absorbs all of the
+/// conditions (`docs/reference/client.md` §8). Video absorbs all of the
 /// adaptation — audio's Opus bitrate is never touched by this system.
 /// Defined here (not in `camera`, which is feature-gated) so `engine`'s
 /// `Shared` and `CameraLink` can hold and expose it unconditionally.
@@ -268,7 +268,7 @@ const DECODE_QUEUE: usize = 64;
 /// The frames are decoded on one dedicated thread, `icu-video-decode`, not
 /// on the tokio workers: an H.264 decode plus the RGBA conversion blocks a
 /// worker for milliseconds, and the same two workers drive QUIC and stamp
-/// the audio datagrams' arrival times (`Client/IMPLEMENTATION.md` §4). One
+/// the audio datagrams' arrival times (`docs/reference/client.md` §4). One
 /// thread also keeps a speaker's frames in arrival order, which
 /// `spawn_blocking` per frame would not.
 pub async fn accept_loop<S: VideoSink>(conn: quinn::Connection, sink: S) {
@@ -311,7 +311,7 @@ pub async fn accept_loop<S: VideoSink>(conn: quinn::Connection, sink: S) {
 }
 
 /// Sends frames, one uni stream each. Drops the frame when flow control
-/// blocks (`Client/IMPLEMENTATION.md` §8). Shared by reference: the camera
+/// blocks (`docs/reference/client.md` §8). Shared by reference: the camera
 /// thread sends on it while the session task may be taking it down.
 pub struct Sender {
     conn: quinn::Connection,
@@ -437,7 +437,7 @@ impl Receivers {
         r.last_frame = Some(Instant::now());
         let seq = frame.header.seq;
         if let Some(last) = r.last_seq {
-            // Modulo 2^16 (`PROTOCOL.md` §3): a step past half the range is
+            // Modulo 2^16 (`docs/reference/protocol.md` §3): a step past half the range is
             // a step back.
             let step = seq.wrapping_sub(last) as i16;
             if step <= 0 && step > -REORDER_DEPTH {
@@ -481,7 +481,7 @@ impl Receivers {
     }
 
     /// Sessions that need an IDR (none yet, or one lost since), rate limited
-    /// to one request per second and speaker (`PROTOCOL.md` §2.2 Nr. 13) —
+    /// to one request per second and speaker (`docs/reference/protocol.md` §2.2 Nr. 13) —
     /// as long as their frames still arrive: a sender that stopped (camera
     /// off, stalled) was asked every second for the rest of the session.
     pub fn take_keyframe_requests(&mut self) -> Vec<Session> {

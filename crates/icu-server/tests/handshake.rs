@@ -1,4 +1,4 @@
-//! The handshake under attack (`PROTOCOL.md` §7, `Server/IMPLEMENTATION.md`
+//! The handshake under attack (`docs/reference/protocol.md` §7, `docs/reference/server.md`
 //! §6.2): whatever an outsider does before the handshake completes must not
 //! keep a legitimate client out.
 
@@ -122,7 +122,7 @@ async fn stalled_handshakes_from_one_source_do_not_lock_out_others() {
 
     // Any 127/8 address is loopback on Linux: the flood has a source of its
     // own, the legitimate client keeps 127.0.0.1. The attacker holds the com
-    // key — a revoked member still does (`PROTOCOL.md` §1).
+    // key — a revoked member still does (`docs/reference/protocol.md` §1).
     let runtime = quinn::default_runtime().expect("tokio runtime");
     let socket = std::net::UdpSocket::bind("127.0.0.2:0").expect("bind 127.0.0.2");
     let socket = Arc::new(RetryOnly(Arc::new(ComSocket::new(
@@ -231,7 +231,7 @@ async fn answer(socket: &tokio::net::UdpSocket) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-/// Without the com tag the port stays silent (`PROTOCOL.md` §1): a genuine
+/// Without the com tag the port stays silent (`docs/reference/protocol.md` §1): a genuine
 /// QUIC Initial starts no handshake, a packet of an unknown version gets no
 /// Version Negotiation, a short header no Stateless Reset. The same Initial
 /// with the tag is answered, so the silence is the tag's doing.

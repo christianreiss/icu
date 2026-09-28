@@ -1,5 +1,5 @@
 //! Deterministic synthetic signals and metrics (lifted from
-//! `Research/spikes/spike-aec/src/signal.rs`). Used by the AEC tests, the
+//! `experiments/spike-aec/src/signal.rs`). Used by the AEC tests, the
 //! integration tests and `--test-tone`.
 
 /// Sample rate.

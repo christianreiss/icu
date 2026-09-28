@@ -1,9 +1,9 @@
-//! Adaptive jitter buffer, one per speaker (`Client/IMPLEMENTATION.md` §6,
-//! `Research/latency-budget.md`).
+//! Adaptive jitter buffer, one per speaker (`docs/reference/client.md` §6,
+//! `docs/research/latency-budget.md`).
 //!
 //! Pure data structure: the caller injects `now` and pops once per frame
 //! period. All `seq`/`ts` comparisons are signed differences modulo 2^16 /
-//! 2^32 (`PROTOCOL.md` §3). Loss (a `seq` gap) is told apart from a pause
+//! 2^32 (`docs/reference/protocol.md` §3). Loss (a `seq` gap) is told apart from a pause
 //! (a `ts` jump with gapless `seq`); the latter re-anchors the buffer.
 //!
 //! Depth. The playout runs `target` behind the spurt's earliest arrival

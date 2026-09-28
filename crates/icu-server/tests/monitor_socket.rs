@@ -1,4 +1,4 @@
-//! The read-only monitoring socket (`Server/IMPLEMENTATION.md` §5).
+//! The read-only monitoring socket (`docs/reference/server.md` §5).
 //!
 //! Until 2026-09-28 a monitor had to be in the admin socket's group, which
 //! may invite, disable and revoke. The second socket answers `status` and

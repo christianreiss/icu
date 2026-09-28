@@ -1,5 +1,5 @@
 //! The main connection: client config with the client certificate, connect,
-//! `Hello`/`Welcome`, control stream helpers (`PROTOCOL.md` §1, §2, §5).
+//! `Hello`/`Welcome`, control stream helpers (`docs/reference/protocol.md` §1, §2, §5).
 
 use std::{
     net::SocketAddr,
@@ -168,14 +168,14 @@ pub fn client_config_with_crl(
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(pl::max_uni_streams(
         pl::MAX_MAX_USERS,
     )));
-    // The com tag rides on every datagram (`PROTOCOL.md` §1).
+    // The com tag rides on every datagram (`docs/reference/protocol.md` §1).
     transport.mtu_discovery_config(Some(icu_proto::com::mtu_discovery()));
     config.transport_config(Arc::new(transport));
     Ok((config, cert_failure))
 }
 
 /// The check of the server's certificate: against our CA only and, with a
-/// CRL, against that for the leaf (`PROTOCOL.md` §1). Also how `crate::crl`
+/// CRL, against that for the leaf (`docs/reference/protocol.md` §1). Also how `crate::crl`
 /// finds out whether rustls takes a CRL at all, so the trial and the real
 /// build cannot drift apart.
 pub(crate) fn server_verifier(
@@ -202,7 +202,7 @@ pub(crate) fn server_verifier(
 /// Refuses a registration certificate whose `notAfter` lies before `now`
 /// (Unix seconds): an expired invitation is spent. An expired certificate of
 /// our own is let through: the server admits it to a renew-only session
-/// (`PROTOCOL.md` §2.3). A leaf that does not parse is left to the handshake.
+/// (`docs/reference/protocol.md` §2.3). A leaf that does not parse is left to the handshake.
 fn check_not_expired(leaf_der: &[u8], now: i64) -> Result<(), NetError> {
     if !crate::net::register::is_registration(leaf_der) || !leaf_expired(leaf_der, now) {
         return Ok(());
@@ -233,7 +233,7 @@ pub fn unix_now() -> i64 {
 /// Turns a failed check of the *server's* certificate into a clear,
 /// user-facing reason. None of them is fatal: rustls checks the certificate
 /// before the server's `CertificateVerify` signature, so whoever sent it has
-/// proven nothing yet (`PROTOCOL.md` §1). Expired or revoked are the server
+/// proven nothing yet (`docs/reference/protocol.md` §1). Expired or revoked are the server
 /// operator's to fix (automatic rotation, `rotate-server-cert`): the client
 /// keeps retrying and picks up the new leaf, while verification still
 /// refuses the old one. Not valid yet is most likely this machine's clock.
@@ -416,7 +416,7 @@ pub async fn connect(
     }
 }
 
-/// The client's half of the version gate (`PROTOCOL.md` §8): the server
+/// The client's half of the version gate (`docs/reference/protocol.md` §8): the server
 /// checked our `Hello.minor` and version, we check its `Welcome.server_minor`.
 fn check_server(server_minor: u16) -> Result<(), ConnectError> {
     if server_minor < icu_proto::MIN_PEER_MINOR {
@@ -457,7 +457,7 @@ pub enum ConnectError {
     /// can present such a certificate (with the com key, or control of DNS),
     /// so it must not end the reconnects or send the user off for a new
     /// invitation, which is what an attacker would hand them next
-    /// (`PROTOCOL.md` §1). Retried with [`slow_backoff`].
+    /// (`docs/reference/protocol.md` §1). Retried with [`slow_backoff`].
     Unverified {
         /// The FQDN/IP TLS verification ran against.
         server_name: String,
@@ -469,7 +469,7 @@ pub enum ConnectError {
     /// We could not make sense of what the server sent.
     Protocol(String),
     /// The server speaks another protocol version: TLS alert
-    /// `protocol_version` or `no_application_protocol` (ALPN, `PROTOCOL.md`
+    /// `protocol_version` or `no_application_protocol` (ALPN, `docs/reference/protocol.md`
     /// §8). Fatal: it takes an update, not a retry.
     Version(String),
     /// Like [`ConnectError::Version`], but the alert came before the server
@@ -531,7 +531,7 @@ impl ConnectError {
                 let alert = u64::from(c.error_code) - 0x100;
                 match alert {
                     // certificate_revoked: the server's CRL lists our leaf
-                    // (`PROTOCOL.md` §1).
+                    // (`docs/reference/protocol.md` §1).
                     44 => ConnectError::Certificate {
                         server_name: String::new(),
                         issue: CertIssue::RevokedByServer,
@@ -573,7 +573,7 @@ impl ConnectError {
         }
     }
 
-    /// Whether the client must not reconnect (`PROTOCOL.md` §5).
+    /// Whether the client must not reconnect (`docs/reference/protocol.md` §5).
     pub fn is_fatal(&self) -> bool {
         match self {
             ConnectError::Closed { code, .. } => icu_proto::error::is_fatal(*code),

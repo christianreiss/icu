@@ -1,4 +1,4 @@
-//! Server configuration (`Server/IMPLEMENTATION.md` §4).
+//! Server configuration (`docs/reference/server.md` §4).
 //!
 //! The on-disk format is `/etc/icu/server.toml`. Two sections beyond the spec
 //! exist so that the server can run as a library in integration tests:
@@ -24,7 +24,7 @@ use crate::error::{Context, Error, Result};
 pub struct Config {
     /// Listen addresses, room size, names.
     pub server: ServerSection,
-    /// Rate limits, defaults from `PROTOCOL.md` §7.
+    /// Rate limits, defaults from `docs/reference/protocol.md` §7.
     pub limits: LimitsSection,
     /// Certificate validity periods.
     pub tls: TlsSection,
@@ -52,7 +52,7 @@ pub struct ServerSection {
     /// name an existing CA carries (`open_ca` in `lib.rs`).
     pub server_name: String,
     /// `host:port` clients dial. Written into every client certificate as
-    /// URI SAN `icu://<public_host>` (`PROTOCOL.md` §2.3).
+    /// URI SAN `icu://<public_host>` (`docs/reference/protocol.md` §2.3).
     pub public_host: String,
     /// Room size, 1..=64.
     pub max_users: u16,
@@ -265,7 +265,7 @@ pub struct TimingSection {
     /// How long a video frame may take to arrive, header and payload.
     pub video_frame_timeout_ms: u64,
     /// How long the admin socket waits for a request line, and for the
-    /// client to take the answer (`Server/IMPLEMENTATION.md` §5).
+    /// client to take the answer (`docs/reference/server.md` §5).
     pub admin_timeout_ms: u64,
 }
 
@@ -492,7 +492,7 @@ impl Config {
 
     /// Certificate lifetimes of at least a day. A certificate that expires
     /// as it is issued would send a client with an expired one into a renewal
-    /// loop (`PROTOCOL.md` §2.3.3). Checked for configuration files only: the
+    /// loop (`docs/reference/protocol.md` §2.3.3). Checked for configuration files only: the
     /// in-process tests issue already expired certificates on purpose.
     pub fn validate_lifetimes(&self) -> Result<()> {
         for (key, days) in [
@@ -507,7 +507,7 @@ impl Config {
         Ok(())
     }
 
-    /// Validates the configuration (`Server/IMPLEMENTATION.md` §6.1.1).
+    /// Validates the configuration (`docs/reference/server.md` §6.1.1).
     pub fn validate(&self) -> Result<()> {
         if self.server.listen.is_empty() {
             return Err(Error::msg("server.listen is empty"));
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn spec_example_parses() {
-        // The example from Server/IMPLEMENTATION.md §4, verbatim.
+        // The example from docs/reference/server.md §4, verbatim.
         let text = r#"
 [server]
 listen = ["0.0.0.0:4711", "[::]:4711"]

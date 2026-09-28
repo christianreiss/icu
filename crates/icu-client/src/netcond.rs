@@ -1,7 +1,7 @@
 //! Network-condition detection: quinn's own transport statistics, composed
 //! with the existing loss/congestion feedback, into one signal for the
-//! quality controller (`crate::quality`; `Client/IMPLEMENTATION.md` §8,
-//! `Research/transport.md`).
+//! quality controller (`crate::quality`; `docs/reference/client.md` §8,
+//! `docs/research/transport.md`).
 //!
 //! Pure data structure, `Instant`-injected like `dsp::jitter`, so the
 //! smoothing logic is testable without a real connection. No custom
@@ -51,7 +51,7 @@ pub struct NetworkCondition {
     pub rtt_ms: f32,
     /// EWMA of `rtt - min_rtt`, milliseconds — the only pre-loss pressure
     /// signal a stock-Cubic-controlled path gives before it actually drops
-    /// packets (`Research/transport.md`).
+    /// packets (`docs/research/transport.md`).
     pub queuing_delay_ms: f32,
     /// Congestion events observed during the last tick (a delta; not
     /// smoothed — smoothing a delta double-counts persistence).

@@ -1,5 +1,5 @@
 //! Per-client state machine on ALPN `icu/1`
-//! (`Server/IMPLEMENTATION.md` §6.4).
+//! (`docs/reference/server.md` §6.4).
 
 use std::{
     sync::{Arc, Mutex},
@@ -62,7 +62,7 @@ pub async fn handle(server: Arc<Server>, conn: quinn::Connection) -> Result<()> 
         conn.set_max_concurrent_bi_streams(quinn::VarInt::from_u32(0));
     }
 
-    // One live connection per certificate: this one wins (`PROTOCOL.md` §7).
+    // One live connection per certificate: this one wins (`docs/reference/protocol.md` §7).
     // A renew-only session has a table of its own: it must not kick a room
     // session still running on the same certificate.
     let slots = if roomless {
@@ -250,15 +250,15 @@ struct Identity {
     /// Subject CN of the presented leaf, `""` when it does not parse.
     /// Advisory: authentication is the fingerprint, never the name. It only
     /// says whether this client still holds a certificate carrying the current
-    /// name, or has to catch up (`PROTOCOL.md` §2.2).
+    /// name, or has to catch up (`docs/reference/protocol.md` §2.2).
     cert_cn: String,
-    /// Authenticated with a registration certificate (`PROTOCOL.md` §2.3).
+    /// Authenticated with a registration certificate (`docs/reference/protocol.md` §2.3).
     registration: bool,
     /// SubjectPublicKeyInfo of the presented leaf. A registration has to
     /// bring a different key.
     cert_spki: Vec<u8>,
     /// The presented leaf has expired: a renew-only session
-    /// (`PROTOCOL.md` §2.3).
+    /// (`docs/reference/protocol.md` §2.3).
     expired: bool,
     /// notBefore and notAfter of the presented leaf, `None` when it does not
     /// parse. A re-issue outside the renewal window carries them over.
@@ -286,7 +286,7 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
         // Not a reason to reject: the store keeps fingerprints, not DER, so
         // certificates issued before the name moved into the certificate have
         // no recorded CN at all. The client notices the same mismatch and
-        // renews itself (`PROTOCOL.md` §2.2).
+        // renews itself (`docs/reference/protocol.md` §2.2).
         tracing::debug!(
             user_id,
             cert_cn = %info.cn,
@@ -297,7 +297,7 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
     let registration = cert.registration;
     let expired = cert_expired(info.validity, now());
     // The handshake forgives expiry only for renewing a real certificate; a
-    // registration certificate that ran out is spent (`PROTOCOL.md` §2.3).
+    // registration certificate that ran out is spent (`docs/reference/protocol.md` §2.3).
     if registration && expired {
         return Err(Error::coded(
             ec::AUTH_UNKNOWN_CERT,
@@ -316,7 +316,7 @@ async fn authenticate(server: &Arc<Server>, conn: &quinn::Connection) -> Result<
         });
     // Likewise for a renewal: the first login with the new certificate
     // proves it was stored, and everything it replaced is revoked
-    // (`PROTOCOL.md` §2.2 Nr. 10). Not on a renew-only session, which proves
+    // (`docs/reference/protocol.md` §2.2 Nr. 10). Not on a renew-only session, which proves
     // nothing about a successor. A failed write is retried on the next login.
     let retired = if registration || expired {
         Vec::new()
@@ -413,7 +413,7 @@ async fn read_hello(server: &Arc<Server>, conn: &quinn::Connection) -> Result<He
         .await
         .map_err(|_| Error::coded(ec::HELLO_TIMEOUT, "no control stream within the timeout"))?
         .map_err(|e| Error::coded(ec::HELLO_TIMEOUT, e.to_string()))?;
-    let _ = send.set_priority(1); // control beats video (`PROTOCOL.md` §4)
+    let _ = send.set_priority(1); // control beats video (`docs/reference/protocol.md` §4)
 
     let body = tokio::time::timeout_at(deadline, wire::read_frame(&mut recv, MAX_CONTROL_FRAME))
         .await
@@ -439,7 +439,7 @@ async fn read_hello(server: &Arc<Server>, conn: &quinn::Connection) -> Result<He
             "Hello.client is longer than 64 bytes",
         ));
     }
-    // Both minimums (`PROTOCOL.md` §8): the protocol minor, then the client
+    // Both minimums (`docs/reference/protocol.md` §8): the protocol minor, then the client
     // version against `server.min_client`. A client string without a readable
     // version cannot prove it is new enough.
     if minor < icu_proto::MIN_PEER_MINOR {
@@ -544,7 +544,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     lock(&server.audio_feedback).join(session, caps);
     drop(store);
     // The client checks the server leaf against the newest CRL it holds;
-    // this is how it gets one (`PROTOCOL.md` §2.2).
+    // this is how it gets one (`docs/reference/protocol.md` §2.2).
     let crl_der = server.crl.read().unwrap_or_else(|e| e.into_inner()).clone();
     if !crl_der.is_empty() {
         server
@@ -769,7 +769,7 @@ fn stream_end(read: Result<Vec<u8>>) -> Result<Option<Vec<u8>>> {
 }
 
 /// A session authenticated with an **expired** certificate
-/// (`PROTOCOL.md` §2.3): renew-only. It never joins the room. After `Welcome`
+/// (`docs/reference/protocol.md` §2.3): renew-only. It never joins the room. After `Welcome`
 /// (with no users) comes `Error{RENEW_REQUIRED}`, and the only useful message
 /// is a `RenewRequest` under the stored name with the existing key; anything
 /// else is answered with `RENEW_REQUIRED` again. After `RenewResponse` the
@@ -839,7 +839,7 @@ async fn recovery_exchange(
     }
 }
 
-/// Registration sessions: 5/min per IP, 20/min global (`PROTOCOL.md` §7).
+/// Registration sessions: 5/min per IP, 20/min global (`docs/reference/protocol.md` §7).
 fn enroll_budget(server: &Arc<Server>, conn: &quinn::Connection) -> Result<()> {
     let allowed = lock(&server.ip_limits).allow_enroll(conn.remote_address().ip());
     Counters::inc(&server.counters.enroll_attempts);
@@ -854,7 +854,7 @@ fn enroll_budget(server: &Arc<Server>, conn: &quinn::Connection) -> Result<()> {
 }
 
 /// A session authenticated with a registration certificate
-/// (`PROTOCOL.md` §2.3). It never joins the room: after `Welcome` with
+/// (`docs/reference/protocol.md` §2.3). It never joins the room: after `Welcome` with
 /// `registration = true` the only useful message is a `RenewRequest` with a
 /// fresh key. On success the answer is `RenewResponse`, the registration
 /// certificate is revoked, and the client reconnects with its own.
@@ -957,7 +957,7 @@ async fn redeem(server: &Arc<Server>, identity: &Identity, csr_der: &[u8]) -> Re
         ));
     }
     let mut store = server.store.lock().await;
-    // A placeholder whose bundle expired unused frees its name (`PROTOCOL.md`
+    // A placeholder whose bundle expired unused frees its name (`docs/reference/protocol.md`
     // §2.3); otherwise only the next invite or a restart would. This user is
     // among them only if its own bundle expired during the session.
     if store.purge_expired_registrations()? > 0 {
@@ -1316,7 +1316,7 @@ fn within(last: time::OffsetDateTime, bound: time::Duration, now: time::OffsetDa
 }
 
 /// A plain renewal is accepted once less than a third of the presented
-/// certificate's lifetime, and at least 30 days, is left (`PROTOCOL.md` §2.2
+/// certificate's lifetime, and at least 30 days, is left (`docs/reference/protocol.md` §2.2
 /// Nr. 9; the client asks at the same point).
 fn renew_window(issued: &str, expires: &str) -> time::Duration {
     let third = match (parse_rfc3339(issued), parse_rfc3339(expires)) {
@@ -1333,7 +1333,7 @@ struct Renewed {
     renamed: bool,
 }
 
-/// Certificate renewal, and the only way a name changes (`PROTOCOL.md` §2.2).
+/// Certificate renewal, and the only way a name changes (`docs/reference/protocol.md` §2.2).
 ///
 /// The CSR's subject CN is the name the client asks for. Four cases, told
 /// apart by exact string comparison against the stored name — case-insensitive
@@ -1364,7 +1364,7 @@ async fn renew_leaf(
     // a new key on the strength of an expired certificate (external review
     // 2026-09-27).
     let expired = identity.expired || cert_expired(identity.cert_validity, now());
-    // An expired certificate renews onto its own key (`PROTOCOL.md` §2.3.3):
+    // An expired certificate renews onto its own key (`docs/reference/protocol.md` §2.3.3):
     // the handshake proved that key and nothing else, so a new one would be
     // trusted on the strength of an expired certificate alone.
     if expired
@@ -1527,7 +1527,7 @@ async fn handle_renew(server: &Arc<Server>, session: Session, identity: &Identit
 }
 
 /// Issues a registration and returns its bundle (`CreateInviteRequest`,
-/// `PROTOCOL.md` §2.3). Admin only; rejected non-fatally otherwise.
+/// `docs/reference/protocol.md` §2.3). Admin only; rejected non-fatally otherwise.
 async fn handle_create_invite(
     server: &Arc<Server>,
     session: Session,
@@ -1628,7 +1628,7 @@ pub(crate) fn restriction_changed(muted: bool, deafened: bool) -> ControlMsg {
 }
 
 /// The in-band answer to an admin action: `ok` on success, else
-/// `AdminActionError` with the code the store gave (`PROTOCOL.md` §2.2). An
+/// `AdminActionError` with the code the store gave (`docs/reference/protocol.md` §2.2). An
 /// uncoded error is the server's own trouble — a failed write — and goes out
 /// as `SERVER_ERROR`, not as a policy refusal the admin would read as their
 /// mistake.
@@ -1652,7 +1652,7 @@ fn admin_answer<T>(
     }
 }
 
-/// `UserListRequest` (`PROTOCOL.md` §2.2). Admin only; every registered user,
+/// `UserListRequest` (`docs/reference/protocol.md` §2.2). Admin only; every registered user,
 /// online or not.
 async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor: &admin::Actor) {
     let store = server.store.lock().await;
@@ -1704,7 +1704,7 @@ async fn handle_user_list_request(server: &Arc<Server>, session: Session, actor:
         .send_to(session, &ControlMsg::UserListResponse { users });
 }
 
-/// `users` as they fit one `UserListResponse` (`PROTOCOL.md` §2.2 Nr. 27):
+/// `users` as they fit one `UserListResponse` (`docs/reference/protocol.md` §2.2 Nr. 27):
 /// all of them, or the longest head that fits together with a last row that
 /// stands for the rest — `user_id` 0, the number left out in `name`. Without
 /// this, a list past a control frame (~230 users) was not sent at all.
@@ -1753,7 +1753,7 @@ fn fit_user_list(users: Vec<icu_proto::UserSummary>) -> Vec<icu_proto::UserSumma
 /// The code the peer closed with, reduced to the `UserLeft.reason` range.
 ///
 /// Anything that is not a clean application close — idle timeout, reset,
-/// transport error — is `TIMEOUT` (`PROTOCOL.md` §6).
+/// transport error — is `TIMEOUT` (`docs/reference/protocol.md` §6).
 fn peer_close_code(conn: &quinn::Connection) -> u32 {
     match conn.close_reason() {
         Some(quinn::ConnectionError::ApplicationClosed(closed)) => {

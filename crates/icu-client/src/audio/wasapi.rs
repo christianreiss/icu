@@ -1,4 +1,4 @@
-//! WASAPI backend (Windows, `Client/IMPLEMENTATION.md` §3): shared mode,
+//! WASAPI backend (Windows, `docs/reference/client.md` §3): shared mode,
 //! one thread per stream, 48 kHz mono f32 in 240-sample blocks like every
 //! backend.
 //!

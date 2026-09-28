@@ -1,5 +1,5 @@
 //! Video: a synthetic camera sends H.264 over the relay, a `KeyframeRequest`
-//! forces an IDR (`Client/IMPLEMENTATION.md` §14).
+//! forces an IDR (`docs/reference/client.md` §14).
 //!
 //! Unix only: the in-process server (`common`) is.
 #![cfg(unix)]

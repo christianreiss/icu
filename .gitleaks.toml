@@ -1,6 +1,6 @@
 # gitleaks configuration for packaging/release.sh: the default rules plus
 # ICU's own bearer credential. A passport or registration bundle
-# (PROTOCOL.md §2.3.1) carries a private key; the armor header alone (docs,
+# (docs/reference/protocol.md §2.3.1) carries a private key; the armor header alone (docs,
 # tests with a dummy body) does not match, a real base64 body does.
 [extend]
 useDefault = true

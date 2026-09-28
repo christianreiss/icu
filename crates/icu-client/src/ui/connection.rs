@@ -1301,7 +1301,7 @@ fn block_row(ui: &mut Ui, row: &Row, copied: &mut Option<(String, Instant)>) {
         .show(ui, |ui| {
             // `ui.horizontal`, not `widgets::ltr`: the latter is
             // `with_layout`, which claims the parent's entire remaining
-            // height (`Client/IMPLEMENTATION.md` §16) — inside a
+            // height (`docs/reference/client.md` §16) — inside a
             // non-shrinking `ScrollArea` that is the whole viewport, and
             // the card balloons to fill it.
             ui.horizontal(|ui| {

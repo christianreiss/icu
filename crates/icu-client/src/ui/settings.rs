@@ -93,7 +93,7 @@ pub struct SettingsView {
     passport_status: Option<String>,
     /// A parsed passport waiting for confirmation: importing replaces the
     /// identity, and the passport brings its own server, so the user sees
-    /// which one first (`PROTOCOL.md` §2.3.1). With the settings it carries,
+    /// which one first (`docs/reference/protocol.md` §2.3.1). With the settings it carries,
     /// if any.
     import_preview: Option<(Box<Identity>, Option<Box<Settings>>, config::ImportSummary)>,
     /// The import option: take the passport's settings along. On for every
@@ -867,7 +867,7 @@ impl SettingsView {
     }
 
     /// Export and import of the whole identity, and of the settings that may
-    /// move with it (`PROTOCOL.md` §2.3.1).
+    /// move with it (`docs/reference/protocol.md` §2.3.1).
     ///
     /// The armored text is never rendered: it carries the private key in the
     /// clear, and a settings window is exactly the thing people have open
@@ -1664,7 +1664,7 @@ impl SettingsView {
 
     /// Admin-only "Nutzer" tab: inviting, and managing who is already in
     /// (`ControlMsg::UserListRequest`/`AdminSetRole`/`AdminSetDisabled`/
-    /// `AdminRevokeUser`, `PROTOCOL.md` §2.2).
+    /// `AdminRevokeUser`, `docs/reference/protocol.md` §2.2).
     fn users_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         // A fresh invite adds a pending entry; fetch the list without a click
         // and keep the result in the open form.
@@ -1698,7 +1698,7 @@ impl SettingsView {
 
         let me = state.me.as_ref().map(|m| m.user_id);
         // A list too long for one frame ends in a row with `user_id` 0 that
-        // only counts the rest (`PROTOCOL.md` §2.2 Nr. 27): no member, no
+        // only counts the rest (`docs/reference/protocol.md` §2.2 Nr. 27): no member, no
         // buttons.
         let (more, listed): (Vec<_>, Vec<_>) = state.user_list.iter().partition(|u| u.user_id == 0);
         let (removed, rest): (Vec<_>, Vec<_>) = listed.into_iter().partition(|u| u.revoked);

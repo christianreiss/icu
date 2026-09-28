@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- ICU invitations (registration bundles) and passports: `*.icu` files, or
-     any file that starts with the passport armor (PROTOCOL.md §2.3.1).
+     any file that starts with the passport armor (docs/reference/protocol.md §2.3.1).
      Installed as /usr/share/mime/packages/icu.xml; a binary run from
      elsewhere writes the same file to ~/.local/share/mime/packages
      (crates/icu-client/src/uri.rs). -->

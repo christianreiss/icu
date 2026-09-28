@@ -1,14 +1,14 @@
-//! The server's own certificate authority (`Server/IMPLEMENTATION.md` §6.1,
+//! The server's own certificate authority (`docs/reference/server.md` §6.1,
 //! §6.3).
 //!
 //! The server is its own CA: it issues the server leaf and every client
 //! certificate, and it is the only thing clients trust. SAN, EKU, basic
 //! constraints, key usage, validity and serial are server-set; from a CSR come
 //! the public key **and the validated subject CN**, which is the user's display
-//! name (`PROTOCOL.md` §2.1, revised 2026-09-22).
+//! name (`docs/reference/protocol.md` §2.1, revised 2026-09-22).
 //!
 //! The certificates also say where the server is, so a passport needs nothing
-//! besides key, leaf and CA (`PROTOCOL.md` §2.3): every client certificate
+//! besides key, leaf and CA (`docs/reference/protocol.md` §2.3): every client certificate
 //! carries a URI SAN `icu://<public_host>`, and the CA's CN is
 //! `ICU CA <server_name>`.
 
@@ -256,7 +256,7 @@ impl Ca {
     }
 
     /// Issues a fresh server leaf from the same CA. Clients need no change
-    /// (`Server/IMPLEMENTATION.md` §5, `rotate-server-cert`). The leaf it
+    /// (`docs/reference/server.md` §5, `rotate-server-cert`). The leaf it
     /// replaces is retired ([`Ca::take_retired_leaves`]).
     ///
     /// The leaf being replaced goes into `server.crt.retired` before anything
@@ -378,7 +378,7 @@ impl Ca {
     }
 
     /// Issues a registration certificate on a freshly generated key
-    /// (`PROTOCOL.md` §2.3): subject `CN=<name>, OU=ICU registration`, the
+    /// (`docs/reference/protocol.md` §2.3): subject `CN=<name>, OU=ICU registration`, the
     /// server URI SAN, EKU ClientAuth, valid for `ttl`. Returns the leaf and
     /// the key as PKCS#8 DER — the key leaves the server inside the bundle and
     /// is not kept.
@@ -422,7 +422,7 @@ impl Ca {
     }
 
     /// Signs a CRL listing `serials` (lowercase hex, see [`leaf_serial`]) with
-    /// the CA key (`PROTOCOL.md` §1). One CRL covers client and server leaves:
+    /// the CA key (`docs/reference/protocol.md` §1). One CRL covers client and server leaves:
     /// the server checks client certificates against it during the
     /// handshake, clients check the server leaf.
     pub fn crl(
@@ -494,7 +494,7 @@ fn pkcs8(key: &KeyPair) -> PrivateKeyDer<'static> {
 }
 
 /// The display name a CSR asks for: exactly one subject CN, readable as UTF-8,
-/// passing `validate_stored_name` (`PROTOCOL.md` §2.3). Whether it also has
+/// passing `validate_stored_name` (`docs/reference/protocol.md` §2.3). Whether it also has
 /// to pass the strict `validate_name` is the caller's business: a new name
 /// does, a stored name carried into a renewal does not, or a user whose name
 /// predates the strict rules could never renew.
@@ -557,7 +557,7 @@ pub fn csr_public_key(csr_der: &[u8]) -> Result<Vec<u8>> {
 
 /// Parses a CSR for signing, refusing it with `code`: the signature must
 /// verify, and the key must be P-256 signed with SHA-256 or P-384 signed
-/// with SHA-384 (`PROTOCOL.md` §2.3, "nur P-256/P-384").
+/// with SHA-384 (`docs/reference/protocol.md` §2.3, "nur P-256/P-384").
 ///
 /// The curve comes from the key's own SubjectPublicKeyInfo. rcgen 0.14
 /// (`CertificateSigningRequestParams::from_der`) takes the algorithm from the
@@ -706,7 +706,7 @@ pub enum Lifetime {
     Days(u32),
     /// Exactly the validity of the certificate it replaces: a re-issue that
     /// must not extend it (rename or catch-up outside the renewal window,
-    /// `PROTOCOL.md` §2.2 Nr. 9).
+    /// `docs/reference/protocol.md` §2.2 Nr. 9).
     Keep {
         not_before: OffsetDateTime,
         not_after: OffsetDateTime,
@@ -764,7 +764,7 @@ fn server_uri(public_host: &str) -> Result<SanType> {
 
 /// The subject CN of an already verified leaf, or `""` when it has none or does
 /// not parse. Never fails: an unreadable CN must not cost a client its
-/// connection, it only means the client has to catch up (`PROTOCOL.md` §2.2).
+/// connection, it only means the client has to catch up (`docs/reference/protocol.md` §2.2).
 pub fn leaf_common_name(der: &[u8]) -> String {
     with_leaf(der, common_name).unwrap_or_default()
 }

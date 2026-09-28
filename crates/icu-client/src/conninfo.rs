@@ -225,7 +225,7 @@ pub fn leaf_signed_by(leaf_der: &[u8], ca_der: &[u8]) -> bool {
 }
 
 /// Whether `passport`'s inline signature verifies against the CA it carries
-/// (`icu_proto::passport::Passport::signable_bytes`, `PROTOCOL.md` §2.3.1).
+/// (`icu_proto::passport::Passport::signable_bytes`, `docs/reference/protocol.md` §2.3.1).
 /// The server signs every registration bundle it issues with its CA key,
 /// which never travels inside the bundle itself — so this catches tampering
 /// with the armored text after the server wrote it, the com key included,

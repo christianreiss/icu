@@ -1,4 +1,4 @@
-//! Protocol limits the server enforces (`PROTOCOL.md` §7).
+//! Protocol limits the server enforces (`docs/reference/protocol.md` §7).
 
 /// ALPN of the main protocol. Major version gate.
 pub const ALPN_MAIN: &[u8] = b"icu/1";
@@ -25,7 +25,7 @@ pub const VIDEO_KBIT_S: u32 = 400;
 pub const ENROLL_PER_IP_PER_MIN: u32 = 5;
 /// Registration sessions per minute, server wide.
 pub const ENROLL_GLOBAL_PER_MIN: u32 = 20;
-/// Handshakes per second and source IP (`Server/IMPLEMENTATION.md` §6.6).
+/// Handshakes per second and source IP (`docs/reference/server.md` §6.6).
 pub const HANDSHAKES_PER_IP_PER_S: u32 = 10;
 /// Handshakes per second, server wide. Caps what many source addresses
 /// together can make the server spend on TLS.
@@ -85,7 +85,7 @@ pub const VIDEO_STREAMS_PER_SENDER: usize = 4;
 /// downlink falls behind to about this many frames, instead of whatever the
 /// stream credit and send window hold. At 15 fps, 2 cover a round trip
 /// (plus ACK delay) of up to about 130 ms without loss; beyond that the pair
-/// drops frames, which `VideoCongestionHint` reports (`PROTOCOL.md` §4).
+/// drops frames, which `VideoCongestionHint` reports (`docs/reference/protocol.md` §4).
 pub const VIDEO_UNACKED_PER_PAIR: usize = 2;
 /// Seconds a video frame may take to arrive, header and payload, before the
 /// server stops its stream with `RATE_LIMITED`.
@@ -97,19 +97,19 @@ pub const DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
 /// quinn drops the oldest datagram once it is full. 8 KiB is 20–50 packets
 /// (0.4–1 s); the receiver's jitter buffer caps at 200 ms and drains any
 /// post-stall backlog anyway, so queueing more only sends stale audio late
-/// and bursts past the server's per-second rate limit (`PROTOCOL.md` §1).
+/// and bursts past the server's per-second rate limit (`docs/reference/protocol.md` §1).
 pub const CLIENT_DATAGRAM_SEND_BUFFER_BYTES: usize = 8 * 1024;
 
 /// Silence after which a speaker is considered to have stopped, and below
-/// which a new datagram starts a talk spurt (`PROTOCOL.md` §2.1).
+/// which a new datagram starts a talk spurt (`docs/reference/protocol.md` §2.1).
 pub const SPEAKING_SILENCE_MS: u64 = 500;
-/// Time after which a `LossReport` expires (`PROTOCOL.md` §2.2).
+/// Time after which a `LossReport` expires (`docs/reference/protocol.md` §2.2).
 pub const LOSS_REPORT_TTL_S: u64 = 6;
 /// Cap for `LossHint` in percent, as handed to `OPUS_SET_PACKET_LOSS_PERC`.
 pub const LOSS_HINT_MAX_PERCENT: u16 = 20;
 
 /// Window over which a sender's per-receiver video slot displacements are
-/// aggregated into a `VideoCongestionHint` (`PROTOCOL.md` §2.2).
+/// aggregated into a `VideoCongestionHint` (`docs/reference/protocol.md` §2.2).
 pub const VIDEO_CONGESTION_WINDOW_S: u64 = 2;
 /// Minimum change, in per mille, before a new `VideoCongestionHint` is sent.
 pub const VIDEO_CONGESTION_HINT_STEP_PERMILLE: u16 = 20;
@@ -127,21 +127,21 @@ pub const RENEW_PER_DAY: u32 = 1;
 pub const INVITES_PER_ADMIN_PER_HOUR: u32 = 20;
 /// How long a registration certificate stays valid by default.
 pub const INVITE_TTL_S: u64 = 24 * 60 * 60;
-/// Organizational unit of a registration certificate (`PROTOCOL.md` §2.3).
+/// Organizational unit of a registration certificate (`docs/reference/protocol.md` §2.3).
 /// Informational: it lets a client tell a registration bundle from a
 /// passport before connecting; the server decides by its own records.
 pub const REGISTRATION_OU: &str = "ICU registration";
 /// Longest lifetime of a registration certificate; longer requests are
-/// clamped to it (`PROTOCOL.md` §2.3).
+/// clamped to it (`docs/reference/protocol.md` §2.3).
 pub const MAX_INVITE_TTL_S: u64 = 7 * 24 * 60 * 60;
 
 /// Bytes reserved per `UserInfo` when validating that a full `Welcome` fits
-/// into one control frame (`PROTOCOL.md` §7).
+/// into one control frame (`docs/reference/protocol.md` §7).
 pub const WELCOME_BYTES_PER_USER: usize = 100;
 /// Fixed overhead reserved for the rest of `Welcome`.
 pub const WELCOME_RESERVE: usize = 1024;
 
-/// `max_concurrent_uni_streams` per direction (`PROTOCOL.md` §1).
+/// `max_concurrent_uni_streams` per direction (`docs/reference/protocol.md` §1).
 pub fn max_uni_streams(max_users: u16) -> u32 {
     2 * u32::from(max_users) + 4
 }

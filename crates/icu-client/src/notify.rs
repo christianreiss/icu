@@ -1,5 +1,5 @@
 //! Desktop notifications when someone comes or goes
-//! (`Research/feature-freeze.md`, Join/Leave-Hinweis: tone and
+//! (`docs/reference/features.md`, Join/Leave-Hinweis: tone and
 //! notification, each switched on its own). On Linux through
 //! `org.freedesktop.Notifications` on the session bus, which KDE, GNOME and
 //! the notification daemons of the smaller desktops all serve; on Windows

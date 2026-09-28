@@ -1,5 +1,5 @@
 //! `LossReport` aggregation and `LossHint` generation
-//! (`PROTOCOL.md` §2.2, `Server/IMPLEMENTATION.md` §6.5).
+//! (`docs/reference/protocol.md` §2.2, `docs/reference/server.md` §6.5).
 //!
 //! Every receiver reports the loss it measures on a speaker's audio stream.
 //! The server forwards to that speaker the value more than a third of its
@@ -13,7 +13,7 @@ use std::{
 
 use icu_proto::Session;
 
-/// The hint for a sender from what its receivers measured (`PROTOCOL.md`
+/// The hint for a sender from what its receivers measured (`docs/reference/protocol.md`
 /// §2.2 Nr. 12 and 16): the largest value that more than a third of its
 /// `receivers` measured at least, i.e. the (⌊n/3⌋ + 1)-th largest of n. A
 /// receiver without a value in `values` counts as 0, so `values` may be

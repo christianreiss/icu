@@ -1,5 +1,5 @@
 //! Real-time scheduling for the engine's audio worker threads
-//! (`Client/IMPLEMENTATION.md` §4).
+//! (`docs/reference/client.md` §4).
 //!
 //! `icu-dsp` and `icu-mixer` sit between the real-time backend callbacks
 //! and, respectively, the network and the playback ring. As ordinary

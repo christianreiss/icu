@@ -1,5 +1,5 @@
 //! The engine: connection loop, DSP thread, playout mixer, state and command
-//! bus (`Client/IMPLEMENTATION.md` §4, §5, §6).
+//! bus (`docs/reference/client.md` §4, §5, §6).
 //!
 //! Threads:
 //! * backend callbacks (real-time) → ring buffers only;
@@ -154,7 +154,7 @@ pub struct Peer {
     /// Volume in percent.
     pub volume: f32,
     /// Server-measured RTT to this peer, milliseconds. `None` until the
-    /// first `ControlMsg::UserRtt` arrives (`PROTOCOL.md` §2.2).
+    /// first `ControlMsg::UserRtt` arrives (`docs/reference/protocol.md` §2.2).
     pub rtt_ms: Option<u16>,
     /// What this client loses of *this* peer's audio, per mille, as the
     /// jitter buffer last measured it. Already computed for `LossReport`;
@@ -317,7 +317,7 @@ pub enum Command {
     /// Per peer volume in percent.
     SetVolume(UserId, f32),
     /// Rename. Travels as a certificate renewal carrying the new CN, because
-    /// the name lives in the certificate (`PROTOCOL.md` §2.2).
+    /// the name lives in the certificate (`docs/reference/protocol.md` §2.2).
     RequestRename(String),
     /// Replace the whole identity (passport import): persist it, then
     /// reconnect with it. The settings the passport carried come along when
@@ -771,7 +771,7 @@ struct Shared {
 }
 
 /// Received video, tagged with the connection it belongs to. Session IDs
-/// are only valid within one connection (`PROTOCOL.md` §5): the decode
+/// are only valid within one connection (`docs/reference/protocol.md` §5): the decode
 /// thread of a connection that ended can still hold frames, and delivered
 /// after a reconnect they would appear under a session ID that now belongs
 /// to somebody else — a peer briefly showing another person's picture.
@@ -1779,7 +1779,7 @@ fn dsp_thread(
                     let ref_db = 10.0 * (ref_energy / ref_samples.max(1) as f64 + 1e-12).log10();
                     ref_energy = 0.0;
                     ref_samples = 0;
-                    // Self-diagnosis (`Research/aec.md`): what the far end
+                    // Self-diagnosis (`docs/research/aec.md`): what the far end
                     // and the loudspeaker did since the last report, and
                     // what the canceller made of it.
                     let played = f32::from_bits(shared.play_peak.swap(0, Ordering::Relaxed));
@@ -2056,7 +2056,7 @@ fn mode_of(vad: bool) -> Mode {
 /// in the frame that was *not* sent; sending it too costs one packet and
 /// 20 ms of pre-speech audio per spurt, not latency — both packets arrive
 /// together and the jitter buffer's prefill starts on the pair
-/// (`Client/IMPLEMENTATION.md` §6). PTT users press before they speak. A
+/// (`docs/reference/client.md` §6). PTT users press before they speak. A
 /// frame that already went out (the END frame, when voice returns right
 /// after the hangover) is never sent twice.
 fn preroll_now(was_open: bool, prev_sent: bool, decision: Decision, mode: Mode) -> bool {
@@ -2377,7 +2377,7 @@ const SPEAKING_HOLD: Duration = Duration::from_millis(60);
 
 /// How long after its last datagram the local path still decides a
 /// speaker's indicator; after that the server's `speaking` flag does
-/// (`Client/IMPLEMENTATION.md` §6: deafened, peer at volume 0, no audio).
+/// (`docs/reference/client.md` §6: deafened, peer at volume 0, no audio).
 const LOCAL_AUTHORITY: Duration = Duration::from_secs(1);
 
 /// The speaking indicator as the local datagram path sees it: `None` when
@@ -2428,7 +2428,7 @@ async fn net_task(
         settings_tx,
         paths: cfg.paths.clone(),
         // The name is whatever the certificate says, so the pre-`Welcome`
-        // display cannot contradict it (`PROTOCOL.md` §2.1).
+        // display cannot contradict it (`docs/reference/protocol.md` §2.1).
         name: crate::conninfo::CertInfo::from_der(&cfg.identity.leaf_der).subject,
         backend,
         identity: cfg.identity.clone(),
@@ -2600,7 +2600,7 @@ enum SessionEnd {
 }
 
 impl From<ConnectError> for SessionEnd {
-    /// Fatal codes end the reconnect loop (`PROTOCOL.md` §5); everything
+    /// Fatal codes end the reconnect loop (`docs/reference/protocol.md` §5); everything
     /// else is retried.
     fn from(e: ConnectError) -> SessionEnd {
         if e.is_fatal() {
@@ -2880,7 +2880,7 @@ fn renewal_due(cert: &crate::conninfo::CertInfo, stored: &str) -> Option<RenewRe
         return Some(RenewReason::CatchUp);
     }
     // In the last third of the lifetime, and at least the last 30 days,
-    // where the server opens the window (`PROTOCOL.md` §2.2 Nr. 9). Both day
+    // where the server opens the window (`docs/reference/protocol.md` §2.2 Nr. 9). Both day
     // counts are floored, which keeps this a little inside the server's
     // window rather than before it: 30 floored days are up to 31 left.
     if cert.expires_in_days < (cert.valid_days / 3).max(RENEW_BEFORE_EXPIRY_DAYS) {
@@ -2899,7 +2899,7 @@ fn retry_lost_renewal_at_once(reason: RenewReason) -> bool {
 }
 
 /// Renew at the latest this many days before the certificate expires
-/// (`Client/IMPLEMENTATION.md` §5).
+/// (`docs/reference/client.md` §5).
 const RENEW_BEFORE_EXPIRY_DAYS: i64 = 30;
 
 /// How long an automatic renewal waits after the previous one, matching the
@@ -3025,7 +3025,7 @@ impl LocalState {
                     self.muted_before_deafen = self.flags.muted();
                 }
                 // Undeafening restores the mute from before deafening
-                // (`Research/feature-freeze.md`), unless an admin enforces it.
+                // (`docs/reference/features.md`), unless an admin enforces it.
                 let muted = if d {
                     true
                 } else if was {
@@ -3432,7 +3432,7 @@ impl LocalState {
         renewed.leaf_der = leaf_der;
         renewed.server.name = pending.cn.clone();
         // Adopted only once stored: its first login revokes the old one
-        // (`PROTOCOL.md` §2.2 Nr. 10), so reconnecting with a leaf that is
+        // (`docs/reference/protocol.md` §2.2 Nr. 10), so reconnecting with a leaf that is
         // not on disk would leave the next start with a revoked certificate.
         // The old one stays valid until then; the next renewal tries again.
         if let Err(e) = store_identity(&renewed, &self.paths, shared, false) {
@@ -3564,7 +3564,7 @@ async fn run_session(
 
     // A registration bundle imported into a running client: swap it for a
     // certificate of our own under the placeholder name, which the user can
-    // change like any other name (`PROTOCOL.md` §2.3). The first-run window
+    // change like any other name (`docs/reference/protocol.md` §2.3). The first-run window
     // does this itself, with the name the user typed.
     if welcome.registration {
         shared.state.send_modify(|s| {
@@ -3578,7 +3578,7 @@ async fn run_session(
             end = drain_until_quit(cmd_rx, local, shared) => return end,
         };
         // Stored first, then closed: the clean close is the receipt that
-        // makes the server revoke the bundle (`PROTOCOL.md` §2.3).
+        // makes the server revoke the bundle (`docs/reference/protocol.md` §2.3).
         return match registered {
             // Saved before it is taken into use: an identity that only lives
             // in memory would consume the bundle on the next login and be
@@ -3623,7 +3623,7 @@ async fn run_session(
     }
 
     // An expired certificate still gets through the handshake, into a
-    // renew-only session (`PROTOCOL.md` §2.3): renew it under the stored name
+    // renew-only session (`docs/reference/protocol.md` §2.3): renew it under the stored name
     // with the same key, store it, reconnect with it. `renew_only` covers a
     // server whose clock already disagrees with ours.
     let expired = conn::leaf_expired(&local.identity.leaf_der, conn::unix_now());
@@ -3776,7 +3776,7 @@ async fn run_session(
     }
 
     // Pick up a rename that happened on another device, or renew a
-    // certificate that is about to expire (`PROTOCOL.md` §2.2); again every
+    // certificate that is about to expire (`docs/reference/protocol.md` §2.2); again every
     // hour, since a session can outlive the window.
     if maybe_auto_renew(&mut send, local, shared, &welcome.you.name)
         .await
@@ -4240,7 +4240,7 @@ enum Inbound {
     /// close code decides whether to retry.
     End,
     /// A frame that breaks the framing or does not decode
-    /// (`PROTOCOL.md` §2, §8): `PROTOCOL_VIOLATION`, fatal — the same
+    /// (`docs/reference/protocol.md` §2, §8): `PROTOCOL_VIOLATION`, fatal — the same
     /// server would send it again after every reconnect.
     Violation(String),
 }
@@ -4279,7 +4279,7 @@ async fn control_reader(
 
 /// Ends a session on a protocol violation: the server is told
 /// `PROTOCOL_VIOLATION`, and the client stops instead of reconnecting into
-/// the same fault every second (`PROTOCOL.md` §5, §6).
+/// the same fault every second (`docs/reference/protocol.md` §5, §6).
 fn protocol_violation(connection: &quinn::Connection, detail: String) -> SessionEnd {
     tracing::warn!(%detail, "protocol violation, not reconnecting");
     connection.close(
@@ -4416,7 +4416,7 @@ const LOSS_REPORT_REFRESH: Duration = Duration::from_secs(3);
 const _: () = assert!(LOSS_REPORT_REFRESH.as_secs() + 2 < pl::LOSS_REPORT_TTL_S);
 
 /// Whether this window's figure for a speaker goes out as `LossReport`
-/// (`PROTOCOL.md` §2.2 Nr. 11): a change of at least [`LOSS_REPORT_STEP`];
+/// (`docs/reference/protocol.md` §2.2 Nr. 11): a change of at least [`LOSS_REPORT_STEP`];
 /// and a figure other than 0 also once the last report is
 /// [`LOSS_REPORT_REFRESH`] old, and in the first window with traffic after
 /// one without (`resumed`). The server forgets a report after 6 s and then
@@ -4779,7 +4779,7 @@ async fn handle_control(
     None
 }
 
-/// The `SetState` budget: a token bucket like the server's (`PROTOCOL.md`
+/// The `SetState` budget: a token bucket like the server's (`docs/reference/protocol.md`
 /// §2.2 Nr. 5, 20 per second, burst 20), at three quarters of its size, so
 /// the client never sends what the server would answer with `RATE_LIMITED`
 /// and drop — three of those within 60 s would even be `RATE_LIMITED_FATAL`.
@@ -5115,7 +5115,7 @@ mod tests {
 
     /// A frame that does not decode, or breaks the framing, is a protocol
     /// violation and ends the client's attempts; a broken stream is just the
-    /// connection going away (`PROTOCOL.md` §5, §6).
+    /// connection going away (`docs/reference/protocol.md` §5, §6).
     #[test]
     fn an_undecodable_control_message_is_a_violation() {
         let ping = ControlMsg::Ping { nonce: 7 }.encode().unwrap();

@@ -1,4 +1,4 @@
-//! ASCII-armored identity bundle (`PROTOCOL.md` §2.3, §2.3.1).
+//! ASCII-armored identity bundle (`docs/reference/protocol.md` §2.3, §2.3.1).
 //!
 //! Private key, client leaf, CA and the server's com key in one block a user
 //! can copy into another installation, optionally with the exporting client's

@@ -1,5 +1,5 @@
 //! A viewer whose downlink is too narrow for the video it asks for
-//! (`PROTOCOL.md` §4; readiness review 2026-09-27, S3).
+//! (`docs/reference/protocol.md` §4; readiness review 2026-09-27, S3).
 //!
 //! The server keeps at most `VIDEO_UNACKED_PER_PAIR` frames per pair
 //! unacknowledged. Such a viewer therefore drops frames and stays close to

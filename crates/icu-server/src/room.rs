@@ -1,5 +1,5 @@
 //! Participant list, session id assignment and broadcast
-//! (`Server/IMPLEMENTATION.md` §6.4).
+//! (`docs/reference/server.md` §6.4).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,7 +14,7 @@ use bytes::Bytes;
 use icu_proto::{ControlMsg, Session, UserFlags, UserId, UserInfo};
 use tokio::sync::mpsc;
 
-/// Talk spurt tracking for one sender (`PROTOCOL.md` §2.1).
+/// Talk spurt tracking for one sender (`docs/reference/protocol.md` §2.1).
 ///
 /// The server derives `speaking` from the datagram flow: the first datagram
 /// after at least `silence` of quiet turns it on, the `END` flag or `silence`
@@ -99,7 +99,7 @@ pub struct Member {
     pub last_keyframe: Option<Instant>,
     /// Set just before the server closes this connection itself, so that
     /// `UserLeft.reason` carries the code the server closed with
-    /// (`Server/IMPLEMENTATION.md` §6.4.6).
+    /// (`docs/reference/server.md` §6.4.6).
     pub close_code: Option<u32>,
 }
 
@@ -163,7 +163,7 @@ pub enum JoinError {
 /// The next free session id from `*next` on, advancing it. Monotonic until
 /// `u16` runs out, then it wraps to 1 and skips ids still in use: with at
 /// most `max_users` members there is always one free, and an id comes back
-/// only after 65 534 others have been handed out (`PROTOCOL.md` §1). Without
+/// only after 65 534 others have been handed out (`docs/reference/protocol.md` §1). Without
 /// the wrap, a client reconnecting in a loop exhausted the space in about
 /// two hours, and the server then turned everybody away until restarted.
 fn allocate_session(next: &mut Session, in_use: impl Fn(Session) -> bool) -> Session {
@@ -353,8 +353,8 @@ impl Room {
     /// Everything the audio relay needs from the room, in **one** lock: the
     /// sender's flags, and — unless it is muted — the connections to fan the
     /// datagram out to, which is everybody else who is not deafened
-    /// (`PROTOCOL.md` §3), plus the talk spurt bookkeeping (`PROTOCOL.md`
-    /// §2.1, `Server/IMPLEMENTATION.md` §6.5): `end` closes the spurt, any
+    /// (`docs/reference/protocol.md` §3), plus the talk spurt bookkeeping (`docs/reference/protocol.md`
+    /// §2.1, `docs/reference/server.md` §6.5): `end` closes the spurt, any
     /// other datagram is noted. The second value is the new flags when
     /// `speaking` flipped, for the `UserState` broadcast. Returns `None` when
     /// the sender has already left.
@@ -417,8 +417,8 @@ impl Room {
     }
 
     /// Connections to hand a video frame to: everybody else who is viewing
-    /// (`PROTOCOL.md` §4). A user's own deafen only concerns audio; one an
-    /// admin enforces cuts video as well (`PROTOCOL.md` §2.2 Nr. 33).
+    /// (`docs/reference/protocol.md` §4). A user's own deafen only concerns audio; one an
+    /// admin enforces cuts video as well (`docs/reference/protocol.md` §2.2 Nr. 33).
     pub fn video_receivers(&self, sender: Session) -> Vec<(Session, quinn::Connection)> {
         self.lock()
             .members
@@ -497,7 +497,7 @@ impl Room {
 
     /// One `(session, rtt_ms)` pair per member, from the server's own QUIC
     /// path RTT measurement — not a client self-reported value
-    /// (`PROTOCOL.md` §2.2 `UserRtt`). Empty when fewer than two members are
+    /// (`docs/reference/protocol.md` §2.2 `UserRtt`). Empty when fewer than two members are
     /// present: a lone participant has nobody to show a ping to.
     pub fn rtt_snapshot(&self) -> Vec<(Session, u16)> {
         let state = self.lock();
@@ -590,7 +590,7 @@ fn encode(msg: &ControlMsg) -> Option<Bytes> {
 }
 
 /// Relay and connection counters, exposed through `status`
-/// (`Server/IMPLEMENTATION.md` §7).
+/// (`docs/reference/server.md` §7).
 #[derive(Debug, Default)]
 pub struct Counters {
     /// Accepted connections, total since the start; what is open right now
@@ -668,7 +668,7 @@ impl Counters {
 mod tests {
     use super::*;
 
-    /// §10 / `PROTOCOL.md` §2.1: the server derives `speaking` from the
+    /// §10 / `docs/reference/protocol.md` §2.1: the server derives `speaking` from the
     /// datagram flow. A `quinn::Connection` has no public constructor, so the
     /// room itself is covered by the integration tests; the decision logic is
     /// tested here.

@@ -1,4 +1,4 @@
-//! Registration with a bundle (`PROTOCOL.md` §2.3, `Client/IMPLEMENTATION.md`
+//! Registration with a bundle (`docs/reference/protocol.md` §2.3, `docs/reference/client.md`
 //! §5).
 //!
 //! A registration bundle is a passport whose certificate is a short-lived
@@ -34,7 +34,7 @@ pub fn is_registration(leaf_der: &[u8]) -> bool {
 /// identity on a fresh key, carrying `name`, under `paths` and returns it.
 ///
 /// Stored before the session closes, because the clean close is the receipt
-/// that makes the server revoke the bundle (`PROTOCOL.md` §2.3): when saving
+/// that makes the server revoke the bundle (`docs/reference/protocol.md` §2.3): when saving
 /// fails, the session ends with another code and the bundle stays usable for
 /// another attempt. A server that does not take the bundle for a
 /// registration (`Welcome.registration` false) gets no receipt and the
@@ -110,7 +110,7 @@ pub async fn register(
 /// The close code that ends a registration session: `REGISTRATION_STORED`
 /// only once the new identity is stored, which tells the server to revoke the
 /// bundle. Anything else keeps it valid, including the code 0 quinn closes
-/// with when a connection is merely dropped (`PROTOCOL.md` §2.3).
+/// with when a connection is merely dropped (`docs/reference/protocol.md` §2.3).
 pub fn receipt(stored: bool) -> quinn::VarInt {
     quinn::VarInt::from_u32(if stored {
         icu_proto::error::REGISTRATION_STORED
@@ -134,7 +134,7 @@ pub async fn complete(
 }
 
 /// Renews an **expired** certificate on a renew-only session
-/// (`PROTOCOL.md` §2.3): the same key, the stored `name`, a new leaf. The
+/// (`docs/reference/protocol.md` §2.3): the same key, the stored `name`, a new leaf. The
 /// handshake with the expired leaf proved the key; the server was checked
 /// against the CA as always. The key is kept so passports exported from this
 /// device keep matching.
@@ -150,7 +150,7 @@ pub async fn renew_expired(
 
 /// How long [`exchange`] waits for the server's answer, writing included:
 /// well inside the 120 s a registration session may stay open
-/// (`PROTOCOL.md` §2.3), and a server that sends something else or nothing
+/// (`docs/reference/protocol.md` §2.3), and a server that sends something else or nothing
 /// at all must not leave the first-start window busy for good.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -241,7 +241,7 @@ async fn answer(
 ///
 /// The one place a name goes into a certificate request: registration and
 /// renewal must not drift apart, because the server reads the CN as the
-/// display name (`PROTOCOL.md` §2.3).
+/// display name (`docs/reference/protocol.md` §2.3).
 pub fn csr_for(cn: &str, key: &rcgen::KeyPair) -> Result<Vec<u8>, NetError> {
     // Only the rules every issued name met: renewals carry a stored name that
     // may predate the strict ones. New names are checked by the callers.

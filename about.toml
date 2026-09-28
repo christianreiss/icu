@@ -19,7 +19,7 @@ targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
 
-# `license-file = COPYING`, verbatim Google BSD-3-Clause (deny.toml, Research/aec.md E6).
+# `license-file = COPYING`, verbatim Google BSD-3-Clause (deny.toml, docs/research/aec.md E6).
 # Checksums are SHA-256 of COPYING in the 2.1.0 crates; a version bump must
 # re-check the text.
 [webrtc-audio-processing.clarify]

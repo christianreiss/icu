@@ -1,4 +1,4 @@
-//! The admin CLI (`Server/IMPLEMENTATION.md` §5).
+//! The admin CLI (`docs/reference/server.md` §5).
 //!
 //! Every command except `run` talks to the running server over the admin
 //! socket, so a change takes effect immediately instead of at the next

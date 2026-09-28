@@ -1,4 +1,4 @@
-//! Load and network tests (`Server/IMPLEMENTATION.md` §10, rows "Last" and
+//! Load and network tests (`docs/reference/server.md` §10, rows "Last" and
 //! "Netz").
 //!
 //! Both are `#[ignore]`d: they take tens of seconds and the netem one needs
@@ -68,7 +68,7 @@ fn cpu_seconds() -> f64 {
 async fn datagram_load() {
     let seconds = load_seconds();
     // 16 clients enrol and connect back to back from 127.0.0.1, which is well
-    // over the 10 handshakes/s per IP of `PROTOCOL.md` §7. That limit is meant
+    // over the 10 handshakes/s per IP of `docs/reference/protocol.md` §7. That limit is meant
     // for the internet, not for a loopback benchmark.
     let server = TestServer::start_with(|config| {
         config.limits.handshakes_per_ip_per_s = 10_000;

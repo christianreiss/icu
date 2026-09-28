@@ -1,7 +1,7 @@
 //! XDG GlobalShortcuts portal (ashpd 0.13).
 //!
 //! What the user answers in the portal's dialog counts as their decision
-//! (`Client/IMPLEMENTATION.md` §7): cancelling it, confirming it without a
+//! (`docs/reference/client.md` §7): cancelling it, confirming it without a
 //! key, or leaving it unanswered is [`Error::Declined`], and the caller does
 //! not fall back to reading every keyboard through evdev. Only a portal that
 //! is missing or fails is [`Error::Unavailable`] (Spike 4a).

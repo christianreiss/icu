@@ -1,5 +1,5 @@
 //! Registration certificates, the only way onto the server
-//! (`PROTOCOL.md` §2.3, `Server/IMPLEMENTATION.md` §6.3).
+//! (`docs/reference/protocol.md` §2.3, `docs/reference/server.md` §6.3).
 //!
 //! An admin (CLI or `CreateInviteRequest`) gets a **registration bundle**: a
 //! freshly generated key, a short-lived certificate on it and the CA, armored
@@ -35,7 +35,7 @@ pub struct Issued {
     /// Whether this is the first user, and therefore an admin.
     pub is_admin: bool,
     /// Whether some admin has confirmed a registration. While none has,
-    /// whoever confirms one first becomes admin (`PROTOCOL.md` §2.3).
+    /// whoever confirms one first becomes admin (`docs/reference/protocol.md` §2.3).
     pub admin_confirmed: bool,
 }
 
@@ -115,7 +115,7 @@ pub async fn issue(
         // Signed inline with the CA key, which never travels inside the
         // bundle itself: tampering with the armored text afterwards — the
         // com key included, otherwise uncovered by anything else here — no
-        // longer imports silently (`PROTOCOL.md` §2.3.1).
+        // longer imports silently (`docs/reference/protocol.md` §2.3.1).
         bundle.signature = ca.sign_raw(&bundle.signable_bytes())?;
         bundle
     };

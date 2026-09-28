@@ -1,5 +1,5 @@
 //! What a received access unit may ask of the decoder, read from its SPS
-//! before the decoder sees it (`PROTOCOL.md` §4). The encoder of a modified
+//! before the decoder sees it (`docs/reference/protocol.md` §4). The encoder of a modified
 //! client is not bound to the 320×240 profile; openh264 itself accepts up
 //! to level 5.2 (about 9.4 Mpx), and a frame that size costs every viewer
 //! tens of MB and a stalled decode thread. Only the fields up to

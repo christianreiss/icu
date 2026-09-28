@@ -12,12 +12,12 @@
 #                   BUILDINFO says DIRTY, packaging/release.sh refuses it)
 #   NO_AEC=1        build without the echo canceller (feature `aec`)
 #
-# Cross-built on Fedora for x86_64-pc-windows-gnu (Research/cross-compile.md):
+# Cross-built on Fedora for x86_64-pc-windows-gnu (docs/research/cross-compile.md):
 # needs mingw64-gcc, mingw64-gcc-c++, mingw64-winpthreads-static,
 # mingw64-binutils (windres for the icon and version resource),
 # rust-std-static-x86_64-pc-windows-gnu, meson, ninja, zip, cargo-about
 # 0.9.2 and cargo-deny 0.20.2 (same versions as the Linux build container). The exe is
-# unsigned; SmartScreen warns on first start (Research/packaging-licensing.md).
+# unsigned; SmartScreen warns on first start (docs/research/packaging-licensing.md).
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
@@ -39,8 +39,9 @@ fi
 COMMIT=$(git rev-parse HEAD)
 
 # openh264 asks for libstdc++ dynamically; this copy links it statically
-# (build/win-static/README.md).
-cp -u /usr/x86_64-w64-mingw32/sys-root/mingw/lib/libstdc++.a build/win-static/
+# (packaging/windows/toolchain/README.md).
+mkdir -p target/windows-static
+cp -u /usr/x86_64-w64-mingw32/sys-root/mingw/lib/libstdc++.a target/windows-static/
 
 features=gui,camera,tray,overlay
 if [ "${NO_AEC:-0}" != 1 ]; then
@@ -52,15 +53,15 @@ log "supply chain: cargo deny"
 cargo deny --locked check
 
 log "cargo build --release --target $TARGET ($features)"
-# build/win-aec/meson hands webrtc-audio-processing's meson the mingw cross
-# file (Research/aec.md, A1).
-PATH="$ROOT/build/win-aec:$PATH" cargo build --release --locked -p icu-client \
+# packaging/windows/toolchain/meson hands webrtc-audio-processing's meson the mingw cross
+# file (docs/research/aec.md, A1).
+PATH="$ROOT/packaging/windows/toolchain:$PATH" cargo build --release --locked -p icu-client \
     --target "$TARGET" --no-default-features --features "$features"
 EXE=target/$TARGET/release/icu.exe
 
 log "imports: Windows system DLLs only"
 # Everything a stock Windows 10/11 ships. mf*.dll are missing on N/KN
-# editions without the Media Feature Pack (camera, Client/IMPLEMENTATION.md §1).
+# editions without the Media Feature Pack (camera, docs/reference/client.md §1).
 allowed='^(advapi32|api-ms-win-core-[a-z0-9-]+|bcrypt|bcryptprimitives|combase|comctl32|crypt32|d3d11|d3d12|dwmapi|dxgi|gdi32|imm32|kernel32|mf|mfplat|mfreadwrite|mmdevapi|msvcrt|ntdll|ole32|oleaut32|opengl32|propsys|rpcrt4|secur32|setupapi|shell32|shlwapi|uiautomationcore|user32|userenv|uxtheme|winmm|ws2_32|wtsapi32|avrt)\.dll$'
 dlls=$(x86_64-w64-mingw32-objdump -p "$EXE" | awk '/DLL Name:/{print tolower($3)}' | sort -u)
 bad=$(echo "$dlls" | grep -Ev "$allowed" || true)
@@ -85,7 +86,7 @@ cargo about generate --locked --fail --target "$TARGET" \
     cat crates/icu-client/assets/fonts/inter/LICENSE.txt
 } >> "$WORK/THIRD-PARTY-LICENSES.txt"
 # Statically linked native code that no crate declares
-# (Research/packaging-licensing.md item 11): the mingw-w64 CRT and
+# (docs/research/packaging-licensing.md item 11): the mingw-w64 CRT and
 # winpthreads, libgcc and libstdc++ (GCC Runtime Library Exception), and
 # with `aec` abseil, which meson fetches as a subproject of
 # webrtc-audio-processing. The texts in packaging/windows/notices/ come from

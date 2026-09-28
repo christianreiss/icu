@@ -282,7 +282,7 @@ fn in_window(cli: &Cli) -> bool {
 fn import_in_terminal(cli: &Cli, paths: &Paths, text: &str) -> Result<(), String> {
     let (mut identity, settings) = Identity::from_passport_with_settings(text)?;
     // A passport brings its own CA and address: show where it leads
-    // before anything is replaced (`PROTOCOL.md` §2.3.1).
+    // before anything is replaced (`docs/reference/protocol.md` §2.3.1).
     let current = Identity::load(paths).ok().flatten();
     let summary = icu_client::config::ImportSummary::of(&identity, current.as_ref());
     for line in summary.lines() {

@@ -1,5 +1,5 @@
 //! Certificate lifetimes. An expired client certificate renews itself on a
-//! renew-only session (`PROTOCOL.md` §2.3.3), however long ago it expired,
+//! renew-only session (`docs/reference/protocol.md` §2.3.3), however long ago it expired,
 //! without anyone trusting anything new: the key is proven in the handshake,
 //! the record in the store admits it, the CA still vouches for the server.
 //! And no re-issue outside the renewal window extends a certificate.
@@ -156,7 +156,7 @@ async fn an_expired_certificate_cannot_rename_or_renew_twice_in_an_hour() {
 }
 
 /// An expired certificate renews onto its own key and no other
-/// (`PROTOCOL.md` §2.3.3): the handshake proved that key, nothing more.
+/// (`docs/reference/protocol.md` §2.3.3): the handshake proved that key, nothing more.
 #[tokio::test]
 async fn an_expired_certificate_renews_onto_its_own_key_only() {
     let (server, alice) = expired_user("alice").await;
@@ -251,7 +251,7 @@ async fn renew_only_session(server: &TestServer, identity: &Identity) -> common:
 }
 
 /// One renew-only session per certificate, the newest wins — like room
-/// sessions, but in a table of their own (`PROTOCOL.md` §7).
+/// sessions, but in a table of their own (`docs/reference/protocol.md` §7).
 #[tokio::test]
 async fn a_second_renew_only_session_replaces_the_first() {
     let (server, alice) = expired_user("alice").await;
@@ -309,7 +309,7 @@ async fn kick_disable_and_revoke_close_a_renew_only_session() {
 
 /// A copy of an expired certificate whose renew-only session is still open
 /// when its owner's successor logs in is closed with it: the retirement
-/// reaches renew-only sessions as well (`PROTOCOL.md` §2.2 Nr. 10).
+/// reaches renew-only sessions as well (`docs/reference/protocol.md` §2.2 Nr. 10).
 #[tokio::test]
 async fn a_successor_login_closes_a_renew_only_session_on_the_old_certificate() {
     let (server, alice) = expired_user("alice").await;
@@ -413,7 +413,7 @@ fn validity(der: &[u8]) -> (i64, i64) {
 }
 
 /// A re-issue outside the renewal window never extends a certificate: a
-/// rename gets exactly the old validity (`PROTOCOL.md` §2.2 Nr. 9).
+/// rename gets exactly the old validity (`docs/reference/protocol.md` §2.2 Nr. 9).
 #[tokio::test]
 async fn a_rename_outside_the_window_keeps_the_validity() {
     let server = TestServer::start().await;

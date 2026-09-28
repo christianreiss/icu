@@ -1,4 +1,4 @@
-//! Pairs AEC reference blocks with capture blocks (`Research/aec.md`).
+//! Pairs AEC reference blocks with capture blocks (`docs/research/aec.md`).
 //!
 //! Capture and reference are two PipeWire streams in one `node.group`, so
 //! both callbacks push the same number of samples per graph cycle, one right

@@ -1,4 +1,4 @@
-//! Speaking overlay (`Client/IMPLEMENTATION.md` §9): a click-through window
+//! Speaking overlay (`docs/reference/client.md` §9): a click-through window
 //! above everything that shows, for everyone whose camera is on, a camera
 //! tile with the name, and for everyone without one a name plate while they
 //! talk — so the overlay answers „wer spricht?" in a voice-only round too.

@@ -1,14 +1,14 @@
-# Nur der Windows-gnu-Teil des Rezepts aus Research/cross-compile.md.
+# Nur der Windows-gnu-Teil des Rezepts aus docs/research/cross-compile.md.
 # Der musl-Block von dort fehlt bewusst: das Fedora-`rust`-Paket hat keine
 # musl-Std, der Server-Static-Build laeuft ueber einen Container
 # (siehe deploy/README.md). Auf dem Host-Target hat diese Datei keine Wirkung.
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-ar"
-# build/win-static/ enthaelt NUR libstdc++.a (Kopie aus
+# target/windows-static/ enthaelt NUR libstdc++.a (Kopie aus
 # /usr/x86_64-w64-mingw32/sys-root/mingw/lib/); -static-libstdc++ wirkt bei rustc
 # nicht, weil openh264-sys2 `-lstdc++` dynamisch anfordert (Spike 1).
-rustflags = ["-L", "native=build/win-static", "-C", "link-arg=-static-libgcc", "-C", "link-arg=-static"]
+rustflags = ["-L", "native=target/windows-static", "-C", "link-arg=-static-libgcc", "-C", "link-arg=-static"]
 
 [env]
 CC_x86_64_pc_windows_gnu = "x86_64-w64-mingw32-gcc"

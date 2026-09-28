@@ -1,4 +1,4 @@
-//! The name lives in the certificate (`PROTOCOL.md` §2.1): renaming issues a
+//! The name lives in the certificate (`docs/reference/protocol.md` §2.1): renaming issues a
 //! new certificate, a device that missed a rename catches up by itself, and a
 //! passport moves the whole identity to another installation.
 //!
@@ -381,7 +381,7 @@ async fn a_passport_import_recovers_from_a_fatal_state() {
 
 /// The clean close after `RenewResponse` is the receipt that revokes the
 /// bundle, so it is sent only once the identity is on disk: a failed save
-/// leaves the bundle usable for another attempt (`PROTOCOL.md` §2.3).
+/// leaves the bundle usable for another attempt (`docs/reference/protocol.md` §2.3).
 #[tokio::test]
 async fn a_failed_save_does_not_burn_the_bundle() {
     use icu_client::net::register::register;
@@ -432,7 +432,7 @@ async fn a_certificate_the_server_does_not_register_is_not_reported_as_stored() 
 }
 
 /// Two devices share one passport. Device A renames and logs in with the new
-/// certificate, which revokes every older one (`PROTOCOL.md` §2.2 Nr. 10).
+/// certificate, which revokes every older one (`docs/reference/protocol.md` §2.2 Nr. 10).
 /// Device B, still on the old certificate, is refused — and told to fetch the
 /// passport from the other device, not to ask for an invitation (which would
 /// create a second account).

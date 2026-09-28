@@ -1,4 +1,4 @@
-//! Video relay and the feedback messages (`Server/IMPLEMENTATION.md` §10:
+//! Video relay and the feedback messages (`docs/reference/server.md` §10:
 //! video relay with frame dropping, `LossReport` -> `LossHint`,
 //! `KeyframeRequest` forwarding).
 
@@ -354,7 +354,7 @@ async fn stop_code(send: &mut quinn::SendStream, within: Duration) -> Option<u32
 
 /// A frame whose sender stops writing, in the header or in the payload, is
 /// dropped after `timing.video_frame_timeout_ms` instead of holding a relay
-/// task for as long as the connection lives (`PROTOCOL.md` §4).
+/// task for as long as the connection lives (`docs/reference/protocol.md` §4).
 #[tokio::test]
 async fn a_stalled_video_frame_is_dropped() {
     let server = TestServer::start_with(|c| c.timing.video_frame_timeout_ms = 300).await;
@@ -407,7 +407,7 @@ async fn more_frames_in_flight_than_a_camera_sends_are_refused() {
 }
 
 /// The flow control windows are no size limit: a frame of the largest size
-/// the protocol allows still flows, window by window (`PROTOCOL.md` §1, §4).
+/// the protocol allows still flows, window by window (`docs/reference/protocol.md` §1, §4).
 #[tokio::test]
 async fn a_video_frame_of_the_maximum_size_still_flows() {
     let server = TestServer::start().await;
@@ -604,7 +604,7 @@ async fn a_receiver_without_stream_credit_has_a_bounded_frame_wait() {
         "expired frame is discarded"
     );
     // Bob never got frame 1, so a delta is useless to him until the next
-    // keyframe (`PROTOCOL.md` §4): it is dropped, the keyframe passes.
+    // keyframe (`docs/reference/protocol.md` §4): it is dropped, the keyframe passes.
     alice.send_video(2, 3200, false, &[0x43; 200]).await;
     assert!(
         bob.recv_video(BRIEFLY).await.is_none(),

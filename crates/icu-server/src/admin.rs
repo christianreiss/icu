@@ -1,5 +1,5 @@
 //! Admin socket: `/run/icu/admin.sock`, one JSON request line, one JSON
-//! response line, then close (`Server/IMPLEMENTATION.md` §5). A request line
+//! response line, then close (`docs/reference/server.md` §5). A request line
 //! is at most [`MAX_REQUEST_LINE`], at most [`MAX_CONNECTIONS`] are served at
 //! once, and `timing.admin_timeout_ms` bounds the wait for the request and
 //! for the client to take the answer.
@@ -36,7 +36,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum AdminRequest {
-    /// Issue a registration bundle (`PROTOCOL.md` §2.3).
+    /// Issue a registration bundle (`docs/reference/protocol.md` §2.3).
     Invite {
         /// Placeholder name until the invited user picks their own. Empty or
         /// absent means a generated one.
@@ -763,7 +763,7 @@ fn status(server: &Arc<Server>) -> serde_json::Value {
         "connections": Counters::get(&c.connections),
         "open_connections": server.open_connections.load(Relaxed),
         "handshakes": server.handshakes.load(Relaxed),
-        // Datagrams without a valid com tag (`PROTOCOL.md` §1): port noise,
+        // Datagrams without a valid com tag (`docs/reference/protocol.md` §1): port noise,
         // or a client whose passport belongs to another key.
         "com_dropped": server.com_dropped.load(Relaxed),
         "roomless_sessions": crate::lock(&server.roomless).len(),

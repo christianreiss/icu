@@ -1,4 +1,4 @@
-//! Control channel behaviour (`Server/IMPLEMENTATION.md` §10: Hello-Timeout,
+//! Control channel behaviour (`docs/reference/server.md` §10: Hello-Timeout,
 //! `SERVER_FULL`, `Ping`/`Pong`, rename through `RenewRequest`, `Hello.name`,
 //! rate limits).
 
@@ -154,7 +154,7 @@ async fn ping_is_answered_with_a_plausible_pong() {
 }
 
 /// A rename is a renewal carrying a new CN: the name lives in the certificate
-/// (`PROTOCOL.md` §2.2).
+/// (`docs/reference/protocol.md` §2.2).
 #[tokio::test]
 async fn renewal_with_a_new_cn_renames_and_broadcasts_user_renamed() {
     let server = TestServer::start().await;
@@ -192,7 +192,7 @@ async fn renewal_with_a_new_cn_renames_and_broadcasts_user_renamed() {
     }
 
     // The pre-rename certificate stays valid until the renamed one first
-    // logs in (`PROTOCOL.md` §2.2 Nr. 10), and sees the current name.
+    // logs in (`docs/reference/protocol.md` §2.2 Nr. 10), and sees the current name.
     let mut stale = server.connect(&old).await.expect("old cert still connects");
     match stale.hello("alice").await {
         ControlMsg::Welcome { you, .. } => assert_eq!(you.name, "alicia"),

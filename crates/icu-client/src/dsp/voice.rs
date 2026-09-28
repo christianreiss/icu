@@ -1,9 +1,9 @@
 //! Optional voice optimizer: 80 Hz high-pass → compressor → peak limiter.
 //!
-//! Fixed, non-adaptive dynamics (no AGC, `Research/feature-freeze.md`).
+//! Fixed, non-adaptive dynamics (no AGC, `docs/reference/features.md`).
 //! Nonlinear, therefore strictly **after** AEC: in front of it the adaptive
 //! filter would lose the linear relation to the reference
-//! (`Research/aec.md`). No lookahead, so no added latency. Works on any
+//! (`docs/research/aec.md`). No lookahead, so no added latency. Works on any
 //! block length at 48 kHz, allocates nothing per block.
 
 use serde::{Deserialize, Serialize};

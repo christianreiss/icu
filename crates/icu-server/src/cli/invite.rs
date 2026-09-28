@@ -1,6 +1,6 @@
 //! `icu-server invite [--name neu-bob] [--ttl 24h] [--out bundle.txt]`
 //!
-//! Issues a registration bundle (`PROTOCOL.md` §2.3): one-time key,
+//! Issues a registration bundle (`docs/reference/protocol.md` §2.3): one-time key,
 //! short-lived registration certificate and CA, armored as a passport. The
 //! invited user imports it and picks their own name; `--name` is only the
 //! placeholder until then. Works without a running server too, which is how
@@ -49,7 +49,7 @@ pub async fn run(
 
 /// What to point out while no admin has confirmed a registration: not the
 /// first bundle issued makes its holder admin, the first one completed does
-/// (`PROTOCOL.md` §2.3).
+/// (`docs/reference/protocol.md` §2.3).
 fn admin_hint(value: &serde_json::Value) -> Option<&'static str> {
     (value.get("admin_confirmed").and_then(|v| v.as_bool()) == Some(false)).then_some(
         "note: no admin has registered yet. Whoever completes a registration first \

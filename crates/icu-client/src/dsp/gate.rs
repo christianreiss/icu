@@ -1,4 +1,4 @@
-//! PTT/VAD gate state machine (`Client/IMPLEMENTATION.md` §6).
+//! PTT/VAD gate state machine (`docs/reference/client.md` §6).
 //!
 //! Evaluated once per Opus frame. The gate sits behind AEC and denoise; both
 //! keep running while the gate is closed.

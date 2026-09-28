@@ -1,9 +1,9 @@
-//! Persistent state: `users.toml`, `state.lock` (`Server/IMPLEMENTATION.md`
+//! Persistent state: `users.toml`, `state.lock` (`docs/reference/server.md`
 //! §4).
 //!
 //! There is no invite table: an invitation is a registration certificate,
 //! recorded like any other certificate with `registration = true`
-//! (`PROTOCOL.md` §2.3). A leftover `invites.toml` from before is ignored.
+//! (`docs/reference/protocol.md` §2.3). A leftover `invites.toml` from before is ignored.
 //!
 //! All writes are atomic (temp file + rename) and happen while `state.lock` is
 //! held with `flock`. A running server holds that lock for its whole lifetime
@@ -28,21 +28,21 @@ use crate::error::{Context, Error, Result};
 /// Schema version of the state file.
 pub const SCHEMA: u32 = 1;
 
-/// Redeems of one registration bundle without a receipt (`PROTOCOL.md`
+/// Redeems of one registration bundle without a receipt (`docs/reference/protocol.md`
 /// §2.3). One is the rule, a second repairs a lost answer; past this many
 /// something is wrong, and each one costs a certificate on the CRL.
 pub const REDEEMS_PER_BUNDLE: usize = 5;
 
 /// File name of the user database.
 pub const USERS_FILE: &str = "users.toml";
-/// File name of the com key (`PROTOCOL.md` §1), base64, mode 0600.
+/// File name of the com key (`docs/reference/protocol.md` §1), base64, mode 0600.
 pub const COM_KEY_FILE: &str = "com.key";
 /// File name of the lock file.
 pub const LOCK_FILE: &str = "state.lock";
 
 /// Formats a timestamp as RFC 3339 in UTC.
 pub fn rfc3339(t: OffsetDateTime) -> String {
-    // Whole seconds, as in the examples of `Server/IMPLEMENTATION.md` §4.
+    // Whole seconds, as in the examples of `docs/reference/server.md` §4.
     t.to_offset(time::UtcOffset::UTC)
         .replace_nanosecond(0)
         .unwrap_or(t)
@@ -119,7 +119,7 @@ pub struct CertRecord {
     /// device that still has its own catch-up to do.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renewed: Option<String>,
-    /// A registration certificate (`PROTOCOL.md` §2.3): its session may only
+    /// A registration certificate (`docs/reference/protocol.md` §2.3): its session may only
     /// swap it for a certificate on the client's own key, and it is revoked
     /// once the client confirms it stored that one
     /// ([`Store::consume_registration`]).
@@ -133,7 +133,7 @@ pub struct CertRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub superseded: bool,
     /// Serial number, lowercase hex of the DER integer's content octets —
-    /// what the CRL lists (`PROTOCOL.md` §1). `None` for records written
+    /// what the CRL lists (`docs/reference/protocol.md` §1). `None` for records written
     /// before the CRL existed; those stay covered by the fingerprint check
     /// alone, since the DER is not kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,7 +169,7 @@ impl CertRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
     /// Display name — a mirror of the subject CN of the most recently issued
-    /// certificate (`PROTOCOL.md` §2.1). Only `Store::add_user` and
+    /// certificate (`docs/reference/protocol.md` §2.1). Only `Store::add_user` and
     /// `Store::add_cert` write it.
     pub name: String,
     /// When the user was enrolled, RFC 3339 UTC.
@@ -227,7 +227,7 @@ pub struct UsersFile {
     /// Next `user_id` to hand out.
     pub next_user_id: UserId,
     /// Number of the most recently issued CRL; strictly increasing, so a
-    /// client can refuse an older one (`PROTOCOL.md` §2.2 `CrlUpdate`).
+    /// client can refuse an older one (`docs/reference/protocol.md` §2.2 `CrlUpdate`).
     #[serde(default)]
     pub crl_number: u64,
     /// Server leaves replaced by `rotate-server-cert`. They stay on the CRL
@@ -472,7 +472,7 @@ impl Store {
     /// CN as the user's current name — together with [`Store::add_user`] the
     /// only writer of `UserRecord.name`. The older certificates stay valid
     /// until the new one first logs in, which retires them
-    /// ([`Store::retire_predecessors`], `PROTOCOL.md` §2.2 Nr. 10).
+    /// ([`Store::retire_predecessors`], `docs/reference/protocol.md` §2.2 Nr. 10).
     ///
     /// `supersedes` stamps the certificate the request was made with, and is
     /// passed only for catch-up renewals — that stamp is what bounds them.
@@ -688,7 +688,7 @@ impl Store {
     }
 
     /// Records an invited user with their registration certificate
-    /// (`PROTOCOL.md` §2.3). The certificate's CN is the placeholder name,
+    /// (`docs/reference/protocol.md` §2.3). The certificate's CN is the placeholder name,
     /// which has to be free like any other. The first registration against an
     /// empty store is marked admin — provisionally: who ends up admin is
     /// decided when a registration is confirmed ([`Store::consume_registration`]).
@@ -811,7 +811,7 @@ impl Store {
     /// Revokes every certificate of the user issued before `fingerprint`,
     /// once that one logs in: its first login proves the client stored it,
     /// so whatever it replaced — on this device or on any other holding a
-    /// copy — is invalid from then on, expired or not (`PROTOCOL.md` §2.2
+    /// copy — is invalid from then on, expired or not (`docs/reference/protocol.md` §2.2
     /// Nr. 10). Registration certificates are left to
     /// [`Store::consume_registration`]. Returns the fingerprints revoked.
     pub fn retire_predecessors(&mut self, id: UserId, fingerprint: &str) -> Result<Vec<String>> {
@@ -936,7 +936,7 @@ impl Store {
 
 /// Whether a certificate record is still worth keeping. An expired client
 /// certificate still authenticates a renew-only session, so its holder can
-/// renew after missing the window (`PROTOCOL.md` §2.3); the record is what
+/// renew after missing the window (`docs/reference/protocol.md` §2.3); the record is what
 /// admits it, with no time limit. Revoked ones stay too: they are what makes a
 /// revoke visible, and what `is_revoked` counts. Only a consumed registration
 /// certificate goes once expired, its revocation only ever meant "used". At
@@ -1012,7 +1012,7 @@ fn first_users(dir: &Path) -> Result<UsersFile> {
 }
 
 /// Writes `contents` atomically: temp file in the same directory, fsync,
-/// rename, fsync of the directory (`Server/IMPLEMENTATION.md` §4). `mode` is
+/// rename, fsync of the directory (`docs/reference/server.md` §4). `mode` is
 /// the permission bits of the result, whatever the umask; `owner` says whose
 /// it is.
 ///
@@ -1815,7 +1815,7 @@ mod tests {
     /// confirmed yet does not let the last confirmed admin step down. The
     /// server used to end with the admin gone, the promoted invitee's mark
     /// wiped and a third, never promoted user admin — against "immer genau
-    /// einen Admin" (`PROTOCOL.md` §2.3).
+    /// einen Admin" (`docs/reference/protocol.md` §2.3).
     #[test]
     fn a_pending_admin_does_not_count_for_the_last_admin_guard() {
         let (_dir, mut s) = store();

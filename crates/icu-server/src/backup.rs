@@ -1,5 +1,5 @@
 //! Automatic snapshots of the state directory, and restoring one
-//! (`Server/IMPLEMENTATION.md` §4, runbook "Backup und Restore" in
+//! (`docs/reference/server.md` §4, runbook "Backup und Restore" in
 //! `deploy/README.md`).
 //!
 //! A snapshot is a directory `<backup dir>/<UTC time>/` with copies of the

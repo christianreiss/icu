@@ -1,5 +1,5 @@
-//! Opus encoder/decoder wrappers with the v1 profile (`PROTOCOL.md` §3,
-//! `Client/IMPLEMENTATION.md` §6), directly over `opusic-sys`: the `opus`
+//! Opus encoder/decoder wrappers with the v1 profile (`docs/reference/protocol.md` §3,
+//! `docs/reference/client.md` §6), directly over `opusic-sys`: the `opus`
 //! crate has no decoder complexity control, and Deep PLC needs one.
 
 use std::ffi::{c_int, CStr};
@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(dec.complexity().unwrap(), DECODER_COMPLEXITY);
     }
 
-    /// The 10 ms option (`frame_ms = 10`, `PROTOCOL.md` §3): 480-sample
+    /// The 10 ms option (`frame_ms = 10`, `docs/reference/protocol.md` §3): 480-sample
     /// frames encode, carry their duration in the TOC, and both FEC and PLC
     /// recover a 10 ms frame.
     #[test]

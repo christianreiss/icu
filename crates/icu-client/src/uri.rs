@@ -1,4 +1,4 @@
-//! Invites and passports open ICU (`Client/IMPLEMENTATION.md` §5): `*.icu`
+//! Invites and passports open ICU (`docs/reference/client.md` §5): `*.icu`
 //! files, and any file that starts with the passport armor, are
 //! `application/x-icu`, opened with `icu %f`. The rpm/deb install the
 //! definition and the desktop entry system-wide; a binary run from anywhere

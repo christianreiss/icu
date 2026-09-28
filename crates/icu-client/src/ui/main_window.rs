@@ -1159,7 +1159,7 @@ impl MainView {
                     .filter(|_| connected);
                 // Own outgoing video quality tier, set by
                 // `crate::quality::QualityController`. Automatic, no settings
-                // toggle (`Research/feature-freeze.md`'s bias against exposing
+                // toggle (`docs/reference/features.md`'s bias against exposing
                 // adaptive behavior as a dial) — but shown, since a tier-down
                 // is visible to other people as this client's video degrading.
                 let video_hint = match env.video_tier {
@@ -1751,7 +1751,7 @@ pub(super) struct Participant<'a> {
     /// else's camera is on.
     pub(super) viewing: bool,
     /// Server-measured RTT, milliseconds. `None` until the first
-    /// `UserRtt` arrives (`PROTOCOL.md` §2.2).
+    /// `UserRtt` arrives (`docs/reference/protocol.md` §2.2).
     pub(super) rtt_ms: Option<u16>,
     /// Own `Ping`/`Pong` round trip; `Some` only for the local user.
     pub(super) client_rtt_ms: Option<u16>,
@@ -1997,7 +1997,7 @@ fn participant_row(
                     }
                     widgets::rtl(ui, 36.0, |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        // Server-measured RTT (`PROTOCOL.md` §2.2 `UserRtt`), not
+                        // Server-measured RTT (`docs/reference/protocol.md` §2.2 `UserRtt`), not
                         // a client self-report: every viewer sees the same number
                         // for a given peer. Signal bars in a fixed box, the exact
                         // number on hover. Far right, the column every row has.
@@ -2294,7 +2294,7 @@ pub struct EnrollApp {
     server_addr: Option<SocketAddr>,
     link: String,
     /// The name the user picks. It is what the CSR asks for, so it ends up in
-    /// the certificate (`PROTOCOL.md` §2.3). Starts empty and is required.
+    /// the certificate (`docs/reference/protocol.md` §2.3). Starts empty and is required.
     name: String,
     status: Option<EnrollStatus>,
     step: EnrollStep,
@@ -2523,7 +2523,7 @@ impl eframe::App for EnrollApp {
             .unwrap_or_default();
         let parsed = parsed.map(|(identity, _)| identity);
         // Where the pasted text leads, shown before joining: it brings its
-        // own CA and address (`PROTOCOL.md` §2.3.1).
+        // own CA and address (`docs/reference/protocol.md` §2.3.1).
         let summary = parsed
             .as_ref()
             .map(|id| crate::config::ImportSummary::of(id, self.current.as_ref()));

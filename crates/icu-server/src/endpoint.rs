@@ -1,5 +1,5 @@
 //! QUIC endpoint: TLS configuration, binding and the accept loop
-//! (`Server/IMPLEMENTATION.md` §6.1.5–§6.2).
+//! (`docs/reference/server.md` §6.1.5–§6.2).
 
 use std::{
     net::SocketAddr,
@@ -32,7 +32,7 @@ use crate::{
 /// client certificate verifier (A8). The verifier uses
 /// `allow_unauthenticated()` although every client needs a certificate: the
 /// requirement is enforced in `session.rs`, which closes with a readable
-/// `AUTH_REQUIRED` instead of a bare TLS alert (`PROTOCOL.md` §1, Spike 2b).
+/// `AUTH_REQUIRED` instead of a bare TLS alert (`docs/reference/protocol.md` §1, Spike 2b).
 ///
 /// `crl` makes a revoked client certificate fail the handshake itself
 /// (`certificate_revoked` alert). Only the leaf is checked; the CA is the
@@ -68,7 +68,7 @@ pub fn server_config(
     .context("cannot install the server certificate")?;
 
     tls.alpn_protocols = vec![pl::ALPN_MAIN.to_vec()];
-    // 0-RTT off (`PROTOCOL.md` §1).
+    // 0-RTT off (`docs/reference/protocol.md` §1).
     tls.max_early_data_size = 0;
     tls.send_half_rtt_data = false;
 
@@ -93,9 +93,9 @@ pub fn server_config(
     transport.max_concurrent_uni_streams(VarInt::from_u32(pl::max_uni_streams(
         config.server.max_users,
     )));
-    // One control stream per connection (`PROTOCOL.md` §1).
+    // One control stream per connection (`docs/reference/protocol.md` §1).
     transport.max_concurrent_bidi_streams(VarInt::from_u32(1));
-    // Flow control (`PROTOCOL.md` §1). quinn's defaults are 1.25 MB per
+    // Flow control (`docs/reference/protocol.md` §1). quinn's defaults are 1.25 MB per
     // stream and no limit per connection: a member with 36 video streams
     // open could pin ~47 MB of server memory. Streams nobody reads — a
     // renew-only session never accepts any — count against the connection
@@ -103,7 +103,7 @@ pub fn server_config(
     transport.stream_receive_window(VarInt::from_u32(pl::STREAM_RECEIVE_WINDOW));
     transport.receive_window(VarInt::from_u32(pl::CONNECTION_RECEIVE_WINDOW));
     transport.send_window(pl::SEND_WINDOW);
-    // The com tag rides on every datagram (`PROTOCOL.md` §1).
+    // The com tag rides on every datagram (`docs/reference/protocol.md` §1).
     transport.mtu_discovery_config(Some(icu_proto::com::mtu_discovery()));
     quic.transport_config(Arc::new(transport));
 
@@ -115,7 +115,7 @@ pub fn server_config(
 const INCOMING_QUEUE: usize = 1024;
 
 /// Lets an **expired** client certificate through the handshake, so its
-/// holder can renew it however long ago it expired (`PROTOCOL.md` §2.3).
+/// holder can renew it however long ago it expired (`docs/reference/protocol.md` §2.3).
 /// Refuses a chain longer than the leaf before any check.
 ///
 /// Only expiry is forgiven: when the inner verifier's sole complaint is that
@@ -197,7 +197,7 @@ impl ClientCertVerifier for ExpiredClientCertVerifier {
     }
 }
 
-/// The two CRLs of one reload (`PROTOCOL.md` §1), signed under the same
+/// The two CRLs of one reload (`docs/reference/protocol.md` §1), signed under the same
 /// CRL number.
 pub struct Crls {
     /// Every revoked certificate the handshake has to refuse: client leaves,
@@ -264,7 +264,7 @@ pub async fn reload_tls_logged(server: &Arc<Server>) {
 }
 
 /// Binds one endpoint. It speaks only with the com tag of `com_key`
-/// (`PROTOCOL.md` §1) and counts what it drops for it in `com_dropped`.
+/// (`docs/reference/protocol.md` §1) and counts what it drops for it in `com_dropped`.
 ///
 /// IPv6 addresses are bound `IPV6_V6ONLY`, so that the spec's default
 /// `listen = ["0.0.0.0:4711", "[::]:4711"]` does not collide on Linux, where

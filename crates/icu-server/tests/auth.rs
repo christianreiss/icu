@@ -1,4 +1,4 @@
-//! Registration and authentication (`Server/IMPLEMENTATION.md` §10, rows
+//! Registration and authentication (`docs/reference/server.md` §10, rows
 //! "Registrierung → Connect → Hello/Welcome", "Connect ohne Cert",
 //! "unbekanntes Cert", "Revoke während Verbindung", "RenewRequest").
 
@@ -53,7 +53,7 @@ async fn connect_without_a_certificate_is_auth_required() {
     server.shutdown().await;
 }
 
-/// `PROTOCOL.md` §7: past `max_connections` established connections,
+/// `docs/reference/protocol.md` §7: past `max_connections` established connections,
 /// `Hello` or not, a completed handshake is closed with the non-fatal
 /// `SERVER_FULL` instead of accumulating state.
 #[tokio::test]
@@ -326,7 +326,7 @@ async fn a_confirmed_registration_consumes_the_bundle() {
 
 /// A client that got no answer, or could not store it, closes without
 /// `REGISTRATION_STORED`: the bundle stays valid, and redeeming it again replaces the
-/// certificate nobody holds (`PROTOCOL.md` §2.3).
+/// certificate nobody holds (`docs/reference/protocol.md` §2.3).
 #[tokio::test]
 async fn an_unconfirmed_registration_can_be_repeated() {
     let server = TestServer::start().await;
@@ -358,7 +358,7 @@ async fn an_unconfirmed_registration_can_be_repeated() {
 
 /// `NO_ERROR` is no receipt: quinn closes a dropped connection implicitly with
 /// code 0, so a client that quit between `RenewResponse` and saving would
-/// otherwise burn its bundle (`PROTOCOL.md` §2.3).
+/// otherwise burn its bundle (`docs/reference/protocol.md` §2.3).
 #[tokio::test]
 async fn a_plain_close_is_no_receipt() {
     let server = TestServer::start().await;
@@ -562,7 +562,7 @@ async fn a_taken_name_at_registration_leaves_the_bundle_reusable() {
 }
 
 /// Every client certificate says where the server is, so a passport needs no
-/// separate address (`PROTOCOL.md` §2.3).
+/// separate address (`docs/reference/protocol.md` §2.3).
 #[tokio::test]
 async fn certificates_carry_the_server_address() {
     use x509_parser::prelude::FromDer;
@@ -595,7 +595,7 @@ async fn certificates_carry_the_server_address() {
 #[tokio::test]
 async fn renewal_revokes_the_old_certificate_once_the_new_one_logs_in() {
     // Short-lived certificates, so the fresh one is already inside the
-    // 30-day renewal window (`PROTOCOL.md` §2.2 Nr. 9).
+    // 30-day renewal window (`docs/reference/protocol.md` §2.2 Nr. 9).
     let server = TestServer::start_with(|c| c.tls.client_validity_days = 20).await;
     let old = server.enroll("alice").await;
     let mut client = server.connect(&old).await.expect("connect");
@@ -724,7 +724,7 @@ async fn a_shut_down_server_closes_with_shutdown() {
 }
 
 /// A plain renewal is refused while the presented certificate still has
-/// more than 30 days to run (`PROTOCOL.md` §2.2 Nr. 9).
+/// more than 30 days to run (`docs/reference/protocol.md` §2.2 Nr. 9).
 #[tokio::test]
 async fn plain_renewal_is_refused_outside_the_window() {
     let server = TestServer::start().await;
@@ -874,7 +874,7 @@ fn serial_of(der: &[u8]) -> String {
     icu_server::ca::leaf_serial(der)
 }
 
-/// `PROTOCOL.md` §7: one live connection per certificate, the newest wins
+/// `docs/reference/protocol.md` §7: one live connection per certificate, the newest wins
 /// and the older one ends with the fatal `SESSION_REPLACED`.
 #[tokio::test]
 async fn a_second_connection_with_the_same_certificate_replaces_the_first() {
@@ -928,7 +928,7 @@ async fn a_registration_session_is_replaced_by_a_newer_one() {
     server.shutdown().await;
 }
 
-/// `PROTOCOL.md` §7: sessions outside the room — registration and
+/// `docs/reference/protocol.md` §7: sessions outside the room — registration and
 /// renew-only — are capped server wide, since the room size does not bound
 /// them. A room session is not affected, and a freed slot is taken again.
 #[tokio::test]
@@ -1069,7 +1069,7 @@ async fn a_registration_turned_away_as_full_keeps_its_budget() {
     server.shutdown().await;
 }
 
-/// `PROTOCOL.md` §1/§2.2: a revoke is in force in the handshake at once,
+/// `docs/reference/protocol.md` §1/§2.2: a revoke is in force in the handshake at once,
 /// without a restart. The CRL clients get follows `Welcome` and lists only
 /// replaced server leaves — a revoked client certificate is none of their
 /// business.
@@ -1478,7 +1478,7 @@ fn server_leaf(conn: &quinn::Connection) -> Vec<u8> {
         .expect("server certificate")
 }
 
-/// A name stored before the strict rules (`PROTOCOL.md` §2.1, 2026-09-24)
+/// A name stored before the strict rules (`docs/reference/protocol.md` §2.1, 2026-09-24)
 /// is carried into new certificates as it is: catch-up and plain renewal
 /// both work, or its owner would be locked out once the certificate expires.
 #[tokio::test]

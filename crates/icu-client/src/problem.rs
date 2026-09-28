@@ -79,7 +79,7 @@ pub const SERVER_NAME_UNVERIFIED: &str = "Die Serveradresse passt nicht zum Zert
 /// Our certificate was revoked. Since 2026-09-25 that is what a second
 /// device holding the same passport sees once the other one renewed or
 /// renamed and logged in with the new certificate: that login revokes every
-/// older one (`PROTOCOL.md` §2.2 Nr. 10). A new invitation would create a
+/// older one (`docs/reference/protocol.md` §2.2 Nr. 10). A new invitation would create a
 /// second account, so the text names the passport as the way back, and the
 /// admin only for a real revocation.
 pub const SUPERSEDED_REVOKED: &str = "Dieses Zertifikat gilt nicht mehr. Wurde ICU auf einem \
@@ -119,11 +119,11 @@ pub const UPDATE_NEEDED: &str =
     "Der Server antwortet unerwartet. Bitte ICU auf die neueste Version aktualisieren.";
 
 /// The server speaks a protocol older than this client accepts
-/// (`Welcome.server_minor`, `PROTOCOL.md` §8).
+/// (`Welcome.server_minor`, `docs/reference/protocol.md` §8).
 pub const SERVER_TOO_OLD: &str = "Der Server ist älter als diese ICU-Version. Bitte den \
      Server-Betreiber, den Server zu aktualisieren.";
 
-/// German text for a protocol code (`PROTOCOL.md` §6).
+/// German text for a protocol code (`docs/reference/protocol.md` §6).
 pub fn code_text(code: u32) -> String {
     let s = match code {
         codes::NO_ERROR => "Die Verbindung wurde beendet.",

@@ -1,4 +1,4 @@
-//! Platform neutral audio backend interface (`Client/IMPLEMENTATION.md` §3).
+//! Platform neutral audio backend interface (`docs/reference/client.md` §3).
 //!
 //! A backend owns the device streams and calls back with mono f32 blocks at
 //! 48 kHz. The callbacks run on the backend's own (usually real-time) thread

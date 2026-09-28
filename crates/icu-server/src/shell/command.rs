@@ -1,6 +1,6 @@
 //! The shell's command tree: pure, no I/O. Shared by TAB completion, `?`
 //! context help, prefix/abbreviation resolution and dispatch
-//! (`Server/IMPLEMENTATION.md` §5.1), so all four ways of asking "what can I
+//! (`docs/reference/server.md` §5.1), so all four ways of asking "what can I
 //! type here" and "what does this line mean" agree by construction.
 //!
 //! Grammar: a line is a sequence of literal keyword tokens (matched by exact

@@ -25,12 +25,12 @@ pub enum NetError {
     /// Connection setup or transport.
     Connect(String),
     /// The peer broke the framing or sent a message that does not decode
-    /// (`PROTOCOL.md` §2, §6 `PROTOCOL_VIOLATION`). Fatal: reconnecting to
+    /// (`docs/reference/protocol.md` §2, §6 `PROTOCOL_VIOLATION`). Fatal: reconnecting to
     /// the same server would only loop.
     Protocol(String),
     /// The server answered with an error code.
     Rejected {
-        /// Error code (`PROTOCOL.md` §6).
+        /// Error code (`docs/reference/protocol.md` §6).
         code: u32,
         /// Detail.
         detail: String,
@@ -117,7 +117,7 @@ pub async fn resolve(host: &str, port: u16) -> Result<SocketAddr, NetError> {
 
 /// Binds a client endpoint in the address family of `remote` that tags every
 /// datagram with `com_key` and hears only datagrams tagged with it
-/// (`PROTOCOL.md` §1).
+/// (`docs/reference/protocol.md` §1).
 pub fn bind_endpoint(
     remote: SocketAddr,
     com_key: &icu_proto::com::ComKey,
@@ -139,7 +139,7 @@ pub fn bind_endpoint(
     .map_err(|e| NetError::Connect(format!("bind: {e}")))
 }
 
-/// Reads one length prefixed frame (`PROTOCOL.md` §2).
+/// Reads one length prefixed frame (`docs/reference/protocol.md` §2).
 pub async fn read_frame(recv: &mut quinn::RecvStream, max: usize) -> Result<Vec<u8>, NetError> {
     let mut prefix = [0u8; icu_proto::framing::LEN_PREFIX];
     recv.read_exact(&mut prefix)
@@ -154,7 +154,7 @@ pub async fn read_frame(recv: &mut quinn::RecvStream, max: usize) -> Result<Vec<
 }
 
 /// The body length a frame prefix announces. Outside `1..=max` it is a
-/// `PROTOCOL_VIOLATION` (`PROTOCOL.md` §2), not a transport failure: the
+/// `PROTOCOL_VIOLATION` (`docs/reference/protocol.md` §2), not a transport failure: the
 /// same server would send the same frame again after a reconnect.
 fn checked_len(
     prefix: [u8; icu_proto::framing::LEN_PREFIX],

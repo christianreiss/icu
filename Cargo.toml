@@ -1,12 +1,19 @@
 [workspace]
 members = ["crates/icu-proto", "crates/icu-server", "crates/icu-client"]
-# Die Spikes unter Research/spikes/ sind eigenstaendige Pakete und gehoeren nicht
+# Die Spikes unter experiments/ sind eigenstaendige Pakete und gehoeren nicht
 # in diesen Workspace; ohne exclude meldet cargo dort "believes it's in a workspace".
-exclude = ["Research/spikes/*"]
+exclude = [
+    "experiments/spike-aec",
+    "experiments/spike-audio",
+    "experiments/spike-camera",
+    "experiments/spike-quic",
+    "experiments/spike-wayland",
+    "experiments/spike-xwin",
+]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.98"
 license = "Apache-2.0"

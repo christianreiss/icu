@@ -1,4 +1,4 @@
-//! The server's CRL on the client (`PROTOCOL.md` §1, §2.2 `CrlUpdate`).
+//! The server's CRL on the client (`docs/reference/protocol.md` §1, §2.2 `CrlUpdate`).
 //!
 //! The server sends its CRL after `Welcome` and whenever it changes. The
 //! client keeps the newest one its own CA signed and checks the server leaf

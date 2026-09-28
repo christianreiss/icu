@@ -1,4 +1,4 @@
-//! Audio datagram and video stream headers (`PROTOCOL.md` §3, §4).
+//! Audio datagram and video stream headers (`docs/reference/protocol.md` §3, §4).
 //!
 //! Both headers are little-endian and carry their protocol version in `kind`.
 //! Reserved bits are written as 0 by the sender and **ignored** by the
@@ -23,9 +23,9 @@ pub const AUDIO_MAX_DATAGRAM: usize = AUDIO_HEADER_LEN + AUDIO_MAX_PAYLOAD;
 
 /// Video header size in bytes.
 pub const VIDEO_HEADER_LEN: usize = 12;
-/// Largest video frame payload (`PROTOCOL.md` §4, §7).
+/// Largest video frame payload (`docs/reference/protocol.md` §4, §7).
 pub const VIDEO_MAX_FRAME: usize = 512 * 1024;
-/// Largest picture a receiver decodes, in pixels (`PROTOCOL.md` §4): twice
+/// Largest picture a receiver decodes, in pixels (`docs/reference/protocol.md` §4): twice
 /// the 320×240 profile in each direction, headroom for a later profile. A
 /// frame whose SPS asks for more is refused before the decoder sees it.
 pub const VIDEO_MAX_WIDTH: usize = 640;
@@ -91,7 +91,7 @@ impl AudioHeader {
 
     /// Parses a datagram and returns header plus the Opus payload slice.
     ///
-    /// Enforces the length window from `PROTOCOL.md` §3: the server drops
+    /// Enforces the length window from `docs/reference/protocol.md` §3: the server drops
     /// datagrams below 11 or above 410 bytes.
     pub fn decode(buf: &[u8]) -> Result<(AudioHeader, &[u8]), ProtoError> {
         if buf.len() < AUDIO_MIN_DATAGRAM || buf.len() > AUDIO_MAX_DATAGRAM {
@@ -177,7 +177,7 @@ impl VideoHeader {
 /// Overwrites the `speaker` field of an already serialized header in place.
 ///
 /// Works for both header kinds because the field sits at the same offset. The
-/// server uses this so relaying costs no copy (`PROTOCOL.md` §3).
+/// server uses this so relaying costs no copy (`docs/reference/protocol.md` §3).
 pub fn set_speaker_in_place(buf: &mut [u8], speaker: Session) -> Result<(), ProtoError> {
     if buf.len() < SPEAKER_OFFSET + 2 {
         return Err(ProtoError::ShortHeader(buf.len()));
@@ -186,7 +186,7 @@ pub fn set_speaker_in_place(buf: &mut [u8], speaker: Session) -> Result<(), Prot
     Ok(())
 }
 
-/// Signed difference of two `seq` values modulo 2^16 (`PROTOCOL.md` §3).
+/// Signed difference of two `seq` values modulo 2^16 (`docs/reference/protocol.md` §3).
 ///
 /// A difference beyond half the value range is a step backwards, not a huge
 /// step forwards.
@@ -194,7 +194,7 @@ pub fn seq_diff(a: u16, b: u16) -> i16 {
     a.wrapping_sub(b) as i16
 }
 
-/// Signed difference of two `ts` values modulo 2^32 (`PROTOCOL.md` §3).
+/// Signed difference of two `ts` values modulo 2^32 (`docs/reference/protocol.md` §3).
 pub fn ts_diff(a: u32, b: u32) -> i32 {
     a.wrapping_sub(b) as i32
 }
@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(payload, &[1, 2, 3]);
     }
 
-    /// `PROTOCOL.md` §3: drop below 11 and above 410 bytes.
+    /// `docs/reference/protocol.md` §3: drop below 11 and above 410 bytes.
     #[test]
     fn audio_length_window() {
         let ok_min = AudioHeader::default().datagram(&[0]).unwrap();

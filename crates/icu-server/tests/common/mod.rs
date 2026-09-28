@@ -92,7 +92,7 @@ impl TestServer {
     }
 
     /// Registers with an explicit bundle, so the failure paths are testable.
-    /// The name travels in the CSR's subject CN (`PROTOCOL.md` §2.3).
+    /// The name travels in the CSR's subject CN (`docs/reference/protocol.md` §2.3).
     pub async fn register(&self, bundle: &str, name: &str) -> Result<Identity, EnrollFail> {
         let (key, csr) = csr_with_cn(name);
         self.register_with_csr(bundle, key, csr).await
@@ -111,7 +111,7 @@ impl TestServer {
 
     /// Registers like [`TestServer::register`] but ends the session with
     /// `SHUTDOWN` — anything but `REGISTRATION_STORED` is a client that did
-    /// not confirm it stored the certificate (`PROTOCOL.md` §2.3).
+    /// not confirm it stored the certificate (`docs/reference/protocol.md` §2.3).
     pub async fn register_unconfirmed(
         &self,
         bundle: &str,
@@ -585,7 +585,7 @@ pub fn client_endpoint(
 }
 
 /// A client endpoint on `127.0.0.1` without a default configuration,
-/// speaking with `com_key`'s tag (`PROTOCOL.md` §1).
+/// speaking with `com_key`'s tag (`docs/reference/protocol.md` §1).
 pub fn bare_endpoint(com_key: &ComKey) -> Endpoint {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind 127.0.0.1");
     icu_proto::com::endpoint(socket, com_key, Side::Client, None, Arc::default())

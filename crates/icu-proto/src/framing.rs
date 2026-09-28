@@ -1,5 +1,5 @@
 //! Length prefixed framing for the control stream
-//! (`PROTOCOL.md` §2).
+//! (`docs/reference/protocol.md` §2).
 //!
 //! ```text
 //! offset 0  size 2    len  u16 LE, 1 <= len <= MAX
@@ -13,7 +13,7 @@ use crate::ProtoError;
 /// Size of the length prefix in bytes.
 pub const LEN_PREFIX: usize = 2;
 
-/// Maximum body size of a control frame (`PROTOCOL.md` §2, §7).
+/// Maximum body size of a control frame (`docs/reference/protocol.md` §2, §7).
 pub const MAX_CONTROL_FRAME: usize = 16 * 1024;
 
 /// Encodes `msg` into a complete frame (prefix + body).
@@ -89,7 +89,7 @@ mod tests {
         assert_eq!(back, msg);
     }
 
-    /// `PROTOCOL.md` §2: `len = 0` is a protocol violation.
+    /// `docs/reference/protocol.md` §2: `len = 0` is a protocol violation.
     #[test]
     fn frame_len_zero_is_rejected() {
         let err = check_len(0, MAX_CONTROL_FRAME).unwrap_err();
@@ -101,7 +101,7 @@ mod tests {
         ));
     }
 
-    /// `PROTOCOL.md` §2: 16384 is the last accepted length, 16385 is not.
+    /// `docs/reference/protocol.md` §2: 16384 is the last accepted length, 16385 is not.
     #[test]
     fn frame_len_boundaries_16384_and_16385() {
         assert!(check_len(16384, MAX_CONTROL_FRAME).is_ok());

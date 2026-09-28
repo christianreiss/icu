@@ -14,7 +14,7 @@ RUN apt-get update \
       llvm nasm linux-libc-dev \
  && rm -rf /var/lib/apt/lists/*
 # webrtc-audio-processing-sys expects rust-objcopy in the rustc sysroot
-# (Client/IMPLEMENTATION.md §12); here it lives inside the container only.
+# (docs/reference/client.md §12); here it lives inside the container only.
 RUN d="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin" \
  && mkdir -p "$d" && ln -sfn "$(command -v llvm-objcopy)" "$d/rust-objcopy"
 # Debian's abseil (20240722) builds string_view and throw_delegate as separate

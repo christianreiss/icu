@@ -100,11 +100,11 @@ pub struct Server {
     /// (`limits.max_connections`).
     pub open_connections: std::sync::atomic::AtomicUsize,
     /// The one live connection per client certificate fingerprint, with its
-    /// user; a newer one replaces it (`PROTOCOL.md` §7). Room sessions, and
+    /// user; a newer one replaces it (`docs/reference/protocol.md` §7). Room sessions, and
     /// those still waiting for `Hello`.
     pub live_certs: std::sync::Mutex<CertSlots>,
     /// The same for sessions outside the room — registration and renew-only
-    /// (`PROTOCOL.md` §2.3) — with a server wide cap
+    /// (`docs/reference/protocol.md` §2.3) — with a server wide cap
     /// ([`icu_proto::limits::MAX_ROOMLESS_SESSIONS`]). Separate, so renewing
     /// an expired certificate never replaces a room session that still runs
     /// on it.
@@ -112,7 +112,7 @@ pub struct Server {
     /// The QUIC endpoints, so a new CRL or server leaf reaches the TLS
     /// config without a restart (`endpoint::reload_tls`). Empty offline.
     pub endpoints: Vec<quinn::Endpoint>,
-    /// The com key (`PROTOCOL.md` §1): every datagram carries its tag, and
+    /// The com key (`docs/reference/protocol.md` §1): every datagram carries its tag, and
     /// every registration bundle carries the key.
     pub com_key: icu_proto::com::ComKey,
     /// Datagrams the endpoints dropped for a missing or wrong com tag.
@@ -484,7 +484,7 @@ fn open_ca(config: &Config, store: &Store) -> Result<Ca> {
     Ok(ca)
 }
 
-/// Loads the com key (`PROTOCOL.md` §1), or creates it for a state that has
+/// Loads the com key (`docs/reference/protocol.md` §1), or creates it for a state that has
 /// never been used. Like the CA it is never replaced silently: every passport
 /// carries it, and a new one would lock every client out.
 fn open_com_key(config: &Config, store: &Store) -> Result<icu_proto::com::ComKey> {
@@ -539,7 +539,7 @@ async fn housekeeping(server: Arc<Server>) {
         }
 
         // The expiry of a report is a change: the speaker must learn that it
-        // can stop paying for FEC (`PROTOCOL.md` §2.2).
+        // can stop paying for FEC (`docs/reference/protocol.md` §2.2).
         let hints = lock(&server.loss).expire(ttl, |speaker| server.room.audio_listeners(speaker));
         for (speaker, loss_permille) in hints {
             server
@@ -563,7 +563,7 @@ async fn housekeeping(server: Arc<Server>) {
         prune_counter += 1;
 
         // Every 2 s (20 ticks of 100 ms): server-measured RTT per participant
-        // (`PROTOCOL.md` §2.2 `UserRtt`), broadcast to the whole room.
+        // (`docs/reference/protocol.md` §2.2 `UserRtt`), broadcast to the whole room.
         if prune_counter.is_multiple_of(20) {
             let rtts = server.room.rtt_snapshot();
             if !rtts.is_empty() {

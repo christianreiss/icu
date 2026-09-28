@@ -1,0 +1,3 @@
+# Build-Ausgaben bleiben außerhalb des Experiment-Quellbaums.
+[build]
+target-dir = "../../target/experiments/spike-audio"

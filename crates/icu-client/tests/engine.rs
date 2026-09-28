@@ -1,6 +1,6 @@
 //! Engine behaviour against an in-process server: what reaches the server of
 //! the local state, and how mute, deafen and admin restrictions interact
-//! (`Client/IMPLEMENTATION.md` §5, §10).
+//! (`docs/reference/client.md` §5, §10).
 //!
 //! Unix only: the in-process server (`common`) is.
 #![cfg(unix)]
@@ -107,7 +107,7 @@ async fn an_enforced_deafen_keeps_the_microphone_off() {
 }
 
 /// Undeafening restores the mute from before deafening
-/// (`Research/feature-freeze.md`); unmuting while deafened undeafens too; an
+/// (`docs/reference/features.md`); unmuting while deafened undeafens too; an
 /// enforced mute survives undeafening.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn undeafen_restores_the_previous_mute() {

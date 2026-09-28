@@ -1,10 +1,8 @@
 target/
 *.log
-.scratch/
+.local/
 dist/
 .claude/
-# Windows cross-build copy (build/win-static/README.md)
-build/win-static/libstdc++.a
 # Credentials never belong in the repository, wherever they land: passports
 # and invitations (bearer identities), server state and keys, client keys,
 # SSH private keys. Test fixtures are created in temporary directories.
