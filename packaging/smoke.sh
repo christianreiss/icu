@@ -29,6 +29,7 @@ $INSTALL /pkgs/$SERVER_PKG ${CLIENT_PKG:+/pkgs/$CLIENT_PKG}
 icu-server --version
 icu-cli --version
 getent group icu
+getent group icu-monitor
 test "$(stat -c %G /etc/icu/server.toml)" = icu
 test "$(stat -c %a /etc/icu/server.toml)" = 640
 systemd-analyze verify /usr/lib/systemd/system/icu-server.service

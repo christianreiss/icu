@@ -62,6 +62,13 @@ pub struct ServerSection {
     /// and then through the host's `getent`, or a gid. `None` leaves the
     /// group alone.
     pub admin_socket_group: Option<String>,
+    /// Group that owns the read-only monitoring socket, resolved like
+    /// `admin_socket_group`. `None` — the default — means no monitoring
+    /// socket at all, so nothing changes for an installation that does not
+    /// ask for one. Set it to a group of its own (`icu-monitor`), never to
+    /// `admin_socket_group`: the point is a monitor that cannot invite,
+    /// disable or revoke.
+    pub monitor_socket_group: Option<String>,
 }
 
 impl Default for ServerSection {
@@ -76,6 +83,7 @@ impl Default for ServerSection {
             max_users: pl::DEFAULT_MAX_USERS,
             min_client: "0.1.0".to_string(),
             admin_socket_group: None,
+            monitor_socket_group: None,
         }
     }
 }
@@ -185,10 +193,13 @@ impl Default for LogSection {
 pub struct PathsSection {
     /// Directory holding `ca.key`, `users.toml`, `state.lock`, …
     pub state_dir: PathBuf,
-    /// Directory holding `admin.sock`.
+    /// Directory holding `admin.sock` and `monitor.sock`.
     pub runtime_dir: PathBuf,
     /// Explicit admin socket path. Defaults to `runtime_dir/admin.sock`.
     pub admin_socket: Option<PathBuf>,
+    /// Explicit monitoring socket path. Defaults to
+    /// `runtime_dir/monitor.sock`.
+    pub monitor_socket: Option<PathBuf>,
 }
 
 impl Default for PathsSection {
@@ -197,6 +208,7 @@ impl Default for PathsSection {
             state_dir: PathBuf::from("/var/lib/icu"),
             runtime_dir: PathBuf::from("/run/icu"),
             admin_socket: None,
+            monitor_socket: None,
         }
     }
 }
@@ -706,6 +718,17 @@ impl Config {
             .unwrap_or_else(|| self.paths.runtime_dir.join("admin.sock"))
     }
 
+    /// The read-only monitoring socket: `paths.monitor_socket`, else
+    /// `monitor.sock` beside the admin socket. The path exists whether or
+    /// not `server.monitor_socket_group` is set; only that decides whether
+    /// the server binds it.
+    pub fn monitor_socket(&self) -> PathBuf {
+        self.paths
+            .monitor_socket
+            .clone()
+            .unwrap_or_else(|| self.paths.runtime_dir.join("monitor.sock"))
+    }
+
     /// Where snapshots go: `backup.dir`, else `backups/` in the state
     /// directory.
     pub fn backup_dir(&self) -> PathBuf {
@@ -870,6 +893,10 @@ settle_ms = 5000
         assert_eq!(config.server.max_users, 16);
         assert_eq!(config.public_host(), "icu.home.arpa:4711");
         assert_eq!(config.admin_socket(), Path::new("/run/icu/admin.sock"));
+        assert_eq!(config.monitor_socket(), Path::new("/run/icu/monitor.sock"));
+        // No `monitor_socket_group` in the example: the socket has a path,
+        // but the server binds none.
+        assert!(config.server.monitor_socket_group.is_none());
         assert_eq!(config.backup_dir(), Path::new("/var/lib/icu/backups"));
     }
 

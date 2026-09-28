@@ -560,3 +560,91 @@ fn listing(dir: &std::path::Path) -> Vec<String> {
     found.sort();
     found
 }
+
+/// A monitor holds `server.monitor_socket_group` and nothing else: the admin
+/// socket refuses it, and `status` still works because the CLI then tries
+/// the read-only socket. Anything that writes does not (2026-09-28).
+///
+/// The admin socket is made unreachable with mode 0000 rather than with a
+/// foreign group, which needs root; for its owner that is `EACCES` all the
+/// same.
+#[tokio::test]
+async fn status_falls_back_to_the_monitoring_socket() {
+    let _alone = ALONE.lock().await;
+    if common::root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (state, run) = (dir.path().join("state"), dir.path().join("run"));
+    let mut config = icu_server::Config::for_test(&state);
+    config.paths.runtime_dir = run.clone();
+    config.server.monitor_socket_group = Some({
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(dir.path()).unwrap().gid().to_string()
+    });
+    let handle = icu_server::run(config).await.expect("server");
+    let monitor = handle
+        .monitor_socket()
+        .expect("monitor socket")
+        .to_path_buf();
+    let file = dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
+            state.to_str().unwrap(),
+            run.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let run_cli = |command: &'static str| {
+        let file = file.clone();
+        async move {
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+                .arg("--config")
+                .arg(&file)
+                .args([command, "--json"])
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+
+    // Shut out of the admin socket, but not of the monitoring one.
+    let shut = common::Mode::set(handle.admin_socket().unwrap(), 0o000);
+    let out = run_cli("status").await;
+    assert!(
+        out.status.success(),
+        "status: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["ok"], serde_json::json!(true));
+    assert!(value["limits"]["max_connections"].as_u64().unwrap() > 0);
+
+    // `users` is no monitoring datum: it stays behind the admin socket, and
+    // the error names both groups instead of falling back to the state.
+    let out = run_cli("users").await;
+    assert!(!out.status.success(), "users must not fall back");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("admin_socket_group") && stderr.contains("monitor_socket_group"),
+        "{stderr}"
+    );
+    drop(shut);
+
+    // Without a monitoring socket the old error is what comes back.
+    std::fs::remove_file(&monitor).unwrap();
+    let shut = common::Mode::set(handle.admin_socket().unwrap(), 0o000);
+    let out = run_cli("status").await;
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot connect to the admin socket"),
+        "{stderr}"
+    );
+    drop(shut);
+
+    handle.shutdown().await;
+}

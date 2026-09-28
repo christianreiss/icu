@@ -7,6 +7,12 @@
 //! A running server is the only writer of `users.toml`, so
 //! every CLI command except `run` goes through here. Authentication is the
 //! file permissions of the socket, nothing else.
+//!
+//! Beside it, and only when `server.monitor_socket_group` is set, the same
+//! code serves a second socket `/run/icu/monitor.sock` that answers
+//! [`AdminRequest::Status`] and refuses everything else with `FORBIDDEN`.
+//! Monitoring used to need the admin group, which may invite, disable and
+//! revoke; a Checkmk agent has no business holding that.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -745,7 +751,15 @@ fn status(server: &Arc<Server>) -> serde_json::Value {
         "uptime_s": server.uptime().as_secs(),
         "online": server.room.len(),
         "max_users": server.config.server.max_users,
+        "version": env!("CARGO_PKG_VERSION"),
         "server_time_ms": unix_millis(),
+        // The ceilings the gauges below run against. Without them a monitor
+        // can graph `open_connections` and `handshakes` but not say whether
+        // they are close to the limit (readiness follow-up 2026-09-28).
+        "limits": {
+            "max_connections": server.config.limits.max_connections,
+            "max_handshakes": server.config.limits.max_handshakes,
+        },
         "connections": Counters::get(&c.connections),
         "open_connections": server.open_connections.load(Relaxed),
         "handshakes": server.handshakes.load(Relaxed),
@@ -806,6 +820,48 @@ fn tls_status(server: &Arc<Server>) -> serde_json::Value {
 /// for the server; only the CLI becomes unavailable.
 pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, AbortHandle)> {
     let path = server.config.admin_socket();
+    let group = server.config.server.admin_socket_group.clone();
+    listen_at(server, path, group, Access::Full, "admin socket").await
+}
+
+/// Opens the read-only monitoring socket, if one is configured.
+///
+/// `None` when `server.monitor_socket_group` is unset: an installation that
+/// did not ask for a monitoring socket gets none, and nothing about it
+/// changes. Failure to bind is as little fatal as for the admin socket.
+pub async fn listen_monitor(server: Arc<Server>) -> Result<Option<(PathBuf, AbortHandle)>> {
+    let Some(group) = server.config.server.monitor_socket_group.clone() else {
+        return Ok(None);
+    };
+    let path = server.config.monitor_socket();
+    listen_at(
+        server,
+        path,
+        Some(group),
+        Access::StatusOnly,
+        "monitor socket",
+    )
+    .await
+    .map(Some)
+}
+
+/// What a connection on this socket may ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Every [`AdminRequest`]: the admin socket.
+    Full,
+    /// [`AdminRequest::Status`] and nothing else: the monitoring socket.
+    StatusOnly,
+}
+
+/// Binds `path` (0660, owned by `group`) and serves it until shutdown.
+async fn listen_at(
+    server: Arc<Server>,
+    path: PathBuf,
+    group: Option<String>,
+    access: Access,
+    what: &'static str,
+) -> Result<(PathBuf, AbortHandle)> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).context(format!("cannot create {}", dir.display()))?;
     }
@@ -818,14 +874,14 @@ pub async fn listen(server: Arc<Server>) -> Result<(PathBuf, AbortHandle)> {
     // Mode 0660, group from the configuration (§5, §8).
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
-        .context("cannot chmod the admin socket")?;
-    if let Some(group) = &server.config.server.admin_socket_group {
+        .context(format!("cannot chmod the {what}"))?;
+    if let Some(group) = &group {
         if let Err(e) = crate::store::blocking(|| chgrp(&path, group)) {
-            tracing::warn!(group = %group, error = %e, "cannot set the admin socket group");
+            tracing::warn!(group = %group, error = %e, "cannot set the {} group", what);
         }
     }
 
-    let task = crate::spawn_logged("admin socket", serve(server, listener));
+    let task = crate::spawn_logged(what, serve(server, listener, access));
     Ok((path, task))
 }
 
@@ -911,7 +967,7 @@ const ACCEPT_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_millis
 /// Longest pause between two `accept` attempts that fail.
 const ACCEPT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 
-async fn serve(server: Arc<Server>, listener: UnixListener) {
+async fn serve(server: Arc<Server>, listener: UnixListener, access: Access) {
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let mut backoff = ACCEPT_BACKOFF_MIN;
     loop {
@@ -955,7 +1011,7 @@ async fn serve(server: Arc<Server>, listener: UnixListener) {
         let server = server.clone();
         crate::spawn_logged("admin connection", async move {
             let _permit = permit;
-            if let Err(e) = serve_one(server, stream).await {
+            if let Err(e) = serve_one(server, stream, access).await {
                 tracing::debug!(error = %e, "admin connection ended");
             }
         });
@@ -965,7 +1021,7 @@ async fn serve(server: Arc<Server>, listener: UnixListener) {
 /// Serves one connection: one request, one answer, close. Every client is
 /// one-shot — the CLI and through it the Checkmk check — and a connection
 /// looping over requests was one more way to hold a slot for good.
-async fn serve_one(server: Arc<Server>, stream: UnixStream) -> Result<()> {
+async fn serve_one(server: Arc<Server>, stream: UnixStream, access: Access) -> Result<()> {
     let timeout = server.config.timing.admin_timeout();
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
@@ -979,6 +1035,16 @@ async fn serve_one(server: Arc<Server>, stream: UnixStream) -> Result<()> {
             format!("request line longer than {MAX_REQUEST_LINE} bytes"),
         ),
         Request::Line(line) => match serde_json::from_str::<AdminRequest>(&line) {
+            // The gate sits behind the parser, not in front of a list of
+            // allowed commands: a request added later is refused here until
+            // somebody decides it is a monitoring datum, instead of slipping
+            // through because the list was not updated.
+            Ok(request) if access == Access::StatusOnly && request != AdminRequest::Status => {
+                AdminResponse::err(
+                    "FORBIDDEN",
+                    "the monitoring socket answers status and nothing else",
+                )
+            }
             Ok(request) => handle(&server, request).await,
             Err(e) => AdminResponse::err("BAD_REQUEST", e),
         },
