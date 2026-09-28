@@ -125,6 +125,21 @@ pub fn leaf_signed_by(leaf_der: &[u8], ca_der: &[u8]) -> bool {
     leaf.issuer() == ca.subject() && leaf.verify_signature(Some(ca.public_key())).is_ok()
 }
 
+/// Whether `passport`'s inline signature verifies against the CA it carries
+/// (`icu_proto::passport::Passport::signable_bytes`, `PROTOCOL.md` §2.3.1).
+/// The server signs every registration bundle it issues with its CA key,
+/// which never travels inside the bundle itself — so this catches tampering
+/// with the armored text after the server wrote it, the com key included,
+/// which nothing else here checks. `false` on an empty or garbled signature,
+/// same as a missing one; it does not by itself say the CA is genuine, only
+/// that the bundle matches what its own CA signed.
+pub fn passport_signed_by_its_ca(passport: &icu_proto::passport::Passport) -> bool {
+    let Ok((_, ca)) = x509_parser::parse_x509_certificate(&passport.ca_der) else {
+        return false;
+    };
+    passport.verify_signature(ca.public_key().subject_public_key.data.as_ref())
+}
+
 /// Checks a leaf the server issued in answer to a CSR: its CN must be the
 /// `cn` asked for, its public key the one of `key_der` (PKCS#8), and its
 /// signature the one of the CA in `ca_der`. `Err` carries the technical

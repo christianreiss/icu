@@ -8,8 +8,9 @@
 //!
 //! Where to connect comes from the certificates themselves: the client leaf
 //! has a URI SAN `icu://host:port`, the CA's CN is `ICU CA <server_name>`.
-//! There is one format, version 4 (2026-09-27); earlier versions lack the com
-//! key and cannot reach a server any more, so they are refused.
+//! There is one format, version 5 (2026-09-28); earlier versions lack fields
+//! this crate depends on and are refused outright, with no migration path —
+//! client and server in this project ship in lockstep.
 //!
 //! The body is **not encrypted**. A passport is a bearer credential for the
 //! account until the certificate expires or an admin revokes it — whoever reads
@@ -30,7 +31,7 @@ pub const ARMOR_END: &str = "-----END ICU PASSPORT-----";
 /// It sits *outside* the postcard body on purpose: postcard is not
 /// self-describing, so a version with changed fields would otherwise decode as
 /// a plausible-looking older one instead of being rejected.
-pub const PASSPORT_VERSION: u8 = 4;
+pub const PASSPORT_VERSION: u8 = 5;
 
 /// Upper bound on the decoded body. A real bundle is 1–1.5 KiB, with settings
 /// some 3 KiB; the headroom covers a longer key or CA without inviting a
@@ -57,6 +58,14 @@ pub struct Passport {
     /// client adds a setting or an older one lacks it, which postcard would
     /// not.
     pub settings: String,
+    /// DER ECDSA-P256 signature by the server's CA key over
+    /// [`Passport::signable_bytes`], present (non-empty) only on a
+    /// registration bundle: the one case where the signing key never travels
+    /// inside the bundle itself, so the signature actually proves nothing
+    /// was altered since the server wrote it. Empty on a personal export —
+    /// a client signing its own export would only be proving the bundle
+    /// matches a key that travels right there in the same bundle.
+    pub signature: Vec<u8>,
 }
 
 /// `key_der` and `com_key` are redacted: a passport must never end up in a
@@ -72,6 +81,7 @@ impl std::fmt::Debug for Passport {
             .field("ca_der", &format_args!("{} bytes", self.ca_der.len()))
             .field("com_key", &self.com_key)
             .field("settings", &format_args!("{} bytes", self.settings.len()))
+            .field("signature", &format_args!("{} bytes", self.signature.len()))
             .finish()
     }
 }
@@ -112,6 +122,48 @@ impl Passport {
     pub fn fits(&self) -> bool {
         // The version byte comes on top of the postcard body.
         postcard::to_stdvec(self).is_ok_and(|body| body.len() < MAX_PASSPORT_BYTES)
+    }
+
+    /// Bytes [`Passport::signature`] covers: the version byte plus every
+    /// other field, postcard-encoded. The version byte is included so a
+    /// signature from one format version can't be replayed against another.
+    /// Both the signer and the verifier must hash exactly this.
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        #[derive(Serialize)]
+        struct Signable<'a> {
+            key_der: &'a [u8],
+            leaf_der: &'a [u8],
+            ca_der: &'a [u8],
+            com_key: &'a ComKey,
+            settings: &'a str,
+        }
+        let mut out = vec![PASSPORT_VERSION];
+        out.extend(
+            postcard::to_stdvec(&Signable {
+                key_der: &self.key_der,
+                leaf_der: &self.leaf_der,
+                ca_der: &self.ca_der,
+                com_key: &self.com_key,
+                settings: &self.settings,
+            })
+            .unwrap_or_default(),
+        );
+        out
+    }
+
+    /// Whether [`Passport::signature`] verifies against `ec_point` (an
+    /// uncompressed P-256 public key point, `0x04 || x || y` — e.g. the raw
+    /// bit-string contents of a certificate's SPKI, not the SPKI DER
+    /// itself) for the fields this passport carries. `false` on an empty
+    /// signature or anything else that doesn't check out; never panics.
+    pub fn verify_signature(&self, ec_point: &[u8]) -> bool {
+        use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+        if self.signature.is_empty() {
+            return false;
+        }
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, ec_point)
+            .verify(&self.signable_bytes(), &self.signature)
+            .is_ok()
     }
 }
 
@@ -197,6 +249,7 @@ mod tests {
             ca_der: (0..366u32).map(|i| (i % 253) as u8).collect(),
             com_key: ComKey::from_bytes([0x5A; crate::com::COM_KEY_LEN]),
             settings: String::new(),
+            signature: Vec::new(),
         }
     }
 
@@ -295,12 +348,12 @@ mod tests {
         ));
     }
 
-    /// Versions 1–3 had no com key: they cannot reach a server any more and
-    /// are refused by their version byte, as is anything newer.
+    /// Versions 1–3 had no com key and version 4 no signature field: none of
+    /// them can be read by this build, and anything newer is refused too.
     #[test]
     fn other_versions_are_rejected() {
         let body = postcard::to_stdvec(&sample()).unwrap();
-        for version in [1, 2, 3, 5] {
+        for version in [1, 2, 3, 4, 6] {
             assert!(matches!(
                 Passport::decode(&armored_body(version, &body)),
                 Err(PassportError::UnsupportedVersion(v)) if v == version
@@ -329,8 +382,67 @@ mod tests {
         let shown = format!("{:?}", with_settings());
         assert!(shown.contains("<redacted, 200 bytes>"));
         assert!(shown.contains("ComKey(<redacted>)"));
+        assert!(shown.contains("signature: 0 bytes"));
         assert!(!shown.contains("197, 198, 199"));
         assert!(!shown.contains("90, 90"));
+    }
+
+    /// A real ECDSA-P256 keypair (`ring`, not `rcgen`: icu-proto doesn't
+    /// depend on it), standing in for the server's CA key.
+    fn test_keypair() -> (ring::signature::EcdsaKeyPair, Vec<u8>) {
+        use ring::rand::SystemRandom;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
+        let ec_point = key_pair.public_key().as_ref().to_vec();
+        (key_pair, ec_point)
+    }
+
+    fn sign_with(p: &Passport, key_pair: &ring::signature::EcdsaKeyPair) -> Vec<u8> {
+        let rng = ring::rand::SystemRandom::new();
+        key_pair
+            .sign(&rng, &p.signable_bytes())
+            .unwrap()
+            .as_ref()
+            .to_vec()
+    }
+
+    /// The concrete guarantee this feature buys: a valid signature accepts
+    /// the exact bundle it was made for, and rejects it the moment any
+    /// signed field — including `com_key`, which nothing else here checks —
+    /// changes afterwards.
+    #[test]
+    fn signature_roundtrip_and_tamper_detection() {
+        let (key_pair, ec_point) = test_keypair();
+        let mut p = with_settings();
+        p.signature = sign_with(&p, &key_pair);
+        assert!(p.verify_signature(&ec_point));
+
+        // Round-trips through the armor unchanged.
+        let armored = p.encode();
+        assert_eq!(Passport::decode(&armored).unwrap(), p);
+
+        let mut tampered_settings = p.clone();
+        tampered_settings.settings.push('x');
+        assert!(!tampered_settings.verify_signature(&ec_point));
+
+        let mut tampered_com_key = p.clone();
+        tampered_com_key.com_key = ComKey::from_bytes([0x11; crate::com::COM_KEY_LEN]);
+        assert!(!tampered_com_key.verify_signature(&ec_point));
+
+        let mut flipped_signature = p.clone();
+        let last = flipped_signature.signature.len() - 1;
+        flipped_signature.signature[last] ^= 1;
+        assert!(!flipped_signature.verify_signature(&ec_point));
+
+        // No signature at all, and a signature checked against the wrong key.
+        assert!(!sample().verify_signature(&ec_point));
+        let (_, other_point) = test_keypair();
+        assert!(!p.verify_signature(&other_point));
     }
 
     /// Settings that would push the body past the cap are caught before

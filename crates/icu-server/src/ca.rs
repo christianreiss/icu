@@ -407,6 +407,20 @@ impl Ca {
         Ok((cert.der().clone(), key.serialize_der()))
     }
 
+    /// Signs `msg` with the CA's own key (DER ECDSA), for binding an inline
+    /// signature onto data the CA isn't issuing a certificate for — the
+    /// passport it hands out at registration (`icu_proto::passport`) — so
+    /// tampering after issuance is detectable. The CA key is P-256
+    /// (`create_ca`), matching the `ECDSA_P256_SHA256_ASN1` verification the
+    /// client side hardcodes.
+    pub fn sign_raw(&self, msg: &[u8]) -> Result<Vec<u8>> {
+        use rcgen::SigningKey;
+        self.issuer
+            .key()
+            .sign(msg)
+            .map_err(|e| Error::msg(format!("cannot sign: {e}")))
+    }
+
     /// Signs a CRL listing `serials` (lowercase hex, see [`leaf_serial`]) with
     /// the CA key (`PROTOCOL.md` §1). One CRL covers client and server leaves:
     /// the server checks client certificates against it during the
@@ -991,6 +1005,27 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "{name} must be 0600");
         }
+    }
+
+    /// The CA key is P-256: [`Ca::sign_raw`]'s signature must verify with
+    /// `ring`'s `ECDSA_P256_SHA256_ASN1`, which the client side hardcodes
+    /// (`icu_proto::passport::Passport::verify_signature`). If `create_ca`
+    /// ever changes what `KeyPair::generate()` defaults to, client
+    /// verification of every future invite breaks silently — pin it here.
+    #[test]
+    fn sign_raw_is_p256_and_verifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Ca::load_or_create(dir.path(), &tls(), "localhost").unwrap();
+        let msg = b"passport signable bytes";
+        let sig = ca.sign_raw(msg).unwrap();
+
+        let cert = parse(ca.ca_der());
+        let ec_point = cert.public_key().subject_public_key.data.to_vec();
+
+        use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1};
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &ec_point)
+            .verify(msg, &sig)
+            .expect("CA key must be P-256 for the client's hardcoded verification to work");
     }
 
     /// A CSR for `cn`, plus its key so the caller can keep it.

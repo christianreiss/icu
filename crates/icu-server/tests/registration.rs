@@ -88,6 +88,31 @@ async fn a_bundle_from_an_admin_registers_a_client_with_its_own_name() {
     server.shutdown().await;
 }
 
+/// The server signs every bundle it issues with its CA key; a client refuses
+/// one whose signature doesn't verify (`PROTOCOL.md` §2.3.1). This checks
+/// the server's half — the raw bundle carries a valid signature — the
+/// client's refusal of a tampered one is covered in icu-client's own tests.
+#[tokio::test]
+async fn the_issued_bundle_carries_a_verifying_signature() {
+    let server = TestServer::start().await;
+    let mut admin = admin_client(&server).await;
+    let (bundle, _expires) = mint(&mut admin, "signed-check", 0).await;
+
+    let passport = icu_proto::passport::Passport::decode(&bundle).expect("bundle decodes");
+    assert!(
+        !passport.signature.is_empty(),
+        "a registration bundle must carry a signature"
+    );
+    let (_, ca_cert) = x509_parser::certificate::X509Certificate::from_der(&passport.ca_der)
+        .expect("ca_der parses");
+    let ec_point = ca_cert.public_key().subject_public_key.data.to_vec();
+    assert!(
+        passport.verify_signature(&ec_point),
+        "the signature must verify against the CA's own key"
+    );
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_bundle_without_a_label_gets_a_placeholder() {
     let server = TestServer::start().await;

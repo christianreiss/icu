@@ -101,26 +101,32 @@ pub async fn issue(
         })?;
         label.to_string()
     };
-    let (leaf, key_der, ca_der) = {
+    let bundle = {
         let ca = server.ca.read().await;
         let (leaf, key_der) = ca.issue_registration(&name, ttl, &public_host)?;
-        (leaf, key_der, ca.ca_der().to_vec())
+        let mut bundle = Passport {
+            key_der,
+            leaf_der: leaf.to_vec(),
+            ca_der: ca.ca_der().to_vec(),
+            com_key: server.com_key.clone(),
+            settings: String::new(),
+            signature: Vec::new(),
+        };
+        // Signed inline with the CA key, which never travels inside the
+        // bundle itself: tampering with the armored text afterwards — the
+        // com key included, otherwise uncovered by anything else here — no
+        // longer imports silently (`PROTOCOL.md` §2.3.1).
+        bundle.signature = ca.sign_raw(&bundle.signable_bytes())?;
+        bundle
     };
-    let cert = CertRecord::issued(&leaf, name.clone(), rfc3339(now()), true);
+    let cert = CertRecord::issued(&bundle.leaf_der, name.clone(), rfc3339(now()), true);
     let expires = cert.expires.clone();
     let (user_id, is_admin) = store.add_registration(cert)?;
     let admin_confirmed = store.has_confirmed_admin();
     drop(store);
 
     tracing::info!(user_id, name = %name, is_admin, %expires, "registration issued");
-    let bundle = Passport {
-        key_der,
-        leaf_der: leaf.to_vec(),
-        ca_der,
-        com_key: server.com_key.clone(),
-        settings: String::new(),
-    }
-    .encode();
+    let bundle = bundle.encode();
     Ok(Issued {
         bundle,
         expires,

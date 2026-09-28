@@ -711,6 +711,27 @@ impl Identity {
             tracing::info!(%e, "passport does not decode");
             crate::problem::passport_text(&e)
         })?;
+        // A registration bundle must carry a valid signature by its own CA
+        // (`PROTOCOL.md` §2.3.1): that key never travels inside the bundle,
+        // so this catches tampering with the armored text after the server
+        // wrote it — the com key included, which nothing else here checks.
+        // A personal export normally carries none; if one is present anyway
+        // it is still checked rather than silently ignored.
+        let is_registration = crate::net::register::is_registration(&passport.leaf_der);
+        if (is_registration || !passport.signature.is_empty())
+            && !crate::conninfo::passport_signed_by_its_ca(&passport)
+        {
+            tracing::info!(is_registration, "passport signature missing or invalid");
+            return Err(if is_registration {
+                "Diese Einladung ist beschädigt (Signatur fehlt oder ist ungültig). Bitte \
+                 beim Admin eine neue anfordern."
+                    .to_string()
+            } else {
+                "Dieser Passport ist beschädigt (die Signatur ist ungültig). Bitte auf dem \
+                 anderen Gerät neu exportieren."
+                    .to_string()
+            });
+        }
         let settings = if passport.settings.trim().is_empty() {
             None
         } else {
@@ -830,6 +851,10 @@ impl Identity {
             ca_der: self.ca_der.clone(),
             com_key: self.com_key.clone(),
             settings,
+            // Unsigned: the only key a client could sign with here already
+            // travels inside the bundle itself (see `Passport::signature`'s
+            // doc). Only a server-issued registration bundle is signed.
+            signature: Vec::new(),
         }
     }
 
@@ -1358,7 +1383,8 @@ mod tests {
         ComKey::from_bytes([3; icu_proto::com::COM_KEY_LEN])
     }
 
-    /// A passport of `key`, `leaf` and `ca` with `settings`.
+    /// A passport of `key`, `leaf` and `ca` with `settings`, unsigned — the
+    /// shape of a personal export, not a registration bundle.
     fn passport(key: Vec<u8>, leaf: Vec<u8>, ca: Vec<u8>, settings: &str) -> String {
         icu_proto::passport::Passport {
             key_der: key,
@@ -1366,6 +1392,7 @@ mod tests {
             ca_der: ca,
             com_key: com(),
             settings: settings.into(),
+            signature: Vec::new(),
         }
         .encode()
     }
@@ -1487,6 +1514,51 @@ mod tests {
         (leaf.der().to_vec(), ca.der().to_vec(), key.serialize_der())
     }
 
+    /// [`issued_as`], plus a real CA signature over the resulting passport's
+    /// signable bytes — the shape a genuine registration bundle has
+    /// (`registration::issue` in icu-server signs the same way, with the
+    /// same CA key that issued the leaf).
+    fn issued_and_signed(
+        uri: Option<&str>,
+        ca_cn: &str,
+        cn: &str,
+        leaf: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> icu_proto::passport::Passport {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SanType, SigningKey};
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_key_pem = ca_key.serialize_pem();
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params.distinguished_name.push(DnType::CommonName, ca_cn);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(DnType::CommonName, cn);
+        if let Some(uri) = uri {
+            params.subject_alt_names = vec![SanType::URI(uri.to_string().try_into().unwrap())];
+        }
+        leaf(&mut params);
+        let leaf_cert = params.signed_by(&key, &issuer).unwrap();
+
+        let mut bundle = icu_proto::passport::Passport {
+            key_der: key.serialize_der(),
+            leaf_der: leaf_cert.der().to_vec(),
+            ca_der: ca.der().to_vec(),
+            com_key: com(),
+            settings: String::new(),
+            signature: Vec::new(),
+        };
+        // Reloaded from PEM rather than reusing `ca_key`, which `Issuer`
+        // above already took ownership of — same reload `icu-server`'s `Ca`
+        // does when it needs its key twice.
+        let signing_key = KeyPair::from_pem(&ca_key_pem).unwrap();
+        bundle.signature = signing_key.sign(&bundle.signable_bytes()).unwrap();
+        bundle
+    }
+
     /// A passport is refused before anything is replaced when its key does
     /// not belong to its certificate, its certificate is not from the CA it
     /// brings, an invitation has expired, or a name it shows is not plain
@@ -1516,14 +1588,14 @@ mod tests {
             p.not_before = rcgen::date_time_ymd(2020, 1, 1);
             p.not_after = rcgen::date_time_ymd(2021, 1, 1);
         };
-        let (leaf, ca, key) = issued_as(URI, CA, "neu-1a2b", |p| {
+        let expired_registration = issued_and_signed(URI, CA, "neu-1a2b", |p| {
             expired(p);
             p.distinguished_name.push(
                 rcgen::DnType::OrganizationalUnitName,
                 crate::net::register::REGISTRATION_OU,
             );
         });
-        let err = Identity::from_passport(&passport(key, leaf, ca, "")).unwrap_err();
+        let err = Identity::from_passport(&expired_registration.encode()).unwrap_err();
         assert!(err.contains("Einladung ist abgelaufen"), "{err}");
         let (leaf, ca, key) = issued_as(URI, CA, "alice", expired);
         assert!(
@@ -1547,6 +1619,51 @@ mod tests {
                 "{cn:?} {ca_cn:?}: {err}"
             );
         }
+    }
+
+    /// The concrete guarantee the signature buys (`PROTOCOL.md` §2.3.1): a
+    /// registration bundle needs one at all, and it must cover every field,
+    /// `com_key` included — nothing else here checks that one.
+    #[test]
+    fn a_registration_bundle_needs_a_valid_signature() {
+        const URI: Option<&str> = Some("icu://icu.example.org:4711");
+        const CA: &str = "ICU CA icu.example.org";
+        let registration = |p: &mut rcgen::CertificateParams| {
+            p.distinguished_name.push(
+                rcgen::DnType::OrganizationalUnitName,
+                crate::net::register::REGISTRATION_OU,
+            );
+        };
+
+        // No signature at all: the unsigned `passport()` helper stands in
+        // for a stripped or never-signed bundle.
+        let (leaf, ca, key) = issued_as(URI, CA, "neu-1a2b", registration);
+        let err = Identity::from_passport(&passport(key, leaf, ca, "")).unwrap_err();
+        assert!(err.contains("Signatur"), "{err}");
+
+        // A genuinely signed bundle is accepted.
+        let bundle = issued_and_signed(URI, CA, "neu-1a2b", registration);
+        assert!(Identity::from_passport(&bundle.encode()).is_ok());
+
+        // Tampering with `com_key` after signing — the field nothing else
+        // here checks — invalidates the signature and is refused, not
+        // silently accepted.
+        let mut tampered = bundle.clone();
+        tampered.com_key = ComKey::from_bytes([tampered.com_key.as_bytes()[0] ^ 1; 32]);
+        let err = Identity::from_passport(&tampered.encode()).unwrap_err();
+        assert!(err.contains("Signatur"), "{err}");
+
+        // A flipped signature byte, same result.
+        let mut flipped = bundle.clone();
+        let last = flipped.signature.len() - 1;
+        flipped.signature[last] ^= 1;
+        let err = Identity::from_passport(&flipped.encode()).unwrap_err();
+        assert!(err.contains("Signatur"), "{err}");
+
+        // A personal export (no registration OU) needs none, exactly as
+        // before this feature: unsigned still imports.
+        let (leaf, ca, key) = issued(URI, CA);
+        assert!(Identity::from_passport(&passport(key, leaf, ca, "")).is_ok());
     }
 
     #[test]
