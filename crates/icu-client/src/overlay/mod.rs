@@ -39,6 +39,17 @@ use self::windows as platform;
 
 const GAP: u32 = 8;
 const BORDER: u32 = 3;
+/// Gap between a tile's border ring and its outside name-label band.
+const LABEL_GAP: u32 = 4;
+/// Vertical padding inside the label band, above/below the glyphs' ascent
+/// span, that sets the band's radial thickness.
+const LABEL_PAD_V: u32 = 4;
+/// Half the total arc a name may curve across before it's cut with „…" —
+/// past this the letters would start reading upside down near the ends.
+const MAX_LABEL_HALF_ANGLE: f32 = 62.0 * std::f32::consts::PI / 180.0;
+/// Extra angle the opaque label band extends past the text itself, so
+/// antialiased glyph edges never poke out past an opaque backing.
+const LABEL_BAND_PAD_ANGLE: f32 = 6.0 * std::f32::consts::PI / 180.0;
 /// Brightness multiplier (out of 256) applied to dimmed, non-speaking tiles.
 const DIM_MUL: u32 = 128;
 /// Frame interval: 15 fps.
@@ -143,34 +154,59 @@ impl Labels {
         &self.cache[&key]
     }
 
-    fn render(&self, text: &str, px: u32, max_width: u32) -> Label {
-        let scaled = self.font.as_scaled(PxScale::from(px as f32));
-        let width_of = |t: &str| {
-            let mut w = 0.0f32;
-            let mut prev = None;
-            for c in t.chars() {
-                let id = scaled.glyph_id(c);
-                if let Some(p) = prev {
-                    w += scaled.kern(p, id);
-                }
-                w += scaled.h_advance(id);
-                prev = Some(id);
+    /// One character's own bitmap, cached separately from whole-string
+    /// labels: the curved outside label places each glyph on its own
+    /// rotation, so it needs them individually rather than kerned into a
+    /// single strip.
+    fn glyph(&mut self, c: char, px: u32) -> &Label {
+        let mut buf = [0u8; 4];
+        let key = (c.encode_utf8(&mut buf).to_string(), px, u32::MAX);
+        if !self.cache.contains_key(&key) {
+            if self.cache.len() > 256 {
+                self.cache.clear();
             }
-            w
-        };
-        let mut shown = text.to_string();
-        if width_of(&shown) > max_width as f32 {
-            let mut chars: Vec<char> = text.chars().collect();
-            while !chars.is_empty() {
-                chars.pop();
-                let candidate = format!("{}…", chars.iter().collect::<String>().trim_end());
-                if width_of(&candidate) <= max_width as f32 {
-                    shown = candidate;
-                    break;
-                }
+            let label = self.render(&key.0, px, u32::MAX);
+            self.cache.insert(key.clone(), label);
+        }
+        &self.cache[&key]
+    }
+
+    /// Total advance (with kerning) of `text` at `px` pixels, unclamped.
+    fn advance(&self, text: &str, px: u32) -> f32 {
+        let scaled = self.font.as_scaled(PxScale::from(px as f32));
+        let mut w = 0.0f32;
+        let mut prev = None;
+        for c in text.chars() {
+            let id = scaled.glyph_id(c);
+            if let Some(p) = prev {
+                w += scaled.kern(p, id);
+            }
+            w += scaled.h_advance(id);
+            prev = Some(id);
+        }
+        w
+    }
+
+    /// `text`, cut with „…" so its advance at `px` pixels fits `max_width`.
+    fn cut(&self, text: &str, px: u32, max_width: f32) -> String {
+        if self.advance(text, px) <= max_width {
+            return text.to_string();
+        }
+        let mut chars: Vec<char> = text.chars().collect();
+        while !chars.is_empty() {
+            chars.pop();
+            let candidate = format!("{}…", chars.iter().collect::<String>().trim_end());
+            if self.advance(&candidate, px) <= max_width {
+                return candidate;
             }
         }
-        let width = (width_of(&shown).ceil() as u32).clamp(1, max_width.max(1));
+        String::new()
+    }
+
+    fn render(&self, text: &str, px: u32, max_width: u32) -> Label {
+        let scaled = self.font.as_scaled(PxScale::from(px as f32));
+        let shown = self.cut(text, px, max_width as f32);
+        let width = (self.advance(&shown, px).ceil() as u32).clamp(1, max_width.max(1));
         let height = ((scaled.ascent() - scaled.descent()).ceil() as u32).max(1);
         let mut alpha = vec![0u8; (width * height) as usize];
         let mut caret = 0.0f32;
@@ -207,6 +243,15 @@ impl Labels {
     }
 }
 
+/// Blends white into one premultiplied BGRA pixel by coverage `a` (0-255) —
+/// shared by the straight `blend_label` strip blit and the curved outside
+/// label's rotated glyph blit.
+fn blend_white(dst: &mut [u8], a: u32) {
+    for c in dst.iter_mut() {
+        *c = ((255 * a + u32::from(*c) * (255 - a)) / 255) as u8;
+    }
+}
+
 /// Blends a white `label` into `canvas` (premultiplied BGRA, `stride`
 /// bytes per row) at `x`, `y`, clipped to the canvas.
 fn blend_label(canvas: &mut [u8], stride: usize, x: u32, y: u32, label: &Label) {
@@ -217,11 +262,75 @@ fn blend_label(canvas: &mut [u8], stride: usize, x: u32, y: u32, label: &Label) 
                 continue;
             }
             let i = (y + ly) as usize * stride + (x + lx) as usize * 4;
-            let Some(px) = canvas.get_mut(i..i + 4) else {
+            if let Some(px) = canvas.get_mut(i..i + 4) {
+                blend_white(px, a);
+            }
+        }
+    }
+}
+
+/// Blits one already-rasterized glyph (see [`Labels::glyph`]) rotated by
+/// `theta` around a tile's center `(cx, cy)`: its top row (ascent, small
+/// row indices) sits at radius `r_inner`, closest to the circle, and it
+/// extends further outward as the row index grows toward its baseline and
+/// descent — the normal top-then-bottom reading order, just bent around
+/// the circle instead of running straight. `theta = 0` is straight down;
+/// it increases clockwise, matching left→right reading.
+fn blit_rotated_glyph(
+    canvas: &mut [u8],
+    stride: usize,
+    canvas_w: u32,
+    canvas_h: u32,
+    cx: f32,
+    cy: f32,
+    r_inner: f32,
+    theta: f32,
+    glyph: &Label,
+) {
+    if glyph.width == 0 || glyph.height == 0 {
+        return;
+    }
+    let (sin_t, cos_t) = theta.sin_cos();
+    let (ox, oy) = (sin_t, cos_t); // outward at theta
+    let (tx, ty) = (cos_t, -sin_t); // tangent, left→right as theta increases
+    let (gw, gh) = (glyph.width as f32, glyph.height as f32);
+    // World = center + (lx - gw/2)*tangent + (r_inner + ly)*outward.
+    let point = |lx: f32, ly: f32| {
+        let lx_c = lx - gw / 2.0;
+        let rr = r_inner + ly;
+        (cx + lx_c * tx + rr * ox, cy + lx_c * ty + rr * oy)
+    };
+    // World-space bounding box of the rotated glyph, from its four corners.
+    let corners = [point(0.0, 0.0), point(gw, 0.0), point(0.0, gh), point(gw, gh)];
+    let min_x = corners.iter().fold(f32::MAX, |a, &(x, _)| a.min(x));
+    let max_x = corners.iter().fold(f32::MIN, |a, &(x, _)| a.max(x));
+    let min_y = corners.iter().fold(f32::MAX, |a, &(_, y)| a.min(y));
+    let max_y = corners.iter().fold(f32::MIN, |a, &(_, y)| a.max(y));
+    let x0 = min_x.floor().max(0.0) as u32;
+    let x1 = (max_x.ceil().max(0.0) as u32).min(canvas_w);
+    let y0 = min_y.floor().max(0.0) as u32;
+    let y1 = (max_y.ceil().max(0.0) as u32).min(canvas_h);
+    for wy in y0..y1 {
+        for wx in x0..x1 {
+            let dx = wx as f32 + 0.5 - cx;
+            let dy = wy as f32 + 0.5 - cy;
+            // Inverse of the forward map above: project onto the
+            // (tangent, outward) basis, which is orthonormal, so a dot
+            // product suffices.
+            let lx_c = dx * tx + dy * ty;
+            let rr = dx * ox + dy * oy;
+            let lx = lx_c + gw / 2.0;
+            let ly = rr - r_inner;
+            if lx < 0.0 || ly < 0.0 || lx >= gw || ly >= gh {
                 continue;
-            };
-            for c in px.iter_mut() {
-                *c = ((255 * a + u32::from(*c) * (255 - a)) / 255) as u8;
+            }
+            let a = u32::from(glyph.alpha[(ly as u32 * glyph.width + lx as u32) as usize]);
+            if a == 0 {
+                continue;
+            }
+            let i = wy as usize * stride + wx as usize * 4;
+            if let Some(px) = canvas.get_mut(i..i + 4) {
+                blend_white(px, a);
             }
         }
     }
@@ -273,31 +382,44 @@ impl Scene {
         }
     }
 
-    fn tile_dims(&self) -> (u32, u32) {
-        let (w, h) = match self.settings.size {
-            TileSize::Small => (160, 120),
-            TileSize::Medium => (320, 240),
-            TileSize::Large => (480, 360),
+    /// Diameter of a camera tile's circle.
+    fn camera_diameter(&self) -> u32 {
+        let d = match self.settings.size {
+            TileSize::Small => 120,
+            TileSize::Medium => 240,
+            TileSize::Large => 360,
         };
-        (scaled(w, self.scale), scaled(h, self.scale))
+        scaled(d, self.scale)
     }
 
-    /// Height of a name plate, and the name's pixel size, per tile size.
-    fn plate_dims(&self) -> (u32, u32) {
-        let (h, px) = match self.settings.size {
-            TileSize::Small => (26, 12),
-            TileSize::Medium => (34, 15),
-            TileSize::Large => (42, 18),
+    /// Diameter of a voice-only plate's circle — smaller than a camera
+    /// tile, closer to the small avatars elsewhere in the UI.
+    fn plate_diameter(&self) -> u32 {
+        let d = match self.settings.size {
+            TileSize::Small => 72,
+            TileSize::Medium => 144,
+            TileSize::Large => 216,
         };
-        (scaled(h, self.scale), scaled(px, self.scale))
+        scaled(d, self.scale)
     }
 
-    /// Inner height of a tile.
-    fn tile_height(&self, tile: &Tile) -> u32 {
-        match tile.face {
-            Face::Camera(_) => self.tile_dims().1,
-            Face::Plate => self.plate_dims().0,
-        }
+    /// The outside name label's font size, per tile size.
+    fn label_px(&self) -> u32 {
+        let px = match self.settings.size {
+            TileSize::Small => 12,
+            TileSize::Medium => 15,
+            TileSize::Large => 18,
+        };
+        scaled(px, self.scale)
+    }
+
+    /// A tile's full round shape: its circle plus its outside label ring.
+    fn tile_geom(&self, tile: &Tile) -> CircleGeom {
+        let diameter = match tile.face {
+            Face::Camera(_) => self.camera_diameter(),
+            Face::Plate => self.plate_diameter(),
+        };
+        circle_geometry(diameter, self.label_px())
     }
 
     /// Whether the surface hangs from its bottom edge: the tiles of a
@@ -375,17 +497,20 @@ impl Scene {
                 size_changed: false,
             };
         }
-        let (tw, _) = self.tile_dims();
         let n = self.tiles.len() as u32;
-        let heights: Vec<u32> = self.tiles.iter().map(|t| self.tile_height(t)).collect();
+        let geoms: Vec<CircleGeom> = self.tiles.iter().map(|t| self.tile_geom(t)).collect();
+        // Each tile reserves a fixed slot sized for the worst-case label
+        // arc, not its actual name's length, so a row/column stays aligned
+        // regardless of who has a long name (same principle as before:
+        // only the text itself gets truncated with „…").
         let (width, height) = match self.effective_expand() {
             Expand::Vertical => (
-                tw + 2 * BORDER,
-                heights.iter().map(|h| h + 2 * BORDER).sum::<u32>() + (n - 1) * GAP,
+                geoms.iter().map(|g| g.outer_w).max().unwrap_or(0),
+                geoms.iter().map(|g| g.outer_h).sum::<u32>() + n.saturating_sub(1) * GAP,
             ),
             Expand::Horizontal => (
-                n * (tw + 2 * BORDER) + (n - 1) * GAP,
-                heights.iter().max().copied().unwrap_or(0) + 2 * BORDER,
+                geoms.iter().map(|g| g.outer_w).sum::<u32>() + n.saturating_sub(1) * GAP,
+                geoms.iter().map(|g| g.outer_h).max().unwrap_or(0),
             ),
         };
         let size_changed = width != self.width || height != self.height;
@@ -401,15 +526,12 @@ impl Scene {
     /// Draws the tiles into `canvas`, premultiplied BGRA of
     /// `self.width × self.height`.
     fn draw(&mut self, canvas: &mut [u8]) {
-        let (tile_w, camera_h) = self.tile_dims();
-        let (plate_h, name_px) = self.plate_dims();
         let geometry = Geometry {
             width: self.width,
             height: self.height,
-            tile_w,
-            camera_h,
-            plate_h,
-            name_px,
+            camera_diameter: self.camera_diameter(),
+            plate_diameter: self.plate_diameter(),
+            name_px: self.label_px(),
             horizontal: self.effective_expand() == Expand::Horizontal,
             bottom: self.anchored_bottom(),
             speaking_frame: self.settings.speaking_frame,
@@ -441,14 +563,115 @@ fn layout(s: &OverlaySettings) -> (Corner, [u32; 2], TileSize, Expand) {
     (s.corner, s.offset, s.size, s.expand)
 }
 
+/// A tile's round shape and outside label ring, derived purely from its
+/// circle's diameter and the label font size, so the sizing pass
+/// ([`Scene::update`]) and the draw pass ([`compose`]) can't drift apart.
+#[derive(Clone, Copy)]
+struct CircleGeom {
+    r: f32,
+    r_outer: f32,
+    r_label_inner: f32,
+    r_label_outer: f32,
+    /// Half the outer bounding box's width.
+    half_w: u32,
+    outer_w: u32,
+    outer_h: u32,
+}
+
+/// The border ring around a circle of `diameter`, and the label band
+/// around that sized for `name_px` text.
+fn circle_geometry(diameter: u32, name_px: u32) -> CircleGeom {
+    let r = diameter as f32 / 2.0;
+    let r_outer = r + BORDER as f32;
+    let thickness = (name_px + 2 * LABEL_PAD_V) as f32;
+    let r_label_inner = r_outer + LABEL_GAP as f32;
+    let r_label_outer = r_label_inner + thickness;
+    // The label band can bulge sideways past the circle itself at wide
+    // angles; the tile's reserved box must be wide enough for that, sized
+    // for the widest angle a name is ever allowed (truncation keeps
+    // shorter names from needing it, but the slot stays constant).
+    let band_half_angle = MAX_LABEL_HALF_ANGLE + LABEL_BAND_PAD_ANGLE;
+    let bulge = r_label_outer * band_half_angle.sin();
+    let half_w = r_outer.max(bulge).ceil() as u32;
+    CircleGeom {
+        r,
+        r_outer,
+        r_label_inner,
+        r_label_outer,
+        half_w,
+        outer_w: half_w * 2,
+        outer_h: (r_outer + r_label_outer).ceil() as u32,
+    }
+}
+
+/// Samples `rgba` (announced `fw × fh`) as a centered square crop into a
+/// circle of radius `r`, so a 4:3 frame doesn't stretch: the short side is
+/// kept whole and the long one cropped symmetrically — the same idea
+/// `ui/widgets.rs::avatar` uses for the small round avatars. `dx`, `dy` are
+/// the destination pixel's offset from the circle's center, in `[-r, r]`.
+/// Bounds-checked: a frame shorter than its announced size (a partial
+/// decode) must not take the client down.
+fn sample_camera_circle(fw: usize, fh: usize, rgba: &[u8], dx: f32, dy: f32, r: f32, mul: u32) -> [u8; 4] {
+    let side = fw.min(fh).max(1);
+    let u = ((dx + r) / (2.0 * r)).clamp(0.0, 0.999_9);
+    let v = ((dy + r) / (2.0 * r)).clamp(0.0, 0.999_9);
+    let sx = (fw - side) / 2 + (u * side as f32) as usize;
+    let sy = (fh - side) / 2 + (v * side as f32) as usize;
+    let i = (sy * fw + sx) * 4;
+    match rgba.get(i..i + 3) {
+        Some(&[r8, g8, b8]) => [
+            ((u32::from(b8) * mul) >> 8) as u8,
+            ((u32::from(g8) * mul) >> 8) as u8,
+            ((u32::from(r8) * mul) >> 8) as u8,
+            0xff,
+        ],
+        _ => [0x20, 0x20, 0x20, 0xff],
+    }
+}
+
+/// Draws `name`, curved along the arc up to `max_half_angle` either side of
+/// straight down from `(cx, cy)`, its ascent following the circle at
+/// radius `r_inner`, cut with „…" to fit — the tile's outside label,
+/// replacing the old strip drawn over the picture. Kerning is dropped
+/// (each glyph is its own rigid rotation), and layout uses exact arc
+/// length (`theta = s / r_inner`), not an approximation.
+#[allow(clippy::too_many_arguments)]
+fn draw_curved_label(
+    canvas: &mut [u8],
+    stride: usize,
+    canvas_w: u32,
+    canvas_h: u32,
+    cx: f32,
+    cy: f32,
+    r_inner: f32,
+    max_half_angle: f32,
+    name: &str,
+    px: u32,
+    labels: &mut Labels,
+) {
+    let max_arc = 2.0 * max_half_angle * r_inner;
+    let shown = labels.cut(name, px, max_arc);
+    let total_w = labels.advance(&shown, px);
+    if total_w <= 0.0 {
+        return;
+    }
+    let mut caret = -total_w / 2.0;
+    for c in shown.chars() {
+        let glyph_w = labels.advance(&c.to_string(), px);
+        let theta = (caret + glyph_w / 2.0) / r_inner;
+        caret += glyph_w;
+        let glyph = labels.glyph(c, px);
+        blit_rotated_glyph(canvas, stride, canvas_w, canvas_h, cx, cy, r_inner, theta, glyph);
+    }
+}
+
 /// Where and how big the tiles are; everything [`compose`] needs besides
 /// the tiles themselves.
 struct Geometry {
     width: u32,
     height: u32,
-    tile_w: u32,
-    camera_h: u32,
-    plate_h: u32,
+    camera_diameter: u32,
+    plate_diameter: u32,
     name_px: u32,
     horizontal: bool,
     /// The surface hangs from its bottom edge: a row lines up there.
@@ -458,113 +681,118 @@ struct Geometry {
 }
 
 /// Draws the tiles into `canvas` (premultiplied BGRA, `width × height`):
-/// a border, the picture or a plate, and the name. Every pixel access is
-/// bounds-checked — a frame that does not match its announced size must
-/// not take the client down.
+/// a round, opaque border and fill — the picture, or for a plate an
+/// initials circle — and the name curved along the outside of the circle.
+/// Every pixel access is bounds-checked — a frame that does not match its
+/// announced size must not take the client down.
 fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&mut Labels>) {
     canvas.fill(0);
     let stride = g.width as usize * 4;
-    let tw = g.tile_w;
     let mut x0 = 0u32;
     let mut y0 = 0u32;
+    let band_half_angle = MAX_LABEL_HALF_ANGLE + LABEL_BAND_PAD_ANGLE;
     for tile in tiles {
-        let th = match tile.face {
-            Face::Camera(_) => g.camera_h,
-            Face::Plate => g.plate_h,
+        let diameter = match tile.face {
+            Face::Camera(_) => g.camera_diameter,
+            Face::Plate => g.plate_diameter,
         };
-        let outer_w = tw + 2 * BORDER;
-        let outer_h = th + 2 * BORDER;
-        // In a row the tiles line up at the edge the surface hangs from.
+        let geom = circle_geometry(diameter, g.name_px);
+        let outer_w = geom.outer_w;
+        let outer_h = geom.outer_h;
+        // In a row the tiles line up at the edge the surface hangs from; in
+        // a column each tile centers within the column's width — camera
+        // and plate circles are different sizes now, unlike the old
+        // uniform-width rectangles.
         let ty = if g.horizontal && g.bottom {
             g.height.saturating_sub(outer_h)
         } else {
             y0
         };
+        let tx = if g.horizontal {
+            x0
+        } else {
+            (g.width.saturating_sub(outer_w)) / 2
+        };
+        let cx = tx as f32 + geom.half_w as f32;
+        let cy = ty as f32 + geom.r_outer;
         let [fr, fg, fb] = g.frame_color;
         let border = if tile.speaking && g.speaking_frame {
             [fb, fg, fr, 0xff] // B G R A premultiplied
         } else {
-            [0x30, 0x30, 0x30, 0xc0]
+            [0x30, 0x30, 0x30, 0xff]
         };
         let mul = if tile.dim { DIM_MUL } else { 256 };
+
+        // Pass 1: the circle (fill + border ring) and the opaque label
+        // band behind it; everything else stays transparent — that's what
+        // makes the tile round instead of a square with a circle painted
+        // on it.
         for y in 0..outer_h {
             for x in 0..outer_w {
-                let inside = x >= BORDER && x < BORDER + tw && y >= BORDER && y < BORDER + th;
-                let px = if !inside {
-                    border
-                } else {
-                    match &tile.face {
+                // `cx`/`cy` are absolute canvas coordinates (they already
+                // include `tx`/`ty`); `x`/`y` here are tile-local, so they
+                // need the same offset before comparing against them.
+                let dx = (tx + x) as f32 + 0.5 - cx;
+                let dy = (ty + y) as f32 + 0.5 - cy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let px = if dist <= geom.r {
+                    Some(match &tile.face {
                         Face::Camera(Some((fw, fh, rgba))) => {
-                            let sx = ((x - BORDER) as usize * fw) / tw as usize;
-                            let sy = ((y - BORDER) as usize * fh) / th as usize;
-                            let i = (sy * fw + sx) * 4;
-                            match rgba.get(i..i + 3) {
-                                Some(&[r, g, b]) => [
-                                    ((u32::from(b) * mul) >> 8) as u8,
-                                    ((u32::from(g) * mul) >> 8) as u8,
-                                    ((u32::from(r) * mul) >> 8) as u8,
-                                    0xff,
-                                ],
-                                _ => [0x20, 0x20, 0x20, 0xc0],
-                            }
+                            sample_camera_circle(*fw, *fh, rgba, dx, dy, geom.r, mul)
                         }
-                        Face::Camera(None) => [0x20, 0x20, 0x20, 0xc0],
-                        Face::Plate => [0x1c, 0x1c, 0x1c, 0xd8],
-                    }
+                        Face::Camera(None) => [0x20, 0x20, 0x20, 0xff],
+                        Face::Plate => [0x1c, 0x1c, 0x1c, 0xff],
+                    })
+                } else if dist <= geom.r_outer {
+                    Some(border)
+                } else if dist > geom.r_label_inner
+                    && dist <= geom.r_label_outer
+                    && dx.atan2(dy).abs() <= band_half_angle
+                {
+                    Some([0x1c, 0x1c, 0x1c, 0xff])
+                } else {
+                    None
                 };
-                let i = (ty + y) as usize * stride + (x0 + x) as usize * 4;
-                if let Some(dst) = canvas.get_mut(i..i + 4) {
-                    dst.copy_from_slice(&px);
+                if let Some(px) = px {
+                    let i = (ty + y) as usize * stride + (tx + x) as usize * 4;
+                    if let Some(dst) = canvas.get_mut(i..i + 4) {
+                        dst.copy_from_slice(&px);
+                    }
                 }
             }
         }
-        if let Some(labels) = labels.as_deref_mut() {
-            const PAD: u32 = 6;
-            let max = tw.saturating_sub(2 * PAD + 12);
-            let label = labels.get(&tile.name, g.name_px, max);
-            let (lx, ly) = match tile.face {
-                // A darkened strip along the bottom of the picture keeps the
-                // name readable on any background.
-                Face::Camera(_) => {
-                    let strip = label.height + 6;
-                    let top = ty + BORDER + th.saturating_sub(strip);
-                    for y in top..ty + BORDER + th {
-                        for x in x0 + BORDER..x0 + BORDER + tw {
-                            let i = y as usize * stride + x as usize * 4;
-                            if let Some(dst) = canvas.get_mut(i..i + 4) {
-                                for c in &mut dst[..3] {
-                                    *c = ((u32::from(*c) * 110) >> 8) as u8;
-                                }
-                                dst[3] = dst[3].max(0xd0);
-                            }
-                        }
-                    }
-                    (x0 + BORDER + PAD, top + 3)
-                }
-                // A plate: a dot in the frame color, then the name.
-                Face::Plate => {
-                    let cy = ty + BORDER + th / 2;
-                    let cx = x0 + BORDER + PAD + 4;
-                    for dy in 0..9u32 {
-                        for dx in 0..9u32 {
-                            let (ex, ey) = (dx as i32 - 4, dy as i32 - 4);
-                            if ex * ex + ey * ey <= 16 {
-                                let i =
-                                    (cy + dy - 4) as usize * stride + (cx + dx - 4) as usize * 4;
-                                if let Some(dst) = canvas.get_mut(i..i + 4) {
-                                    dst.copy_from_slice(&[fb, fg, fr, 0xff]);
-                                }
-                            }
-                        }
-                    }
-                    (
-                        x0 + BORDER + PAD + 14,
-                        ty + BORDER + th.saturating_sub(label.height) / 2,
-                    )
-                }
-            };
-            blend_label(canvas, stride, lx, ly, label);
+
+        // Pass 2: a plate's initials, centered and straight inside its
+        // circle — the same no-picture fallback the small avatars
+        // elsewhere use (`ui/widgets.rs::avatar`).
+        if matches!(tile.face, Face::Plate) {
+            if let Some(labels) = labels.as_deref_mut() {
+                let initials_px = (diameter as f32 * 0.37).round().max(1.0) as u32;
+                let text = crate::ui::widgets::initials(&tile.name);
+                let label = labels.get(&text, initials_px, diameter);
+                let lx = (cx - label.width as f32 / 2.0).round().max(0.0) as u32;
+                let ly = (cy - label.height as f32 / 2.0).round().max(0.0) as u32;
+                blend_label(canvas, stride, lx, ly, label);
+            }
         }
+
+        // Pass 3: the name, curved along the outside of the circle.
+        if let Some(labels) = labels.as_deref_mut() {
+            draw_curved_label(
+                canvas,
+                stride,
+                g.width,
+                g.height,
+                cx,
+                cy,
+                geom.r_label_inner,
+                MAX_LABEL_HALF_ANGLE,
+                &tile.name,
+                g.name_px,
+                labels,
+            );
+        }
+
         if g.horizontal {
             x0 += outer_w + GAP;
         } else {
@@ -577,27 +805,39 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
 mod tests {
     use super::*;
 
+    const CAMERA_D: u32 = 120;
+    const PLATE_D: u32 = 72;
+    const NAME_PX: u32 = 12;
+
     fn geometry(tiles: &[Tile], horizontal: bool) -> Geometry {
-        let heights = tiles.iter().map(|t| match t.face {
-            Face::Camera(_) => 120 + 2 * BORDER,
-            Face::Plate => 26 + 2 * BORDER,
-        });
+        let geoms: Vec<CircleGeom> = tiles
+            .iter()
+            .map(|t| {
+                let d = match t.face {
+                    Face::Camera(_) => CAMERA_D,
+                    Face::Plate => PLATE_D,
+                };
+                circle_geometry(d, NAME_PX)
+            })
+            .collect();
         let n = tiles.len() as u32;
         let (width, height) = if horizontal {
             (
-                n * (160 + 2 * BORDER) + (n - 1) * GAP,
-                heights.max().unwrap(),
+                geoms.iter().map(|g| g.outer_w).sum::<u32>() + n.saturating_sub(1) * GAP,
+                geoms.iter().map(|g| g.outer_h).max().unwrap(),
             )
         } else {
-            (160 + 2 * BORDER, heights.sum::<u32>() + (n - 1) * GAP)
+            (
+                geoms.iter().map(|g| g.outer_w).max().unwrap(),
+                geoms.iter().map(|g| g.outer_h).sum::<u32>() + n.saturating_sub(1) * GAP,
+            )
         };
         Geometry {
             width,
             height,
-            tile_w: 160,
-            camera_h: 120,
-            plate_h: 26,
-            name_px: 12,
+            camera_diameter: CAMERA_D,
+            plate_diameter: PLATE_D,
+            name_px: NAME_PX,
             horizontal,
             bottom: true,
             speaking_frame: true,
@@ -631,16 +871,18 @@ mod tests {
         assert_eq!(dpi_scale(144), 1.5);
         assert_eq!(dpi_scale(192), 2.0);
         assert_eq!(dpi_scale(0), 1.0);
-        let at = |scale| [160, 120, 26, 12, 20].map(|px| scaled(px, scale));
-        assert_eq!(at(1.0), [160, 120, 26, 12, 20]);
-        assert_eq!(at(1.5), [240, 180, 39, 18, 30]);
-        assert_eq!(at(2.0), [320, 240, 52, 24, 40]);
+        let at = |scale| [120, 72, 12, 20].map(|px| scaled(px, scale));
+        assert_eq!(at(1.0), [120, 72, 12, 20]);
+        assert_eq!(at(1.5), [180, 108, 18, 30]);
+        assert_eq!(at(2.0), [240, 144, 24, 40]);
         assert_eq!(scaled(15, 1.25), 19);
     }
 
     /// Camera tile and plate both carry their name, a long one cut with
-    /// „…" inside the tile; a picture shorter than announced does not
-    /// panic; both layouts stay inside the buffer.
+    /// „…" curving outside the tile; a picture shorter than announced does
+    /// not panic; both layouts stay inside the buffer; tiles are round
+    /// (transparent corners) with an opaque fill (no more see-through
+    /// background).
     #[test]
     fn names_are_drawn_and_nothing_panics() {
         let mut labels = Labels::new().expect("embedded font");
@@ -649,6 +891,24 @@ mod tests {
             let g = geometry(&tiles, horizontal);
             let mut canvas = vec![0u8; (g.width * g.height * 4) as usize];
             compose(&mut canvas, &g, &tiles, Some(&mut labels));
+            let alpha_at = |x: u32, y: u32| canvas[(y as usize * g.width as usize + x as usize) * 4 + 3];
+            for (x, y) in [
+                (0, 0),
+                (g.width - 1, 0),
+                (0, g.height - 1),
+                (g.width - 1, g.height - 1),
+            ] {
+                assert_eq!(
+                    alpha_at(x, y),
+                    0,
+                    "canvas corner ({x},{y}) should be transparent — tiles are round, not square"
+                );
+            }
+            let opaque = canvas.as_chunks::<4>().0.iter().filter(|p| p[3] == 0xff).count();
+            assert!(
+                opaque > 100,
+                "expected a solidly opaque tile fill, found {opaque} fully-opaque pixels"
+            );
             // White text pixels exist (only the labels are near-white).
             let white = canvas
                 .as_chunks::<4>()
