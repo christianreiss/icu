@@ -28,7 +28,9 @@ pub mod limits;
 pub mod passport;
 pub mod types;
 
-pub use control::{ControlMsg, CAPS, MINOR, MIN_PEER_MINOR};
+pub mod audio_level;
+pub use audio_level::AudioLevel;
+pub use control::{ControlMsg, CAPS, CAP_AUDIO_FEEDBACK, MINOR, MIN_PEER_MINOR};
 pub use framing::MAX_CONTROL_FRAME;
 pub use header::{seq_diff, set_speaker_in_place, ts_diff, AudioHeader, VideoHeader};
 pub use types::{

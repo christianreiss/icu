@@ -398,6 +398,7 @@ struct Hello {
     send: quinn::SendStream,
     recv: quinn::RecvStream,
     minor: u16,
+    caps: u32,
     client: String,
     initial: icu_proto::UserFlags,
 }
@@ -421,7 +422,7 @@ async fn read_hello(server: &Arc<Server>, conn: &quinn::Connection) -> Result<He
     let hello = ControlMsg::decode(&body).context("bad Hello")?;
     let ControlMsg::Hello {
         minor,
-        caps: _,
+        caps,
         client,
         initial,
         name,
@@ -478,6 +479,7 @@ async fn read_hello(server: &Arc<Server>, conn: &quinn::Connection) -> Result<He
         send,
         recv,
         minor,
+        caps,
         client,
         initial,
     })
@@ -488,6 +490,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         send,
         mut recv,
         minor,
+        caps,
         client,
         initial,
     } = read_hello(server, conn).await?;
@@ -538,6 +541,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
             .room
             .send_to(session, &restriction_changed(forced_muted, forced_deafened));
     }
+    lock(&server.audio_feedback).join(session, caps);
     drop(store);
     // The client checks the server leaf against the newest CRL it holds;
     // this is how it gets one (`PROTOCOL.md` §2.2).
@@ -588,6 +592,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     let member = server.room.leave(session);
     seat.left = true;
     let listeners = |speaker| server.room.audio_listeners(speaker);
+    lock(&server.audio_feedback).forget(session);
     for (speaker, loss_permille) in lock(&server.loss).forget(session, listeners) {
         server
             .room
@@ -644,6 +649,7 @@ impl Drop for Seat<'_> {
         if self.server.room.leave(self.session).is_some() {
             let listeners = |speaker| self.server.room.audio_listeners(speaker);
             lock(&self.server.loss).forget(self.session, listeners);
+            lock(&self.server.audio_feedback).forget(self.session);
             self.server.room.broadcast(&ControlMsg::UserLeft {
                 session: self.session,
                 reason: ec::SHUTDOWN as u8,
@@ -706,6 +712,7 @@ async fn roomless_welcome(
         minor,
         client,
         initial: _,
+        caps: _,
     } = read_hello(server, conn).await?;
     let (name, is_admin) = {
         let store = server.store.lock().await;
@@ -1148,6 +1155,16 @@ async fn control_loop(
             }
             ControlMsg::Ping { nonce } => {
                 server.room.send_to(session, &pong(nonce));
+            }
+            ControlMsg::AudioLevelReport { speaker, level } => {
+                if server.room.feedback_eligible(session, speaker) {
+                    lock(&server.audio_feedback).report(
+                        session,
+                        speaker,
+                        level,
+                        std::time::Instant::now(),
+                    );
+                }
             }
             // Both name a speaker, and both key server state by it: only a
             // peer that is in the room right now counts, or a client could

@@ -126,6 +126,27 @@ pub trait AudioBackend: Send {
     /// Takes the event receiver. Only the first call returns `Some`.
     fn take_events(&mut self) -> Option<std::sync::mpsc::Receiver<BackendEvent>>;
 
+    /// Snapshot of the actual open capture device; unsupported on fallback hosts.
+    fn capture_level(&mut self) -> Result<Option<super::level::CaptureLevel>, BackendError> {
+        Ok(None)
+    }
+    /// Compare the current native value before writing; acknowledge with readback.
+    fn set_capture_level(
+        &mut self,
+        _expected: &super::level::CaptureLevel,
+        _db: f32,
+    ) -> Result<super::level::CaptureLevel, BackendError> {
+        Err(super::level::unsupported())
+    }
+    /// Restore the original native channel values if ICU still owns the level.
+    fn restore_capture_level(
+        &mut self,
+        expected: &super::level::CaptureLevel,
+        original: &super::level::CaptureLevel,
+    ) -> Result<(), BackendError> {
+        self.set_capture_level(expected, original.db).map(|_| ())
+    }
+
     /// How late the AEC reference may arrive behind the microphone before
     /// the engine counts it as missing. Zero where both run in one graph
     /// cycle (PipeWire); a backend with free-running streams names its

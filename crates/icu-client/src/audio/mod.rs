@@ -6,8 +6,11 @@ mod channels;
 #[cfg(any(feature = "cpal-fallback", target_os = "windows"))]
 pub mod cpal_fallback;
 pub mod fake;
+pub mod level;
 #[cfg(target_os = "linux")]
 pub mod pipewire;
+#[cfg(target_os = "linux")]
+mod pipewire_level;
 pub mod rt;
 #[cfg(target_os = "windows")]
 pub mod wasapi;

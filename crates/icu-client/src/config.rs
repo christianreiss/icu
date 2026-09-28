@@ -109,6 +109,10 @@ pub struct AudioSettings {
     /// Mic auto leveling (`dsp::normalize::Profile::MIC_LEVEL`) after
     /// `gain_db`, ahead of denoise and VAD. Requires `denoise`.
     pub auto_level: bool,
+    /// Peer measurements refine automatic leveling.
+    pub peer_assistance: bool,
+    /// Temporarily tune system capture volume; restore on call end.
+    pub tune_system_mic: bool,
     /// RNNoise on.
     pub denoise: bool,
     /// AEC3 on.
@@ -153,6 +157,8 @@ impl Default for AudioSettings {
             vad_auto: true,
             gain_db: 0.0,
             auto_level: true,
+            peer_assistance: true,
+            tune_system_mic: true,
             denoise: true,
             aec: true,
             voice_opt: true,
@@ -1524,7 +1530,9 @@ mod tests {
         cn: &str,
         leaf: impl FnOnce(&mut rcgen::CertificateParams),
     ) -> icu_proto::passport::Passport {
-        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SanType, SigningKey};
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SanType, SigningKey,
+        };
         let ca_key = KeyPair::generate().unwrap();
         let ca_key_pem = ca_key.serialize_pem();
         let mut ca_params = CertificateParams::default();

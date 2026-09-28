@@ -267,6 +267,7 @@ fn state() -> AppState {
         kind,
     };
     AppState {
+        tuning_status: String::new(),
         conn: ConnStatus::Connected,
         server: "icu.example.org:4711".into(),
         server_name: "icu.example.org".into(),
@@ -786,13 +787,23 @@ fn settings_import_of_an_invitation_takes_no_settings() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let bundle = rt.block_on(async {
         let server = common::TestServer::start().await;
-        server.invite_bundle("").await
+        let text = server.invite_bundle("").await;
+        let mut bundle = icu_proto::passport::Passport::decode(&text).unwrap();
+        let mut hot = Settings::default();
+        hot.audio.vad_auto = false;
+        hot.audio.vad_threshold = 0.0;
+        bundle.settings = toml::to_string(&hot).unwrap();
+        // This tests ignoring settings in a VALID invitation. Re-sign the fixture
+        // with its test CA; changing signed fields must otherwise be rejected.
+        let ca = icu_server::ca::Ca::load_or_create(
+            server.dir.path(),
+            &icu_server::config::TlsSection::default(),
+            "localhost",
+        )
+        .unwrap();
+        bundle.signature = ca.sign_raw(&bundle.signable_bytes()).unwrap();
+        bundle.encode()
     });
-    let mut forged = icu_proto::passport::Passport::decode(&bundle).unwrap();
-    let mut hot = Settings::default();
-    hot.audio.vad_auto = false;
-    hot.audio.vad_threshold = 0.0;
-    forged.settings = toml::to_string(&hot).unwrap();
     let s = state();
     let dir = tempfile::tempdir().unwrap();
     let mut view = SettingsView::new(
@@ -800,7 +811,7 @@ fn settings_import_of_an_invitation_takes_no_settings() {
         Arc::new(DebugStats::default()),
         Paths::new(Some(dir.path().to_path_buf())),
     );
-    view.import_text(forged.encode());
+    view.import_text(bundle);
     let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
     let cmds_out = cmds.clone();
     let mut h = harness(SETTINGS, "light", true, move |ui| {
@@ -1202,4 +1213,44 @@ fn setup_skip_keeps_everything_and_an_earlier_mute() {
             .any(|c| matches!(c, Command::SetMuted(_))),
         "a mute from before the setup is not the setup's to lift"
     );
+}
+
+#[test]
+fn autotune_details_keep_controls_accessible_and_independent() {
+    for theme in THEMES {
+        let mut s = state();
+        s.tuning_status =
+            "Eingeregelt · Hardware · System +2.0 dB · Software +0.8 dB · Peer +0.5 dB (aktiv)"
+                .into();
+        let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+        let output = cmds.clone();
+        let mut view = SettingsView::new(
+            &s,
+            Arc::new(DebugStats::default()),
+            Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+        );
+        let mut h = harness(SETTINGS, theme, true, move |ui| {
+            output.borrow_mut().extend(view.ui(ui, &s, false).cmds);
+        });
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Klang")
+            .click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Details")
+            .click();
+        h.run();
+        h.get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Systemmikrofon automatisch",
+        );
+        shot(&mut h, &format!("autotune-details-{theme}"));
+        h.get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Pegel mit Empfangsfeedback",
+        )
+        .click_accesskit();
+        h.run();
+        let settings = last_update(&cmds.borrow()).clone();
+        assert!(!settings.audio.peer_assistance);
+        assert!(settings.audio.tune_system_mic && settings.audio.auto_level);
+    }
 }

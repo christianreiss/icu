@@ -593,7 +593,7 @@ impl SetupView {
                     true,
                     "Pegel automatisch",
                     Some("Regelt dein Mikrofon nach, wenn du zu leise oder zu laut bist."),
-                    |ui| widgets::named_toggle(ui, &mut audio.auto_level, "Pegel automatisch"),
+                    |ui| widgets::autotune_control(ui, audio, &state.tuning_status),
                 )
             });
             widgets::setting_row(
@@ -758,6 +758,12 @@ fn summary(
     }
     if audio.auto_level && audio.denoise {
         on.push("Pegel automatisch".to_string());
+        if audio.peer_assistance {
+            on.push("Empfangsfeedback".to_string());
+        }
+        if audio.tune_system_mic {
+            on.push("Systemmikrofon automatisch".to_string());
+        }
     }
     if audio.normalize_outgoing {
         on.push("Selbst gleich laut ankommen".to_string());
@@ -1122,8 +1128,7 @@ mod tests {
         assert_eq!(lines[2].warning, None);
         assert_eq!(
             lines[3].value,
-            "Rauschunterdrückung, Echo-Unterdrückung, Pegel automatisch, Selbst gleich laut \
-             ankommen, Andere gleich laut hören"
+            "Rauschunterdrückung, Echo-Unterdrückung, Pegel automatisch, Empfangsfeedback, Systemmikrofon automatisch, Selbst gleich laut ankommen, Andere gleich laut hören, Stimmoptimierung (Mittel)"
         );
 
         s.audio.vad_auto = false;

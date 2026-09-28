@@ -282,7 +282,7 @@ fn describe_certificate_error(ce: &rustls::CertificateError) -> String {
 pub struct Welcome {
     /// Negotiated minor.
     pub minor: u16,
-    /// Capability bits the server announced. All zero in v1.
+    /// Capability bits the server announced; bit 0 enables audio feedback.
     pub caps: u32,
     /// Own entry.
     pub you: icu_proto::UserInfo,

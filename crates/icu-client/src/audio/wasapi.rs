@@ -25,7 +25,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -219,9 +219,75 @@ impl IMMNotificationClient_Impl for Notifications_Impl {
     }
 }
 
+use windows::Win32::Media::Audio::{
+    Endpoints::{
+        IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl,
+    },
+    AUDIO_VOLUME_NOTIFICATION_DATA,
+};
+
+fn volume_context() -> windows::core::GUID {
+    windows::core::GUID::from_u128(0x6a3297b0271c4a56a5d123ab00000000 | std::process::id() as u128)
+}
+#[implement(IAudioEndpointVolumeCallback)]
+struct VolumeChanges {
+    id: String,
+    changes: Arc<Mutex<HashMap<String, u64>>>,
+}
+impl IAudioEndpointVolumeCallback_Impl for VolumeChanges_Impl {
+    fn OnNotify(&self, data: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows::core::Result<()> {
+        // SAFETY: Windows supplies a valid notification for the duration of this call.
+        if !data.is_null() && unsafe { (*data).guidEventContext } != volume_context() {
+            *self
+                .changes
+                .lock()
+                .unwrap()
+                .entry(self.id.clone())
+                .or_default() += 1;
+        }
+        Ok(())
+    }
+}
+struct VolumeWatch {
+    volume: IAudioEndpointVolume,
+    callback: IAudioEndpointVolumeCallback,
+}
+impl Drop for VolumeWatch {
+    fn drop(&mut self) {
+        // SAFETY: both COM objects live on the watcher's initialized apartment.
+        unsafe {
+            let _ = self.volume.UnregisterControlChangeNotify(&self.callback);
+        }
+    }
+}
+fn watch_volumes(
+    e: &IMMDeviceEnumerator,
+    changes: Arc<Mutex<HashMap<String, u64>>>,
+) -> Vec<VolumeWatch> {
+    list(e)
+        .into_iter()
+        .filter(|d| d.kind == DeviceKind::Input)
+        .filter_map(|d| {
+            // SAFETY: invoked only by the COM-initialized watcher thread.
+            unsafe {
+                let device = e.GetDevice(&HSTRING::from(d.id.as_str())).ok()?;
+                let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None).ok()?;
+                let callback: IAudioEndpointVolumeCallback = VolumeChanges {
+                    id: d.id,
+                    changes: changes.clone(),
+                }
+                .into();
+                volume.RegisterControlChangeNotify(&callback).ok()?;
+                Some(VolumeWatch { volume, callback })
+            }
+        })
+        .collect()
+}
+
 /// The thread that holds the notification registration and sends the
 /// device list after every burst of changes. Ends when dropped.
 struct Watcher {
+    changes: Arc<Mutex<HashMap<String, u64>>>,
     stopping: Arc<AtomicBool>,
     wake: mpsc::Sender<()>,
     thread: Option<JoinHandle<()>>,
@@ -237,6 +303,8 @@ impl Watcher {
         let stop = wake_tx.clone();
         let stopping = Arc::new(AtomicBool::new(false));
         let stopping_t = stopping.clone();
+        let changes = Arc::new(Mutex::new(HashMap::new()));
+        let changes_t = changes.clone();
         let thread = std::thread::Builder::new()
             .name("icu-wasapi-watch".into())
             .spawn(move || {
@@ -264,6 +332,7 @@ impl Watcher {
                 {
                     tracing::warn!(%e, "no audio hot-plug notifications");
                 }
+                let mut volumes = watch_volumes(&enumerator, changes_t.clone());
                 let _ = ready_tx.send(Ok(()));
                 while wake_rx.recv().is_ok() {
                     if stopping_t.load(Ordering::SeqCst) {
@@ -274,6 +343,8 @@ impl Watcher {
                     if stopping_t.load(Ordering::SeqCst) {
                         break;
                     }
+                    volumes.clear();
+                    volumes = watch_volumes(&enumerator, changes_t.clone());
                     let _ = events.send(BackendEvent::DevicesChanged(list(&enumerator)));
                 }
                 unsafe {
@@ -282,6 +353,7 @@ impl Watcher {
             })
             .map_err(|e| e.to_string())?;
         let watcher = Watcher {
+            changes,
             stopping,
             wake: stop,
             thread: Some(thread),
@@ -326,6 +398,7 @@ pub struct WasapiBackend {
     events: Option<mpsc::Receiver<BackendEvent>>,
     defaults: Arc<Defaults>,
     streams: HashMap<StreamKind, Running>,
+    capture_device: Option<String>,
     /// Dropped after the streams.
     _watcher: Watcher,
 }
@@ -341,6 +414,7 @@ impl WasapiBackend {
             events: Some(rx),
             defaults,
             streams: HashMap::new(),
+            capture_device: None,
             _watcher: watcher,
         })
     }
@@ -369,7 +443,10 @@ impl WasapiBackend {
             thread: Some(thread),
         };
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => {
+            Ok(Ok(id)) => {
+                if kind == StreamKind::Capture {
+                    self.capture_device = Some(id);
+                }
                 self.streams.insert(kind, running);
                 Ok(())
             }
@@ -424,9 +501,42 @@ impl AudioBackend for WasapiBackend {
     }
 
     fn close(&mut self, stream: StreamKind) {
+        if stream == StreamKind::Capture {
+            self.capture_device = None;
+        }
         self.streams.remove(&stream);
     }
 
+    fn capture_level(&mut self) -> Result<Option<super::level::CaptureLevel>, BackendError> {
+        let Some(id) = self.capture_device.as_deref() else {
+            return Ok(None);
+        };
+        endpoint_level(id, None, &self._watcher.changes).map(Some)
+    }
+    fn set_capture_level(
+        &mut self,
+        expected: &super::level::CaptureLevel,
+        db: f32,
+    ) -> Result<super::level::CaptureLevel, BackendError> {
+        endpoint_level(
+            &expected.device,
+            Some((expected, db, None)),
+            &self._watcher.changes,
+        )
+    }
+
+    fn restore_capture_level(
+        &mut self,
+        expected: &super::level::CaptureLevel,
+        original: &super::level::CaptureLevel,
+    ) -> Result<(), BackendError> {
+        endpoint_level(
+            &expected.device,
+            Some((expected, original.db, Some(&original.channels))),
+            &self._watcher.changes,
+        )
+        .map(|_| ())
+    }
     fn take_events(&mut self) -> Option<mpsc::Receiver<BackendEvent>> {
         self.events.take()
     }
@@ -438,6 +548,85 @@ impl AudioBackend for WasapiBackend {
     fn reference_slack(&self) -> Duration {
         Duration::from_millis(40)
     }
+}
+
+/// All endpoint COM operations stay inside one initialized apartment.
+fn endpoint_level(
+    id: &str,
+    change: Option<(&super::level::CaptureLevel, f32, Option<&[f32]>)>,
+    changes: &Arc<Mutex<HashMap<String, u64>>>,
+) -> Result<super::level::CaptureLevel, BackendError> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| -> Result<super::level::CaptureLevel, BackendError> {
+                use windows::Win32::Media::Audio::{
+                    Endpoints::IAudioEndpointVolume, ENDPOINT_HARDWARE_SUPPORT_VOLUME,
+                };
+                let _com = Com::init().map_err(BackendError)?;
+                let enumerator = enumerator().map_err(BackendError)?;
+                let err = |e: windows::core::Error| BackendError(e.to_string());
+                // SAFETY: initialized COM apartment; endpoint/interfaces outlive every call and never escape it.
+                unsafe {
+                    let device = enumerator.GetDevice(&HSTRING::from(id)).map_err(err)?;
+                    let volume: IAudioEndpointVolume =
+                        device.Activate(CLSCTX_ALL, None).map_err(err)?;
+                    let read = || -> Result<super::level::CaptureLevel, BackendError> {
+                        let (mut min, mut max, mut step) = (0.0, 0.0, 0.0);
+                        volume
+                            .GetVolumeRange(&mut min, &mut max, &mut step)
+                            .map_err(err)?;
+                        let db = volume.GetMasterVolumeLevel().map_err(err)?;
+                        let mut channels = Vec::new();
+                        for i in 0..volume.GetChannelCount().map_err(err)? {
+                            channels.push(volume.GetChannelVolumeLevel(i).map_err(err)?);
+                        }
+                        Ok(super::level::CaptureLevel {
+                            device: id.to_string(),
+                            revision: *changes.lock().unwrap().get(id).unwrap_or(&0),
+                            db,
+                            min_db: min,
+                            max_db: max,
+                            step_db: step,
+                            muted: volume.GetMute().map_err(err)?.as_bool(),
+                            channels,
+                            kind: if volume.QueryHardwareSupport().map_err(err)?
+                                & ENDPOINT_HARDWARE_SUPPORT_VOLUME
+                                != 0
+                            {
+                                "Hardware"
+                            } else {
+                                "Systemsoftware"
+                            },
+                        })
+                    };
+                    let current = read()?;
+                    if let Some((expected, db, original)) = change {
+                        if !current.same(expected)
+                            || !db.is_finite()
+                            || db < current.min_db
+                            || db > current.max_db
+                        {
+                            return Err(super::level::unsupported());
+                        }
+                        volume
+                            .SetMasterVolumeLevel(db, &volume_context())
+                            .map_err(err)?;
+                        if let Some(channels) = original {
+                            for (i, db) in channels.iter().enumerate() {
+                                volume
+                                    .SetChannelVolumeLevel(i as u32, *db, &volume_context())
+                                    .map_err(err)?;
+                            }
+                        }
+                        read()
+                    } else {
+                        Ok(current)
+                    }
+                }
+            })
+            .join()
+            .unwrap_or_else(|_| Err(super::level::unsupported()))
+    })
 }
 
 enum Callback {
@@ -491,7 +680,7 @@ fn run_stream(
     stop: Arc<AtomicBool>,
     defaults: Arc<Defaults>,
     events: mpsc::Sender<BackendEvent>,
-    ready: mpsc::Sender<Result<(), String>>,
+    ready: mpsc::Sender<Result<String, String>>,
 ) {
     let _com = match Com::init() {
         Ok(c) => c,
@@ -515,7 +704,7 @@ fn run_stream(
             return;
         }
     };
-    let _ = ready.send(Ok(()));
+    let _ = ready.send(Ok(stream.device_id.clone()));
     tracing::info!(stream = spec.name(), device = %stream.device_name,
         channels = stream.channels, period = stream.period, mode = stream.mode,
         "wasapi stream open");
@@ -561,6 +750,7 @@ struct Stream {
     voice: Vec<bool>,
     loopback: bool,
     device_name: String,
+    device_id: String,
     /// Captured samples not yet handed on as a whole block.
     pending: Vec<f32>,
     /// One block for the playback callback.
@@ -770,6 +960,7 @@ impl Stream {
                 ),
                 loopback: spec.loopback(),
                 device_name,
+                device_id: device_id(&device)?,
                 pending: Vec::with_capacity(BLOCK_SAMPLES * 8),
                 block: vec![0.0; BLOCK_SAMPLES],
             };

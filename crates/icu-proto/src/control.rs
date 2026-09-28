@@ -24,8 +24,10 @@ pub const MINOR: u16 = 2;
 /// `Welcome` whose `server_minor` is below it (`PROTOCOL.md` §8).
 pub const MIN_PEER_MINOR: u16 = 2;
 
-/// Capability bits. All zero in v1, reserved for later extensions.
-pub const CAPS: u32 = 0;
+/// Peer-assisted audio measurements and hints (bit 0).
+pub const CAP_AUDIO_FEEDBACK: u32 = 1;
+/// Capabilities supported by this implementation.
+pub const CAPS: u32 = CAP_AUDIO_FEEDBACK;
 
 /// Messages on the control stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,6 +322,20 @@ pub enum ControlMsg {
         /// Enforced deafen.
         deafened: bool,
     },
+    /// 36, C→S. Two-second pre-playback speech measurement; capability bit 0.
+    AudioLevelReport {
+        /// Current speaker session.
+        speaker: Session,
+        /// Measurement before receiver processing.
+        level: crate::AudioLevel,
+    },
+    /// 37, S→C. None means expired/conflicting/insufficient reports.
+    AudioLevelHint {
+        /// Consensus correction in centi-dB, absent when insufficient/conflicting.
+        correction_cdb: Option<i16>,
+        /// Number of fresh eligible reporters.
+        reporters: u16,
+    },
 }
 
 impl ControlMsg {
@@ -341,6 +357,8 @@ impl ControlMsg {
     /// Stable variant name, for logs.
     pub fn variant(&self) -> &'static str {
         match self {
+            ControlMsg::AudioLevelReport { .. } => "AudioLevelReport",
+            ControlMsg::AudioLevelHint { .. } => "AudioLevelHint",
             ControlMsg::Hello { .. } => "Hello",
             ControlMsg::Welcome { .. } => "Welcome",
             ControlMsg::UserJoined { .. } => "UserJoined",
@@ -388,6 +406,7 @@ impl ControlMsg {
                 | ControlMsg::SetState { .. }
                 | ControlMsg::Ping { .. }
                 | ControlMsg::RenewRequest { .. }
+                | ControlMsg::AudioLevelReport { .. }
                 | ControlMsg::LossReport { .. }
                 | ControlMsg::KeyframeRequest { .. }
                 | ControlMsg::CreateInviteRequest { .. }
@@ -553,6 +572,20 @@ mod tests {
                 muted: true,
                 deafened: true,
             },
+            ControlMsg::AudioLevelReport {
+                speaker: 2,
+                level: crate::AudioLevel {
+                    level_cdb: -2600,
+                    correction_cdb: 200,
+                    peak_cdb: -600,
+                    near_full_permille: 0,
+                    speech_ms: 1200,
+                },
+            },
+            ControlMsg::AudioLevelHint {
+                correction_cdb: Some(200),
+                reporters: 2,
+            },
         ]
     }
 
@@ -560,7 +593,7 @@ mod tests {
     #[test]
     fn roundtrip_all_control_variants() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 36, "v1 has exactly 36 control variants");
+        assert_eq!(variants.len(), 38, "38 append-only control variants");
         for msg in variants {
             let frame = msg.encode().unwrap();
             let body = framing::split_frame(&frame, MAX_CONTROL_FRAME)
@@ -589,8 +622,8 @@ mod tests {
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
     #[test]
     fn unknown_variant_is_an_error() {
-        // Discriminant 36 does not exist yet.
-        let body = [36u8, 0, 0];
+        // Discriminant 38 does not exist yet.
+        let body = [38u8, 0, 0];
         let err = ControlMsg::decode(&body).unwrap_err();
         assert!(
             matches!(err, ProtoError::UnknownVariant),
