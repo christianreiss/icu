@@ -360,6 +360,20 @@ async fn the_icu_cli_alias_is_the_admin_surface() {
     );
     assert!(stdout.contains("fingerprint"), "{stdout}");
 
+    // `doctor` is admin-side too, flag and all: it needs neither a stopped
+    // nor a configured server, so it is not one of the three below.
+    let out = tokio::process::Command::new(&icu_cli)
+        .arg("--config")
+        .arg(&file)
+        .args(["doctor", "--json"])
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json");
+    assert_eq!(report["ok"], serde_json::json!(true));
+
     for (verb, args) in [
         ("run", vec!["run"]),
         ("restore", vec!["restore", "latest"]),
