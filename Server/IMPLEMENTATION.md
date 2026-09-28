@@ -425,6 +425,10 @@ Lizenz von ICU selbst: **Apache-2.0** (entschieden 2026-09-24 mit der Veröffent
 
 Jeder Milestone endet mit grünen Tests und einem Eintrag in `../Research/verification.md`, wenn er einen offenen Messpunkt schließt.
 
+## Öffentliche Sitzungszertifikate (2026-09-28)
+
+Minor 3 ergänzt `PeerCertificateRequest`/`PeerCertificateResponse` (Nr. 38/39). Der reguläre Control-Handler verwendet das bestehende Ratenlimit. `Room::certificate` liest ausschließlich das öffentliche Leaf aus `quinn::Connection::peer_identity` einer aktuell anwesenden Sitzung. Maximal 8192 DER-Bytes, Antwort nur an den Anfragenden. Fehlende/zu große Zertifikate ergeben `None`; Raumlose Registrierungs- und Renewal-Sitzungen erhalten diesen Zugriff nicht. Server und Clients gemeinsam aktualisieren; Mindest-Minor ist 3.
+
 ## Audio-Empfangsfeedback (2026-09-28)
 
 `audio_feedback::Feedback` speichert Capability-Bits und höchstens einen gültigen

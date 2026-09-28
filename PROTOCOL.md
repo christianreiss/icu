@@ -111,8 +111,11 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | 34 | `AdminSetRestrictionOk` | S→C | `user_id: UserId`, `muted: bool`, `deafened: bool` | Bestätigung an den ausführenden Admin. |
 | 35 | `UserRestrictionChanged` | S→C | `muted: bool`, `deafened: bool` | **Unicast** an alle eigenen Sitzungen des betroffenen Nutzers, bei jeder Änderung und direkt nach `Welcome`, solange eine Einschränkung besteht. Meldet, was durchgesetzt wird: bei `deafened` ist auch `muted` gesetzt (Nr. 33). Der Client schaltet sich stumm/taub und verweigert das Aufheben, bis ein Admin es aufhebt. |
 
+
 | 36 | `AudioLevelReport` | C→S | `speaker: Session`, `level: AudioLevel` | Optional, Capability Bit 0; Sprachpegel nach regulärem Opus-Decode, vor Normalisierung und Benutzerlautstärke. |
 | 37 | `AudioLevelHint` | S→C | `correction_cdb: Option<i16>`, `reporters: u16` | Optional, Capability Bit 0; Median-Korrektur für den eigenen Sender, `None` bei fehlender Einigung oder abgelaufenen Messungen. |
+| 38 | `PeerCertificateRequest` | C→S | `session: u16` | Ab Minor 3: öffentliches Zertifikat einer aktuell anwesenden Sitzung abfragen. Reguläre Raumteilnehmer, unter dem Control-Ratenlimit; Registrierung und Renewal-only sind ausgeschlossen. |
+| 39 | `PeerCertificateResponse` | S→C | `session: u16`, `certificate_der: Option<Vec<u8>>` | Unicast-Antwort mit dem tatsächlich im TLS-Handshake dieser Sitzung verwendeten Leaf (DER, max. 8192 Bytes). `None` bei abwesender Sitzung oder nicht verfügbarem/zu großem Zertifikat. Keine privaten Schlüssel. Die Sitzung wird vom Server zugeordnet; Empfänger prüfen die Signatur gegen ihre lokale CA und die verfügbare signierte CRL. |
 
 **Empfangsfeedback (2026-09-28):** `AudioLevel` enthält in dieser Reihenfolge `level_cdb: i16`, `correction_cdb: i16`, `peak_cdb: i16`, `near_full_permille: u16`, `speech_ms: u16`. Pegel/Spitze sind Centi-dBFS, Korrektur Centi-dB. Grenzen: Pegel −10000…1200, Korrektur −1200…1200, Spitze −10000…2400, Anteil 0…1000, Sprachdauer 1000…2200 ms. Bericht alle 2 s, nur bei mindestens 1 s geeigneter Sprache; keine Stille, NaN, PLC/FEC oder künstliche Jitter-Ausgabe. Die Spitze ist ein Clipping-Indiz, kein Beweis für dessen Ursache.
 
@@ -122,7 +125,7 @@ Varianten 19–28 (und 31, 33) sind die ersten C→S-Nachrichten, bei denen der 
 
 Fehlercodes kommen wie Varianten additiv hinzu (§6, zuletzt `SERVER_ERROR` 2026-09-26); ein Client, der einen Code nicht kennt, behandelt ihn als nicht fatal.
 
-Capability-Bits (`caps`): Bit 0 (`CAP_AUDIO_FEEDBACK = 1`) für optionale Varianten 36/37. Ohne gegenseitige Unterstützung werden diese nie gesendet; ältere Minor-2-Peers funktionieren unverändert. v1-Baseline war `minor = 1`, aktuell ist `minor = 2` (`Welcome.server_minor`, 2026-09-26); ein Minor 0 existiert nicht, und die 36 Basis-Variantennummern (0–35) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
+Capability-Bits (`caps`): Bit 0 (`CAP_AUDIO_FEEDBACK = 1`) für optionale Varianten 36/37. Diese werden nur bei gegenseitiger Unterstützung gesendet. v1-Baseline war `minor = 1`, aktuell ist `minor = 3` (Zertifikatsabfrage, 2026-09-28); ein Minor 0 existiert nicht, und alle 40 Variantennummern (0–39) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
 ### 2.3 Registrierung (revidiert 2026-09-24, nur Zertifikate)
 
@@ -302,8 +305,8 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 ## 8. Versionierung
 
 - Major = ALPN-String (`icu/1`). Inkompatible Änderung → `icu/2`, Server bietet ggf. beide.
-- Minor: der Client nennt sein Protokoll-Minor in `Hello.minor`, der Server seins in `Welcome.server_minor`; `Welcome.minor` ist das ausgehandelte `min(client, server)`. Varianten oberhalb des ausgehandelten Minors werden nie gesendet. Ein Minor 0 gibt es nicht; aktuell ist `minor = 2`.
-- Mindestversionen, beidseitig durchgesetzt (2026-09-26). Jede Seite hat ein Mindest-Minor für die Gegenseite (`icu_proto::MIN_PEER_MINOR`, derzeit 2):
+- Minor: der Client nennt sein Protokoll-Minor in `Hello.minor`, der Server seins in `Welcome.server_minor`; `Welcome.minor` ist das ausgehandelte `min(client, server)`. Varianten oberhalb des ausgehandelten Minors werden nie gesendet. Ein Minor 0 gibt es nicht; aktuell ist `minor = 3`.
+- Mindestversionen, beidseitig durchgesetzt (2026-09-26). Jede Seite hat ein Mindest-Minor für die Gegenseite (`icu_proto::MIN_PEER_MINOR`, derzeit 3):
   - Der Server schließt mit `VERSION_UNSUPPORTED`, wenn `Hello.minor` darunter liegt, oder wenn die SemVer in `Hello.client` (`<name>/<semver> <os>`, Pre-Release-Suffix zählt nicht) unter `server.min_client` liegt oder sich nicht lesen lässt. Das gilt für jede Sitzung, Registrierung und renew-only eingeschlossen.
   - Der Client schließt selbst mit `VERSION_UNSUPPORTED`, wenn `Welcome.server_minor` darunter liegt, fatal, mit dem Hinweis, dass der Server aktualisiert werden muss.
   - Ein Client von vor Minor 2 dekodiert das längere `Welcome` ohne Fehler (postcard ignoriert überzählige Bytes); deshalb weist ihn der Server über `Hello.minor` ab. Umgekehrt kann ein Client ab Minor 2 das kürzere `Welcome` eines älteren Servers nicht dekodieren und zeigt das allgemeine „Update nötig“ — hingenommen, weil Client und Server im Lockstep ausgeliefert werden (§2.2).
@@ -318,3 +321,9 @@ Aus `Research/verification.md` und den Research-Dokumenten: In-place-`speaker`-W
 **Belegt (2026-09-21):** Datagram-vs-Stream-Priorisierung in quinn — `quinn-proto-0.11.18/src/connection/mod.rs::populate_packet` schreibt `self.datagrams` vor `self.streams` in jedes ausgehende Paket; Audio-Datagramme gewinnen die Paket-interne Framing-Priorität gegenüber Video-Streams immer. Ungeklärt bleibt die Congestion-Window-Ebene: ein gesättigtes `cwnd` drosselt trotzdem beide (`Client/IMPLEMENTATION.md` §8, Messpunkt).
 
 **Neu (Netzwerk-adaptive Qualität, `Client/IMPLEMENTATION.md` §8):** `tc netem`-Messung, ob `queuing_delay_ms` (`rtt − min_rtt`) bei diesem App-Bitratenniveau (74 kbit/s Audio + bis 150 kbit/s Video) vor `congestion_events` messbar ausschlägt; ob ein aktiver Video-Stream Audio-Datagramme über das gemeinsame `cwnd` spürbar verzögert; Wirksamkeit von `VideoCongestionHint` binnen 2 s (analog zu `LossHint`).
+
+### Nutzerpfad und Vertrauensanzeige (2026-09-28)
+
+Minor 3 erfordert ein gemeinsames Update von Server und Clients; beide Seiten weisen Minor 2 und älter über die bestehende Versionsprüfung ab. Die Zertifikatsabfrage erfolgt beim Öffnen der Nutzeransicht, nicht im Raum-Broadcast. Antworten werden nach Sitzung zugeordnet und beim Verlassen/Neuverbinden verworfen. Die aktuelle PKI stellt Nutzer- und Server-Leaves direkt durch die im Passport hinterlegte CA aus.
+
+CA-Signatur, Gültigkeitszeitraum, Widerruf laut signierter CRL und Server-Authentifizierung sind getrennte Aussagen. Eine fehlende oder veraltete CRL ist kein Beleg gegen Widerruf. Die weitergereichte Nutzeridentität bleibt eine Aussage des Servers, auch wenn die Leaf-Signatur lokal geprüft wurde. Beide Medien-Transportstrecken sind verschlüsselt; der Relay-Server kann die Medien lesen. RTTs gelten pro Verbindung zum Server; Audio-Empfangsverlust eines Nutzers ist eine Messung des gesamten Empfangspfads.

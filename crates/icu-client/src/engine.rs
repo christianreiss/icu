@@ -160,6 +160,8 @@ pub struct Peer {
     /// jitter buffer last measured it. Already computed for `LossReport`;
     /// kept here so the Verbindung window can show it per participant.
     pub recv_loss_permille: Option<u16>,
+    /// On-demand public certificate, scoped to this exact live session.
+    pub certificate: Option<Result<Arc<crate::conninfo::CertInfo>, String>>,
 }
 
 impl Peer {
@@ -172,6 +174,7 @@ impl Peer {
             volume,
             rtt_ms: None,
             recv_loss_permille: None,
+            certificate: None,
         }
     }
 }
@@ -352,6 +355,8 @@ pub enum Command {
     },
     /// Refresh the full user list for the Nutzer tab. Admin only.
     RequestUserList,
+    /// Fetch the public certificate of an online peer.
+    RequestPeerCertificate(Session),
     /// Close another user's connections; they may come back. Admin only.
     KickUser {
         /// The affected user.
@@ -3141,6 +3146,7 @@ impl LocalState {
             | Command::SetUserAdmin { .. }
             | Command::SetUserDisabled { .. }
             | Command::RevokeUser { .. }
+            | Command::RequestPeerCertificate(_)
             | Command::RequestUserList
             | Command::KickUser { .. }
             | Command::SetUserRestriction { .. }
@@ -3446,6 +3452,10 @@ impl LocalState {
             if let Some(old) = s.conn_info.as_ref() {
                 let mut fresh = (**old).clone();
                 fresh.client_cert = info.clone();
+                let crl = std::fs::read(crate::crl::path(&self.paths)).ok();
+                fresh
+                    .client_cert
+                    .check_trust(&self.identity.ca_der, crl.as_deref());
                 s.conn_info = Some(Arc::new(fresh));
             }
         });
@@ -3692,12 +3702,15 @@ async fn run_session(
         // Behind an `Arc`: `AppState` is cloned on every change — the
         // speaking tick alone fires ten times a second — and this is a
         // couple of dozen strings that are written exactly once.
-        let info = Arc::new(crate::conninfo::ConnInfo::collect(
+        let mut info = crate::conninfo::ConnInfo::collect(
             &connection,
             &welcome,
             &local.identity,
             &cfg.client_string,
-        ));
+        );
+        let crl = std::fs::read(crate::crl::path(&local.paths)).ok();
+        info.check_trust(&local.identity.ca_der, crl.as_deref());
+        let info = Arc::new(info);
         shared.state.send_modify(|s| {
             s.conn = ConnStatus::Connected;
             s.me = Some(me);
@@ -3898,6 +3911,13 @@ async fn run_session(
                     }
                     Command::RevokeUser { user_id } => {
                         if conn::write_msg(&mut send, &ControlMsg::AdminRevokeUser { user_id }).await.is_err() {
+                            break send_failed(&connection);
+                        }
+                    }
+                    Command::RequestPeerCertificate(session) => {
+                        let needed = shared.state.borrow().peers.iter().any(|p|
+                            p.info.session == session && !matches!(p.certificate, Some(Ok(_))));
+                        if needed && conn::write_msg(&mut send, &ControlMsg::PeerCertificateRequest { session }).await.is_err() {
                             break send_failed(&connection);
                         }
                     }
@@ -4445,6 +4465,49 @@ async fn handle_control(
                 Ok(false) => tracing::debug!("CRL not newer, kept the stored one"),
                 Err(e) => tracing::warn!(error = %e, "CRL refused"),
             }
+            let crl = std::fs::read(crate::crl::path(&local.paths)).ok();
+            shared.state.send_modify(|s| {
+                if let Some(info) = &mut s.conn_info {
+                    Arc::make_mut(info).check_trust(&local.identity.ca_der, crl.as_deref());
+                }
+                for peer in &mut s.peers {
+                    if let Some(Ok(cert)) = &mut peer.certificate {
+                        Arc::make_mut(cert).check_trust(&local.identity.ca_der, crl.as_deref());
+                    }
+                }
+            });
+        }
+        ControlMsg::PeerCertificateResponse {
+            session,
+            certificate_der,
+        } => {
+            // Reject departed sessions before doing any certificate work.
+            if !shared
+                .state
+                .borrow()
+                .peers
+                .iter()
+                .any(|p| p.info.session == session)
+            {
+                return None;
+            }
+            let cert = certificate_der
+                .filter(|der| !der.is_empty() && der.len() <= ControlMsg::MAX_CERTIFICATE_DER)
+                .ok_or_else(|| "Zertifikat nicht verfügbar".to_string())
+                .and_then(|der| {
+                    let mut cert = crate::conninfo::CertInfo::from_der(&der);
+                    if cert.valid_from.is_none() {
+                        return Err("Zertifikat unlesbar".into());
+                    }
+                    let crl = std::fs::read(crate::crl::path(&local.paths)).ok();
+                    cert.check_trust(&local.identity.ca_der, crl.as_deref());
+                    Ok(Arc::new(cert))
+                });
+            shared.state.send_modify(|s| {
+                if let Some(p) = s.peers.iter_mut().find(|p| p.info.session == session) {
+                    p.certificate = Some(cert);
+                }
+            });
         }
         ControlMsg::UserJoined { user } => {
             let peer = admit(shared, &local.settings, &user);
@@ -4703,6 +4766,7 @@ async fn handle_control(
         | ControlMsg::AdminSetRole { .. }
         | ControlMsg::AdminSetDisabled { .. }
         | ControlMsg::AdminRevokeUser { .. }
+        | ControlMsg::PeerCertificateRequest { .. }
         | ControlMsg::UserListRequest
         | ControlMsg::AdminKick { .. }
         | ControlMsg::AdminSetRestriction { .. } => {

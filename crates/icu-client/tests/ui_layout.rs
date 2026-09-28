@@ -184,6 +184,10 @@ fn cert(subject: &str, issuer: &str, days: i64) -> CertInfo {
                       9D:2B:61:F0:34:AA:5E:C7:88:13:DE:92:4C:0A:B5:67"
             .replace(' ', ""),
         sig_alg: "ecdsa-with-SHA256".into(),
+        signature_valid: Some(true),
+        valid_from: Some(icu_client::net::conn::unix_now() - 86400),
+        valid_until: Some(icu_client::net::conn::unix_now() + days * 86400),
+        ..CertInfo::default()
     }
 }
 
@@ -199,6 +203,7 @@ fn peer(user_id: u32, name: &str, flags: u8, rtt: u16) -> Peer {
     );
     p.rtt_ms = Some(rtt);
     p.recv_loss_permille = Some(3);
+    p.certificate = Some(Ok(Arc::new(cert(name, "ICU CA", 365))));
     p
 }
 
@@ -546,8 +551,11 @@ fn connection_pages_fit() {
 fn user_window_fits() {
     let mut overflows = Overflows::default();
     for theme_name in THEMES {
-        for (label, user_id) in [("self", 1u32), ("peer", 2u32)] {
-            let s = state();
+        for (label, user_id) in [("self", 1u32), ("peer", 2u32), ("member", 2u32)] {
+            let mut s = state();
+            if label == "member" {
+                s.is_admin = false;
+            }
             let (cmd, _rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
             let overflow = Rc::new(RefCell::new(0.0));
             let out = overflow.clone();
@@ -786,22 +794,21 @@ fn settings_import_takes_the_settings_unless_switched_off() {
 fn settings_import_of_an_invitation_takes_no_settings() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let bundle = rt.block_on(async {
+        use rcgen::SigningKey;
         let server = common::TestServer::start().await;
-        let text = server.invite_bundle("").await;
-        let mut bundle = icu_proto::passport::Passport::decode(&text).unwrap();
+        let mut bundle =
+            icu_proto::passport::Passport::decode(&server.invite_bundle("").await).unwrap();
         let mut hot = Settings::default();
         hot.audio.vad_auto = false;
         hot.audio.vad_threshold = 0.0;
         bundle.settings = toml::to_string(&hot).unwrap();
-        // This tests ignoring settings in a VALID invitation. Re-sign the fixture
-        // with its test CA; changing signed fields must otherwise be rejected.
-        let ca = icu_server::ca::Ca::load_or_create(
-            server.dir.path(),
-            &icu_server::config::TlsSection::default(),
-            "localhost",
+        // Settings belong to the signed payload. This test needs a genuine
+        // invitation carrying settings; tampering is rejected before import.
+        let key = rcgen::KeyPair::from_pem(
+            &std::fs::read_to_string(server.dir.path().join("ca.key")).unwrap(),
         )
         .unwrap();
-        bundle.signature = ca.sign_raw(&bundle.signable_bytes()).unwrap();
+        bundle.signature = key.sign(&bundle.signable_bytes()).unwrap();
         bundle.encode()
     });
     let s = state();
@@ -1212,6 +1219,172 @@ fn setup_skip_keeps_everything_and_an_earlier_mute() {
             .iter()
             .any(|c| matches!(c, Command::SetMuted(_))),
         "a mute from before the setup is not the setup's to lift"
+    );
+}
+
+/// Certificate selection, copy, ordinary-member controls, missing data and
+/// narrow/long-name layouts in both themes.
+#[test]
+fn user_path_details_and_missing_data() {
+    for theme_name in THEMES {
+        for (case, width, missing, long) in [
+            ("normal", 900.0, false, false),
+            ("narrow-long", 760.0, false, true),
+            ("missing", 760.0, true, false),
+        ] {
+            let mut s = state();
+            s.is_admin = false;
+            if long {
+                s.peers[0].info.name = "Alexandra-Christiane mit einem langen Anzeigenamen".into();
+                s.server_name = "voice-server-mit-langem-namen.example.org".into();
+            }
+            if missing {
+                s.peers[0].certificate = Some(Err("Zertifikat unlesbar".into()));
+                s.peers[0].rtt_ms = None;
+                s.peers[0].recv_loss_permille = None;
+                s.server_rtt_ms = None;
+            }
+            let mut view = UserView::new(2);
+            let height = if width < 900.0 { 520.0 } else { 640.0 };
+            let mut h = harness([width, height], theme_name, true, move |ui| {
+                ui.ctx().input_mut(|input| {
+                    for viewport in input.raw.viewports.values_mut() {
+                        viewport.monitor_size = Some(egui::vec2(1920.0, 1080.0));
+                    }
+                });
+                view.ui(ui, &s, &|_| None, &|_| {});
+                assert!(
+                    ui.min_rect().right() <= ui.max_rect().right() + 0.5,
+                    "user path overflows horizontally"
+                );
+            });
+            h.run();
+            shot(&mut h, &format!("user-path-{case}-{theme_name}"));
+            for (name, label) in [
+                ("peer", "Nutzerzertifikat"),
+                ("server", "Serverzertifikat"),
+                ("own", "Dein Zertifikat"),
+            ] {
+                let glyph = egui_phosphor::regular::CERTIFICATE;
+                h.get_by_label(&format!("{glyph} {label}")).click();
+                h.run();
+                shot(&mut h, &format!("user-path-{case}-{name}-{theme_name}"));
+                // Same button collapses the details again.
+                h.get_by_label(&format!("{glyph} {label}")).click();
+                h.run();
+            }
+        }
+    }
+}
+
+#[test]
+fn user_path_requests_once_and_retries_on_new_connection() {
+    let mut s = state();
+    s.is_admin = false;
+    s.peers[0].certificate = None;
+    let session = s.peers[0].info.session;
+    let s = Rc::new(RefCell::new(s));
+    let shared = s.clone();
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let captured = sent.clone();
+    let mut view = UserView::new(2);
+    let mut h = harness(USER, "dark", true, move |ui| {
+        view.ui(ui, &shared.borrow(), &|_| None, &|cmd| {
+            captured.borrow_mut().push(cmd)
+        });
+    });
+    h.run();
+    h.run();
+    assert_eq!(
+        sent.borrow()
+            .iter()
+            .filter(|c| matches!(c, Command::RequestPeerCertificate(s) if *s == session))
+            .count(),
+        1
+    );
+    Arc::make_mut(s.borrow_mut().conn_info.as_mut().unwrap()).connected_at +=
+        std::time::Duration::from_secs(1);
+    h.run();
+    assert_eq!(
+        sent.borrow()
+            .iter()
+            .filter(|c| matches!(c, Command::RequestPeerCertificate(s) if *s == session))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn user_path_keeps_volume_moderation_and_certificate_copy() {
+    let s = Rc::new(RefCell::new(state()));
+    let current = s.clone();
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let captured = sent.clone();
+    let expected = s.borrow().peers[0]
+        .certificate
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .fingerprint
+        .clone();
+    let clipboard = Rc::new(RefCell::new(Vec::new()));
+    let captured_clipboard = clipboard.clone();
+    let mut view = UserView::new(2);
+    let mut h = harness(USER, "dark", true, move |ui| {
+        view.ui(ui, &current.borrow(), &|_| None, &|c| {
+            captured.borrow_mut().push(c)
+        });
+        ui.ctx().output(|o| {
+            for command in &o.commands {
+                if let egui::OutputCommand::CopyText(text) = command {
+                    captured_clipboard.borrow_mut().push(text.clone());
+                }
+            }
+        });
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Für mich stummschalten")
+        .click();
+    h.run();
+    assert!(sent
+        .borrow()
+        .iter()
+        .any(|c| matches!(c, Command::SetVolume(2, v) if *v == 0.0)));
+    s.borrow_mut().peers[0].volume = 0.0;
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Wieder hören")
+        .click();
+    h.run();
+    assert!(sent
+        .borrow()
+        .iter()
+        .any(|c| matches!(c, Command::SetVolume(2, v) if *v == 100.0)));
+    h.get_by_label(&format!(
+        "{}  Stummschalten",
+        egui_phosphor::regular::MICROPHONE_SLASH
+    ))
+    .click();
+    h.run();
+    assert!(sent.borrow().iter().any(|c| matches!(
+        c,
+        Command::SetUserRestriction {
+            user_id: 2,
+            muted: true,
+            deafened: false
+        }
+    )));
+    h.get_by_label(&format!(
+        "{} Nutzerzertifikat",
+        egui_phosphor::regular::CERTIFICATE
+    ))
+    .click();
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Fingerabdruck kopieren")
+        .click();
+    h.run();
+    assert!(
+        clipboard.borrow().contains(&expected),
+        "copy keeps the complete unwrapped SHA-256 fingerprint"
     );
 }
 

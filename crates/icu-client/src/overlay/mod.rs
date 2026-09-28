@@ -308,14 +308,14 @@ fn blend_label(canvas: &mut [u8], stride: usize, x: u32, y: u32, label: &Label) 
 fn blit_rotated_glyph(
     canvas: &mut [u8],
     stride: usize,
-    canvas_w: u32,
-    canvas_h: u32,
-    cx: f32,
-    cy: f32,
+    canvas_size: (u32, u32),
+    center: (f32, f32),
     r_inner: f32,
     theta: f32,
     glyph: &Label,
 ) {
+    let (canvas_w, canvas_h) = canvas_size;
+    let (cx, cy) = center;
     if glyph.width == 0 || glyph.height == 0 {
         return;
     }
@@ -330,7 +330,12 @@ fn blit_rotated_glyph(
         (cx + lx_c * tx + rr * ox, cy + lx_c * ty + rr * oy)
     };
     // World-space bounding box of the rotated glyph, from its four corners.
-    let corners = [point(0.0, 0.0), point(gw, 0.0), point(0.0, gh), point(gw, gh)];
+    let corners = [
+        point(0.0, 0.0),
+        point(gw, 0.0),
+        point(0.0, gh),
+        point(gw, gh),
+    ];
     let min_x = corners.iter().fold(f32::MAX, |a, &(x, _)| a.min(x));
     let max_x = corners.iter().fold(f32::MIN, |a, &(x, _)| a.max(x));
     let min_y = corners.iter().fold(f32::MAX, |a, &(_, y)| a.min(y));
@@ -688,7 +693,15 @@ fn circle_geometry(diameter: u32, name_px: u32) -> CircleGeom {
 /// the destination pixel's offset from the circle's center, in `[-r, r]`.
 /// Bounds-checked: a frame shorter than its announced size (a partial
 /// decode) must not take the client down.
-fn sample_camera_circle(fw: usize, fh: usize, rgba: &[u8], dx: f32, dy: f32, r: f32, mul: u32) -> [u8; 4] {
+fn sample_camera_circle(
+    fw: usize,
+    fh: usize,
+    rgba: &[u8],
+    dx: f32,
+    dy: f32,
+    r: f32,
+    mul: u32,
+) -> [u8; 4] {
     let side = fw.min(fh).max(1);
     let u = ((dx + r) / (2.0 * r)).clamp(0.0, 0.999_9);
     let v = ((dy + r) / (2.0 * r)).clamp(0.0, 0.999_9);
@@ -738,7 +751,15 @@ fn draw_curved_label(
         let theta = (caret + glyph_w / 2.0) / r_inner;
         caret += glyph_w;
         let glyph = labels.glyph(c, px);
-        blit_rotated_glyph(canvas, stride, canvas_w, canvas_h, cx, cy, r_inner, theta, glyph);
+        blit_rotated_glyph(
+            canvas,
+            stride,
+            (canvas_w, canvas_h),
+            (cx, cy),
+            r_inner,
+            theta,
+            glyph,
+        );
     }
 }
 
@@ -983,7 +1004,8 @@ mod tests {
             let g = geometry(&tiles, horizontal);
             let mut canvas = vec![0u8; (g.width * g.height * 4) as usize];
             compose(&mut canvas, &g, &tiles, Some(&mut labels));
-            let alpha_at = |x: u32, y: u32| canvas[(y as usize * g.width as usize + x as usize) * 4 + 3];
+            let alpha_at =
+                |x: u32, y: u32| canvas[(y as usize * g.width as usize + x as usize) * 4 + 3];
             for (x, y) in [
                 (0, 0),
                 (g.width - 1, 0),
@@ -996,7 +1018,12 @@ mod tests {
                     "canvas corner ({x},{y}) should be transparent — tiles are round, not square"
                 );
             }
-            let opaque = canvas.as_chunks::<4>().0.iter().filter(|p| p[3] == 0xff).count();
+            let opaque = canvas
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[3] == 0xff)
+                .count();
             assert!(
                 opaque > 100,
                 "expected a solidly opaque tile fill, found {opaque} fully-opaque pixels"

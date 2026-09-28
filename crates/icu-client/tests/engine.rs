@@ -1049,3 +1049,86 @@ async fn a_stale_settings_copy_keeps_the_mute() {
     assert!(saved.audio.muted, "the stale copy did not unmute the file");
     server.handle.shutdown().await;
 }
+
+/// A normal member can inspect the actual public leaf of an online peer,
+/// including its locally checked CA signature. Cache lifetime is the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_certificate_matches_the_authenticated_session_and_expires_with_it() {
+    use icu_client::{config::Identity, conninfo::CertInfo};
+    let server = TestServer::start().await;
+    let (bob, paths, _bob_dir) = server
+        .engine_with_paths("bob", Box::new(FakeBackend::silent().0), false)
+        .await;
+    wait_connected(&bob).await;
+    let (alice, _alice_dir) = server
+        .engine("alice", Box::new(FakeBackend::silent().0), false)
+        .await;
+    let bob_session = wait_connected(&bob).await.me.unwrap().session;
+    wait_for(&alice, SOON, |s| {
+        s.peers.iter().any(|p| p.info.session == bob_session)
+    })
+    .await;
+    alice.command(Command::RequestPeerCertificate(bob_session));
+    let s = wait_for(&alice, SOON, |s| {
+        s.peers
+            .iter()
+            .any(|p| p.info.session == bob_session && matches!(p.certificate, Some(Ok(_))))
+    })
+    .await;
+    let received = s
+        .peers
+        .iter()
+        .find(|p| p.info.session == bob_session)
+        .unwrap()
+        .certificate
+        .as_ref()
+        .unwrap()
+        .as_ref()
+        .unwrap();
+    let expected = CertInfo::from_der(&Identity::load(&paths).unwrap().unwrap().leaf_der);
+    assert_eq!(received.fingerprint, expected.fingerprint);
+    assert_eq!(received.der, expected.der);
+    assert_eq!(received.signature_valid, Some(true));
+    assert!(!s.is_admin, "lookup is available to ordinary room members");
+    bob.shutdown();
+    wait_for(&alice, SOON, |s| s.peers.is_empty()).await;
+    // A subsequent lookup cannot recreate departed peer state.
+    alice.command(Command::RequestPeerCertificate(bob_session));
+    assert!(alice.snapshot().peers.is_empty());
+    let (carol, _carol_dir) = server
+        .engine("carol", Box::new(FakeBackend::silent().0), false)
+        .await;
+    let new_session = wait_connected(&carol).await.me.unwrap().session;
+    let s = wait_for(&alice, SOON, |s| {
+        s.peers.iter().any(|p| p.info.session == new_session)
+    })
+    .await;
+    assert!(s
+        .peers
+        .iter()
+        .find(|p| p.info.session == new_session)
+        .unwrap()
+        .certificate
+        .is_none());
+    let mut inspector = server.raw_client("inspector").await;
+    inspector
+        .send(&ControlMsg::PeerCertificateRequest {
+            session: bob_session,
+        })
+        .await;
+    let answer = inspector
+        .recv_matching(SOON, |m| {
+            matches!(m, ControlMsg::PeerCertificateResponse { .. })
+        })
+        .await;
+    assert_eq!(
+        answer,
+        Some(ControlMsg::PeerCertificateResponse {
+            session: bob_session,
+            certificate_der: None
+        })
+    );
+    alice.shutdown();
+    carol.shutdown();
+    server.handle.shutdown().await;
+}
