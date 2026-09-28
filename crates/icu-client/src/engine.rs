@@ -302,7 +302,7 @@ pub struct AppState {
 /// Commands from UI, tray and hotkeys.
 #[derive(Debug, Clone)]
 pub enum Command {
-    /// A frame from this peer was presented by the main window or overlay.
+    /// A frame from this peer was presented by the overlay.
     VideoDisplayed(Session),
     /// Mute/unmute.
     SetMuted(bool),

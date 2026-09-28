@@ -657,7 +657,7 @@ impl eframe::App for App {
         // textures nobody is looking at. `ui` already asks for a repaint
         // every 33 ms against a 15 fps decoder, so every picture is uploaded
         // exactly once.
-        let fresh_video = self.videos.refresh(&ctx);
+        self.videos.refresh(&ctx);
         #[cfg(feature = "camera")]
         let self_video = {
             let on = self.state.camera_on;
@@ -676,7 +676,6 @@ impl eframe::App for App {
             cmd: &self.cmd,
             video_tier: VideoTier::from_u8(self.stats.video_tier.load(Ordering::Relaxed) as u8),
             video: &|session| videos.get(session),
-            fresh_video: &fresh_video,
             self_video,
             settings_open: self.settings.is_some(),
             user_open: self.user.as_ref().map(|v| v.user_id()),
@@ -1092,8 +1091,6 @@ pub struct MainEnv<'a> {
     pub video_tier: VideoTier,
     /// Somebody's live picture, by session; `None` draws the initials.
     pub video: &'a dyn Fn(icu_proto::Session) -> Option<egui::load::SizedTexture>,
-    /// Sessions with a newly uploaded frame on this repaint.
-    pub fresh_video: &'a [icu_proto::Session],
     /// The own camera's preview, while it is on.
     pub self_video: Option<egui::load::SizedTexture>,
     /// The settings window is open, which the gear shows.
@@ -1546,14 +1543,9 @@ impl MainView {
                                     participant_for(state, me.user_id, env.video, env.self_video)
                                 {
                                     let active = env.user_open == Some(me.user_id);
-                                    if let Some(id) = participant_row(
-                                        ui,
-                                        participant,
-                                        &columns,
-                                        active,
-                                        env.fresh_video,
-                                        &send,
-                                    ) {
+                                    if let Some(id) =
+                                        participant_row(ui, participant, &columns, active, &send)
+                                    {
                                         out.open_user = Some(id);
                                     }
                                 }
@@ -1568,14 +1560,9 @@ impl MainView {
                                     continue;
                                 };
                                 let active = env.user_open == Some(p.info.user_id);
-                                if let Some(id) = participant_row(
-                                    ui,
-                                    participant,
-                                    &columns,
-                                    active,
-                                    env.fresh_video,
-                                    &send,
-                                ) {
+                                if let Some(id) =
+                                    participant_row(ui, participant, &columns, active, &send)
+                                {
                                     out.open_user = Some(id);
                                 }
                             }
@@ -1972,7 +1959,6 @@ fn participant_row(
     p: Participant<'_>,
     columns: &[Badge],
     active: bool,
-    fresh_video: &[icu_proto::Session],
     send: &impl Fn(Command),
 ) -> Option<icu_proto::UserId> {
     let tok = theme::tokens(ui.visuals());
@@ -2005,12 +1991,6 @@ fn participant_row(
                         hint.push_str(s);
                     }
                     let avatar = widgets::avatar(ui, p.name, p.user_id, p.speaking, 30.0, p.video);
-                    if p.mode.is_none()
-                        && fresh_video.contains(&p.session)
-                        && ui.is_rect_visible(avatar.rect)
-                    {
-                        send(Command::VideoDisplayed(p.session));
-                    }
                     ui.add_space(2.0);
                     // The name gets what the icons on the right leave — ping
                     // 22, volume 28, an 18 slot for the mode and one per badge

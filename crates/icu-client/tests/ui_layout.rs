@@ -388,7 +388,6 @@ fn main_window(
     let mut view = MainView::default();
     let harness = harness(MAIN, theme_name, false, move |root| {
         let env = MainEnv {
-            fresh_video: &[],
             cmd: &cmd,
             video_tier: icu_client::video::VideoTier::T0,
             video: &|_| None,
