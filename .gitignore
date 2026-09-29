@@ -14,3 +14,7 @@ admin.txt
 id_ed25519
 id_ecdsa
 id_rsa
+
+# Site: packages are copied in by web/tools/publish-release.py
+web/downloads/*
+!web/downloads/.gitkeep

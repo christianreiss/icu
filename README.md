@@ -92,6 +92,7 @@ Vollständige, mit Zahlen belegte Liste inklusive bewusst abgelehnter Features:
 
 ## Installation
 
+Überblick und Downloads: https://icu.uggs.io (Quelle: [`web/`](web/README.md)).
 Pakete unter https://github.com/christianreiss/icu/releases: der Client `icu`
 für Fedora 42/43 (`.rpm`) und Debian 13 (`.deb`) sowie als portables, unsigniertes
 ZIP für Windows 10/11 (SmartScreen beim ersten Start: „Weitere Informationen“ →
@@ -119,6 +120,7 @@ Details und Voraussetzungen: [Bauanleitung](docs/development/building.md).
 | [docs/](docs/README.md) | Referenz, Bauanleitung, Tests, Recherche und Verlauf |
 | [experiments/](experiments/README.md) | Eigenständige Forschungsprogramme |
 | `packaging/` | Paketbau, Cross-Toolchain und Release-Skripte |
+| [web/](web/README.md) | Webseite icu.uggs.io: Überblick, Screenshots, Download |
 | [deploy/](deploy/README.md) | Deployment-Dateien und Betriebshandbuch |
 | `target/` | Regenerierbare Build-Ausgaben und Paket-Staging |
 | `dist/<version>/` | Fertige Pakete, BUILDINFO und Prüfsummen |

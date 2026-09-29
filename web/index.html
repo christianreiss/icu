@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ICU – Voice für eine feste Gruppe</title>
+<meta name="description" content="ICU ist ein minimales Voice-System für eine feste Gruppe: ein Server, ein Raum, keine Channels. Opus, Echo- und Rauschunterdrückung, Kamera-Overlay fürs Spiel, mutual TLS statt Passwort. Für Linux und Windows.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#050f1a">
+<link rel="canonical" href="https://icu.uggs.io/">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="assets/img/icu-256.png">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="ICU">
+<meta property="og:title" content="ICU – Eine Gruppe. Ein Raum. Kein Rauschen.">
+<meta property="og:description" content="Minimales Voice-System für eine feste Gruppe: Opus, WebRTC-AEC, RNNoise, Kamera-Overlay fürs Spiel und mutual TLS statt Passwort.">
+<meta property="og:url" content="https://icu.uggs.io/">
+<meta property="og:image" content="https://icu.uggs.io/assets/img/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preload" href="assets/fonts/redhat-display-black.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/redhat-text-regular.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="assets/css/site.css">
+<script src="assets/js/boot.js"></script>
+<script src="assets/js/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main" data-i18n="skip">Zum Inhalt springen</a>
+
+<!-- Icon sprite -->
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-wave" viewBox="0 0 24 24"><path d="M4 10v4M8 6v12M12 3v18M16 7v10M20 10v4"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3"/></symbol>
+  <symbol id="i-users" viewBox="0 0 24 24"><path d="M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM2.5 20a6.5 6.5 0 0 1 13 0M16 4.5a3.5 3.5 0 0 1 0 6.6M18.5 14.2A6.5 6.5 0 0 1 21.5 20"/></symbol>
+  <symbol id="i-cam" viewBox="0 0 24 24"><path d="M3 7h11a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H3zM16 10l5-3v10l-5-3"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M16 7l3 3M14 9l2 2"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6zM9 12l2 2 4-4"/></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
+  <symbol id="i-route" viewBox="0 0 24 24"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="18" r="2.5"/><path d="M7.5 6H14a3 3 0 0 1 0 6h-4a3 3 0 0 0 0 6h6.5"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M4 20h16"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16M14 6l6 6-6 6"/></symbol>
+  <symbol id="i-term" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/></symbol>
+  <symbol id="i-win" viewBox="0 0 24 24"><path d="M3 5.6l7.5-1v7H3zM12 4.4L21 3v8.6h-9zM3 12.4h7.5v7L3 18.4zM12 12.4h9V21l-9-1.4z" fill="currentColor" stroke="none"/></symbol>
+</svg>
+
+<header class="top" id="top">
+  <div class="wrap top-in">
+    <a class="brand" href="#top" aria-label="ICU">
+      <img src="assets/img/icu.svg" alt="" width="30" height="30">
+      <span>ICU</span>
+    </a>
+    <nav class="nav" aria-label="Hauptnavigation" data-i18n-attr="aria-label:nav.label">
+      <a href="#funktionen" data-i18n="nav.features">Funktionen</a>
+      <a href="#ansicht" data-i18n="nav.views">Ansicht</a>
+      <a href="#loslegen" data-i18n="nav.start">Loslegen</a>
+      <a href="#grenzen" data-i18n="nav.limits">Bewusst nicht</a>
+    </nav>
+    <div class="top-r">
+      <div class="lang" role="group" aria-label="Sprache / Language">
+        <button type="button" data-lang="de" aria-pressed="true">DE</button>
+        <button type="button" data-lang="en" aria-pressed="false">EN</button>
+      </div>
+      <a class="btn btn-sm" href="#download" aria-label="Download"><svg class="ic"><use href="#i-download"/></svg><span data-i18n="nav.download">Download</span></a>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+
+<!-- HERO -->
+<section class="hero">
+  <div class="wrap hero-in">
+    <div class="hero-copy">
+      <p class="tag reveal"><span class="led" aria-hidden="true"></span><span data-i18n="hero.tag">Raum 01 · 1 Server · 0 Channels</span></p>
+      <h1 class="hero-title reveal" data-i18n="hero.title" data-html>Eine Gruppe.<br>Ein Raum.<br><em>Kein&nbsp;Rauschen.</em></h1>
+      <p class="lead reveal" data-i18n="hero.lead">ICU ist das, was von Mumble und TeamSpeak übrig bleibt, wenn man alles streicht, was eine feste Gruppe nicht braucht. Dafür bekommst du Opus-Sprachqualität, Echo- und Rauschunterdrückung, ein Kamera-Overlay fürs Spiel und mutual TLS statt Passwort.</p>
+      <div class="cta reveal">
+        <a class="btn btn-lg" href="#download" id="hero-dl"><svg class="ic"><use href="#i-download"/></svg><span id="hero-dl-label" data-i18n="hero.cta">Download</span></a>
+        <a class="btn btn-ghost btn-lg" href="#funktionen"><span data-i18n="hero.cta2">Funktionen ansehen</span><svg class="ic"><use href="#i-arrow"/></svg></a>
+      </div>
+      <p class="fine reveal"><span id="hero-version">v0.1</span> · <span data-i18n="hero.platforms">Linux (Fedora, Debian) &amp; Windows 10/11</span> · Apache-2.0</p>
+    </div>
+
+    <div class="stage" id="stage">
+      <div class="rings" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <button class="eye" id="eye" type="button" aria-pressed="false" aria-label="Sende-Demo: gedrückt halten" data-i18n-attr="aria-label:hero.eye">
+        <svg viewBox="0 0 64 64" width="220" height="220" aria-hidden="true">
+          <defs><clipPath id="eyeclip"><path d="M10 32c6-9 13-14 22-14s16 5 22 14c-6 9-13 14-22 14S16 41 10 32z"/></clipPath></defs>
+          <circle class="eye-disc" cx="32" cy="32" r="30"/>
+          <path class="eye-lid" d="M10 32c6-9 13-14 22-14s16 5 22 14c-6 9-13 14-22 14S16 41 10 32z"/>
+          <g clip-path="url(#eyeclip)"><g class="eye-iris"><circle class="iris" cx="32" cy="32" r="8"/><circle class="pupil" cx="32" cy="32" r="3.5"/></g></g>
+        </svg>
+        <span class="eye-state" aria-hidden="true"><b class="on" data-i18n="hero.tx">Sendet</b><b class="off" data-i18n="hero.rx">Hört zu</b></span>
+      </button>
+      <p class="eye-hint mono" data-i18n="hero.hint">↓ Auge gedrückt halten = PTT</p>
+      <figure class="shot shot-a"><img src="assets/img/shots/video-call.png" width="430" height="380" alt="ICU-Fenster mit zwei Teilnehmern, Kamerastatus, Signalstärke und den Tasten Stumm, Taub, Kamera und Overlay" data-i18n-attr="alt:hero.alt1"></figure>
+      <figure class="shot shot-b"><img src="assets/img/shots/call-window.png" width="430" height="445" alt="ICU-Hauptfenster: verbunden, ein Teilnehmer, Sende-Taste F12" data-i18n-attr="alt:hero.alt2"></figure>
+    </div>
+  </div>
+</section>
+
+<!-- TICKER -->
+<div class="ticker" aria-hidden="true">
+  <div class="ticker-track">
+    <ul><li>Opus 48 kHz</li><li>20 ms Frames</li><li>WebRTC AEC3</li><li>RNNoise</li><li>QUIC + TLS 1.3</li><li>mutual TLS</li><li>H.264</li><li>PipeWire</li><li>WASAPI</li><li>Jitter-Buffer · FEC · PLC</li></ul>
+    <ul><li>Opus 48 kHz</li><li>20 ms Frames</li><li>WebRTC AEC3</li><li>RNNoise</li><li>QUIC + TLS 1.3</li><li>mutual TLS</li><li>H.264</li><li>PipeWire</li><li>WASAPI</li><li>Jitter-Buffer · FEC · PLC</li></ul>
+  </div>
+</div>
+
+<!-- 01 PRINZIP -->
+<section class="sec" id="prinzip">
+  <div class="wrap">
+    <p class="idx reveal"><span>01</span><span data-i18n="idx.principle">Prinzip</span></p>
+    <div class="split">
+      <div>
+        <h2 class="reveal" data-i18n="p.h" data-html>Weglassen ist das Feature.</h2>
+        <p class="body reveal" data-i18n="p.p1">Kein Server-Browser, keine Channel-Hierarchie, keine Rollen außer Admin. Eine feste Gruppe braucht das nicht, und alles, was fehlt, kann weder kaputtgehen noch konfiguriert werden.</p>
+        <p class="body reveal" data-i18n="p.p2">Zugang ist ein Zertifikat, keine Zeichenkette, die man weitergibt: Du bekommst eine Einladung, ziehst sie ins Fenster, wählst deinen Namen — fertig registriert.</p>
+      </div>
+      <dl class="stats reveal">
+        <div><dt data-i18n="p.s1">Raum</dt><dd>1</dd></div>
+        <div><dt data-i18n="p.s2">Channels</dt><dd>0</dd></div>
+        <div><dt data-i18n="p.s3">Passwörter</dt><dd>0</dd></div>
+        <div><dt data-i18n="p.s4">je Audioframe</dt><dd>20<small>ms</small></dd></div>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<!-- 02 FUNKTIONEN -->
+<section class="sec" id="funktionen">
+  <div class="wrap">
+    <p class="idx reveal"><span>02</span><span data-i18n="idx.features">Funktionen</span></p>
+    <h2 class="reveal" data-i18n="f.h" data-html>Nur, was wirklich gebraucht wird.<br><span class="dim">Das dafür perfekt.</span></h2>
+
+    <div class="bento">
+      <article class="card c-audio reveal">
+        <svg class="ic ic-lg"><use href="#i-wave"/></svg>
+        <h3 data-i18n="f.audio.h">Audio</h3>
+        <p data-i18n="f.audio.p">Opus 48&nbsp;kHz mono, adaptiver Jitter-Buffer mit FEC und PLC, WebRTC-AEC3-Echounterdrückung, RNNoise-Rauschunterdrückung und automatische Mikrofon- und Empfangslautstärke.</p>
+        <div class="chips chips-audio" aria-hidden="true"><span class="chip">Opus 48 kHz</span><span class="chip">AEC3</span><span class="chip">RNNoise</span><span class="chip">FEC · PLC</span></div>
+        <div class="eq" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+      </article>
+
+      <article class="card c-talk reveal">
+        <svg class="ic ic-lg"><use href="#i-mic"/></svg>
+        <h3 data-i18n="f.talk.h">Sprechen</h3>
+        <p data-i18n="f.talk.p">Push-to-Talk oder Voice-Activation, global bindbar — auch auf Maustasten. Mit Release-Delay und Sende-Cue.</p>
+        <div class="keys" aria-hidden="true"><kbd>F12</kbd><kbd data-i18n="f.talk.k">Maus 4</kbd><span><kbd>Strg</kbd><kbd>Shift</kbd><kbd>T</kbd></span></div>
+      </article>
+
+      <article class="card c-people reveal">
+        <svg class="ic ic-lg"><use href="#i-users"/></svg>
+        <h3 data-i18n="f.people.h">Teilnehmer</h3>
+        <p data-i18n="f.people.p">Sprecher-Indikator, Mute-, Deafen- und Kamerastatus. Lautstärke pro Person von 0 bis 200&nbsp;%, gemerkt für immer.</p>
+      </article>
+
+      <article class="card c-cam reveal">
+        <svg class="ic ic-lg"><use href="#i-cam"/></svg>
+        <h3 data-i18n="f.cam.h">Kamera &amp; Overlay</h3>
+        <p data-i18n="f.cam.p">Das Overlay ist ein eigenes transparentes Always-on-top-Fenster über Borderless-Spielen: click-through, GPU-gerendert, mit DPI-skalierter Sprecher-Hervorhebung. Kein Render-Hooking.</p>
+        <div class="mini-game" aria-hidden="true"><span class="mg-tile"><img src="assets/img/shots/overlay.png" width="155" height="145" alt=""></span></div>
+      </article>
+
+      <article class="card c-id reveal">
+        <svg class="ic ic-lg"><use href="#i-key"/></svg>
+        <h3 data-i18n="f.id.h">Identität statt Passwort</h3>
+        <p data-i18n="f.id.p">Mutual TLS mit einer server-eigenen CA. Beitritt per Einladungs-Bundle (<code>.icu</code>-Datei oder Text). Dein Zertifikat ist sichtbar, und der Passport exportiert deine ganze Identität auf ein anderes Gerät.</p>
+        <div class="chips" aria-hidden="true"><span class="chip ok" data-i18n="f.id.c1">CA-Signatur geprüft</span><span class="chip">QUIC · TLS 1.3 · mTLS</span></div>
+      </article>
+
+      <article class="card c-admin reveal">
+        <svg class="ic ic-lg"><use href="#i-shield"/></svg>
+        <h3>Admin</h3>
+        <p data-i18n="f.admin.p">Einladen, befördern, sperren, stumm- oder taubschalten, rauswerfen — im Client oder per Server-CLI und Shell.</p>
+      </article>
+
+      <article class="card c-ops reveal">
+        <svg class="ic ic-lg"><use href="#i-server"/></svg>
+        <h3 data-i18n="f.ops.h">Betrieb</h3>
+        <p data-i18n="f.ops.p">Ein statisches Server-Binary, automatischer Reconnect mit Backoff, Tray-Icon und ein Einrichtungsassistent beim ersten Start.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- 03 ANSICHT -->
+<section class="sec" id="ansicht">
+  <div class="wrap">
+    <p class="idx reveal"><span>03</span><span data-i18n="idx.views">Ansicht</span></p>
+    <h2 class="reveal" data-i18n="v.h" data-html>So sieht das aus.</h2>
+
+    <div class="showcase reveal">
+      <div class="tabs" role="tablist" aria-label="Screenshots" data-i18n-attr="aria-label:v.label">
+        <button role="tab" id="tab-main" aria-controls="pan-main" aria-selected="true" data-i18n="v.t1">Hauptfenster</button>
+        <button role="tab" id="tab-cam" aria-controls="pan-cam" aria-selected="false" tabindex="-1" data-i18n="v.t2">Kamera</button>
+        <button role="tab" id="tab-ovl" aria-controls="pan-ovl" aria-selected="false" tabindex="-1" data-i18n="v.t3">Overlay</button>
+        <button role="tab" id="tab-inv" aria-controls="pan-inv" aria-selected="false" tabindex="-1" data-i18n="v.t4">Einladung</button>
+        <button role="tab" id="tab-con" aria-controls="pan-con" aria-selected="false" tabindex="-1" data-i18n="v.t5">Verbindungspfad</button>
+      </div>
+
+      <div class="panel" role="tabpanel" id="pan-main" aria-labelledby="tab-main">
+        <div class="frame"><img src="assets/img/shots/call-window.png" width="430" height="445" alt="ICU-Hauptfenster: verbunden, ein Teilnehmer, Sende-Taste F12, Tasten Stumm, Taub, Kamera und Overlay" loading="lazy" data-i18n-attr="alt:hero.alt2"></div>
+        <div class="cap">
+          <h3 data-i18n="v.1.h">Ein Raum, alle Teilnehmer.</h3>
+          <ul>
+            <li data-i18n="v.1.a">PTT-Taste (hier F12) und Pegelanzeige direkt im Fenster</li>
+            <li data-i18n="v.1.b">Stumm, Taub, Kamera und Overlay sind je ein Klick</li>
+            <li data-i18n="v.1.c">Tray-Icon zeigt Verbunden, Mute und Deafen</li>
+            <li data-i18n="v.1.d">Einrichtungsassistent beim ersten Start: Geräte, Sprechen, Klang</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="panel" role="tabpanel" id="pan-cam" aria-labelledby="tab-cam" hidden>
+        <div class="frame"><img src="assets/img/shots/video-call.png" width="430" height="380" alt="ICU mit zwei Teilnehmern, Sprecher-Indikator, Kamerastatus und Signalstärke" loading="lazy" data-i18n-attr="alt:hero.alt1"></div>
+        <div class="cap">
+          <h3 data-i18n="v.2.h">Videocall mit Kamerakacheln.</h3>
+          <ul>
+            <li data-i18n="v.2.a">Sprecher-Indikator, Signalstärke und Kamerastatus je Teilnehmer</li>
+            <li data-i18n="v.2.b">Kamera an und aus mit Vorschau vorab; H.264 über openh264</li>
+            <li data-i18n="v.2.c">Gesendet wird nur, solange jemand zuschaut</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="panel" role="tabpanel" id="pan-ovl" aria-labelledby="tab-ovl" hidden>
+        <div class="frame frame-game"><div class="game" aria-hidden="true"><span class="game-tile"><img src="assets/img/shots/overlay.png" width="155" height="145" alt="" loading="lazy"></span></div><small data-i18n="v.3.note">Schematisch: die echte Overlay-Kachel über einem Spielfenster</small></div>
+        <div class="cap">
+          <h3 data-i18n="v.3.h">Overlay im Spiel.</h3>
+          <ul>
+            <li data-i18n="v.3.a">Click-through und immer im Vordergrund, mit Sprecher-Highlight und Kamerabild</li>
+            <li data-i18n="v.3.b">Eigenes Fenster statt Render-Hooking — dafür nur über Borderless-Spielen, exklusives Vollbild verdeckt es</li>
+            <li data-i18n="v.3.c">Linux: Wayland-Layer-Shell (KDE, wlroots); unter GNOME nicht verfügbar</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="panel" role="tabpanel" id="pan-inv" aria-labelledby="tab-inv" hidden>
+        <div class="frame"><img src="assets/img/shots/invite.png" width="590" height="635" alt="Dialog „Mit ICU verbinden“ mit Eingabefeld für die Einladung" loading="lazy" data-i18n-attr="alt:v.4.alt"></div>
+        <div class="cap">
+          <h3 data-i18n="v.4.h">Einladung statt Passwort.</h3>
+          <ul>
+            <li data-i18n="v.4.a">Einladung einfügen oder die <code>.icu</code>-Datei ins Fenster ziehen</li>
+            <li data-i18n="v.4.b">Server, Adresse und CA-Fingerabdruck stehen vor dem Beitreten da</li>
+            <li data-i18n="v.4.c">„Beitreten“ holt im selben Schritt dein Client-Zertifikat</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="panel" role="tabpanel" id="pan-con" aria-labelledby="tab-con" hidden>
+        <div class="frame frame-tall">
+          <img class="theme-dark" src="assets/img/shots/connection-details-dark.png" width="900" height="914" alt="Verbindungspfad im dunklen Theme: Nutzer, Server und du, mit RTT, Paketverlust und Zertifikatskette" loading="lazy" data-i18n-attr="alt:v.5.alt1">
+          <img class="theme-light" src="assets/img/shots/connection-details-light.png" width="900" height="914" alt="Verbindungspfad im hellen Theme" loading="lazy" data-i18n-attr="alt:v.5.alt2">
+          <div class="theme-switch" role="group" aria-label="Theme">
+            <button type="button" data-theme-shot="dark" aria-pressed="true" data-i18n="v.5.dark">Dunkel</button>
+            <button type="button" data-theme-shot="light" aria-pressed="false" data-i18n="v.5.light">Hell</button>
+          </div>
+        </div>
+        <div class="cap">
+          <h3 data-i18n="v.5.h">Wer mit wem spricht — und worauf das beruht.</h3>
+          <ul>
+            <li data-i18n="v.5.a">RTT zum Server und Audio-Paketverlust je Teilnehmer</li>
+            <li data-i18n="v.5.b">Zertifikatskette und Vertrauensanker aus deinem Passport</li>
+            <li data-i18n="v.5.c">Moderation für Admins: stumm, taub, rauswerfen, sperren</li>
+            <li data-i18n="v.5.d">Ehrlich beschriftet: Beide Strecken sind transportverschlüsselt, der Server kann die weitergeleiteten Medien lesen</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 04 LOSLEGEN -->
+<section class="sec" id="loslegen">
+  <div class="wrap">
+    <p class="idx reveal"><span>04</span><span data-i18n="idx.start">Loslegen</span></p>
+    <h2 class="reveal" data-i18n="s.h" data-html>Drei Schritte bis zum ersten Wort.</h2>
+
+    <ol class="steps">
+      <li class="step reveal">
+        <span class="num">1</span>
+        <h3 data-i18n="s.1.h">Server aufsetzen</h3>
+        <p data-i18n="s.1.p">Ein Paket, ein Setup-Dialog. Freigeben musst du nur einen UDP-Port (Vorgabe 4711).</p>
+        <div class="code"><button class="copy" type="button" aria-label="Kopieren" data-i18n-attr="aria-label:copy"><svg class="ic"><use href="#i-copy"/></svg></button><pre><code>sudo dnf install ./icu-server-<span class="ver">0.1.4</span>-1.x86_64.rpm  # Fedora, Alma 10+
+sudo apt install ./icu-server_<span class="ver">0.1.4</span>-1_amd64.deb  # Debian 12+
+sudo icu-server setup
+sudo systemctl enable --now icu-server
+sudo firewall-cmd --permanent --add-service=icu
+sudo firewall-cmd --reload</code></pre></div>
+      </li>
+      <li class="step reveal">
+        <span class="num">2</span>
+        <h3 data-i18n="s.2.h">Einladung ausstellen</h3>
+        <p data-i18n="s.2.p">Wer sich als Erstes registriert, wird Admin. Jede Einladung lässt sich einmal einlösen und ist zeitlich begrenzt.</p>
+        <div class="code"><button class="copy" type="button" aria-label="Kopieren" data-i18n-attr="aria-label:copy"><svg class="ic"><use href="#i-copy"/></svg></button><pre><code>sudo icu-server invite --out /root/icu-admin.icu
+icu-server invite --ttl 24h --out ~/bob.icu</code></pre></div>
+      </li>
+      <li class="step reveal">
+        <span class="num">3</span>
+        <h3 data-i18n="s.3.h">Client installieren, beitreten</h3>
+        <p data-i18n="s.3.p">Einladung einfügen oder die Datei ins Fenster ziehen, Namen wählen, „Beitreten“. Der Assistent richtet Mikrofon, Sprechtaste und Klang ein.</p>
+        <div class="code"><button class="copy" type="button" aria-label="Kopieren" data-i18n-attr="aria-label:copy"><svg class="ic"><use href="#i-copy"/></svg></button><pre><code>sudo dnf install ./icu-<span class="ver">0.1.4</span>-1.fc43.x86_64.rpm  # Fedora 42/43
+sudo apt install ./icu_<span class="ver">0.1.4</span>-1+deb13_amd64.deb  # Debian 13
+# Windows: icu-<span class="ver">0.1.4</span>-windows-x86_64-setup.exe</code></pre></div>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<!-- 05 GRENZEN -->
+<section class="sec" id="grenzen">
+  <div class="wrap">
+    <p class="idx reveal"><span>05</span><span data-i18n="idx.limits">Bewusst nicht</span></p>
+    <div class="split split-top">
+      <div>
+        <h2 class="reveal" data-i18n="n.h" data-html>Was fehlt, ist Absicht.</h2>
+        <p class="body reveal" data-i18n="n.p">Jede Zeile hier ist eine Entscheidung. Wer eines davon braucht, sollte lieber Mumble oder TeamSpeak nehmen — und das ist in Ordnung.</p>
+      </div>
+      <ul class="nogo reveal">
+        <li><span data-i18n="n.1">Channels &amp; Server-Browser</span></li>
+        <li><span data-i18n="n.2">Rechteverwaltung (außer Admin)</span></li>
+        <li><span data-i18n="n.3">Text-Chat &amp; Dateitransfer</span></li>
+        <li><span data-i18n="n.4">Bots &amp; Plugins</span></li>
+        <li><span data-i18n="n.5">Mobile Clients &amp; Web-Client</span></li>
+        <li><span data-i18n="n.6">Overlay in exklusivem Vollbild</span></li>
+      </ul>
+    </div>
+    <blockquote class="quote reveal" data-i18n="n.q">Nur die Features, die wirklich gebraucht werden. Die sind dafür perfekt.</blockquote>
+  </div>
+</section>
+
+<!-- 06 VERTRAUEN -->
+<section class="sec sec-tight" id="vertrauen">
+  <div class="wrap">
+    <p class="idx reveal"><span>06</span><span data-i18n="idx.trust">Vertrauen</span></p>
+    <div class="trust">
+      <div class="trust-col reveal">
+        <svg class="ic ic-lg"><use href="#i-shield"/></svg>
+        <h3 data-i18n="t.1.h">Eigene CA, kein Passwort</h3>
+        <p data-i18n="t.1.p">Jeder Server betreibt seine eigene CA. Die Einladung trägt den Vertrauensanker, das Client-Zertifikat ist deine Anmeldung. Auf jedem Audio-Datagramm sitzt zusätzlich ein HMAC-Tag: Ohne den Com-Schlüssel bleibt der Port stumm.</p>
+      </div>
+      <div class="trust-col reveal">
+        <svg class="ic ic-lg"><use href="#i-route"/></svg>
+        <h3 data-i18n="t.2.h">Nichts hinter deinem Rücken</h3>
+        <p data-i18n="t.2.p">Der Verbindungspfad zeigt, wer worüber mit wem spricht. Der Server ist ein reiner Relay: Beide Strecken sind per QUIC/TLS&nbsp;1.3 verschlüsselt, er kann die weitergeleiteten Medien aber lesen — deshalb betreibt ihn deine Gruppe selbst.</p>
+      </div>
+      <div class="trust-col reveal">
+        <svg class="ic ic-lg"><use href="#i-term"/></svg>
+        <h3 data-i18n="t.3.h">Offen und prüfbar</h3>
+        <p data-i18n="t.3.p">Apache-2.0. Jedes Release trägt <code>SHA256SUMS</code> und je Build eine <code>BUILDINFO</code> mit Commit und Compiler. Die Pakete enthalten THIRD-PARTY-LICENSES für den gebündelten Fremdcode.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 07 DOWNLOAD -->
+<section class="sec sec-dl" id="download">
+  <div class="wrap">
+    <p class="idx reveal"><span>07</span><span data-i18n="idx.download">Download</span></p>
+    <h2 class="reveal" data-i18n="d.h" data-html>Hol dir ICU.</h2>
+
+    <div class="dl" id="dl">
+      <div class="dl-primary reveal" id="dl-primary" aria-live="polite">
+        <p class="mono dim"><span data-i18n="d.loading">Lade Paketliste …</span> <a href="downloads/">downloads/</a></p>
+      </div>
+
+      <aside class="dl-side reveal">
+        <h3 data-i18n="d.status.h">Status</h3>
+        <p data-i18n="d.status.p">Frühe Version: Server, Protokoll und Linux-/Windows-Client sind implementiert. Noch offen ist der Test auf physischer Windows-Zielhardware (akustische Echounterdrückung, Gaming-Maus, gemischte DPI) und der Portal-Hotkey unter KDE.</p>
+        <h3 data-i18n="d.win.h">Windows &amp; SmartScreen</h3>
+        <p data-i18n="d.win.p">Die Windows-Builds sind unsigniert. Beim ersten Start: „Weitere Informationen“ → „Trotzdem ausführen“. Wo Smart App Control eingeschaltet ist, blockiert Windows die Datei.</p>
+      </aside>
+    </div>
+
+    <div class="dl-all reveal">
+      <div class="dl-all-head">
+        <h3 data-i18n="d.all">Alle Pakete</h3>
+        <div class="seg" role="tablist" aria-label="Client oder Server" data-i18n-attr="aria-label:d.kind">
+          <button type="button" role="tab" data-kind="client" aria-selected="true" data-i18n="d.client">Client</button>
+          <button type="button" role="tab" data-kind="server" aria-selected="false" data-i18n="d.server">Server</button>
+        </div>
+      </div>
+      <ul class="pkgs" id="pkgs"></ul>
+      <noscript><p class="fine"><a href="downloads/">downloads/</a></p></noscript>
+    </div>
+
+    <div class="verify reveal">
+      <h3 data-i18n="d.verify.h">Downloads prüfen</h3>
+      <p data-i18n="d.verify.p">Die SHA-256-Summen stehen neben jedem Paket und in <a id="sums-link" href="downloads/">SHA256SUMS</a>. Im Download-Ordner:</p>
+      <div class="two">
+        <div class="code"><button class="copy" type="button" aria-label="Kopieren" data-i18n-attr="aria-label:copy"><svg class="ic"><use href="#i-copy"/></svg></button><pre><code>sha256sum -c --ignore-missing SHA256SUMS</code></pre></div>
+        <div class="code"><button class="copy" type="button" aria-label="Kopieren" data-i18n-attr="aria-label:copy"><svg class="ic"><use href="#i-copy"/></svg></button><pre><code>certutil -hashfile icu-<span class="ver">0.1.4</span>-windows-x86_64.zip SHA256</code></pre></div>
+      </div>
+      <p class="fine" id="buildinfo"></p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-in">
+    <div class="foot-brand">
+      <img src="assets/img/icu.svg" alt="" width="36" height="36">
+      <p><strong>ICU</strong><br><span data-i18n="foot.tag">Minimales Voice-System für eine feste Gruppe.</span></p>
+    </div>
+    <p class="fine" data-i18n="foot.legal">Lizenz: Apache-2.0. Diese Seite lädt nichts von Dritten: keine Tracker, keine externen Schriften (Red Hat Display/Text und Source Code Pro, SIL OFL, selbst gehostet).</p>
+    <a class="fine up" href="#top"><span data-i18n="foot.top">Nach oben</span></a>
+  </div>
+</footer>
+
+</body>
+</html>
