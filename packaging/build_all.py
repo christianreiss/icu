@@ -29,6 +29,19 @@ STAGES = ("Preflight", "Linux server + clients / tests", "Windows client + ZIP",
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 
 
+def component(stage, step):
+    """Which part of the product a build step belongs to."""
+    if stage in (2, 3):
+        return "Windows client"
+    if step.startswith("smoke:"):
+        return "Smoke tests"
+    if step.startswith("server:") or step.startswith("nfpm: icu-server"):
+        return "Server"
+    if step.startswith("client:") or step.startswith("nfpm: icu for"):
+        return "Linux clients"
+    return "Shared"
+
+
 class BuildError(Exception):
     pass
 
@@ -98,6 +111,29 @@ class Dashboard:
         self.stage_start = self.started
         self.tail = deque(maxlen=6)
         self.step = "Preparing build"
+        self.steps = []  # (component, step, seconds)
+        self.step_start = self.started
+
+    def close_step(self):
+        """Record the running `==>` step; a step ends where the next begins."""
+        now = time.monotonic()
+        if self.step_name:
+            self.steps.append((component(self.current, self.step_name), self.step_name,
+                               now - self.step_start))
+        self.step_name = None
+        self.step_start = now
+
+    step_name = None
+
+    def summary(self):
+        """Per-component totals and per-step timings, as printable lines."""
+        lines = []
+        for group in ("Server", "Linux clients", "Windows client", "Smoke tests", "Shared"):
+            rows = [(name, secs) for g, name, secs in self.steps if g == group]
+            if rows:
+                lines.append(f"  {group:<16} {elapsed(sum(secs for _, secs in rows))}")
+                lines += [f"      {elapsed(secs)}  {name}" for name, secs in rows]
+        return lines
 
     def tint(self, text, color):
         return f"\033[{color}m{text}\033[0m" if self.color else text
@@ -118,14 +154,16 @@ class Dashboard:
     def start(self, index):
         self.current = index
         self.states[index] = "running"
-        self.stage_start = time.monotonic()
+        self.stage_start = self.step_start = time.monotonic()
         self.step = STAGES[index]
+        self.step_name = None
         self.tail.clear()
         if not self.live:
             print(f"\n[{index + 1}/{len(STAGES)}] {STAGES[index]}", flush=True)
         self.render()
 
     def finish(self, success=True):
+        self.close_step()
         self.times[self.current] = time.monotonic() - self.stage_start
         self.states[self.current] = "passed" if success else "failed"
         if not self.live:
@@ -135,7 +173,8 @@ class Dashboard:
     def line(self, line):
         line = clean(line.rstrip("\r\n"))
         if line.startswith("==> "):
-            self.step = line[4:]
+            self.close_step()
+            self.step = self.step_name = line[4:]
         self.tail.append(line)
         if not self.live:
             print(line, flush=True)
@@ -506,6 +545,7 @@ def execute(root, plain, bump=False, clean_build=False):
             ui.finish(False)
             message = "Build cancelled" if isinstance(error, KeyboardInterrupt) else str(error)
             (logs / "failure.txt").write_text(message + "\n" + "\n".join(ui.tail) + "\n")
+            (logs / "timings.txt").write_text("\n".join(ui.summary()) + "\n")
             print(f"\nICU BUILD FAILED | {message}", file=sys.stderr)
             if ui.live:
                 print("\n".join(ui.tail), file=sys.stderr)
@@ -528,6 +568,10 @@ def execute(root, plain, bump=False, clean_build=False):
         print(f"\nICU BUILD COMPLETE | {elapsed(time.monotonic() - ui.started)} | 7 artifacts | checksums verified")
         for index, name in enumerate(STAGES):
             print(f"  PASS {name:<34} {elapsed(ui.times[index])}")
+        print("\nTIME BY COMPONENT")
+        timings = ui.summary()
+        print("\n".join(timings))
+        (logs / "timings.txt").write_text("\n".join(timings) + "\n")
         print(f"\n{'ARTIFACT':<58} {'MiB':>9}")
         for name in artifacts:
             print(f"{name:<58} {(out / name).stat().st_size / 1024 ** 2:>9.2f}")

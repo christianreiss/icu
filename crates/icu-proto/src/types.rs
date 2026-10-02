@@ -205,13 +205,12 @@ impl UserFlags {
     pub const RESERVED: u8 = 0;
     /// Bits a client may set through `SetState`: everything but `SPEAKING`,
     /// `ADMIN` and the reserved range.
-    pub const CLIENT_SETTABLE: u8 =
-        Self::MUTED
-            | Self::DEAFENED
-            | Self::CAMERA_ON
-            | Self::VIEWING
-            | Self::PTT
-            | Self::SYSTEM_MUTED;
+    pub const CLIENT_SETTABLE: u8 = Self::MUTED
+        | Self::DEAFENED
+        | Self::CAMERA_ON
+        | Self::VIEWING
+        | Self::PTT
+        | Self::SYSTEM_MUTED;
     /// Bits the server keeps regardless of what a client requests.
     const SERVER_AUTHORITATIVE: u8 = Self::SPEAKING | Self::ADMIN;
 

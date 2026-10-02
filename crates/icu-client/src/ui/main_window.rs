@@ -1391,6 +1391,7 @@ impl MainView {
         egui::Panel::bottom("controls")
             .show_separator_line(false)
             .frame(dock_frame.inner_margin(egui::Margin {
+                top: 0,
                 bottom: side,
                 ..dock_frame.inner_margin
             }))
@@ -1462,7 +1463,6 @@ impl MainView {
                 ];
                 let toggles: Vec<_> = toggles.into_iter().filter(|t| t.6.is_some()).collect();
 
-                ui.add_space(6.0);
                 // One card, one grid: the tiles share their column width and
                 // gap with the speak row above, so every edge in the dock
                 // lines up with another.
@@ -1514,15 +1514,14 @@ impl MainView {
                 }
             });
 
-        let own = state
-            .me
-            .as_ref()
-            .map(|_| [
+        let own = state.me.as_ref().map(|_| {
+            [
                 state.deafened,
                 state.muted || state.system_muted,
                 state.camera_on,
                 state.is_admin,
-            ]);
+            ]
+        });
         let columns = badge_columns(own.into_iter().chain(state.peers.iter().map(|p| {
             let f = p.info.flags;
             [
@@ -1532,58 +1531,72 @@ impl MainView {
                 f.is_admin(),
             ]
         })));
-        let list = egui::CentralPanel::default().show(root, |ui| {
-            // The people get a card of their own, the same surface as the
-            // control dock below, so the window reads as two calm blocks.
-            egui::Frame::new()
-                .fill(ui.visuals().faint_bg_color)
-                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                .corner_radius(egui::CornerRadius::same(theme::R_CARD))
-                .inner_margin(egui::Margin::same(6))
-                .show(ui, |ui| {
-                    let visible = ui.available_height();
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            let top = ui.cursor().top();
-                            ui.spacing_mut().item_spacing.y = 4.0;
-                            ui.add_space(2.0);
-                            if let Some(me) = &state.me {
-                                if let Some(participant) =
-                                    participant_for(state, me.user_id, env.video, env.self_video)
-                                {
-                                    let active = env.user_open == Some(me.user_id);
+        let list = egui::CentralPanel::default()
+            .frame(
+                egui::Frame::central_panel(root.style()).inner_margin(egui::Margin {
+                    top: 4,
+                    ..egui::Frame::central_panel(root.style()).inner_margin
+                }),
+            )
+            .show(root, |ui| {
+                // The people get a card of their own, the same surface as the
+                // control dock below, so the window reads as two calm blocks.
+                egui::Frame::new()
+                    .fill(ui.visuals().faint_bg_color)
+                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                    .corner_radius(egui::CornerRadius::same(theme::R_CARD))
+                    .inner_margin(egui::Margin::same(6))
+                    .show(ui, |ui| {
+                        let visible = ui.available_height();
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let top = ui.cursor().top();
+                                ui.spacing_mut().item_spacing.y = 4.0;
+                                ui.add_space(2.0);
+                                if let Some(me) = &state.me {
+                                    if let Some(participant) = participant_for(
+                                        state,
+                                        me.user_id,
+                                        env.video,
+                                        env.self_video,
+                                    ) {
+                                        let active = env.user_open == Some(me.user_id);
+                                        if let Some(id) = participant_row(
+                                            ui,
+                                            participant,
+                                            &columns,
+                                            active,
+                                            &send,
+                                        ) {
+                                            out.open_user = Some(id);
+                                        }
+                                    }
+                                }
+                                for p in &state.peers {
+                                    let Some(participant) = participant_for(
+                                        state,
+                                        p.info.user_id,
+                                        env.video,
+                                        env.self_video,
+                                    ) else {
+                                        continue;
+                                    };
+                                    let active = env.user_open == Some(p.info.user_id);
                                     if let Some(id) =
                                         participant_row(ui, participant, &columns, active, &send)
                                     {
                                         out.open_user = Some(id);
                                     }
                                 }
-                            }
-                            for p in &state.peers {
-                                let Some(participant) = participant_for(
-                                    state,
-                                    p.info.user_id,
-                                    env.video,
-                                    env.self_video,
-                                ) else {
-                                    continue;
-                                };
-                                let active = env.user_open == Some(p.info.user_id);
-                                if let Some(id) =
-                                    participant_row(ui, participant, &columns, active, &send)
-                                {
-                                    out.open_user = Some(id);
+                                if state.peers.is_empty() {
+                                    let used = ui.cursor().top() - top;
+                                    empty(ui, &state.conn, visible - used);
                                 }
-                            }
-                            if state.peers.is_empty() {
-                                let used = ui.cursor().top() - top;
-                                empty(ui, &state.conn, visible - used);
-                            }
-                        })
-                })
-                .inner
-        });
+                            })
+                    })
+                    .inner
+            });
         out.list_overflow = list.inner.content_size.y - list.inner.inner_rect.height();
         out
     }
