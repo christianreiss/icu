@@ -16,7 +16,7 @@ use crate::{
     audio::DeviceKind,
     config::{
         self, Corner, Expand, HotkeyBackend, Identity, ModeSetting, Paths, Settings, VoiceStrength,
-        TILE_SIZES,
+        SHY_HOLDS, TILE_SIZES,
     },
     engine::{AppState, Command},
     stats::DebugStats,
@@ -1578,6 +1578,23 @@ impl SettingsView {
                     )
                 })
                 .on_hover_text("Liegt der Mauszeiger auf einer Kachel, blendet sich die ganze Reihe aus und auf der gegenüberliegenden Bildschirmseite wieder ein; Klicks gehen zum Fenster darunter durch");
+                if self.draft.overlay.shy {
+                    let holds = SHY_HOLDS;
+                    let mut hold = self.draft.overlay.shy_hold_ms as f32;
+                    if widgets::slider_row(
+                        ui,
+                        true,
+                        "Wechselsperre",
+                        &mut hold,
+                        *holds.start() as f32..=*holds.end() as f32,
+                        " ms",
+                    )
+                    .on_hover_text("So lange bleibt die Reihe nach dem Erscheinen oder einem Seitenwechsel stehen, auch unter dem Mauszeiger, bevor sie wieder ausweicht; Klicks gehen in der Zeit durch")
+                    .changed()
+                    {
+                        self.draft.overlay.shy_hold_ms = hold.round() as u32;
+                    }
+                }
             });
         });
     }

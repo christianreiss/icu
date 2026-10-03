@@ -270,6 +270,9 @@ pub enum Corner {
 /// pixels; a voice-only plate is 60 % of that.
 pub const TILE_SIZES: std::ops::RangeInclusive<u32> = 80..=480;
 
+/// What the „Wechselsperre“ slider offers for `overlay.shy_hold_ms`.
+pub const SHY_HOLDS: std::ops::RangeInclusive<u32> = 0..=5000;
+
 /// `overlay.size`: a diameter in pixels, or — in a file from before the
 /// slider — one of the three fixed sizes it replaced.
 fn tile_size<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
@@ -334,6 +337,10 @@ pub struct OverlaySettings {
     /// fades the whole row out, letting clicks through to what is below,
     /// and back in on the other side of the screen.
     pub shy: bool,
+    /// How long the shy row stays where it showed up before the pointer
+    /// can send it off again, in ms, within [`SHY_HOLDS`] — so a pointer
+    /// over both places does not bounce it to and fro.
+    pub shy_hold_ms: u32,
     /// Show the own tile too (own camera, or a plate as for the others),
     /// after everyone else's.
     pub show_self: bool,
@@ -353,6 +360,7 @@ impl Default for OverlaySettings {
             frame_color: [0x2e, 0x9b, 0xff],
             voice_plates: true,
             shy: false,
+            shy_hold_ms: 1000,
             show_self: false,
         }
     }
@@ -605,6 +613,7 @@ impl Settings {
         audio.gain_db = clamped(audio.gain_db, -20.0, 20.0, defaults.gain_db);
         audio.release_ms = audio.release_ms.min(1000);
         audio.hangover_ms = audio.hangover_ms.min(3000);
+        self.overlay.shy_hold_ms = self.overlay.shy_hold_ms.min(*SHY_HOLDS.end());
         if !matches!(audio.frame_ms, 10 | 20) {
             audio.frame_ms = defaults.frame_ms;
         }
@@ -1464,6 +1473,7 @@ mod tests {
         s.overlay.speaking_frame = false;
         s.overlay.frame_color = [0x10, 0x20, 0x30];
         s.overlay.shy = true;
+        s.overlay.shy_hold_ms = 2500;
         s.overlay.show_self = true;
         s.set_volume(7, 120.0);
         s.set_volume(9, 100.0);
@@ -1487,6 +1497,7 @@ mod tests {
         assert!(!back.overlay.speaking_frame);
         assert_eq!(back.overlay.frame_color, [0x10, 0x20, 0x30]);
         assert!(back.overlay.shy);
+        assert_eq!(back.overlay.shy_hold_ms, 2500);
         assert!(back.overlay.show_self);
 
         let text = fs::read_to_string(paths.settings()).unwrap();
@@ -1523,6 +1534,7 @@ mod tests {
         assert_eq!(s.audio.voice_strength, VoiceStrength::Medium);
         assert!(s.overlay.dim_non_speaking, "old settings.toml default on");
         assert!(!s.overlay.shy, "old settings.toml: tiles stay put");
+        assert_eq!(s.overlay.shy_hold_ms, 1000);
         assert!(!s.overlay.show_self);
         assert_eq!(s.overlay.size, 120);
         assert_eq!(s.overlay.speaking_size, None);

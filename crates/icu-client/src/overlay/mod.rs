@@ -28,7 +28,7 @@ use icu_proto::Session;
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    config::{Corner, Expand, OverlaySettings, TILE_SIZES},
+    config::{Corner, Expand, OverlaySettings, SHY_HOLDS, TILE_SIZES},
     engine::{AppState, Command, Peer, VideoFrames},
 };
 
@@ -89,11 +89,6 @@ const SCALE_EASE: f32 = 0.35;
 /// the other side.
 const SHY_HIDE_SECS: f32 = 0.12;
 const SHY_SHOW_SECS: f32 = 0.3;
-/// How long the fully shown row must be free of the pointer before the
-/// pointer can send it off: one that it came back under, or that rests on
-/// it, does not. Longer than a tick, since on Wayland the pointer's Enter
-/// only arrives the tick after the row takes input again.
-const SHY_SETTLE: Duration = Duration::from_millis(100);
 
 /// The row's shyness (`overlay.shy`): how opaque its tiles are, and whether
 /// they are on their way out — all together, so the pointer on one tile
@@ -103,38 +98,39 @@ struct Shy {
     opacity: f32,
     /// Fading out, to come back on the other side.
     leaving: bool,
-    /// Since when the fully shown row has been free of the pointer.
-    quiet_since: Option<Instant>,
+    /// When the row was last all there after showing up.
+    arrived: Option<Instant>,
 }
 
 impl Shy {
     const SHOWN: Shy = Shy {
         opacity: 1.0,
         leaving: false,
-        quiet_since: None,
+        arrived: None,
     };
 
-    /// Advances to `now`, `dt` seconds on: the pointer coming onto a tile
-    /// (`hovered`) of the row that is all there and has been free of it
-    /// for [`SHY_SETTLE`] sends the row away — it fades out, and the step
-    /// it is gone in returns true: time to move to the other side, where it
-    /// fades back in. Arriving under the pointer, it stays until the
-    /// pointer leaves and comes again, so a pointer over both places does
-    /// not bounce it to and fro. Off (`enabled` false), it only fades back
-    /// in.
-    fn step(self, enabled: bool, hovered: bool, now: Instant, dt: f32) -> (Shy, bool) {
-        let armed = self
-            .quiet_since
-            .is_some_and(|t| now.saturating_duration_since(t) >= SHY_SETTLE);
-        let leaving = enabled && (self.leaving || hovered && armed);
+    /// Advances to `now`, `dt` seconds on: the pointer on a tile
+    /// (`hovered`) of the row that [takes input](Shy::takes_input) sends
+    /// it away — it fades out, and the step it is gone in returns true:
+    /// time to move to the other side, where it fades back in. Off
+    /// (`enabled` false), it only fades back in.
+    fn step(
+        self,
+        enabled: bool,
+        hovered: bool,
+        hold: Duration,
+        now: Instant,
+        dt: f32,
+    ) -> (Shy, bool) {
+        let leaving = enabled && (self.leaving || hovered && self.takes_input(hold, now));
         if !leaving {
             let opacity = (self.opacity + dt / SHY_SHOW_SECS).min(1.0);
-            let quiet_since = (opacity >= 1.0 && !hovered).then(|| self.quiet_since.unwrap_or(now));
+            let arrived = (opacity >= 1.0).then(|| self.arrived.unwrap_or(now));
             return (
                 Shy {
                     opacity,
                     leaving,
-                    quiet_since,
+                    arrived,
                 },
                 false,
             );
@@ -145,18 +141,22 @@ impl Shy {
             Shy {
                 opacity,
                 leaving: !gone,
-                quiet_since: None,
+                arrived: None,
             },
             gone,
         )
     }
 
-    /// Whether the tiles take pointer input (Wayland) so the scene learns
-    /// where the pointer is: only while the row is all there and staying —
-    /// leaving or coming back, a click on it reaches whatever is below.
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
-    fn takes_input(self) -> bool {
-        !self.leaving && self.opacity >= 1.0
+    /// Whether the tiles take pointer input (Wayland) — and so whether the
+    /// pointer on them sends the row off: only once it is all there and has
+    /// stayed for `hold` (`overlay.shy_hold_ms`), so a pointer over both
+    /// places does not bounce it to and fro. Leaving, coming back or held,
+    /// a click on it reaches whatever is below.
+    fn takes_input(self, hold: Duration, now: Instant) -> bool {
+        !self.leaving
+            && self
+                .arrived
+                .is_some_and(|at| now.saturating_duration_since(at) >= hold)
     }
 }
 
@@ -745,7 +745,7 @@ impl Scene {
     /// nowhere — the overlay is click-through.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn input_rects(&self) -> Vec<Slot> {
-        if !self.settings.shy || !self.shy.takes_input() {
+        if !self.settings.shy || !self.shy.takes_input(self.shy_hold(), Instant::now()) {
             return Vec::new();
         }
         self.slots.clone()
@@ -779,6 +779,11 @@ impl Scene {
             geom.outer_h += pad * 2;
         }
         geom
+    }
+
+    /// How long the shy row stays where it showed up (`overlay.shy_hold_ms`).
+    fn shy_hold(&self) -> Duration {
+        Duration::from_millis(self.settings.shy_hold_ms.min(*SHY_HOLDS.end()).into())
     }
 
     /// Where the overlay is: the configured corner, or the one across from
@@ -996,7 +1001,9 @@ impl Scene {
             .iter()
             .chain(&trail)
             .any(|&at| self.slots.iter().any(|slot| on_slot(slot, at)));
-        let (shy, gone) = self.shy.step(self.settings.shy, hovered, now, dt);
+        let (shy, gone) = self
+            .shy
+            .step(self.settings.shy, hovered, self.shy_hold(), now, dt);
         self.shy = shy;
         if gone {
             // Placed anew over there; where the pointer was is of the old
@@ -2019,63 +2026,64 @@ mod tests {
         assert_eq!(speak_scale(&s), 480.0 / 220.0, "kept to the slider's range");
     }
 
-    /// The shy row fades out as soon as the pointer comes onto a tile,
-    /// says when it is gone (time to move across) and fades back in; it
-    /// takes pointer input only while it is all there and staying. Arriving
-    /// under the pointer it stays until the pointer has been off it for
-    /// [`SHY_SETTLE`] and comes again; switched off it just shows.
-    #[test]
-    fn shy_row_fades_out_and_comes_back_across() {
-        let start = Instant::now();
-        let at = |frame: u32| start + Duration::from_millis(u64::from(frame) * 33);
-        let dt = 0.033;
-        let mut frame = 0;
-        let mut step = |shy: Shy, hovered: bool| {
-            let next = shy.step(true, hovered, at(frame), dt);
-            frame += 1;
-            next
-        };
-        let mut shy = Shy::SHOWN;
-        for _ in 0..4 {
-            shy = step(shy, false).0;
-        }
-        assert!(shy.takes_input());
-        let mut frames = 0;
-        let gone = loop {
-            let (next, gone) = step(shy, frames == 0);
-            frames += 1;
-            assert!(!next.takes_input(), "leaving, it lets clicks through");
-            shy = next;
-            if gone || frames > 10 {
-                break gone;
+    /// Steps `shy` up to `frames` ticks of 33 ms on from `now`, the pointer
+    /// on it or not; the tick it was gone in ends the run.
+    fn shy_steps(
+        shy: &mut Shy,
+        now: &mut Instant,
+        hold: Duration,
+        hovered: bool,
+        frames: u32,
+    ) -> Option<u32> {
+        for n in 0..frames {
+            *now += Duration::from_millis(33);
+            let (next, gone) = shy.step(true, hovered, hold, *now, 0.033);
+            *shy = next;
+            if gone {
+                return Some(n);
             }
-            assert!(shy.leaving && shy.opacity < 1.0, "keeps going once sent");
-        };
-        assert!(gone && frames as f32 * dt <= 0.2, "gone within 200 ms");
-        assert_eq!(shy.opacity, 0.0);
-        // Over there, under the pointer: back all the way, and it stays.
-        for _ in 0..30 {
-            let (next, gone) = step(shy, true);
-            assert!(!gone && !next.leaving, "no bounce under a resting pointer");
-            shy = next;
         }
-        assert_eq!(shy.opacity, 1.0, "back");
-        // Off it for less than the settle time and back: still stays.
-        shy = step(shy, false).0;
-        shy = step(shy, true).0;
-        assert!(!shy.leaving, "a twitch does not send it off");
-        // Off it for longer, then onto it: off again.
-        for _ in 0..4 {
-            shy = step(shy, false).0;
-            assert!(shy.takes_input());
-        }
-        let (shy, _) = step(shy, true);
-        assert!(shy.leaving, "the pointer coming again sends it off");
-        let (off, gone) = shy.step(false, true, at(100), dt);
+        None
+    }
+
+    /// The shy row stays for the hold wherever it shows up, letting clicks
+    /// through even with the pointer resting on it; then the pointer on a
+    /// tile fades it out, it says when it is gone (time to move across),
+    /// and it fades back in to be held again. Switched off it just shows.
+    #[test]
+    fn shy_row_is_held_then_goes_across() {
+        let hold = Duration::from_millis(1000);
+        let mut now = Instant::now();
+        let mut shy = Shy::SHOWN;
+        assert_eq!(shy_steps(&mut shy, &mut now, hold, true, 29), None, "held");
+        assert!(!shy.takes_input(hold, now), "held: clicks go through");
+        let gone = shy_steps(&mut shy, &mut now, hold, true, 10);
         assert!(
-            !gone && !off.leaving && off.opacity > shy.opacity,
-            "off: never leaves"
+            gone.is_some_and(|n| n <= 6),
+            "sent off after the hold: {gone:?}"
         );
+        assert_eq!(shy.opacity, 0.0);
+        // Over there, under the pointer: back within 300 ms, then held.
+        assert_eq!(shy_steps(&mut shy, &mut now, hold, true, 10), None);
+        assert_eq!(shy.opacity, 1.0, "back");
+        assert_eq!(
+            shy_steps(&mut shy, &mut now, hold, true, 25),
+            None,
+            "no bounce"
+        );
+        assert!(
+            shy_steps(&mut shy, &mut now, hold, true, 15).is_some(),
+            "then off again"
+        );
+        // Without a hold it may go at once.
+        let mut shy = Shy::SHOWN;
+        assert_eq!(
+            shy_steps(&mut shy, &mut now, Duration::ZERO, false, 1),
+            None
+        );
+        assert!(shy.takes_input(Duration::ZERO, now));
+        let (off, gone) = shy.step(false, true, Duration::ZERO, now, 0.033);
+        assert!(!gone && !off.leaving, "off: never leaves");
     }
 
     /// The shy row goes to the mirrored corner, or the other edge from the

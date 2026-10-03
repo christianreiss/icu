@@ -237,6 +237,8 @@ fn summary(user_id: u32, name: &str) -> UserSummary {
 fn state() -> AppState {
     let mut settings = Settings::default();
     settings.audio.mode = ModeSetting::Ptt;
+    // Shows the „Wechselsperre“ slider under it on the Kamera page.
+    settings.overlay.shy = true;
     let peers = vec![
         peer(
             2,
