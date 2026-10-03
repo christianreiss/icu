@@ -4,8 +4,8 @@
 //!
 //! With `overlay.shy` the tiles that are shown take pointer input instead
 //! (`Scene::input_rects`): only so does the compositor tell where the
-//! pointer is. A tile hides as soon as the pointer is on it and gives its
-//! input up, so clicks reach what is below again.
+//! pointer is. The whole row hides as soon as the pointer is on a tile and
+//! gives its input up, so clicks reach what is below again.
 
 use std::{
     sync::{

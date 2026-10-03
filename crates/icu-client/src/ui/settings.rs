@@ -665,31 +665,57 @@ impl SettingsView {
         });
 
         widgets::group_card(ui, "Hinweise", |ui| {
-            widgets::card_note(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                    let audio = &mut self.draft.audio;
-                    widgets::chip_toggle(ui, &mut audio.cue_join, "Jemand kommt oder geht")
-                        .on_hover_text(
-                            "Ein kurzer Ton, wenn jemand den Raum betritt oder verlässt",
-                        );
-                    widgets::chip_toggle(ui, &mut audio.cue_tx, "Senden beginnt oder endet")
-                        .on_hover_text(
-                            "Ein hoher Ton, wenn du zu hören bist, ein tieferer, wenn nicht mehr",
-                        );
-                    widgets::chip_toggle(ui, &mut audio.cue_mute, "Stummschalten")
-                        .on_hover_text("Zwei Töne beim Stummschalten und wieder Einschalten");
-                    widgets::chip_toggle(
+            let audio = &mut self.draft.audio;
+            let cues = [
+                (
+                    &mut audio.cue_join,
+                    "Kommen und Gehen",
+                    "Ein kurzer Ton, wenn jemand den Raum betritt oder verlässt",
+                ),
+                (
+                    &mut audio.cue_tx,
+                    "Senden",
+                    "Ein hoher Ton, wenn du zu hören bist, ein tieferer, wenn nicht mehr",
+                ),
+                (
+                    &mut audio.cue_mute,
+                    "Stummschalten",
+                    "Zwei Töne beim Stummschalten und wieder Einschalten",
+                ),
+            ];
+            widgets::setting_row(ui, false, "Töne", None, |ui| {
+                const GAP: f32 = 6.0;
+                let width = cues
+                    .iter()
+                    .map(|(_, label, _)| widgets::chip_toggle_width(ui, label))
+                    .sum::<f32>()
+                    + GAP * (cues.len() - 1) as f32;
+                // Flush right like every row's control, but in reading
+                // (and tab) order.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 28.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = GAP;
+                        for (on, label, hover) in cues {
+                            widgets::chip_toggle(ui, on, label).on_hover_text(hover);
+                        }
+                    },
+                );
+            });
+            widgets::setting_row(
+                ui,
+                true,
+                "Meldung bei Kommen und Gehen",
+                Some("Zusätzlich zum Ton eine Benachrichtigung – hilfreich, solange ICU im Tray liegt."),
+                |ui| {
+                    widgets::named_toggle(
                         ui,
                         &mut self.draft.ui.notify_join,
                         "Meldung bei Kommen und Gehen",
                     )
-                    .on_hover_text(
-                        "Zusätzlich zum Ton eine Benachrichtigung der Arbeitsumgebung – \
-                         hilfreich, solange ICU im Tray liegt",
-                    );
-                });
-            });
+                },
+            );
         });
     }
 
@@ -1551,7 +1577,7 @@ impl SettingsView {
                         "Dem Mauszeiger ausweichen",
                     )
                 })
-                .on_hover_text("Eine Kachel blendet sich aus, sobald der Mauszeiger auf ihr liegt, und lässt Klicks zum Fenster darunter durch; eine Sekunde, nachdem er weg ist, kommt sie zurück");
+                .on_hover_text("Die ganze Kachelreihe blendet sich aus, sobald der Mauszeiger auf einer Kachel liegt, und lässt Klicks zum Fenster darunter durch; eine Sekunde, nachdem er weg ist, kommt sie zurück");
             });
         });
     }

@@ -330,8 +330,9 @@ pub struct OverlaySettings {
     /// Show smaller name plates for everyone without a camera, including
     /// while silent, with the same speaking and dimming rules as video tiles.
     pub voice_plates: bool,
-    /// Tiles get out of the mouse pointer's way: a tile fades out while
-    /// the pointer is over it and lets clicks through to what is below.
+    /// Tiles get out of the mouse pointer's way: the whole row fades out
+    /// while the pointer is over any tile and lets clicks through to what
+    /// is below.
     pub shy: bool,
     /// Show the own tile too (own camera, or a plate as for the others),
     /// after everyone else's.

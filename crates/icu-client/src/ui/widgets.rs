@@ -832,6 +832,18 @@ pub fn segmented<T: PartialEq + Copy>(
     response
 }
 
+/// How wide a [`chip_toggle`] for `label` is: always with room for the
+/// check, so a chip keeps its width — and its neighbors their place — when
+/// it is switched.
+pub fn chip_toggle_width(ui: &Ui, label: &str) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        format!("{}  {label}", icon::CHECK),
+        seg_font(),
+        ui.visuals().text_color(),
+    );
+    galley.size().x + SEG_PAD * 2.0
+}
+
 /// A chip that switches one thing on and off, for a row of related
 /// switches that would each be a row of their own otherwise: tinted with a
 /// check when on, an outline when off.
@@ -845,7 +857,7 @@ pub fn chip_toggle(ui: &mut Ui, on: &mut bool, label: &str) -> egui::Response {
     let galley = ui
         .painter()
         .layout_no_wrap(text, seg_font(), ui.visuals().text_color());
-    let size = egui::vec2(galley.size().x + SEG_PAD * 2.0, 28.0);
+    let size = egui::vec2(chip_toggle_width(ui, label), 28.0);
     let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
     if response.clicked() {
         *on = !*on;

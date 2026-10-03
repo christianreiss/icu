@@ -712,7 +712,7 @@ fn settings_window_keeps_outside_changes() {
     h.run();
 
     // The next edit in the window keeps push-to-talk.
-    h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Senden beginnt oder endet")
+    h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Senden")
         .click();
     h.run();
     let sent = last_update(&cmds.borrow());

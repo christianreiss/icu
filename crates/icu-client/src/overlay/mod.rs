@@ -2,7 +2,8 @@
 //! above everything that shows, for everyone whose camera is on, a camera
 //! tile with the name, and for everyone without one a smaller name plate.
 //! Both remain visible and highlight whoever is speaking. With
-//! `overlay.shy` a tile fades out of the mouse pointer's way (see [`Shy`]);
+//! `overlay.shy` the whole row fades out of the mouse pointer's way as soon
+//! as it is on any tile (see [`Shy`]);
 //! with `overlay.show_self` the own tile comes last, from the local camera.
 //!
 //! What is shown and how it is drawn (GPU 30 fps, CPU fallback 15 fps) lives
@@ -83,19 +84,20 @@ const SPEAK_SCALE: f32 = 1.2;
 /// (at 15 fps, ~5-8 ticks / 300-500 ms to settle).
 const SCALE_EASE: f32 = 0.35;
 
-/// How long a shy tile (`overlay.shy`) stays out of the way after the
-/// pointer was last seen over it.
+/// How long the shy row (`overlay.shy`) stays out of the way after the
+/// pointer was last seen over one of its tiles.
 const SHY_LINGER: Duration = Duration::from_millis(1000);
-/// The end of that linger, during which a still hidden tile takes pointer
+/// The end of that linger, during which the still hidden row takes pointer
 /// input again on Wayland: a surface that takes none hears nothing of the
 /// pointer, so this is the only way to learn whether it is still there.
 const SHY_PROBE: Duration = Duration::from_millis(350);
-/// Seconds a shy tile takes to fade out, and back in.
+/// Seconds the shy row takes to fade out, and back in.
 const SHY_HIDE_SECS: f32 = 0.12;
 const SHY_SHOW_SECS: f32 = 0.3;
 
-/// One tile's shyness (`overlay.shy`): how opaque it is, and until when it
-/// stays out of the pointer's way.
+/// The row's shyness (`overlay.shy`): how opaque its tiles are, and until
+/// when they stay out of the pointer's way — all together, so the pointer on
+/// one tile clears the whole row.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Shy {
     opacity: f32,
@@ -109,10 +111,10 @@ impl Shy {
         until: None,
     };
 
-    /// Advances by `dt` seconds: the pointer over the tile (`hovered`)
-    /// hides it at once and keeps it hidden until [`SHY_LINGER`] after it
-    /// was last seen there; then it fades back in. Off (`enabled` false),
-    /// it only fades back in.
+    /// Advances by `dt` seconds: the pointer over a tile (`hovered`)
+    /// hides the row at once and keeps it hidden until [`SHY_LINGER`] after
+    /// it was last seen on one; then it fades back in. Off (`enabled`
+    /// false), it only fades back in.
     fn step(self, enabled: bool, hovered: bool, now: Instant, dt: f32) -> Shy {
         let until = match (enabled, hovered) {
             (false, _) => None,
@@ -127,9 +129,9 @@ impl Shy {
         Shy { opacity, until }
     }
 
-    /// Whether the tile takes pointer input (Wayland) so the scene learns
+    /// Whether the tiles take pointer input (Wayland) so the scene learns
     /// where the pointer is: while shown, and in the last [`SHY_PROBE`] of
-    /// its linger — never while it is hidden otherwise, so a click on it
+    /// the linger — never while hidden otherwise, so a click on them
     /// reaches whatever is below.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn takes_input(self, now: Instant) -> bool {
@@ -598,10 +600,8 @@ struct Scene {
     presented_frames: Option<Vec<(Session, u64)>>,
     /// Each tile's slot, in tile order, as of the last [`Scene::update`].
     slots: Vec<Slot>,
-    /// Each tile's shyness by session, rebuilt every update like `anim`;
-    /// `shyness` holds the same in tile order.
-    shy: HashMap<Session, Shy>,
-    shyness: Vec<Shy>,
+    /// The row's shyness: one for all tiles.
+    shy: Shy,
     /// Where the pointer is on the canvas, if known (see
     /// [`Scene::pointer_at`]).
     pointer: Option<(f32, f32)>,
@@ -664,8 +664,7 @@ impl Scene {
             membership: Vec::new(),
             presented_frames: None,
             slots: Vec::new(),
-            shy: HashMap::new(),
-            shyness: Vec::new(),
+            shy: Shy::SHOWN,
             pointer: None,
             pointer_trail: Vec::new(),
             own_video,
@@ -704,20 +703,14 @@ impl Scene {
     }
 
     /// Where the overlay takes pointer input (Wayland): with `overlay.shy`
-    /// every tile that [`Shy::takes_input`], otherwise nowhere — the
-    /// overlay is click-through.
+    /// every tile's slot while the row [`Shy::takes_input`], otherwise
+    /// nowhere — the overlay is click-through.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn input_rects(&self) -> Vec<Slot> {
-        if !self.settings.shy {
+        if !self.settings.shy || !self.shy.takes_input(Instant::now()) {
             return Vec::new();
         }
-        let now = Instant::now();
-        self.slots
-            .iter()
-            .zip(&self.shyness)
-            .filter(|(_, shy)| shy.takes_input(now))
-            .map(|(slot, _)| *slot)
-            .collect()
+        self.slots.clone()
     }
 
     /// Diameter of a camera tile's circle.
@@ -933,9 +926,9 @@ impl Scene {
         self.width = width;
         self.height = height;
 
-        // Shyness: a tile the pointer is (or was, since the last frame) over
-        // gets out of its way. A hidden one is not displayed, so its
-        // picture is not reported as seen.
+        // Shyness: the pointer on any tile (now, or since the last frame)
+        // gets the whole row out of its way. A hidden row is not displayed,
+        // so its pictures are not reported as seen.
         self.slots = slots(
             &geoms,
             width,
@@ -945,30 +938,15 @@ impl Scene {
             self.hug(),
             gap,
         );
-        let mut shy = HashMap::with_capacity(self.shy.len());
-        self.shyness = self
-            .membership
+        let hovered = self
+            .pointer
             .iter()
-            .zip(&self.slots)
-            .map(|((session, ..), slot)| {
-                let hovered = self
-                    .pointer
-                    .iter()
-                    .chain(&trail)
-                    .any(|&at| on_slot(slot, at));
-                let next = self.shy.get(session).copied().unwrap_or(Shy::SHOWN).step(
-                    self.settings.shy,
-                    hovered,
-                    now,
-                    dt,
-                );
-                shy.insert(*session, next);
-                next
-            })
-            .collect();
-        self.shy = shy;
-        self.visible_frames
-            .retain(|(session, _)| self.shy.get(session).is_none_or(|shy| shy.opacity > 0.0));
+            .chain(&trail)
+            .any(|&at| self.slots.iter().any(|slot| on_slot(slot, at)));
+        self.shy = self.shy.step(self.settings.shy, hovered, now, dt);
+        if self.shy.opacity <= 0.0 {
+            self.visible_frames.clear();
+        }
         Update {
             shown,
             layout_changed,
@@ -1029,9 +1007,9 @@ impl Scene {
         true
     }
 
-    /// Fades shy tiles on a finished frame.
+    /// Fades the shy row on a finished frame.
     fn fade(&self, canvas: &mut [u8]) {
-        let opacities: Vec<f32> = self.shyness.iter().map(|s| s.opacity).collect();
+        let opacities = vec![self.shy.opacity; self.slots.len()];
         fade_slots(canvas, self.width, &self.slots, &opacities);
     }
 
@@ -1977,8 +1955,8 @@ mod tests {
         assert_eq!(speak_scale(&s), 480.0 / 220.0, "kept to the slider's range");
     }
 
-    /// A shy tile hides as soon as the pointer is on it, stays hidden for
-    /// [`SHY_LINGER`] after it was last there, and only takes pointer input
+    /// The shy row hides as soon as the pointer is on a tile, stays hidden
+    /// for [`SHY_LINGER`] after it was last there, and only takes pointer input
     /// again in the last [`SHY_PROBE`] of that; switched off it just shows.
     #[test]
     fn shy_tile_hides_under_the_pointer_and_comes_back() {
