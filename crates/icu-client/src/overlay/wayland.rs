@@ -1,6 +1,11 @@
 //! Wayland layer-shell overlay (Spike 4b): own thread, own Wayland
 //! connection, calloop with a 30/15 fps GPU/software timer, layer `Overlay`, empty input
 //! region, exclusive zone −1, the scene drawn into a wl_shm buffer.
+//!
+//! With `overlay.shy` the tiles that are shown take pointer input instead
+//! (`Scene::input_rects`): only so does the compositor tell where the
+//! pointer is. A tile hides as soon as the pointer is on it and gives its
+//! input up, so clicks reach what is below again.
 
 use std::{
     sync::{
@@ -20,9 +25,18 @@ use smithay_client_toolkit::{
             EventLoop,
         },
         calloop_wayland_source::WaylandSource,
+        protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
+            Shape, WpCursorShapeDeviceV1,
+        },
     },
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        pointer::{
+            cursor_shape::CursorShapeManager, PointerEvent, PointerEventKind, PointerHandler,
+        },
+        Capability, SeatHandler, SeatState,
+    },
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -34,11 +48,11 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    Connection, Proxy, QueueHandle,
 };
 
-use super::{Scene, TICK};
+use super::{Scene, Slot, TICK};
 use crate::config::Corner;
 
 struct App {
@@ -52,6 +66,15 @@ struct App {
     configured: bool,
     scene: Scene,
     qh: QueueHandle<App>,
+    seats: SeatState,
+    /// The seat's pointer: where it is over the tiles, for `overlay.shy`.
+    pointer: Option<wl_pointer::WlPointer>,
+    /// A surface the pointer enters owns its image: the tiles show the
+    /// normal arrow, where the compositor offers cursor shapes.
+    cursor_shapes: Option<CursorShapeManager>,
+    cursor_shape: Option<WpCursorShapeDeviceV1>,
+    /// The input region the surface has, as tile slots (empty: none).
+    input: Vec<Slot>,
 }
 
 /// Runs the overlay until `stop`; reports on `ready` whether it came up.
@@ -115,6 +138,11 @@ fn setup(scene: Scene) -> Result<(Connection, EventLoop<'static, App>, App), Str
         configured: false,
         scene,
         qh: qh.clone(),
+        seats: SeatState::new(&globals, &qh),
+        pointer: None,
+        cursor_shapes: CursorShapeManager::bind(&globals, &qh).ok(),
+        cursor_shape: None,
+        input: Vec::new(),
     };
     Ok((conn, event_loop, app))
 }
@@ -160,6 +188,8 @@ impl App {
             if let Ok(empty) = Region::new(&self.compositor) {
                 layer.set_input_region(Some(empty.wl_region()));
             }
+            self.input.clear();
+            self.scene.pointer_at(None);
             layer.commit();
             tracing::info!(
                 width,
@@ -170,37 +200,71 @@ impl App {
             self.surface = Some(layer);
             return;
         }
+        // The new size goes out with the next picture, in one commit: on
+        // its own the compositor would place the old picture by the new
+        // size (centered on an edge it moves sideways at once) and the
+        // rest of the change would follow only with the picture.
         if update.size_changed {
             if let Some(layer) = &self.surface {
                 layer.set_size(width, height);
-                layer.commit();
             }
         }
         if self.configured {
-            self.draw();
+            let input_changed = self.set_input();
+            if !self.draw() && input_changed {
+                if let Some(layer) = &self.surface {
+                    layer.commit();
+                }
+            }
         }
     }
 
-    fn draw(&mut self) {
-        let Some(layer) = &self.surface else { return };
+    /// Stages the input region the scene wants, when it changed, for the
+    /// next commit; true if it did.
+    fn set_input(&mut self) -> bool {
+        let rects = self.scene.input_rects();
+        if rects == self.input {
+            return false;
+        }
+        let Some(layer) = &self.surface else {
+            return false;
+        };
+        let Ok(region) = Region::new(&self.compositor) else {
+            return false;
+        };
+        for &[x, y, w, h] in &rects {
+            region.add(x as i32, y as i32, w as i32, h as i32);
+        }
+        layer.set_input_region(Some(region.wl_region()));
+        self.input = rects;
+        true
+    }
+
+    /// Draws and commits a picture; false if there was none to show yet.
+    fn draw(&mut self) -> bool {
+        let Some(layer) = &self.surface else {
+            return false;
+        };
         let (w, h) = (self.scene.width as i32, self.scene.height as i32);
         if w <= 0 || h <= 0 {
-            return;
+            return false;
         }
         let Ok((buffer, canvas)) = self
             .pool
             .create_buffer(w, h, w * 4, wl_shm::Format::Argb8888)
         else {
-            return;
+            return false;
         };
         if !self.scene.draw(canvas) {
-            return;
+            return false;
         }
         layer.wl_surface().damage_buffer(0, 0, w, h);
-        if buffer.attach_to(layer.wl_surface()).is_ok() {
-            layer.commit();
-            self.scene.report_displayed();
+        if buffer.attach_to(layer.wl_surface()).is_err() {
+            return false;
         }
+        layer.commit();
+        self.scene.report_displayed();
+        true
     }
 }
 
@@ -253,6 +317,8 @@ impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
         self.surface = None;
         self.configured = false;
+        self.input.clear();
+        self.scene.pointer_at(None);
     }
     fn configure(
         &mut self,
@@ -262,13 +328,90 @@ impl LayerShellHandler for App {
         c: LayerSurfaceConfigure,
         _: u32,
     ) {
-        if c.new_size.0 > 0 && c.new_size.1 > 0 {
-            self.scene.width = c.new_size.0;
-            self.scene.height = c.new_size.1;
-        }
+        // The size is the one asked for with `set_size` — both are always
+        // set, so the compositor has nothing to choose. While the size
+        // sliders move, one for a size already gone by can still arrive:
+        // the scene's own size stays, so no picture of a stale size ever
+        // goes out between two current ones.
         tracing::debug!(size = ?c.new_size, "overlay configured");
         self.configured = true;
         self.draw();
+    }
+}
+
+impl SeatHandler for App {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seats
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability != Capability::Pointer || self.pointer.is_some() {
+            return;
+        }
+        if let Ok(pointer) = self.seats.get_pointer(qh, &seat) {
+            self.cursor_shape = self
+                .cursor_shapes
+                .as_ref()
+                .map(|shapes| shapes.get_shape_device(&pointer, qh));
+            self.pointer = Some(pointer);
+        }
+    }
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability != Capability::Pointer {
+            return;
+        }
+        if let Some(shape) = self.cursor_shape.take() {
+            shape.destroy();
+        }
+        if let Some(pointer) = self.pointer.take() {
+            if pointer.version() >= 3 {
+                pointer.release();
+            }
+        }
+        self.scene.pointer_at(None);
+    }
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for App {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        let Some(layer) = &self.surface else { return };
+        for event in events {
+            if &event.surface != layer.wl_surface() {
+                continue;
+            }
+            // Surface-local coordinates are canvas pixels: the compositor
+            // scales the surface, the scene draws at scale 1.
+            let at = (event.position.0 as f32, event.position.1 as f32);
+            match event.kind {
+                PointerEventKind::Enter { serial } => {
+                    if let Some(shape) = &self.cursor_shape {
+                        shape.set_shape(serial, Shape::Default);
+                    }
+                    self.scene.pointer_at(Some(at));
+                }
+                PointerEventKind::Leave { .. } => self.scene.pointer_at(None),
+                _ => self.scene.pointer_at(Some(at)),
+            }
+        }
     }
 }
 
@@ -282,7 +425,7 @@ impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 delegate_registry!(App);

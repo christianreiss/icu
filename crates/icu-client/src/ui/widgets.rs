@@ -1648,7 +1648,7 @@ pub fn slider_row(
         ui.separator();
     }
     let format = |v: f32| {
-        if suffix == " ms" || suffix == " %" {
+        if suffix == " ms" || suffix == " %" || suffix == " px" {
             format!("{v:.0}{suffix}")
         } else {
             format!("{v:.1}{suffix}")

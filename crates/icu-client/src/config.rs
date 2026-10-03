@@ -266,17 +266,27 @@ pub enum Corner {
     Bottom,
 }
 
-/// Overlay tile size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum TileSize {
-    /// 160×120.
-    #[default]
-    Small,
-    /// 320×240.
-    Medium,
-    /// 480×360.
-    Large,
+/// The overlay's camera-tile diameters the size slider offers, in layout
+/// pixels; a voice-only plate is 60 % of that.
+pub const TILE_SIZES: std::ops::RangeInclusive<u32> = 80..=480;
+
+/// `overlay.size`: a diameter in pixels, or — in a file from before the
+/// slider — one of the three fixed sizes it replaced.
+fn tile_size<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Size {
+        Px(u32),
+        Named(String),
+    }
+    Ok(match Size::deserialize(d)? {
+        Size::Px(px) => px,
+        Size::Named(name) => match name.as_str() {
+            "medium" => 240,
+            "large" => 360,
+            _ => 120,
+        },
+    })
 }
 
 /// Direction the tile stack grows in for a corner position. Ignored for
@@ -301,8 +311,14 @@ pub struct OverlaySettings {
     pub corner: Corner,
     /// Offset from the corner in pixels.
     pub offset: [u32; 2],
-    /// Tile size.
-    pub size: TileSize,
+    /// Camera-tile diameter in layout pixels while its person is silent,
+    /// within [`TILE_SIZES`].
+    #[serde(deserialize_with = "tile_size")]
+    pub size: u32,
+    /// The same while its person speaks; unset, 20 % more than `size`
+    /// (see [`OverlaySettings::speaking_diameter`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaking_size: Option<u32>,
     /// Stack direction for corner positions.
     pub expand: Expand,
     /// Dim tiles of peers who aren't currently speaking.
@@ -314,6 +330,12 @@ pub struct OverlaySettings {
     /// Show smaller name plates for everyone without a camera, including
     /// while silent, with the same speaking and dimming rules as video tiles.
     pub voice_plates: bool,
+    /// Tiles get out of the mouse pointer's way: a tile fades out while
+    /// the pointer is over it and lets clicks through to what is below.
+    pub shy: bool,
+    /// Show the own tile too (own camera, or a plate as for the others),
+    /// after everyone else's.
+    pub show_self: bool,
 }
 
 impl Default for OverlaySettings {
@@ -322,13 +344,25 @@ impl Default for OverlaySettings {
             enabled: false,
             corner: Corner::TopRight,
             offset: [40, 40],
-            size: TileSize::Small,
+            size: 120,
+            speaking_size: None,
             expand: Expand::Vertical,
             dim_non_speaking: true,
             speaking_frame: true,
             frame_color: [0x2e, 0x9b, 0xff],
             voice_plates: true,
+            shy: false,
+            show_self: false,
         }
+    }
+}
+
+impl OverlaySettings {
+    /// A speaking person's camera-tile diameter: `speaking_size`, or —
+    /// until its slider is touched — 20 % more than `size`, as before there
+    /// was one.
+    pub fn speaking_diameter(&self) -> u32 {
+        self.speaking_size.unwrap_or(self.size * 6 / 5)
     }
 }
 
@@ -1424,9 +1458,12 @@ mod tests {
         s.overlay.corner = Corner::BottomLeft;
         s.overlay.expand = Expand::Horizontal;
         s.overlay.dim_non_speaking = false;
-        s.overlay.size = TileSize::Large;
+        s.overlay.size = 360;
+        s.overlay.speaking_size = Some(300);
         s.overlay.speaking_frame = false;
         s.overlay.frame_color = [0x10, 0x20, 0x30];
+        s.overlay.shy = true;
+        s.overlay.show_self = true;
         s.set_volume(7, 120.0);
         s.set_volume(9, 100.0);
         s.ui.name = Some("chris".into());
@@ -1440,14 +1477,23 @@ mod tests {
         assert_eq!(back.volume(9), 100.0, "100 % is not stored");
         assert!(!back.volumes.contains_key("9"));
         assert!(!back.overlay.dim_non_speaking);
-        assert_eq!(back.overlay.size, TileSize::Large);
+        assert_eq!(back.overlay.size, 360);
+        assert_eq!(
+            back.overlay.speaking_diameter(),
+            300,
+            "smaller than at rest is allowed"
+        );
         assert!(!back.overlay.speaking_frame);
         assert_eq!(back.overlay.frame_color, [0x10, 0x20, 0x30]);
+        assert!(back.overlay.shy);
+        assert!(back.overlay.show_self);
 
         let text = fs::read_to_string(paths.settings()).unwrap();
         assert!(text.contains("mode = \"ptt\""));
         assert!(text.contains("voice_strength = \"strong\""));
         assert!(text.contains("corner = \"bottom-left\""));
+        assert!(text.contains("size = 360"), "a size is written as pixels");
+        assert!(text.contains("speaking_size = 300"));
         assert!(text.contains("[volumes]"));
         assert!(text.contains("setup_done = true"));
         assert!(text.contains("close_action = \"minimize\""));
@@ -1475,6 +1521,20 @@ mod tests {
         assert!(s.audio.normalize_outgoing);
         assert_eq!(s.audio.voice_strength, VoiceStrength::Medium);
         assert!(s.overlay.dim_non_speaking, "old settings.toml default on");
+        assert!(!s.overlay.shy, "old settings.toml: tiles stay put");
+        assert!(!s.overlay.show_self);
+        assert_eq!(s.overlay.size, 120);
+        assert_eq!(s.overlay.speaking_size, None);
+        assert_eq!(
+            s.overlay.speaking_diameter(),
+            144,
+            "20 % more while speaking"
+        );
+        for (name, px) in [("small", 120), ("medium", 240), ("large", 360)] {
+            let s: Settings = toml::from_str(&format!("[overlay]\nsize = \"{name}\"\n")).unwrap();
+            assert_eq!(s.overlay.size, px, "the old {name} size");
+            assert_eq!(s.overlay.speaking_diameter(), px * 6 / 5, "grows as it did");
+        }
         assert_eq!(s.ui.close_action, "tray");
         assert!(
             !s.ui.setup_done,

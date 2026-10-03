@@ -9,8 +9,10 @@ pub mod setup;
 pub mod theme;
 pub mod user;
 pub mod widgets;
+#[cfg(windows)]
+mod window_move;
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use crate::{
     config::{Identity, Paths},
@@ -18,6 +20,24 @@ use crate::{
 };
 
 pub use main_window::Exit;
+
+/// `ctx.request_repaint_after(after)` — the periodic repaints (levels,
+/// timers). They pause while one of ICU's windows is dragged on Windows,
+/// so the window keeps up with the pointer (`window_move`).
+pub(crate) fn repaint_after(ctx: &egui::Context, after: Duration) {
+    #[cfg(windows)]
+    if window_move::active() {
+        return;
+    }
+    ctx.request_repaint_after(after);
+}
+
+/// Lets ICU's windows on this thread be dragged smoothly on Windows
+/// (`window_move`); called every frame, a no-op elsewhere.
+pub(crate) fn watch_window_moves(_ctx: &egui::Context) {
+    #[cfg(windows)]
+    window_move::watch(_ctx);
+}
 
 /// The push-to-talk binding as a person would say it: `KEY_RIGHTCTRL`
 /// becomes `RIGHTCTRL`. Through the Portal it is the key the desktop

@@ -1137,7 +1137,7 @@ async fn peer_certificate_matches_the_authenticated_session_and_expires_with_it(
 /// media switches and their detailed settings survive quitting and restarting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn camera_and_overlay_survive_a_restart() {
-    use icu_client::config::{Corner, Expand, Settings, TileSize};
+    use icu_client::config::{Corner, Expand, Settings};
     let server = TestServer::start().await;
     let (identity, paths, _dir) = server.enroll("alice").await;
     let start = |settings: Settings| {
@@ -1154,7 +1154,7 @@ async fn camera_and_overlay_survive_a_restart() {
     settings.camera.enabled = true;
     settings.overlay.corner = Corner::BottomLeft;
     settings.overlay.offset = [72, 96];
-    settings.overlay.size = TileSize::Large;
+    settings.overlay.size = 300;
     settings.overlay.expand = Expand::Horizontal;
     settings.overlay.voice_plates = false;
     settings.overlay.speaking_frame = false;

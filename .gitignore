@@ -18,3 +18,6 @@ id_rsa
 # Site: packages are copied in by web/tools/publish-release.py
 web/downloads/*
 !web/downloads/.gitkeep
+
+# Python bytecode from the packaging scripts
+__pycache__/

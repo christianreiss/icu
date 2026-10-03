@@ -10,6 +10,7 @@ Wegwerf-Code der empirischen Prüfungen vom 2026-09-20; Ergebnisse in `../docs/h
 | `spike-wayland/` | 4a Hotkey (`src/bin/hotkey.rs`, interaktiv: KDE-Dialog bestätigen), 4b Overlay (`src/bin/overlay.rs`) | `cargo run --bin hotkey`, `cargo run --bin overlay` |
 | `spike-camera/` | 5 Kamera + H.264 | `cargo run` |
 | `spike-aec/` | 6 Echo Cancellation (`src/main.rs` = WebRTC AEC3), 6b Speex-Vergleich (`src/bin/speex.rs`) | `cargo run --release`, `cargo run --release --bin speex`. Braucht `meson`, `ninja-build`, `clang`, `abseil-cpp-devel`, `speexdsp-devel` und einmalig den `rust-objcopy`-Symlink aus `docs/reference/client.md` §12. Release-Profil nötig, sonst dauern die 60–600-s-Driftläufe zu lange. |
+| `spike-window-drag/` | Fenster ziehen unter Windows (2026-10-02, kein Cargo-Projekt): `drag-probe.c` zieht ein Fenster per synthetischer Maus an der Titelleiste und misst, wie dicht es dem Zeiger folgt (Positionswechsel/s, längste Lücke, Rückstand in px) | `x86_64-w64-mingw32-gcc -O2 -o drag-probe.exe drag-probe.c -lwinmm`; in der Desktop-Sitzung (nicht über SSH direkt, sondern z. B. per `schtasks /it`) `drag-probe.exe ICU 150 8 ergebnis.txt` — Titelanfang, Schritte, ms je Schritt |
 
 Die lokale Cargo-Konfiguration legt Build-Ausgaben beim Aufruf im jeweiligen
 Experiment automatisch unter `target/experiments/<name>/` ab. Bei einem Aufruf

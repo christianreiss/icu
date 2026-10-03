@@ -1,11 +1,15 @@
 //! Offscreen hardware rendering. Native presentation stays click-through;
-//! two asynchronous readback slots bound memory and never wait on the GPU.
+//! two asynchronous readback slots bound memory and wait on the GPU only
+//! for the first frame of a new size.
 use super::*;
 use eframe::wgpu::{self, util::DeviceExt};
 use std::sync::mpsc as channel;
 
 pub(super) const HALO: u32 = 24;
 pub(super) const GPU_TICK: Duration = Duration::from_nanos(1_000_000_000 / 30);
+/// How long a frame of a new size may hold up the overlay thread (see
+/// [`Renderer::draw`]); a slower one is presented a tick later as usual.
+const RESIZE_WAIT: Duration = Duration::from_millis(100);
 
 pub(super) struct RenderScene<'a> {
     pub geometry: Geometry,
@@ -191,43 +195,13 @@ impl Renderer {
         if self.failed.load(Ordering::Relaxed) {
             return Err("GPU device unavailable".into());
         }
-        let mut presented = None;
-        while let Some(front) = self.pending.front() {
-            match front.done.try_recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(e.to_string()),
-                Err(channel::TryRecvError::Disconnected) => {
-                    return Err("GPU readback disconnected".into())
-                }
-                Err(channel::TryRecvError::Empty) => {
-                    if front.at.elapsed() > Duration::from_secs(2) {
-                        return Err("GPU readback timeout".into());
-                    }
-                    break;
-                }
-            }
-            let frame = self.pending.pop_front().unwrap();
-            if frame.size == (scene.geometry.width, scene.geometry.height) {
-                let view = frame
-                    .buffer
-                    .slice(..)
-                    .get_mapped_range()
-                    .map_err(|e| e.to_string())?;
-                for (src, dst) in view
-                    .chunks_exact(frame.stride as usize)
-                    .zip(canvas.chunks_exact_mut(scene.geometry.width as usize * 4))
-                {
-                    dst.copy_from_slice(&src[..dst.len()]);
-                }
-                presented = Some(frame.frames);
-            }
-            frame.buffer.unmap();
-            self.buffers.push(frame.buffer);
-        }
+        let (w, h) = (scene.geometry.width, scene.geometry.height);
+        let mut presented = self.collect((w, h), canvas)?;
+        // A readback of another size can never be shown any more.
+        self.pending.retain(|frame| frame.size == (w, h));
         if self.pending.len() >= 2 {
             return Ok(presented);
         }
-        let (w, h) = (scene.geometry.width, scene.geometry.height);
         if w == 0
             || h == 0
             || w > self.device.limits().max_texture_dimension_2d
@@ -259,8 +233,8 @@ impl Renderer {
                 Face::Camera(_) => scene.geometry.camera_diameter,
                 Face::Plate => scene.geometry.plate_diameter,
             };
-            let reserve = speak_diameter(diameter);
-            let mut geom = circle_geometry(reserve, scene.geometry.name_px);
+            let mut geom =
+                reserved_geometry(diameter, scene.geometry.speak_scale, scene.geometry.dpi);
             geom.half_w += pad;
             geom.outer_w += pad * 2;
             geom.outer_h += pad * 2;
@@ -276,8 +250,9 @@ impl Renderer {
             };
             let cx = tx as f32 + geom.half_w as f32;
             let cy = ty as f32 + pad as f32 + geom.radii.r_outer;
-            let r = radii(diameter as f32 * tile.scale, scene.geometry.name_px);
-            let name_px = scene.geometry.name_px;
+            let drawn = diameter as f32 * tile.scale;
+            let name_px = label_px(drawn, scene.geometry.dpi);
+            let r = radii(drawn, name_px);
             let (shown, sweep) = scene
                 .labels
                 .as_mut()
@@ -506,7 +481,7 @@ impl Renderer {
             },
             target.size(),
         );
-        self.queue.submit([encoder.finish()]);
+        let submission = self.queue.submit([encoder.finish()]);
         let (tx, done) = channel::channel();
         buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -519,6 +494,63 @@ impl Renderer {
             stride,
             frames: scene.visible_frames.to_vec(),
         });
+        // Nothing of this size was in flight: the first frame, one after
+        // `invalidate`, or the size just changed (the size sliders). Wait
+        // for this one rather than leave the window a tick or two without
+        // a picture of its new size — the compositor would meanwhile place
+        // the old picture as if it had it.
+        if presented.is_none() && self.pending.len() == 1 {
+            if let Err(error) = self.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(RESIZE_WAIT),
+            }) {
+                tracing::debug!(%error, "overlay readback not ready, presenting later");
+            }
+            presented = self.collect((w, h), canvas)?;
+        }
+        Ok(presented)
+    }
+
+    /// Takes the finished readbacks off the queue, oldest first; the newest
+    /// one of `size` lands in `canvas` and its frames are returned.
+    fn collect(
+        &mut self,
+        size: (u32, u32),
+        canvas: &mut [u8],
+    ) -> Result<Option<Vec<(Session, u64)>>, String> {
+        let mut presented = None;
+        while let Some(front) = self.pending.front() {
+            match front.done.try_recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e.to_string()),
+                Err(channel::TryRecvError::Disconnected) => {
+                    return Err("GPU readback disconnected".into())
+                }
+                Err(channel::TryRecvError::Empty) => {
+                    if front.at.elapsed() > Duration::from_secs(2) {
+                        return Err("GPU readback timeout".into());
+                    }
+                    break;
+                }
+            }
+            let frame = self.pending.pop_front().unwrap();
+            if frame.size == size {
+                let view = frame
+                    .buffer
+                    .slice(..)
+                    .get_mapped_range()
+                    .map_err(|e| e.to_string())?;
+                for (src, dst) in view
+                    .chunks_exact(frame.stride as usize)
+                    .zip(canvas.chunks_exact_mut(size.0 as usize * 4))
+                {
+                    dst.copy_from_slice(&src[..dst.len()]);
+                }
+                presented = Some(frame.frames);
+            }
+            frame.buffer.unmap();
+            self.buffers.push(frame.buffer);
+        }
         Ok(presented)
     }
 }
@@ -560,7 +592,7 @@ mod tests {
     fn hardware_non_video_members() {
         let mut renderer = Renderer::new().expect("hardware GPU");
         let mut labels = Labels::new();
-        for (camera, plate, font) in [(120, 72, 12), (240, 144, 15), (360, 216, 18)] {
+        for (camera, plate) in [(120, 72), (240, 144), (360, 216)] {
             for dpi in [1.0, 1.25, 1.5, 2.0] {
                 for (horizontal, bottom) in [(false, false), (true, false), (true, true)] {
                     let tiles = [
@@ -593,8 +625,7 @@ mod tests {
                     let pad = scaled(HALO, dpi);
                     let gap = scaled(GAP, dpi);
                     let geoms = [camera, plate, plate].map(|d| {
-                        let mut g =
-                            circle_geometry(speak_diameter(scaled(d, dpi)), scaled(font, dpi));
+                        let mut g = reserved_geometry(scaled(d, dpi), SPEAK_SCALE, dpi);
                         g.half_w += pad;
                         g.outer_w += 2 * pad;
                         g.outer_h += 2 * pad;
@@ -616,7 +647,8 @@ mod tests {
                         height,
                         camera_diameter: scaled(camera, dpi),
                         plate_diameter: scaled(plate, dpi),
-                        name_px: scaled(font, dpi),
+                        speak_scale: SPEAK_SCALE,
+                        dpi,
                         horizontal,
                         bottom,
                         speaking_frame: true,
@@ -731,7 +763,7 @@ mod tests {
             })
             .collect();
         for diameter in [120, 240, 360] {
-            let geom = circle_geometry(speak_diameter(diameter), 12);
+            let geom = reserved_geometry(diameter, SPEAK_SCALE, 1.);
             let tw = geom.outer_w + HALO * 2;
             let th = geom.outer_h + HALO * 2;
             let w = tw * 4 + GAP * 3;
@@ -742,7 +774,8 @@ mod tests {
                     height: th,
                     camera_diameter: diameter,
                     plate_diameter: 72,
-                    name_px: 12,
+                    speak_scale: SPEAK_SCALE,
+                    dpi: 1.,
                     horizontal: true,
                     bottom: false,
                     speaking_frame: true,
@@ -844,11 +877,25 @@ mod tests {
             renderer.invalidate();
             complete(&mut renderer, &mut scene, &mut canvas);
             assert_eq!(canvas[halo], 0, "disabled highlight has no halo");
-            // No stale viewer reports may survive a same-size scene change.
+            // No stale viewer reports may survive a same-size scene change;
+            // its first frame is waited for, so it comes at once.
             scene.visible_frames = &[(2, 9)];
             renderer.invalidate();
-            assert!(renderer.draw(&mut scene, &mut canvas).unwrap().is_none());
-            complete(&mut renderer, &mut scene, &mut canvas);
+            assert_eq!(
+                renderer.draw(&mut scene, &mut canvas).unwrap(),
+                Some(vec![(2, 9)])
+            );
+            // Nor does a new size (the size sliders) wait a tick or two.
+            scene.tiles = &video_sets[0][..1];
+            scene.intensities = &[1.];
+            scene.geometry.width = tw;
+            let mut one = vec![0; (tw * th * 4) as usize];
+            assert_eq!(
+                renderer.draw(&mut scene, &mut one).unwrap(),
+                Some(vec![(2, 9)])
+            );
+            let center = ((cy * tw + cx) * 4) as usize;
+            assert_eq!(&one[center..center + 4], &[0, 0, 255, 255]);
         }
         // Mixed camera/voice tiles, a vertical stack and a bottom-aligned row
         // at 200% scale. Their unequal slot sizes must never clip the label.
@@ -871,7 +918,7 @@ mod tests {
                 },
             ];
             let geoms = [240, 144].map(|d| {
-                let mut g = circle_geometry(speak_diameter(d), 24);
+                let mut g = reserved_geometry(d, SPEAK_SCALE, 2.);
                 g.outer_w += HALO * 4;
                 g.outer_h += HALO * 4;
                 g
@@ -893,7 +940,8 @@ mod tests {
                     height: h,
                     camera_diameter: 240,
                     plate_diameter: 144,
-                    name_px: 24,
+                    speak_scale: SPEAK_SCALE,
+                    dpi: 2.,
                     horizontal,
                     bottom: true,
                     speaking_frame: true,

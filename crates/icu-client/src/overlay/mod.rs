@@ -1,7 +1,9 @@
 //! Speaking overlay (`docs/reference/client.md` §9): a click-through window
 //! above everything that shows, for everyone whose camera is on, a camera
 //! tile with the name, and for everyone without one a smaller name plate.
-//! Both remain visible and highlight whoever is speaking.
+//! Both remain visible and highlight whoever is speaking. With
+//! `overlay.shy` a tile fades out of the mouse pointer's way (see [`Shy`]);
+//! with `overlay.show_self` the own tile comes last, from the local camera.
 //!
 //! What is shown and how it is drawn (GPU 30 fps, CPU fallback 15 fps) lives
 //! here; the window is the platform's: a wlr layer-shell surface on Linux
@@ -24,7 +26,7 @@ use icu_proto::Session;
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    config::{Corner, Expand, OverlaySettings, TileSize},
+    config::{Corner, Expand, OverlaySettings, TILE_SIZES},
     engine::{AppState, Command, Peer, VideoFrames},
 };
 
@@ -69,14 +71,136 @@ const LABEL_INK: [u8; 3] = [0x1a, 0x22, 0x2b];
 /// Frame interval: 15 fps.
 const TICK: Duration = Duration::from_millis(1000 / 15);
 
-/// A tile's resting scale — its normal, not-speaking size.
+/// A tile's resting scale — its normal, not-speaking size. While its
+/// person speaks it eases to the speaking scale instead ([`speak_scale`]).
 const REST_SCALE: f32 = 1.0;
-/// How much larger a tile grows while its person is speaking.
+/// The speaking scale with `overlay.speaking_size` unset, as the tests use
+/// it.
+#[cfg(test)]
 const SPEAK_SCALE: f32 = 1.2;
 /// Fraction of the remaining gap to the target scale closed per tick;
 /// the same both growing and shrinking, so both directions ease equally
 /// (at 15 fps, ~5-8 ticks / 300-500 ms to settle).
 const SCALE_EASE: f32 = 0.35;
+
+/// How long a shy tile (`overlay.shy`) stays out of the way after the
+/// pointer was last seen over it.
+const SHY_LINGER: Duration = Duration::from_millis(1000);
+/// The end of that linger, during which a still hidden tile takes pointer
+/// input again on Wayland: a surface that takes none hears nothing of the
+/// pointer, so this is the only way to learn whether it is still there.
+const SHY_PROBE: Duration = Duration::from_millis(350);
+/// Seconds a shy tile takes to fade out, and back in.
+const SHY_HIDE_SECS: f32 = 0.12;
+const SHY_SHOW_SECS: f32 = 0.3;
+
+/// One tile's shyness (`overlay.shy`): how opaque it is, and until when it
+/// stays out of the pointer's way.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Shy {
+    opacity: f32,
+    /// Hidden until then; `None` while nothing is in its way.
+    until: Option<Instant>,
+}
+
+impl Shy {
+    const SHOWN: Shy = Shy {
+        opacity: 1.0,
+        until: None,
+    };
+
+    /// Advances by `dt` seconds: the pointer over the tile (`hovered`)
+    /// hides it at once and keeps it hidden until [`SHY_LINGER`] after it
+    /// was last seen there; then it fades back in. Off (`enabled` false),
+    /// it only fades back in.
+    fn step(self, enabled: bool, hovered: bool, now: Instant, dt: f32) -> Shy {
+        let until = match (enabled, hovered) {
+            (false, _) => None,
+            (true, true) => Some(now + SHY_LINGER),
+            (true, false) => self.until.filter(|&until| until > now),
+        };
+        let opacity = if until.is_some() {
+            (self.opacity - dt / SHY_HIDE_SECS).max(0.0)
+        } else {
+            (self.opacity + dt / SHY_SHOW_SECS).min(1.0)
+        };
+        Shy { opacity, until }
+    }
+
+    /// Whether the tile takes pointer input (Wayland) so the scene learns
+    /// where the pointer is: while shown, and in the last [`SHY_PROBE`] of
+    /// its linger — never while it is hidden otherwise, so a click on it
+    /// reaches whatever is below.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    fn takes_input(self, now: Instant) -> bool {
+        self.until
+            .is_none_or(|until| until.saturating_duration_since(now) <= SHY_PROBE)
+    }
+}
+
+/// A tile's slot on the canvas: `[x, y, width, height]`.
+type Slot = [u32; 4];
+
+/// Where each tile's slot (`geoms`, in tile order) sits on a `width ×
+/// height` canvas — the same placement [`compose`] and the GPU renderer
+/// use: a row lines up at the edge the surface hangs from (`bottom`), a
+/// column centers each tile in its width.
+fn slots(
+    geoms: &[CircleGeom],
+    width: u32,
+    height: u32,
+    horizontal: bool,
+    bottom: bool,
+    gap: u32,
+) -> Vec<Slot> {
+    let (mut x, mut y) = (0, 0);
+    geoms
+        .iter()
+        .map(|g| {
+            let slot = if horizontal {
+                let ty = if bottom {
+                    height.saturating_sub(g.outer_h)
+                } else {
+                    0
+                };
+                [x, ty, g.outer_w, g.outer_h]
+            } else {
+                [width.saturating_sub(g.outer_w) / 2, y, g.outer_w, g.outer_h]
+            };
+            if horizontal {
+                x += g.outer_w + gap;
+            } else {
+                y += g.outer_h + gap;
+            }
+            slot
+        })
+        .collect()
+}
+
+/// Whether `(x, y)` lies on `slot`.
+fn on_slot(&[sx, sy, w, h]: &Slot, (x, y): (f32, f32)) -> bool {
+    x >= sx as f32 && y >= sy as f32 && x < (sx + w) as f32 && y < (sy + h) as f32
+}
+
+/// Fades each tile's slot on `canvas` (premultiplied BGRA, `width` pixels
+/// a row) to its `opacities` entry — premultiplied, so all four channels
+/// scale alike. Slots never overlap, so nothing is faded twice.
+fn fade_slots(canvas: &mut [u8], width: u32, slots: &[Slot], opacities: &[f32]) {
+    for (&[x, y, w, h], &opacity) in slots.iter().zip(opacities) {
+        if opacity >= 1.0 {
+            continue;
+        }
+        let a = (opacity.max(0.0) * 255.0).round() as u32;
+        for row in y..y + h {
+            let start = (row as usize * width as usize + x as usize) * 4;
+            if let Some(pixels) = canvas.get_mut(start..start + w as usize * 4) {
+                for c in pixels {
+                    *c = ((u32::from(*c) * a + 127) / 255) as u8;
+                }
+            }
+        }
+    }
+}
 
 /// Eases `current` toward `target` by `factor` of the remaining distance —
 /// used once per tick per tile so its size animates smoothly both ways
@@ -94,14 +218,32 @@ fn fade(value: f32, speaking: bool, dt: f32) -> f32 {
     }
 }
 
-/// The diameter a tile's slot reserves: always the *speaking* size,
-/// so the reserved slot never needs to resize as a tile's drawn size
-/// animates between resting and speaking. Rounds up, not to nearest — the
-/// reserved slot must never end up a fraction of a pixel smaller than the
-/// exact (unrounded) size a tile can actually draw at `SPEAK_SCALE`.
-fn speak_diameter(base: u32) -> u32 {
-    (base as f32 * SPEAK_SCALE).ceil() as u32
+/// The diameter a tile's slot reserves: the larger of its resting `base`
+/// and its speaking size (`speak` times that), so the reserved slot never
+/// needs to resize as a tile's drawn size animates between the two. Rounds
+/// up, not to nearest — the reserved slot must never end up a fraction of
+/// a pixel smaller than the exact (unrounded) size a tile can actually draw.
+fn reserve_diameter(base: u32, speak: f32) -> u32 {
+    (base as f32 * speak.max(REST_SCALE)).ceil() as u32
 }
+
+/// A tile's reserved slot for a resting `base` diameter: its circle at
+/// [`reserve_diameter`], with the name sized for that ([`label_px`]).
+fn reserved_geometry(base: u32, speak: f32, dpi: f32) -> CircleGeom {
+    let diameter = reserve_diameter(base, speak);
+    circle_geometry(diameter, label_px(diameter as f32, dpi))
+}
+
+/// Where the overlay takes the own camera's pictures from: the capture
+/// thread's preview slot (`CameraHandle::preview_source`).
+#[cfg(feature = "camera")]
+pub type OwnVideo = Arc<crate::camera::PreviewSlot>;
+/// Without camera support there are none.
+#[cfg(not(feature = "camera"))]
+pub type OwnVideo = std::convert::Infallible;
+
+/// A picture as a tile shows it: width, height, RGBA.
+type Picture = (usize, usize, Arc<Vec<u8>>);
 
 /// Owns the overlay thread.
 pub struct OverlayHandle {
@@ -111,18 +253,22 @@ pub struct OverlayHandle {
 
 impl OverlayHandle {
     /// Opens the overlay on a new thread. Fails when the platform has no
-    /// way to show one (no Wayland display, no layer shell).
+    /// way to show one (no Wayland display, no layer shell). `own_video`
+    /// feeds the own tile (`overlay.show_self`).
     pub fn start(
         state: watch::Receiver<AppState>,
         frames: VideoFrames,
         cmd: mpsc::UnboundedSender<Command>,
+        own_video: Option<OwnVideo>,
     ) -> Result<OverlayHandle, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let stop_t = stop.clone();
         let thread = std::thread::Builder::new()
             .name("icu-overlay".into())
-            .spawn(move || platform::run(Scene::new(state, frames, cmd), stop_t, ready_tx))
+            .spawn(move || {
+                platform::run(Scene::new(state, frames, cmd, own_video), stop_t, ready_tx)
+            })
             .map_err(|e| e.to_string())?;
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(())) => Ok(OverlayHandle {
@@ -153,7 +299,7 @@ impl Drop for OverlayHandle {
 /// What a tile shows.
 enum Face {
     /// Camera on: the latest picture, once one has arrived.
-    Camera(Option<(usize, usize, Arc<Vec<u8>>)>),
+    Camera(Option<Picture>),
     /// No camera: a smaller name plate, also visible while silent.
     Plate,
 }
@@ -163,7 +309,8 @@ struct Tile {
     name: String,
     speaking: bool,
     dim: bool,
-    /// Current eased size multiplier ([`REST_SCALE`]..=[`SPEAK_SCALE`]).
+    /// Current eased size multiplier, between [`REST_SCALE`] and the
+    /// speaking scale ([`speak_scale`]).
     scale: f32,
 }
 
@@ -426,14 +573,33 @@ struct Scene {
     last_update: Instant,
     membership: Vec<(Session, String, bool)>,
     presented_frames: Option<Vec<(Session, u64)>>,
+    /// Each tile's slot, in tile order, as of the last [`Scene::update`].
+    slots: Vec<Slot>,
+    /// Each tile's shyness by session, rebuilt every update like `anim`;
+    /// `shyness` holds the same in tile order.
+    shy: HashMap<Session, Shy>,
+    shyness: Vec<Shy>,
+    /// Where the pointer is on the canvas, if known (see
+    /// [`Scene::pointer_at`]).
+    pointer: Option<(f32, f32)>,
+    /// Every position the pointer was seen at since the last update, so
+    /// one that crossed a tile between two frames still counts.
+    pointer_trail: Vec<(f32, f32)>,
+    /// The own camera's pictures, for the own tile.
+    #[cfg_attr(not(feature = "camera"), allow(dead_code))]
+    own_video: Option<OwnVideo>,
+    /// Its last picture as RGBA, with the slot's `seq` it was taken at:
+    /// converted once per picture, not once per frame.
+    #[cfg_attr(not(feature = "camera"), allow(dead_code))]
+    own_picture: Option<(u64, Option<Picture>)>,
 }
 
 /// What [`Scene::update`] found.
 struct Update {
     /// Something to show: overlay on and at least one tile.
     shown: bool,
-    /// Position or tile size changed: the window is placed anew. (The
-    /// Windows overlay places and sizes itself every frame.)
+    /// Position changed: the window is placed anew. (The Windows overlay
+    /// places and sizes itself every frame.)
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     layout_changed: bool,
     /// The needed size changed.
@@ -446,6 +612,7 @@ impl Scene {
         state: watch::Receiver<AppState>,
         frames: VideoFrames,
         cmd: mpsc::UnboundedSender<Command>,
+        own_video: Option<OwnVideo>,
     ) -> Scene {
         let settings = state.borrow().settings.overlay.clone();
         Scene {
@@ -473,50 +640,84 @@ impl Scene {
             last_update: Instant::now(),
             membership: Vec::new(),
             presented_frames: None,
+            slots: Vec::new(),
+            shy: HashMap::new(),
+            shyness: Vec::new(),
+            pointer: None,
+            pointer_trail: Vec::new(),
+            own_video,
+            own_picture: None,
         }
+    }
+
+    /// The own camera's latest picture, `None` until it delivers one.
+    fn own_picture(&mut self) -> Option<Picture> {
+        #[cfg(feature = "camera")]
+        {
+            let slot = self.own_video.as_ref()?;
+            let seq = slot.seq.load(Ordering::Acquire);
+            if self.own_picture.as_ref().is_none_or(|(at, _)| *at != seq) {
+                let frame = slot.frame.lock().unwrap().clone();
+                let picture = frame.filter(|f| f.is_valid()).map(|f| {
+                    let rgba = f.rgb.as_chunks::<3>().0.iter();
+                    let rgba = rgba.flat_map(|&[r, g, b]| [r, g, b, 0xff]).collect();
+                    (f.width, f.height, Arc::new(rgba))
+                });
+                self.own_picture = Some((seq, picture));
+            }
+            self.own_picture.as_ref().and_then(|(_, p)| p.clone())
+        }
+        #[cfg(not(feature = "camera"))]
+        None
+    }
+
+    /// The pointer is at `at` on the canvas, in its pixels, or not known to
+    /// be over it (`None`). Windows reports it every frame; Wayland
+    /// whenever the compositor does, which is only over tiles that take
+    /// input ([`Scene::input_rects`]).
+    fn pointer_at(&mut self, at: Option<(f32, f32)>) {
+        self.pointer = at;
+        self.pointer_trail.extend(at);
+    }
+
+    /// Where the overlay takes pointer input (Wayland): with `overlay.shy`
+    /// every tile that [`Shy::takes_input`], otherwise nowhere — the
+    /// overlay is click-through.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    fn input_rects(&self) -> Vec<Slot> {
+        if !self.settings.shy {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        self.slots
+            .iter()
+            .zip(&self.shyness)
+            .filter(|(_, shy)| shy.takes_input(now))
+            .map(|(slot, _)| *slot)
+            .collect()
     }
 
     /// Diameter of a camera tile's circle.
     fn camera_diameter(&self) -> u32 {
-        let d = match self.settings.size {
-            TileSize::Small => 120,
-            TileSize::Medium => 240,
-            TileSize::Large => 360,
-        };
-        scaled(d, self.scale)
+        scaled(tile_base(self.settings.size), self.scale)
     }
 
     /// Diameter of a voice-only plate's circle — smaller than a camera
     /// tile, closer to the small avatars elsewhere in the UI.
     fn plate_diameter(&self) -> u32 {
-        let d = match self.settings.size {
-            TileSize::Small => 72,
-            TileSize::Medium => 144,
-            TileSize::Large => 216,
-        };
-        scaled(d, self.scale)
-    }
-
-    /// The outside name label's font size, per tile size.
-    fn label_px(&self) -> u32 {
-        let px = match self.settings.size {
-            TileSize::Small => 12,
-            TileSize::Medium => 15,
-            TileSize::Large => 18,
-        };
-        scaled(px, self.scale)
+        scaled(plate_base(self.settings.size), self.scale)
     }
 
     /// A tile's reserved slot: its circle plus its outside label ring, at
-    /// the size it will ever need. Every tile reserves its *speaking*
-    /// size — larger than it draws at rest — so the slot never has to
-    /// resize as its drawn size eases between resting and speaking.
+    /// the size it will ever need — the larger of its resting and speaking
+    /// sizes — so the slot never has to resize as its drawn size eases
+    /// between the two.
     fn tile_geom(&self, tile: &Tile) -> CircleGeom {
         let diameter = match tile.face {
-            Face::Camera(_) => speak_diameter(self.camera_diameter()),
-            Face::Plate => speak_diameter(self.plate_diameter()),
+            Face::Camera(_) => self.camera_diameter(),
+            Face::Plate => self.plate_diameter(),
         };
-        let mut geom = circle_geometry(diameter, self.label_px());
+        let mut geom = reserved_geometry(diameter, speak_scale(&self.settings), self.scale);
         if self.gpu.is_some() {
             let pad = scaled(gpu::HALO, self.scale);
             geom.half_w += pad;
@@ -557,13 +758,15 @@ impl Scene {
         let now = Instant::now();
         let dt = now.duration_since(self.last_update).as_secs_f32();
         self.last_update = now;
+        let trail = std::mem::take(&mut self.pointer_trail);
         // Only what a tile needs leaves the state: the whole `AppState`
         // (device list, user list, invite text) is not worth cloning at
         // 15 Hz.
-        let (settings, peers) = {
+        let (settings, peers, own) = {
             let state = self.state.borrow();
-            let peers: Vec<(Session, String, bool, bool)> =
-                overlay_peers(&state.peers, state.settings.overlay.voice_plates)
+            let overlay = &state.settings.overlay;
+            let mut peers: Vec<(Session, String, bool, bool)> =
+                overlay_peers(&state.peers, overlay.voice_plates)
                     .into_iter()
                     .map(|p| {
                         (
@@ -574,7 +777,17 @@ impl Scene {
                         )
                     })
                     .collect();
-            (state.settings.overlay.clone(), peers)
+            // The own tile, after everyone else's, by the same rule: the
+            // camera, or a plate if plates are shown; speaking while the
+            // gate is open.
+            let own = state
+                .me
+                .as_ref()
+                .filter(|_| overlay.show_self && (state.camera_on || overlay.voice_plates));
+            if let Some(me) = own {
+                peers.push((me.session, me.name.clone(), state.sending, state.camera_on));
+            }
+            (overlay.clone(), peers, own.map(|me| me.session))
         };
         let layout_changed = layout(&settings) != layout(&self.settings);
         let settings_changed = self.settings != settings;
@@ -583,9 +796,12 @@ impl Scene {
         // Camera tiles first, then the smaller plates; each group in name order.
         let frames = self.frames.latest();
         let seqs = self.frames.seqs();
+        let own_picture = own.and_then(|_| self.own_picture());
         self.visible_frames = peers
             .iter()
-            .filter(|(session, _, _, camera)| *camera && frames.iter().any(|(s, _)| s == session))
+            .filter(|(session, _, _, camera)| {
+                *camera && Some(*session) != own && frames.iter().any(|(s, _)| s == session)
+            })
             .filter_map(|(session, _, _, _)| seqs.iter().find(|(s, _)| s == session).copied())
             .collect();
         let membership: Vec<_> = peers
@@ -606,7 +822,11 @@ impl Scene {
             .into_iter()
             .map(|(session, name, speaking, camera)| {
                 let scale = {
-                    let target = if speaking { SPEAK_SCALE } else { REST_SCALE };
+                    let target = if speaking {
+                        speak_scale(&self.settings)
+                    } else {
+                        REST_SCALE
+                    };
                     let prev = self.anim.get(&session).copied().unwrap_or(REST_SCALE);
                     let factor = if self.gpu.is_some() {
                         1.0 - (1.0 - SCALE_EASE).powf(dt / TICK.as_secs_f32())
@@ -629,7 +849,9 @@ impl Scene {
                     0.0
                 });
                 Tile {
-                    face: if camera {
+                    face: if camera && Some(session) == own {
+                        Face::Camera(own_picture.clone())
+                    } else if camera {
                         Face::Camera(
                             frames
                                 .iter()
@@ -677,6 +899,42 @@ impl Scene {
         let size_changed = width != self.width || height != self.height;
         self.width = width;
         self.height = height;
+
+        // Shyness: a tile the pointer is (or was, since the last frame) over
+        // gets out of its way. A hidden one is not displayed, so its
+        // picture is not reported as seen.
+        self.slots = slots(
+            &geoms,
+            width,
+            height,
+            self.effective_expand() == Expand::Horizontal,
+            self.anchored_bottom(),
+            gap,
+        );
+        let mut shy = HashMap::with_capacity(self.shy.len());
+        self.shyness = self
+            .membership
+            .iter()
+            .zip(&self.slots)
+            .map(|((session, ..), slot)| {
+                let hovered = self
+                    .pointer
+                    .iter()
+                    .chain(&trail)
+                    .any(|&at| on_slot(slot, at));
+                let next = self.shy.get(session).copied().unwrap_or(Shy::SHOWN).step(
+                    self.settings.shy,
+                    hovered,
+                    now,
+                    dt,
+                );
+                shy.insert(*session, next);
+                next
+            })
+            .collect();
+        self.shy = shy;
+        self.visible_frames
+            .retain(|(session, _)| self.shy.get(session).is_none_or(|shy| shy.opacity > 0.0));
         Update {
             shown,
             layout_changed,
@@ -692,7 +950,8 @@ impl Scene {
             height: self.height,
             camera_diameter: self.camera_diameter(),
             plate_diameter: self.plate_diameter(),
-            name_px: self.label_px(),
+            speak_scale: speak_scale(&self.settings),
+            dpi: self.scale,
             horizontal: self.effective_expand() == Expand::Horizontal,
             bottom: self.anchored_bottom(),
             speaking_frame: self.settings.speaking_frame,
@@ -716,6 +975,9 @@ impl Scene {
                 Ok(frames) => {
                     self.gpu = Some(renderer);
                     self.presented_frames = frames;
+                    if self.presented_frames.is_some() {
+                        self.fade(canvas);
+                    }
                     return self.presented_frames.is_some();
                 }
                 Err(error) => {
@@ -728,7 +990,14 @@ impl Scene {
         }
         self.presented_frames = Some(self.visible_frames.clone());
         compose(canvas, &geometry, &self.tiles, self.labels.as_mut());
+        self.fade(canvas);
         true
+    }
+
+    /// Fades shy tiles on a finished frame.
+    fn fade(&self, canvas: &mut [u8]) {
+        let opacities: Vec<f32> = self.shyness.iter().map(|s| s.opacity).collect();
+        fade_slots(canvas, self.width, &self.slots, &opacities);
     }
 
     /// Called only after the platform accepts a frame for presentation.
@@ -784,10 +1053,38 @@ fn dpi_scale(dpi: u32) -> f32 {
     }
 }
 
-/// What decides the window's position and tile size: a change here needs
-/// the window placed anew.
-fn layout(s: &OverlaySettings) -> (Corner, [u32; 2], TileSize, Expand) {
-    (s.corner, s.offset, s.size, s.expand)
+/// What decides the window's position: a change here needs the window
+/// placed anew. The tile size only resizes it — the slider drags smoothly.
+fn layout(s: &OverlaySettings) -> (Corner, [u32; 2], Expand) {
+    (s.corner, s.offset, s.expand)
+}
+
+/// A camera tile's diameter in layout pixels for `overlay.size`, kept to
+/// the slider's range whatever the file says.
+fn tile_base(size: u32) -> u32 {
+    size.clamp(*TILE_SIZES.start(), *TILE_SIZES.end())
+}
+
+/// A voice-only plate: 60 % of a camera tile.
+fn plate_base(size: u32) -> u32 {
+    tile_base(size) * 3 / 5
+}
+
+/// How much larger a speaking person's tile draws than at rest:
+/// `overlay.speaking_size` over `overlay.size`, both kept to the slider's
+/// range. Below 1 when the speaking size is the smaller one.
+fn speak_scale(s: &OverlaySettings) -> f32 {
+    tile_base(s.speaking_diameter()) as f32 / tile_base(s.size) as f32
+}
+
+/// The name's font size on a circle drawn `diameter` pixels wide at `dpi`
+/// pixels per layout pixel: 4 px + a fifteenth of the diameter (in layout
+/// pixels: 12 px at 120, 20 at 240, 36 at 480), at least 12 px. It grows
+/// with the tile — also while it eases to its speaking size — so a large
+/// tile keeps a name in proportion, while small tiles and plates keep a
+/// readable one.
+fn label_px(diameter: f32, dpi: f32) -> u32 {
+    (4.0 * dpi + diameter / 15.0).max(12.0 * dpi).round() as u32
 }
 
 /// A circle's border ring and outside label band, in continuous pixels —
@@ -956,9 +1253,13 @@ fn draw_curved_label(
 struct Geometry {
     width: u32,
     height: u32,
+    /// Resting diameters.
     camera_diameter: u32,
     plate_diameter: u32,
-    name_px: u32,
+    /// The speaking size over the resting one ([`speak_scale`]).
+    speak_scale: f32,
+    /// Pixels per layout pixel, for the name's size ([`label_px`]).
+    dpi: f32,
     horizontal: bool,
     /// The surface hangs from its bottom edge: a row lines up there.
     bottom: bool,
@@ -983,14 +1284,16 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
             Face::Camera(_) => g.camera_diameter,
             Face::Plate => g.plate_diameter,
         };
-        // The reserved slot (fixed: sized for every tile's *speaking*
-        // size, see `Scene::tile_geom`) decides position and the loop
-        // bounds below; `draw` (animated via `tile.scale`) decides what's
-        // actually painted, from the same fixed center — so a tile grows
-        // and shrinks concentrically without moving or resizing its slot.
-        let reserve_diameter = speak_diameter(diameter);
-        let geom = circle_geometry(reserve_diameter, g.name_px);
-        let draw = radii(diameter as f32 * tile.scale, g.name_px);
+        // The reserved slot (fixed: sized for the larger of every tile's
+        // resting and speaking sizes, see `Scene::tile_geom`) decides
+        // position and the loop bounds below; `draw` (animated via
+        // `tile.scale`, its name along with it) decides what's actually
+        // painted, from the same fixed center — so a tile grows and shrinks
+        // concentrically without moving or resizing its slot.
+        let geom = reserved_geometry(diameter, g.speak_scale, g.dpi);
+        let drawn = diameter as f32 * tile.scale;
+        let name_px = label_px(drawn, g.dpi);
+        let draw = radii(drawn, name_px);
         let outer_w = geom.outer_w;
         let outer_h = geom.outer_h;
         // In a row the tiles line up at the edge the surface hangs from; in
@@ -1039,7 +1342,7 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
             Some(labels) => label_extent(
                 labels,
                 &tile.name,
-                g.name_px,
+                name_px,
                 draw.r_label_inner,
                 MAX_LABEL_ANGLE,
             ),
@@ -1131,7 +1434,7 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
                     cy,
                     draw.r_label_inner,
                     &shown,
-                    g.name_px,
+                    name_px,
                     ink,
                     labels,
                 );
@@ -1208,7 +1511,6 @@ mod tests {
 
     const CAMERA_D: u32 = 120;
     const PLATE_D: u32 = 72;
-    const NAME_PX: u32 = 12;
 
     fn geometry(tiles: &[Tile], horizontal: bool) -> Geometry {
         // Mirrors `compose`'s own reservation math: every tile's slot
@@ -1217,10 +1519,10 @@ mod tests {
             .iter()
             .map(|t| {
                 let d = match t.face {
-                    Face::Camera(_) => speak_diameter(CAMERA_D),
-                    Face::Plate => speak_diameter(PLATE_D),
+                    Face::Camera(_) => CAMERA_D,
+                    Face::Plate => PLATE_D,
                 };
-                circle_geometry(d, NAME_PX)
+                reserved_geometry(d, SPEAK_SCALE, 1.0)
             })
             .collect();
         let n = tiles.len() as u32;
@@ -1240,7 +1542,8 @@ mod tests {
             height,
             camera_diameter: CAMERA_D,
             plate_diameter: PLATE_D,
-            name_px: NAME_PX,
+            speak_scale: SPEAK_SCALE,
+            dpi: 1.0,
             horizontal,
             bottom: true,
             speaking_frame: true,
@@ -1399,7 +1702,7 @@ mod tests {
         let g = geometry(&tiles, true);
         let mut canvas = vec![0u8; (g.width * g.height * 4) as usize];
         compose(&mut canvas, &g, &tiles, Some(&mut labels));
-        let geom = circle_geometry(speak_diameter(CAMERA_D), NAME_PX);
+        let geom = reserved_geometry(CAMERA_D, SPEAK_SCALE, 1.0);
         let cx = geom.half_w as f32; // the lone tile sits at x0 == 0
         let is_ink = |p: &[u8]| p[2] > p[1] && p[1] > p[0] && p[2] < 80;
         let (mut ink_left, mut ink_right) = (0u32, 0u32);
@@ -1546,33 +1849,184 @@ mod tests {
         }
     }
 
-    /// However a tile is currently scaled, it never draws past the
-    /// slot reserved for its speaking size — the invariant that keeps the
-    /// animation from ever resizing the overlay window or clipping.
+    /// The size slider meets the old fixed sizes where they were and keeps
+    /// a hand-edited value inside its range; the name grows along with the
+    /// tile, in proportion, but never below a readable size — also on a
+    /// plate and at 200 %.
+    #[test]
+    fn slider_sizes_and_names_scale_together() {
+        for (size, plate) in [(120, 72), (240, 144), (360, 216)] {
+            assert_eq!((tile_base(size), plate_base(size)), (size, plate));
+        }
+        assert_eq!(tile_base(10), *TILE_SIZES.start());
+        assert_eq!(tile_base(9000), *TILE_SIZES.end());
+        for (diameter, px) in [(72, 12), (120, 12), (240, 20), (360, 28), (480, 36)] {
+            assert_eq!(label_px(diameter as f32, 1.0), px, "at {diameter}");
+            assert_eq!(
+                label_px(diameter as f32 * 2.0, 2.0),
+                px * 2,
+                "at {diameter}, 200 %"
+            );
+        }
+        let mut last = (0, 0, 0);
+        for size in TILE_SIZES {
+            let now = (
+                tile_base(size),
+                plate_base(size),
+                label_px(tile_base(size) as f32, 1.0),
+            );
+            assert!(now.0 > last.0 && now.1 >= last.1 && now.2 >= last.2);
+            let share = now.2 as f32 / now.0 as f32;
+            assert!(
+                size < 120 || (0.07..=0.105).contains(&share),
+                "name {} px on a {size} px tile",
+                now.2
+            );
+            last = now;
+        }
+    }
+
+    /// The speaking size comes from its own slider; unset it is 20 % more,
+    /// and it may also be the smaller one.
+    #[test]
+    fn speaking_scale_follows_its_slider() {
+        let mut s = OverlaySettings {
+            size: 220,
+            ..OverlaySettings::default()
+        };
+        assert!((speak_scale(&s) - SPEAK_SCALE).abs() < 1e-6);
+        s.speaking_size = Some(440);
+        assert_eq!(speak_scale(&s), 2.0);
+        s.speaking_size = Some(110);
+        assert_eq!(speak_scale(&s), 0.5);
+        s.speaking_size = Some(9000);
+        assert_eq!(speak_scale(&s), 480.0 / 220.0, "kept to the slider's range");
+    }
+
+    /// A shy tile hides as soon as the pointer is on it, stays hidden for
+    /// [`SHY_LINGER`] after it was last there, and only takes pointer input
+    /// again in the last [`SHY_PROBE`] of that; switched off it just shows.
+    #[test]
+    fn shy_tile_hides_under_the_pointer_and_comes_back() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let dt = 1.0 / 30.0;
+        let mut shy = Shy::SHOWN;
+        assert!(shy.takes_input(start));
+        shy = shy.step(true, true, start, dt);
+        assert!(shy.opacity < 1.0, "fades out at once");
+        assert!(!shy.takes_input(start), "a hidden tile lets clicks through");
+        for ms in (33..=200).step_by(33) {
+            shy = shy.step(true, false, at(ms), dt);
+        }
+        assert_eq!(shy.opacity, 0.0, "gone within 200 ms");
+        assert!(!shy.takes_input(at(600)));
+        assert!(shy.takes_input(at(700)), "probes before it shows again");
+        shy = shy.step(true, false, at(990), dt);
+        assert_eq!(shy.opacity, 0.0, "still hidden inside the linger");
+        // Seen again while probing: the linger starts over.
+        shy = shy.step(true, true, at(995), dt);
+        shy = shy.step(true, false, at(1500), dt);
+        assert_eq!(shy.opacity, 0.0);
+        for ms in (2000..2400).step_by(33) {
+            shy = shy.step(true, false, at(ms), dt);
+        }
+        assert_eq!(shy, Shy::SHOWN, "back once the pointer stays away");
+        let hidden = Shy::SHOWN.step(true, true, start, 1.0);
+        assert_eq!(hidden.opacity, 0.0);
+        let off = hidden.step(false, true, at(10), dt);
+        assert!(off.until.is_none() && off.opacity > 0.0, "off: never hides");
+    }
+
+    /// `slots` places tiles where `compose` draws them, and fading one
+    /// slot to nothing clears exactly that tile.
+    #[test]
+    fn slots_cover_the_drawn_tiles_and_fade_only_their_own() {
+        let mut labels = Labels::new().expect("embedded font");
+        for horizontal in [false, true] {
+            let tiles = tiles();
+            let g = geometry(&tiles, horizontal);
+            let geoms: Vec<CircleGeom> = tiles
+                .iter()
+                .map(|t| {
+                    let d = match t.face {
+                        Face::Camera(_) => CAMERA_D,
+                        Face::Plate => PLATE_D,
+                    };
+                    reserved_geometry(d, SPEAK_SCALE, 1.0)
+                })
+                .collect();
+            let slots = slots(&geoms, g.width, g.height, horizontal, g.bottom, g.gap);
+            let mut canvas = vec![0u8; (g.width * g.height * 4) as usize];
+            compose(&mut canvas, &g, &tiles, Some(&mut labels));
+            let painted = |canvas: &[u8], slot: Option<&Slot>| {
+                (0..g.height)
+                    .flat_map(|y| (0..g.width).map(move |x| (x, y)))
+                    .filter(|&(x, y)| {
+                        canvas[(y as usize * g.width as usize + x as usize) * 4 + 3] > 0
+                            && slot.is_none_or(|s| on_slot(s, (x as f32 + 0.5, y as f32 + 0.5)))
+                    })
+                    .count()
+            };
+            let total = painted(&canvas, None);
+            let per_slot: Vec<usize> = slots.iter().map(|s| painted(&canvas, Some(s))).collect();
+            assert!(per_slot.iter().all(|&n| n > 100), "a slot missed its tile");
+            assert_eq!(
+                per_slot.iter().sum::<usize>(),
+                total,
+                "paint outside the slots"
+            );
+            let mut faded = canvas.clone();
+            fade_slots(&mut faded, g.width, &slots, &[1.0, 0.0, 0.5]);
+            assert_eq!(painted(&faded, Some(&slots[0])), per_slot[0]);
+            assert_eq!(painted(&faded, Some(&slots[1])), 0, "hidden tile gone");
+            assert_eq!(painted(&faded, Some(&slots[2])), per_slot[2]);
+            let [x, y, w, h] = slots[2];
+            let half = (y..y + h)
+                .flat_map(|y| (x..x + w).map(move |x| (x, y)))
+                .map(|(x, y)| (y as usize * g.width as usize + x as usize) * 4)
+                .find(|&i| canvas[i + 3] == 0xff)
+                .unwrap();
+            assert_eq!(faded[half + 3], 128, "half-faded tile is half opaque");
+            assert!(faded[half..half + 3].iter().all(|&c| c <= faded[half + 3]));
+        }
+    }
+
+    /// However a tile is currently scaled between its resting and speaking
+    /// sizes — its name along with it — it never draws past its reserved
+    /// slot: the invariant that keeps the animation from ever resizing the
+    /// overlay window or clipping, whichever of the two sizes is larger.
     #[test]
     fn speaking_size_never_exceeds_its_reserved_slot() {
-        for base in [72u32, 120, 144, 216, 240, 360] {
-            for dpi in [1.0, 1.25, 1.5, 2.0] {
-                let base = scaled(base, dpi);
-                let name_px = scaled(NAME_PX, dpi);
-                let reserved = circle_geometry(speak_diameter(base), name_px);
-                for &scale in &[REST_SCALE, 1.05, SPEAK_SCALE] {
-                    let drawn = radii(base as f32 * scale, name_px);
-                    assert!(
-                        drawn.r_outer <= reserved.radii.r_outer + 1e-3,
-                        "base {base} scale {scale}: drawn r_outer {} > reserved {}",
-                        drawn.r_outer,
-                        reserved.radii.r_outer
-                    );
-                    assert!(
-                        drawn.r_label_outer <= reserved.radii.r_label_outer + 1e-3,
-                        "base {base} scale {scale}: drawn r_label_outer {} > reserved {}",
-                        drawn.r_label_outer,
-                        reserved.radii.r_label_outer
-                    );
+        for base in [72u32, 120, 144, 216, 240, 360, 480] {
+            for speak in [0.5, REST_SCALE, SPEAK_SCALE, 2.0] {
+                for dpi in [1.0, 1.25, 1.5, 2.0] {
+                    let base = scaled(base, dpi);
+                    let reserved = reserved_geometry(base, speak, dpi);
+                    for step in 0..=10 {
+                        let scale = REST_SCALE + (speak - REST_SCALE) * step as f32 / 10.0;
+                        let d = base as f32 * scale;
+                        let drawn = radii(d, label_px(d, dpi));
+                        assert!(
+                            drawn.r_outer <= reserved.radii.r_outer + 1e-3,
+                            "base {base} scale {scale}: drawn r_outer {} > reserved {}",
+                            drawn.r_outer,
+                            reserved.radii.r_outer
+                        );
+                        assert!(
+                            drawn.r_label_outer <= reserved.radii.r_label_outer + 1e-3,
+                            "base {base} scale {scale}: drawn r_label_outer {} > reserved {}",
+                            drawn.r_label_outer,
+                            reserved.radii.r_label_outer
+                        );
+                    }
                 }
             }
         }
-        assert_eq!(speak_diameter(100), (100.0 * SPEAK_SCALE).ceil() as u32);
+        assert_eq!(
+            reserve_diameter(100, SPEAK_SCALE),
+            (100.0 * SPEAK_SCALE).ceil() as u32
+        );
+        assert_eq!(reserve_diameter(100, 0.5), 100, "a smaller speaking size");
     }
 }

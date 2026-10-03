@@ -295,11 +295,23 @@ impl App {
         crate::signals::set_waker(move || ctx.request_repaint());
         #[cfg(feature = "tray")]
         let tray = crate::tray::Tray::start(cmd.clone(), cc.egui_ctx.clone(), tray_waker(cc)).ok();
+        #[cfg(feature = "camera")]
+        let (camera, self_video) = {
+            let handle = crate::camera::CameraHandle::new(camera_link);
+            let preview = crate::camera::CameraPreview::new(handle.preview_source());
+            (Some(handle), Some(preview))
+        };
+        // The own tile shows what the camera captures (`overlay.show_self`).
+        #[cfg(all(feature = "overlay", feature = "camera"))]
+        let own_video = camera.as_ref().map(|c| c.preview_source());
+        #[cfg(all(feature = "overlay", not(feature = "camera")))]
+        let own_video = None;
         #[cfg(feature = "overlay")]
         let overlay = match crate::overlay::OverlayHandle::start(
             state_rx.clone(),
             frames.clone(),
             cmd.clone(),
+            own_video,
         ) {
             Ok(h) => {
                 tracing::info!("overlay thread started (layer shell available)");
@@ -309,12 +321,6 @@ impl App {
                 tracing::warn!(%err, "overlay unavailable");
                 None
             }
-        };
-        #[cfg(feature = "camera")]
-        let (camera, self_video) = {
-            let handle = crate::camera::CameraHandle::new(camera_link);
-            let preview = crate::camera::CameraPreview::new(handle.preview_source());
-            (Some(handle), Some(preview))
         };
         let videos = crate::video::VideoTextures::new(frames);
         let setup = (!state.settings.ui.setup_done).then(|| SetupView::new(&state));
@@ -482,7 +488,7 @@ fn wake_on_change(mut state: tokio::sync::watch::Receiver<AppState>, ctx: egui::
                 while state.changed().await.is_ok() {
                     // Not immediate: a visible window repaints every 33 ms
                     // anyway, and the levels change 20 times a second.
-                    ctx.request_repaint_after(Duration::from_millis(100));
+                    super::repaint_after(&ctx, Duration::from_millis(100));
                 }
             });
         });
@@ -639,7 +645,8 @@ impl eframe::App for App {
         if !self.positioned {
             self.positioned = super::position_window(&ctx, MAIN_SIZE, MAIN_MIN_SIZE);
         }
-        ctx.request_repaint_after(Duration::from_millis(33));
+        super::watch_window_moves(&ctx);
+        super::repaint_after(&ctx, Duration::from_millis(33));
 
         self.debug_window(&ctx);
         let settings_test = self.settings_window(&ctx);
@@ -2494,7 +2501,7 @@ impl eframe::App for EnrollApp {
         // Registration completes on a worker, including while minimized.
         // An idle invitation needs no periodic repaint.
         if self.pending.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            super::repaint_after(ctx, Duration::from_millis(100));
         }
         if crate::signals::requested() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -2548,6 +2555,7 @@ impl eframe::App for EnrollApp {
         if !self.positioned {
             self.positioned = super::position_window(&ctx, [560.0, 600.0], [480.0, 520.0]);
         }
+        super::watch_window_moves(&ctx);
         let busy = self.pending.is_some();
         if !busy {
             self.take_dropped(&ctx);

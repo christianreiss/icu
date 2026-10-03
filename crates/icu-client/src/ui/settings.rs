@@ -15,8 +15,8 @@ use super::{theme, widgets};
 use crate::{
     audio::DeviceKind,
     config::{
-        self, Corner, Expand, HotkeyBackend, Identity, ModeSetting, Paths, Settings, TileSize,
-        VoiceStrength,
+        self, Corner, Expand, HotkeyBackend, Identity, ModeSetting, Paths, Settings, VoiceStrength,
+        TILE_SIZES,
     },
     engine::{AppState, Command},
     stats::DebugStats,
@@ -1102,7 +1102,7 @@ impl SettingsView {
             .is_some_and(|t| t.elapsed() < Duration::from_secs(3));
         if confirming {
             // Let the armed button fall back on its own after 3 s.
-            ui.ctx().request_repaint_after(Duration::from_millis(250));
+            super::repaint_after(ui.ctx(), Duration::from_millis(250));
         }
         widgets::setting_row(ui, true, "Von diesem Gerät abmelden", None, |ui| {
             let label = if confirming { "Wirklich?" } else { "Abmelden" };
@@ -1351,6 +1351,32 @@ impl SettingsView {
                             )
                         },
                     );
+                    // Beside the preview there is room the overlay card
+                    // has not: it would push the page past the screen.
+                    // Both say who the overlay shows.
+                    if self.overlay_available {
+                        ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {
+                            widgets::setting_row(ui, true, "Mich im Overlay zeigen", None, |ui| {
+                                widgets::named_toggle(
+                                    ui,
+                                    &mut self.draft.overlay.show_self,
+                                    "Mich im Overlay zeigen",
+                                )
+                            })
+                            .on_hover_text(
+                                "Deine eigene Kachel erscheint im Overlay nach allen anderen: \
+                                 dein Kamerabild, ohne Kamera ein Kreis mit deinen Initialen",
+                            );
+                            widgets::setting_row(ui, true, "Teilnehmer ohne Kamera", None, |ui| {
+                                widgets::named_toggle(
+                                    ui,
+                                    &mut self.draft.overlay.voice_plates,
+                                    "Teilnehmer ohne Kamera",
+                                )
+                            })
+                            .on_hover_text("Teilnehmer ohne Kamera bleiben im Overlay als kleinere Kreise mit Initialen und Namen sichtbar und werden beim Sprechen hervorgehoben");
+                        });
+                    }
                 });
                 #[cfg(feature = "camera")]
                 egui::Frame::new()
@@ -1428,35 +1454,45 @@ impl SettingsView {
                         corner_picker(ui, &mut self.draft.overlay.corner)
                     });
                 });
-                widgets::setting_row(ui, true, "Kachelgröße", None, |ui| {
-                    widgets::segmented(
-                        ui,
-                        &mut self.draft.overlay.size,
-                        &[
-                            (TileSize::Small, "Klein"),
-                            (TileSize::Medium, "Mittel"),
-                            (TileSize::Large, "Groß"),
-                        ],
-                    )
-                });
-                widgets::setting_row(ui, true, "Teilnehmer ohne Kamera", None, |ui| {
-                    widgets::named_toggle(
-                        ui,
-                        &mut self.draft.overlay.voice_plates,
-                        "Teilnehmer ohne Kamera",
-                    )
-                })
-                .on_hover_text("Teilnehmer ohne Kamera bleiben als kleinere Kreise mit Initialen und Namen sichtbar und werden beim Sprechen hervorgehoben");
+                // The camera tile's diameter, silent and speaking; plates and
+                // names follow it. Until its slider is touched the speaking
+                // size stays 20 % above the other one.
+                let sizes = *TILE_SIZES.start() as f32..=*TILE_SIZES.end() as f32;
+                let mut size = self.draft.overlay.size as f32;
+                widgets::slider_row(
+                    ui,
+                    true,
+                    "Inaktive Sprecher",
+                    &mut size,
+                    sizes.clone(),
+                    " px",
+                )
+                .on_hover_text("Durchmesser einer Kachel, solange die Person schweigt");
+                self.draft.overlay.size = size.round() as u32;
+                let mut speaking = self.draft.overlay.speaking_diameter() as f32;
+                if widgets::slider_row(ui, true, "Aktive Sprecher", &mut speaking, sizes, " px")
+                    .on_hover_text("Durchmesser einer Kachel, während die Person spricht")
+                    .changed()
+                {
+                    self.draft.overlay.speaking_size = Some(speaking.round() as u32);
+                }
                 if !adv {
                     return;
                 }
                 widgets::advanced_caption(ui);
+                // The frame's color sits beside its switch: a row of its
+                // own would push this page past the screen.
                 widgets::setting_row(ui, false, "Sprechende Person umranden", None, |ui| {
-                    widgets::named_toggle(
+                    let toggle = widgets::named_toggle(
                         ui,
                         &mut self.draft.overlay.speaking_frame,
                         "Sprechende Person umranden",
-                    )
+                    );
+                    ui.add_enabled_ui(self.draft.overlay.speaking_frame, |ui| {
+                        ui.color_edit_button_srgb(&mut self.draft.overlay.frame_color)
+                            .on_hover_text("Rahmenfarbe")
+                    });
+                    toggle
                 });
                 let edge = matches!(self.draft.overlay.corner, Corner::Top | Corner::Bottom);
                 widgets::setting_row(ui, true, "Anordnung", None, |ui| {
@@ -1494,12 +1530,14 @@ impl SettingsView {
                         "Stille Personen abdunkeln",
                     )
                 });
-                widgets::setting_row(ui, true, "Rahmenfarbe", None, |ui| {
-                    ui.add_enabled_ui(self.draft.overlay.speaking_frame, |ui| {
-                        ui.color_edit_button_srgb(&mut self.draft.overlay.frame_color)
-                    })
-                    .inner
-                });
+                widgets::setting_row(ui, true, "Dem Mauszeiger ausweichen", None, |ui| {
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.overlay.shy,
+                        "Dem Mauszeiger ausweichen",
+                    )
+                })
+                .on_hover_text("Eine Kachel blendet sich aus, sobald der Mauszeiger auf ihr liegt, und lässt Klicks zum Fenster darunter durch; eine Sekunde, nachdem er weg ist, kommt sie zurück");
             });
         });
     }
@@ -1694,7 +1732,7 @@ impl SettingsView {
             self.users_requested = Some(Instant::now());
             cmds.push(Command::RequestUserList);
         }
-        ui.ctx().request_repaint_after(every);
+        super::repaint_after(ui.ctx(), every);
 
         let me = state.me.as_ref().map(|m| m.user_id);
         // A list too long for one frame ends in a row with `user_id` 0 that
@@ -2907,7 +2945,7 @@ impl Capture {
     /// ICU may not read them — a key pressed while this window has the
     /// focus. Keeps the window repainting while it waits.
     pub(super) fn poll(&mut self, ui: &Ui) -> Option<Result<Captured, String>> {
-        ui.ctx().request_repaint_after(Duration::from_millis(50));
+        super::repaint_after(ui.ctx(), Duration::from_millis(50));
         let evdev = self.slot.lock().ok().and_then(|mut s| s.take());
         if let Some(Ok(key)) = evdev {
             return Some(Ok(Captured::from_evdev(key)));

@@ -9,6 +9,9 @@
 //! the configured corner or edge plus offset. The window is sized in
 //! physical pixels: tiles, names and offset are scaled by the monitor's
 //! DPI (`Scene::scale`), so at 150 % the overlay is as large as elsewhere.
+//!
+//! For `overlay.shy` the cursor position is read every frame; the window
+//! stays click-through throughout.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -28,8 +31,8 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::HiDpi::GetDpiForWindow,
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, PeekMessageW,
-            RegisterClassExW, SetWindowPos, ShowWindow, HWND_TOPMOST, MSG, PM_REMOVE,
+            CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos,
+            PeekMessageW, RegisterClassExW, SetWindowPos, ShowWindow, HWND_TOPMOST, MSG, PM_REMOVE,
             SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
             WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
             WS_EX_TRANSPARENT, WS_POPUP,
@@ -56,6 +59,8 @@ pub(super) fn run(
     let _ = ready.send(Ok(()));
     let mut surface: Option<Dib> = None;
     let mut visible = false;
+    // Where the window was last placed, while it is shown.
+    let mut placed: Option<POINT> = None;
     let mut raised_at = std::time::Instant::now();
     while !stop.load(Ordering::Relaxed) {
         let tick_started = std::time::Instant::now();
@@ -66,6 +71,14 @@ pub(super) fn run(
         // The window sits on the primary monitor; per-monitor DPI aware,
         // Windows reports that monitor's scaling (it may change at any time).
         scene.scale = dpi_scale(unsafe { GetDpiForWindow(hwnd) });
+        // Physical pixels, like the placement: the process is per-monitor
+        // DPI aware.
+        let mut cursor = POINT::default();
+        scene.pointer_at(placed.and_then(|at| {
+            unsafe { GetCursorPos(&mut cursor) }
+                .ok()
+                .map(|()| ((cursor.x - at.x) as f32, (cursor.y - at.y) as f32))
+        }));
         let update = scene.update();
         if !update.shown {
             if visible {
@@ -74,6 +87,7 @@ pub(super) fn run(
                 }
                 visible = false;
             }
+            placed = None;
         } else {
             let (w, h) = (scene.width, scene.height);
             if surface
@@ -96,6 +110,7 @@ pub(super) fn run(
                     Ok(()) => scene.report_displayed(),
                     Err(e) => tracing::warn!(%e, "overlay update"),
                 }
+                placed = Some(at);
                 if !visible {
                     unsafe {
                         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
