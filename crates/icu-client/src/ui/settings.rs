@@ -37,6 +37,9 @@ const PASTE_MAX_H: f32 = 120.0;
 /// Width of the camera preview beside the camera controls: enough to judge
 /// framing, small enough that the card stays a settings card.
 const PREVIEW_W: f32 = 176.0;
+/// The largest distance of the overlay from the screen edge the slider
+/// offers, in pixels.
+const EDGE_MAX: u32 = 200;
 /// Width of the settings sidebar.
 const NAV_W: f32 = 184.0;
 /// Content column cap: cards wider than this only put more empty space
@@ -1437,23 +1440,31 @@ impl SettingsView {
                 );
                 return;
             }
+            // Where it shows sits beside the switch: a row of its own would
+            // push this page past the screen once the sliders are there.
             widgets::setting_row(
                 ui,
                 false,
                 "Anzeigen",
                 Some(
-                    "Zeigt über allen Fenstern die Kameras der anderen, mit Namen — über \
-                     Spielen nur im Fenster- oder randlosen Modus, nicht im exklusiven \
-                     Vollbild.",
+                    "Über allen Fenstern; über Spielen im Fenster- oder randlosen Modus, \
+                     nicht im exklusiven Vollbild.",
                 ),
-                |ui| widgets::named_toggle(ui, &mut self.draft.overlay.enabled, "Anzeigen"),
+                |ui| {
+                    let toggle =
+                        widgets::named_toggle(ui, &mut self.draft.overlay.enabled, "Anzeigen");
+                    ui.add_space(16.0);
+                    ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {
+                        widgets::row_group(ui, CORNER_PICKER_W, |ui| {
+                            corner_picker(ui, &mut self.draft.overlay.corner)
+                        })
+                    })
+                    .response
+                    .on_hover_text("Position");
+                    toggle
+                },
             );
             ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {
-                widgets::setting_row(ui, true, "Position", None, |ui| {
-                    widgets::row_group(ui, CORNER_PICKER_W, |ui| {
-                        corner_picker(ui, &mut self.draft.overlay.corner)
-                    });
-                });
                 // The camera tile's diameter, silent and speaking; plates and
                 // names follow it. Until its slider is touched the speaking
                 // size stays 20 % above the other one.
@@ -1475,6 +1486,24 @@ impl SettingsView {
                     .changed()
                 {
                     self.draft.overlay.speaking_size = Some(speaking.round() as u32);
+                }
+                // One distance for both edges of a corner; separate ones
+                // from an older file stay until the slider is touched.
+                let [x, y] = self.draft.overlay.offset;
+                let mut edge = x.max(y).min(EDGE_MAX) as f32;
+                if widgets::slider_row(
+                    ui,
+                    true,
+                    "Abstand zum Rand",
+                    &mut edge,
+                    0.0..=EDGE_MAX as f32,
+                    " px",
+                )
+                .on_hover_text("Wie weit die Kacheln vom Bildschirmrand entfernt bleiben")
+                .changed()
+                {
+                    let edge = edge.round() as u32;
+                    self.draft.overlay.offset = [edge, edge];
                 }
                 if !adv {
                     return;
@@ -1507,21 +1536,6 @@ impl SettingsView {
                         )
                     })
                     .inner
-                });
-                widgets::setting_row(ui, true, "Abstand zum Rand", None, |ui| {
-                    const DRAG_W: f32 = 84.0;
-                    widgets::row_group(ui, DRAG_W * 2.0 + 6.0, |ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        for (axis, prefix) in [(0, "x "), (1, "y ")] {
-                            ui.add_sized(
-                                [DRAG_W, 24.0],
-                                egui::DragValue::new(&mut self.draft.overlay.offset[axis])
-                                    .prefix(prefix)
-                                    .suffix(" px")
-                                    .range(0..=2000),
-                            );
-                        }
-                    });
                 });
                 widgets::setting_row(ui, true, "Stille Personen abdunkeln", None, |ui| {
                     widgets::named_toggle(

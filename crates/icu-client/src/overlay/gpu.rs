@@ -233,26 +233,32 @@ impl Renderer {
                 Face::Camera(_) => scene.geometry.camera_diameter,
                 Face::Plate => scene.geometry.plate_diameter,
             };
-            let mut geom =
+            let reserved =
                 reserved_geometry(diameter, scene.geometry.speak_scale, scene.geometry.dpi);
+            let mut geom = reserved;
             geom.half_w += pad;
             geom.outer_w += pad * 2;
             geom.outer_h += pad * 2;
             let tx = if scene.geometry.horizontal {
                 x
             } else {
-                (w - geom.outer_w) / 2
+                scene.geometry.hug.offset(w, geom.outer_w)
             };
             let ty = if scene.geometry.horizontal && scene.geometry.bottom {
                 h - geom.outer_h
             } else {
                 y
             };
-            let cx = tx as f32 + geom.half_w as f32;
-            let cy = ty as f32 + pad as f32 + geom.radii.r_outer;
             let drawn = diameter as f32 * tile.scale;
             let name_px = label_px(drawn, scene.geometry.dpi);
             let r = radii(drawn, name_px);
+            let (cx, cy) = drawn_center(
+                ((tx + pad) as f32, (ty + pad) as f32),
+                &reserved,
+                &r,
+                scene.geometry.hug,
+                scene.geometry.bottom,
+            );
             let (shown, sweep) = scene
                 .labels
                 .as_mut()
@@ -651,6 +657,7 @@ mod tests {
                         dpi,
                         horizontal,
                         bottom,
+                        hug: Hug::Center,
                         speaking_frame: true,
                         frame_color: [46, 155, 255],
                         gap,
@@ -678,8 +685,17 @@ mod tests {
                         } else {
                             y
                         };
-                        let cx = tx + geom.half_w;
-                        let cy = ty + pad + geom.radii.r_outer as u32;
+                        // Where the tile is drawn at its current scale.
+                        let base = scaled([camera, plate, plate][index], dpi);
+                        let drawn = base as f32 * tiles[index].scale;
+                        let (cx, cy) = drawn_center(
+                            ((tx + pad) as f32, (ty + pad) as f32),
+                            &reserved_geometry(base, SPEAK_SCALE, dpi),
+                            &radii(drawn, label_px(drawn, dpi)),
+                            Hug::Center,
+                            bottom,
+                        );
+                        let (cx, cy) = (cx as u32, cy as u32);
                         let pixel = |x, y| &canvas[((y * width + x) * 4) as usize..][..4];
                         if index > 0 {
                             // Sample inside the face but clear of the initials.
@@ -778,6 +794,7 @@ mod tests {
                     dpi: 1.,
                     horizontal: true,
                     bottom: false,
+                    hug: Hug::Center,
                     speaking_frame: true,
                     frame_color: [46, 155, 255],
                     gap: GAP,
@@ -810,8 +827,11 @@ mod tests {
                 assert!(started.elapsed() < Duration::from_secs(10), "GPU stalled");
                 std::thread::sleep(GPU_TICK.saturating_sub(before.elapsed()));
             }
+            // Not speaking (scale 1): at the top of the slot reserved for
+            // speaking.
             let cx = geom.half_w + HALO;
-            let cy = geom.radii.r_outer as u32 + HALO;
+            let cy = (HALO as f32 + radii(diameter as f32, label_px(diameter as f32, 1.)).r_outer)
+                as u32;
             let center = ((cy * w + cx) * 4) as usize;
             assert_eq!(
                 &canvas[center..center + 4],
@@ -944,6 +964,7 @@ mod tests {
                     dpi: 2.,
                     horizontal,
                     bottom: true,
+                    hug: Hug::Center,
                     speaking_frame: true,
                     frame_color: [46, 155, 255],
                     gap,

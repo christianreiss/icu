@@ -141,16 +141,39 @@ impl Shy {
 /// A tile's slot on the canvas: `[x, y, width, height]`.
 type Slot = [u32; 4];
 
+/// Which side of the space it has a tile keeps to: the side toward the
+/// screen edge the overlay hangs from, so a tile keeps its distance to that
+/// edge and grows toward the middle of the screen; on an edge the overlay
+/// is centered along, the middle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hug {
+    Start,
+    Center,
+    End,
+}
+
+impl Hug {
+    /// Where something `size` long starts in a space `space` long.
+    fn offset(self, space: u32, size: u32) -> u32 {
+        match self {
+            Hug::Start => 0,
+            Hug::Center => space.saturating_sub(size) / 2,
+            Hug::End => space.saturating_sub(size),
+        }
+    }
+}
+
 /// Where each tile's slot (`geoms`, in tile order) sits on a `width ×
 /// height` canvas — the same placement [`compose`] and the GPU renderer
 /// use: a row lines up at the edge the surface hangs from (`bottom`), a
-/// column centers each tile in its width.
+/// column at its side (`hug`).
 fn slots(
     geoms: &[CircleGeom],
     width: u32,
     height: u32,
     horizontal: bool,
     bottom: bool,
+    hug: Hug,
     gap: u32,
 ) -> Vec<Slot> {
     let (mut x, mut y) = (0, 0);
@@ -165,7 +188,7 @@ fn slots(
                 };
                 [x, ty, g.outer_w, g.outer_h]
             } else {
-                [width.saturating_sub(g.outer_w) / 2, y, g.outer_w, g.outer_h]
+                [hug.offset(width, g.outer_w), y, g.outer_w, g.outer_h]
             };
             if horizontal {
                 x += g.outer_w + gap;
@@ -736,6 +759,16 @@ impl Scene {
         )
     }
 
+    /// The side tiles keep to across the screen: the one the overlay hangs
+    /// from, the middle on a top or bottom edge.
+    fn hug(&self) -> Hug {
+        match self.settings.corner {
+            Corner::TopLeft | Corner::BottomLeft => Hug::Start,
+            Corner::TopRight | Corner::BottomRight => Hug::End,
+            Corner::Top | Corner::Bottom => Hug::Center,
+        }
+    }
+
     /// `Top`/`Bottom` are always laid out horizontally (and centered by the
     /// compositor); other positions follow the configured expand direction.
     fn effective_expand(&self) -> Expand {
@@ -909,6 +942,7 @@ impl Scene {
             height,
             self.effective_expand() == Expand::Horizontal,
             self.anchored_bottom(),
+            self.hug(),
             gap,
         );
         let mut shy = HashMap::with_capacity(self.shy.len());
@@ -954,6 +988,7 @@ impl Scene {
             dpi: self.scale,
             horizontal: self.effective_expand() == Expand::Horizontal,
             bottom: self.anchored_bottom(),
+            hug: self.hug(),
             speaking_frame: self.settings.speaking_frame,
             frame_color: self.settings.frame_color,
             gap: scaled(GAP, self.scale),
@@ -1122,6 +1157,8 @@ fn radii(diameter: f32, name_px: u32) -> Radii {
 /// never needs to change size.
 #[derive(Clone, Copy)]
 struct CircleGeom {
+    /// The radii at the reserved size; the tests hold drawn tiles to them.
+    #[cfg_attr(not(test), allow(dead_code))]
     radii: Radii,
     /// Half the outer bounding box's width.
     half_w: u32,
@@ -1131,6 +1168,18 @@ struct CircleGeom {
 
 fn circle_geometry(diameter: u32, name_px: u32) -> CircleGeom {
     let radii = radii(diameter as f32, name_px);
+    let half_w = half_width(&radii).ceil() as u32;
+    CircleGeom {
+        radii,
+        half_w,
+        outer_w: half_w * 2,
+        outer_h: (radii.r_outer + radii.r_label_outer).ceil() as u32,
+    }
+}
+
+/// Half the width a circle with `radii` and its name take, measured from
+/// its center: the larger of its sides.
+fn half_width(radii: &Radii) -> f32 {
     // The label band can bulge sideways past the circle itself at wide
     // angles, all to the right since the label starts at 6 o'clock and
     // only ever sweeps counterclockwise from there; the tile's reserved
@@ -1146,13 +1195,35 @@ fn circle_geometry(diameter: u32, name_px: u32) -> CircleGeom {
     let mid_r = radii.r_label_inner + half_thick;
     let flat_bulge = radii.r_label_outer * MAX_LABEL_ANGLE.min(std::f32::consts::FRAC_PI_2).sin();
     let cap_bulge = mid_r * MAX_LABEL_ANGLE.sin() + half_thick;
-    let half_w = radii.r_outer.max(flat_bulge).max(cap_bulge).ceil() as u32;
-    CircleGeom {
-        radii,
-        half_w,
-        outer_w: half_w * 2,
-        outer_h: (radii.r_outer + radii.r_label_outer).ceil() as u32,
-    }
+    radii.r_outer.max(flat_bulge).max(cap_bulge)
+}
+
+/// The center of a tile drawn with `drawn` radii in a slot reserved as
+/// `reserved` whose inside (any halo padding aside) starts at `origin`: up
+/// against the slot's sides toward the screen edges the overlay hangs from
+/// (`hug` across, `bottom` or else the top), so the tile keeps its
+/// distance to them as it grows and shrinks, and grows toward the middle of
+/// the screen. What faces those sides is the circle (left, top), or the
+/// name curving around its bottom and right side (bottom, right).
+fn drawn_center(
+    origin: (f32, f32),
+    reserved: &CircleGeom,
+    drawn: &Radii,
+    hug: Hug,
+    bottom: bool,
+) -> (f32, f32) {
+    let (x, y) = origin;
+    let cx = match hug {
+        Hug::Start => x + drawn.r_outer,
+        Hug::Center => x + reserved.half_w as f32,
+        Hug::End => x + reserved.outer_w as f32 - half_width(drawn),
+    };
+    let cy = if bottom {
+        y + reserved.outer_h as f32 - drawn.r_label_outer
+    } else {
+        y + drawn.r_outer
+    };
+    (cx, cy)
 }
 
 /// Samples `rgba` (announced `fw × fh`) as a centered square crop into a
@@ -1261,8 +1332,11 @@ struct Geometry {
     /// Pixels per layout pixel, for the name's size ([`label_px`]).
     dpi: f32,
     horizontal: bool,
-    /// The surface hangs from its bottom edge: a row lines up there.
+    /// The surface hangs from its bottom edge: a row lines up there, and
+    /// every tile keeps to the bottom of its slot.
     bottom: bool,
+    /// The side a column lines up at, and every tile keeps to in its slot.
+    hug: Hug,
     speaking_frame: bool,
     frame_color: [u8; 3],
     /// Spacing between adjacent tiles, already scaled — see [`GAP`].
@@ -1288,8 +1362,9 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
         // resting and speaking sizes, see `Scene::tile_geom`) decides
         // position and the loop bounds below; `draw` (animated via
         // `tile.scale`, its name along with it) decides what's actually
-        // painted, from the same fixed center — so a tile grows and shrinks
-        // concentrically without moving or resizing its slot.
+        // painted, kept to the slot's sides toward the screen edges
+        // (`drawn_center`) — so a tile grows toward the middle of the
+        // screen without moving or resizing its slot.
         let geom = reserved_geometry(diameter, g.speak_scale, g.dpi);
         let drawn = diameter as f32 * tile.scale;
         let name_px = label_px(drawn, g.dpi);
@@ -1297,9 +1372,8 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
         let outer_w = geom.outer_w;
         let outer_h = geom.outer_h;
         // In a row the tiles line up at the edge the surface hangs from; in
-        // a column each tile centers within the column's width — camera
-        // and plate circles are different sizes now, unlike the old
-        // uniform-width rectangles.
+        // a column at its side — camera and plate circles are different
+        // sizes, unlike the old uniform-width rectangles.
         let ty = if g.horizontal && g.bottom {
             g.height.saturating_sub(outer_h)
         } else {
@@ -1308,10 +1382,9 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
         let tx = if g.horizontal {
             x0
         } else {
-            (g.width.saturating_sub(outer_w)) / 2
+            g.hug.offset(g.width, outer_w)
         };
-        let cx = tx as f32 + geom.half_w as f32;
-        let cy = ty as f32 + geom.radii.r_outer;
+        let (cx, cy) = drawn_center((tx as f32, ty as f32), &geom, &draw, g.hug, g.bottom);
         let [fr, fg, fb] = g.frame_color;
         let border = if tile.speaking && g.speaking_frame {
             [fb, fg, fr, 0xff] // B G R A premultiplied
@@ -1546,6 +1619,7 @@ mod tests {
             dpi: 1.0,
             horizontal,
             bottom: true,
+            hug: Hug::Center,
             speaking_frame: true,
             frame_color: [0x2e, 0x9b, 0xff],
             gap: GAP,
@@ -1956,7 +2030,9 @@ mod tests {
                     reserved_geometry(d, SPEAK_SCALE, 1.0)
                 })
                 .collect();
-            let slots = slots(&geoms, g.width, g.height, horizontal, g.bottom, g.gap);
+            let slots = slots(
+                &geoms, g.width, g.height, horizontal, g.bottom, g.hug, g.gap,
+            );
             let mut canvas = vec![0u8; (g.width * g.height * 4) as usize];
             compose(&mut canvas, &g, &tiles, Some(&mut labels));
             let painted = |canvas: &[u8], slot: Option<&Slot>| {
@@ -1989,6 +2065,79 @@ mod tests {
                 .unwrap();
             assert_eq!(faded[half + 3], 128, "half-faded tile is half opaque");
             assert!(faded[half..half + 3].iter().all(|&c| c <= faded[half + 3]));
+        }
+    }
+
+    /// A tile keeps its distance to the screen edges the overlay hangs from
+    /// and grows toward the middle of the screen: the sides of what it draws
+    /// toward those edges stay where they are between resting and
+    /// speaking, at the sides of its slot.
+    #[test]
+    fn tiles_grow_toward_the_middle_of_the_screen() {
+        let mut labels = Labels::new().expect("embedded font");
+        let speak = 2.0;
+        let geom = reserved_geometry(PLATE_D, speak, 1.0);
+        let (w, h) = (geom.outer_w, geom.outer_h);
+        for hug in [Hug::Start, Hug::Center, Hug::End] {
+            for bottom in [false, true] {
+                let mut bounds = |scale: f32| {
+                    let tiles = [Tile {
+                        face: Face::Plate,
+                        // Long enough to curve past 3 o'clock at any size.
+                        name: "Eva-Maria Schulte-Wiedenbrück".into(),
+                        speaking: false,
+                        dim: false,
+                        scale,
+                    }];
+                    let g = Geometry {
+                        width: w,
+                        height: h,
+                        camera_diameter: CAMERA_D,
+                        plate_diameter: PLATE_D,
+                        speak_scale: speak,
+                        dpi: 1.0,
+                        horizontal: false,
+                        bottom,
+                        hug,
+                        speaking_frame: false,
+                        frame_color: [0; 3],
+                        gap: GAP,
+                    };
+                    let mut canvas = vec![0u8; (w * h * 4) as usize];
+                    compose(&mut canvas, &g, &tiles, Some(&mut labels));
+                    let drawn: Vec<(u32, u32)> = (0..h)
+                        .flat_map(|y| (0..w).map(move |x| (x, y)))
+                        .filter(|&(x, y)| canvas[((y * w + x) * 4 + 3) as usize] > 0)
+                        .collect();
+                    let x = drawn.iter().map(|p| p.0);
+                    let y = drawn.iter().map(|p| p.1);
+                    (
+                        x.clone().min().unwrap(),
+                        y.clone().min().unwrap(),
+                        x.max().unwrap(),
+                        y.max().unwrap(),
+                    )
+                };
+                let (rest, speaking) = (bounds(REST_SCALE), bounds(speak));
+                let at = |a: u32, b: u32| a.abs_diff(b) <= 2;
+                let what =
+                    format!("{hug:?}, bottom {bottom}: rest {rest:?}, speaking {speaking:?}");
+                if bottom {
+                    assert!(at(rest.3, h - 1) && at(speaking.3, h - 1), "{what}");
+                    assert!(rest.1 > speaking.1 + 30, "grows upward: {what}");
+                } else {
+                    assert!(at(rest.1, 0) && at(speaking.1, 0), "{what}");
+                    assert!(rest.3 + 30 < speaking.3, "grows downward: {what}");
+                }
+                match hug {
+                    Hug::Start => assert!(at(rest.0, 0) && at(speaking.0, 0), "{what}"),
+                    Hug::End => assert!(at(rest.2, w - 1) && at(speaking.2, w - 1), "{what}"),
+                    Hug::Center => assert!(
+                        rest.0 > speaking.0 + 20 && rest.2 + 20 < speaking.2,
+                        "grows both ways: {what}"
+                    ),
+                }
+            }
         }
     }
 
