@@ -1577,7 +1577,7 @@ impl SettingsView {
                         "Dem Mauszeiger ausweichen",
                     )
                 })
-                .on_hover_text("Die ganze Kachelreihe blendet sich aus, sobald der Mauszeiger auf einer Kachel liegt, und lässt Klicks zum Fenster darunter durch; eine Sekunde, nachdem er weg ist, kommt sie zurück");
+                .on_hover_text("Liegt der Mauszeiger auf einer Kachel, blendet sich die ganze Reihe aus und auf der gegenüberliegenden Bildschirmseite wieder ein; Klicks gehen zum Fenster darunter durch");
             });
         });
     }

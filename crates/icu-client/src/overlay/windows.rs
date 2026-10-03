@@ -197,11 +197,11 @@ fn work_area() -> RECT {
     }
 }
 
-/// Top left corner of a `w × h` overlay for the configured corner and
-/// offset.
+/// Top left corner of a `w × h` overlay for the corner it is in (the
+/// configured one, or across from it, `Scene::corner`) and offset.
 fn position(scene: &Scene, w: u32, h: u32) -> POINT {
     place(
-        scene.settings.corner,
+        scene.corner(),
         scene.settings.offset,
         scene.scale,
         work_area(),

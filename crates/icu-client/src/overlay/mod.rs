@@ -3,7 +3,8 @@
 //! tile with the name, and for everyone without one a smaller name plate.
 //! Both remain visible and highlight whoever is speaking. With
 //! `overlay.shy` the whole row fades out of the mouse pointer's way as soon
-//! as it is on any tile (see [`Shy`]);
+//! as it is on any tile, and back in on the other side of the screen (see
+//! [`Shy`]);
 //! with `overlay.show_self` the own tile comes last, from the local camera.
 //!
 //! What is shown and how it is drawn (GPU 30 fps, CPU fallback 15 fps) lives
@@ -84,59 +85,91 @@ const SPEAK_SCALE: f32 = 1.2;
 /// (at 15 fps, ~5-8 ticks / 300-500 ms to settle).
 const SCALE_EASE: f32 = 0.35;
 
-/// How long the shy row (`overlay.shy`) stays out of the way after the
-/// pointer was last seen over one of its tiles.
-const SHY_LINGER: Duration = Duration::from_millis(1000);
-/// The end of that linger, during which the still hidden row takes pointer
-/// input again on Wayland: a surface that takes none hears nothing of the
-/// pointer, so this is the only way to learn whether it is still there.
-const SHY_PROBE: Duration = Duration::from_millis(350);
-/// Seconds the shy row takes to fade out, and back in.
+/// Seconds the shy row (`overlay.shy`) takes to fade out, and back in on
+/// the other side.
 const SHY_HIDE_SECS: f32 = 0.12;
 const SHY_SHOW_SECS: f32 = 0.3;
+/// How long the fully shown row must be free of the pointer before the
+/// pointer can send it off: one that it came back under, or that rests on
+/// it, does not. Longer than a tick, since on Wayland the pointer's Enter
+/// only arrives the tick after the row takes input again.
+const SHY_SETTLE: Duration = Duration::from_millis(100);
 
-/// The row's shyness (`overlay.shy`): how opaque its tiles are, and until
-/// when they stay out of the pointer's way — all together, so the pointer on
-/// one tile clears the whole row.
+/// The row's shyness (`overlay.shy`): how opaque its tiles are, and whether
+/// they are on their way out — all together, so the pointer on one tile
+/// sends the whole row to the other side of the screen ([`opposite`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Shy {
     opacity: f32,
-    /// Hidden until then; `None` while nothing is in its way.
-    until: Option<Instant>,
+    /// Fading out, to come back on the other side.
+    leaving: bool,
+    /// Since when the fully shown row has been free of the pointer.
+    quiet_since: Option<Instant>,
 }
 
 impl Shy {
     const SHOWN: Shy = Shy {
         opacity: 1.0,
-        until: None,
+        leaving: false,
+        quiet_since: None,
     };
 
-    /// Advances by `dt` seconds: the pointer over a tile (`hovered`)
-    /// hides the row at once and keeps it hidden until [`SHY_LINGER`] after
-    /// it was last seen on one; then it fades back in. Off (`enabled`
-    /// false), it only fades back in.
-    fn step(self, enabled: bool, hovered: bool, now: Instant, dt: f32) -> Shy {
-        let until = match (enabled, hovered) {
-            (false, _) => None,
-            (true, true) => Some(now + SHY_LINGER),
-            (true, false) => self.until.filter(|&until| until > now),
-        };
-        let opacity = if until.is_some() {
-            (self.opacity - dt / SHY_HIDE_SECS).max(0.0)
-        } else {
-            (self.opacity + dt / SHY_SHOW_SECS).min(1.0)
-        };
-        Shy { opacity, until }
+    /// Advances to `now`, `dt` seconds on: the pointer coming onto a tile
+    /// (`hovered`) of the row that is all there and has been free of it
+    /// for [`SHY_SETTLE`] sends the row away — it fades out, and the step
+    /// it is gone in returns true: time to move to the other side, where it
+    /// fades back in. Arriving under the pointer, it stays until the
+    /// pointer leaves and comes again, so a pointer over both places does
+    /// not bounce it to and fro. Off (`enabled` false), it only fades back
+    /// in.
+    fn step(self, enabled: bool, hovered: bool, now: Instant, dt: f32) -> (Shy, bool) {
+        let armed = self
+            .quiet_since
+            .is_some_and(|t| now.saturating_duration_since(t) >= SHY_SETTLE);
+        let leaving = enabled && (self.leaving || hovered && armed);
+        if !leaving {
+            let opacity = (self.opacity + dt / SHY_SHOW_SECS).min(1.0);
+            let quiet_since = (opacity >= 1.0 && !hovered).then(|| self.quiet_since.unwrap_or(now));
+            return (
+                Shy {
+                    opacity,
+                    leaving,
+                    quiet_since,
+                },
+                false,
+            );
+        }
+        let opacity = (self.opacity - dt / SHY_HIDE_SECS).max(0.0);
+        let gone = opacity <= 0.0;
+        (
+            Shy {
+                opacity,
+                leaving: !gone,
+                quiet_since: None,
+            },
+            gone,
+        )
     }
 
     /// Whether the tiles take pointer input (Wayland) so the scene learns
-    /// where the pointer is: while shown, and in the last [`SHY_PROBE`] of
-    /// the linger — never while hidden otherwise, so a click on them
-    /// reaches whatever is below.
+    /// where the pointer is: only while the row is all there and staying —
+    /// leaving or coming back, a click on it reaches whatever is below.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
-    fn takes_input(self, now: Instant) -> bool {
-        self.until
-            .is_none_or(|until| until.saturating_duration_since(now) <= SHY_PROBE)
+    fn takes_input(self) -> bool {
+        !self.leaving && self.opacity >= 1.0
+    }
+}
+
+/// Where the shy row goes from `corner`: the mirrored corner on the other
+/// side of the screen, the other edge from the top or bottom middle.
+fn opposite(corner: Corner) -> Corner {
+    match corner {
+        Corner::TopLeft => Corner::TopRight,
+        Corner::TopRight => Corner::TopLeft,
+        Corner::BottomLeft => Corner::BottomRight,
+        Corner::BottomRight => Corner::BottomLeft,
+        Corner::Top => Corner::Bottom,
+        Corner::Bottom => Corner::Top,
     }
 }
 
@@ -602,6 +635,10 @@ struct Scene {
     slots: Vec<Slot>,
     /// The row's shyness: one for all tiles.
     shy: Shy,
+    /// The shy row got out of the pointer's way to the [`opposite`] corner
+    /// and stays there until the pointer comes again. Not saved: a new
+    /// position, `shy` off or a restart puts it back.
+    flipped: bool,
     /// Where the pointer is on the canvas, if known (see
     /// [`Scene::pointer_at`]).
     pointer: Option<(f32, f32)>,
@@ -665,6 +702,7 @@ impl Scene {
             presented_frames: None,
             slots: Vec::new(),
             shy: Shy::SHOWN,
+            flipped: false,
             pointer: None,
             pointer_trail: Vec::new(),
             own_video,
@@ -707,7 +745,7 @@ impl Scene {
     /// nowhere — the overlay is click-through.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn input_rects(&self) -> Vec<Slot> {
-        if !self.settings.shy || !self.shy.takes_input(Instant::now()) {
+        if !self.settings.shy || !self.shy.takes_input() {
             return Vec::new();
         }
         self.slots.clone()
@@ -743,11 +781,21 @@ impl Scene {
         geom
     }
 
+    /// Where the overlay is: the configured corner, or the one across from
+    /// it while the shy row is over there.
+    fn corner(&self) -> Corner {
+        if self.flipped {
+            opposite(self.settings.corner)
+        } else {
+            self.settings.corner
+        }
+    }
+
     /// Whether the surface hangs from its bottom edge: the tiles of a
     /// horizontal row line up there.
     fn anchored_bottom(&self) -> bool {
         matches!(
-            self.settings.corner,
+            self.corner(),
             Corner::BottomLeft | Corner::BottomRight | Corner::Bottom
         )
     }
@@ -755,7 +803,7 @@ impl Scene {
     /// The side tiles keep to across the screen: the one the overlay hangs
     /// from, the middle on a top or bottom edge.
     fn hug(&self) -> Hug {
-        match self.settings.corner {
+        match self.corner() {
             Corner::TopLeft | Corner::BottomLeft => Hug::Start,
             Corner::TopRight | Corner::BottomRight => Hug::End,
             Corner::Top | Corner::Bottom => Hug::Center,
@@ -765,7 +813,7 @@ impl Scene {
     /// `Top`/`Bottom` are always laid out horizontally (and centered by the
     /// compositor); other positions follow the configured expand direction.
     fn effective_expand(&self) -> Expand {
-        match self.settings.corner {
+        match self.corner() {
             Corner::Top | Corner::Bottom => Expand::Horizontal,
             _ => self.settings.expand,
         }
@@ -815,8 +863,13 @@ impl Scene {
             }
             (overlay.clone(), peers, own.map(|me| me.session))
         };
-        let layout_changed = layout(&settings) != layout(&self.settings);
+        let mut layout_changed = layout(&settings) != layout(&self.settings);
         let settings_changed = self.settings != settings;
+        // A new position, or shyness off, brings the row home.
+        if self.flipped && (layout_changed || !settings.shy) {
+            self.flipped = false;
+            layout_changed = true;
+        }
         self.settings = settings;
 
         // Camera tiles first, then the smaller plates; each group in name order.
@@ -927,8 +980,8 @@ impl Scene {
         self.height = height;
 
         // Shyness: the pointer on any tile (now, or since the last frame)
-        // gets the whole row out of its way. A hidden row is not displayed,
-        // so its pictures are not reported as seen.
+        // sends the whole row to the other side. A hidden row is not
+        // displayed, so its pictures are not reported as seen.
         self.slots = slots(
             &geoms,
             width,
@@ -943,7 +996,18 @@ impl Scene {
             .iter()
             .chain(&trail)
             .any(|&at| self.slots.iter().any(|slot| on_slot(slot, at)));
-        self.shy = self.shy.step(self.settings.shy, hovered, now, dt);
+        let (shy, gone) = self.shy.step(self.settings.shy, hovered, now, dt);
+        self.shy = shy;
+        if gone {
+            // Placed anew over there; where the pointer was is of the old
+            // place.
+            self.flipped = !self.flipped;
+            self.pointer = None;
+            layout_changed = true;
+            if let Some(renderer) = self.gpu.as_mut() {
+                renderer.invalidate();
+            }
+        }
         if self.shy.opacity <= 0.0 {
             self.visible_frames.clear();
         }
@@ -1955,39 +2019,78 @@ mod tests {
         assert_eq!(speak_scale(&s), 480.0 / 220.0, "kept to the slider's range");
     }
 
-    /// The shy row hides as soon as the pointer is on a tile, stays hidden
-    /// for [`SHY_LINGER`] after it was last there, and only takes pointer input
-    /// again in the last [`SHY_PROBE`] of that; switched off it just shows.
+    /// The shy row fades out as soon as the pointer comes onto a tile,
+    /// says when it is gone (time to move across) and fades back in; it
+    /// takes pointer input only while it is all there and staying. Arriving
+    /// under the pointer it stays until the pointer has been off it for
+    /// [`SHY_SETTLE`] and comes again; switched off it just shows.
     #[test]
-    fn shy_tile_hides_under_the_pointer_and_comes_back() {
+    fn shy_row_fades_out_and_comes_back_across() {
         let start = Instant::now();
-        let at = |ms| start + Duration::from_millis(ms);
-        let dt = 1.0 / 30.0;
+        let at = |frame: u32| start + Duration::from_millis(u64::from(frame) * 33);
+        let dt = 0.033;
+        let mut frame = 0;
+        let mut step = |shy: Shy, hovered: bool| {
+            let next = shy.step(true, hovered, at(frame), dt);
+            frame += 1;
+            next
+        };
         let mut shy = Shy::SHOWN;
-        assert!(shy.takes_input(start));
-        shy = shy.step(true, true, start, dt);
-        assert!(shy.opacity < 1.0, "fades out at once");
-        assert!(!shy.takes_input(start), "a hidden tile lets clicks through");
-        for ms in (33..=200).step_by(33) {
-            shy = shy.step(true, false, at(ms), dt);
+        for _ in 0..4 {
+            shy = step(shy, false).0;
         }
-        assert_eq!(shy.opacity, 0.0, "gone within 200 ms");
-        assert!(!shy.takes_input(at(600)));
-        assert!(shy.takes_input(at(700)), "probes before it shows again");
-        shy = shy.step(true, false, at(990), dt);
-        assert_eq!(shy.opacity, 0.0, "still hidden inside the linger");
-        // Seen again while probing: the linger starts over.
-        shy = shy.step(true, true, at(995), dt);
-        shy = shy.step(true, false, at(1500), dt);
+        assert!(shy.takes_input());
+        let mut frames = 0;
+        let gone = loop {
+            let (next, gone) = step(shy, frames == 0);
+            frames += 1;
+            assert!(!next.takes_input(), "leaving, it lets clicks through");
+            shy = next;
+            if gone || frames > 10 {
+                break gone;
+            }
+            assert!(shy.leaving && shy.opacity < 1.0, "keeps going once sent");
+        };
+        assert!(gone && frames as f32 * dt <= 0.2, "gone within 200 ms");
         assert_eq!(shy.opacity, 0.0);
-        for ms in (2000..2400).step_by(33) {
-            shy = shy.step(true, false, at(ms), dt);
+        // Over there, under the pointer: back all the way, and it stays.
+        for _ in 0..30 {
+            let (next, gone) = step(shy, true);
+            assert!(!gone && !next.leaving, "no bounce under a resting pointer");
+            shy = next;
         }
-        assert_eq!(shy, Shy::SHOWN, "back once the pointer stays away");
-        let hidden = Shy::SHOWN.step(true, true, start, 1.0);
-        assert_eq!(hidden.opacity, 0.0);
-        let off = hidden.step(false, true, at(10), dt);
-        assert!(off.until.is_none() && off.opacity > 0.0, "off: never hides");
+        assert_eq!(shy.opacity, 1.0, "back");
+        // Off it for less than the settle time and back: still stays.
+        shy = step(shy, false).0;
+        shy = step(shy, true).0;
+        assert!(!shy.leaving, "a twitch does not send it off");
+        // Off it for longer, then onto it: off again.
+        for _ in 0..4 {
+            shy = step(shy, false).0;
+            assert!(shy.takes_input());
+        }
+        let (shy, _) = step(shy, true);
+        assert!(shy.leaving, "the pointer coming again sends it off");
+        let (off, gone) = shy.step(false, true, at(100), dt);
+        assert!(
+            !gone && !off.leaving && off.opacity > shy.opacity,
+            "off: never leaves"
+        );
+    }
+
+    /// The shy row goes to the mirrored corner, or the other edge from the
+    /// middle of one, and back.
+    #[test]
+    fn shy_row_goes_across_and_back() {
+        use Corner::*;
+        for (from, to) in [
+            (TopLeft, TopRight),
+            (BottomLeft, BottomRight),
+            (Top, Bottom),
+        ] {
+            assert_eq!(opposite(from), to);
+            assert_eq!(opposite(to), from);
+        }
     }
 
     /// `slots` places tiles where `compose` draws them, and fading one

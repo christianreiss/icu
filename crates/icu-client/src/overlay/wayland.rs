@@ -5,7 +5,8 @@
 //! With `overlay.shy` the tiles that are shown take pointer input instead
 //! (`Scene::input_rects`): only so does the compositor tell where the
 //! pointer is. The whole row hides as soon as the pointer is on a tile and
-//! gives its input up, so clicks reach what is below again.
+//! gives its input up, so clicks reach what is below again; on the other
+//! side of the screen it comes back on a new layer surface.
 
 use std::{
     sync::{
@@ -169,7 +170,7 @@ impl App {
                 None,
             );
             let settings = &self.scene.settings;
-            let anchor = match settings.corner {
+            let anchor = match self.scene.corner() {
                 Corner::TopLeft => Anchor::TOP | Anchor::LEFT,
                 Corner::TopRight => Anchor::TOP | Anchor::RIGHT,
                 Corner::BottomLeft => Anchor::BOTTOM | Anchor::LEFT,
