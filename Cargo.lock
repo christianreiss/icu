@@ -2503,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "icu-client"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ab_glyph",
  "arboard",
@@ -2555,7 +2555,7 @@ dependencies = [
 
 [[package]]
 name = "icu-proto"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "base64 0.22.1",
  "postcard",
@@ -2570,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "icu-server"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bytes",
  "clap",
