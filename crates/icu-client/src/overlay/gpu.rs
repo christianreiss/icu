@@ -108,7 +108,11 @@ impl Renderer {
                     module: &shader,
                     entry_point: Some("fs"),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::TextureFormat::Bgra8Unorm.into())],
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Bgra8Unorm,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
                 }),
                 primitive: Default::default(),
                 depth_stencil: None,
@@ -233,8 +237,7 @@ impl Renderer {
                 Face::Camera(_) => scene.geometry.camera_diameter,
                 Face::Plate => scene.geometry.plate_diameter,
             };
-            let reserved =
-                reserved_geometry(diameter, scene.geometry.speak_scale, scene.geometry.dpi);
+            let reserved = animated_geometry(diameter, tile.scale, scene.geometry.dpi);
             let mut geom = reserved;
             geom.half_w += pad;
             geom.outer_w += pad * 2;
@@ -430,9 +433,9 @@ impl Renderer {
             groups.push(group);
             boxes.push((tx, ty, geom.outer_w, geom.outer_h));
             if scene.geometry.horizontal {
-                x += geom.outer_w + scene.geometry.gap;
+                x += reserved.outer_w + scene.geometry.gap;
             } else {
-                y += geom.outer_h + scene.geometry.gap;
+                y += reserved.outer_h + scene.geometry.gap;
             }
         }
         self.labels.truncate(scene.tiles.len());
@@ -630,22 +633,26 @@ mod tests {
                     ];
                     let pad = scaled(HALO, dpi);
                     let gap = scaled(GAP, dpi);
-                    let geoms = [camera, plate, plate].map(|d| {
-                        let mut g = reserved_geometry(scaled(d, dpi), SPEAK_SCALE, dpi);
-                        g.half_w += pad;
-                        g.outer_w += 2 * pad;
-                        g.outer_h += 2 * pad;
-                        g
-                    });
+                    let geoms = [camera, plate, plate]
+                        .into_iter()
+                        .zip(&tiles)
+                        .map(|(d, t)| {
+                            let mut g = animated_geometry(scaled(d, dpi), t.scale, dpi);
+                            g.half_w += pad;
+                            g.outer_w += 2 * pad;
+                            g.outer_h += 2 * pad;
+                            g
+                        })
+                        .collect::<Vec<_>>();
                     let (width, height) = if horizontal {
                         (
-                            geoms.iter().map(|g| g.outer_w).sum::<u32>() + 2 * gap,
+                            geoms.iter().map(|g| g.outer_w).sum::<u32>() - 4 * pad + 2 * gap,
                             geoms.iter().map(|g| g.outer_h).max().unwrap(),
                         )
                     } else {
                         (
                             geoms.iter().map(|g| g.outer_w).max().unwrap(),
-                            geoms.iter().map(|g| g.outer_h).sum::<u32>() + 2 * gap,
+                            geoms.iter().map(|g| g.outer_h).sum::<u32>() - 4 * pad + 2 * gap,
                         )
                     };
                     let geometry = Geometry {
@@ -653,7 +660,6 @@ mod tests {
                         height,
                         camera_diameter: scaled(camera, dpi),
                         plate_diameter: scaled(plate, dpi),
-                        speak_scale: SPEAK_SCALE,
                         dpi,
                         horizontal,
                         bottom,
@@ -690,7 +696,7 @@ mod tests {
                         let drawn = base as f32 * tiles[index].scale;
                         let (cx, cy) = drawn_center(
                             ((tx + pad) as f32, (ty + pad) as f32),
-                            &reserved_geometry(base, SPEAK_SCALE, dpi),
+                            &animated_geometry(base, tiles[index].scale, dpi),
                             &radii(drawn, label_px(drawn, dpi)),
                             Hug::Center,
                             bottom,
@@ -713,18 +719,20 @@ mod tests {
                                 }
                             }
                             assert!(initials > 10, "missing initials for plate {index}");
-                            // The speaking plate's halo is inside its reserved slot;
-                            // the silent plate has none above its full speaking radius.
-                            let halo = pixel(
-                                cx,
-                                cy - (scaled(plate, dpi) as f32 * SPEAK_SCALE / 2.) as u32 - 6,
-                            );
+                            // Sample perpendicular to the packing axis: neighboring
+                            // halos may overlap in the narrow inter-tile gap.
+                            let distance = radii(drawn, label_px(drawn, dpi)).r_outer as u32 + 6;
+                            let halo = if horizontal {
+                                pixel(cx, cy - distance)
+                            } else {
+                                pixel(cx - distance, cy)
+                            };
                             assert_eq!(halo[3] > 0, index == 1);
                         }
                         if horizontal {
-                            x += geom.outer_w + gap;
+                            x += geom.outer_w - 2 * pad + gap;
                         } else {
-                            y += geom.outer_h + gap;
+                            y += geom.outer_h - 2 * pad + gap;
                         }
                     }
                     assert!(canvas
@@ -790,7 +798,6 @@ mod tests {
                     height: th,
                     camera_diameter: diameter,
                     plate_diameter: 72,
-                    speak_scale: SPEAK_SCALE,
                     dpi: 1.,
                     horizontal: true,
                     bottom: false,
@@ -960,7 +967,6 @@ mod tests {
                     height: h,
                     camera_diameter: 240,
                     plate_diameter: 144,
-                    speak_scale: SPEAK_SCALE,
                     dpi: 2.,
                     horizontal,
                     bottom: true,

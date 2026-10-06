@@ -237,7 +237,7 @@ fn summary(user_id: u32, name: &str) -> UserSummary {
 fn state() -> AppState {
     let mut settings = Settings::default();
     settings.audio.mode = ModeSetting::Ptt;
-    // Shows the „Wechselsperre“ slider under it on the Kamera page.
+    // Shows the hold and return-delay sliders on the Kamera page.
     settings.overlay.shy = true;
     let peers = vec![
         peer(
@@ -947,6 +947,36 @@ fn switches_and_sliders_are_named_and_keyboard_driven() {
     h.run();
     let back = last_update(&cmds.borrow()).audio.output_volume;
     assert!(back < after && back > before, "one step back: {back}");
+}
+
+/// The return-delay control is reachable and updates the persisted draft.
+#[test]
+fn shy_return_delay_slider_is_named_and_keyboard_driven() {
+    let mut s = state();
+    s.settings.ui.show_advanced = true;
+    s.settings.overlay.enabled = true;
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let cmds_out = cmds.clone();
+    let state_in = s.clone();
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness([SETTINGS[0], 1000.0], "light", true, move |ui| {
+        cmds_out
+            .borrow_mut()
+            .extend(view.ui(ui, &state_in, false).cmds);
+    });
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Kamera")
+        .click();
+    h.run();
+    let delay = h.get_by_role_and_label(egui::accesskit::Role::Slider, "Zurück nach");
+    delay.focus();
+    h.run();
+    h.key_press(egui::Key::ArrowRight);
+    h.run();
+    assert!(last_update(&cmds.borrow()).overlay.shy_return_ms > 3000);
 }
 
 /// The mic test runs on the Klang page too, where Stimmoptimierung and its

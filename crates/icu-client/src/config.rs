@@ -273,6 +273,9 @@ pub const TILE_SIZES: std::ops::RangeInclusive<u32> = 80..=480;
 /// What the „Wechselsperre“ slider offers for `overlay.shy_hold_ms`.
 pub const SHY_HOLDS: std::ops::RangeInclusive<u32> = 0..=5000;
 
+/// Return-delay slider range for `overlay.shy_return_ms`.
+pub const SHY_RETURNS: std::ops::RangeInclusive<u32> = 0..=60_000;
+
 /// `overlay.size`: a diameter in pixels, or — in a file from before the
 /// slider — one of the three fixed sizes it replaced.
 fn tile_size<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
@@ -341,6 +344,9 @@ pub struct OverlaySettings {
     /// can send it off again, in ms, within [`SHY_HOLDS`] — so a pointer
     /// over both places does not bounce it to and fro.
     pub shy_hold_ms: u32,
+    /// Return to the configured position after this long without the pointer
+    /// over the displaced row, in ms, within [`SHY_RETURNS`].
+    pub shy_return_ms: u32,
     /// Show the own tile too (own camera, or a plate as for the others),
     /// after everyone else's.
     pub show_self: bool,
@@ -361,6 +367,7 @@ impl Default for OverlaySettings {
             voice_plates: true,
             shy: false,
             shy_hold_ms: 1000,
+            shy_return_ms: 3000,
             show_self: false,
         }
     }
@@ -614,6 +621,7 @@ impl Settings {
         audio.release_ms = audio.release_ms.min(1000);
         audio.hangover_ms = audio.hangover_ms.min(3000);
         self.overlay.shy_hold_ms = self.overlay.shy_hold_ms.min(*SHY_HOLDS.end());
+        self.overlay.shy_return_ms = self.overlay.shy_return_ms.min(*SHY_RETURNS.end());
         if !matches!(audio.frame_ms, 10 | 20) {
             audio.frame_ms = defaults.frame_ms;
         }
@@ -1474,6 +1482,7 @@ mod tests {
         s.overlay.frame_color = [0x10, 0x20, 0x30];
         s.overlay.shy = true;
         s.overlay.shy_hold_ms = 2500;
+        s.overlay.shy_return_ms = 7500;
         s.overlay.show_self = true;
         s.set_volume(7, 120.0);
         s.set_volume(9, 100.0);
@@ -1498,6 +1507,7 @@ mod tests {
         assert_eq!(back.overlay.frame_color, [0x10, 0x20, 0x30]);
         assert!(back.overlay.shy);
         assert_eq!(back.overlay.shy_hold_ms, 2500);
+        assert_eq!(back.overlay.shy_return_ms, 7500);
         assert!(back.overlay.show_self);
 
         let text = fs::read_to_string(paths.settings()).unwrap();
@@ -1509,6 +1519,19 @@ mod tests {
         assert!(text.contains("[volumes]"));
         assert!(text.contains("setup_done = true"));
         assert!(text.contains("close_action = \"minimize\""));
+    }
+
+    #[test]
+    fn shy_return_delay_is_clamped_to_the_slider_range() {
+        let mut s = Settings::default();
+        s.overlay.shy_return_ms = u32::MAX;
+        s.clamp_numbers();
+        assert_eq!(s.overlay.shy_return_ms, *SHY_RETURNS.end());
+        s.overlay.shy_return_ms = 0;
+        s.clamp_numbers();
+        assert_eq!(s.overlay.shy_return_ms, 0);
+        let old: Settings = toml::from_str("[overlay]\nshy = true\nshy_hold_ms = 2500\n").unwrap();
+        assert_eq!(old.overlay.shy_return_ms, 3000);
     }
 
     #[test]
@@ -1535,6 +1558,7 @@ mod tests {
         assert!(s.overlay.dim_non_speaking, "old settings.toml default on");
         assert!(!s.overlay.shy, "old settings.toml: tiles stay put");
         assert_eq!(s.overlay.shy_hold_ms, 1000);
+        assert_eq!(s.overlay.shy_return_ms, 3000);
         assert!(!s.overlay.show_self);
         assert_eq!(s.overlay.size, 120);
         assert_eq!(s.overlay.speaking_size, None);

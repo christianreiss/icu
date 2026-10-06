@@ -4,7 +4,7 @@
 //! Both remain visible and highlight whoever is speaking. With
 //! `overlay.shy` the whole row fades out of the mouse pointer's way as soon
 //! as it is on any tile, and back in on the other side of the screen (see
-//! [`Shy`]);
+//! [`Shy`]), returning home after the configured pointer-free delay;
 //! with `overlay.show_self` the own tile comes last, from the local camera.
 //!
 //! What is shown and how it is drawn (GPU 30 fps, CPU fallback 15 fps) lives
@@ -28,7 +28,7 @@ use icu_proto::Session;
 use tokio::sync::{mpsc, watch};
 
 use crate::{
-    config::{Corner, Expand, OverlaySettings, SHY_HOLDS, TILE_SIZES},
+    config::{Corner, Expand, OverlaySettings, SHY_HOLDS, SHY_RETURNS, TILE_SIZES},
     engine::{AppState, Command, Peer, VideoFrames},
 };
 
@@ -46,7 +46,7 @@ mod gpu;
 /// Base spacing between adjacent tiles, in layout pixels — run through
 /// [`scaled`] like every other overlay dimension so it tracks DPI and tile
 /// size instead of sitting fixed while everything around it grows/shrinks.
-const GAP: u32 = 3;
+const GAP: u32 = 2;
 const BORDER: u32 = 3;
 /// Gap between a tile's border ring and its outside name-label band: flush,
 /// so the paper tag reads as attached to the tile rather than floating near
@@ -100,6 +100,8 @@ struct Shy {
     leaving: bool,
     /// When the row was last all there after showing up.
     arrived: Option<Instant>,
+    /// When the pointer last left the fully shown displaced row.
+    away_since: Option<Instant>,
 }
 
 impl Shy {
@@ -107,6 +109,7 @@ impl Shy {
         opacity: 1.0,
         leaving: false,
         arrived: None,
+        away_since: None,
     };
 
     /// Advances to `now`, `dt` seconds on: the pointer on a tile
@@ -131,6 +134,7 @@ impl Shy {
                     opacity,
                     leaving,
                     arrived,
+                    away_since: enabled.then_some(self.away_since).flatten(),
                 },
                 false,
             );
@@ -142,9 +146,24 @@ impl Shy {
                 opacity,
                 leaving: !gone,
                 arrived: None,
+                away_since: None,
             },
             gone,
         )
+    }
+
+    /// Start the same fade/move transition back home after a continuous
+    /// pointer-free interval. Hovering again restarts the countdown.
+    fn return_home(&mut self, displaced: bool, hovered: bool, delay: Duration, now: Instant) {
+        if !displaced || hovered || self.leaving || self.opacity < 1.0 {
+            self.away_since = None;
+            return;
+        }
+        let since = *self.away_since.get_or_insert(now);
+        if now.saturating_duration_since(since) >= delay {
+            self.leaving = true;
+            self.away_since = None;
+        }
     }
 
     /// Whether the tiles take pointer input (Wayland) — and so whether the
@@ -281,15 +300,24 @@ fn fade(value: f32, speaking: bool, dt: f32) -> f32 {
 /// needs to resize as a tile's drawn size animates between the two. Rounds
 /// up, not to nearest — the reserved slot must never end up a fraction of
 /// a pixel smaller than the exact (unrounded) size a tile can actually draw.
+#[cfg(test)]
 fn reserve_diameter(base: u32, speak: f32) -> u32 {
     (base as f32 * speak.max(REST_SCALE)).ceil() as u32
 }
 
 /// A tile's reserved slot for a resting `base` diameter: its circle at
 /// [`reserve_diameter`], with the name sized for that ([`label_px`]).
+#[cfg(test)]
 fn reserved_geometry(base: u32, speak: f32, dpi: f32) -> CircleGeom {
     let diameter = reserve_diameter(base, speak);
     circle_geometry(diameter, label_px(diameter as f32, dpi))
+}
+
+/// Size the slot from this frame's animated diameter, so neighbors move
+/// with the circle. Round up to keep the circle and label inside it.
+fn animated_geometry(base: u32, scale: f32, dpi: f32) -> CircleGeom {
+    let diameter = base as f32 * scale;
+    circle_geometry(diameter.ceil() as u32, label_px(diameter, dpi))
 }
 
 /// Where the overlay takes the own camera's pictures from: the capture
@@ -636,8 +664,8 @@ struct Scene {
     /// The row's shyness: one for all tiles.
     shy: Shy,
     /// The shy row got out of the pointer's way to the [`opposite`] corner
-    /// and stays there until the pointer comes again. Not saved: a new
-    /// position, `shy` off or a restart puts it back.
+    /// until the pointer-free return timer or another hover brings it back.
+    /// Not saved: a new position, `shy` off or a restart also puts it back.
     flipped: bool,
     /// Where the pointer is on the canvas, if known (see
     /// [`Scene::pointer_at`]).
@@ -762,23 +790,13 @@ impl Scene {
         scaled(plate_base(self.settings.size), self.scale)
     }
 
-    /// A tile's reserved slot: its circle plus its outside label ring, at
-    /// the size it will ever need — the larger of its resting and speaking
-    /// sizes — so the slot never has to resize as its drawn size eases
-    /// between the two.
+    /// Current animated bounds, shared by layout, hit testing and drawing.
     fn tile_geom(&self, tile: &Tile) -> CircleGeom {
         let diameter = match tile.face {
             Face::Camera(_) => self.camera_diameter(),
             Face::Plate => self.plate_diameter(),
         };
-        let mut geom = reserved_geometry(diameter, speak_scale(&self.settings), self.scale);
-        if self.gpu.is_some() {
-            let pad = scaled(gpu::HALO, self.scale);
-            geom.half_w += pad;
-            geom.outer_w += pad * 2;
-            geom.outer_h += pad * 2;
-        }
-        geom
+        animated_geometry(diameter, tile.scale, self.scale)
     }
 
     /// How long the shy row stays where it showed up (`overlay.shy_hold_ms`).
@@ -965,10 +983,8 @@ impl Scene {
         }
         let n = self.tiles.len() as u32;
         let geoms: Vec<CircleGeom> = self.tiles.iter().map(|t| self.tile_geom(t)).collect();
-        // Each tile reserves a fixed slot sized for the worst-case label
-        // arc, not its actual name's length, so a row/column stays aligned
-        // regardless of who has a long name (same principle as before:
-        // only the text itself gets truncated with „…").
+        // Pack animated circles and their label bands, with glow padding
+        // around the whole row rather than between every pair of tiles.
         let gap = scaled(GAP, self.scale);
         let (width, height) = match self.effective_expand() {
             Expand::Vertical => (
@@ -980,9 +996,14 @@ impl Scene {
                 geoms.iter().map(|g| g.outer_h).max().unwrap_or(0),
             ),
         };
-        let size_changed = width != self.width || height != self.height;
-        self.width = width;
-        self.height = height;
+        let pad = if self.gpu.is_some() {
+            scaled(gpu::HALO, self.scale)
+        } else {
+            0
+        };
+        let size_changed = width + 2 * pad != self.width || height + 2 * pad != self.height;
+        self.width = width + 2 * pad;
+        self.height = height + 2 * pad;
 
         // Shyness: the pointer on any tile (now, or since the last frame)
         // sends the whole row to the other side. A hidden row is not
@@ -996,11 +1017,21 @@ impl Scene {
             self.hug(),
             gap,
         );
+        for slot in &mut self.slots {
+            slot[0] += pad;
+            slot[1] += pad;
+        }
         let hovered = self
             .pointer
             .iter()
             .chain(&trail)
             .any(|&at| self.slots.iter().any(|slot| on_slot(slot, at)));
+        self.shy.return_home(
+            self.settings.shy && self.flipped,
+            hovered,
+            Duration::from_millis(self.settings.shy_return_ms.min(*SHY_RETURNS.end()).into()),
+            now,
+        );
         let (shy, gone) = self
             .shy
             .step(self.settings.shy, hovered, self.shy_hold(), now, dt);
@@ -1033,7 +1064,6 @@ impl Scene {
             height: self.height,
             camera_diameter: self.camera_diameter(),
             plate_diameter: self.plate_diameter(),
-            speak_scale: speak_scale(&self.settings),
             dpi: self.scale,
             horizontal: self.effective_expand() == Expand::Horizontal,
             bottom: self.anchored_bottom(),
@@ -1080,8 +1110,13 @@ impl Scene {
 
     /// Fades the shy row on a finished frame.
     fn fade(&self, canvas: &mut [u8]) {
-        let opacities = vec![self.shy.opacity; self.slots.len()];
-        fade_slots(canvas, self.width, &self.slots, &opacities);
+        // Fade once across the whole frame, including overlapping halos.
+        fade_slots(
+            canvas,
+            self.width,
+            &[[0, 0, self.width, self.height]],
+            &[self.shy.opacity],
+        );
     }
 
     /// Called only after the platform accepts a frame for presentation.
@@ -1198,15 +1233,11 @@ fn radii(diameter: f32, name_px: u32) -> Radii {
     }
 }
 
-/// A tile's reserved slot: its round shape and outside label ring at the
-/// largest size it will ever draw, derived purely from its circle's
-/// diameter and the label font size, so the sizing pass ([`Scene::update`])
-/// and the draw pass ([`compose`]) can't drift apart. A tile may draw
-/// smaller than this (see [`Tile::scale`]), but never larger, so the slot
-/// never needs to change size.
+/// A tile's circle and outside label bounds. Layout and drawing use the
+/// current animated diameter, including enough room for the label arc.
 #[derive(Clone, Copy)]
 struct CircleGeom {
-    /// The radii at the reserved size; the tests hold drawn tiles to them.
+    /// Radii corresponding to these bounds.
     #[cfg_attr(not(test), allow(dead_code))]
     radii: Radii,
     /// Half the outer bounding box's width.
@@ -1376,8 +1407,6 @@ struct Geometry {
     /// Resting diameters.
     camera_diameter: u32,
     plate_diameter: u32,
-    /// The speaking size over the resting one ([`speak_scale`]).
-    speak_scale: f32,
     /// Pixels per layout pixel, for the name's size ([`label_px`]).
     dpi: f32,
     horizontal: bool,
@@ -1407,14 +1436,8 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
             Face::Camera(_) => g.camera_diameter,
             Face::Plate => g.plate_diameter,
         };
-        // The reserved slot (fixed: sized for the larger of every tile's
-        // resting and speaking sizes, see `Scene::tile_geom`) decides
-        // position and the loop bounds below; `draw` (animated via
-        // `tile.scale`, its name along with it) decides what's actually
-        // painted, kept to the slot's sides toward the screen edges
-        // (`drawn_center`) — so a tile grows toward the middle of the
-        // screen without moving or resizing its slot.
-        let geom = reserved_geometry(diameter, g.speak_scale, g.dpi);
+        // Use the exact same animated bounds as layout and hit testing.
+        let geom = animated_geometry(diameter, tile.scale, g.dpi);
         let drawn = diameter as f32 * tile.scale;
         let name_px = label_px(drawn, g.dpi);
         let draw = radii(drawn, name_px);
@@ -1635,8 +1658,7 @@ mod tests {
     const PLATE_D: u32 = 72;
 
     fn geometry(tiles: &[Tile], horizontal: bool) -> Geometry {
-        // Mirrors `compose`'s own reservation math: every tile's slot
-        // is sized for its *speaking* diameter, never its resting one.
+        // Mirrors the animated bounds used by compose.
         let geoms: Vec<CircleGeom> = tiles
             .iter()
             .map(|t| {
@@ -1644,7 +1666,7 @@ mod tests {
                     Face::Camera(_) => CAMERA_D,
                     Face::Plate => PLATE_D,
                 };
-                reserved_geometry(d, SPEAK_SCALE, 1.0)
+                animated_geometry(d, t.scale, 1.0)
             })
             .collect();
         let n = tiles.len() as u32;
@@ -1664,7 +1686,6 @@ mod tests {
             height,
             camera_diameter: CAMERA_D,
             plate_diameter: PLATE_D,
-            speak_scale: SPEAK_SCALE,
             dpi: 1.0,
             horizontal,
             bottom: true,
@@ -1825,7 +1846,7 @@ mod tests {
         let g = geometry(&tiles, true);
         let mut canvas = vec![0u8; (g.width * g.height * 4) as usize];
         compose(&mut canvas, &g, &tiles, Some(&mut labels));
-        let geom = reserved_geometry(CAMERA_D, SPEAK_SCALE, 1.0);
+        let geom = animated_geometry(CAMERA_D, REST_SCALE, 1.0);
         let cx = geom.half_w as f32; // the lone tile sits at x0 == 0
         let is_ink = |p: &[u8]| p[2] > p[1] && p[1] > p[0] && p[2] < 80;
         let (mut ink_left, mut ink_right) = (0u32, 0u32);
@@ -1880,11 +1901,9 @@ mod tests {
         assert_eq!(ease(SPEAK_SCALE, SPEAK_SCALE, SCALE_EASE), SPEAK_SCALE);
     }
 
-    /// A speaking-sized tile draws visibly larger than a resting one, but
-    /// both reserve the exact same slot — the animation must never resize
-    /// or clip against the overlay window.
+    /// Speaking resizes the slot and window along with the drawn tile.
     #[test]
-    fn scale_changes_the_drawn_circle_but_not_its_slot() {
+    fn scale_changes_the_drawn_circle_and_its_slot() {
         let mut labels = Labels::new().expect("embedded font");
         for camera in [false, true] {
             let tile = |scale: f32| {
@@ -1902,10 +1921,9 @@ mod tests {
             };
             let (rest, speak) = (tile(REST_SCALE), tile(SPEAK_SCALE));
             let (g_rest, g_speak) = (geometry(&rest, false), geometry(&speak, false));
-            assert_eq!(
-                (g_rest.width, g_rest.height),
-                (g_speak.width, g_speak.height),
-                "the reserved slot must not depend on the tile's current scale"
+            assert!(
+                g_speak.width > g_rest.width && g_speak.height > g_rest.height,
+                "the slot grows with the speaking tile"
             );
 
             let max_opaque_row_span = |canvas: &[u8], width: u32, height: u32| {
@@ -2086,6 +2104,123 @@ mod tests {
         assert!(!gone && !off.leaving, "off: never leaves");
     }
 
+    #[test]
+    fn animated_layout_packs_tiles_and_pushes_neighbors_smoothly() {
+        for horizontal in [false, true] {
+            for dpi in [1.0, 1.5, 2.0] {
+                for target in [0.5, 2.0] {
+                    let base = scaled(CAMERA_D, dpi);
+                    let gap = scaled(GAP, dpi);
+                    let mut scale = REST_SCALE;
+                    let mut previous = None;
+                    for _ in 0..12 {
+                        let geoms = [
+                            animated_geometry(base, scale, dpi),
+                            animated_geometry(base, REST_SCALE, dpi),
+                        ];
+                        let width = if horizontal {
+                            geoms[0].outer_w + geoms[1].outer_w + gap
+                        } else {
+                            geoms[0].outer_w.max(geoms[1].outer_w)
+                        };
+                        let height = if horizontal {
+                            geoms[0].outer_h.max(geoms[1].outer_h)
+                        } else {
+                            geoms[0].outer_h + geoms[1].outer_h + gap
+                        };
+                        let placed =
+                            slots(&geoms, width, height, horizontal, false, Hug::Start, gap);
+                        let axis = if horizontal { 0 } else { 1 };
+                        let extent = axis + 2;
+                        let neighbor = placed[1][axis];
+                        assert_eq!(
+                            neighbor - (placed[0][axis] + placed[0][extent]),
+                            gap,
+                            "no reserved growth or glow gap"
+                        );
+                        if let Some(prev) = previous {
+                            if target > REST_SCALE {
+                                assert!(neighbor >= prev);
+                            } else {
+                                assert!(neighbor <= prev);
+                            }
+                            assert!(
+                                neighbor.abs_diff(prev) < base / 2,
+                                "neighbor slides in small steps"
+                            );
+                        }
+                        previous = Some(neighbor);
+                        scale = ease(scale, target, SCALE_EASE);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shy_returns_after_pointer_leaves_with_configurable_delay() {
+        for millis in [0, 3000, 7500] {
+            let delay = Duration::from_millis(millis);
+            let mut now = Instant::now();
+            let mut shy = Shy::SHOWN;
+            shy.return_home(true, true, delay, now);
+            now += Duration::from_secs(60);
+            shy.return_home(true, true, delay, now);
+            assert!(!shy.leaving, "no return while hovered");
+            shy.return_home(true, false, delay, now);
+            if millis > 0 {
+                shy.return_home(true, false, delay, now + delay - Duration::from_millis(1));
+                assert!(!shy.leaving, "wait for the full delay");
+                // A fresh hover discards elapsed time.
+                now += delay;
+                shy.return_home(true, true, delay, now);
+                shy.return_home(true, false, delay, now);
+                assert!(!shy.leaving, "countdown restarts on leaving");
+            }
+            shy.return_home(true, false, delay, now + delay);
+            assert!(shy.leaving, "return starts at the configured deadline");
+            let (next, gone) = shy.step(
+                true,
+                false,
+                Duration::from_secs(1),
+                now + delay,
+                SHY_HIDE_SECS,
+            );
+            assert!(gone, "fade completes and asks the scene to switch sides");
+            assert_eq!(next.opacity, 0.0);
+            let (home, gone) = next.step(
+                true,
+                false,
+                Duration::from_secs(1),
+                now + delay,
+                SHY_SHOW_SECS,
+            );
+            assert!(!gone);
+            assert_eq!(home.opacity, 1.0);
+            shy = home;
+            shy.return_home(false, false, Duration::ZERO, now + delay);
+            assert!(!shy.leaving, "stay home until the pointer arrives");
+        }
+    }
+
+    #[test]
+    fn shy_return_waits_for_visible_row_and_cancels_when_disabled() {
+        let now = Instant::now();
+        let mut shy = Shy {
+            opacity: 0.5,
+            ..Shy::SHOWN
+        };
+        shy.return_home(true, false, Duration::ZERO, now);
+        assert!(!shy.leaving, "finish arriving before counting down");
+        shy.opacity = 1.0;
+        shy.return_home(true, false, Duration::from_secs(3), now);
+        let (mut off, gone) = shy.step(false, false, Duration::ZERO, now, 0.033);
+        assert!(!gone);
+        assert_eq!(off.away_since, None);
+        off.return_home(false, false, Duration::ZERO, now);
+        assert!(!off.leaving);
+    }
+
     /// The shy row goes to the mirrored corner, or the other edge from the
     /// middle of one, and back.
     #[test]
@@ -2116,7 +2251,7 @@ mod tests {
                         Face::Camera(_) => CAMERA_D,
                         Face::Plate => PLATE_D,
                     };
-                    reserved_geometry(d, SPEAK_SCALE, 1.0)
+                    animated_geometry(d, t.scale, 1.0)
                 })
                 .collect();
             let slots = slots(
@@ -2178,12 +2313,13 @@ mod tests {
                         dim: false,
                         scale,
                     }];
+                    let current = animated_geometry(PLATE_D, scale, 1.0);
+                    let (cw, ch) = (current.outer_w, current.outer_h);
                     let g = Geometry {
-                        width: w,
-                        height: h,
+                        width: cw,
+                        height: ch,
                         camera_diameter: CAMERA_D,
                         plate_diameter: PLATE_D,
-                        speak_scale: speak,
                         dpi: 1.0,
                         horizontal: false,
                         bottom,
@@ -2192,11 +2328,12 @@ mod tests {
                         frame_color: [0; 3],
                         gap: GAP,
                     };
-                    let mut canvas = vec![0u8; (w * h * 4) as usize];
+                    let mut canvas = vec![0u8; (cw * ch * 4) as usize];
                     compose(&mut canvas, &g, &tiles, Some(&mut labels));
-                    let drawn: Vec<(u32, u32)> = (0..h)
-                        .flat_map(|y| (0..w).map(move |x| (x, y)))
-                        .filter(|&(x, y)| canvas[((y * w + x) * 4 + 3) as usize] > 0)
+                    let drawn: Vec<(u32, u32)> = (0..ch)
+                        .flat_map(|y| (0..cw).map(move |x| (x, y)))
+                        .filter(|&(x, y)| canvas[((y * cw + x) * 4 + 3) as usize] > 0)
+                        .map(|(x, y)| (x + hug.offset(w, cw), y + if bottom { h - ch } else { 0 }))
                         .collect();
                     let x = drawn.iter().map(|p| p.0);
                     let y = drawn.iter().map(|p| p.1);
