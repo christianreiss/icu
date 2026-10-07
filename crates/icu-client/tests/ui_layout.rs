@@ -237,7 +237,7 @@ fn summary(user_id: u32, name: &str) -> UserSummary {
 fn state() -> AppState {
     let mut settings = Settings::default();
     settings.audio.mode = ModeSetting::Ptt;
-    // Shows the hold and return-delay sliders on the Kamera page.
+    // Shows the hold and return-delay sliders on the Overlay page.
     settings.overlay.shy = true;
     let peers = vec![
         peer(
@@ -488,11 +488,12 @@ fn main_window_grows_for_a_bigger_room() {
 }
 
 /// The settings pages as the sidebar names them.
-const PAGES: [&str; 7] = [
+const PAGES: [&str; 8] = [
     "Audio",
     "Klang",
     "Tastenkürzel",
     "Kamera",
+    "Overlay",
     "Allgemein",
     "Nutzer",
     "Über ICU",
@@ -968,7 +969,7 @@ fn shy_return_delay_slider_is_named_and_keyboard_driven() {
             .borrow_mut()
             .extend(view.ui(ui, &state_in, false).cmds);
     });
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Kamera")
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Overlay")
         .click();
     h.run();
     let delay = h.get_by_role_and_label(egui::accesskit::Role::Slider, "Zurück nach");

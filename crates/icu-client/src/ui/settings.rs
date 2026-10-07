@@ -61,6 +61,7 @@ enum Tab {
     Sound,
     Hotkeys,
     Camera,
+    Overlay,
     General,
     Users,
     About,
@@ -394,11 +395,12 @@ impl SettingsView {
             (Tab::Sound, icon::WAVEFORM, "Klang"),
             (Tab::Hotkeys, icon::COMMAND, "Tastenkürzel"),
             (Tab::Camera, icon::VIDEO_CAMERA, "Kamera"),
+            (Tab::Overlay, icon::SQUARES_FOUR, "Overlay"),
             (Tab::General, icon::GEAR_FINE, "Allgemein"),
             (Tab::About, icon::QUESTION, "Über ICU"),
         ];
         if state.is_admin {
-            tabs.insert(5, (Tab::Users, icon::USERS_THREE, "Nutzer"));
+            tabs.insert(6, (Tab::Users, icon::USERS_THREE, "Nutzer"));
         }
 
         egui::Panel::left("settings_nav")
@@ -463,6 +465,7 @@ impl SettingsView {
                             Tab::Sound => self.sound_tab(ui, state, &mut cmds),
                             Tab::Hotkeys => self.hotkeys_tab(ui, state, &mut cmds),
                             Tab::Camera => self.camera_tab(ui, state),
+                            Tab::Overlay => self.overlay_tab(ui),
                             Tab::General => self.general_tab(ui, state, &mut cmds),
                             Tab::Users => self.users_tab(ui, state, &mut cmds),
                             Tab::About => self.about_tab(ui, state),
@@ -1340,11 +1343,10 @@ impl SettingsView {
 
     #[cfg_attr(not(feature = "camera"), allow(unused_variables))]
     fn camera_tab(&mut self, ui: &mut Ui, state: &AppState) {
-        let adv = self.draft.ui.show_advanced;
         widgets::page_header(
             ui,
             "Kamera",
-            "Deine Kamera und die Video-Kacheln, die über anderen Fenstern schweben.",
+            "Deine Kamera auswählen, einschalten und das Bild prüfen.",
             |_| {},
         );
         widgets::group_card(ui, "Kamera", |ui| {
@@ -1380,32 +1382,6 @@ impl SettingsView {
                             )
                         },
                     );
-                    // Beside the preview there is room the overlay card
-                    // has not: it would push the page past the screen.
-                    // Both say who the overlay shows.
-                    if self.overlay_available {
-                        ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {
-                            widgets::setting_row(ui, true, "Mich im Overlay zeigen", None, |ui| {
-                                widgets::named_toggle(
-                                    ui,
-                                    &mut self.draft.overlay.show_self,
-                                    "Mich im Overlay zeigen",
-                                )
-                            })
-                            .on_hover_text(
-                                "Deine eigene Kachel erscheint im Overlay nach allen anderen: \
-                                 dein Kamerabild, ohne Kamera ein Kreis mit deinen Initialen",
-                            );
-                            widgets::setting_row(ui, true, "Teilnehmer ohne Kamera", None, |ui| {
-                                widgets::named_toggle(
-                                    ui,
-                                    &mut self.draft.overlay.voice_plates,
-                                    "Teilnehmer ohne Kamera",
-                                )
-                            })
-                            .on_hover_text("Teilnehmer ohne Kamera bleiben im Overlay als kleinere Kreise mit Initialen und Namen sichtbar und werden beim Sprechen hervorgehoben");
-                        });
-                    }
                 });
                 #[cfg(feature = "camera")]
                 egui::Frame::new()
@@ -1449,8 +1425,17 @@ impl SettingsView {
                     });
             });
         });
+    }
 
-        widgets::group_card(ui, "Video-Overlay", |ui| {
+    fn overlay_tab(&mut self, ui: &mut Ui) {
+        let adv = self.draft.ui.show_advanced;
+        widgets::page_header(
+            ui,
+            "Overlay",
+            "Teilnehmer-Kacheln, die über anderen Fenstern schweben.",
+            |_| {},
+        );
+        widgets::group_card(ui, "Anzeige", |ui| {
             if !self.overlay_available {
                 widgets::help_note(
                     ui,
@@ -1491,6 +1476,25 @@ impl SettingsView {
                 },
             );
             ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {
+                widgets::setting_row(ui, true, "Mich im Overlay zeigen", None, |ui| {
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.overlay.show_self,
+                        "Mich im Overlay zeigen",
+                    )
+                })
+                .on_hover_text(
+                    "Deine eigene Kachel erscheint im Overlay nach allen anderen: \
+                     dein Kamerabild, ohne Kamera ein Kreis mit deinen Initialen",
+                );
+                widgets::setting_row(ui, true, "Teilnehmer ohne Kamera", None, |ui| {
+                    widgets::named_toggle(
+                        ui,
+                        &mut self.draft.overlay.voice_plates,
+                        "Teilnehmer ohne Kamera",
+                    )
+                })
+                .on_hover_text("Teilnehmer ohne Kamera bleiben im Overlay als kleinere Kreise mit Initialen und Namen sichtbar und werden beim Sprechen hervorgehoben");
                 // The camera tile's diameter, silent and speaking; plates and
                 // names follow it. Until its slider is touched the speaking
                 // size stays 20 % above the other one.
