@@ -490,6 +490,17 @@ def clean_targets(root, log, ui):
         ui.line(message)
 
 
+def execute_clean(root):
+    """Reclaim generated build space without requiring any build toolchains."""
+    with build_lock(root):
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + f"-{os.getpid()}"
+        logs = root / "target/build-logs" / run_id
+        logs.mkdir(parents=True)
+        clean_targets(root, logs / "0-clean.log", Dashboard(True, "Cleanup only"))
+        print(f"ICU CLEAN COMPLETE | Logs: {logs}")
+    return 0
+
+
 def execute(root, plain, bump=False, clean_build=False):
     with build_lock(root):
         version = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]["package"]["version"]
@@ -588,13 +599,19 @@ def main():
                         help="increment the shared client/server patch version before building (e.g. 0.1.0 -> 0.1.1)")
     parser.add_argument("--clean", action="store_true",
                         help="remove all compiled targets and staging before rebuilding; keep packages and logs")
+    parser.add_argument("--clean-only", action="store_true",
+                        help="remove compiled targets and staging without building; keep packages and logs")
     args = parser.parse_args()
+    if args.clean_only and (args.clean or args.bump):
+        parser.error("--clean-only cannot be combined with --clean or --bump")
 
     def interrupted(_signum, _frame):
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, interrupted)
     try:
+        if args.clean_only:
+            return execute_clean(ROOT)
         return execute(ROOT, args.plain, args.bump, args.clean)
     except (BuildError, OSError, ValueError, KeyError) as error:
         print(f"ICU build: {error}", file=sys.stderr)

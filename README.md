@@ -112,6 +112,8 @@ DEB-/RPM-Pakete und den Windows-Installer, mit Live-Dashboard und Prüfungen.
 Mit `./build.sh --bump` wird vorher die gemeinsame Patch-Version erhöht.
 `./build.sh --clean` entfernt vorher alle kompilierten Ziele und baut frisch;
 beide Optionen lassen sich kombinieren.
+`./build.sh --clean-only` gibt Build-Speicherplatz frei, ohne neu zu bauen;
+fertige Pakete, Backups und Logs bleiben erhalten.
 Details und Voraussetzungen: [Bauanleitung](docs/development/building.md).
 
 | Pfad | Inhalt |

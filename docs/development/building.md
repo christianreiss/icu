@@ -10,6 +10,7 @@ Paketrezepte liegen unter `packaging/`; Experimente sind separate Cargo-Projekte
 ./build.sh
 ./build.sh --bump      # Gemeinsame Patch-Version erhöhen, dann alles bauen
 ./build.sh --clean     # Alle kompilierten Ziele entfernen, dann frisch bauen
+./build.sh --clean-only  # Build-Speicherplatz freigeben, ohne neu zu bauen
 ./build.sh --clean --bump  # Beides kombinieren
 ./build.sh --plain     # Vollständige Logs direkt im Terminal
 ```
@@ -34,6 +35,13 @@ Cargo-Abhängigkeiten und Podman-Images/-Download-Volumes bleiben verfügbar.
 Aktive Builds oder Programme aus diesem Checkout verhindern die Bereinigung;
 parallel keine einzelnen Cargo-/Paket-Befehle starten. Symlinks innerhalb von
 `target/` werden nur entfernt, ihre Ziele bleiben unangetastet.
+
+`--clean-only` führt dieselbe Bereinigung aus, beendet sich aber ohne Neubau.
+Es benötigt nur Bash und Python ab 3.11, keine Cargo-/Podman-/Cross-Toolchain;
+Version und Paketausgaben werden nicht verändert. Die Bereinigung verwendet
+dieselbe Checkout-Sperre und Prozessprüfung wie `--clean` und schreibt ein Log
+unter `target/build-logs/<run>/0-clean.log`. `--plain` ist erlaubt;
+`--bump` und `--clean` lassen sich nicht mit `--clean-only` kombinieren.
 
 Der Einstieg baut den aktuellen Arbeitsstand, einschließlich uncommitteter
 Änderungen. Es gibt keine Auswahl zwischen Entwicklungs- und Release-Build.

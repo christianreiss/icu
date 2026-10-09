@@ -152,6 +152,46 @@ print("==> built " + component)
             self.assertEqual(build.main(), 0)
         execute.assert_called_once_with(build.ROOT, True, True, True)
 
+    def test_clean_only_cli_removes_outputs_without_build_requirements(self):
+        stale = self.root / "target/debug/stale"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("compiled output")
+        package = self.root / "dist/0.1.0/keep.rpm"
+        package.parent.mkdir(parents=True)
+        package.write_text("package")
+        originals = {name: (self.root / name).read_bytes() for name in ("Cargo.toml", "Cargo.lock")}
+        previous = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        with patch.object(sys, "argv", ["build.sh", "--clean-only", "--plain"]), \
+                patch.object(build, "ROOT", self.root), \
+                patch.object(build, "execute", side_effect=AssertionError("unexpected build")), \
+                patch.object(build, "capture", side_effect=AssertionError("unexpected tool invocation")), \
+                patch.object(build, "preflight", side_effect=AssertionError("unexpected preflight")), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(build.main(), 0)
+            self.assertEqual(build.main(), 0)  # Repeated cleanup is safe.
+        self.assertFalse(stale.exists())
+        self.assertEqual(package.read_text(), "package")
+        for name, original in originals.items():
+            self.assertEqual((self.root / name).read_bytes(), original)
+        self.assertIn("ICU CLEAN COMPLETE", output.getvalue())
+        self.assertEqual(len(list((self.root / "target/build-logs").glob("*/0-clean.log"))), 2)
+
+    def test_clean_only_rejects_build_options_before_deleting(self):
+        for option in ("--clean", "--bump"):
+            with self.subTest(option=option), \
+                    patch.object(sys, "argv", ["build.sh", "--clean-only", option]), \
+                    patch.object(build, "execute_clean") as cleanup, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    build.main()
+                self.assertEqual(error.exception.code, 2)
+                cleanup.assert_not_called()
+
+    def test_clean_only_respects_existing_build_lock(self):
+        with build.build_lock(self.root):
+            with self.assertRaisesRegex(build.BuildError, "already running"):
+                build.execute_clean(self.root)
+
     def test_clean_scrubs_every_target_preserving_lock_logs_and_user_data(self):
         target = self.root / "target"
         for name in ("debug", "release", "release-server", "musl", "pkg", "pkg-fc42", "pkg-fc43",
