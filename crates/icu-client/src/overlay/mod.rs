@@ -1723,6 +1723,35 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn software_speaking_border_follows_selected_color() {
+        let tiles = [Tile {
+            face: Face::Camera(None),
+            name: String::new(),
+            speaking: true,
+            dim: false,
+            scale: 1.,
+        }];
+        let mut g = geometry(&tiles, true);
+        let mut canvas = vec![0; (g.width * g.height * 4) as usize];
+        for rgb in [[255, 0, 0], [0, 255, 0], [0, 0, 255]] {
+            g.frame_color = rgb;
+            g.speaking_frame = true;
+            compose(&mut canvas, &g, &tiles, None);
+            let border = [rgb[2], rgb[1], rgb[0], 255];
+            assert!(
+                canvas.as_chunks::<4>().0.contains(&border),
+                "{rgb:?} border"
+            );
+            g.speaking_frame = false;
+            compose(&mut canvas, &g, &tiles, None);
+            assert!(
+                !canvas.as_chunks::<4>().0.contains(&border),
+                "disabled {rgb:?} border"
+            );
+        }
+    }
+
     /// At 150 % and 200 % display scaling the tiles, plates and names are
     /// as large on screen as at 100 %, not ⅔ or ½ of it.
     #[test]

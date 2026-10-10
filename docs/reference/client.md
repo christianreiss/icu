@@ -261,12 +261,21 @@ Einstellungen sind ein eigenes Fenster mit Seitenleiste: Audio, Klang,
 Tastenkürzel, Kamera, Overlay, Allgemein, Nutzer (nur Admins) und Über ICU.
 Kamera enthält Gerätewahl, Ein-/Ausschalten und Vorschau. Overlay bündelt
 Anzeige, Position, eigene Kachel, Teilnehmer ohne Kamera, Kachelgrößen und
-Randabstand; erweitert kommen Rahmen und Farbe, Anordnung, Abdunkeln und
+Randabstand sowie „Sprech-Corona“ mit dem Farbwähler „Coronafarbe“; erweitert
+kommen Anordnung, Abdunkeln und
 Maus-Ausweichen mit Wechselsperre und Rückkehrzeit hinzu.
 „Erweitert“ ergänzt technische Felder innerhalb derselben Karten. Änderungen
 wirken sofort; Änderungen aus Tray, Hotkeys und Hauptfenster werden übernommen,
 statt durch einen veralteten Entwurf überschrieben zu werden. Der Mikrofontest
 bleibt auf Audio und Klang aktiv, damit Klangänderungen hörbar vergleichbar sind.
+
+Die Coronafarbe gilt lokal für alle sprechenden Kacheln, einschließlich
+Namensschildern und der eigenen Kachel. Der Nebel variiert die Helligkeit der
+gewählten RGB-Farbe ohne violette Beimischung; der CPU-Ersatz verwendet dieselbe
+Farbe für seinen Rahmen. Die Farbe bleibt beim Ausschalten der Sprech-Corona
+gespeichert, ihr Farbwähler ist dann deaktiviert. Bestehende
+`overlay.frame_color`-Werte bleiben erhalten; ohne eigene Wahl gilt weiterhin
+Blau (`[46, 155, 255]`).
 
 Die erste Einrichtung führt durch Geräte, Sprechen, Klang und Übersicht.
 Währenddessen hält sie das Mikrofon stumm, lässt Pegel, VAD, PTT-Probe und

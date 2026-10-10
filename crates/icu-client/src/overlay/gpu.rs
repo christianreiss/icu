@@ -598,6 +598,68 @@ mod tests {
 
     #[test]
     #[ignore = "requires a hardware GPU; run with --ignored --nocapture"]
+    fn hardware_corona_follows_selected_color() {
+        let mut renderer = Renderer::new().expect("hardware GPU");
+        let tiles = [Tile {
+            face: Face::Camera(None),
+            name: String::new(),
+            speaking: true,
+            dim: false,
+            scale: 1.,
+        }];
+        let geom = animated_geometry(120, 1., 1.);
+        let (width, height) = (geom.outer_w + HALO * 2, geom.outer_h + HALO * 2);
+        let mut labels = None;
+        let mut scene = RenderScene {
+            geometry: Geometry {
+                width,
+                height,
+                camera_diameter: 120,
+                plate_diameter: 72,
+                dpi: 1.,
+                horizontal: true,
+                bottom: false,
+                hug: Hug::Center,
+                speaking_frame: true,
+                frame_color: [255, 0, 0],
+                gap: GAP,
+            },
+            scale: 1.,
+            tiles: &tiles,
+            intensities: &[1.],
+            labels: &mut labels,
+            visible_frames: &[],
+        };
+        let mut canvas = vec![0; (width * height * 4) as usize];
+        // Reuse the renderer and dimensions: settings changes must not show
+        // a queued frame with the previous color.
+        for rgb in [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 0, 0]] {
+            scene.geometry.frame_color = rgb;
+            renderer.invalidate();
+            complete(&mut renderer, &mut scene, &mut canvas);
+            let bgra = [rgb[2], rgb[1], rgb[0]];
+            let mut halo_pixels = 0;
+            for pixel in canvas.as_chunks::<4>().0 {
+                if pixel[3] > 10 && pixel[3] < 255 {
+                    halo_pixels += 1;
+                    for channel in 0..3 {
+                        if bgra[channel] == 0 {
+                            assert_eq!(pixel[channel], 0, "unselected channel in {rgb:?} corona");
+                        } else {
+                            assert!(
+                                pixel[channel] > 0,
+                                "selected channel missing in {rgb:?} corona"
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(halo_pixels > 30, "visible {rgb:?} corona");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a hardware GPU; run with --ignored --nocapture"]
     fn hardware_non_video_members() {
         let mut renderer = Renderer::new().expect("hardware GPU");
         let mut labels = Labels::new();

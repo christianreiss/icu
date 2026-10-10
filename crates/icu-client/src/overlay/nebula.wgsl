@@ -38,7 +38,7 @@ fn noise(q: vec3<f32>) -> f32 {
         let envelope=1.-smoothstep(0.,extent,edge);
         let strands=smoothstep(.18,.8,n*.65+detail*.55);
         let a=clamp(envelope*strands*p.effect.y*.92,0.,.9);
-        let tint=mix(p.color.rgb,vec3(.72,.54,1.),n*.5);
+        let tint=p.color.rgb*(.75+.25*n);
         out=vec4(tint*a,a);
     }
     if r <= p.radius.y {

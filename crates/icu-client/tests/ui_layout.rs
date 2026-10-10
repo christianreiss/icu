@@ -15,7 +15,10 @@
 
 use std::{cell::RefCell, net::SocketAddr, rc::Rc, sync::Arc, time::Instant};
 
-use egui_kittest::{kittest::Queryable, Harness};
+use egui_kittest::{
+    kittest::{NodeT, Queryable},
+    Harness,
+};
 use icu_client::{
     audio::{DeviceInfo, DeviceKind},
     config::{ModeSetting, Paths, Settings},
@@ -948,6 +951,67 @@ fn switches_and_sliders_are_named_and_keyboard_driven() {
     h.run();
     let back = last_update(&cmds.borrow()).audio.output_volume;
     assert!(back < after && back > before, "one step back: {back}");
+}
+
+/// The everyday color picker updates settings and retains the choice while off.
+#[test]
+fn corona_color_is_available_in_plain_settings_and_persists() {
+    for theme_name in THEMES {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf()));
+        let mut s = state();
+        s.settings.ui.show_advanced = false;
+        s.settings.overlay.enabled = true;
+        let initial = s.settings.overlay.frame_color;
+        let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+        let cmds_out = cmds.clone();
+        let state_in = s.clone();
+        let mut view = SettingsView::new(&s, Arc::new(DebugStats::default()), paths.clone());
+        let mut h = harness(SETTINGS, theme_name, true, move |ui| {
+            cmds_out
+                .borrow_mut()
+                .extend(view.ui(ui, &state_in, false).cmds);
+        });
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Overlay")
+            .click();
+        h.run();
+        assert!(!h.get_by_label("Coronafarbe").accesskit_node().is_disabled());
+        shot(&mut h, &format!("corona-plain-{theme_name}"));
+        h.get_by_label("Coronafarbe").click();
+        h.run();
+        h.get_all_by_role(egui::accesskit::Role::SpinButton)
+            .next()
+            .expect("RGB editor")
+            .focus();
+        h.run();
+        h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::A);
+        h.event(egui::Event::Text("200".into()));
+        h.key_press(egui::Key::Enter);
+        h.run();
+        shot(&mut h, &format!("corona-picker-{theme_name}"));
+        let color = last_update(&cmds.borrow()).overlay.frame_color;
+        assert_ne!(color, initial, "picker sends a live settings update");
+        h.key_press(egui::Key::Escape);
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Sprech-Corona")
+            .click();
+        h.run();
+        assert!(h.get_by_label("Coronafarbe").accesskit_node().is_disabled());
+        let saved = last_update(&cmds.borrow());
+        assert!(!saved.overlay.speaking_frame);
+        assert_eq!(saved.overlay.frame_color, color, "off retains the color");
+        saved.save(&paths).unwrap();
+        let restored = Settings::load(&paths).unwrap();
+        assert_eq!(
+            restored.overlay.frame_color, color,
+            "reload retains the color"
+        );
+        h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Sprech-Corona")
+            .click();
+        h.run();
+        assert!(!h.get_by_label("Coronafarbe").accesskit_node().is_disabled());
+        assert_eq!(last_update(&cmds.borrow()).overlay.frame_color, color);
+    }
 }
 
 /// The return-delay control is reachable and updates the persisted draft.

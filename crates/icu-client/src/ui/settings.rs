@@ -1535,24 +1535,31 @@ impl SettingsView {
                     let edge = edge.round() as u32;
                     self.draft.overlay.offset = [edge, edge];
                 }
+                // Keep the corona and its color together in the everyday
+                // settings, without adding a separate color row.
+                widgets::setting_row(ui, true, "Sprech-Corona", None, |ui| {
+                    let toggle = widgets::named_toggle(
+                        ui,
+                        &mut self.draft.overlay.speaking_frame,
+                        "Sprech-Corona",
+                    );
+                    ui.add_enabled_ui(self.draft.overlay.speaking_frame, |ui| {
+                        let color = ui.color_edit_button_srgb(&mut self.draft.overlay.frame_color);
+                        color.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::ColorButton,
+                                ui.is_enabled(),
+                                "Coronafarbe",
+                            )
+                        });
+                        color.on_hover_text("Coronafarbe")
+                    });
+                    toggle
+                });
                 if !adv {
                     return;
                 }
                 widgets::advanced_caption(ui);
-                // The frame's color sits beside its switch: a row of its
-                // own would push this page past the screen.
-                widgets::setting_row(ui, false, "Sprechende Person umranden", None, |ui| {
-                    let toggle = widgets::named_toggle(
-                        ui,
-                        &mut self.draft.overlay.speaking_frame,
-                        "Sprechende Person umranden",
-                    );
-                    ui.add_enabled_ui(self.draft.overlay.speaking_frame, |ui| {
-                        ui.color_edit_button_srgb(&mut self.draft.overlay.frame_color)
-                            .on_hover_text("Rahmenfarbe")
-                    });
-                    toggle
-                });
                 let edge = matches!(self.draft.overlay.corner, Corner::Top | Corner::Bottom);
                 widgets::setting_row(ui, true, "Anordnung", None, |ui| {
                     ui.add_enabled_ui(!edge, |ui| {
