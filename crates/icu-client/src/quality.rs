@@ -66,9 +66,10 @@ pub struct QualityController {
     last_local_drops_total: u64,
     local_drop_window_start: Instant,
     local_drops_in_window: u32,
-    /// Set once a local drop-burst has been seen; cleared on any calm tick.
-    /// A *second* burst while this is still set jumps straight to pause.
+    /// Whether the previous completed window contained a drop burst.
     seen_local_burst: bool,
+    /// The current window's burst has already caused a step down.
+    local_burst_reported: bool,
 }
 
 impl QualityController {
@@ -85,6 +86,7 @@ impl QualityController {
             local_drop_window_start: now,
             local_drops_in_window: 0,
             seen_local_burst: false,
+            local_burst_reported: false,
         }
     }
 
@@ -105,12 +107,17 @@ impl QualityController {
     ) -> VideoTier {
         let local_delta = local_drops_total.saturating_sub(self.last_local_drops_total);
         self.last_local_drops_total = local_drops_total;
-        if now.duration_since(self.local_drop_window_start) >= LOCAL_DROP_WINDOW {
+        let window_age = now.duration_since(self.local_drop_window_start);
+        if window_age >= LOCAL_DROP_WINDOW {
+            self.seen_local_burst = window_age < LOCAL_DROP_WINDOW * 2
+                && self.local_drops_in_window >= LOCAL_DROP_BURST;
             self.local_drop_window_start = now;
             self.local_drops_in_window = 0;
+            self.local_burst_reported = false;
         }
         self.local_drops_in_window += local_delta as u32;
-        let local_burst = self.local_drops_in_window >= LOCAL_DROP_BURST;
+        let local_burst =
+            self.local_drops_in_window >= LOCAL_DROP_BURST && !self.local_burst_reported;
 
         let baseline = *self.rtt_baseline_ms.get_or_insert(cond.rtt_ms);
         let rtt_bad = cond.rtt_ms - baseline > RTT_STEP_DOWN_MS;
@@ -122,15 +129,17 @@ impl QualityController {
         // with nothing sent the hint could never clear. At the last tier
         // that still sends it only holds the tier.
         let viewer_bad = cond.video_drop_hint_permille >= VIDEO_DROP_STEP_DOWN_PERMILLE;
-        let viewer_steps = viewer_bad && !self.tier.step_down().paused();
-        let bad = rtt_bad || queuing_bad || loss_bad || viewer_steps;
+        // Moderate pressure lowers quality but keeps a picture at T3.
+        // Only severe audio loss or bursts in consecutive windows pause.
+        let pressure = rtt_bad || queuing_bad || loss_bad || viewer_bad;
+        let bad = pressure && !self.tier.step_down().paused();
 
         // Jump straight to pause: severe loss, or a local drop-burst
         // repeating in a second consecutive window.
         let severe = cond.audio_loss_hint_permille >= LOSS_PAUSE_PERMILLE
             || (local_burst && self.seen_local_burst);
         if local_burst {
-            self.seen_local_burst = true;
+            self.local_burst_reported = true;
         }
 
         if severe {
@@ -145,7 +154,7 @@ impl QualityController {
             self.good_ticks = 0;
             self.bad_ticks += 1;
             let confirm = if local_burst { 1 } else { DOWN_CONFIRM_TICKS };
-            if self.bad_ticks >= confirm && self.tier != VideoTier::T4 {
+            if self.bad_ticks >= confirm && !self.tier.step_down().paused() {
                 self.tier = self.tier.step_down();
                 self.bad_ticks = 0;
                 if let Some(last_up) = self.last_step_up {
@@ -155,13 +164,12 @@ impl QualityController {
                     }
                 }
             }
-        } else if viewer_bad && !self.tier.paused() {
-            // The viewer still struggles at the lowest sending tier: hold.
+        } else if pressure && !self.tier.paused() {
+            // Pressure at the lowest sending tier: hold until clear.
             self.bad_ticks = 0;
             self.good_ticks = 0;
         } else {
             self.bad_ticks = 0;
-            self.seen_local_burst = false;
             self.rtt_baseline_ms = Some(baseline + RTT_BASELINE_ALPHA * (cond.rtt_ms - baseline));
 
             if self.tier != VideoTier::T0 {
@@ -296,6 +304,51 @@ mod tests {
             VideoTier::T1,
             "a burst needs only one confirming tick"
         );
+    }
+
+    #[test]
+    fn one_local_burst_is_not_counted_again_on_later_ticks() {
+        let t0 = Instant::now();
+        let mut qc = QualityController::new(t0);
+        assert_eq!(
+            qc.tick(&calm(), 3, t0 + Duration::from_secs(1)),
+            VideoTier::T1
+        );
+        for second in 2..5 {
+            assert_eq!(
+                qc.tick(&calm(), 3, t0 + Duration::from_secs(second)),
+                VideoTier::T1
+            );
+        }
+    }
+
+    #[test]
+    fn moderate_pressure_keeps_a_low_rate_picture() {
+        for pressure in [
+            NetworkCondition {
+                rtt_ms: 200.0,
+                ..calm()
+            },
+            NetworkCondition {
+                queuing_delay_ms: 60.0,
+                ..calm()
+            },
+            NetworkCondition {
+                audio_loss_hint_permille: 50,
+                ..calm()
+            },
+        ] {
+            let t0 = Instant::now();
+            let mut qc = QualityController::new(t0);
+            qc.tick(&calm(), 0, t0);
+            for second in 1..40 {
+                assert_ne!(
+                    qc.tick(&pressure, 0, t0 + Duration::from_secs(second)),
+                    VideoTier::T4
+                );
+            }
+            assert_eq!(qc.tier(), VideoTier::T3);
+        }
     }
 
     #[test]

@@ -4124,7 +4124,7 @@ async fn run_session(
                 let previous = shared.video_tier.swap(tier.as_u8(), Ordering::Relaxed);
                 if previous != tier.as_u8() {
                     DebugStats::inc(&shared.stats.video_tier_changes);
-                    tracing::info!(?tier, "video quality tier changed");
+                    tracing::info!(?tier, ?cond, local_drops, "video quality tier changed");
                 }
                 shared.stats.video_tier.store(tier.as_u8() as i64, Ordering::Relaxed);
             }
