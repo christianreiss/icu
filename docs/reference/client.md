@@ -207,6 +207,7 @@ Bindung: Aufnahme-Modus in den Settings („Taste drücken“), Speicherung als 
 - Vorschau im Settings-Dialog vor dem Einschalten: `CameraHandle::set_preview(true)` lässt die Kamera für die lokale Vorschau laufen, ohne zu encodieren, zu senden oder `CAMERA_ON` zu setzen (2026-09-26; vorher lief sie nur bei `camera_on`, und das Prüfen des eigenen Bilds meldete allen „Kamera an“). Kamera an/aus per Button und Hotkey (`camera`-Bindung); `camera_on` im `SetState`.
 - Robustheit (2026-09-26): jedes Bild läuft durch `RgbFrame::checked` — Länge muss Breite × Höhe × 3 sein (bei MJPEG gilt die Größe aus dem SOF-Kopf, wenn sie die Länge erklärt), ungerade Seiten werden um eine Spalte/Zeile gekürzt, sonst wird das Bild verworfen; vorher asserteten openh264 und egui darauf, im Release-Build (`panic = "abort"`) das Ende des Clients. Öffnet die Kamera nicht oder liefert sie 5 s kein Bild, versucht `CameraHandle::sync` es mit Backoff 1, 2, 4 … 30 s erneut (vorher bei jedem UI-Frame); nach fünf Fehlversuchen in Folge `Command::CameraFailed` — die Engine schaltet die Kamera aus und zeigt den Grund im Banner. Gerätewechsel oder erneutes Einschalten fangen von vorn an. `--headless` folgt `camera_on` ebenso.
 - **Nur senden, wenn jemand zuschaut** (2026-09-24): der Client setzt `viewing` (`protocol.md` §2.1), solange das Overlay an oder das Hauptfenster sichtbar ist (nicht im Tray, nicht minimiert; `minimized` unbekannt, z. B. Wayland → sichtbar). Die UI meldet Sichtbarkeitswechsel als `Command::SetWindowVisible`; der Startwert folgt `start_minimized`, ein Client ohne Fenster (Tests) zählt als Zuschauer. `camera::run_sender` liest `CameraLink::send_tier()`: das ist `T4` (pausiert), solange kein Peer `viewing` trägt, sonst der Tier der Ladder. Die lokale Vorschau läuft weiter; beim Fortsetzen liefert der frische Encoder ein IDR. Allein im Raum ist das immer so (keine Peers → `T4`); Audio folgt derselben Regel (§6 Sender, 2026-09-27).
+- **Bilder in der Teilnehmerliste** (2026-10-12): Jedes neu dekodierte Bild weckt das Hauptfenster vom Decode-Thread aus (`VideoFrames::set_waker`, `ui::repaint_for_video`); während eines Fensterzugs unter Windows nicht. Vorher holte nur der 33-ms-Takt die Bilder ab: gegen 15 fps stand jedes Bild abwechselnd einen und zwei Takte, gelegentlich fiel eines aus.
 - **Anzeige beim Empfänger bestätigt** (2026-09-28): Nur das Overlay meldet, nach erfolgreicher Übergabe seines Bildes an das Betriebssystem; das Hauptfenster zeigt Kamerabilder in der Teilnehmerliste nur als Vorschau-Avatar, ohne dies als Anzeige zu melden — sonst zählte jeder mit offenem Fenster und sichtbarer Zeile als Zuschauer, unabhängig davon, ob überhaupt hingesehen wurde. Die Engine begrenzt `VideoDisplayed` auf einen Bericht je Sekunde und Sender. Der Server prüft die Berechtigung und meldet `VideoViewer` an den Sender. Der Kamerabereich zeigt die Zahl der in den letzten drei Sekunden bestätigten Empfänger, Namen im Hovertext; ohne Bestätigung erscheint „Warte auf angezeigtes Video“. Der Bericht belegt keine menschliche Aufmerksamkeit und erlischt bei Bildstillstand, geschlossenem Fenster oder Verbindungsverlust. Protokoll-Minor 4 erfordert ein gemeinsames Client-/Server-Update.
 - Kein MJPEG: `codec = 2` darf nicht gesendet werden, weil es dafür keine Aushandlung gibt (`protocol.md` §4); empfangene Frames mit `codec = 2` verwirft `Receivers::accept`. Das frühere Feature `mjpeg` zog nur `zune-jpeg` herein, einen Dekodierpfad gab es nie; es ist seit 2026-09-27 entfernt (§16).
 
@@ -320,6 +321,16 @@ Fenster), und die periodischen Repaints (`ui::repaint_after`) pausieren, bis
 nur der schon eingeplante Frame am Anfang des Zugs bleibt. Während des Ziehens
 stehen Pegel und Zeiten still; Größenänderungen zeichnen weiter bei jedem
 Schritt. Messwerkzeug: `experiments/spike-window-drag`.
+
+Diagnose auf echter Hardware (2026-10-12, nach einem Bericht „Ziehen ruckelt“):
+Jeder Zug schreibt eine Logzeile `window drag` mit Dauer (`ms`), Positionswechseln
+(`moves`) und Frames, die trotzdem darin gezeichnet wurden (`frames`); jeder davon
+wartet auf VSync, während das Fenster steht; 0–1 ist normal (der schon eingeplante), `resize=true` markiert eine Größenänderung. Beim Start loggt jedes Fenster
+`renderer` mit Adapter, Backend (DX12/Vulkan/GL), Gerätetyp (diskret, integriert,
+CPU = WARP) und Present-Mode. `ICU_PRESENT_MODE=vsync|novsync|mailbox` wählt den
+Present-Mode für einen A/B-Vergleich; Standard bleibt eframes `AutoVsync` mit
+Frame-Latenz 1, denn ohne VSync zeichnen egui-Animationen (die Pegel laufen beim
+Sprechen fast durchgehend) so schnell, wie die GPU kann.
 
 Je Konfigurationsverzeichnis gibt es eine Fenster-Instanz: Unix nutzt flock und
 Unix-Socket im privaten Laufzeitverzeichnis, Windows Mutex und eine Named Pipe

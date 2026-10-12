@@ -13,10 +13,17 @@
 //! reads the position from the window each frame anyway — and the periodic
 //! repaints pause ([`super::repaint_after`]); one repaint catches up once
 //! the drag ends. Resizing still repaints on every step, as eframe wants.
+//!
+//! Each drag logs how many moves Windows made and how many frames were drawn
+//! inside it anyway: a frame there waits for vsync while the window stands
+//! still, so a real machine that drags badly shows which of the two it is.
+//! 0–1 frames is normal for a move (the one already scheduled); a resize
+//! (`resize=true`) draws on every step.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     sync::atomic::{AtomicBool, Ordering},
+    time::Instant,
 };
 
 use windows::Win32::{
@@ -38,6 +45,29 @@ thread_local! {
     /// is up now: enrollment and main window are separate eframe runs, each
     /// with its own context, on the same thread.
     static CTX: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
+    /// The move or size loop under way.
+    static DRAG: Cell<Option<Drag>> = const { Cell::new(None) };
+}
+
+/// What one move or size loop did, for its log line.
+#[derive(Clone, Copy)]
+struct Drag {
+    began: Instant,
+    /// Position changes Windows made.
+    moves: u32,
+    /// Frames drawn inside the loop anyway.
+    frames: u32,
+    /// The size changed: a resize, which repaints on every step by design.
+    resize: bool,
+}
+
+fn update_drag(f: impl FnOnce(&mut Drag)) {
+    DRAG.with(|d| {
+        if let Some(mut drag) = d.get() {
+            f(&mut drag);
+            d.set(Some(drag));
+        }
+    });
 }
 const SUBCLASS_ID: usize = 0x1c0_d4a6;
 
@@ -50,6 +80,9 @@ pub(super) fn active() -> bool {
 /// thread. Idempotent and cheap, so it runs every frame and picks up
 /// viewports opened since.
 pub(super) fn watch(ctx: &egui::Context) {
+    if active() {
+        update_drag(|d| d.frames += 1);
+    }
     CTX.with_borrow_mut(|current| {
         if current.as_ref() != Some(ctx) {
             *current = Some(ctx.clone());
@@ -78,9 +111,24 @@ unsafe extern "system" fn subclass(
     _: usize,
 ) -> LRESULT {
     match msg {
-        WM_ENTERSIZEMOVE => ACTIVE.store(true, Ordering::Relaxed),
+        WM_ENTERSIZEMOVE => {
+            ACTIVE.store(true, Ordering::Relaxed);
+            DRAG.with(|d| {
+                d.set(Some(Drag {
+                    began: Instant::now(),
+                    moves: 0,
+                    frames: 0,
+                    resize: false,
+                }))
+            });
+        }
         WM_EXITSIZEMOVE => {
             ACTIVE.store(false, Ordering::Relaxed);
+            if let Some(d) = DRAG.with(|d| d.take()) {
+                let ms = d.began.elapsed().as_millis() as u64;
+                let (moves, frames, resize) = (d.moves, d.frames, d.resize);
+                tracing::info!(ms, moves, frames, resize, "window drag");
+            }
             CTX.with_borrow(|ctx| {
                 if let Some(ctx) = ctx {
                     ctx.request_repaint();
@@ -93,8 +141,10 @@ unsafe extern "system" fn subclass(
             // SAFETY: WM_WINDOWPOSCHANGED carries a WINDOWPOS in `lparam`.
             let pos = unsafe { &*(lparam.0 as *const WINDOWPOS) };
             if pos.flags.contains(SWP_NOSIZE) {
+                update_drag(|d| d.moves += 1);
                 return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             }
+            update_drag(|d| d.resize = true);
         }
         WM_NCDESTROY => {
             let _ = unsafe { RemoveWindowSubclass(hwnd, Some(subclass), SUBCLASS_ID) };

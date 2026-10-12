@@ -32,6 +32,18 @@ pub(crate) fn repaint_after(ctx: &egui::Context, after: Duration) {
     ctx.request_repaint_after(after);
 }
 
+/// Repaints the main window for a new video picture, from the decode
+/// thread: shown when it arrives, not up to 33 ms later on the timer, which
+/// against a 15 fps stream held pictures alternately one and two ticks.
+/// Held back like [`repaint_after`] while a window is dragged.
+pub(crate) fn repaint_for_video(ctx: &egui::Context) {
+    #[cfg(windows)]
+    if window_move::active() {
+        return;
+    }
+    ctx.request_repaint_of(egui::ViewportId::ROOT);
+}
+
 /// Lets ICU's windows on this thread be dragged smoothly on Windows
 /// (`window_move`); called every frame, a no-op elsewhere.
 pub(crate) fn watch_window_moves(_ctx: &egui::Context) {
@@ -216,7 +228,50 @@ pub(crate) fn native_options(viewport: egui::ViewportBuilder) -> eframe::NativeO
             .dx12
             .shader_compiler = eframe::wgpu::Dx12Compiler::Fxc;
     }
+    if let Some(mode) = present_mode_override(std::env::var("ICU_PRESENT_MODE").ok().as_deref()) {
+        options.wgpu_options.surface.present_mode = mode;
+    }
     options
+}
+
+/// `ICU_PRESENT_MODE`, for comparing how a window drags and plays video:
+/// `vsync` (eframe's default), `novsync` or `mailbox`. Not the default:
+/// without vsync egui's animations — the level bars, nearly always moving
+/// while someone talks — repaint as fast as the GPU allows.
+fn present_mode_override(value: Option<&str>) -> Option<eframe::wgpu::PresentMode> {
+    use eframe::wgpu::PresentMode;
+    let mode = match value?.trim().to_ascii_lowercase().as_str() {
+        "" => return None,
+        "vsync" => PresentMode::AutoVsync,
+        "novsync" => PresentMode::AutoNoVsync,
+        "mailbox" => PresentMode::Mailbox,
+        other => {
+            tracing::warn!(value = other, "ICU_PRESENT_MODE unknown, using vsync");
+            return None;
+        }
+    };
+    tracing::info!(?mode, "present mode from ICU_PRESENT_MODE");
+    Some(mode)
+}
+
+/// Logs the GPU and API a window renders with: DX12 on the graphics card,
+/// an integrated GPU or WARP (software) explain very different drag and
+/// video behaviour, and the log said nothing about it.
+pub(crate) fn log_renderer(cc: &eframe::CreationContext<'_>) {
+    let Some(render) = cc.wgpu_render_state.as_ref() else {
+        return;
+    };
+    let info = render.adapter.get_info();
+    tracing::info!(
+        adapter = %info.name,
+        backend = ?info.backend,
+        device_type = ?info.device_type,
+        driver = %info.driver,
+        driver_info = %info.driver_info,
+        present_mode = ?render.surface_config.present_mode,
+        frame_latency = ?render.surface_config.desired_maximum_frame_latency,
+        "renderer"
+    );
 }
 
 /// Runs the main window until the user quits or logs out. Owns the engine.
@@ -267,6 +322,18 @@ mod native_options_tests {
             )),
             other => panic!("unexpected wgpu setup: {other:?}"),
         }
+    }
+
+    #[test]
+    fn present_mode_override_reads_known_values_only() {
+        use super::present_mode_override as parse;
+        use eframe::wgpu::PresentMode;
+        assert_eq!(parse(None), None);
+        assert_eq!(parse(Some("")), None);
+        assert_eq!(parse(Some("vsync")), Some(PresentMode::AutoVsync));
+        assert_eq!(parse(Some(" NoVsync ")), Some(PresentMode::AutoNoVsync));
+        assert_eq!(parse(Some("mailbox")), Some(PresentMode::Mailbox));
+        assert_eq!(parse(Some("fast")), None);
     }
 }
 

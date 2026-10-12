@@ -193,6 +193,10 @@ struct App {
     /// What was last reported as `Command::SetWindowVisible`; the engine
     /// starts from the same `start_minimized` value.
     window_visible: bool,
+    /// `window_visible` for the decode thread: a new video picture wakes
+    /// the window only while it is on screen (eframe sleeps 10 ms on every
+    /// wake of a hidden or minimized window).
+    video_wake: Arc<AtomicBool>,
     /// What the window title says now; set again only when it changes.
     title: String,
     /// The window has been sized to the list once since connecting.
@@ -285,7 +289,16 @@ impl App {
 
         fonts::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, &theme_name);
+        super::log_renderer(cc);
         wake_on_change(state_rx.clone(), cc.egui_ctx.clone());
+        let video_wake = Arc::new(AtomicBool::new(!start_minimized));
+        let ctx = cc.egui_ctx.clone();
+        let on_screen = video_wake.clone();
+        frames.set_waker(move || {
+            if on_screen.load(Ordering::Relaxed) {
+                super::repaint_for_video(&ctx);
+            }
+        });
         // A later start of ICU hands over here (`crate::instance`); woken,
         // `logic` runs even while the window is hidden to the tray.
         let ctx = cc.egui_ctx.clone();
@@ -352,6 +365,7 @@ impl App {
             hidden: start_minimized,
             window_restore: WindowRestore::default(),
             window_visible: !start_minimized,
+            video_wake,
             title: "ICU".into(),
             fitted: false,
             #[cfg(windows)]
@@ -625,6 +639,7 @@ impl eframe::App for App {
         }
         if visible != self.window_visible {
             self.window_visible = visible;
+            self.video_wake.store(visible, Ordering::Relaxed);
             let _ = self.cmd.send(Command::SetWindowVisible(visible));
         }
 
@@ -661,9 +676,9 @@ impl eframe::App for App {
         }
 
         // Here and not in `logic`: a window hidden to tray would upload
-        // textures nobody is looking at. `ui` already asks for a repaint
-        // every 33 ms against a 15 fps decoder, so every picture is uploaded
-        // exactly once.
+        // textures nobody is looking at. Every new picture asks for a
+        // repaint (`repaint_for_video`), so each is uploaded once, when it
+        // arrives.
         self.videos.refresh(&ctx);
         #[cfg(feature = "camera")]
         let self_video = {
@@ -2300,6 +2315,7 @@ pub fn run_enroll(
         "ICU",
         options,
         Box::new(move |cc| {
+            super::log_renderer(cc);
             fonts::install(&cc.egui_ctx);
             theme::apply(&cc.egui_ctx, &enroll_theme);
             let ctx = cc.egui_ctx.clone();

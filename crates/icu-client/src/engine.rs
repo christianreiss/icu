@@ -743,6 +743,10 @@ struct Shared {
     /// Video frames received, keyed by session (M4), and the connection
     /// they belong to.
     video: Mutex<VideoIn>,
+    /// Called on the decode thread for every new picture, so a window shows
+    /// it when it arrives instead of on its next timed repaint
+    /// ([`VideoFrames::set_waker`]).
+    video_waker: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Video sender (M4). Taken out of the lock for each frame, so the
     /// camera thread never holds it across a send.
     video_tx: Mutex<Option<Arc<crate::video::Sender>>>,
@@ -963,6 +967,7 @@ impl Engine {
             cycle: Arc::new(CycleClock::default()),
             keyframe_request: AtomicBool::new(false),
             video: Mutex::new(VideoIn::default()),
+            video_waker: Mutex::new(None),
             video_tx: Mutex::new(None),
             cap_prod: Arc::new(Mutex::new(cap_prod)),
             ref_prod: Arc::new(Mutex::new(ref_prod)),
@@ -4206,7 +4211,13 @@ impl crate::video::VideoSink for SessionVideo {
             return;
         };
         let picture = crate::video::decode(&mut decoder, &frame.data);
+        let new_picture = picture.is_some();
         lock(&self.shared.video).finish_for(self.generation, session, decoder, picture);
+        if new_picture {
+            if let Some(wake) = lock(&self.shared.video_waker).as_ref() {
+                wake();
+            }
+        }
     }
 
     fn overflow(&self) {
@@ -5071,6 +5082,12 @@ impl VideoFrames {
     /// One session's latest picture and its `seq`.
     pub fn picture(&self, session: Session) -> Option<(u64, crate::video::Frame)> {
         self.shared.video.lock().unwrap().picture(session)
+    }
+
+    /// Runs `wake` on the decode thread after every new picture; replaces
+    /// the one set before (one window draws the participant list).
+    pub fn set_waker(&self, wake: impl Fn() + Send + 'static) {
+        *self.shared.video_waker.lock().unwrap() = Some(Box::new(wake));
     }
 }
 
