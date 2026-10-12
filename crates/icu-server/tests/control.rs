@@ -568,3 +568,82 @@ async fn one_rate_limit_violation_keeps_the_connection() {
     );
     server.shutdown().await;
 }
+
+/// A user's own corona color goes to everybody, the user's own session
+/// included; an unchanged color sends nothing; `Welcome` and `UserJoined`
+/// carry it after a reconnect and after a server restart; more than three
+/// changes at once are rate limited.
+#[tokio::test]
+async fn corona_color_is_broadcast_stored_and_announced() {
+    let pink = Some([255, 105, 180]);
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let identity = server.enroll("bob").await;
+    let mut bob = server.connect(&identity).await.expect("connect");
+    bob.hello("bob").await;
+    let bob_session = bob.session;
+
+    bob.send_msg(&ControlMsg::SetCoronaColor { color: pink })
+        .await;
+    for client in [&mut alice, &mut bob] {
+        let got = client
+            .recv_matching(|m| matches!(m, ControlMsg::UserCoronaColor { .. }))
+            .await;
+        assert_eq!(
+            got,
+            Some(ControlMsg::UserCoronaColor {
+                session: bob_session,
+                color: pink
+            })
+        );
+    }
+    bob.send_msg(&ControlMsg::SetCoronaColor { color: pink })
+        .await;
+    alice.expect_silence().await;
+
+    // Reconnect: in bob's own `Welcome` and in alice's `UserJoined`.
+    bob.conn.close(0u32.into(), b"");
+    drop(bob);
+    let mut bob = server.connect(&identity).await.expect("reconnect");
+    let ControlMsg::Welcome { you, .. } = bob.hello("bob").await else {
+        panic!("no Welcome")
+    };
+    assert_eq!(you.corona_color, pink);
+    let joined = alice
+        .recv_matching(|m| matches!(m, ControlMsg::UserJoined { .. }))
+        .await;
+    let Some(ControlMsg::UserJoined { user }) = joined else {
+        panic!("{joined:?}")
+    };
+    assert_eq!(user.corona_color, pink);
+
+    // A burst of three passes, the fourth is rate limited.
+    for blue in 1..=4u8 {
+        bob.send_msg(&ControlMsg::SetCoronaColor {
+            color: Some([0, 0, blue]),
+        })
+        .await;
+    }
+    let err = bob
+        .recv_matching(|m| matches!(m, ControlMsg::Error { .. }))
+        .await;
+    assert!(
+        matches!(err, Some(ControlMsg::Error { code, .. }) if code == ec::RATE_LIMITED),
+        "{err:?}"
+    );
+    drop(alice);
+    drop(bob);
+
+    // Restart: the store kept the last accepted color.
+    let server = server.restart_with(|_| {}).await;
+    let mut bob = server
+        .connect(&identity)
+        .await
+        .expect("connect after restart");
+    let ControlMsg::Welcome { you, users, .. } = bob.hello("bob").await else {
+        panic!("no Welcome")
+    };
+    assert_eq!(you.corona_color, Some([0, 0, 3]));
+    assert!(users.iter().all(|u| u.corona_color.is_none()), "{users:?}");
+    server.shutdown().await;
+}

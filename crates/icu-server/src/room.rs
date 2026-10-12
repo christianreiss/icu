@@ -11,7 +11,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use icu_proto::{ControlMsg, Session, UserFlags, UserId, UserInfo};
+use icu_proto::{ControlMsg, Rgb, Session, UserFlags, UserId, UserInfo};
 use tokio::sync::mpsc;
 
 /// Talk spurt tracking for one sender (`docs/reference/protocol.md` §2.1).
@@ -85,6 +85,8 @@ pub struct Member {
     /// `MUTED`/`DEAFENED` enforced by an admin (`AdminSetRestriction`): kept
     /// set in `flags` whatever the client requests.
     pub forced: UserFlags,
+    /// The user's own corona color, from the store (`SetCoronaColor`).
+    pub corona_color: Option<Rgb>,
     /// The QUIC connection, for datagrams and for closing.
     pub conn: quinn::Connection,
     /// Outgoing control frames, each shared with every other recipient of a
@@ -136,6 +138,7 @@ impl Member {
             session: self.session,
             name: self.name.clone(),
             flags: self.flags,
+            corona_color: self.corona_color,
         }
     }
 }
@@ -219,6 +222,7 @@ impl Room {
         flags: UserFlags,
         is_admin: bool,
         forced: UserFlags,
+        corona_color: Option<Rgb>,
         conn: quinn::Connection,
         out: mpsc::Sender<Bytes>,
         welcome: impl FnOnce(Session, UserFlags, Vec<UserInfo>) -> ControlMsg,
@@ -239,6 +243,7 @@ impl Room {
             name,
             flags: initial,
             forced,
+            corona_color,
             conn,
             out,
             speak: Speaking::default(),
@@ -464,6 +469,20 @@ impl Room {
         if let Some(member) = self.lock().members.get_mut(&session) {
             member.name = name.to_string();
         }
+    }
+
+    /// Sets the corona color on every live session of `user_id`. Returns the
+    /// sessions whose color changed, for the `UserCoronaColor` broadcast.
+    pub fn set_corona_color(&self, user_id: UserId, color: Option<Rgb>) -> Vec<Session> {
+        let mut state = self.lock();
+        let mut changed = Vec::new();
+        for member in state.members.values_mut() {
+            if member.user_id == user_id && member.corona_color != color {
+                member.corona_color = color;
+                changed.push(member.session);
+            }
+        }
+        changed
     }
 
     /// Sets or clears `ADMIN` on every live session of `user_id`. Returns the

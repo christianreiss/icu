@@ -1838,6 +1838,14 @@ pub(super) struct Participant<'a> {
     /// `Some` when the viewer is an admin and this is somebody else: what
     /// an admin currently enforces on them, for the moderation menu.
     pub(super) moderation: Option<Moderation>,
+    /// The speaking ring in the corona color this person chose; `None`
+    /// (none chosen) keeps the theme's accent.
+    pub(super) ring: Option<egui::Color32>,
+}
+
+/// A chosen corona color as a ring color.
+fn ring(color: Option<icu_proto::Rgb>) -> Option<egui::Color32> {
+    color.map(|[r, g, b]| egui::Color32::from_rgb(r, g, b))
 }
 
 /// What an admin enforces on a participant (`AdminSetRestriction`), as the
@@ -1913,6 +1921,11 @@ pub(super) fn participant_for<'a>(
             session: me.session,
             video: self_video,
             moderation: None,
+            // The own pick at once, before the server echoes it.
+            ring: ring(
+                (state.settings.overlay.frame_color != crate::config::DEFAULT_FRAME_COLOR)
+                    .then_some(state.settings.overlay.frame_color),
+            ),
         });
     }
     let p = state.peers.iter().find(|p| p.info.user_id == user_id)?;
@@ -1932,6 +1945,7 @@ pub(super) fn participant_for<'a>(
         client_rtt_ms: None,
         loss_permille: p.recv_loss_permille,
         session: p.info.session,
+        ring: ring(p.info.corona_color),
         moderation: state.is_admin.then(|| {
             let row = state.user_list.iter().find(|u| u.user_id == p.info.user_id);
             Moderation {
@@ -2035,7 +2049,8 @@ fn participant_row(
                     if let Some(s) = p.subtitle() {
                         hint.push_str(s);
                     }
-                    let avatar = widgets::avatar(ui, p.name, p.user_id, p.speaking, 30.0, p.video);
+                    let avatar =
+                        widgets::avatar(ui, p.name, p.user_id, p.speaking, p.ring, 30.0, p.video);
                     ui.add_space(2.0);
                     // The name gets what the icons on the right leave — ping
                     // 22, volume 28, an 18 slot for the mode and one per badge
@@ -3063,6 +3078,7 @@ mod tests {
                 session,
                 name: name.into(),
                 flags: UserFlags(flags),
+                corona_color: None,
             },
             100.0,
         )

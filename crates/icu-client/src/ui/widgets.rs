@@ -1094,7 +1094,8 @@ const AVATAR_LIGHT: [(Color32, Color32); 6] = [
 ];
 
 /// A circular avatar with a hash-picked fill and the name's [`initials`];
-/// `speaking` draws an accent ring around it. `video` puts that person's live
+/// `speaking` draws a ring around it, in `ring` (the person's corona color)
+/// or the theme's accent. `video` puts that person's live
 /// picture into the circle instead of the initials — same slot, same
 /// allocation, same ring, so a row does not move when a camera comes on.
 pub fn avatar(
@@ -1102,6 +1103,7 @@ pub fn avatar(
     name: &str,
     user_id: icu_proto::UserId,
     speaking: bool,
+    ring: Option<Color32>,
     size: f32,
     video: Option<egui::load::SizedTexture>,
 ) -> egui::Response {
@@ -1157,7 +1159,8 @@ pub fn avatar(
         }
         if speaking {
             let tok = theme::tokens(ui.visuals());
-            painter.circle_stroke(center, size / 2.0 + 2.0, Stroke::new(2.0, tok.accent));
+            let color = ring.unwrap_or(tok.accent);
+            painter.circle_stroke(center, size / 2.0 + 2.0, Stroke::new(2.0, color));
         }
     }
     response

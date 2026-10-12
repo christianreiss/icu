@@ -9,7 +9,7 @@ use std::{
 
 use bytes::Bytes;
 use icu_proto::{
-    error as ec, limits as pl, name_key, AudioParams, ControlMsg, Session, UserId, UserInfo,
+    error as ec, limits as pl, name_key, AudioParams, ControlMsg, Rgb, Session, UserId, UserInfo,
     MAX_CONTROL_FRAME,
 };
 use rustls::pki_types::CertificateDer;
@@ -507,6 +507,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
     let is_admin = user.is_admin;
     let (forced_muted, forced_deafened) = (user.server_muted, user.server_deafened);
     let forced = restriction_flags(forced_muted, forced_deafened);
+    let corona_color = user.corona_color;
 
     // 3. Join, `Welcome`, `UserJoined`.
     let (out_tx, out_rx) = mpsc::channel(crate::limits::CONTROL_QUEUE_FRAMES);
@@ -516,6 +517,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
             session,
             name: stored_name.clone(),
             flags,
+            corona_color,
         };
         welcome(server, minor, you, users, is_admin, false)
     };
@@ -525,6 +527,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         initial,
         is_admin,
         forced,
+        corona_color,
         conn.clone(),
         out_tx,
         welcome,
@@ -715,18 +718,19 @@ async fn roomless_welcome(
         initial: _,
         caps: _,
     } = read_hello(server, conn).await?;
-    let (name, is_admin) = {
+    let (name, is_admin, corona_color) = {
         let store = server.store.lock().await;
         let user = store
             .user(identity.user_id)
             .ok_or_else(|| Error::coded(ec::AUTH_UNKNOWN_CERT, "user vanished"))?;
-        (user.name.clone(), user.is_admin)
+        (user.name.clone(), user.is_admin, user.corona_color)
     };
     let you = UserInfo {
         user_id: identity.user_id,
         session: 0,
         name,
         flags: icu_proto::UserFlags::NONE,
+        corona_color,
     };
     let welcome = welcome(server, minor, you, Vec::new(), is_admin, registration);
     write_msg(&mut send, &welcome).await?;
@@ -1102,6 +1106,9 @@ async fn control_loop(
     };
     let mut control = TokenBucket::per_second(server.config.limits.control_msgs_per_s);
     let mut set_state = TokenBucket::per_second(server.config.limits.set_state_per_s);
+    // Every change rewrites `users.toml`; a client sends one per picked
+    // color, debounced, so a burst of three and one a second is plenty.
+    let mut corona = TokenBucket::new(1.0, 3.0);
     let mut last_video_report: HashMap<Session, Instant> = HashMap::new();
     let mut violations = ViolationCounter::new(
         pl::RATE_VIOLATIONS_FATAL,
@@ -1154,6 +1161,18 @@ async fn control_loop(
                         .room
                         .broadcast(&ControlMsg::UserState { session, flags });
                 }
+            }
+            ControlMsg::SetCoronaColor { color } => {
+                if !corona.take_one() {
+                    rate_limited(
+                        server,
+                        session,
+                        &mut violations,
+                        "SetCoronaColor rate exceeded",
+                    )?;
+                    continue;
+                }
+                set_corona_color(server, session, user_id, color).await;
             }
             ControlMsg::VideoDisplayed { speaker } => {
                 if server.room.video_display_eligible(session, speaker) {
@@ -1290,6 +1309,42 @@ async fn control_loop(
 
 /// Sends `Error(RATE_LIMITED)`; the fatal third violation within the window
 /// is the `Err` (§6.6).
+/// `SetCoronaColor`: store, room and the `UserCoronaColor` broadcast under
+/// the store lock, like an admin restriction (`admin::set_restriction`): a
+/// session joining meanwhile reads the store under that lock too, so it
+/// either sees the old color and then gets the broadcast, or sees the new
+/// one. An unchanged color writes and sends nothing. A failed write is the
+/// server's own trouble: logged, the sender gets `SERVER_ERROR`, nothing
+/// changes.
+async fn set_corona_color(
+    server: &Arc<Server>,
+    session: Session,
+    user_id: UserId,
+    color: Option<Rgb>,
+) {
+    let mut store = server.store.lock().await;
+    match store.set_corona_color(user_id, color) {
+        Ok(_) => {
+            for changed in server.room.set_corona_color(user_id, color) {
+                server.room.broadcast(&ControlMsg::UserCoronaColor {
+                    session: changed,
+                    color,
+                });
+            }
+        }
+        Err(e) => {
+            tracing::warn!(user_id, error = %e, "cannot store the corona color");
+            server.room.send_to(
+                session,
+                &ControlMsg::Error {
+                    code: e.code().unwrap_or(ec::SERVER_ERROR),
+                    detail: e.to_string(),
+                },
+            );
+        }
+    }
+}
+
 fn rate_limited(
     server: &Arc<Server>,
     session: Session,

@@ -369,7 +369,7 @@ impl Renderer {
                     self.upload(1, 1, &[0, 0, 0, 255]),
                 ),
             };
-            let color = scene.geometry.frame_color.map(|c| c as f32 / 255.);
+            let color = tile.color.map(|c| c as f32 / 255.);
             let values = [
                 w as f32,
                 h as f32,
@@ -600,41 +600,40 @@ mod tests {
     #[ignore = "requires a hardware GPU; run with --ignored --nocapture"]
     fn hardware_corona_follows_selected_color() {
         let mut renderer = Renderer::new().expect("hardware GPU");
-        let tiles = [Tile {
-            face: Face::Camera(None),
-            name: String::new(),
-            speaking: true,
-            dim: false,
-            scale: 1.,
-        }];
         let geom = animated_geometry(120, 1., 1.);
         let (width, height) = (geom.outer_w + HALO * 2, geom.outer_h + HALO * 2);
         let mut labels = None;
-        let mut scene = RenderScene {
-            geometry: Geometry {
-                width,
-                height,
-                camera_diameter: 120,
-                plate_diameter: 72,
-                dpi: 1.,
-                horizontal: true,
-                bottom: false,
-                hug: Hug::Center,
-                speaking_frame: true,
-                frame_color: [255, 0, 0],
-                gap: GAP,
-            },
-            scale: 1.,
-            tiles: &tiles,
-            intensities: &[1.],
-            labels: &mut labels,
-            visible_frames: &[],
-        };
         let mut canvas = vec![0; (width * height * 4) as usize];
-        // Reuse the renderer and dimensions: settings changes must not show
-        // a queued frame with the previous color.
+        // Reuse the renderer and dimensions: a tile's new color must not
+        // show a queued frame with the previous one.
         for rgb in [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 0, 0]] {
-            scene.geometry.frame_color = rgb;
+            let tiles = [Tile {
+                face: Face::Camera(None),
+                name: String::new(),
+                speaking: true,
+                color: rgb,
+                dim: false,
+                scale: 1.,
+            }];
+            let mut scene = RenderScene {
+                geometry: Geometry {
+                    width,
+                    height,
+                    camera_diameter: 120,
+                    plate_diameter: 72,
+                    dpi: 1.,
+                    horizontal: true,
+                    bottom: false,
+                    hug: Hug::Center,
+                    speaking_frame: true,
+                    gap: GAP,
+                },
+                scale: 1.,
+                tiles: &tiles,
+                intensities: &[1.],
+                labels: &mut labels,
+                visible_frames: &[],
+            };
             renderer.invalidate();
             complete(&mut renderer, &mut scene, &mut canvas);
             let bgra = [rgb[2], rgb[1], rgb[0]];
@@ -675,6 +674,7 @@ mod tests {
                             ))),
                             name: "Anna".into(),
                             speaking: false,
+                            color: crate::config::DEFAULT_FRAME_COLOR,
                             dim: true,
                             scale: REST_SCALE,
                         },
@@ -682,6 +682,7 @@ mod tests {
                             face: Face::Plate,
                             name: "Ben ohne Kamera".into(),
                             speaking: true,
+                            color: crate::config::DEFAULT_FRAME_COLOR,
                             dim: false,
                             scale: SPEAK_SCALE,
                         },
@@ -689,6 +690,7 @@ mod tests {
                             face: Face::Plate,
                             name: "Carla".into(),
                             speaking: false,
+                            color: crate::config::DEFAULT_FRAME_COLOR,
                             dim: true,
                             scale: REST_SCALE,
                         },
@@ -727,7 +729,6 @@ mod tests {
                         bottom,
                         hug: Hug::Center,
                         speaking_frame: true,
-                        frame_color: [46, 155, 255],
                         gap,
                     };
                     let mut scene = RenderScene {
@@ -842,6 +843,7 @@ mod tests {
                         ))),
                         name: format!("Speaker {i}"),
                         speaking: true,
+                        color: crate::config::DEFAULT_FRAME_COLOR,
                         dim: false,
                         scale: 1.,
                     })
@@ -865,7 +867,6 @@ mod tests {
                     bottom: false,
                     hug: Hug::Center,
                     speaking_frame: true,
-                    frame_color: [46, 155, 255],
                     gap: GAP,
                 },
                 scale: 1.,
@@ -995,6 +996,7 @@ mod tests {
                     face: Face::Camera(None),
                     name: "Camera missing".into(),
                     speaking: false,
+                    color: crate::config::DEFAULT_FRAME_COLOR,
                     dim: true,
                     scale: 1.,
                 },
@@ -1002,6 +1004,7 @@ mod tests {
                     face: Face::Plate,
                     name: "Voice only".into(),
                     speaking: true,
+                    color: crate::config::DEFAULT_FRAME_COLOR,
                     dim: false,
                     scale: SPEAK_SCALE,
                 },
@@ -1034,7 +1037,6 @@ mod tests {
                     bottom: true,
                     hug: Hug::Center,
                     speaking_frame: true,
-                    frame_color: [46, 155, 255],
                     gap,
                 },
                 scale: 2.,

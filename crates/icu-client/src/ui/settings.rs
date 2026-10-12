@@ -1535,25 +1535,37 @@ impl SettingsView {
                     let edge = edge.round() as u32;
                     self.draft.overlay.offset = [edge, edge];
                 }
-                // Keep the corona and its color together in the everyday
-                // settings, without adding a separate color row.
+                // Keep the corona and the own color together in the everyday
+                // settings, without adding a separate color row. The switch
+                // only decides whether this overlay draws coronas; the color
+                // is how everybody else sees this user, so it stays usable.
                 widgets::setting_row(ui, true, "Sprech-Corona", None, |ui| {
                     let toggle = widgets::named_toggle(
                         ui,
                         &mut self.draft.overlay.speaking_frame,
                         "Sprech-Corona",
                     );
-                    ui.add_enabled_ui(self.draft.overlay.speaking_frame, |ui| {
-                        let color = ui.color_edit_button_srgb(&mut self.draft.overlay.frame_color);
-                        color.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::ColorButton,
-                                ui.is_enabled(),
-                                "Coronafarbe",
-                            )
+                    let own = &mut self.draft.overlay.frame_color;
+                    if *own != crate::config::DEFAULT_FRAME_COLOR {
+                        let reset = ui.small_button(icon::ARROW_COUNTER_CLOCKWISE);
+                        reset.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Standardfarbe")
                         });
-                        color.on_hover_text("Coronafarbe")
+                        if reset.on_hover_text("Zurück zur Standardfarbe").clicked() {
+                            *own = crate::config::DEFAULT_FRAME_COLOR;
+                        }
+                    }
+                    let color = ui.color_edit_button_srgb(own);
+                    color.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::ColorButton,
+                            true,
+                            "Meine Coronafarbe",
+                        )
                     });
+                    color.on_hover_text(
+                        "Meine Coronafarbe – so sehen mich alle im Raum, wenn ich spreche",
+                    );
                     toggle
                 });
                 if !adv {
@@ -2003,7 +2015,8 @@ impl SettingsView {
             .inner_margin(egui::Margin::symmetric(12, 5))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let avatar = widgets::avatar(ui, &user.name, user.user_id, false, 26.0, None);
+                    let avatar =
+                        widgets::avatar(ui, &user.name, user.user_id, false, None, 26.0, None);
                     if !user.pending {
                         let dot = if user.disabled {
                             tok.error

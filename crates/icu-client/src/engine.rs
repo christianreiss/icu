@@ -20,7 +20,7 @@ use std::{
 };
 
 use icu_proto::{
-    error as codes, header::AUDIO_FLAG_END, limits as pl, AudioHeader, ControlMsg, Session,
+    error as codes, header::AUDIO_FLAG_END, limits as pl, AudioHeader, ControlMsg, Rgb, Session,
     UserFlags, UserId, UserInfo,
 };
 use ringbuf::{
@@ -2457,6 +2457,8 @@ async fn net_task(
         muted_before_deafen: false,
         notifier: crate::notify::Notifier::default(),
         trial: None,
+        corona_seen: cfg.settings.overlay.frame_color,
+        corona_pending: None,
     };
     local.update_viewing();
     let mut attempt: u32 = 0;
@@ -2801,6 +2803,21 @@ struct LocalState {
     /// An imported identity that has yet to prove itself, and what to go
     /// back to if it cannot.
     trial: Option<ImportTrial>,
+    /// The own corona color as last committed, to tell a picked color from
+    /// settings that changed elsewhere.
+    corona_seen: [u8; 3],
+    /// When a color the server has not heard of yet was picked. It goes
+    /// out [`CORONA_DEBOUNCE`] after the last pick — the picker reports
+    /// every step of a drag — or right after the next `Welcome`.
+    corona_pending: Option<Instant>,
+}
+
+/// How long a picked corona color settles before it is sent.
+const CORONA_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// The own corona color as the server keeps it: the default is `None`.
+fn corona_wire(color: [u8; 3]) -> Option<Rgb> {
+    (color != crate::config::DEFAULT_FRAME_COLOR).then_some(color)
 }
 
 /// The identity in force before an import, kept until the imported one
@@ -3239,6 +3256,10 @@ impl LocalState {
         // The mute is the engine's: a settings window's copy taken before a
         // mute hotkey, or a passport's, must not undo it on disk.
         self.settings.audio.muted = self.own_mute();
+        if self.settings.overlay.frame_color != self.corona_seen {
+            self.corona_seen = self.settings.overlay.frame_color;
+            self.corona_pending = Some(Instant::now());
+        }
         shared.dsp.apply_settings(&self.settings);
         shared
             .output_gain
@@ -3260,6 +3281,31 @@ impl LocalState {
         });
         let _ = self.settings_tx.send(self.settings.clone());
         self.update_viewing() || camera_changed
+    }
+
+    /// Takes the own corona color the server has (`None`: the default) into
+    /// the settings, without counting it as a pick to send back.
+    fn adopt_corona(&mut self, color: Option<Rgb>, shared: &Arc<Shared>) {
+        let color = color.unwrap_or(crate::config::DEFAULT_FRAME_COLOR);
+        if color != self.settings.overlay.frame_color {
+            self.settings.overlay.frame_color = color;
+            self.corona_seen = color;
+            self.commit_settings(shared, false);
+        }
+    }
+
+    /// After `Welcome`: the server's color wins, unless one was picked here
+    /// that it has not heard of yet. A server without one gets this
+    /// client's, so a color picked while it was still local carries over.
+    fn sync_corona(&mut self, stored: Option<Rgb>, shared: &Arc<Shared>) {
+        if self.corona_pending.is_some() {
+            return;
+        }
+        if stored.is_some() {
+            self.adopt_corona(stored, shared);
+        } else if corona_wire(self.settings.overlay.frame_color).is_some() {
+            self.corona_pending = Some(Instant::now() - CORONA_DEBOUNCE);
+        }
     }
 
     /// Replaces the settings and takes them into effect. The streams are
@@ -3806,6 +3852,8 @@ async fn run_session(
         return send_failed(&connection);
     }
 
+    local.sync_corona(welcome.you.corona_color, shared);
+
     // Pick up a rename that happened on another device, or renew a
     // certificate that is about to expire (`docs/reference/protocol.md` §2.2); again every
     // hour, since a session can outlive the window.
@@ -3862,6 +3910,7 @@ async fn run_session(
         // next token is there.
         let state_due = (!same_settable(local.flags, sent_flags))
             .then(|| set_state_budget.ready_at(Instant::now()));
+        let corona_due = local.corona_pending.map(|picked| picked + CORONA_DEBOUNCE);
         tokio::select! {
             msg = ctrl_rx.recv() => {
                 let msg = match msg {
@@ -3987,6 +4036,18 @@ async fn run_session(
             _ = tokio::time::sleep_until(
                 state_due.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()
             ), if state_due.is_some() => {}
+            _ = tokio::time::sleep_until(
+                corona_due.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()
+            ), if corona_due.is_some() => {
+                local.corona_pending = None;
+                let color = corona_wire(local.settings.overlay.frame_color);
+                let stored = shared.state.borrow().me.as_ref().and_then(|m| m.corona_color);
+                if color != stored
+                    && conn::write_msg(&mut send, &ControlMsg::SetCoronaColor { color }).await.is_err()
+                {
+                    break send_failed(&connection);
+                }
+            }
             _ = renew_tick.tick() => {
                 let stored = local.name.clone();
                 if maybe_auto_renew(&mut send, local, shared, &stored).await.is_err() {
@@ -4765,6 +4826,27 @@ async fn handle_control(
                 shared.state.send_modify(|s| s.video_viewers = viewers);
             }
         }
+        ControlMsg::UserCoronaColor { session, color } => {
+            let mine = shared
+                .state
+                .borrow()
+                .me
+                .as_ref()
+                .is_some_and(|m| m.session == session);
+            shared.state.send_modify(|s| {
+                if let Some(me) = s.me.as_mut().filter(|me| me.session == session) {
+                    me.corona_color = color;
+                }
+                for p in s.peers.iter_mut().filter(|p| p.info.session == session) {
+                    p.info.corona_color = color;
+                }
+            });
+            // Picked on another device of this user: the settings follow,
+            // unless a pick here is still on its way.
+            if mine && local.corona_pending.is_none() {
+                local.adopt_corona(color, shared);
+            }
+        }
         ControlMsg::UserRenamed { session, name } => {
             let me_session = shared.state.borrow().me.as_ref().map(|m| m.session);
             if me_session == Some(session) {
@@ -4858,6 +4940,7 @@ async fn handle_control(
         | ControlMsg::AdminRevokeUser { .. }
         | ControlMsg::PeerCertificateRequest { .. }
         | ControlMsg::VideoDisplayed { .. }
+        | ControlMsg::SetCoronaColor { .. }
         | ControlMsg::UserListRequest
         | ControlMsg::AdminKick { .. }
         | ControlMsg::AdminSetRestriction { .. } => {
@@ -5230,6 +5313,7 @@ mod tests {
                 session,
                 name: format!("p{session}"),
                 flags: UserFlags(flags),
+                corona_color: None,
             },
             100.0,
         )

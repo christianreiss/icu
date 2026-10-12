@@ -270,13 +270,25 @@ wirken sofort; Änderungen aus Tray, Hotkeys und Hauptfenster werden übernommen
 statt durch einen veralteten Entwurf überschrieben zu werden. Der Mikrofontest
 bleibt auf Audio und Klang aktiv, damit Klangänderungen hörbar vergleichbar sind.
 
-Die Coronafarbe gilt lokal für alle sprechenden Kacheln, einschließlich
-Namensschildern und der eigenen Kachel. Der Nebel variiert die Helligkeit der
-gewählten RGB-Farbe ohne violette Beimischung; der CPU-Ersatz verwendet dieselbe
-Farbe für seinen Rahmen. Die Farbe bleibt beim Ausschalten der Sprech-Corona
-gespeichert, ihr Farbwähler ist dann deaktiviert. Bestehende
-`overlay.frame_color`-Werte bleiben erhalten; ohne eigene Wahl gilt weiterhin
-Blau (`[46, 155, 255]`).
+„Meine Coronafarbe“ (2026-10-12, Protokoll-Minor 5) ist die eigene Farbe, nicht
+mehr die aller Kacheln: Jeder wählt, in welcher Farbe er für alle im Raum
+leuchtet, wenn er spricht. Der Client schickt sie 500 ms nach der letzten Wahl
+(`SetCoronaColor`; der Farbwähler meldet jeden Schritt), der Server speichert sie
+am Nutzer und verteilt sie (`UserInfo.corona_color`, `UserCoronaColor`). Das
+Overlay zeichnet jede Kachel und jedes Namensschild in der Farbe ihres Nutzers,
+die eigene sofort in der gerade gewählten; wer keine gewählt hat, leuchtet in
+Blau (`DEFAULT_FRAME_COLOR`, `[46, 155, 255]`). Der Sprech-Ring um den Avatar im
+Hauptfenster nimmt dieselbe Farbe, ohne Wahl den Akzent des Themes. Der Nebel
+variiert die Helligkeit der Farbe ohne violette Beimischung; der CPU-Ersatz
+verwendet sie für den Rahmen. Der Schalter „Sprech-Corona“ bleibt lokal: Er
+bestimmt nur, ob dieses Overlay Coronas zeichnet, deshalb bleibt der Farbwähler
+auch ausgeschaltet bedienbar. Der Pfeil daneben setzt auf Standard zurück
+(= `None` auf dem Server). Abgleich beim `Welcome`: Hat der Server eine Farbe,
+übernimmt der Client sie in `overlay.frame_color` (zweites Gerät, Neuinstallation);
+hat er keine und ist die lokale nicht Blau, geht die lokale hoch (Übernahme der
+bis 0.1.14 nur lokalen Wahl); eine offline gewählte Farbe wird hochgeschickt
+statt überschrieben. Eine Änderung von einem anderen Gerät desselben Nutzers
+übernimmt der Client ebenso, außer während eine eigene Wahl noch unterwegs ist.
 
 Die erste Einrichtung führt durch Geräte, Sprechen, Klang und Übersicht.
 Währenddessen hält sie das Mikrofon stumm, lässt Pegel, VAD, PTT-Probe und

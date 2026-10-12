@@ -307,6 +307,9 @@ pub enum Expand {
     Horizontal,
 }
 
+/// The corona color of everyone who chose none, the own one included.
+pub const DEFAULT_FRAME_COLOR: [u8; 3] = [0x2e, 0x9b, 0xff];
+
 /// `[overlay]`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -330,8 +333,11 @@ pub struct OverlaySettings {
     /// Dim tiles of peers who aren't currently speaking.
     pub dim_non_speaking: bool,
     /// Draw a highlighted frame around the tile of whoever is speaking.
+    /// Only here: whether others see coronas is theirs to choose.
     pub speaking_frame: bool,
-    /// Color of that frame, RGB.
+    /// This user's own corona color, RGB: stored on the server and shown
+    /// for them on every client (protocol minor 5); [`DEFAULT_FRAME_COLOR`]
+    /// is the server's "none chosen".
     pub frame_color: [u8; 3],
     /// Show smaller name plates for everyone without a camera, including
     /// while silent, with the same speaking and dimming rules as video tiles.
@@ -363,7 +369,7 @@ impl Default for OverlaySettings {
             expand: Expand::Vertical,
             dim_non_speaking: true,
             speaking_frame: true,
-            frame_color: [0x2e, 0x9b, 0xff],
+            frame_color: DEFAULT_FRAME_COLOR,
             voice_plates: true,
             shy: false,
             shy_hold_ms: 1000,

@@ -291,7 +291,13 @@ pub struct UserInfo {
     pub name: String,
     /// State bits.
     pub flags: UserFlags,
+    /// The speaking corona color this user chose for themselves, shown for
+    /// them on every client; `None` = the client's default (minor 5).
+    pub corona_color: Option<Rgb>,
 }
+
+/// An sRGB color, red, green, blue.
+pub type Rgb = [u8; 3];
 
 /// One row of the admin User Manager list (`ControlMsg::UserListResponse`,
 /// `docs/reference/protocol.md` §2.2). Lighter than the admin-socket's `AdminUser`: no

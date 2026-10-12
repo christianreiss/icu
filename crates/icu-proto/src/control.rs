@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     framing::{self, MAX_CONTROL_FRAME},
-    AudioParams, ProtoError, Session, UserFlags, UserId, UserInfo, UserSummary,
+    AudioParams, ProtoError, Rgb, Session, UserFlags, UserId, UserInfo, UserSummary,
 };
 
 /// Protocol minor version of this implementation: the client sends it in
@@ -18,13 +18,16 @@ use crate::{
 /// this project (`docs/reference/protocol.md` §2.2). Minor 2 appended
 /// `Welcome.server_minor` (2026-09-26). Minor 3 adds peer certificate lookup
 /// and requires a coordinated client/server update. Minor 4 adds video
-/// display reports and likewise requires a coordinated update.
-pub const MINOR: u16 = 4;
+/// display reports and likewise requires a coordinated update. Minor 5 adds
+/// each user's own corona color (`UserInfo.corona_color`, `SetCoronaColor`,
+/// `UserCoronaColor`); `UserInfo` sits inside `Welcome`, so again a
+/// coordinated update.
+pub const MINOR: u16 = 5;
 
 /// Lowest protocol minor this build talks to, in both directions: the server
 /// closes a `Hello` below it with `VERSION_UNSUPPORTED`, the client a
 /// `Welcome` whose `server_minor` is below it (`docs/reference/protocol.md` §8).
-pub const MIN_PEER_MINOR: u16 = 4;
+pub const MIN_PEER_MINOR: u16 = 5;
 
 /// Peer-assisted audio measurements and hints (bit 0).
 pub const CAP_AUDIO_FEEDBACK: u32 = 1;
@@ -361,6 +364,20 @@ pub enum ControlMsg {
         /// Authenticated reporting session.
         viewer: Session,
     },
+    /// 42, C→S. The sender's own corona color, stored for their user and
+    /// shown for them on every client; `None` = back to the default.
+    SetCoronaColor {
+        /// The chosen color.
+        color: Option<Rgb>,
+    },
+    /// 43, S→C. A user's corona color changed, sent once per session of
+    /// that user (also to the user's own sessions).
+    UserCoronaColor {
+        /// Whose color.
+        session: Session,
+        /// The new color; `None` = default.
+        color: Option<Rgb>,
+    },
 }
 
 impl ControlMsg {
@@ -427,6 +444,8 @@ impl ControlMsg {
             ControlMsg::PeerCertificateResponse { .. } => "PeerCertificateResponse",
             ControlMsg::VideoDisplayed { .. } => "VideoDisplayed",
             ControlMsg::VideoViewer { .. } => "VideoViewer",
+            ControlMsg::SetCoronaColor { .. } => "SetCoronaColor",
+            ControlMsg::UserCoronaColor { .. } => "UserCoronaColor",
         }
     }
 
@@ -450,6 +469,7 @@ impl ControlMsg {
                 | ControlMsg::UserListRequest
                 | ControlMsg::AdminKick { .. }
                 | ControlMsg::AdminSetRestriction { .. }
+                | ControlMsg::SetCoronaColor { .. }
         )
     }
 }
@@ -465,6 +485,7 @@ mod tests {
             session,
             name: name.to_string(),
             flags: UserFlags(UserFlags::MUTED),
+            corona_color: Some([255, 105, 180]),
         }
     }
 
@@ -627,6 +648,13 @@ mod tests {
             },
             ControlMsg::VideoDisplayed { speaker: 7 },
             ControlMsg::VideoViewer { viewer: 8 },
+            ControlMsg::SetCoronaColor {
+                color: Some([255, 105, 180]),
+            },
+            ControlMsg::UserCoronaColor {
+                session: 7,
+                color: None,
+            },
         ]
     }
 
@@ -634,7 +662,7 @@ mod tests {
     #[test]
     fn roundtrip_all_control_variants() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 42, "42 append-only control variants");
+        assert_eq!(variants.len(), 44, "44 append-only control variants");
         for msg in variants {
             let frame = msg.encode().unwrap();
             let body = framing::split_frame(&frame, MAX_CONTROL_FRAME)
@@ -663,8 +691,8 @@ mod tests {
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
     #[test]
     fn unknown_variant_is_an_error() {
-        // Discriminant 42 does not exist yet.
-        let body = [42u8, 0, 0];
+        // Discriminant 44 does not exist yet.
+        let body = [44u8, 0, 0];
         let err = ControlMsg::decode(&body).unwrap_err();
         assert!(
             matches!(err, ProtoError::UnknownVariant),
@@ -699,6 +727,12 @@ mod tests {
     #[test]
     fn direction_table() {
         assert!(ControlMsg::Ping { nonce: 1 }.is_client_to_server());
+        assert!(ControlMsg::SetCoronaColor { color: None }.is_client_to_server());
+        assert!(!ControlMsg::UserCoronaColor {
+            session: 1,
+            color: None
+        }
+        .is_client_to_server());
         assert!(!ControlMsg::Pong {
             nonce: 1,
             server_time_ms: 0

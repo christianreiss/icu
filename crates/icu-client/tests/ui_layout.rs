@@ -212,6 +212,7 @@ fn peer(user_id: u32, name: &str, flags: u8, rtt: u16) -> Peer {
             session: user_id as u16 + 10,
             name: name.into(),
             flags: UserFlags(flags),
+            corona_color: None,
         },
         100.0,
     );
@@ -297,6 +298,7 @@ fn state() -> AppState {
             session: 11,
             name: "Chris".into(),
             flags: UserFlags(UserFlags::ADMIN | UserFlags::VIEWING | UserFlags::PTT),
+            corona_color: None,
         }),
         peers,
         video_viewers: Vec::new(),
@@ -953,7 +955,8 @@ fn switches_and_sliders_are_named_and_keyboard_driven() {
     assert!(back < after && back > before, "one step back: {back}");
 }
 
-/// The everyday color picker updates settings and retains the choice while off.
+/// The everyday picker sets the own corona color, which others see: it
+/// stays usable with the local corona switched off, and resets to default.
 #[test]
 fn corona_color_is_available_in_plain_settings_and_persists() {
     for theme_name in THEMES {
@@ -975,9 +978,12 @@ fn corona_color_is_available_in_plain_settings_and_persists() {
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Overlay")
             .click();
         h.run();
-        assert!(!h.get_by_label("Coronafarbe").accesskit_node().is_disabled());
+        assert!(!h
+            .get_by_label("Meine Coronafarbe")
+            .accesskit_node()
+            .is_disabled());
         shot(&mut h, &format!("corona-plain-{theme_name}"));
-        h.get_by_label("Coronafarbe").click();
+        h.get_by_label("Meine Coronafarbe").click();
         h.run();
         h.get_all_by_role(egui::accesskit::Role::SpinButton)
             .next()
@@ -996,7 +1002,12 @@ fn corona_color_is_available_in_plain_settings_and_persists() {
         h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Sprech-Corona")
             .click();
         h.run();
-        assert!(h.get_by_label("Coronafarbe").accesskit_node().is_disabled());
+        assert!(
+            !h.get_by_label("Meine Coronafarbe")
+                .accesskit_node()
+                .is_disabled(),
+            "others still see the own color"
+        );
         let saved = last_update(&cmds.borrow());
         assert!(!saved.overlay.speaking_frame);
         assert_eq!(saved.overlay.frame_color, color, "off retains the color");
@@ -1009,8 +1020,13 @@ fn corona_color_is_available_in_plain_settings_and_persists() {
         h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Sprech-Corona")
             .click();
         h.run();
-        assert!(!h.get_by_label("Coronafarbe").accesskit_node().is_disabled());
         assert_eq!(last_update(&cmds.borrow()).overlay.frame_color, color);
+        h.get_by_label("Standardfarbe").click();
+        h.run();
+        assert_eq!(
+            last_update(&cmds.borrow()).overlay.frame_color,
+            icu_client::config::DEFAULT_FRAME_COLOR
+        );
     }
 }
 

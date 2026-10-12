@@ -325,7 +325,9 @@ fn path_cards(
                     1 => {
                         ui.horizontal_top(|ui| {
                             if let Some(p) = person {
-                                widgets::avatar(ui, p.name, p.user_id, p.speaking, 38.0, p.video);
+                                widgets::avatar(
+                                    ui, p.name, p.user_id, p.speaking, p.ring, 38.0, p.video,
+                                );
                             } else {
                                 let (r, _) = ui.allocate_exact_size(
                                     egui::vec2(44.0, 44.0),

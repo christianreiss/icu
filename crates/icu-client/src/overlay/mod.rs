@@ -394,6 +394,8 @@ struct Tile {
     face: Face,
     name: String,
     speaking: bool,
+    /// Whose tile it is chose this corona color (or none: the default).
+    color: [u8; 3],
     dim: bool,
     /// Current eased size multiplier, between [`REST_SCALE`] and the
     /// speaking scale ([`speak_scale`]).
@@ -657,7 +659,7 @@ struct Scene {
     glow: HashMap<Session, f32>,
     intensities: Vec<f32>,
     last_update: Instant,
-    membership: Vec<(Session, String, bool)>,
+    membership: Vec<(Session, String, bool, [u8; 3])>,
     presented_frames: Option<Vec<(Session, u64)>>,
     /// Each tile's slot, in tile order, as of the last [`Scene::update`].
     slots: Vec<Slot>,
@@ -862,7 +864,8 @@ impl Scene {
         let (settings, peers, own) = {
             let state = self.state.borrow();
             let overlay = &state.settings.overlay;
-            let mut peers: Vec<(Session, String, bool, bool)> =
+            // Everyone's corona in the color they chose for themselves.
+            let mut peers: Vec<(Session, String, bool, bool, [u8; 3])> =
                 overlay_peers(&state.peers, overlay.voice_plates)
                     .into_iter()
                     .map(|p| {
@@ -871,6 +874,9 @@ impl Scene {
                             p.info.name.clone(),
                             p.speaking,
                             p.info.flags.camera_on(),
+                            p.info
+                                .corona_color
+                                .unwrap_or(crate::config::DEFAULT_FRAME_COLOR),
                         )
                     })
                     .collect();
@@ -882,7 +888,14 @@ impl Scene {
                 .as_ref()
                 .filter(|_| overlay.show_self && (state.camera_on || overlay.voice_plates));
             if let Some(me) = own {
-                peers.push((me.session, me.name.clone(), state.sending, state.camera_on));
+                // The own pick shows at once, before the server echoes it.
+                peers.push((
+                    me.session,
+                    me.name.clone(),
+                    state.sending,
+                    state.camera_on,
+                    overlay.frame_color,
+                ));
             }
             (overlay.clone(), peers, own.map(|me| me.session))
         };
@@ -901,14 +914,14 @@ impl Scene {
         let own_picture = own.and_then(|_| self.own_picture());
         self.visible_frames = peers
             .iter()
-            .filter(|(session, _, _, camera)| {
+            .filter(|(session, _, _, camera, _)| {
                 *camera && Some(*session) != own && frames.iter().any(|(s, _)| s == session)
             })
-            .filter_map(|(session, _, _, _)| seqs.iter().find(|(s, _)| s == session).copied())
+            .filter_map(|(session, _, _, _, _)| seqs.iter().find(|(s, _)| s == session).copied())
             .collect();
         let membership: Vec<_> = peers
             .iter()
-            .map(|(s, n, _, c)| (*s, n.clone(), *c))
+            .map(|(s, n, _, c, color)| (*s, n.clone(), *c, *color))
             .collect();
         if settings_changed || membership != self.membership {
             if let Some(renderer) = self.gpu.as_mut() {
@@ -922,7 +935,7 @@ impl Scene {
         self.intensities.clear();
         self.tiles = peers
             .into_iter()
-            .map(|(session, name, speaking, camera)| {
+            .map(|(session, name, speaking, camera, color)| {
                 let scale = {
                     let target = if speaking {
                         speak_scale(&self.settings)
@@ -965,6 +978,7 @@ impl Scene {
                     },
                     name,
                     speaking,
+                    color,
                     dim: self.settings.dim_non_speaking && !speaking,
                     scale,
                 }
@@ -1069,7 +1083,6 @@ impl Scene {
             bottom: self.anchored_bottom(),
             hug: self.hug(),
             speaking_frame: self.settings.speaking_frame,
-            frame_color: self.settings.frame_color,
             gap: scaled(GAP, self.scale),
         };
 
@@ -1416,7 +1429,6 @@ struct Geometry {
     /// The side a column lines up at, and every tile keeps to in its slot.
     hug: Hug,
     speaking_frame: bool,
-    frame_color: [u8; 3],
     /// Spacing between adjacent tiles, already scaled — see [`GAP`].
     gap: u32,
 }
@@ -1457,7 +1469,7 @@ fn compose(canvas: &mut [u8], g: &Geometry, tiles: &[Tile], mut labels: Option<&
             g.hug.offset(g.width, outer_w)
         };
         let (cx, cy) = drawn_center((tx as f32, ty as f32), &geom, &draw, g.hug, g.bottom);
-        let [fr, fg, fb] = g.frame_color;
+        let [fr, fg, fb] = tile.color;
         let border = if tile.speaking && g.speaking_frame {
             [fb, fg, fr, 0xff] // B G R A premultiplied
         } else {
@@ -1608,6 +1620,7 @@ mod tests {
                     user_id: u32::from(session),
                     name: name.into(),
                     flags: UserFlags(flags),
+                    corona_color: None,
                 },
                 100.0,
             )
@@ -1691,7 +1704,6 @@ mod tests {
             bottom: true,
             hug: Hug::Center,
             speaking_frame: true,
-            frame_color: [0x2e, 0x9b, 0xff],
             gap: GAP,
         }
     }
@@ -1703,6 +1715,7 @@ mod tests {
                 face: Face::Camera(Some((64, 48, Arc::new(vec![200; 64 * 20 * 4])))),
                 name: "Anna".into(),
                 speaking: false,
+                color: crate::config::DEFAULT_FRAME_COLOR,
                 dim: true,
                 scale: REST_SCALE,
             },
@@ -1710,6 +1723,7 @@ mod tests {
                 face: Face::Plate,
                 name: "Eva-Maria Schulte-Wiedenbrück von Hohenfels".into(),
                 speaking: true,
+                color: crate::config::DEFAULT_FRAME_COLOR,
                 dim: false,
                 scale: SPEAK_SCALE,
             },
@@ -1717,25 +1731,47 @@ mod tests {
                 face: Face::Plate,
                 name: "Frank".into(),
                 speaking: false,
+                color: crate::config::DEFAULT_FRAME_COLOR,
                 dim: true,
                 scale: REST_SCALE,
             },
         ]
     }
 
+    /// Each speaking tile is bordered in its own user's color.
     #[test]
-    fn software_speaking_border_follows_selected_color() {
-        let tiles = [Tile {
+    fn software_border_color_is_per_tile() {
+        let speaker = |color| Tile {
             face: Face::Camera(None),
             name: String::new(),
             speaking: true,
+            color,
+            dim: false,
+            scale: 1.,
+        };
+        let tiles = [speaker([255, 0, 0]), speaker([0, 0, 255])];
+        let g = geometry(&tiles, true);
+        let mut canvas = vec![0; (g.width * g.height * 4) as usize];
+        compose(&mut canvas, &g, &tiles, None);
+        let pixels = canvas.as_chunks::<4>().0;
+        assert!(pixels.contains(&[0, 0, 255, 255]), "red border (BGRA)");
+        assert!(pixels.contains(&[255, 0, 0, 255]), "blue border (BGRA)");
+    }
+
+    #[test]
+    fn software_speaking_border_follows_selected_color() {
+        let mut tiles = [Tile {
+            face: Face::Camera(None),
+            name: String::new(),
+            speaking: true,
+            color: crate::config::DEFAULT_FRAME_COLOR,
             dim: false,
             scale: 1.,
         }];
         let mut g = geometry(&tiles, true);
         let mut canvas = vec![0; (g.width * g.height * 4) as usize];
         for rgb in [[255, 0, 0], [0, 255, 0], [0, 0, 255]] {
-            g.frame_color = rgb;
+            tiles[0].color = rgb;
             g.speaking_frame = true;
             compose(&mut canvas, &g, &tiles, None);
             let border = [rgb[2], rgb[1], rgb[0], 255];
@@ -1869,6 +1905,7 @@ mod tests {
             face: Face::Camera(None),
             name: "Anna".into(),
             speaking: false,
+            color: crate::config::DEFAULT_FRAME_COLOR,
             dim: false,
             scale: REST_SCALE,
         }];
@@ -1944,6 +1981,7 @@ mod tests {
                     },
                     name: "Anna".into(),
                     speaking: scale > REST_SCALE,
+                    color: crate::config::DEFAULT_FRAME_COLOR,
                     dim: false,
                     scale,
                 }]
@@ -1988,6 +2026,7 @@ mod tests {
             face: Face::Plate,
             name: "Anna".into(),
             speaking: false,
+            color: crate::config::DEFAULT_FRAME_COLOR,
             dim: false,
             scale: REST_SCALE,
         }];
@@ -2339,6 +2378,7 @@ mod tests {
                         // Long enough to curve past 3 o'clock at any size.
                         name: "Eva-Maria Schulte-Wiedenbrück".into(),
                         speaking: false,
+                        color: crate::config::DEFAULT_FRAME_COLOR,
                         dim: false,
                         scale,
                     }];
@@ -2354,7 +2394,6 @@ mod tests {
                         bottom,
                         hug,
                         speaking_frame: false,
-                        frame_color: [0; 3],
                         gap: GAP,
                     };
                     let mut canvas = vec![0u8; (cw * ch * 4) as usize];

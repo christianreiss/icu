@@ -18,7 +18,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use icu_proto::{error as ec, name_key, validate_name, UserId};
+use icu_proto::{error as ec, name_key, validate_name, Rgb, UserId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -199,6 +199,11 @@ pub struct UserRecord {
     /// Deafen enforced by an admin, like `server_muted` for bit1.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub server_deafened: bool,
+    /// The speaking corona color the user chose for themselves
+    /// (`SetCoronaColor`), shown for them on every client; absent = the
+    /// clients' default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corona_color: Option<Rgb>,
 }
 
 impl UserRecord {
@@ -478,6 +483,7 @@ impl Store {
                     disabled: false,
                     server_muted: false,
                     server_deafened: false,
+                    corona_color: None,
                 },
             );
             Ok(id)
@@ -669,6 +675,26 @@ impl Store {
             user.server_deafened = deafened;
             Ok(true)
         })
+    }
+
+    /// Sets a user's own corona color. Returns whether anything changed;
+    /// an unchanged color writes nothing.
+    pub fn set_corona_color(&mut self, id: UserId, color: Option<Rgb>) -> Result<bool> {
+        let current = self
+            .user(id)
+            .ok_or_else(|| Error::coded(ec::NO_SUCH_USER, format!("unknown user_id {id}")))?;
+        if current.corona_color == color {
+            return Ok(false);
+        }
+        self.update_users(|users| {
+            user_entry(users, id)?.corona_color = color;
+            Ok(true)
+        })
+    }
+
+    /// A user's corona color; `None` for an unknown user or none chosen.
+    pub fn corona_color(&self, id: UserId) -> Option<Rgb> {
+        self.user(id).and_then(|u| u.corona_color)
     }
 
     /// The admin-enforced `(muted, deafened)` of a user; both false for an
@@ -1298,6 +1324,24 @@ mod tests {
         assert!(user.certs.iter().all(|c| c.revoked));
     }
 
+    /// A user's corona color survives a restart; setting the same color
+    /// again changes nothing, and `None` goes back to the default.
+    #[test]
+    fn corona_color_is_stored_and_reset() {
+        let (dir, mut s) = store();
+        let alice = s.add_user(named_cert("aa", "alice"), false).unwrap();
+        assert_eq!(s.corona_color(alice), None);
+        assert!(s.set_corona_color(alice, Some([255, 105, 180])).unwrap());
+        assert!(!s.set_corona_color(alice, Some([255, 105, 180])).unwrap());
+        drop(s);
+
+        let mut s = Store::open(dir.path()).unwrap();
+        assert_eq!(s.corona_color(alice), Some([255, 105, 180]));
+        assert!(s.set_corona_color(alice, None).unwrap());
+        assert_eq!(s.corona_color(alice), None);
+        assert!(s.set_corona_color(99, None).is_err(), "unknown user");
+    }
+
     /// A renewal that was queued behind a revoke or disable must not hand
     /// the user a fresh, unrevoked certificate.
     #[test]
@@ -1448,6 +1492,7 @@ mod tests {
                 disabled: false,
                 server_muted: false,
                 server_deafened: false,
+                corona_color: None,
             },
         );
         assert_eq!(s.resolve("Chris"), vec![latin]);
