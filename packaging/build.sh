@@ -189,8 +189,9 @@ done
 for d in $DISTS; do
     log "nfpm: icu for $d"
     cfg=$WORK/icu-$d.yaml
+    case $d in fc*) client_package_name=icu-client ;; *) client_package_name=icu ;; esac
     render packaging/nfpm/icu.yaml "$cfg" \
-        VERSION="$VERSION" RELEASE="$(dist_release "$d")" \
+        VERSION="$VERSION" RELEASE="$(dist_release "$d")" CLIENT_PACKAGE_NAME="$client_package_name" \
         CLIENT_BIN="target/pkg-$d/release/icu" LICENSES_FILE="$LICENSES_FILE"
     cat "$WORK/depends-$d.yaml" >> "$cfg"
     nfpm "$cfg" "$(dist_format "$d")"

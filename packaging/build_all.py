@@ -310,8 +310,8 @@ def expected_artifacts(version, release):
     return {
         "linux": {f"icu-server-{version}-{release}.x86_64.rpm",
                   f"icu-server_{version}-{release}_amd64.deb",
-                  f"icu-{version}-{release}.fc42.x86_64.rpm",
-                  f"icu-{version}-{release}.fc43.x86_64.rpm",
+                  f"icu-client-{version}-{release}.fc42.x86_64.rpm",
+                  f"icu-client-{version}-{release}.fc43.x86_64.rpm",
                   f"icu_{version}-{release}+deb13_amd64.deb"},
         "windows": {f"{name}.zip"},
         "windows-installer": {f"{name}-setup.exe"},

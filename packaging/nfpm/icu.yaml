@@ -4,7 +4,8 @@
 # ${CLIENT_BIN}, ${LICENSES_FILE}). nfpm does not derive soname dependencies: build.sh appends
 # a `depends:` list per distro (linked libraries from ldd, plus the libraries
 # winit/wgpu dlopen), and the smoke test checks it in a clean container.
-name: icu
+# Fedora already owns the name icu (Unicode tools). Keep Debian's existing name.
+name: ${CLIENT_PACKAGE_NAME}
 arch: amd64
 platform: linux
 version: ${VERSION}

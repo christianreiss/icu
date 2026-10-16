@@ -141,6 +141,14 @@ PATH="$PWD/packaging/windows/toolchain:$PATH" cargo build --locked --release \
 
 ## Pakete und Veröffentlichung
 
+Das Fedora-Clientpaket heißt seit 2026-10-16 `icu-client`; der Programmaufruf
+bleibt `icu`. Der bisherige RPM-Name `icu` kollidiert mit Fedoras Unicode-Paket:
+PackageKit ersetzte am 2026-10-15 den Voice-Client 0.1.15 durch Unicode 77.1.
+Das neue Paket lässt sich parallel zum Fedora-Paket installieren. Bei einer
+noch vorhandenen alten Voice-Installation zuerst deren Paket entfernen;
+`~/.config/icu/` mit Identität und Einstellungen bleibt erhalten. Debians
+Paketname bleibt unverändert.
+
 ```sh
 packaging/build.sh       # Linux-Pakete, Workspace-Tests und Container-Smokes
 packaging/smoke.sh       # Bereits gebaute Linux-Pakete prüfen

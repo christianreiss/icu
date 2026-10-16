@@ -36,6 +36,7 @@ systemd-analyze verify /usr/lib/systemd/system/icu-server.service
 test -f /usr/lib/sysusers.d/icu-server.conf
 test -f /usr/share/licenses/icu-server/THIRD-PARTY-LICENSES
 if [ -n "$CLIENT_PKG" ]; then
+    if [ "$CLIENT_NAME" = icu-client ]; then rpm -q icu icu-client; fi
     icu --version
     test "$(ldd /usr/bin/icu | grep -c "not found")" -eq 0
     test -f /usr/share/applications/icu.desktop
@@ -48,13 +49,13 @@ echo "# local edit" >> /etc/icu/server.toml
 $REINSTALL /pkgs/$SERVER_PKG
 grep -q "# local edit" /etc/icu/server.toml
 mkdir -p /var/lib/private/icu && touch /var/lib/private/icu/ca.key
-$REMOVE icu-server ${CLIENT_PKG:+icu}
+$REMOVE icu-server ${CLIENT_PKG:+$CLIENT_NAME}
 test -f /var/lib/private/icu/ca.key
 test ! -e /usr/bin/icu-server && test ! -e /usr/bin/icu-cli && test ! -L /usr/bin/icu-cli && test ! -e /usr/bin/icu
 '
 
 smoke() {  # smoke <dist> <with_client: 0|1>
-    local d=$1 image server client cache env dnf
+    local d=$1 image server client client_name cache env dnf
     printf '\n==> smoke: %s%s\n' "$d" "$([ "$2" = 1 ] || echo ' (server only)')"
     dnf="dnf -y -q --setopt=keepcache=True --setopt=install_weak_deps=False"
     case $d in
@@ -67,11 +68,15 @@ smoke() {  # smoke <dist> <with_client: 0|1>
                      cache=(-v "icu-smoke-dnf-${d}":/var/cache/dnf) ;;
             esac
             server=icu-server-$VERSION-$RELEASE.x86_64.rpm
-            client=icu-$VERSION-$RELEASE.$d.x86_64.rpm
+            client_name=icu-client
+            client=icu-client-$VERSION-$RELEASE.$d.x86_64.rpm
             env=(-e PREP=: -e INSTALL="$dnf install" -e REINSTALL="$dnf reinstall"
                  -e REMOVE="$dnf remove")
+            # Reproduce the installed Fedora Unicode package alongside our client.
+            if [[ "$d" = fc* && "$2" = 1 ]]; then env+=(-e PREP="$dnf install icu"); fi
             ;;
         debian*)
+            client_name=icu
             image=docker.io/library/debian:${d#debian}
             server=icu-server_${VERSION}-${RELEASE}_amd64.deb
             client=icu_${VERSION}-${RELEASE}+deb${d#debian}_amd64.deb
@@ -91,7 +96,7 @@ smoke() {  # smoke <dist> <with_client: 0|1>
     done
     podman run --rm --security-opt label=disable -v "$PWD/$OUT":/pkgs:ro \
         --label "net.icu.build-run=${ICU_BUILD_RUN_ID:-standalone}" \
-        "${cache[@]}" -e SERVER_PKG="$server" -e CLIENT_PKG="$client" "${env[@]}" \
+        "${cache[@]}" -e SERVER_PKG="$server" -e CLIENT_PKG="$client" -e CLIENT_NAME="$client_name" "${env[@]}" \
         "$image" bash -c "$CHECKS"
     echo "ok: $d"
 }

@@ -123,7 +123,7 @@ host's FQDN, if it resolves to this host) and \`sudo systemctl enable --now icu-
 
 **Client** (\`icu\`), one package per distro:
 
-    sudo dnf install ./icu-$VERSION-*.fc43.x86_64.rpm       # Fedora 43 (fc42 for Fedora 42)
+    sudo dnf install ./icu-client-$VERSION-*.fc43.x86_64.rpm  # Fedora 43 (fc42 for Fedora 42)
     sudo apt install ./icu_${VERSION}-*+deb13_amd64.deb      # Debian 13
 
 **Client for Windows 10/11** (portable, unsigned): unzip
