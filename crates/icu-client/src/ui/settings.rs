@@ -25,6 +25,9 @@ use crate::{
 /// Text-field width wherever a row pairs a field with a button, so the
 /// fields line up down the panel.
 const FIELD_W: f32 = 150.0;
+/// Inner margin of a single-line field in a settings row: with the 13.5 px
+/// body text it makes the field as tall as the buttons beside it (30 px).
+const FIELD_MARGIN: egui::Margin = egui::Margin::symmetric(10, 6);
 /// Validity choices for an invite; the last is the server's cap.
 const INVITE_TTLS: [(u64, &str); 4] = [
     (60 * 60, "1 Stunde"),
@@ -1668,6 +1671,7 @@ impl SettingsView {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.name)
                                     .desired_width(FIELD_W)
+                                    .margin(FIELD_MARGIN)
                                     .hint_text("Name"),
                             )
                         })
@@ -2287,6 +2291,7 @@ impl SettingsView {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.invite_name)
                             .desired_width(200.0)
+                            .margin(FIELD_MARGIN)
                             .hint_text("optional"),
                     )
                 },
@@ -3384,6 +3389,7 @@ pub(super) fn binding_row(
                     ui.add(
                         egui::TextEdit::singleline(&mut binding.key)
                             .desired_width(120.0)
+                            .margin(FIELD_MARGIN)
                             .hint_text(if cfg!(target_os = "windows") {
                                 "Taste"
                             } else {
@@ -3395,6 +3401,7 @@ pub(super) fn binding_row(
                         .add(
                             egui::TextEdit::singleline(&mut trigger)
                                 .desired_width(120.0)
+                                .margin(FIELD_MARGIN)
                                 .hint_text(if cfg!(windows) {
                                     "Kombination (ohne Taste)"
                                 } else {

@@ -772,7 +772,9 @@ fn segmented_width(ui: &Ui, labels: &[&str]) -> f32 {
         .iter()
         .map(|l| text_width(ui, l, seg_font()) + SEG_PAD * 2.0)
         .sum();
-    options + SEG_GAP * (labels.len() as f32 - 1.0) + SEG_INSET * 2.0
+    // + the track's 1 px stroke on both sides, which `Frame` adds outside the
+    // inner margin.
+    options + SEG_GAP * (labels.len() as f32 - 1.0) + SEG_INSET * 2.0 + 2.0
 }
 
 /// A segmented control: a track of mutually exclusive options. Returns a
