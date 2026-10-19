@@ -125,6 +125,9 @@ pub struct AudioSettings {
     pub release_ms: u32,
     /// VAD hangover in ms.
     pub hangover_ms: u32,
+    /// How long voice must last in ms before the VAD opens the gate, so a
+    /// key click does not (0 opens on the first voiced frame).
+    pub attack_ms: u32,
     /// Opus frame length: 20 or 10.
     pub frame_ms: u8,
     /// Join/leave cue.
@@ -165,6 +168,7 @@ impl Default for AudioSettings {
             voice_strength: VoiceStrength::Medium,
             release_ms: 150,
             hangover_ms: 1000,
+            attack_ms: 40,
             frame_ms: 20,
             cue_join: true,
             cue_tx: false,
@@ -599,6 +603,11 @@ impl Settings {
             format!("{} ms", was.hangover_ms),
         );
         differs(
+            "VAD-Anlauf",
+            format!("{} ms", will.attack_ms),
+            format!("{} ms", was.attack_ms),
+        );
+        differs(
             "Ton „Jemand kommt oder geht“",
             on(will.cue_join),
             on(was.cue_join),
@@ -626,6 +635,7 @@ impl Settings {
         audio.gain_db = clamped(audio.gain_db, -20.0, 20.0, defaults.gain_db);
         audio.release_ms = audio.release_ms.min(1000);
         audio.hangover_ms = audio.hangover_ms.min(3000);
+        audio.attack_ms = audio.attack_ms.min(200);
         self.overlay.shy_hold_ms = self.overlay.shy_hold_ms.min(*SHY_HOLDS.end());
         self.overlay.shy_return_ms = self.overlay.shy_return_ms.min(*SHY_RETURNS.end());
         if !matches!(audio.frame_ms, 10 | 20) {
@@ -1472,6 +1482,7 @@ mod tests {
         s.audio.vad_threshold = 0.7;
         s.audio.vad_auto = false;
         s.audio.hangover_ms = 1500;
+        s.audio.attack_ms = 80;
         s.audio.voice_opt = true;
         s.audio.voice_strength = VoiceStrength::Strong;
         s.audio.normalize_incoming = false;
@@ -1555,6 +1566,7 @@ mod tests {
         assert_eq!(s.audio.mode, ModeSetting::Vad);
         assert_eq!(s.audio.release_ms, 150);
         assert_eq!(s.audio.hangover_ms, 1000);
+        assert_eq!(s.audio.attack_ms, 40, "a file from before the setting");
         assert!(s.audio.vad_auto);
         assert!(s.audio.voice_opt, "voice optimization default on");
         assert!(s.audio.normalize_incoming);
@@ -2275,6 +2287,7 @@ mod tests {
         incoming.audio.gain_db = f32::NAN;
         incoming.audio.release_ms = 99_999;
         incoming.audio.hangover_ms = 1_000_000;
+        incoming.audio.attack_ms = 1_000_000;
         incoming.audio.frame_ms = 7;
         incoming.volumes.insert("5".into(), 1e9);
         incoming.volumes.insert("6".into(), f32::INFINITY);
@@ -2285,6 +2298,7 @@ mod tests {
         assert_eq!(here.audio.gain_db, 0.0);
         assert_eq!(here.audio.release_ms, 1000);
         assert_eq!(here.audio.hangover_ms, 3000);
+        assert_eq!(here.audio.attack_ms, 200);
         assert_eq!(here.audio.frame_ms, 20);
         assert_eq!(here.volume(5), 200.0);
         assert_eq!(here.volume(6), 100.0);

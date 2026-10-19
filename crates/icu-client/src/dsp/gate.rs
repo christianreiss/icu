@@ -2,6 +2,11 @@
 //!
 //! Evaluated once per Opus frame. The gate sits behind AEC and denoise; both
 //! keep running while the gate is closed.
+//!
+//! In VAD mode a closed gate opens only after voice has lasted the *attack*
+//! time: a key click is one or two blocks of broadband noise the voice
+//! detector may well call voice, and one such block used to hold the gate
+//! open for the whole hangover.
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +33,11 @@ pub enum Decision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Closed,
+    /// Voice since `since`, `frames` voiced frames held back so far.
+    Arming {
+        since: Instant,
+        frames: u32,
+    },
     Open,
     Releasing(Instant),
 }
@@ -40,6 +50,10 @@ pub struct Gate {
     release: Duration,
     /// VAD hangover.
     hangover: Duration,
+    /// How long voice must last before a closed gate opens (VAD only).
+    attack: Duration,
+    /// Voiced frames held back before the last opening.
+    withheld: u32,
     state: State,
     ptt_down: bool,
     muted: bool,
@@ -52,6 +66,8 @@ impl Gate {
             mode,
             release,
             hangover,
+            attack: Duration::ZERO,
+            withheld: 0,
             state: State::Closed,
             ptt_down: false,
             muted: false,
@@ -78,6 +94,18 @@ impl Gate {
         self.hangover = hangover;
     }
 
+    /// Changes the VAD attack: voice must last this long before a closed
+    /// gate opens. Zero opens on the first voiced frame.
+    pub fn set_attack(&mut self, attack: Duration) {
+        self.attack = attack;
+    }
+
+    /// How many voiced frames the gate held back before it last opened, so
+    /// the caller can send them as pre-roll. Zero when it opened at once.
+    pub fn withheld(&self) -> u32 {
+        self.withheld
+    }
+
     /// Reports the PTT key state.
     pub fn set_ptt(&mut self, down: bool) {
         self.ptt_down = down;
@@ -94,9 +122,10 @@ impl Gate {
         self.muted
     }
 
-    /// Whether the gate currently lets audio through.
+    /// Whether the gate currently lets audio through. Not while it is still
+    /// arming: the first voiced frames are held back.
     pub fn is_open(&self) -> bool {
-        !matches!(self.state, State::Closed)
+        matches!(self.state, State::Open | State::Releasing(_))
     }
 
     /// One frame: `voice` is the VAD verdict for this frame.
@@ -110,7 +139,41 @@ impl Gate {
             Mode::Ptt => self.release,
             Mode::Vad => self.hangover,
         };
+        let attack = match self.mode {
+            Mode::Ptt => Duration::ZERO,
+            Mode::Vad => self.attack,
+        };
         match (self.state, want_open) {
+            (State::Closed, true) if !attack.is_zero() => {
+                self.state = State::Arming {
+                    since: now,
+                    frames: 1,
+                };
+                Decision::Silent
+            }
+            (State::Arming { since, frames }, true)
+                if now.saturating_duration_since(since) < attack =>
+            {
+                self.state = State::Arming {
+                    since,
+                    frames: frames + 1,
+                };
+                Decision::Silent
+            }
+            (State::Arming { frames, .. }, true) => {
+                self.withheld = frames;
+                self.state = State::Open;
+                Decision::Send
+            }
+            (State::Arming { .. }, false) => {
+                self.state = State::Closed;
+                Decision::Silent
+            }
+            (State::Closed, true) => {
+                self.withheld = 0;
+                self.state = State::Open;
+                Decision::Send
+            }
             (_, true) => {
                 self.state = State::Open;
                 Decision::Send
@@ -213,5 +276,83 @@ mod tests {
         g.update(t0, false);
         g.set_ptt(false);
         assert_eq!(g.update(t0 + ms(20), false), Decision::SendEnd);
+    }
+
+    #[test]
+    fn a_click_does_not_open_the_gate() {
+        let t0 = Instant::now();
+        let mut g = Gate::new(Mode::Vad, ms(150), ms(200));
+        g.set_attack(ms(40));
+        assert_eq!(g.update(t0, true), Decision::Silent, "arming");
+        assert!(!g.is_open());
+        assert_eq!(g.update(t0 + ms(20), false), Decision::Silent);
+        assert_eq!(g.update(t0 + ms(40), false), Decision::Silent);
+        assert!(!g.is_open(), "one voiced frame never opens it");
+    }
+
+    #[test]
+    fn voice_lasting_the_attack_opens_and_reports_the_held_back_frames() {
+        let t0 = Instant::now();
+        let mut g = Gate::new(Mode::Vad, ms(150), ms(200));
+        g.set_attack(ms(40));
+        assert_eq!(g.update(t0, true), Decision::Silent);
+        assert_eq!(g.update(t0 + ms(20), true), Decision::Silent);
+        assert_eq!(g.update(t0 + ms(40), true), Decision::Send);
+        assert!(g.is_open());
+        assert_eq!(g.withheld(), 2);
+    }
+
+    #[test]
+    fn a_gap_restarts_the_attack() {
+        let t0 = Instant::now();
+        let mut g = Gate::new(Mode::Vad, ms(150), ms(200));
+        g.set_attack(ms(40));
+        g.update(t0, true);
+        g.update(t0 + ms(20), true);
+        assert_eq!(g.update(t0 + ms(40), false), Decision::Silent);
+        assert_eq!(g.update(t0 + ms(60), true), Decision::Silent, "starts over");
+        assert_eq!(g.update(t0 + ms(80), true), Decision::Silent);
+        assert_eq!(g.update(t0 + ms(100), true), Decision::Send);
+    }
+
+    #[test]
+    fn voice_in_the_hangover_resumes_without_an_attack() {
+        let t0 = Instant::now();
+        let mut g = Gate::new(Mode::Vad, ms(150), ms(200));
+        g.set_attack(ms(40));
+        g.update(t0, true);
+        g.update(t0 + ms(40), true);
+        assert_eq!(g.update(t0 + ms(60), false), Decision::Send);
+        assert_eq!(g.update(t0 + ms(80), true), Decision::Send, "no re-arming");
+    }
+
+    #[test]
+    fn zero_attack_opens_on_the_first_voiced_frame() {
+        let t0 = Instant::now();
+        let mut g = Gate::new(Mode::Vad, ms(150), ms(200));
+        g.set_attack(ms(0));
+        assert_eq!(g.update(t0, true), Decision::Send);
+        assert_eq!(g.withheld(), 0);
+    }
+
+    #[test]
+    fn the_attack_does_not_delay_push_to_talk() {
+        let t0 = Instant::now();
+        let mut g = Gate::new(Mode::Ptt, ms(150), ms(200));
+        g.set_attack(ms(40));
+        g.set_ptt(true);
+        assert_eq!(g.update(t0, false), Decision::Send);
+    }
+
+    #[test]
+    fn mute_ends_arming() {
+        let t0 = Instant::now();
+        let mut g = Gate::new(Mode::Vad, ms(150), ms(200));
+        g.set_attack(ms(40));
+        g.update(t0, true);
+        g.set_muted(true);
+        assert_eq!(g.update(t0 + ms(20), true), Decision::Silent);
+        g.set_muted(false);
+        assert_eq!(g.update(t0 + ms(40), true), Decision::Silent, "starts over");
     }
 }

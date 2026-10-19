@@ -667,6 +667,12 @@ impl SettingsView {
                 {
                     self.draft.audio.hangover_ms = hangover as u32;
                 }
+                let mut attack = self.draft.audio.attack_ms as f32;
+                if widgets::slider_row(ui, divider(), "VAD-Anlauf", &mut attack, 0.0..=200.0, " ms")
+                    .changed()
+                {
+                    self.draft.audio.attack_ms = attack as u32;
+                }
             }
         });
 

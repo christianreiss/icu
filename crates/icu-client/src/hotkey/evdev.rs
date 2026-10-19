@@ -330,6 +330,11 @@ fn spawn_reader(
                 }
             };
             if let EventSummary::Key(_, code, value) = ev.destructure() {
+                // Any key going down (a mouse button is not typing), for the
+                // voice gate's attack; just the time, never the key.
+                if value == 1 && code.code() < 0x100 {
+                    super::typing::note();
+                }
                 let pressed = match value {
                     1 => true,
                     0 => false,

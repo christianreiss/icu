@@ -10,6 +10,7 @@ pub mod meter;
 pub mod mixer;
 pub mod normalize;
 pub mod opus;
+pub mod preroll;
 pub mod refalign;
 pub mod testsignal;
 pub mod vad;

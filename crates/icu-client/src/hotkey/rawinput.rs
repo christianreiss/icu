@@ -492,6 +492,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_INPUT => {
             if let Some(input) = unsafe { read_input(HRAWINPUT(lparam.0 as _)) } {
                 let device = input.header.hDevice.0 as Device;
+                if input.header.dwType == RIM_TYPEKEYBOARD.0
+                    && u32::from(unsafe { input.data.keyboard }.Flags) & RI_KEY_BREAK == 0
+                {
+                    // Any key going down, for the voice gate's attack; just
+                    // the time, never the key.
+                    super::typing::note();
+                }
                 for (code, pressed) in transitions(&input) {
                     deliver(device, code, pressed);
                 }

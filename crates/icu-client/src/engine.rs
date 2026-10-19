@@ -41,6 +41,7 @@ use crate::{
         mixer,
         normalize::Normalizer,
         opus,
+        preroll::{self, PreRoll},
         refalign::{self, CycleClock},
         vad, vad_auto,
         voice::VoiceStrength,
@@ -467,6 +468,7 @@ pub struct DspControl {
     gain: AtomicF32,
     release_ms: AtomicU32,
     hangover_ms: AtomicU32,
+    attack_ms: AtomicU32,
     frame_samples: AtomicU32,
     loss_permille: AtomicU32,
     level_peak: AtomicF32,
@@ -507,6 +509,7 @@ impl DspControl {
             gain: AtomicF32::new(0.0),
             release_ms: AtomicU32::new(0),
             hangover_ms: AtomicU32::new(0),
+            attack_ms: AtomicU32::new(0),
             frame_samples: AtomicU32::new(0),
             loss_permille: AtomicU32::new(0),
             level_peak: AtomicF32::new(-100.0),
@@ -547,6 +550,7 @@ impl DspControl {
         self.release_ms.store(s.audio.release_ms, Ordering::Relaxed);
         self.hangover_ms
             .store(s.audio.hangover_ms, Ordering::Relaxed);
+        self.attack_ms.store(s.audio.attack_ms, Ordering::Relaxed);
         self.frame_samples.store(
             if s.audio.frame_ms == 10 { 480 } else { 960 },
             Ordering::Relaxed,
@@ -1613,9 +1617,8 @@ fn dsp_thread(
     let mut frame_acc: Vec<f32> = Vec::with_capacity(960);
     // The frame length `frame_acc` is being collected for.
     let mut acc_frame = 0usize;
-    // The previous frame, for the VAD pre-roll (`preroll_now`).
-    let mut prev_frame: Vec<f32> = Vec::with_capacity(960);
-    let mut prev_frame_valid = false;
+    // The frames the gate held back, for the VAD pre-roll (`preroll_now`).
+    let mut preroll = PreRoll::default();
     let mut prev_sent = false;
     let mut seq: u16 = 0;
     let mut ts: u32 = 0;
@@ -1689,7 +1692,7 @@ fn dsp_thread(
                 reference.skip(excess);
                 DebugStats::add(&stats.capture_backlog_dropped, excess as u64);
                 skip_capture(&mut frame_acc, &mut ts, excess);
-                prev_frame_valid = false;
+                preroll.clear();
             }
             let mut waited = 0u32;
             let mut ready_since: Option<Instant> = None;
@@ -1899,6 +1902,11 @@ fn dsp_thread(
             gate.set_hangover(Duration::from_millis(
                 ctl.hangover_ms.load(Ordering::Relaxed) as u64,
             ));
+            let attack_ms = ctl.attack_ms.load(Ordering::Relaxed);
+            gate.set_attack(Duration::from_millis(attack_for(
+                attack_ms,
+                crate::hotkey::typing::recent(),
+            ) as u64));
             gate.set_ptt(ctl.ptt_down.load(Ordering::Relaxed) || test_tone);
             let online = ctl.online.load(Ordering::Relaxed);
             let muted = ctl.muted.load(Ordering::Relaxed) || !online;
@@ -1926,27 +1934,32 @@ fn dsp_thread(
                 }
             }
             if sending {
-                // Pre-roll: the frame before the one RNNoise reacted to
-                // carries the onset; send it first with the seq/ts it would
-                // have had, so the receiver sees an ordinary spurt start.
-                if preroll_now(was_open, prev_sent, decision, gate.mode())
-                    && prev_frame_valid
-                    && prev_frame.len() == frame_samples
-                {
-                    match encoder.encode(&prev_frame) {
-                        Ok(packet) => {
-                            send_audio(
-                                &shared,
-                                &stats,
-                                0,
-                                seq,
-                                ts.wrapping_sub(frame_samples as u32),
-                                packet,
-                                t_block,
-                            );
-                            seq = seq.wrapping_add(1);
+                // Pre-roll: the frames the gate held back, and the one before
+                // them that RNNoise reacted to late, carry the onset; send
+                // them first with the seq/ts they would have had, so the
+                // receiver sees an ordinary spurt start.
+                if preroll_now(was_open, prev_sent, decision, gate.mode()) {
+                    let held = preroll.take(gate.withheld() as usize + 1);
+                    let n = held.len() as u32;
+                    for (i, frame) in held.iter().enumerate() {
+                        if frame.len() != frame_samples {
+                            continue;
                         }
-                        Err(e) => tracing::warn!(%e, "opus encode (pre-roll)"),
+                        match encoder.encode(frame) {
+                            Ok(packet) => {
+                                send_audio(
+                                    &shared,
+                                    &stats,
+                                    0,
+                                    seq,
+                                    ts.wrapping_sub((n - i as u32) * frame_samples as u32),
+                                    packet,
+                                    t_block,
+                                );
+                                seq = seq.wrapping_add(1);
+                            }
+                            Err(e) => tracing::warn!(%e, "opus encode (pre-roll)"),
+                        }
                     }
                 }
                 // Muted, the gate ends the spurt with this frame — collected
@@ -1972,9 +1985,14 @@ fn dsp_thread(
             ts = ts.wrapping_add(frame_samples as u32);
             // Keep this frame as the next one's pre-roll, unless the gate was
             // muted: nothing captured while muted may leave the machine.
-            prev_frame.clear();
-            prev_frame.extend_from_slice(&frame_acc[..frame_samples]);
-            prev_frame_valid = !muted;
+            if muted || sending {
+                preroll.clear();
+            } else {
+                preroll.push(
+                    &frame_acc[..frame_samples],
+                    preroll::depth(attack_ms.saturating_mul(2), frame_samples as u32 / 48),
+                );
+            }
             prev_sent = sending;
             frame_acc.drain(..frame_samples);
         }
@@ -2061,6 +2079,16 @@ fn mode_of(vad: bool) -> Mode {
         Mode::Vad
     } else {
         Mode::Ptt
+    }
+}
+
+/// The attack time in effect: while keys are being struck, voice has to last
+/// twice as long to open the gate (`hotkey::typing`). Off with the setting.
+fn attack_for(attack_ms: u32, typing: bool) -> u32 {
+    if typing {
+        attack_ms.saturating_mul(2)
+    } else {
+        attack_ms
     }
 }
 
@@ -5280,6 +5308,15 @@ mod tests {
             t0 + Duration::from_millis(1),
             Duration::ZERO
         ));
+    }
+
+    #[test]
+    fn typing_doubles_the_attack_and_zero_stays_off() {
+        use super::attack_for;
+        assert_eq!(attack_for(40, false), 40);
+        assert_eq!(attack_for(40, true), 80);
+        assert_eq!(attack_for(0, true), 0, "attack 0 switches the filter off");
+        assert_eq!(attack_for(u32::MAX, true), u32::MAX);
     }
 
     #[test]

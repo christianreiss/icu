@@ -12,6 +12,7 @@ pub mod keys;
 pub mod portal;
 #[cfg(target_os = "windows")]
 pub mod rawinput;
+pub mod typing;
 
 use std::{future::Future, pin::Pin, time::Duration};
 
