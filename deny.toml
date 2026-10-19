@@ -111,6 +111,14 @@ ignore = [
     # defaults), never untrusted input; comes with winit's Wayland decorations
     # (sctk-adwaita → ab_glyph) and the overlay's name rendering.
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser: only our own embedded fonts" },
+    # zbus split into zbus 6 (names/wire modules); the standalone crates get no
+    # more releases and there is no vulnerability. They come only through
+    # eframe → egui-winit → accesskit_winit → accesskit_unix → atspi-common
+    # (Linux accessibility bus), which is waiting for a zbus 6 release.
+    # Checked 2026-10-19.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained, merged into zbus 6; only via accesskit_unix" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained, merged into zbus 6; only via accesskit_unix" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained, merged into zbus 6; only via accesskit_unix" },
 ]
 
 [sources]
