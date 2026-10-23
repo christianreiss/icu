@@ -257,6 +257,91 @@ fn old_generation_hints_and_fast_timer_ticks_cannot_move_gain() {
 }
 
 mod common;
+
+/// Session feedback must follow the running DSP's generation after reconnect,
+/// even when no processing setting or peer trim changes. The tone supplies real
+/// audio headers; the raw listener supplies a known report to isolate delivery
+/// and acceptance from speech classification and gain convergence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_accepts_feedback_for_the_running_audio_generation() {
+    use icu_client::{audio::fake::FakeBackend, engine::ConnStatus, stats::DebugStats};
+
+    async fn report_window(
+        listener: &common::RawClient,
+        speaker: icu_proto::Session,
+    ) -> AudioWindow {
+        tokio::time::timeout(common::SOON, async {
+            let mut first: Option<AudioHeader> = None;
+            loop {
+                let datagram = listener.session.conn.read_datagram().await.unwrap();
+                let (header, _) = AudioHeader::decode(&datagram).unwrap();
+                if header.speaker != speaker {
+                    continue;
+                }
+                let start = first.get_or_insert(header);
+                let span = header.ts.wrapping_sub(start.ts);
+                if start.gain_epoch != header.gain_epoch || span > 105_600 {
+                    *start = header;
+                    continue;
+                }
+                if span >= 72_000 {
+                    return AudioWindow {
+                        gain_epoch: header.gain_epoch,
+                        first_ts: start.ts,
+                        end_ts: header.ts,
+                        report_id: 0,
+                    };
+                }
+            }
+        })
+        .await
+        .expect("enough real audio in one gain generation")
+    }
+
+    let server = common::TestServer::start().await;
+    let addr = server.addr();
+    let (engine, _dir) = server
+        .engine("speaker", Box::new(FakeBackend::silent().0), true)
+        .await;
+    let speaker = common::wait_connected(&engine).await.me.unwrap().session;
+    let listener = server.raw_client("first-listener").await;
+    let before = report_window(&listener, speaker).await;
+    assert_ne!(before.gain_epoch, 0, "the DSP must already be running");
+    drop(listener);
+
+    let server = server.restart(addr).await;
+    let stats = engine.stats();
+    let state = common::wait_for(&engine, Duration::from_secs(20), |s| {
+        s.conn == ConnStatus::Connected && DebugStats::get(&stats.reconnects) > 0
+    })
+    .await;
+    let speaker = state.me.unwrap().session;
+    let mut listener = server.raw_client("second-listener").await;
+    let window = report_window(&listener, speaker).await;
+    assert_ne!(window.gain_epoch, 0);
+    listener
+        .send(&ControlMsg::AudioLevelReport {
+            speaker,
+            level: level(4.0),
+            window,
+        })
+        .await;
+    let accepted = common::wait_until(common::SOON, || {
+        let health = engine.snapshot().audio_health;
+        health.remote_correction_db == Some(4.0) && health.reporters == 1
+    })
+    .await;
+    let health = engine.snapshot().audio_health;
+    drop(listener);
+    engine.shutdown();
+    server.handle.shutdown().await;
+    assert!(
+        accepted,
+        "fresh feedback for generation {} must survive reconnect: {health:?}",
+        window.gain_epoch
+    );
+}
+
 /// Real engine commands must restore processing without changing transmission privacy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn engine_restores_good_processing_and_forgets_only_current_microphone() {

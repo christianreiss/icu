@@ -455,7 +455,9 @@ impl JitterBuffer {
         self.next = None;
         self.anchor = None;
         self.misses = 0;
-        self.prefill_since = None;
+        // The next short spurt may already be queued behind this END. It
+        // must retain an arrival clock even if no further packet arrives.
+        self.prefill_since = self.queue.values().map(|(_, at)| *at).min();
         self.grown = 0;
         self.excess_pops = 0;
         self.stretch_wait = 0;
@@ -741,6 +743,19 @@ mod tests {
 
     fn buffer() -> JitterBuffer {
         JitterBuffer::new(JitterConfig::default())
+    }
+
+    #[test]
+    fn queued_short_spurt_plays_after_previous_end_without_more_arrivals() {
+        let now = Instant::now();
+        let mut jb = buffer();
+        jb.push(pkt(0, 0, true), now);
+        jb.push(pkt(1, 1920, true), now + ms(20));
+        assert_eq!(jb.pop(now + ms(60)), Pop::Packet(pkt(0, 0, true)));
+        assert_eq!(jb.pop(now + ms(80)), Pop::Packet(pkt(1, 1920, true)));
+        assert_eq!(jb.pop(now + ms(1000)), Pop::Silence);
+        assert_eq!(jb.stats().played, 2);
+        assert_eq!(jb.stats().lost, 0);
     }
 
     #[test]

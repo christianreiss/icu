@@ -99,6 +99,171 @@ async fn audio_from_a_arrives_decoded_at_b() {
     server.handle.shutdown().await;
 }
 
+/// Unmuting between the two 10-ms halves of a 20-ms packet must never send
+/// samples captured while muted, even with PTT held throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unmute_does_not_transmit_a_muted_half_frame() {
+    use icu_client::{
+        audio::{
+            AudioBackend, BackendError, BackendEvent, CaptureCallback, DeviceInfo,
+            PlaybackCallback, StreamKind,
+        },
+        config::ModeSetting,
+        dsp::opus,
+        engine::{Engine, EngineConfig},
+    };
+    use std::sync::{Arc, Mutex};
+
+    struct ManualCapture(Arc<Mutex<Option<CaptureCallback>>>);
+    impl AudioBackend for ManualCapture {
+        fn name(&self) -> &'static str {
+            "manual-capture"
+        }
+        fn devices(&self) -> Vec<DeviceInfo> {
+            vec![]
+        }
+        fn open_capture(
+            &mut self,
+            _: Option<&str>,
+            callback: CaptureCallback,
+        ) -> Result<(), BackendError> {
+            *self.0.lock().unwrap() = Some(callback);
+            Ok(())
+        }
+        fn open_reference(
+            &mut self,
+            _: Option<&str>,
+            _: CaptureCallback,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn open_playback(
+            &mut self,
+            _: Option<&str>,
+            _: PlaybackCallback,
+        ) -> Result<(), BackendError> {
+            Ok(())
+        }
+        fn close(&mut self, stream: StreamKind) {
+            if stream == StreamKind::Capture {
+                *self.0.lock().unwrap() = None;
+            }
+        }
+        fn take_events(&mut self) -> Option<std::sync::mpsc::Receiver<BackendEvent>> {
+            None
+        }
+    }
+
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("speaker").await;
+    let mut settings = test_settings();
+    settings.audio.mode = ModeSetting::Ptt;
+    settings.audio.frame_ms = 20;
+    settings.audio.auto_level = false;
+    settings.audio.voice_opt = false;
+    settings.audio.normalize_outgoing = false;
+    let mut config = EngineConfig::new(identity, settings, paths);
+    config.server_addr = Some(server.addr());
+    let capture = Arc::new(Mutex::new(None::<CaptureCallback>));
+    let engine = Engine::start(config, Box::new(ManualCapture(capture.clone()))).unwrap();
+    let speaker = wait_connected(&engine).await.me.unwrap().session;
+    let mut listener = server.raw_client("listener").await;
+    wait_for(&engine, SOON, |s| !s.peers.is_empty()).await;
+    engine.command(Command::Ptt(true));
+    wait_for(&engine, SOON, |s| s.ptt_down).await;
+    let stats = engine.stats();
+
+    let push = |samples: &[f32]| {
+        capture.lock().unwrap().as_mut().unwrap()(samples);
+    };
+    // Stop at a real packet boundary. The first block after becoming online
+    // may be discarded to clear pre-connection capture history.
+    let warm = tokio::time::timeout(SOON, async {
+        loop {
+            let before = stats.dsp_block.lock().unwrap().count();
+            push(&[0.0; 480]);
+            let processed = wait_until(Duration::from_secs(1), || {
+                stats.dsp_block.lock().unwrap().count() > before
+            })
+            .await;
+            if processed && DebugStats::get(&stats.datagrams_sent) > 0 {
+                break listener.session.conn.read_datagram().await.unwrap();
+            }
+        }
+    })
+    .await
+    .expect("PTT must send the warm-up silence");
+    let (header, payload) = icu_proto::AudioHeader::decode(&warm).unwrap();
+    assert_eq!(header.speaker, speaker);
+    let mut decoder = opus::Decoder::new().unwrap();
+    let mut decoded = [0.0; 5760];
+    decoder.decode(payload, &mut decoded).unwrap();
+
+    engine.command(Command::SetMuted(true));
+    listener
+        .recv_matching(SOON, |m| {
+            matches!(m, ControlMsg::UserState { session, flags }
+                if *session == speaker && flags.muted())
+        })
+        .await
+        .expect("server acknowledged mute");
+    // The histogram records at the end of a DSP iteration, unlike the
+    // dsp_blocks counter at its start. Wait until the loud half is stored.
+    let before = stats.dsp_block.lock().unwrap().count();
+    let mut muted_half = [0.0; 480];
+    for (i, sample) in muted_half.iter_mut().enumerate() {
+        *sample = 0.8 * (i as f32 * std::f32::consts::TAU / 48.0).sin();
+    }
+    push(&muted_half);
+    assert!(
+        wait_until(Duration::from_secs(1), || {
+            stats.dsp_block.lock().unwrap().count() > before
+        })
+        .await,
+        "the muted half must pass through DSP before unmuting"
+    );
+    engine.command(Command::SetMuted(false));
+    listener
+        .recv_matching(SOON, |m| {
+            matches!(m, ControlMsg::UserState { session, flags }
+                if *session == speaker && !flags.muted())
+        })
+        .await
+        .expect("server acknowledged unmute");
+    // A transition may discard the first block. Supply enough fresh silence
+    // for several complete packets, without a capture backlog or timeout.
+    for _ in 0..8 {
+        push(&[0.0; 480]);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut packets = 0;
+    let mut peak = 0.0f32;
+    while let Ok(Ok(packet)) = tokio::time::timeout(
+        Duration::from_millis(250),
+        listener.session.conn.read_datagram(),
+    )
+    .await
+    {
+        let (_, payload) = icu_proto::AudioHeader::decode(&packet).unwrap();
+        let n = decoder.decode(payload, &mut decoded).unwrap();
+        peak = decoded[..n]
+            .iter()
+            .fold(peak, |p, sample| p.max(sample.abs()));
+        packets += 1;
+    }
+    drop(listener);
+    engine.shutdown();
+    server.handle.shutdown().await;
+    assert!(
+        packets > 0,
+        "fresh unmuted silence must still be transmitted"
+    );
+    assert!(
+        peak < 0.01,
+        "muted waveform escaped into outgoing audio: peak {peak}"
+    );
+}
+
 /// The client reconnects after a server restart with backoff and gets a new
 /// session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

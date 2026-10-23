@@ -178,6 +178,21 @@ impl Encoder {
     pub fn loss_perc(&self) -> i32 {
         self.loss_perc
     }
+
+    /// Total codec delay in samples, for aligning decoded audio with input.
+    /// Query the codec: this can vary with configuration or library version.
+    pub fn lookahead_samples(&mut self) -> Result<usize, Error> {
+        let mut samples: c_int = 0;
+        // SAFETY: this CTL writes one opus_int32 to the supplied pointer.
+        check(unsafe {
+            ffi::opus_encoder_ctl(
+                self.inner.0,
+                ffi::OPUS_GET_LOOKAHEAD_REQUEST,
+                &mut samples as *mut c_int,
+            )
+        })?;
+        Ok(samples.max(0) as usize)
+    }
 }
 
 /// Per speaker decoder with PLC and FEC.

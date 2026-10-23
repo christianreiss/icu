@@ -19,7 +19,7 @@ pub struct CpalBackend {
     capture: Option<cpal::Stream>,
     playback: Option<cpal::Stream>,
     events: Option<mpsc::Receiver<BackendEvent>>,
-    _events_tx: mpsc::Sender<BackendEvent>,
+    events_tx: mpsc::Sender<BackendEvent>,
 }
 
 impl CpalBackend {
@@ -36,7 +36,7 @@ impl CpalBackend {
             capture: None,
             playback: None,
             events: Some(rx),
-            _events_tx: tx,
+            events_tx: tx,
         })
     }
 
@@ -103,6 +103,7 @@ impl AudioBackend for CpalBackend {
             buffer_size: cpal::BufferSize::Default,
         };
         let mut mono = Vec::new();
+        let events = self.events_tx.clone();
         let stream = dev
             .build_input_stream(
                 config,
@@ -111,7 +112,12 @@ impl AudioBackend for CpalBackend {
                     mono.extend(data.chunks(channels).map(|c| c[0]));
                     cb(&mono);
                 },
-                |e| tracing::warn!(error = %e, "cpal capture error"),
+                move |e| {
+                    let _ = events.send(BackendEvent::StreamError {
+                        stream: StreamKind::Capture,
+                        message: e.to_string(),
+                    });
+                },
                 None,
             )
             .map_err(|e| BackendError(e.to_string()))?;
@@ -144,6 +150,8 @@ impl AudioBackend for CpalBackend {
             buffer_size: cpal::BufferSize::Default,
         };
         let mut mono = Vec::new();
+        let voice = super::channels::voice_channels(channels, None);
+        let events = self.events_tx.clone();
         let stream = dev
             .build_output_stream(
                 config,
@@ -151,12 +159,14 @@ impl AudioBackend for CpalBackend {
                     let frames = data.len() / channels;
                     mono.clear();
                     mono.resize(frames, 0.0);
-                    cb(&mut mono);
-                    for (frame, s) in data.chunks_mut(channels).zip(mono.iter()) {
-                        frame.fill(*s);
-                    }
+                    super::channels::render_voice(&mut mono, data, &voice, &mut cb);
                 },
-                |e| tracing::warn!(error = %e, "cpal playback error"),
+                move |e| {
+                    let _ = events.send(BackendEvent::StreamError {
+                        stream: StreamKind::Playback,
+                        message: e.to_string(),
+                    });
+                },
                 None,
             )
             .map_err(|e| BackendError(e.to_string()))?;

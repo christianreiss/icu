@@ -129,16 +129,23 @@ impl SendChain {
     /// device may have changed, and a held gain for the old microphone
     /// would hit the new one. The denoiser starts over too.
     pub fn restart(&mut self) {
-        self.denoiser = Denoiser::new();
-        self.denoise_on = false;
+        self.reset_history();
         self.leveler.reset();
-        self.prev_voice = false;
-        self.voice_chain.reset();
         self.out_norm.reset();
-        self.out_limiter.reset();
         self.peer_gain = 1.0;
         self.applied_peer_gain = 1.0;
         self.warm_gain = None;
+    }
+
+    /// Drop buffered sound across a capture gap or unmute, retaining the
+    /// learned gains. The microphone test may process sound while muted;
+    /// none of its filter history may become a later transmitted onset.
+    pub fn reset_history(&mut self) {
+        self.denoiser = Denoiser::new();
+        self.denoise_on = false;
+        self.prev_voice = false;
+        self.voice_chain.reset();
+        self.out_limiter.reset();
         self.dynamics = Dynamics::default();
     }
 
@@ -328,6 +335,38 @@ mod tests {
 
     use super::*;
     use crate::dsp::testsignal;
+
+    #[test]
+    fn capture_history_reset_removes_buffered_sound_but_keeps_learned_gains() {
+        let settings = SendSettings::default();
+        let mut chain = SendChain::new();
+        chain.warm_start(3.0);
+        chain.tune(1.5, 0.0);
+        for frame in 0..30 {
+            let mut block = [0.0; 480];
+            for (i, sample) in block.iter_mut().enumerate() {
+                *sample = ((frame * 480 + i) as f32 * 220.0 / 48_000.0 * std::f32::consts::TAU)
+                    .sin()
+                    * 0.2;
+            }
+            chain.analyze(&mut block, &settings);
+            chain.finish(&mut block, true, &settings);
+        }
+        let gains = chain.gains_db();
+        let peer = chain.applied_peer_gain;
+        chain.reset_history();
+        assert_eq!(chain.gains_db(), gains);
+        assert_eq!(chain.applied_peer_gain, peer);
+        for _ in 0..20 {
+            let mut silence = [0.0; 480];
+            chain.analyze(&mut silence, &settings);
+            chain.finish(&mut silence, false, &settings);
+            assert!(
+                silence.iter().all(|&x| x == 0.0),
+                "old filter audio after reset"
+            );
+        }
+    }
 
     #[test]
     fn peer_trim_reaches_output_after_compression_without_moving_mic_agc() {

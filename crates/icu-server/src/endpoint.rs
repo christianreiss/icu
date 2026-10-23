@@ -429,7 +429,7 @@ impl OpenConnection {
         let max = server.config.limits.max_connections as usize;
         server
             .open_connections
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 (n < max).then_some(n + 1)
             })
             .ok()

@@ -2,7 +2,7 @@
 
 pub mod backend;
 pub mod calibration;
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", feature = "cpal-fallback", test))]
 mod channels;
 #[cfg(any(feature = "cpal-fallback", target_os = "windows"))]
 pub mod cpal_fallback;

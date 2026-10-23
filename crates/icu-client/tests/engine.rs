@@ -416,9 +416,19 @@ async fn the_end_packet_of_a_mute_carries_no_audio() {
         }
     }
     let end = end.expect("an END packet after the mute");
-    let voice = talking[talking.len() / 2];
+    // The harmonic test voice contains 200-ms syllable gaps. A fixed
+    // packet index can land in one after a capture/startup boundary.
+    let voice = talking.iter().copied().fold(0.0f32, f32::max);
     assert!(voice > 0.02, "the tone went out, rms {voice}");
-    let end = rms(&end);
+    // Opus delays decoded samples: the beginning of this packet still
+    // represents input from BEFORE mute. Check silence after the queried
+    // codec delay, without confusing the preceding syllable with a leak.
+    let delay = icu_client::dsp::opus::Encoder::new()
+        .unwrap()
+        .lookahead_samples()
+        .unwrap();
+    assert!(delay < end.len());
+    let end = rms(&end[delay..]);
     assert!(
         end < 0.01,
         "the END packet carries audio: rms {end} (voice {voice})"

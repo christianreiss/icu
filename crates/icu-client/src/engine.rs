@@ -85,6 +85,13 @@ fn skip_capture(acc: &mut Vec<f32>, ts: &mut u32, skipped: usize) {
     acc.clear();
 }
 
+/// Discard exactly the observed backlog; callbacks may append concurrently.
+fn discard_capture(cap: &mut HeapCons<f32>, acc: &mut Vec<f32>, ts: &mut u32, lost: usize) {
+    let queued = cap.occupied_len();
+    cap.skip(queued);
+    skip_capture(acc, ts, queued + lost);
+}
+
 /// How the engine is started.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -674,6 +681,23 @@ struct AudioTuning {
     force_epoch: bool,
 }
 
+impl AudioTuning {
+    fn capture_discontinuity(&mut self) {
+        self.outgoing = Default::default();
+        self.capture = Default::default();
+        self.force_epoch = true;
+    }
+
+    fn new_connection(&mut self, epoch: u32) {
+        // Native gain compensation and local calibration belong to the
+        // microphone, not the connection. Only forget remote evidence.
+        self.peer = Default::default();
+        self.peer.set_epoch(epoch);
+        self.outgoing = Default::default();
+        self.force_epoch = true;
+    }
+}
+
 fn restore_capture(shared: &Arc<Shared>, backend: &Arc<Mutex<Box<dyn AudioBackend>>>) {
     let delta = lock(&shared.system_tuner).restore(&mut **lock(backend));
     let mut tuning = AudioTuning {
@@ -890,6 +914,8 @@ struct Shared {
     /// streams can be reopened with a fresh closure; the callbacks only
     /// `try_lock`, which is uncontended in practice.
     cap_prod: Arc<Mutex<HeapProd<f32>>>,
+    /// Samples callbacks could not enqueue, consumed by the DSP clock.
+    capture_dropped: Arc<AtomicUsize>,
     ref_prod: Arc<Mutex<HeapProd<f32>>>,
     play_cons: Arc<Mutex<HeapCons<f32>>>,
     /// Largest block the playback callback has asked for since the mixer
@@ -1109,6 +1135,7 @@ impl Engine {
             video_waker: Mutex::new(None),
             video_tx: Mutex::new(None),
             cap_prod: Arc::new(Mutex::new(cap_prod)),
+            capture_dropped: Arc::new(AtomicUsize::new(0)),
             ref_prod: Arc::new(Mutex::new(ref_prod)),
             play_cons: Arc::new(Mutex::new(play_cons)),
             play_request: Arc::new(AtomicUsize::new(0)),
@@ -1438,6 +1465,7 @@ fn open_capture_stream(
 ) -> Result<(), crate::audio::BackendError> {
     let stats = shared.stats.clone();
     let cap_prod = shared.cap_prod.clone();
+    let dropped = shared.capture_dropped.clone();
     let cycle = shared.cycle.clone();
     backend.open_capture(
         input,
@@ -1450,6 +1478,7 @@ fn open_capture_stream(
                 .unwrap_or(0);
             if pushed < block.len() {
                 DebugStats::inc(&stats.capture_overruns);
+                dropped.fetch_add(block.len() - pushed, Ordering::Relaxed);
             }
             cycle.capture_pushed(block.len());
         }),
@@ -1778,6 +1807,9 @@ fn dsp_thread(
     let mut applied_peer = 0.0;
     let start = Instant::now();
     let mut tone_ticks: u64 = 0;
+    // The network may connect during AEC/encoder initialization. Initial
+    // offline capture must still be discarded at the first eligible block.
+    let mut capture_was_muted = true;
 
     loop {
         if ctl.stop.load(Ordering::Relaxed) {
@@ -1805,17 +1837,42 @@ fn dsp_thread(
         } else {
             // Pair the capture block with the reference block of the same
             // graph cycle (`dsp::refalign`).
-            if ctl.reinit_aec.swap(false, Ordering::Relaxed) {
+            let reopened = ctl.reinit_aec.swap(false, Ordering::Relaxed);
+            let lost = shared.capture_dropped.swap(0, Ordering::Relaxed);
+            if reopened || lost > 0 {
                 // Streams were reopened: restart both rings together so
                 // their occupancy difference is the reference lag again.
-                cap.clear();
+                discard_capture(&mut cap, &mut frame_acc, &mut ts, lost);
                 reference.clear();
                 if let Some(a) = aec.as_mut() {
                     a.reinitialize();
                 }
-                chain.restart();
-                applied_send = None;
-                *lock(&shared.tuning) = AudioTuning::default();
+                if reopened {
+                    chain.restart();
+                    applied_send = None;
+                    *lock(&shared.tuning) = AudioTuning::default();
+                    reset_capture_detection(&mut gate, &mut auto_threshold, Instant::now());
+                    diagnosis.reset();
+                    ref_energy = 0.0;
+                    ref_samples = 0;
+                    ref_underruns_window = 0;
+                    window_start = Instant::now();
+                    shared.state.send_modify(|s| {
+                        s.aec_suspect = false;
+                        s.aec_no_echo = false;
+                        s.aec_reference_silent = false;
+                    });
+                } else {
+                    chain.reset_history();
+                    lock(&shared.tuning).capture_discontinuity();
+                }
+                gate.reset();
+                preroll.clear();
+                voice_in_frame = false;
+                voice_since_push = false;
+                last_voice = None;
+                prev_sent = false;
+                ctl.sending.store(false, Ordering::Relaxed);
             }
             // Bound the backlog: after a stall of this thread, everything
             // older than 100 ms is stale — sending it late only adds latency
@@ -1832,6 +1889,10 @@ fn dsp_thread(
                 DebugStats::add(&stats.capture_backlog_dropped, excess as u64);
                 skip_capture(&mut frame_acc, &mut ts, excess);
                 preroll.clear();
+                voice_in_frame = false;
+                gate.reset();
+                chain.reset_history();
+                lock(&shared.tuning).capture_discontinuity();
             }
             let mut waited = 0u32;
             let mut ready_since: Option<Instant> = None;
@@ -1884,6 +1945,34 @@ fn dsp_thread(
                 }
             }
         }
+        // A reopen/overflow may have happened while waiting for capture.
+        // Do not run even one block through the old microphone's state.
+        if !test_tone
+            && (ctl.reinit_aec.load(Ordering::Relaxed)
+                || shared.capture_dropped.load(Ordering::Relaxed) > 0)
+        {
+            skip_capture(&mut frame_acc, &mut ts, BLOCK);
+            continue;
+        }
+        let capture_muted =
+            ctl.muted.load(Ordering::Relaxed) || !ctl.online.load(Ordering::Relaxed);
+        if capture_was_muted && !capture_muted {
+            // Audio processed for meters/the mic test while muted may still
+            // live in the capture ring, partial frame or filter history.
+            discard_capture(&mut cap, &mut frame_acc, &mut ts, BLOCK);
+            reference.clear();
+            chain.reset_history();
+            lock(&shared.tuning).capture_discontinuity();
+            if let Some(a) = aec.as_mut() {
+                a.reinitialize();
+            }
+            gate.reset();
+            preroll.clear();
+            voice_in_frame = false;
+            capture_was_muted = false;
+            continue;
+        }
+        capture_was_muted = capture_muted;
         // Whatever the capture path delivered, the AEC and the denoiser only
         // ever see numbers within ±4 (`dsp::sanitize`).
         let mut raw_capture = [0.0; BLOCK];
@@ -1959,6 +2048,10 @@ fn dsp_thread(
             voice_strength: VoiceStrength::from_u32(ctl.voice_strength.load(Ordering::Relaxed)),
             normalize_outgoing: ctl.normalize_outgoing.load(Ordering::Relaxed),
         };
+        if applied_send.is_some_and(|old| old.denoise != send.denoise) {
+            reset_capture_detection(&mut gate, &mut auto_threshold, t_block);
+            voice_in_frame = false;
+        }
         if let Ok(mut tuning) = shared.tuning.try_lock() {
             let delta = std::mem::take(&mut tuning.capture_delta);
             let seed = tuning.seed_gain.take();
@@ -2000,7 +2093,7 @@ fn dsp_thread(
         };
         ctl.vad_effective_threshold.store(threshold);
         let voice = vad::is_voice(threshold, prob, level);
-        voice_in_frame |= voice;
+        voice_in_frame |= voice && !capture_muted;
         voice_since_push |= voice;
         if voice {
             last_voice = Some(t_block);
@@ -2064,6 +2157,12 @@ fn dsp_thread(
         }
 
         // 4. Accumulate to an Opus frame.
+        // Eligibility belongs to each 10-ms block, not only the final
+        // 20-ms frame: unmuting between its halves must not release the
+        // half captured while muted. The mic test above still hears it.
+        if capture_muted {
+            block.fill(0.0);
+        }
         let frame_samples = ctl.frame_samples.load(Ordering::Relaxed) as usize;
         collect_block(
             &mut frame_acc,
@@ -2091,7 +2190,11 @@ fn dsp_thread(
             let muted = ctl.muted.load(Ordering::Relaxed) || !online;
             gate.set_muted(muted);
             let was_open = gate.is_open();
-            let decision = gate.update(now, voice_in_frame);
+            let decision = gate.update_audio(
+                now,
+                voice_in_frame,
+                Duration::from_micros(frame_samples as u64 * 1_000_000 / 48_000),
+            );
             voice_in_frame = false;
 
             // LossHint → encoder.
@@ -2221,6 +2324,12 @@ fn collect_block(
         acc.clear();
     }
     acc.extend_from_slice(block);
+}
+
+/// A new microphone or probability source needs a fresh threshold and attack.
+fn reset_capture_detection(gate: &mut Gate, threshold: &mut vad_auto::AutoThreshold, now: Instant) {
+    gate.reset();
+    *threshold = vad_auto::AutoThreshold::new(now);
 }
 
 /// Keep both admitted and candidate speech out of the automatic noise floor.
@@ -4139,7 +4248,7 @@ async fn run_session(
         });
     }
     *lock(&shared.conn) = Some(connection.clone());
-    *lock(&shared.tuning) = AudioTuning::default();
+    lock(&shared.tuning).new_connection(shared.gain_epoch.load(Ordering::Relaxed));
     shared.feedback_capable.store(
         welcome.caps & icu_proto::CAP_AUDIO_FEEDBACK != 0,
         Ordering::Relaxed,
@@ -5890,6 +5999,79 @@ mod tests {
         skip_capture(&mut acc, &mut ts, 3 * BLOCK);
         assert!(acc.is_empty());
         assert_eq!(ts, 1000 + 4 * BLOCK as u32);
+    }
+
+    #[test]
+    fn overflow_discards_old_audio_and_accounts_for_every_lost_sample() {
+        for room in [0, BLOCK / 2] {
+            let (mut producer, mut consumer) = HeapRb::<f32>::new(2 * BLOCK).split();
+            producer.push_slice(&vec![0.75; 2 * BLOCK - room]);
+            let pushed = producer.push_slice(&[0.5; BLOCK]);
+            assert_eq!(pushed, room);
+            let lost = BLOCK - pushed;
+            let mut partial = vec![0.25; BLOCK];
+            let mut ts = u32::MAX - 100;
+            let before = ts;
+            discard_capture(&mut consumer, &mut partial, &mut ts, lost);
+            assert!(partial.is_empty());
+            assert_eq!(consumer.occupied_len(), 0);
+            assert_eq!(ts, before.wrapping_add((3 * BLOCK + lost) as u32));
+            producer.push_slice(&[0.125; BLOCK]);
+            let mut fresh = [0.0; BLOCK];
+            assert_eq!(consumer.pop_slice(&mut fresh), BLOCK);
+            assert!(fresh.iter().all(|&x| x == 0.125));
+        }
+    }
+
+    #[test]
+    fn new_microphone_does_not_inherit_a_noisy_devices_threshold_or_attack() {
+        let start = Instant::now();
+        let mut threshold = vad_auto::AutoThreshold::new(start);
+        let mut gate = Gate::new(Mode::Vad, Duration::ZERO, Duration::from_millis(200));
+        gate.set_attack(Duration::from_millis(40));
+        for i in 0..1000 {
+            let now = start + Duration::from_millis(i * 10);
+            let speech = floor_sample_is_speech(gate.is_open(), 0.65, threshold.threshold());
+            threshold.update(now, speech, 0.65);
+            gate.update_audio(
+                now,
+                0.65 >= threshold.threshold(),
+                Duration::from_millis(10),
+            );
+        }
+        assert!(threshold.threshold() > 0.75);
+        let now = start + Duration::from_secs(10);
+        reset_capture_detection(&mut gate, &mut threshold, now);
+        for i in 0..5 {
+            let voice = 0.60 >= threshold.threshold();
+            let decision = gate.update_audio(now, voice, Duration::from_millis(10));
+            assert_eq!(
+                decision,
+                if i == 4 {
+                    Decision::Send
+                } else {
+                    Decision::Silent
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn reconnect_preserves_pending_microphone_compensation_and_forces_fresh_feedback() {
+        let mut tuning = AudioTuning {
+            capture_delta: -1.0,
+            seed_gain: Some(3.0),
+            software_gain_db: 2.0,
+            ..Default::default()
+        };
+        tuning.peer.offset_db = 1.5;
+        tuning.new_connection(17);
+        assert_eq!(tuning.capture_delta, -1.0);
+        assert_eq!(tuning.seed_gain, Some(3.0));
+        assert_eq!(tuning.software_gain_db, 2.0);
+        assert_eq!(tuning.peer.offset_db, 0.0);
+        assert_eq!(tuning.peer.epoch(), 17);
+        assert!(tuning.force_epoch);
     }
 
     /// Whichever way `run_session` returns, its reader tasks end with it.

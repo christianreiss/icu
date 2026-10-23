@@ -90,6 +90,9 @@ auch große Endpoint-Puffer werden nicht als viele kleine Anforderungen verborge
 Die Referenz ist der System-Loopback des Ausgabe-Endpoints, alle 2 ms abgefragt.
 Default-Wechsel folgen `eConsole`. CPAL ist der Rückfall, wenn der WASAPI-Watcher
 nicht startet; eigene Resampling-Planungen gehören nicht zum aktuellen Pfad.
+CPAL gibt Stimme ebenfalls nur auf dem ersten Kanalpaar aus und meldet
+Streamfehler an die automatische Wiederöffnung. Der Capture-Fallback setzt
+weiterhin einen vom Backend unterstützten float32/48-kHz-Eingang voraus.
 
 ### Verarbeitung und Senden
 
@@ -103,6 +106,8 @@ nicht startet; eigene Resampling-Planungen gehören nicht zum aktuellen Pfad.
   fehlender Verbindung oder losgelassener PTT-Taste zählt nicht als Rauschen.
   Das gilt auch für Sprachkandidaten während des VAD-Anlaufs: die Schwelle
   darf leise Sprache nicht weglernen, bevor das Gate öffnen kann.
+  Nach einem Streamwechsel oder Denoise-Umschalten beginnt die Erkennung
+  frisch; Rauschboden und VAD-Anlauf des alten Signals werden verworfen.
   Die Sprachanzeige hält über den VAD-Nachlauf, auch während Stumm.
 - Stimmoptimierung ist standardmäßig an, Stärke mittel. Hochpass 80 Hz,
   Kompressor und Limiter folgen AEC und VAD; leicht/mittel/stark verwenden
@@ -110,6 +115,9 @@ nicht startet; eigene Resampling-Planungen gehören nicht zum aktuellen Pfad.
 - PTT-Nachlauf: standardmäßig 150 ms; VAD-Nachlauf: 1000 ms. VAD sendet einen
   Pre-Roll-Frame, der während Stumm aufgenommene Frames ausschließt. Stummschalten
   verwirft angebrochenes Audio; das abschließende END-Paket enthält Stille.
+  Die Stummschaltung gilt für jeden 10-ms-Block. Beim Entstummen werden
+  noch gepufferte Capture-Samples, Teilframes und Filter-Audio verworfen;
+  die erlernten Verstärkungen bleiben erhalten.
 - VAD-Anlauf (Tipp-Filter, `attack_ms`, standardmäßig 40 ms, 0–200, 0 = aus):
   ein geschlossenes VAD-Gate öffnet erst, wenn die Stimme den Anlauf über
   anhält (`Gate`-Zustand `Arming`). Ein Tastenanschlag ist ein oder zwei
@@ -120,8 +128,11 @@ nicht startet; eigene Resampling-Planungen gehören nicht zum aktuellen Pfad.
   zurückgehaltenen Frames gehen als Pre-Roll vor dem öffnenden Frame hinaus
   (`dsp::preroll::PreRoll`, Tiefe aus Anlauf und Frame-Dauer; `Gate::withheld`
   zählt sie), der Wortanfang bleibt also erhalten. Währenddessen zählt ein
-  Block über der Schwelle bei geschlossenem Gate nicht als Sprache für den
-  Rauschboden. Innerhalb von 150 ms nach einem Tastendruck gilt der doppelte
+  Block über der Schwelle bei geschlossenem Gate als Sprachkandidat und
+  nicht als Rauschen. Bei großen Hardware-Quanten zählt auch die Dauer der
+  bereits verarbeiteten Sprachframes zum Anlauf, damit eine schnelle
+  Verarbeitung im Stapel keinen Wortanfang verdrängt.
+  Innerhalb von 150 ms nach einem Tastendruck gilt der doppelte
   Anlauf (`hotkey::typing`, nur ein Zeitstempel, nie welche Taste): das sieht
   der Windows-Raw-Input-Leser und der Linux-evdev-Leser (§7). Über das
   Portal sieht ICU nur die belegten Kürzel, dort wirkt allein der Grundanlauf.
@@ -131,11 +142,16 @@ nicht startet; eigene Resampling-Planungen gehören nicht zum aktuellen Pfad.
   der Frame-Dauer verwirft den angebrochenen Frame.
 - Ohne andere Teilnehmer wird weder Audio codiert noch gesendet; taube Peers
   zählen als Publikum. Gate und Rauschbodenerkennung laufen weiter.
+- Capture-Überläufe verwerfen den vollständigen alten Ringinhalt samt
+  Teilframe. Die Sample-Uhr zählt auch nicht eingereihte Samples; ein
+  CPU-Stall spielt dadurch keine veraltete Aufnahme nach.
 
 ### Empfang und Wiedergabe
 
 Je Sprecher existieren Decoder und adaptiver Jitter-Puffer. Die Zieltiefe ist
 das Maximum aus Jitter- und Stall-Term, geklemmt auf einen Frame bis 200 ms.
+Bereits eingereihte kurze Sprechabschnitte behalten nach einem END ihre
+Ankunftszeit für den Vorlauf; auch ohne weitere Pakete werden sie abgespielt.
 FEC braucht das folgende Paket; sonst verdeckt PLC den Verlust. Deep PLC nutzt
 Decoder-Complexity 5. Ein Sprung außerhalb des Pufferfensters beginnt einen
 neuen Sprechabschnitt, statt minutenlang fehlende Frames zu verdecken.
@@ -180,6 +196,10 @@ Systemregler um. Solange eine Peer-Korrektur wirkt, bleibt der Ausgangslimiter
 auch bei abgeschalteter Ausgangsnormalisierung aktiv. Fehlende lokale Sprache,
 widersprechende Messung, fehlende Spitzenreserve und die Regelgrenze erscheinen
 im Peer-Status statt pauschal als aktive Regelung.
+Bei einer neuen Verbindung wird nur das Empfangsfeedback zurückgesetzt.
+Die nächste DSP-Verarbeitung erhält eine frische Pegelkennung, damit gültige
+Hints auch ohne Einstellungsänderung angenommen werden. Lokale Kalibrierung
+und noch ausstehende Kompensation nativer Mikrofonänderungen bleiben erhalten.
 
 ### Gute Audiopegel und verständlicher Status
 

@@ -37,6 +37,7 @@ enum State {
     Arming {
         since: Instant,
         frames: u32,
+        audio: Duration,
     },
     Open,
     Releasing(Instant),
@@ -128,8 +129,21 @@ impl Gate {
         matches!(self.state, State::Open | State::Releasing(_))
     }
 
+    /// Forget a discontinued capture timeline, keeping the user's controls.
+    pub fn reset(&mut self) {
+        self.state = State::Closed;
+        self.withheld = 0;
+    }
+
     /// One frame: `voice` is the VAD verdict for this frame.
     pub fn update(&mut self, now: Instant, voice: bool) -> Decision {
+        self.update_audio(now, voice, Duration::ZERO)
+    }
+
+    /// Audio may arrive in large hardware batches. Count its duration as
+    /// well as elapsed wall time, so the attack cannot discard the beginning
+    /// of a word merely because its frames were processed in one burst.
+    pub fn update_audio(&mut self, now: Instant, voice: bool, frame: Duration) -> Decision {
         let want_open = !self.muted
             && match self.mode {
                 Mode::Ptt => self.ptt_down,
@@ -148,15 +162,22 @@ impl Gate {
                 self.state = State::Arming {
                     since: now,
                     frames: 1,
+                    audio: Duration::ZERO,
                 };
                 Decision::Silent
             }
-            (State::Arming { since, frames }, true)
-                if now.saturating_duration_since(since) < attack =>
-            {
+            (
+                State::Arming {
+                    since,
+                    frames,
+                    audio,
+                },
+                true,
+            ) if now.saturating_duration_since(since).max(audio + frame) < attack => {
                 self.state = State::Arming {
                     since,
                     frames: frames + 1,
+                    audio: audio + frame,
                 };
                 Decision::Silent
             }
@@ -206,6 +227,25 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    #[test]
+    fn batched_audio_opens_after_the_configured_audio_attack() {
+        let now = Instant::now();
+        for frame_ms in [10, 20] {
+            for attack_ms in [40, 80] {
+                let mut gate = Gate::new(Mode::Vad, ms(150), ms(200));
+                gate.set_attack(ms(attack_ms));
+                let held = attack_ms / frame_ms;
+                for _ in 0..held {
+                    assert_eq!(gate.update_audio(now, true, ms(frame_ms)), Decision::Silent);
+                }
+                assert_eq!(gate.update_audio(now, true, ms(frame_ms)), Decision::Send);
+                assert_eq!(gate.withheld(), held as u32);
+                gate.reset();
+                assert_eq!(gate.update_audio(now, true, ms(frame_ms)), Decision::Silent);
+            }
+        }
     }
 
     #[test]
