@@ -5,7 +5,7 @@ use super::meter;
 
 /// RMS level in dBFS a block must reach to count as voice while the
 /// denoiser (and with it the RNNoise probability) is off.
-const ENERGY_THRESHOLD_DB: f32 = -40.0;
+pub const ENERGY_THRESHOLD_DB: f32 = -40.0;
 /// RMS level in dBFS below which the RNNoise probability is not trusted.
 /// RNNoise does not look at the level: on a digitally silent microphone the
 /// AEC's comfort-noise transient when the far end starts (≈ −96 dBFS; right
@@ -15,6 +15,17 @@ const ENERGY_THRESHOLD_DB: f32 = -40.0;
 /// −40 dBFS without the leveler loses ~4 % of its voiced blocks here, all at
 /// word edges the hangover covers.
 const PROB_FLOOR_DB: f32 = -60.0;
+
+/// Detector and threshold on the same 0–1 display axis. Without RNNoise,
+/// the detector uses energy, mapped from −60 to 0 dBFS like the level meter.
+pub fn meter_values(denoise: bool, probability: f32, threshold: f32, rms_db: f32) -> (f32, f32) {
+    if denoise {
+        (probability, threshold)
+    } else {
+        let fraction = |db: f32| ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+        (fraction(rms_db), fraction(ENERGY_THRESHOLD_DB))
+    }
+}
 
 /// Decides for one 10 ms block. `prob` is the RNNoise probability if the
 /// denoiser ran, compared against `threshold` on blocks at least
@@ -29,6 +40,25 @@ pub fn is_voice(threshold: f32, prob: Option<f32>, level: meter::Level) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_meter_matches_the_actual_energy_gate() {
+        assert_eq!(meter_values(true, 0.7, 0.4, -50.0), (0.7, 0.4));
+        for rms_db in [-55.0, -40.0, -25.0] {
+            let (value, threshold) = meter_values(false, 0.0, 0.9, rms_db);
+            assert_eq!(
+                value >= threshold,
+                is_voice(
+                    0.9,
+                    None,
+                    meter::Level {
+                        rms_db,
+                        peak_db: rms_db
+                    }
+                )
+            );
+        }
+    }
 
     #[test]
     fn decisions() {

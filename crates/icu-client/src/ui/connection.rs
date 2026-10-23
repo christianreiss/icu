@@ -290,6 +290,7 @@ impl ConnectionView {
         let cards = self.page(state, &jitter);
 
         let page = egui::ScrollArea::vertical()
+            .id_salt(("connection-page", self.tab as u8))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 // Clear of the window edge and of the overlay scroll bar.
@@ -1310,15 +1311,14 @@ fn block_row(ui: &mut Ui, row: &Row, copied: &mut Option<(String, Instant)>) {
                 ui.label(RichText::new(row.label.as_ref()).size(12.5));
                 if let Some(copy_value) = &row.copy {
                     widgets::rtl(ui, 22.0, |ui| {
-                        let copy = widgets::icon_button(ui, icon::COPY, 22.0, false)
-                            .on_hover_text("In die Zwischenablage");
-                        copy.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::Button,
-                                ui.is_enabled(),
-                                "Fingerabdruck kopieren",
-                            )
-                        });
+                        let copy = widgets::icon_button(
+                            ui,
+                            icon::COPY,
+                            "Fingerabdruck kopieren",
+                            22.0,
+                            false,
+                        )
+                        .on_hover_text("In die Zwischenablage");
                         if copy.clicked() {
                             ui.ctx().copy_text(copy_value.clone());
                             *copied = Some((row.label.to_string(), Instant::now()));

@@ -683,7 +683,7 @@ pub async fn capture_next_key(timeout: Duration) -> Result<String, String> {
         tracing::warn!(%e, "raw input");
         NO_READER.to_string()
     })?;
-    let _mice = Mice::new(hub.clone());
+    let mice = Mice::new(hub.clone());
     let (tx, rx) = oneshot::channel();
     let mut tx = Some(tx);
     let mut recorder = super::chord::Recorder::default();
@@ -696,8 +696,14 @@ pub async fn capture_next_key(timeout: Duration) -> Result<String, String> {
         }
         false
     }));
+    // The settings window can cancel by dropping this future. Keep listener
+    // and mouse registration scoped across the await, including cancellation.
+    let _guard = Guard {
+        hub,
+        id,
+        _mice: Some(mice),
+    };
     let result = tokio::time::timeout(timeout, rx).await;
-    hub.remove(id);
     match result {
         Ok(Ok(binding)) => Ok(binding),
         Ok(Err(_)) => Err(NO_READER.into()),

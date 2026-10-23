@@ -205,6 +205,8 @@ pub struct AppState {
     pub video_viewers: Vec<Session>,
     /// Local mute.
     pub muted: bool,
+    /// Temporary setup inhibition, independent of the user's persisted mute.
+    pub setup_active: bool,
     /// Local deafen.
     pub deafened: bool,
     /// The OS mutes the recording device (`UserFlags::SYSTEM_MUTED`).
@@ -219,6 +221,9 @@ pub struct AppState {
     pub voice: bool,
     /// Microphone level after processing.
     pub level: Level,
+    /// Raw capture reached full scale within the last second, before AEC,
+    /// gain or denoise. Also measured while muted or setting up.
+    pub input_clipping: bool,
     /// RNNoise voice probability.
     pub vad_prob: f32,
     /// The VAD threshold currently in effect (manual, or auto-calibrated
@@ -311,6 +316,67 @@ pub struct AppState {
     pub hotkey_retries: u32,
 }
 
+impl AppState {
+    /// The active voice detector and its threshold on a shared meter axis.
+    pub fn vad_meter(&self) -> (f32, f32) {
+        vad::meter_values(
+            self.settings.audio.denoise,
+            self.vad_prob,
+            self.vad_threshold,
+            self.level.rms_db,
+        )
+    }
+
+    /// Account for immediately edited switches and temporary transmission
+    /// stops before the next periodic audio report reaches the UI.
+    pub fn effective_audio_health(
+        &self,
+        audio: &crate::config::AudioSettings,
+    ) -> crate::audio::health::AudioHealth {
+        use crate::audio::health::State;
+        let state = if !audio.auto_level || !audio.denoise {
+            Some(State::Disabled)
+        } else if self.conn != ConnStatus::Connected || !audio.peer_assistance {
+            Some(State::LocalOnly)
+        } else if self.setup_active || self.muted || self.deafened {
+            Some(if self.audio_health.peer_trim_db != 0.0 {
+                State::Held
+            } else {
+                State::NoLocalSpeech
+            })
+        } else {
+            None
+        };
+        state.map_or_else(
+            || self.audio_health.clone(),
+            |state| health_without_feedback(&self.audio_health, state),
+        )
+    }
+}
+
+fn health_without_feedback(
+    health: &crate::audio::health::AudioHealth,
+    state: crate::audio::health::State,
+) -> crate::audio::health::AudioHealth {
+    crate::audio::health::AudioHealth {
+        state,
+        reporters: 0,
+        local_correction_db: None,
+        remote_correction_db: None,
+        feedback_age_secs: None,
+        ..health.clone()
+    }
+}
+
+fn publish_audio_profile(
+    health: &mut crate::audio::health::AudioHealth,
+    saved_at: Option<u64>,
+) -> bool {
+    health.profile_saved = saved_at.is_some();
+    health.profile_saved_at = saved_at;
+    saved_at.is_some()
+}
+
 /// Commands from UI, tray and hotkeys.
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -318,6 +384,8 @@ pub enum Command {
     VideoDisplayed(Session),
     /// Mute/unmute.
     SetMuted(bool),
+    /// Prevent transmission during setup without changing the user's mute.
+    SetSetupActive(bool),
     /// Deafen/undeafen.
     SetDeafened(bool),
     /// PTT or VAD.
@@ -458,6 +526,7 @@ impl AtomicF32 {
 #[derive(Debug)]
 pub struct DspControl {
     muted: AtomicBool,
+    setup_active: AtomicBool,
     ptt_down: AtomicBool,
     /// A connection is up; without one the gate stays shut, so nothing is
     /// encoded and the UI never claims to be sending into the void.
@@ -506,6 +575,7 @@ impl DspControl {
             // The one settings-driven field `apply_settings` leaves alone:
             // after the start only the mute commands move it.
             muted: AtomicBool::new(s.audio.muted),
+            setup_active: AtomicBool::new(false),
             ptt_down: AtomicBool::new(false),
             online: AtomicBool::new(false),
             audience: AtomicBool::new(false),
@@ -538,6 +608,10 @@ impl DspControl {
         };
         ctl.apply_settings(s);
         ctl
+    }
+
+    fn transmission_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed) || self.setup_active.load(Ordering::Relaxed)
     }
 
     fn apply_settings(&self, s: &Settings) {
@@ -771,8 +845,7 @@ fn tune_capture(shared: &Arc<Shared>, local: &LocalState) {
         return;
     }
     let w = std::mem::take(&mut lock(&shared.tuning).capture);
-    let paused =
-        shared.dsp.muted.load(Ordering::Relaxed) || !shared.dsp.online.load(Ordering::Relaxed);
+    let paused = shared.dsp.transmission_muted() || !shared.dsp.online.load(Ordering::Relaxed);
     let (delta, status, system_db) = {
         let mut tuner = lock(&shared.system_tuner);
         let delta = tuner.tick(
@@ -1058,11 +1131,13 @@ impl Engine {
             video_viewers: Vec::new(),
             // A mute kept from the last run shows from the first frame.
             muted: settings.audio.muted,
+            setup_active: false,
             deafened: false,
             ptt_down: false,
             sending: false,
             voice: false,
             level: Level::default(),
+            input_clipping: false,
             vad_prob: 0.0,
             vad_threshold: settings.audio.vad_threshold,
             rtt_ms: None,
@@ -1795,6 +1870,7 @@ fn dsp_thread(
     let mut voice_since_push = false;
     // The last block the voice detector heard speech in (`voice_held`).
     let mut last_voice: Option<Instant> = None;
+    let mut last_input_clip: Option<Instant> = None;
     let mut last_aec_stats = Instant::now();
     // Reference energy since the last stats push, folded with the
     // statistics into the user hints (`dsp::aec::Diagnosis`).
@@ -1849,6 +1925,7 @@ fn dsp_thread(
                 }
                 if reopened {
                     chain.restart();
+                    last_input_clip = None;
                     applied_send = None;
                     *lock(&shared.tuning) = AudioTuning::default();
                     reset_capture_detection(&mut gate, &mut auto_threshold, Instant::now());
@@ -1858,6 +1935,7 @@ fn dsp_thread(
                     ref_underruns_window = 0;
                     window_start = Instant::now();
                     shared.state.send_modify(|s| {
+                        s.input_clipping = false;
                         s.aec_suspect = false;
                         s.aec_no_echo = false;
                         s.aec_reference_silent = false;
@@ -1954,8 +2032,7 @@ fn dsp_thread(
             skip_capture(&mut frame_acc, &mut ts, BLOCK);
             continue;
         }
-        let capture_muted =
-            ctl.muted.load(Ordering::Relaxed) || !ctl.online.load(Ordering::Relaxed);
+        let capture_muted = ctl.transmission_muted() || !ctl.online.load(Ordering::Relaxed);
         if capture_was_muted && !capture_muted {
             // Audio processed for meters/the mic test while muted may still
             // live in the capture ring, partial frame or filter history.
@@ -1980,6 +2057,10 @@ fn dsp_thread(
         crate::dsp::sanitize(&mut block);
         crate::dsp::sanitize(&mut ref_block);
         let t_block = Instant::now();
+        let input_clipped = raw_capture.iter().any(|x| x.is_finite() && x.abs() >= 0.99);
+        if !test_tone && input_clipped {
+            last_input_clip = Some(t_block);
+        }
         DebugStats::inc(&stats.dsp_blocks);
 
         // 2. AEC: reference first, then capture.
@@ -2102,14 +2183,14 @@ fn dsp_thread(
         chain.finish(&mut block, voice, &send);
         if !test_tone
             && ctl.online.load(Ordering::Relaxed)
-            && !ctl.muted.load(Ordering::Relaxed)
+            && !ctl.transmission_muted()
             && (ctl.vad_mode.load(Ordering::Relaxed) || ctl.ptt_down.load(Ordering::Relaxed))
         {
             if let Ok(mut tuning) = shared.tuning.try_lock() {
                 tuning.software_gain_db = chain.gains_db().0;
                 let now = Instant::now();
                 let dynamics = chain.dynamics();
-                if raw_capture.iter().any(|x| x.is_finite() && x.abs() >= 0.99) {
+                if input_clipped {
                     tuning.clip_until = Some(now + Duration::from_secs(10));
                 }
                 if dynamics.headroom_limited {
@@ -2187,7 +2268,7 @@ fn dsp_thread(
             ) as u64));
             gate.set_ptt(ctl.ptt_down.load(Ordering::Relaxed) || test_tone);
             let online = ctl.online.load(Ordering::Relaxed);
-            let muted = ctl.muted.load(Ordering::Relaxed) || !online;
+            let muted = ctl.transmission_muted() || !online;
             gate.set_muted(muted);
             let was_open = gate.is_open();
             let decision = gate.update_audio(
@@ -2293,8 +2374,12 @@ fn dsp_thread(
             let hangover = Duration::from_millis(ctl.hangover_ms.load(Ordering::Relaxed) as u64);
             let voice = std::mem::take(&mut voice_since_push)
                 || voice_held(last_voice, last_state_push, hangover);
+            let input_clipping = last_input_clip.is_some_and(|when| {
+                last_state_push.saturating_duration_since(when) < Duration::from_secs(1)
+            });
             shared.state.send_modify(|s| {
                 s.level = level;
+                s.input_clipping = input_clipping;
                 s.vad_prob = p;
                 s.vad_threshold = vad_threshold;
                 s.sending = sending;
@@ -3000,6 +3085,16 @@ fn end_session(shared: &Arc<Shared>) {
         s.notice = None;
         s.restricted_muted = false;
         s.restricted_deafened = false;
+        s.audio_health = health_without_feedback(
+            &s.audio_health,
+            if s.settings.audio.auto_level && s.settings.audio.denoise {
+                crate::audio::health::State::LocalOnly
+            } else {
+                crate::audio::health::State::Disabled
+            },
+        );
+        s.audio_health.system_status = "Keine Verbindung – Systemregelung pausiert".into();
+        s.tuning_status = s.audio_health.diagnostic();
     });
 }
 
@@ -3318,17 +3413,17 @@ impl LocalState {
         };
         let Some(identity) = identity else {
             self.calibration_learner.reset();
+            shared.state.send_modify(|s| {
+                s.can_restore_audio = publish_audio_profile(&mut s.audio_health, None);
+            });
             return;
         };
         let key =
             crate::audio::calibration::device_key(shared.state.borrow().backend, &identity.device);
         let unix = crate::net::conn::unix_now().max(0) as u64;
         let saved_at = self.calibration.profile(&key, unix).map(|p| p.saved_at);
-        let available = saved_at.is_some();
         shared.state.send_modify(|s| {
-            s.can_restore_audio = available;
-            s.audio_health.profile_saved = available;
-            s.audio_health.profile_saved_at = saved_at;
+            s.can_restore_audio = publish_audio_profile(&mut s.audio_health, saved_at);
         });
         if !enabled || !self.settings.audio.remember_good_levels {
             self.calibration_learner.reset();
@@ -3422,6 +3517,10 @@ impl LocalState {
     fn handle_local(&mut self, cmd: Command, shared: &Arc<Shared>) -> bool {
         let mut set_state = false;
         match cmd {
+            Command::SetSetupActive(active) => {
+                shared.dsp.setup_active.store(active, Ordering::Relaxed);
+                shared.state.send_modify(|s| s.setup_active = active);
+            }
             // An enforced deafen keeps the microphone off as well: deafen
             // implies mute, whoever set it.
             Command::SetMuted(false)
@@ -4527,7 +4626,7 @@ async fn run_session(
                 let now = Instant::now();
                 let enabled = local.settings.audio.auto_level && local.settings.audio.denoise
                     && local.settings.audio.peer_assistance;
-                let may_measure=!shared.dsp.muted.load(Ordering::Relaxed) && !shared.dsp.test_tone.load(Ordering::Relaxed);
+                let may_measure=!shared.dsp.transmission_muted() && !shared.dsp.test_tone.load(Ordering::Relaxed);
                 {
                     let mut t = lock(&shared.tuning);
                     let measured=t.outgoing.take_window().filter(|(_,w)|may_measure && w.gain_epoch==t.peer.epoch()).map(|(l,_)|l);
@@ -5655,6 +5754,66 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setup_guard_preserves_user_mute_and_deafen_across_release() {
+        use super::*;
+        for user_muted in [false, true] {
+            for deafened in [false, true] {
+                let mut settings = Settings::default();
+                settings.audio.muted = user_muted;
+                let ctl = DspControl::from_settings(&settings, false);
+                // apply_mute_deafen owns this input; setup owns only its
+                // separate inhibition, never that input or the settings.
+                ctl.muted.store(user_muted || deafened, Ordering::Relaxed);
+                ctl.setup_active.store(true, Ordering::Relaxed);
+                assert!(ctl.transmission_muted());
+                ctl.apply_settings(&settings);
+                assert!(ctl.transmission_muted());
+                ctl.setup_active.store(false, Ordering::Relaxed);
+                assert_eq!(ctl.transmission_muted(), user_muted || deafened);
+                assert_eq!(settings.audio.muted, user_muted);
+            }
+        }
+        let ctl = DspControl::from_settings(&Settings::default(), false);
+        ctl.setup_active.store(true, Ordering::Relaxed);
+        for muted in [true, false, true] {
+            ctl.muted.store(muted, Ordering::Relaxed);
+            assert!(
+                ctl.transmission_muted(),
+                "a mute hotkey cannot release setup"
+            );
+        }
+        ctl.setup_active.store(false, Ordering::Relaxed);
+        assert!(
+            ctl.transmission_muted(),
+            "the last explicit mute survives closing"
+        );
+    }
+
+    #[test]
+    fn unavailable_microphone_clears_profile_actions_and_feedback_is_not_current_offline() {
+        use super::*;
+        use crate::audio::health::{AudioHealth, State};
+        let mut health = AudioHealth {
+            state: State::Good,
+            reporters: 3,
+            remote_correction_db: Some(0.0),
+            local_correction_db: Some(0.0),
+            feedback_age_secs: Some(1.0),
+            ..Default::default()
+        };
+        assert!(publish_audio_profile(&mut health, Some(123)));
+        let offline = health_without_feedback(&health, State::LocalOnly);
+        assert_eq!(offline.state, State::LocalOnly);
+        assert_eq!(offline.reporters, 0);
+        assert_eq!(offline.remote_correction_db, None);
+        assert_eq!(offline.feedback_age_secs, None);
+        assert_eq!(offline.profile_saved_at, Some(123));
+        assert!(!publish_audio_profile(&mut health, None));
+        assert!(!health.profile_saved);
+        assert_eq!(health.profile_saved_at, None);
+    }
+
     #[test]
     fn automatic_threshold_still_rejects_clicks_and_recovers_from_steady_noise() {
         use super::{floor_sample_is_speech, vad_auto::AutoThreshold, Gate, Mode};

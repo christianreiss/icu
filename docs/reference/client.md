@@ -353,7 +353,8 @@ Frisches Video ersetzt den Initialen-Avatar; die eigene Zeile verwendet die
 lokale Vorschau. Die Auswahl öffnet eine eigene Nutzeransicht. Admins können
 fremde Nutzer stumm-/taubschalten, Einschränkungen aufheben, hinauswerfen oder
 sperren. Vom Server erzwungene Einschränkungen lassen sich lokal nicht aufheben.
-Die Sprechfläche lässt PTT los, wenn das Fenster während des Haltens verschwindet.
+Die fokussierte Sprechfläche lässt sich mit Leertaste oder Enter halten.
+Sie lässt PTT bei Loslassen, Fokusverlust oder ausgeblendetem Fenster los.
 Allein im Raum zeigt sie „Allein“ und sendet nichts.
 
 ### Einstellungen und Einrichtung
@@ -369,6 +370,18 @@ Maus-Ausweichen mit Wechselsperre und Rückkehrzeit hinzu.
 wirken sofort; Änderungen aus Tray, Hotkeys und Hauptfenster werden übernommen,
 statt durch einen veralteten Entwurf überschrieben zu werden. Der Mikrofontest
 bleibt auf Audio und Klang aktiv, damit Klangänderungen hörbar vergleichbar sind.
+Jede Seite behält ihre eigene Scrollposition. Bei schmalem Fenster stehen
+Beschriftungen über den Reglern; Tastaturfokus ist auch auf selbst gezeichneten
+Schaltern und Symbolknöpfen sichtbar. Eine laufende Kürzelaufnahme endet beim
+Seitenwechsel. Unter Windows bleiben dabei aufgenommene Modifikatortasten Teil
+des Kürzels.
+
+Ohne Rauschunterdrückung arbeitet die Sprachaktivierung mit einer festen
+Energieschwelle von −40 dBFS. Hauptfenster und Einrichtung zeigen dann den
+Mikrofonpegel mit dieser Schwelle; unwirksame Wahrscheinlichkeitsregler werden
+ausgeblendet. Die erweiterte Eingangsverstärkung bleibt auch bei automatischer
+Pegelregelung sichtbar, weil sie weiterhin vor dieser wirkt. Mit aktiver
+Pegelautomatik schützt die ausgehende Normalisierung nur noch vor Spitzen.
 
 „Meine Coronafarbe“ (2026-10-12, Protokoll-Minor 5) ist die eigene Farbe, nicht
 mehr die aller Kacheln: Jeder wählt, in welcher Farbe er für alle im Raum
@@ -391,9 +404,15 @@ statt überschrieben. Eine Änderung von einem anderen Gerät desselben Nutzers
 übernimmt der Client ebenso, außer während eine eigene Wahl noch unterwegs ist.
 
 Die erste Einrichtung führt durch Geräte, Sprechen, Klang und Übersicht.
-Währenddessen hält sie das Mikrofon stumm, lässt Pegel, VAD, PTT-Probe und
-Mikrofontest aber weiterlaufen. Fertig, Überspringen oder Fensterschließen
-speichern `setup_done`; eine vorherige Stummschaltung bleibt bestehen.
+Währenddessen sperrt sie die Audioübertragung vorübergehend, lässt Pegel, VAD,
+PTT-Probe und Mikrofontest aber weiterlaufen. Diese Sperre ist unabhängig von
+Stumm/Taub und kann durch deren Hotkeys nicht aufgehoben werden. Fertig,
+Überspringen oder Fensterschließen speichern `setup_done` und lösen nur die
+Einrichtungssperre; die eigene Stumm-/Taubwahl bleibt erhalten, auch wenn sie
+während der Einrichtung geändert wurde.
+Der Einrichtungspegel zeigt das verarbeitete Signal. Übersteuerung wird zusätzlich
+am rohen Mikrofoneingang geprüft und eine Sekunde lang angezeigt, auch bei
+stummgeschalteter Übertragung und wenn die Verarbeitung den Pegel schon senkt.
 Wird ICU mit offener Einrichtung beendet, erscheint diese beim nächsten Start
 wieder. Der Assistent ist jederzeit unter Audio erneut erreichbar.
 
@@ -403,6 +422,8 @@ CA-Fingerabdruck und Änderungen am Sendeverhalten. Erst „Übernehmen“ erset
 Identität (§5). Kopieren löscht den eigenen Zwischenablageinhalt nach 60 s,
 sofern er noch dort liegt. Windows schließt Geheimnisse vom Verlauf und der
 Cloud-Synchronisierung aus; unter Wayland ist das Löschen compositorabhängig.
+Enter aktiviert im Beitrittsfenster nur das fokussierte Bedienelement; die
+Option zur Einstellungsübernahme importiert dadurch keine Identität.
 Exportdateien sind unter Unix 0600, unter Windows durch die Profil-ACL geschützt;
 DPAPI schützt die lokale Identität, nicht den zum Weitergeben bestimmten Export.
 

@@ -307,6 +307,8 @@ fn state() -> AppState {
         muted: false,
         deafened: false,
         system_muted: false,
+        setup_active: false,
+        input_clipping: false,
         ptt_down: false,
         sending: false,
         voice: false,
@@ -939,6 +941,10 @@ fn switches_and_sliders_are_named_and_keyboard_driven() {
     ] {
         h.get_by_role_and_label(egui::accesskit::Role::CheckBox, name);
     }
+    h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Pegel automatisch")
+        .focus();
+    h.run();
+    shot(&mut h, "settings-keyboard-toggle-focus");
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Audio")
         .click();
     h.run();
@@ -949,6 +955,7 @@ fn switches_and_sliders_are_named_and_keyboard_driven() {
     h.key_press(egui::Key::ArrowRight);
     h.key_press(egui::Key::ArrowRight);
     h.run();
+    shot(&mut h, "settings-keyboard-volume-focus");
     let after = last_update(&cmds.borrow()).audio.output_volume;
     assert!(after > before, "volume {before} → {after}");
     h.key_press(egui::Key::ArrowLeft);
@@ -1230,10 +1237,9 @@ fn setup_steps_fit() {
     overflows.assert_none();
 }
 
-/// The setup mutes on its first frame; „Fertig“ at the end marks it done
-/// and unmutes, the way the main window closes it (`App::setup_window`).
+/// Setup blocks transmission independently of user mute; finishing releases it.
 #[test]
-fn setup_finish_marks_done_and_unmutes() {
+fn setup_finish_marks_done_and_releases_transmission_guard() {
     let shared = Rc::new(RefCell::new(state()));
     shared.borrow_mut().settings.ui.setup_done = false;
     let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
@@ -1248,11 +1254,11 @@ fn setup_finish_marks_done_and_unmutes() {
         }
     });
     assert!(
-        matches!(cmds.borrow().first(), Some(Command::SetMuted(true))),
+        matches!(cmds.borrow().first(), Some(Command::SetSetupActive(true))),
         "muted while the setup is open"
     );
     // The engine applies it.
-    shared.borrow_mut().muted = true;
+    shared.borrow_mut().setup_active = true;
     h.run();
 
     for _ in 1..Step::ALL.len() {
@@ -1264,7 +1270,7 @@ fn setup_finish_marks_done_and_unmutes() {
         !cmds
             .borrow()
             .iter()
-            .any(|c| matches!(c, Command::SetMuted(false))),
+            .any(|c| matches!(c, Command::SetSetupActive(false))),
         "still muted before „Fertig“"
     );
     h.get_by_role_and_label(
@@ -1275,16 +1281,14 @@ fn setup_finish_marks_done_and_unmutes() {
     h.run();
     assert!(last_update(&cmds.borrow()).ui.setup_done);
     assert!(
-        matches!(cmds.borrow().last(), Some(Command::SetMuted(false))),
+        matches!(cmds.borrow().last(), Some(Command::SetSetupActive(false))),
         "unmuted by „Fertig“"
     );
 }
 
-/// Quitting ICU with the setup open lifts the setup's own mute
-/// (`App::on_exit`): the engine keeps a mute for the next start, and that
-/// must be the user's, not the setup's.
+/// Quitting releases the temporary guard without changing the persisted user mute.
 #[test]
-fn quitting_with_the_setup_open_lifts_its_mute() {
+fn quitting_with_the_setup_open_releases_transmission_guard() {
     let shared = Rc::new(RefCell::new(state()));
     shared.borrow_mut().settings.ui.setup_done = false;
     let view = Rc::new(RefCell::new(SetupView::new(&shared.borrow())));
@@ -1296,15 +1300,15 @@ fn quitting_with_the_setup_open_lifts_its_mute() {
     });
     assert!(matches!(
         cmds.borrow().first(),
-        Some(Command::SetMuted(true))
+        Some(Command::SetSetupActive(true))
     ));
-    shared.borrow_mut().muted = true;
+    shared.borrow_mut().setup_active = true;
     h.run();
     drop(h);
     let state = shared.borrow();
     assert!(matches!(
         view.borrow_mut().release_mute(&state),
-        Some(Command::SetMuted(false))
+        Some(Command::SetSetupActive(false))
     ));
     assert!(
         view.borrow_mut().release_mute(&state).is_none(),
@@ -1726,4 +1730,332 @@ fn last_good_audio_actions_work_even_with_denoise_disabled() {
             .iter()
             .any(|c| matches!(c, icu_client::engine::Command::ForgetGoodAudio)));
     }
+}
+
+/// The native settings window allows 640 logical pixels, including on HiDPI.
+/// Controls must remain inside the content column when labels wrap.
+#[test]
+fn settings_minimum_width_keeps_controls_reachable() {
+    use egui::accesskit::Role;
+    let mut failures = Vec::new();
+    for theme_name in THEMES {
+        for scale in [1.0, 1.5] {
+            for page in PAGES {
+                let mut s = state();
+                s.settings.ui.show_advanced = true;
+                let mut view = SettingsView::new(
+                    &s,
+                    Arc::new(DebugStats::default()),
+                    Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+                );
+                let mut h = harness_scaled([640.0, 980.0], theme_name, true, scale, move |ui| {
+                    view.ui(ui, &s, false);
+                });
+                h.get_by_role_and_label(Role::Button, page).click();
+                h.run();
+                for role in [
+                    Role::Button,
+                    Role::CheckBox,
+                    Role::Slider,
+                    Role::ComboBox,
+                    Role::TextInput,
+                ] {
+                    for node in h.query_all_by_role(role) {
+                        let rect = node.rect();
+                        if !(rect.left() >= -0.5
+                            && rect.right() <= 618.5
+                            && (rect.right() <= 192.5 || rect.left() >= 213.5))
+                        {
+                            failures.push(format!("{page}/{theme_name}/{scale}: control escapes content: {node:?} {rect:?}"));
+                        }
+                    }
+                }
+                if page == "Tastenkürzel" {
+                    let key = h.get_by_label("CTRL+SHIFT+F12").rect();
+                    for button in h.query_all_by_role(Role::Button) {
+                        if key.intersects(button.rect()) {
+                            failures.push(format!(
+                                "{page}/{theme_name}/{scale}: key {key:?} obscured by {button:?}"
+                            ));
+                        }
+                    }
+                }
+                shot(
+                    &mut h,
+                    &format!("settings-narrow-{page}-{theme_name}-{scale}"),
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn focused_speak_button_holds_and_releases_from_keyboard() {
+    use egui::{accesskit::Role, Key};
+    let s = four();
+    let (cmd, mut rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+    let mut view = MainView::default();
+    let mut h = harness(MAIN, "light", false, move |ui| {
+        view.ui(
+            ui,
+            &s,
+            &MainEnv {
+                cmd: &cmd,
+                video_tier: icu_client::video::VideoTier::T0,
+                video: &|_| None,
+                self_video: None,
+                settings_open: false,
+                user_open: None,
+                overlay_available: true,
+            },
+        );
+    });
+    let drain = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<Command>| {
+        let mut events = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            if let Command::Ptt(held) = cmd {
+                events.push(held);
+            }
+        }
+        events
+    };
+    for key in [Key::Space, Key::Enter] {
+        h.get_by_role_and_label(Role::Button, "Sprechen").focus();
+        h.run_steps(2);
+        drain(&mut rx);
+        h.key_down(key);
+        h.run_steps(2);
+        assert_eq!(drain(&mut rx), [true]);
+        h.key_up(key);
+        h.run_steps(2);
+        assert_eq!(drain(&mut rx), [false]);
+    }
+    h.key_down(Key::Space);
+    h.run_steps(2);
+    assert_eq!(drain(&mut rx), [true]);
+    h.get_by_role_and_label(Role::CheckBox, "Stumm").focus();
+    h.run_steps(2);
+    assert_eq!(drain(&mut rx), [false], "moving focus must release PTT");
+    h.key_up(Key::Space);
+    h.run_steps(2);
+    h.get_by_role_and_label(Role::Button, "Sprechen").focus();
+    h.run_steps(2);
+    h.key_down(Key::Enter);
+    h.run_steps(2);
+    assert_eq!(drain(&mut rx), [true]);
+    h.input_mut().focused = false;
+    h.run_steps(2);
+    assert_eq!(drain(&mut rx), [false], "window blur must release PTT");
+}
+
+#[cfg(unix)]
+#[test]
+fn passport_enter_on_settings_option_does_not_import_identity() {
+    use icu_client::{config::Identity, ui::main_window::EnrollApp};
+    use std::sync::Mutex;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let passport = rt.block_on(async {
+        let server = common::TestServer::start().await;
+        let (identity, _, _dir) = server.enroll("Chris").await;
+        identity.to_passport_with_settings(&Settings::default()).0
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::new(Some(dir.path().to_path_buf()));
+    let read_paths = paths.clone();
+    let result = Arc::new(Mutex::new(None));
+    let result_out = result.clone();
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(ENROLL[0], ENROLL[1]))
+        .build_eframe(move |cc| {
+            fonts::install(&cc.egui_ctx);
+            theme::apply(&cc.egui_ctx, "light");
+            let mut app = EnrollApp::new(paths, None, result_out);
+            app.paste(passport);
+            app
+        });
+    h.run_steps(6);
+    let option = h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Von dort übernehmen");
+    let before = option.accesskit_node().toggled();
+    option.focus();
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+    assert_ne!(
+        h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Von dort übernehmen")
+            .accesskit_node()
+            .toggled(),
+        before
+    );
+    assert!(
+        result.lock().unwrap().is_none(),
+        "checkbox activation must not import"
+    );
+    assert!(Identity::load(&read_paths).unwrap().is_none());
+}
+
+#[test]
+fn audio_controls_describe_the_effective_processing_mode() {
+    use egui::accesskit::Role;
+    for theme_name in THEMES {
+        let shared = Rc::new(RefCell::new(state()));
+        {
+            let mut s = shared.borrow_mut();
+            s.settings.audio.mode = ModeSetting::Vad;
+            s.settings.audio.denoise = false;
+            s.settings.audio.vad_auto = false;
+            s.settings.ui.show_advanced = true;
+        }
+        let mut view = SettingsView::new(
+            &shared.borrow(),
+            Arc::new(DebugStats::default()),
+            Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+        );
+        let state_in = shared.clone();
+        let mut h = harness(SETTINGS, theme_name, true, move |ui| {
+            view.ui(ui, &state_in.borrow(), false);
+        });
+        assert!(h
+            .query_by_role_and_label(Role::Slider, "Schwelle")
+            .is_none());
+        assert!(h
+            .get_by_role_and_label(Role::CheckBox, "Schwelle automatisch")
+            .accesskit_node()
+            .is_disabled());
+        h.get_by_label_contains("fester Lautstärkepegel");
+        shot(&mut h, &format!("settings-energy-vad-{theme_name}"));
+        {
+            let mut s = shared.borrow_mut();
+            s.settings.audio.denoise = true;
+            s.settings.audio.auto_level = true;
+            s.settings.audio.gain_db = -12.0;
+        }
+        h.run();
+        assert_eq!(
+            h.get_by_role_and_label(Role::Slider, "Verstärkung")
+                .accesskit_node()
+                .numeric_value(),
+            Some(-12.0)
+        );
+        shot(&mut h, &format!("settings-active-input-trim-{theme_name}"));
+    }
+}
+
+#[test]
+fn settings_navigation_does_not_inherit_another_pages_scroll() {
+    use egui::accesskit::Role;
+    let mut s = state();
+    s.settings.ui.show_advanced = true;
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness([640.0, 500.0], "light", true, move |ui| {
+        ui.ctx().input_mut(|input| {
+            for viewport in input.raw.viewports.values_mut() {
+                viewport.monitor_size = Some(egui::vec2(800.0, 550.0));
+            }
+        });
+        view.ui(ui, &s, false);
+    });
+    let original = h
+        .get_by_role_and_label(Role::Slider, "Lautstärke")
+        .rect()
+        .top();
+    h.get_by_role_and_label(Role::Slider, "Lautstärke")
+        .scroll_down();
+    h.run();
+    let scrolled = h
+        .get_by_role_and_label(Role::Slider, "Lautstärke")
+        .rect()
+        .top();
+    assert!(
+        scrolled < original - 20.0,
+        "test must scroll the original page"
+    );
+    h.get_by_role_and_label(Role::Button, "Klang").click();
+    h.run();
+    let first = h
+        .get_by_role_and_label(Role::CheckBox, "Rauschunterdrückung")
+        .rect();
+    assert!(
+        first.top() >= 100.0 && first.bottom() < 240.0,
+        "fresh tab must start at its heading: {first:?}"
+    );
+    h.get_by_role_and_label(Role::Button, "Audio").click();
+    h.run();
+    let restored = h
+        .get_by_role_and_label(Role::Slider, "Lautstärke")
+        .rect()
+        .top();
+    assert!(
+        (restored - scrolled).abs() < 1.0,
+        "returning restores that tab's own position"
+    );
+}
+
+#[test]
+fn setup_shows_raw_overload_and_energy_voice_detection() {
+    for theme_name in THEMES {
+        let mut s = state();
+        s.settings.audio.mode = ModeSetting::Vad;
+        s.settings.audio.denoise = false;
+        s.settings.audio.vad_auto = false;
+        s.level.peak_db = -25.0;
+        s.level.rms_db = -35.0;
+        s.input_clipping = true;
+        let mut view = SetupView::new(&s);
+        let mut h = harness(SETUP, theme_name, true, move |ui| {
+            view.ui(ui, &s);
+        });
+        h.get_by_label_contains("Eingang übersteuert");
+        shot(&mut h, &format!("setup-raw-overload-{theme_name}"));
+        h.get_by_role_and_label(egui::accesskit::Role::Button, &next_label())
+            .click();
+        h.run();
+        assert!(h
+            .query_by_role_and_label(egui::accesskit::Role::Slider, "Schwelle")
+            .is_none());
+        shot(&mut h, &format!("setup-energy-vad-{theme_name}"));
+    }
+}
+
+#[test]
+fn overlay_positions_are_named_and_keyboard_accessible() {
+    use egui::accesskit::Role;
+    let mut s = state();
+    s.settings.overlay.enabled = true;
+    let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
+    let cmds_out = cmds.clone();
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+    );
+    let mut h = harness(SETTINGS, "dark", true, move |ui| {
+        cmds_out.borrow_mut().extend(view.ui(ui, &s, false).cmds);
+    });
+    h.get_by_role_and_label(Role::Button, "Overlay").click();
+    h.run();
+    for label in [
+        "Oben links",
+        "Oben rechts",
+        "Unten links",
+        "Unten rechts",
+        "Oben mittig",
+        "Unten mittig",
+    ] {
+        h.get_by_role_and_label(Role::RadioButton, label);
+    }
+    h.get_by_role_and_label(Role::RadioButton, "Unten links")
+        .focus();
+    h.run();
+    h.key_press(egui::Key::Enter);
+    h.run();
+    assert_eq!(
+        last_update(&cmds.borrow()).overlay.corner,
+        icu_client::config::Corner::BottomLeft
+    );
+    shot(&mut h, "settings-keyboard-overlay-position");
 }

@@ -664,10 +664,8 @@ fn volume_card(ui: &mut Ui, p: &Participant<'_>, mut v: f32, send: &impl Fn(Comm
                     } else {
                         "Für mich stummschalten"
                     };
-                    let mute = widgets::icon_button(ui, glyph, 24.0, muted).on_hover_text(label);
-                    mute.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
-                    });
+                    let mute =
+                        widgets::icon_button(ui, glyph, label, 24.0, muted).on_hover_text(label);
                     if mute.clicked() {
                         send(Command::SetVolume(
                             p.user_id,

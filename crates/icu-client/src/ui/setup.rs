@@ -106,8 +106,9 @@ pub struct SetupView {
     capture_error: Option<String>,
     /// The first frame has been drawn: the microphone was muted then.
     started: bool,
-    /// The setup muted the microphone, so it unmutes it when it closes.
-    muted_by_setup: bool,
+    /// This view acquired a temporary transmission guard; release it even
+    /// when the engine has not echoed the acquisition yet.
+    setup_guard: bool,
     /// The key row's expert fields, which the setup never opens.
     expanded: HashSet<&'static str>,
 }
@@ -138,7 +139,7 @@ impl SetupView {
             capture: None,
             capture_error: None,
             started: false,
-            muted_by_setup: false,
+            setup_guard: false,
             expanded: HashSet::new(),
         }
     }
@@ -156,23 +157,21 @@ impl SetupView {
     }
 
     /// Ends the setup, finished or skipped: from now on it opens only when
-    /// asked. What was chosen stays; the microphone is unmuted if the setup
-    /// muted it and it still is.
+    /// asked. What was chosen stays; only the temporary transmission guard
+    /// is released, preserving the user's mute/deafen choices.
     pub fn close(&mut self, state: &AppState) -> Vec<Command> {
         self.capture = None;
+        self.sync.adopt(&mut self.draft, &state.settings);
         self.draft.ui.setup_done = true;
         let mut cmds: Vec<Command> = self.sync.commit(&self.draft).into_iter().collect();
         cmds.extend(self.release_mute(state));
         cmds
     }
 
-    /// Unmutes the microphone if the setup muted it and it still is — at
-    /// the end of the setup, and when ICU quits with the setup open: the
-    /// engine keeps a mute for the next start (`AudioSettings::muted`), and
-    /// the setup's own must not be taken for the user's.
-    pub fn release_mute(&mut self, state: &AppState) -> Option<Command> {
-        (std::mem::take(&mut self.muted_by_setup) && state.muted)
-            .then_some(Command::SetMuted(false))
+    /// Releases this view's temporary inhibition, independently of an
+    /// asynchronous state echo or the user's mute/deafen choices.
+    pub fn release_mute(&mut self, _state: &AppState) -> Option<Command> {
+        release_setup_guard(&mut self.setup_guard)
     }
 
     /// Draws the current step with the stepper above and the bar below.
@@ -181,16 +180,16 @@ impl SetupView {
         self.sync.adopt(&mut self.draft, &state.settings);
         if !self.started {
             self.started = true;
-            // Nothing tried out here is meant for the room.
-            if !state.muted {
-                cmds.push(Command::SetMuted(true));
-                self.muted_by_setup = true;
-            }
+            // The guard is independent of user mute and cannot be undone
+            // by a global mute hotkey while the setup remains open.
+            self.setup_guard = true;
+            cmds.push(Command::SetSetupActive(true));
         }
 
         let nav = self.actions(ui);
         let mut goto = None;
         let page = egui::ScrollArea::vertical()
+            .id_salt(("setup-step", self.step.index()))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Frame::new()
@@ -311,7 +310,7 @@ impl SetupView {
              vom Mikrofon hört.",
             |_| {},
         );
-        if self.muted_by_setup && state.muted {
+        if state.setup_active {
             let tok = theme::tokens(ui.visuals());
             ui.label(
                 RichText::new(format!(
@@ -343,21 +342,34 @@ impl SetupView {
                 &inputs,
                 |ui| mic_test_button(ui, state.mic_test, cmds),
             );
-            widgets::setting_row(ui, true, "Pegel", None, |ui| {
+            widgets::setting_row(ui, true, "Verarbeiteter Pegel", None, |ui| {
                 let tok = theme::tokens(ui.visuals());
-                let clipping = state.level.peak_db >= CLIP_DB;
+                let clipping = state.input_clipping || state.level.peak_db >= CLIP_DB;
                 meter(
                     ui,
                     theme::meter_fraction(state.level.rms_db),
                     None,
                     if clipping { tok.error } else { tok.level },
                 )
-                .on_hover_text(if clipping {
-                    "Übersteuert — leiser sprechen oder das Mikrofon herunterregeln."
+                .on_hover_text(if state.input_clipping {
+                    "Das Mikrofon übersteuert schon am Eingang. Den Mikrofonpegel im System senken oder etwas weiter weg sprechen."
+                } else if clipping {
+                    "Der verarbeitete Pegel ist sehr hoch — leiser sprechen oder das Mikrofon herunterregeln."
                 } else {
-                    "Was vom Mikrofon ankommt"
+                    "Mikrofonsignal nach Verstärkung und Rauschunterdrückung. Übersteuerung am Eingang wird unabhängig davon erfasst und eine Sekunde lang angezeigt."
                 })
             });
+            if state.input_clipping {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Eingang übersteuert: Mikrofonpegel im System senken oder weiter weg sprechen.")
+                                .size(12.0)
+                                .color(theme::tokens(ui.visuals()).error),
+                        );
+                    });
+            }
             device_combo(
                 ui,
                 true,
@@ -509,7 +521,7 @@ impl SetupView {
     fn vad_card(&mut self, ui: &mut Ui, state: &AppState) {
         widgets::group_card(ui, "Sprachaktivierung", |ui| {
             let audio = &mut self.draft.audio;
-            ui.add_enabled_ui(audio.denoise, |ui| {
+            if audio.denoise {
                 widgets::setting_row(
                     ui,
                     false,
@@ -518,9 +530,13 @@ impl SetupView {
                         "Passt sich laufend an deine Umgebung an. Braucht die Rauschunterdrückung.",
                     ),
                     |ui| widgets::named_toggle(ui, &mut audio.vad_auto, "Schwelle automatisch"),
-                )
-            });
-            if !audio.vad_auto {
+                );
+            } else {
+                widgets::card_note(ui, |ui| {
+                    ui.label("Ohne Rauschunterdrückung gilt eine feste Pegelschwelle (−40 dBFS). Für eine anpassbare Stimmerkennung schalte sie unter Klang ein.");
+                });
+            }
+            if audio.denoise && !audio.vad_auto {
                 widgets::slider_row(
                     ui,
                     true,
@@ -535,15 +551,15 @@ impl SetupView {
                 true,
                 "Ausprobieren",
                 Some(
-                    "Sprich: der Balken ist die Stimmerkennung, der Strich die Schwelle. Wird \
-                     er farbig, wärst du zu hören.",
+                    "Sprich: der Balken zeigt den Sprachdetektor, der Strich seine Schwelle. Während der Einrichtung bleibt die Übertragung gesperrt.",
                 ),
                 |ui| {
                     let tok = theme::tokens(ui.visuals());
+                    let (value, threshold) = state.vad_meter();
                     meter(
                         ui,
-                        state.vad_prob,
-                        Some(state.vad_threshold),
+                        value,
+                        Some(threshold),
                         if state.voice {
                             tok.accent
                         } else {
@@ -671,12 +687,17 @@ impl SetupView {
                 }
             }
         });
-        if self.muted_by_setup && state.muted {
+        if state.setup_active {
             let tok = theme::tokens(ui.visuals());
             ui.label(
                 RichText::new(format!(
-                    "{}  Mit „Fertig“ bist du wieder zu hören.",
-                    icon::MICROPHONE
+                    "{}  {}",
+                    icon::MICROPHONE,
+                    if state.muted || state.deafened {
+                        "Deine Stummschaltung bleibt nach „Fertig“ bestehen."
+                    } else {
+                        "Mit „Fertig“ bist du wieder zu hören."
+                    }
                 ))
                 .size(12.0)
                 .color(tok.muted_text),
@@ -684,6 +705,10 @@ impl SetupView {
         }
         goto
     }
+}
+
+fn release_setup_guard(acquired: &mut bool) -> Option<Command> {
+    std::mem::take(acquired).then_some(Command::SetSetupActive(false))
 }
 
 /// One row of the overview: what is set, and where it is changed.
@@ -713,6 +738,10 @@ fn summary(
     };
     let audio = &settings.audio;
     let (send, warning) = match audio.mode {
+        ModeSetting::Vad if !audio.denoise => (
+            "Automatisch · feste Pegelschwelle (−40 dBFS)".to_string(),
+            None,
+        ),
         ModeSetting::Vad if audio.vad_auto => {
             ("Automatisch · Schwelle automatisch".to_string(), None)
         }
@@ -975,6 +1004,7 @@ fn choice_card(
             });
     });
     let response = card.response;
+    widgets::focus_ring(ui, &response, theme::R_CARD);
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::RadioButton,
@@ -1077,6 +1107,37 @@ fn lamp(ui: &mut Ui, on: bool, lit: &str, idle: &str) -> egui::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_before_the_engine_echo_still_releases_setup_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut acquired = true;
+        tx.send(Command::SetSetupActive(true)).unwrap();
+        // No state echo has arrived; close must still enqueue the release
+        // behind its acquisition, independent of user mute or deafen.
+        tx.send(release_setup_guard(&mut acquired).unwrap())
+            .unwrap();
+        assert!(matches!(rx.recv().unwrap(), Command::SetSetupActive(true)));
+        assert!(matches!(rx.recv().unwrap(), Command::SetSetupActive(false)));
+        assert!(release_setup_guard(&mut acquired).is_none());
+    }
+
+    #[test]
+    fn overview_describes_energy_detection_without_changing_saved_probability_preferences() {
+        for automatic in [false, true] {
+            let mut settings = Settings::default();
+            settings.audio.denoise = false;
+            settings.audio.vad_auto = automatic;
+            settings.audio.vad_threshold = 0.83;
+            let before = settings.clone();
+            let lines = summary(&settings, &[], "", false);
+            assert_eq!(
+                lines[2].value,
+                "Automatisch · feste Pegelschwelle (−40 dBFS)"
+            );
+            assert_eq!(settings, before);
+        }
+    }
 
     fn device(id: &str, description: &str, kind: DeviceKind) -> DeviceInfo {
         DeviceInfo {

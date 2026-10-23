@@ -173,6 +173,26 @@ pub enum ButtonKind {
     Danger,
 }
 
+/// Keep keyboard focus visible on controls with custom-painted interaction states.
+pub fn focus_ring(ui: &Ui, response: &egui::Response, radius: u8) {
+    if response.has_focus() && ui.is_rect_visible(response.rect) {
+        // A contrasting gap also makes the accent ring visible on filled
+        // primary buttons and the active speak surface.
+        ui.painter().rect_stroke(
+            response.rect.shrink(1.0),
+            CornerRadius::same(radius),
+            Stroke::new(4.0, ui.visuals().window_fill),
+            StrokeKind::Inside,
+        );
+        ui.painter().rect_stroke(
+            response.rect.shrink(2.0),
+            CornerRadius::same(radius),
+            Stroke::new(2.0, theme::tokens(ui.visuals()).accent),
+            StrokeKind::Inside,
+        );
+    }
+}
+
 /// A button with an optional leading icon. The whole app goes through this
 /// instead of `ui.button`, so a button never picks up stock egui's chrome.
 pub fn button(ui: &mut Ui, kind: ButtonKind, glyph: &str, label: &str) -> egui::Response {
@@ -199,14 +219,24 @@ pub fn button(ui: &mut Ui, kind: ButtonKind, glyph: &str, label: &str) -> egui::
         ui.painter()
             .rect_filled(response.rect, CornerRadius::same(R_CTRL), tok.hover_overlay);
     }
+    focus_ring(ui, &response, R_CTRL);
     response
 }
 
 /// A square, quiet icon button — the header's gear, a row's volume handle.
 /// `active` tints it so a toggled-open state is visible without a label.
-pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, active: bool) -> egui::Response {
+pub fn icon_button(
+    ui: &mut Ui,
+    glyph: &str,
+    label: &str,
+    size: f32,
+    active: bool,
+) -> egui::Response {
     let tok = theme::tokens(ui.visuals());
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
     if ui.is_rect_visible(rect) {
         let (fill, color) = if active {
             (tok.accent_tint, tok.accent)
@@ -225,6 +255,7 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, active: bool) -> egui::R
             color,
         );
     }
+    focus_ring(ui, &response, R_CTRL);
     response
 }
 
@@ -320,6 +351,7 @@ pub fn tile(
             }
         }
     }
+    focus_ring(ui, &response, R_ROW);
     response
 }
 
@@ -475,6 +507,7 @@ pub fn speak_surface(ui: &mut Ui, s: &Speak<'_>, size: egui::Vec2) -> egui::Resp
         );
         painter.galley(cap.min + KEY_PAD, k, tok.dim_text);
     }
+    focus_ring(ui, &response, R_ROW);
     response
 }
 
@@ -596,6 +629,7 @@ pub fn status_bar(ui: &mut Ui, s: &StatusBar<'_>) -> egui::Response {
         painter.galley(at(x, &g), g, color);
         x -= STATUS_GAP;
     }
+    focus_ring(ui, &response, R_CHIP);
     response
 }
 
@@ -676,6 +710,7 @@ pub fn action_capsule(ui: &mut Ui, buttons: &[CapsuleButton<'_>]) -> Vec<egui::R
                     color,
                 );
             }
+            focus_ring(ui, &response, 14);
             response.on_hover_text(b.label)
         })
         .collect()
@@ -694,13 +729,14 @@ pub fn autotune_control(
     cmds: &mut Vec<crate::engine::Command>,
 ) -> egui::Response {
     let status = &state.tuning_status;
+    let health = state.effective_audio_health(audio);
     let toggle = ui
         .add_enabled_ui(audio.denoise, |ui| {
             named_toggle(ui, &mut audio.auto_level, "Pegel automatisch")
         })
         .inner;
     use crate::audio::health::State;
-    let (symbol, color) = match state.audio_health.state {
+    let (symbol, color) = match health.state {
         State::Good => ("✓", egui::Color32::from_rgb(50, 160, 95)),
         State::InputClipping | State::Limited | State::SoftwareOverload => {
             ("!", egui::Color32::from_rgb(220, 75, 65))
@@ -709,19 +745,15 @@ pub fn autotune_control(
         _ => ("…", egui::Color32::from_rgb(200, 150, 45)),
     };
     ui.label(egui::RichText::new(symbol).color(color))
-        .on_hover_text(state.audio_health.text())
+        .on_hover_text(health.text())
         .widget_info(|| {
-            egui::WidgetInfo::labeled(
-                egui::WidgetType::Label,
-                ui.is_enabled(),
-                state.audio_health.text(),
-            )
+            egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), health.text())
         });
     ui.menu_button("Details",|ui| {
         ui.set_max_width(360.0);
-        ui.label(state.audio_health.text());
-        if let Some(age)=state.audio_health.feedback_age_secs { ui.small(format!("Empfangsmessung vor {age:.1} s")); }
-        if let Some(at)=state.audio_health.profile_saved_at {
+        ui.label(health.text());
+        if let Some(age)=health.feedback_age_secs { ui.small(format!("Empfangsmessung vor {age:.1} s")); }
+        if let Some(at)=health.profile_saved_at {
             if let Ok(date)=time::OffsetDateTime::from_unix_timestamp(at as i64) { ui.small(format!("Guter Zustand gespeichert: {}",date.date())); }
         }
         ui.checkbox(&mut audio.remember_good_levels,"Gute Mikrofonpegel merken");
@@ -731,7 +763,7 @@ pub fn autotune_control(
         if ui.button("Für dieses Mikrofon neu lernen").clicked() {
             cmds.push(crate::engine::Command::ForgetGoodAudio); ui.close();
         }
-        if ui.button("Audio-Diagnose kopieren").clicked() { ui.ctx().copy_text(state.audio_health.diagnostic()); }
+        if ui.button("Audio-Diagnose kopieren").clicked() { ui.ctx().copy_text(health.diagnostic()); }
         ui.separator();
         ui.add_enabled_ui(audio.auto_level && audio.denoise, |ui| {
             ui.checkbox(&mut audio.peer_assistance,"Pegel mit Empfangsfeedback")
@@ -780,6 +812,7 @@ pub fn named_toggle(ui: &mut Ui, on: &mut bool, name: &str) -> egui::Response {
             lerp_color(tok.dim_text, knob_color(ui.visuals()), t),
         );
     }
+    focus_ring(ui, &response, 12);
     response
 }
 
@@ -858,7 +891,9 @@ pub fn segmented<T: PartialEq + Copy>(
                         })
                         .corner_radius(CornerRadius::same(R_CHIP))
                         .min_size(egui::vec2(seg, SEG_H));
-                    if ui.add(btn).clicked() && !selected {
+                    let response = ui.add(btn);
+                    focus_ring(ui, &response, R_CHIP);
+                    if response.clicked() && !selected {
                         *current = *value;
                         changed = true;
                     }
@@ -930,6 +965,7 @@ pub fn chip_toggle(ui: &mut Ui, on: &mut bool, label: &str) -> egui::Response {
         }
         painter.galley(rect.center() - galley.size() / 2.0, galley, color);
     }
+    focus_ring(ui, &response, R_CTRL);
     response
 }
 
@@ -1225,6 +1261,8 @@ pub fn chip(ui: &mut Ui, text: &str, min_width: f32) -> egui::Response {
         galley.size().y + padding.y * 2.0,
     );
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), text));
     if ui.is_rect_visible(rect) {
         paint_well(ui, rect, R_CHIP);
         ui.painter()
@@ -1337,7 +1375,8 @@ pub fn banner<F: FnOnce()>(
                         egui::vec2(ui.available_width(), 22.0),
                         egui::Layout::right_to_left(egui::Align::TOP),
                         |ui| {
-                            if icon_button(ui, icon::X, 22.0, false).clicked() {
+                            if icon_button(ui, icon::X, "Hinweis schließen", 22.0, false).clicked()
+                            {
                                 dismiss();
                             }
                         },
@@ -1390,6 +1429,7 @@ pub fn rail_button(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool 
             text_color,
         );
     }
+    focus_ring(ui, &resp, R_CTRL);
     resp.clicked()
 }
 
@@ -1449,6 +1489,7 @@ pub fn nav_item(ui: &mut Ui, glyph: &str, label: &str, active: bool) -> bool {
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    focus_ring(ui, &resp, R_CTRL);
     resp.clicked()
 }
 
@@ -1571,6 +1612,7 @@ pub fn more_button(ui: &mut Ui) -> egui::Response {
             painter.circle_filled(rect.center() + egui::vec2(dx, 0.0), 1.8, color);
         }
     }
+    focus_ring(ui, &response, R_CTRL);
     response
 }
 
@@ -1673,12 +1715,17 @@ pub fn setting_row<R>(
             // it on the control; the help text runs underneath at full width
             // rather than beside the label, where it would wrap under the
             // control.
-            let result = ui
-                .horizontal(|ui| {
+            let result = if ui.available_width() < 450.0 {
+                ui.label(RichText::new(label).size(13.5));
+                ui.add_space(4.0);
+                rtl(ui, 30.0, control)
+            } else {
+                ui.horizontal(|ui| {
                     ui.label(RichText::new(label).size(13.5));
                     rtl(ui, 30.0, control)
                 })
-                .inner;
+                .inner
+            };
             if let Some(h) = help {
                 ui.add_space(1.0);
                 ui.label(RichText::new(h).size(11.5).color(tok.dim_text));
@@ -1713,6 +1760,14 @@ pub fn slider_row(
     Frame::new()
         .inner_margin(egui::Margin::symmetric(12, 9))
         .show(ui, |ui| {
+            if ui.available_width() < 450.0 {
+                ui.label(RichText::new(label).size(13.5));
+                ui.add_space(4.0);
+                return rtl(ui, 22.0, |ui| {
+                    chip(ui, &format(*value), reserve);
+                    named_slider(ui, value, range, label)
+                });
+            }
             ui.horizontal(|ui| {
                 label_column(ui, LABEL_W, 22.0, label);
                 rtl(ui, 22.0, |ui| {

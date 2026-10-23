@@ -330,6 +330,162 @@ async fn tone_sender(
     (engine, probe, dir)
 }
 
+/// Setup is a separate transmission guard: global mute/deafen actions may
+/// change the user's preference, but cannot make setup audio leave the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_blocks_network_audio_and_preserves_user_mute_and_deafen() {
+    async fn hear_audio(bob: &RawClient) {
+        tokio::time::timeout(SOON, async {
+            loop {
+                let datagram = bob.session.conn.read_datagram().await.expect("connected");
+                let (header, _) = icu_proto::AudioHeader::decode(&datagram).expect("audio packet");
+                if !header.end() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("audio resumes when the guard and user mute allow it");
+    }
+
+    async fn settle_audio(bob: &RawClient) {
+        // Drain packets already in flight and the silent END. A continuing
+        // stream must fail, rather than allowing an unbounded drain to hang.
+        tokio::time::timeout(SOON, async {
+            loop {
+                match tokio::time::timeout(
+                    Duration::from_millis(60),
+                    bob.session.conn.read_datagram(),
+                )
+                .await
+                {
+                    Ok(packet) => {
+                        packet.expect("connected");
+                    }
+                    Err(_) => return,
+                }
+            }
+        })
+        .await
+        .expect("audio stops after setup opens");
+    }
+
+    async fn hear_nothing(bob: &RawClient) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), bob.session.conn.read_datagram(),)
+                .await
+                .is_err(),
+            "no audio datagram may escape while transmission is inhibited"
+        );
+    }
+
+    let server = TestServer::start().await;
+    let bob = server.raw_client("bob").await;
+    let (engine, _probe, _dir) = tone_sender(&server, "alice", false).await;
+    wait_connected(&engine).await;
+    hear_audio(&bob).await;
+
+    engine.command(Command::SetSetupActive(true));
+    wait_for(&engine, SOON, |s| s.setup_active && !s.sending).await;
+    settle_audio(&bob).await;
+    hear_nothing(&bob).await;
+
+    engine.command(Command::SetMuted(true));
+    wait_for(&engine, SOON, |s| s.muted).await;
+    hear_nothing(&bob).await;
+    engine.command(Command::SetMuted(false));
+    wait_for(&engine, SOON, |s| !s.muted).await;
+    hear_nothing(&bob).await;
+    engine.command(Command::SetDeafened(true));
+    wait_for(&engine, SOON, |s| s.deafened && s.muted).await;
+    hear_nothing(&bob).await;
+    engine.command(Command::SetDeafened(false));
+    wait_for(&engine, SOON, |s| !s.deafened && !s.muted).await;
+    hear_nothing(&bob).await;
+
+    // Finishing setup preserves an explicit mute. Only the user's later
+    // unmute permits audio to resume.
+    engine.command(Command::SetMuted(true));
+    engine.command(Command::SetSetupActive(false));
+    let state = wait_for(&engine, SOON, |s| !s.setup_active && s.muted).await;
+    assert!(!state.deafened);
+    hear_nothing(&bob).await;
+    engine.command(Command::SetMuted(false));
+    wait_for(&engine, SOON, |s| !s.muted).await;
+    hear_audio(&bob).await;
+
+    // The same applies to deafen; closing setup must not undeafen or lose
+    // the remembered unmuted state from before deafen.
+    engine.command(Command::SetSetupActive(true));
+    wait_for(&engine, SOON, |s| s.setup_active && !s.sending).await;
+    settle_audio(&bob).await;
+    engine.command(Command::SetDeafened(true));
+    engine.command(Command::SetSetupActive(false));
+    wait_for(&engine, SOON, |s| !s.setup_active && s.deafened && s.muted).await;
+    hear_nothing(&bob).await;
+    engine.command(Command::SetDeafened(false));
+    wait_for(&engine, SOON, |s| !s.deafened && !s.muted).await;
+    hear_audio(&bob).await;
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// The processed meter can be quiet after manual gain or AGC even though
+/// the input is clipped. Setup must report that damage while it blocks
+/// transmission, including when RNNoise is disabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn setup_reports_raw_input_clipping_even_when_the_processed_level_is_low() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let clipping = Arc::new(AtomicBool::new(false));
+    let signal = clipping.clone();
+    let (backend, _) = FakeBackend::new(Box::new(move |_, out| {
+        out.fill(if signal.load(Ordering::Relaxed) {
+            1.0
+        } else {
+            0.2
+        });
+    }));
+    let mut settings = test_settings();
+    settings.audio.muted = true;
+    settings.audio.gain_db = -20.0;
+    settings.audio.denoise = false;
+    settings.audio.aec = false;
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, settings, paths);
+    cfg.server_addr = Some(server.addr());
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).expect("engine starts");
+    engine.command(Command::SetSetupActive(true));
+    wait_connected(&engine).await;
+    wait_for(&engine, SOON, |s| s.setup_active && s.level.peak_db > -90.0).await;
+    assert!(!engine.snapshot().input_clipping);
+
+    clipping.store(true, Ordering::Relaxed);
+    let state = wait_for(&engine, SOON, |s| s.input_clipping).await;
+    assert!(state.setup_active && state.muted && !state.sending);
+    assert!(
+        state.level.peak_db < -10.0,
+        "processing conceals the raw full-scale peak"
+    );
+    assert!(!state.settings.audio.denoise);
+
+    // A short overload remains visible through a UI refresh, then clears
+    // when the input becomes safe; mute/setup must not freeze the warning.
+    clipping.store(false, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(engine.snapshot().input_clipping);
+    let state = wait_for(&engine, SOON, |s| !s.input_clipping).await;
+    assert!(state.setup_active && state.muted && !state.sending);
+
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
 /// „Senden beginnt oder endet“ (`audio.cue_tx`): a high tone when sending
 /// starts, a lower one when it ends — and nothing when the cue is off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -632,7 +632,7 @@ impl eframe::App for App {
         // then counts as visible: better a frame too many than a black tile.
         let minimized = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
         let visible = !self.hidden && !minimized;
-        if !visible {
+        if !visible || !ctx.input(|input| input.focused) {
             if let Some(release) = self.view.release_ptt() {
                 let _ = self.cmd.send(release);
             }
@@ -1103,6 +1103,10 @@ fn immediate_window(
 pub struct MainView {
     /// The on-screen speak button is being held.
     ptt_held: bool,
+    /// Pointer holds survive dragging off the button, but never window blur.
+    ptt_pointer_held: bool,
+    /// Keyboard holds belong to the focused speak button only.
+    ptt_key_held: Option<egui::Key>,
 }
 
 /// What [`MainView::ui`] needs besides the state.
@@ -1153,7 +1157,48 @@ impl MainView {
     /// or was minimised while it was held. `ui` does not run then, so the
     /// release never arrived and the microphone stayed open.
     pub fn release_ptt(&mut self) -> Option<Command> {
+        self.ptt_pointer_held = false;
+        self.ptt_key_held = None;
         std::mem::take(&mut self.ptt_held).then_some(Command::Ptt(false))
+    }
+
+    fn update_ptt(
+        &mut self,
+        button: Option<&egui::Response>,
+        ctx: &egui::Context,
+    ) -> Option<Command> {
+        let Some(button) = button.filter(|button| button.enabled()) else {
+            return self.release_ptt();
+        };
+        if !ctx.input(|input| input.focused) {
+            return self.release_ptt();
+        }
+        let focused = button.has_focus();
+        let pointer_started = button.is_pointer_button_down_on();
+        ctx.input(|input| {
+            self.ptt_pointer_held = input.pointer.primary_down()
+                && (self.ptt_pointer_held || (pointer_started && input.pointer.primary_pressed()));
+            self.ptt_key_held = if focused && input.modifiers.is_none() {
+                self.ptt_key_held
+                    .filter(|key| input.key_down(*key))
+                    .or_else(|| {
+                        input.events.iter().find_map(|event| match event {
+                            egui::Event::Key {
+                                key: key @ (egui::Key::Space | egui::Key::Enter),
+                                pressed: true,
+                                repeat: false,
+                                modifiers,
+                                ..
+                            } if modifiers.is_none() && input.key_down(*key) => Some(*key),
+                            _ => None,
+                        })
+                    })
+            } else {
+                None
+            };
+        });
+        let held = self.ptt_pointer_held || self.ptt_key_held.is_some();
+        (std::mem::replace(&mut self.ptt_held, held) != held).then_some(Command::Ptt(held))
     }
 
     /// Draws the whole window into `root`.
@@ -1521,18 +1566,11 @@ impl MainView {
                 // if the pointer drifts off the widget or egui stops treating it
                 // as "down on" (observed in the live test: transmission ended
                 // after a few seconds while the button was still held).
-                let primary_down = ui.input(|i| i.pointer.primary_down());
-                let held = match &ptt {
-                    Some(_) if self.ptt_held => primary_down,
-                    Some(button) => button.is_pointer_button_down_on() && primary_down,
-                    None => false,
-                };
-                if held {
-                    ui.ctx().request_repaint();
+                if let Some(command) = self.update_ptt(ptt.as_ref(), ui.ctx()) {
+                    send(command);
                 }
-                if held != self.ptt_held {
-                    self.ptt_held = held;
-                    send(Command::Ptt(held));
+                if self.ptt_held {
+                    ui.ctx().request_repaint();
                 }
             });
 
@@ -1667,29 +1705,39 @@ fn speak_row(
     let offline = state.conn != ConnStatus::Connected;
     // Alone in the room the engine sends nothing (`DspControl::audience`).
     let alone = !offline && state.peers.is_empty();
-    let open = !offline && !alone && if ptt { state.ptt_down } else { state.sending };
+    let open = !offline
+        && !alone
+        && !state.setup_active
+        && if ptt { state.ptt_down } else { state.sending };
     let key = super::ptt_key_label(&state.settings.hotkeys, &state.hotkey_backend);
+    let (vad_level, vad_threshold) = state.vad_meter();
     let speak = widgets::Speak {
         ptt,
         open,
-        muted: state.muted,
+        muted: state.muted || state.setup_active,
         offline,
         alone,
         level: if ptt {
             theme::meter_fraction(state.level.rms_db)
         } else {
-            state.vad_prob
+            vad_level
         },
-        threshold: (!ptt).then_some(state.vad_threshold),
+        threshold: (!ptt).then_some(vad_threshold),
         key: ptt.then_some(key.as_str()),
-        clipping: !offline && state.level.peak_db >= CLIP_DB,
+        clipping: !offline && (state.input_clipping || state.level.peak_db >= CLIP_DB),
     };
     // Built only while hovered: three floats formatted per frame otherwise.
     let tooltip = |ui: &mut egui::Ui| {
         if speak.clipping {
-            ui.label("Übersteuert — leiser sprechen oder das Mikrofon herunterregeln.");
+            ui.label(if state.input_clipping {
+                "Mikrofoneingang übersteuert — den Eingangspegel am Gerät oder im System senken."
+            } else {
+                "Übersteuert — leiser sprechen oder das Mikrofon herunterregeln."
+            });
         }
-        ui.label(if offline {
+        ui.label(if state.setup_active {
+            "Einrichtung offen — Mikrofontests werden nur lokal wiedergegeben.".to_string()
+        } else if offline {
             format!(
                 "Nicht verbunden — es wird nichts gesendet\nPegel {:.0} dBFS",
                 state.level.rms_db
@@ -1702,6 +1750,12 @@ fn speak_row(
         } else if ptt {
             format!(
                 "Push-to-Talk — halten zum Sprechen\nPegel {:.0} dBFS",
+                state.level.rms_db
+            )
+        } else if !state.settings.audio.denoise {
+            format!(
+                "Sprachaktivierung nach Mikrofonpegel\nSchwelle {:.0} dBFS\nPegel {:.0} dBFS",
+                crate::dsp::vad::ENERGY_THRESHOLD_DB,
                 state.level.rms_db
             )
         } else {
@@ -1720,7 +1774,13 @@ fn speak_row(
     };
 
     let size = egui::vec2(ui.available_width() - tile_w - DOCK_GAP, SPEAK_H);
-    let response = widgets::speak_surface(ui, &speak, size).on_hover_ui(tooltip);
+    let response = ui
+        .add_enabled_ui(!state.setup_active, |ui| {
+            widgets::speak_surface(ui, &speak, size)
+        })
+        .inner
+        .on_hover_ui(tooltip)
+        .on_disabled_hover_ui(tooltip);
     let (glyph, label, next) = if ptt {
         (icon::HAND_TAP, "PTT", "Umschalten auf Sprachaktivierung")
     } else {
@@ -2113,7 +2173,7 @@ fn participant_row(
                             } else {
                                 icon::SPEAKER_HIGH
                             };
-                            if widgets::icon_button(ui, glyph, 28.0, active)
+                            if widgets::icon_button(ui, glyph, "Lautstärke ändern", 28.0, active)
                                 .on_hover_ui(|ui| {
                                     ui.label(if vol <= 0.0 {
                                         "Für dich stumm".to_string()
@@ -2626,11 +2686,13 @@ impl eframe::App for EnrollApp {
         let valid = summary.is_some();
         // The join page only makes sense for text that parses; if it stops
         // parsing, start over at the field. A paste that parses moves on.
+        let mut focus_join = false;
         if !valid {
             self.step = EnrollStep::Paste;
         } else if !self.was_valid && self.step == EnrollStep::Paste {
             self.step = EnrollStep::Join;
             self.focus_name = needs_name;
+            focus_join = !needs_name;
             self.take_settings = true;
         }
         self.was_valid = valid;
@@ -2682,7 +2744,7 @@ impl eframe::App for EnrollApp {
                         } else {
                             (widgets::ButtonKind::Neutral, "Beitreten")
                         };
-                        join |= ui
+                        let join_button = ui
                             .allocate_ui_with_layout(
                                 egui::vec2(ui.available_width(), 36.0),
                                 justified,
@@ -2693,8 +2755,11 @@ impl eframe::App for EnrollApp {
                                     .inner
                                 },
                             )
-                            .inner
-                            .clicked();
+                            .inner;
+                        if focus_join {
+                            join_button.request_focus();
+                        }
+                        join |= join_button.clicked();
                     });
                 });
         }
@@ -2843,9 +2908,9 @@ impl eframe::App for EnrollApp {
                                         ui.label(RichText::new(changes.join("\n")).size(11.5));
                                     }
                                 }
-                                if join_ok && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                                    join = true;
-                                }
+                                // Enter belongs to the focused control. The
+                                // join button receives initial focus; using
+                                // the settings checkbox must not also import.
                             }
                             ui.add_space(10.0);
                             match &self.status {
@@ -3088,10 +3153,128 @@ mod tests {
     /// and a view not holding it sends nothing.
     #[test]
     fn a_held_speak_button_is_released_when_the_window_goes() {
-        let mut view = MainView { ptt_held: true };
+        let mut view = MainView {
+            ptt_held: true,
+            ptt_pointer_held: true,
+            ptt_key_held: Some(egui::Key::Space),
+        };
         assert!(matches!(view.release_ptt(), Some(Command::Ptt(false))));
+        assert!(!view.ptt_pointer_held);
+        assert!(view.ptt_key_held.is_none());
         assert!(view.release_ptt().is_none());
         assert!(MainView::default().release_ptt().is_none());
+    }
+
+    #[test]
+    fn keyboard_speak_holds_release_on_keyup_and_focus_loss() {
+        use egui_kittest::{kittest::Queryable, Harness};
+
+        for key in [egui::Key::Space, egui::Key::Enter] {
+            let mut h = Harness::new_ui_state(
+                |ui, (view, commands): &mut (MainView, Vec<bool>)| {
+                    let speak = ui.button("Sprechen");
+                    let _ = ui.button("Anderes Feld");
+                    if let Some(Command::Ptt(held)) = view.update_ptt(Some(&speak), ui.ctx()) {
+                        commands.push(held);
+                    }
+                },
+                (MainView::default(), Vec::new()),
+            );
+            h.get_by_label("Sprechen").focus();
+            h.run();
+            h.key_down(key);
+            h.run();
+            assert_eq!(h.state().1, [true]);
+            h.key_up(key);
+            h.run();
+            assert_eq!(h.state().1, [true, false]);
+
+            h.key_down(key);
+            h.run();
+            h.get_by_label("Anderes Feld").focus();
+            h.run();
+            assert_eq!(h.state().1, [true, false, true, false]);
+            // Focusing it again while the same key remains held must not
+            // restart transmission without a fresh physical key press.
+            h.get_by_label("Sprechen").focus();
+            h.run();
+            assert_eq!(h.state().1, [true, false, true, false]);
+            h.key_up(key);
+            h.run();
+            h.key_down(key);
+            h.run();
+            h.input_mut().focused = false;
+            h.run();
+            assert_eq!(h.state().1, [true, false, true, false, true, false]);
+        }
+    }
+
+    #[test]
+    fn keyboard_shortcuts_never_start_or_keep_speaking() {
+        use egui_kittest::{kittest::Queryable, Harness};
+
+        for key in [egui::Key::Space, egui::Key::Enter] {
+            for modifiers in [
+                egui::Modifiers::ALT,
+                egui::Modifiers::CTRL,
+                egui::Modifiers::SHIFT,
+                egui::Modifiers::COMMAND,
+                egui::Modifiers::MAC_CMD,
+            ] {
+                let mut h = Harness::new_ui_state(
+                    |ui, (view, commands, rect): &mut (MainView, Vec<bool>, egui::Rect)| {
+                        let speak = ui.button("Sprechen");
+                        *rect = speak.rect;
+                        if let Some(Command::Ptt(held)) = view.update_ptt(Some(&speak), ui.ctx()) {
+                            commands.push(held);
+                        }
+                    },
+                    (MainView::default(), Vec::new(), egui::Rect::NOTHING),
+                );
+                h.get_by_label("Sprechen").focus();
+                h.run();
+                h.key_down_modifiers(modifiers, key);
+                h.run();
+                assert!(h.state().1.is_empty());
+                h.key_up(key);
+                h.run();
+
+                h.key_down(key);
+                h.run();
+                assert_eq!(h.state().1, [true]);
+                h.event(egui::Event::ModifiersChanged(modifiers));
+                h.run();
+                assert_eq!(h.state().1, [true, false]);
+                h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+                h.run();
+                assert_eq!(h.state().1, [true, false]);
+                h.key_up(key);
+                h.run();
+
+                // A mouse hold remains independent of keyboard shortcuts.
+                let pos = h.state().2.center();
+                h.event(egui::Event::PointerMoved(pos));
+                h.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                h.run();
+                assert_eq!(h.state().1, [true, false, true]);
+                h.event(egui::Event::ModifiersChanged(modifiers));
+                h.run();
+                assert_eq!(h.state().1, [true, false, true]);
+                h.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers,
+                });
+                h.run();
+                assert_eq!(h.state().1, [true, false, true, false]);
+            }
+        }
     }
 
     #[test]
