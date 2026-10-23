@@ -5,6 +5,7 @@ Stand. Aktuelle Referenzen stehen unter [reference/](../README.md).
 Die frühen Wire-Entwürfe sind durch [protocol.md](../reference/protocol.md) ersetzt.
 
 - [Audio feedback — implementation and verification, 2026-09-28](audio-feedback-verification-2026-09-28.md)
+- [Audio-Pegel und Peer-Hints: Debugging 2026-10-23](audio-balancing-debug-2026-10-23.md)
 - [Client: Implementierungsentscheidungen 2026-09-20 bis 2026-09-28](client-implementation-decisions.md)
 - [Code-Review 2026-09-23](review-2026-09-23.md)
 - [Server-Review 2026-09-24: Betrieb im offenen Internet](review-2026-09-24.md)

@@ -4,7 +4,7 @@
 //! their volume slider and the mix), mic auto leveling (the automatic input
 //! gain ahead of denoise and VAD) and outbound normalization (right before
 //! the encoder, only while the mic leveler is off — `dsp::chain`). The
-//! level estimate only moves on blocks clearly above the voice's own noise
+//! level estimate moves on VAD-confirmed speech or blocks above the voice's noise
 //! floor (the minimum block level of the last 1.5–3 s of sound, so steady
 //! hiss never counts as speech) and, on the send side, only while the VAD
 //! hears voice; in pauses the gain holds, so nothing pumps or lifts room
@@ -156,7 +156,10 @@ impl Normalizer {
         // Exact silence (jitter-buffer gaps, a closed gate) says nothing
         // about the speaker's noise floor: neither counted nor clocked, so
         // the floor survives a pause instead of being forgotten after 3 s.
-        if rms_db > -99.0 {
+        // Confirmed speech cannot teach us the noise floor. Otherwise a
+        // sustained phrase eventually becomes its own floor and freezes
+        // leveling (and the local measurement needed for peer assistance).
+        if voice != Some(true) && rms_db > -99.0 {
             self.win_min = self.win_min.min(rms_db);
             self.win_samples += block.len();
         }
@@ -168,8 +171,12 @@ impl Normalizer {
         let floor = self.win_min.min(self.prev_win_min);
 
         let p = self.profile;
-        let eligible =
-            voice != Some(false) && rms_db > p.speech_min_db.max(floor + SPEECH_MARGIN_DB);
+        let eligible = rms_db > p.speech_min_db
+            && match voice {
+                Some(true) => true,
+                Some(false) => false,
+                None => rms_db > floor + SPEECH_MARGIN_DB,
+            };
         if eligible {
             let a = if rms_db > self.level_db {
                 alpha(p.rise_s, block.len())
@@ -192,11 +199,6 @@ impl Normalizer {
     /// Current speech envelope, in dBFS.
     pub fn level_db(&self) -> f32 {
         self.level_db
-    }
-
-    /// Retarget the existing controller; never add a second gain stage.
-    pub fn target_offset(&mut self, db: f32) {
-        self.profile.target_db = Profile::MIC_LEVEL.target_db + db.clamp(-3.0, 3.0);
     }
 
     /// A confirmed capture gain change shifts both the estimate and its inverse gain.
@@ -281,6 +283,32 @@ mod tests {
         let mut n = Normalizer::with(Profile::OUTBOUND);
         run(&mut n, talk(-34.0, -70.0, 10.0));
         assert!(n.gain_db() > 9.0, "gain {}", n.gain_db());
+    }
+
+    #[test]
+    fn confirmed_sustained_speech_is_leveled_without_a_noise_only_pause() {
+        let mut n = Normalizer::with(Profile::MIC_LEVEL);
+        for _ in 0..2000 {
+            let mut block = vec![from_db(-32.0); BLOCK];
+            n.process_hinted(&mut block, Some(true));
+        }
+        assert!(n.gain_db() > 11.0, "gain {}", n.gain_db());
+        // A louder phrase must still be caught immediately after the floor
+        // windows have seen nothing but sustained speech.
+        for _ in 0..100 {
+            let mut block = vec![from_db(-10.0); BLOCK];
+            n.process_hinted(&mut block, Some(true));
+        }
+        assert!(n.gain_db() < -9.0, "gain {}", n.gain_db());
+    }
+
+    #[test]
+    fn confirmed_speech_still_requires_finite_samples_and_absolute_minimum() {
+        let mut n = Normalizer::with(Profile::MIC_LEVEL);
+        for block in [[0.0; BLOCK], [from_db(-60.0); BLOCK], [f32::NAN; BLOCK]] {
+            assert!(!n.observe(&block, Some(true)));
+        }
+        assert_eq!(n.correction_db(), 0.0);
     }
 
     #[test]

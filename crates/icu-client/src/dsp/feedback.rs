@@ -1,7 +1,11 @@
-//! Peer-assisted target tuning. Measurements never depend on playback volume.
+//! Slow peer-assisted output trim. Measurements never depend on playback volume.
 use super::{meter, normalize::Normalizer};
 use icu_proto::AudioLevel;
 use std::time::{Duration, Instant};
+
+/// Enough to correct a moderate downstream level error without chasing
+/// arbitrary peer requests. Peak headroom and the final limiter still apply.
+pub const MAX_PEER_TRIM_DB: f32 = 6.0;
 
 pub struct Measurement {
     estimator: Normalizer,
@@ -51,6 +55,7 @@ pub struct PeerTuner {
     streak: u8,
     direction: f32,
     last_used: Option<Instant>,
+    decision: Option<&'static str>,
 }
 impl PeerTuner {
     pub fn status(&self, now: Instant) -> &'static str {
@@ -59,10 +64,8 @@ impl PeerTuner {
             .is_none_or(|(_, t)| now.saturating_duration_since(t) >= Duration::from_secs(6))
         {
             "kein gültiges Empfangsfeedback"
-        } else if self.streak < 3 {
-            "prüft"
         } else {
-            "aktiv"
+            self.decision.unwrap_or("prüft")
         }
     }
 
@@ -72,15 +75,32 @@ impl PeerTuner {
             .map(|c| (c as f32 / 100.0, now));
     }
     pub fn tick(&mut self, local: Option<AudioLevel>, enabled: bool, now: Instant) -> f32 {
+        let previous_db = self.offset_db;
+        let offset_db = self.update(local, enabled, now);
+        tracing::debug!(
+            ?local,
+            remote_correction_db = ?self.hint.map(|(db, _)| db),
+            enabled,
+            previous_db,
+            offset_db,
+            status = self.status(now),
+            "peer audio correction"
+        );
+        offset_db
+    }
+
+    fn update(&mut self, local: Option<AudioLevel>, enabled: bool, now: Instant) -> f32 {
         let hint = self
             .hint
             .filter(|(_, t)| now.saturating_duration_since(*t) < Duration::from_secs(6));
         if !enabled || hint.is_none() {
             self.streak = 0;
+            self.decision = Some("aus");
             self.offset_db -= self.offset_db.clamp(-0.5, 0.5);
             return self.offset_db;
         }
         let Some(l) = local.filter(|l| l.valid()) else {
+            self.decision = Some("zu wenig lokale Sprache");
             return self.offset_db;
         };
         let (remote, at) = hint.unwrap();
@@ -89,13 +109,22 @@ impl PeerTuner {
         }
         self.last_used = Some(at);
         let own = l.correction_cdb as f32 / 100.0;
-        if remote.abs() <= 2.0
-            || own.abs() <= 2.0
-            || (own - remote).abs() > 2.0
-            || own.signum() != remote.signum()
-            || (remote > 0.0 && (l.peak_cdb > -300 || l.near_full_permille > 0))
-        {
+        // The listener defines the residual error. Requiring the local
+        // estimate to exceed the same dead band stops too early when Opus
+        // and independent speech selection differ slightly; corroboration
+        // is the bounded difference and common direction below.
+        let rejected = if remote.abs() <= 2.0 {
+            Some("im Zielbereich")
+        } else if (own - remote).abs() > 2.0 || own.signum() != remote.signum() {
+            Some("lokale Messung widerspricht")
+        } else if remote > 0.0 && (l.peak_cdb > -300 || l.near_full_permille > 0) {
+            Some("zu wenig Spitzenreserve")
+        } else {
+            None
+        };
+        if let Some(reason) = rejected {
             self.streak = 0;
+            self.decision = Some(reason);
             return self.offset_db;
         }
         if self.direction != remote.signum() {
@@ -103,8 +132,16 @@ impl PeerTuner {
             self.direction = remote.signum();
         }
         self.streak = self.streak.saturating_add(1);
+        self.decision = Some("prüft");
         if self.streak >= 3 {
-            self.offset_db = (self.offset_db + remote.signum() * 0.5).clamp(-3.0, 3.0);
+            let next =
+                (self.offset_db + remote.signum() * 0.5).clamp(-MAX_PEER_TRIM_DB, MAX_PEER_TRIM_DB);
+            self.decision = Some(if next == self.offset_db {
+                "Regelgrenze"
+            } else {
+                "aktiv"
+            });
+            self.offset_db = next;
         }
         self.offset_db
     }
@@ -172,8 +209,8 @@ mod tests {
             p.hint(Some(400), now);
             p.tick(Some(level(400)), true, now);
         }
-        assert_eq!(p.offset_db, 3.0);
-        for i in 0..6 {
+        assert_eq!(p.offset_db, MAX_PEER_TRIM_DB);
+        for i in 0..12 {
             p.tick(None, true, t + Duration::from_secs(50 + i * 2));
         }
         assert_eq!(p.offset_db, 0.0);
@@ -204,5 +241,117 @@ mod tests {
         assert!(m.take().is_none());
         m.observe(&[f32::NAN; 480], Some(true));
         assert!(m.take().is_none());
+    }
+
+    #[test]
+    fn sustained_local_speech_corroborates_peer_hints() {
+        let mut m = Measurement::default();
+        let mut p = PeerTuner::default();
+        let t = Instant::now();
+        for i in 0..12 {
+            for _ in 0..200 {
+                m.observe(&[meter::from_db(-30.0); 480], Some(true));
+            }
+            let now = t + Duration::from_secs(i * 2);
+            let local = m.take().expect("confirmed speech must produce feedback");
+            p.hint(Some(local.correction_cdb), now);
+            p.tick(Some(local), true, now);
+        }
+        assert!(p.offset_db > 0.0, "peer correction must reach the leveler");
+    }
+
+    #[test]
+    fn clipping_blocks_boost_but_allows_cut_and_reports_the_reason() {
+        let t = Instant::now();
+        let mut p = PeerTuner::default();
+        for i in 0..20 {
+            let now = t + Duration::from_secs(i * 2);
+            p.hint(Some(400), now);
+            p.tick(
+                Some(AudioLevel {
+                    peak_cdb: -100,
+                    ..level(400)
+                }),
+                true,
+                now,
+            );
+            assert_eq!(p.offset_db, 0.0);
+            assert_eq!(p.status(now), "zu wenig Spitzenreserve");
+        }
+        for i in 20..40 {
+            let now = t + Duration::from_secs(i * 2);
+            p.hint(Some(-400), now);
+            p.tick(
+                Some(AudioLevel {
+                    peak_cdb: -100,
+                    ..level(-400)
+                }),
+                true,
+                now,
+            );
+        }
+        assert_eq!(p.offset_db, -MAX_PEER_TRIM_DB);
+        assert_eq!(p.status(t + Duration::from_secs(78)), "Regelgrenze");
+        p.tick(None, false, t + Duration::from_secs(79));
+        assert_eq!(p.offset_db, -MAX_PEER_TRIM_DB + 0.5);
+    }
+
+    #[test]
+    fn missing_local_speech_is_visible_and_cannot_apply_a_hint() {
+        let mut p = PeerTuner::default();
+        let now = Instant::now();
+        p.hint(Some(400), now);
+        p.tick(None, true, now);
+        assert_eq!(p.offset_db, 0.0);
+        assert_eq!(p.status(now), "zu wenig lokale Sprache");
+    }
+
+    #[test]
+    fn corroboration_near_local_dead_band_still_corrects_the_listener() {
+        let mut p = PeerTuner::default();
+        let t = Instant::now();
+        for i in 0..3 {
+            let now = t + Duration::from_secs(i * 2);
+            p.hint(Some(-300), now);
+            p.tick(Some(level(-150)), true, now);
+        }
+        assert_eq!(p.offset_db, -0.5);
+    }
+
+    #[test]
+    fn short_pauses_do_not_erase_valid_corroboration() {
+        let mut p = PeerTuner::default();
+        let t = Instant::now();
+        for i in 0..3 {
+            let now = t + Duration::from_secs(i * 4);
+            p.hint(Some(400), now);
+            p.tick(Some(level(400)), true, now);
+            let before_pause = p.offset_db;
+            p.tick(None, true, now + Duration::from_secs(2));
+            assert_eq!(p.offset_db, before_pause, "a pause must not change gain");
+        }
+        assert_eq!(p.offset_db, 0.5);
+    }
+
+    #[test]
+    fn fresh_in_target_feedback_holds_the_learned_trim() {
+        let mut p = PeerTuner::default();
+        let t = Instant::now();
+        for i in 0..6 {
+            let now = t + Duration::from_secs(i * 2);
+            p.hint(Some(400), now);
+            p.tick(Some(level(400)), true, now);
+        }
+        let learned = p.offset_db;
+        assert!(learned > 0.0);
+        for i in 6..36 {
+            let now = t + Duration::from_secs(i * 2);
+            p.hint(Some(0), now);
+            p.tick(Some(level(0)), true, now);
+            assert_eq!(
+                p.offset_db, learned,
+                "successful feedback must not cause relearning"
+            );
+        }
     }
 }

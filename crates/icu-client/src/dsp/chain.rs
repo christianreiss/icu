@@ -1,6 +1,6 @@
 //! The send-side chain behind the AEC (`docs/reference/client.md` §6):
 //! manual gain → mic auto level → denoise → meter → (the caller's VAD
-//! verdict) → voice optimizer → outbound normalizer and limiter. One struct,
+//! verdict) → voice optimizer → peer trim → outbound normalizer and limiter. One struct,
 //! so the engine's DSP thread and the cascade test (`tests/cascade.rs`) run
 //! the same code with the same switches.
 //!
@@ -80,6 +80,10 @@ pub struct SendChain {
     out_limiter: Limiter,
     out_norm_on: bool,
     limiter_on: bool,
+    /// Slow feedback trim belongs after the fixed compressor, which would
+    /// otherwise compress away corrections made to the microphone target.
+    peer_gain: f32,
+    applied_peer_gain: f32,
 }
 
 impl Default for SendChain {
@@ -103,6 +107,8 @@ impl SendChain {
             out_limiter: Limiter::new(),
             out_norm_on: false,
             limiter_on: false,
+            peer_gain: 1.0,
+            applied_peer_gain: 1.0,
         }
     }
 
@@ -116,6 +122,8 @@ impl SendChain {
         self.voice_chain.reset();
         self.out_norm.reset();
         self.out_limiter.reset();
+        self.peer_gain = 1.0;
+        self.applied_peer_gain = 1.0;
     }
 
     /// First half: gain, auto level, denoise, meter.
@@ -169,6 +177,23 @@ impl SendChain {
         if s.voice_opt {
             self.voice_chain.process(block);
         }
+        // One local AGC and one slow remote trim, not two independent AGCs.
+        // Ramp the trim over a block to avoid a click on a new hint. It must
+        // not affect the denoiser, VAD, or system-gain transfer estimator.
+        let peer_target = if s.auto_level && s.denoise {
+            self.peer_gain
+        } else {
+            1.0
+        };
+        let peer_active = peer_target != 1.0 || self.applied_peer_gain != 1.0;
+        if peer_active && !block.is_empty() {
+            let start = self.applied_peer_gain;
+            let step = (peer_target - start) / block.len() as f32;
+            for (i, sample) in block.iter_mut().enumerate() {
+                *sample *= start + step * (i + 1) as f32;
+            }
+        }
+        self.applied_peer_gain = peer_target;
         // One leveler per direction (`dsp::normalize`): while the mic
         // leveler runs, outbound normalization is the limiter alone; the
         // normalizer takes over only when the leveler is off.
@@ -180,20 +205,29 @@ impl SendChain {
         if out_level {
             self.out_norm.process_hinted(block, Some(voice));
         }
-        if s.normalize_outgoing && !self.limiter_on {
+        // A peer boost always retains peak protection, including when the
+        // user has switched off ordinary outbound normalization.
+        let limit = s.normalize_outgoing || peer_active;
+        if limit && !self.limiter_on {
             self.out_limiter.reset();
         }
-        self.limiter_on = s.normalize_outgoing;
-        if s.normalize_outgoing {
+        self.limiter_on = limit;
+        if limit {
             for x in block.iter_mut() {
                 *x = self.out_limiter.process(*x);
             }
         }
     }
 
-    /// Peer assistance retargets the microphone controller, within its original bounds.
-    pub fn tune(&mut self, target_offset_db: f32, capture_delta_db: f32) {
-        self.leveler.target_offset(target_offset_db);
+    /// Apply the corroborated peer trim; compensate confirmed native gain
+    /// changes in the microphone AGC independently.
+    pub fn tune(&mut self, peer_offset_db: f32, capture_delta_db: f32) {
+        self.peer_gain = if peer_offset_db.is_finite() {
+            let bound = super::feedback::MAX_PEER_TRIM_DB;
+            meter::from_db(peer_offset_db.clamp(-bound, bound))
+        } else {
+            1.0
+        };
         if capture_delta_db != 0.0 {
             self.leveler.capture_changed(capture_delta_db);
         }
@@ -210,6 +244,55 @@ impl SendChain {
 mod tests {
     use super::*;
     use crate::dsp::testsignal;
+
+    #[test]
+    fn peer_trim_reaches_output_after_compression_without_moving_mic_agc() {
+        let settings = SendSettings::default();
+        for trim_db in [-6.0, 6.0] {
+            let mut baseline = SendChain::new();
+            let mut assisted = SendChain::new();
+            assisted.tune(trim_db, 0.0);
+            for b in 0..100 {
+                let input: Vec<f32> = (0..480)
+                    .map(|i| {
+                        ((b * 480 + i) as f32 * 220.0 / 48_000.0 * std::f32::consts::TAU).sin()
+                            * 0.05
+                    })
+                    .collect();
+                let mut plain = input.clone();
+                let mut tuned = input;
+                baseline.finish(&mut plain, true, &settings);
+                assisted.finish(&mut tuned, true, &settings);
+                if b > 0 {
+                    let delta = meter::measure(&tuned).rms_db - meter::measure(&plain).rms_db;
+                    assert!((delta - trim_db).abs() < 0.01, "{delta} vs {trim_db}");
+                }
+                assert_eq!(baseline.gains_db(), assisted.gains_db());
+            }
+        }
+    }
+
+    #[test]
+    fn peer_boost_keeps_limiter_and_disabled_leveling_removes_trim() {
+        let mut chain = SendChain::new();
+        let mut settings = SendSettings {
+            voice_opt: false,
+            normalize_outgoing: false,
+            ..SendSettings::default()
+        };
+        chain.tune(99.0, 0.0);
+        assert!((meter::to_db(chain.peer_gain) - 6.0).abs() < 0.01);
+        let mut block = [0.9; 480];
+        chain.finish(&mut block, true, &settings);
+        assert!(block.iter().all(|s| s.abs() <= 0.891_251));
+        settings.auto_level = false;
+        chain.finish(&mut [0.1; 480], true, &settings);
+        assert_eq!(chain.applied_peer_gain, 1.0);
+        chain.restart();
+        assert_eq!(chain.peer_gain, 1.0);
+        chain.tune(f32::NAN, 0.0);
+        assert_eq!(chain.peer_gain, 1.0);
+    }
 
     /// One corrupt capture block (a float driver's NaN or ±Inf) reaches the
     /// denoiser with the leveler off. It must not poison it: afterwards the

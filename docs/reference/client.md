@@ -161,9 +161,22 @@ Normalisierung/Lautstärke; PLC/FEC und künstliche Jitter-Ausgaben zählen nich
 Der Sender misst denselben Wert vor Opus. Eine Zielkorrektur verlangt drei
 übereinstimmende gültige Fenster, lokale Bestätigung innerhalb 2 dB und bei
 Verstärkung mindestens 3 dB Spitzenreserve. Totband: 2 dB, Schritt: 0,5 dB
-alle 2 s, Zielversatz maximal ±3 dB. Nach 6 s ohne gültigen Hint läuft der
-Versatz in 0,5-dB-Schritten zurück. Kein zweiter digitaler Gain-Regler entsteht:
-`SendChain::tune` verschiebt das Ziel des bestehenden Mikrofon-Levelers.
+alle 2 s, Ausgangskorrektur maximal ±6 dB. Nach 6 s ohne gültigen Hint läuft
+die Korrektur in 0,5-dB-Schritten zurück. `SendChain::tune` setzt eine langsame
+Peer-Korrektur nach dem festen Stimmkompressor und vor dem Ausgangslimiter;
+damit komprimiert der Kompressor die Korrektur nicht wieder weg. Sie wird pro
+Block weich eingeblendet. Der lokale Mikrofon-AGC behält sein Ziel; ein zweiter
+schneller AGC entsteht nicht. Peer-Korrekturen lernen weder die VAD noch den
+Systemregler um. Solange eine Peer-Korrektur wirkt, bleibt der Ausgangslimiter
+auch bei abgeschalteter Ausgangsnormalisierung aktiv. Fehlende lokale Sprache,
+widersprechende Messung, fehlende Spitzenreserve und die Regelgrenze erscheinen
+im Peer-Status statt pauschal als aktive Regelung.
+
+VAD-bestätigte Sprache steuert Mikrofon-Leveler und lokale Feedbackmessung
+auch ohne vorherige Rauschpause. Sie lernt nicht den Rauschboden an; damit
+friert die Regelung bei anhaltender Sprache nicht ein. Die absolute
+Mindestlautstärke bleibt wirksam. Ohne VAD-Bestätigung (Empfang) gilt weiterhin
+der Mindestabstand zum Rauschboden; negative VAD-Urteile halten den Schätzer.
 
 `audio::level::SystemTuner` überträgt dauerhafte digitale Korrektur langsam auf
 den Systemregler: erst nach 10 s geeigneter Sprache aufwärts, normalerweise
@@ -174,6 +187,9 @@ und erlaubt eine Absenkung pro Sekunde. Stille, Mute und Testton lernen nichts.
 Bestätigte Änderungen verschieben Schätzer und digitale Verstärkung invers;
 Messfenster werden verworfen. Der Limiter und die bisherigen digitalen Grenzen
 bleiben bestehen. Unplausible Reaktion oder Schreibfehler pausieren Systemtuning.
+Neu auftretendes Capture-Clipping hat auch gegenüber der Reaktionsprüfung nach
+einer vorherigen Pegelanhebung Vorrang: eine plötzlich lautere Passage führt
+zur Absenkung und nicht zum Pausieren bei weiter übersteuertem Mikrofon.
 
 PipeWire bindet den tatsächlich mit dem Capture-Stream verbundenen Source-Node,
 abonniert dessen Props, schreibt `channelVolumes` und liest nach einem passenden
@@ -244,7 +260,7 @@ Kachelgröße (2026-10-02, vorher fest klein/mittel/groß = 120/240/360 px): zwe
 
 Lage und Abstand (2026-10-06): Die Plätze der Kacheln folgen ihrer gerade animierten Größe, einschließlich Namensband, mit nur 2 Layout-Pixeln Abstand. Beim Sprechen wächst oder schrumpft die Kachel weich; die folgenden Kacheln gleiten mit, statt einen dauerhaft für die maximale Sprechgröße reservierten Abstand zu lassen. Die Reihenfolge bleibt unverändert. Kacheln liegen weiterhin an der Randseite des Overlays (oben/unten und links/rechts, bei oben/unten mittig waagrecht mittig), wachsen also zur Bildschirmmitte. Der GPU-Halo-Rand (24 px) liegt um die ganze Gruppe; die Nebelränder benachbarter Kacheln dürfen überlappen und schaffen keine zusätzlichen Lücken. „Abstand zum Rand“ (0–200 px) setzt `overlay.offset` für beide Achsen gleich; getrennte ältere Werte bleiben bis zum nächsten Bewegen des Reglers erhalten.
 
-Eigene Kachel (`overlay.show_self`, Standard aus, ⚙ → Overlay → „Mich im Overlay zeigen“; 2026-10-02): die eigene Kachel steht nach allen anderen, nach denselben Regeln — mit eingeschalteter Kamera das eigene Bild aus dem Vorschau-Slot des Aufnahme-Threads (`CameraHandle::preview_source`, nicht gespiegelt wie die Vorschau, kein Umweg über Encoder und Server), sonst ein Namensschild, sofern „Teilnehmer ohne Kamera“ an ist; „spricht“, solange das eigene Gate offen ist (`AppState::sending`). Die eigene Kachel löst kein `VideoDisplayed` aus. Allein im Raum zeigt das Overlay mit dieser Option nur sie.
+Eigene Kachel (`overlay.show_self`, seit 2026-10-23 standardmäßig an, ⚙ → Overlay → „Mich im Overlay zeigen“; 2026-10-02): die eigene Kachel steht nach allen anderen, nach denselben Regeln — mit eingeschalteter Kamera das eigene Bild aus dem Vorschau-Slot des Aufnahme-Threads (`CameraHandle::preview_source`, nicht gespiegelt wie die Vorschau, kein Umweg über Encoder und Server), sonst ein Namensschild, sofern „Teilnehmer ohne Kamera“ an ist; „spricht“, solange das eigene Gate offen ist (`AppState::sending`). Die eigene Kachel löst kein `VideoDisplayed` aus. Allein im Raum zeigt das Overlay mit dieser Option nur sie.
 
 Dem Mauszeiger ausweichen (`overlay.shy`, Standard aus, ⚙ → Overlay → Erweitert; 2026-10-02): Liegt der Mauszeiger auf dem Platz einer Kachel (ihr gerade animierter Platz einschließlich Namensband), blendet sich die ganze Reihe in 120 ms aus und in 300 ms auf der gegenüberliegenden Bildschirmseite wieder ein, mit demselben Abstand zum Rand: aus einer Ecke in die links/rechts gespiegelte (oben rechts ↔ oben links, unten rechts ↔ unten links), von oben mittig nach unten mittig und umgekehrt (`overlay::opposite`). Dort kehrt sie automatisch an die eingestellte Position zurück, nachdem der Zeiger die vollständig eingeblendete Reihe verlassen hat: `overlay.shy_return_ms`, Standard 3000 ms, 0–60000 ms, Regler „Zurück nach“ in Sekunden unter „Dem Mauszeiger ausweichen“. Erreicht der Zeiger die Reihe während der Wartezeit, beginnt die Zeit beim Verlassen erneut; erreicht er sie nach der Wechselsperre, weicht sie wie bisher sofort aus. Die Rückkehr nutzt dieselbe Aus-/Einblendung und Wechselsperre (2026-10-06). Wo sie erscheint (beim Start oder nach einem Seitenwechsel), bleibt sie, sobald sie ganz eingeblendet ist, mindestens die „Wechselsperre“ lang stehen (`overlay.shy_hold_ms`, 0–5000 ms, Standard 1000; Regler unter dem Schalter, nur sichtbar, wenn er an ist), auch unter dem Zeiger, und nimmt so lange keine Eingaben an, Klicks gehen durch; danach weicht sie aus, sobald der Zeiger auf einer Kachel liegt (unter Wayland meldet der Compositor einen dort ruhenden Zeiger womöglich erst bei der nächsten Bewegung). Die Sperre verhindert, dass ein Zeiger über beiden Plätzen die Reihe hin- und herspringen lässt; bei 0 kann genau das im Takt der Blenden passieren. (Noch am 2026-10-03 vorher fest: Eine unter dem Zeiger angekommene Reihe blieb, bis er 100 ms weg war und wiederkam, und nahm dabei Eingaben an.) Die Gegenseite wird nicht gespeichert: eine neue Position, „Dem Mauszeiger ausweichen“ aus oder ein Neustart des Overlays bringt die Reihe an die eingestellte Stelle zurück. (2026-10-03; vorher blendete sie sich an Ort und Stelle aus und kam eine Sekunde, nachdem der Zeiger weg war, zurück, zuerst jede Kachel für sich.) Eine ausgeblendete Reihe gilt nicht als angezeigt (kein `VideoDisplayed`). Windows liest dafür je Bild `GetCursorPos`, das Fenster bleibt durchgehend klick-durchlässig. Wayland kennt keine globale Zeigerposition: mit `shy` bekommt die ganz eingeblendete Reihe eine Input-Region (ihre Slots, ohne Lücken), nur so meldet der Compositor Enter/Motion; erreicht der Zeiger eine Kachel, gibt die Reihe ihre Region sofort ab, Klicks gehen dann wieder durch, und auf der Gegenseite entsteht eine neue Layer-Surface mit dem gespiegelten Anker. Ein Klick genau in dem Bild, in dem der Zeiger eine Kachel der ganz eingeblendeten Reihe erreicht (≤ 33 ms), kann dort ankommen statt im Fenster darunter; über einer Kachel setzt das Overlay den normalen Pfeil (`wp_cursor_shape_v1`, wo vorhanden). Ohne `shy` bleibt die Input-Region leer wie bisher.
 
@@ -396,7 +412,7 @@ Die drei Karten verwenden dasselbe Raster: Überschrift, Avatar bzw. Server-Icon
               muted = false   # eigene Stummschaltung, schreibt nur die Engine; gilt beim nächsten Start (2026-09-27)
 [hotkeys]     ptt = {...}, mute = {...}, deafen = {...}, toggle_mode = {...}, camera = {...}, backend = "auto"|"portal"|"evdev"
 [camera]      device, enabled = false
-[overlay]     enabled = false, corner = "top-right", offset = [40, 40], size = 120,
+[overlay]     enabled = false, show_self = true, corner = "top-right", offset = [40, 40], size = 120,
               speaking_size   # nicht gesetzt: size + 20 % (2026-10-03)
 [volumes]     "<user_id>" = 1.2                     # pro Peer, persistent; Schlüssel ist die stabile
                                                     # user_id aus UserInfo — Session-IDs gelten nur je

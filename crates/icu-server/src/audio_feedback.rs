@@ -10,6 +10,8 @@ pub struct Feedback {
     caps: HashMap<Session, u32>,
     reports: HashMap<(Session, Session), (AudioLevel, Instant)>,
     last_tick: Option<Instant>,
+    /// A cached report must not become a new observation on every timer tick.
+    last_hint: HashMap<Session, Instant>,
 }
 
 impl Feedback {
@@ -18,6 +20,7 @@ impl Feedback {
     }
     pub fn forget(&mut self, session: Session) {
         self.caps.remove(&session);
+        self.last_hint.remove(&session);
         self.reports
             .retain(|(s, r), _| *s != session && *r != session);
     }
@@ -58,23 +61,44 @@ impl Feedback {
             return Vec::new();
         }
         self.last_tick = Some(now);
-        self.caps
+        let speakers: Vec<_> = self
+            .caps
             .keys()
             .filter(|s| self.capable(**s))
-            .map(|s| {
+            .copied()
+            .collect();
+        speakers
+            .iter()
+            .filter_map(|s| {
                 let values: Vec<_> = self
                     .reports
                     .iter()
                     .filter(|((speaker, _), _)| speaker == s)
                     .map(|(_, (l, _))| l.correction_cdb)
                     .collect();
-                (
+                let correction = consensus(&values);
+                if let Some(correction) = correction {
+                    let newest = self
+                        .reports
+                        .iter()
+                        .filter(|((speaker, _), (l, _))| {
+                            speaker == s
+                                && (l.correction_cdb as i32 - correction as i32).abs() <= 100
+                        })
+                        .map(|(_, (_, at))| *at)
+                        .max()?;
+                    if self.last_hint.get(s).is_some_and(|at| newest <= *at) {
+                        return None;
+                    }
+                    self.last_hint.insert(*s, newest);
+                }
+                Some((
                     *s,
                     ControlMsg::AudioLevelHint {
-                        correction_cdb: consensus(&values),
+                        correction_cdb: correction,
                         reporters: values.len().min(u16::MAX as usize) as u16,
                     },
-                )
+                ))
             })
             .collect()
     }
@@ -146,6 +170,21 @@ mod tests {
                 reporters: 1
             }
         )));
+        for seconds in [2, 4] {
+            assert!(
+                f.tick(t + Duration::from_secs(seconds), |_, _| true)
+                    .iter()
+                    .all(|(speaker, hint)| *speaker != 1
+                        || !matches!(
+                            hint,
+                            ControlMsg::AudioLevelHint {
+                                correction_cdb: Some(_),
+                                ..
+                            }
+                        )),
+                "cached reports must not fabricate fresh corroboration"
+            );
+        }
         assert!(f.tick(t + Duration::from_secs(6), |_, _| true).contains(&(
             1,
             ControlMsg::AudioLevelHint {
@@ -156,5 +195,62 @@ mod tests {
         f.report(2, 1, l, t + Duration::from_secs(7));
         f.forget(2);
         assert!(f.reports.is_empty());
+    }
+
+    #[test]
+    fn only_fresh_agreeing_reports_refresh_a_hint() {
+        let now = Instant::now();
+        let mut feedback = Feedback::default();
+        for session in 1..=4 {
+            feedback.join(session, icu_proto::CAP_AUDIO_FEEDBACK);
+        }
+        let level = AudioLevel {
+            level_cdb: -2800,
+            correction_cdb: 400,
+            peak_cdb: -600,
+            near_full_permille: 0,
+            speech_ms: 1500,
+        };
+        for receiver in [2, 3] {
+            feedback.report(receiver, 1, level, now);
+        }
+        assert!(feedback.tick(now, |_, _| true).iter().any(|(s, h)| *s == 1
+            && matches!(
+                h,
+                ControlMsg::AudioLevelHint {
+                    correction_cdb: Some(400),
+                    ..
+                }
+            )));
+        let later = now + Duration::from_secs(2);
+        feedback.report(
+            4,
+            1,
+            AudioLevel {
+                correction_cdb: -1200,
+                ..level
+            },
+            later,
+        );
+        assert!(
+            feedback
+                .tick(later, |_, _| true)
+                .iter()
+                .all(|(s, _)| *s != 1),
+            "a fresh outlier cannot refresh an old consensus"
+        );
+        let later = now + Duration::from_secs(4);
+        feedback.report(2, 1, level, later);
+        assert!(feedback
+            .tick(later, |_, _| true)
+            .iter()
+            .any(|(s, h)| *s == 1
+                && matches!(
+                    h,
+                    ControlMsg::AudioLevelHint {
+                        correction_cdb: Some(400),
+                        ..
+                    }
+                )));
     }
 }

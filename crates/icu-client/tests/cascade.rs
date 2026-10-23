@@ -746,7 +746,11 @@ fn voice_optimizer_presets_differ_through_the_chain() {
 fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
     use icu_client::dsp::feedback::{Measurement, PeerTuner};
     fn run(assisted: bool, volume: f32, post_gain: f32) -> (f32, f32, f32) {
-        let mic = microphone(40.0, 812, -65.0, |t| {
+        // The loud case needs several independent confirmations after
+        // an intervening phrase falls inside the dead band; short pauses
+        // provide no fabricated measurements just to accelerate the loop.
+        let seconds = if post_gain > 1.0 { 80.0 } else { 40.0 };
+        let mic = microphone(seconds, 812, -65.0, |t| {
             if t % 4.0 < 3.0 {
                 Some(-30.0)
             } else {
@@ -762,6 +766,10 @@ fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
         let mut cm = Measurement::default();
         let mut local = Measurement::default();
         let mut tuner = PeerTuner::default();
+        let mut feedback = icu_server::audio_feedback::Feedback::default();
+        for session in [1, 2, 3] {
+            feedback.join(session, icu_proto::CAP_AUDIO_FEEDBACK);
+        }
         let mut rx = Normalizer::new();
         let mut pcm = Vec::new();
         let mut decoded = vec![0.0; 5760];
@@ -802,7 +810,15 @@ fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
                 if let Some(l) = bl {
                     reports += 1;
                     last_correction = l.correction_cdb as f32 / 100.0;
-                    tuner.hint(Some(l.correction_cdb), t);
+                    feedback.report(2, 1, l, t);
+                    feedback.report(3, 1, cl.unwrap(), t);
+                }
+                for (speaker, hint) in feedback.tick(t, |_, _| true) {
+                    if let (1, icu_proto::ControlMsg::AudioLevelHint { correction_cdb, .. }) =
+                        (speaker, hint)
+                    {
+                        tuner.hint(correction_cdb, t);
+                    }
                 }
                 tuner.tick(own, assisted, t);
             }
@@ -814,7 +830,7 @@ fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
     let assisted = run(true, 0.05, 1.0);
     let loud_listener = run(true, 2.0, 1.0);
     assert_eq!(assisted, loud_listener);
-    assert!(assisted.1.abs() <= 3.0);
+    assert!(assisted.1.abs() <= icu_client::dsp::feedback::MAX_PEER_TRIM_DB);
     assert!(
         assisted.0.abs() <= baseline.0.abs() + 0.25,
         "baseline {baseline:?}, assisted {assisted:?}"
@@ -828,5 +844,20 @@ fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
         "feedback must actually improve a sustained correctable error"
     );
     assert!(quiet_assisted.0.abs() <= 2.0, "convergence into dead band");
+    let loud_baseline = run(false, 1.0, meter::from_db(6.0));
+    let loud_assisted = run(true, 1.0, meter::from_db(6.0));
+    eprintln!("post-processing loud baseline={loud_baseline:?} assisted={loud_assisted:?}");
+    assert!(
+        loud_assisted.1 < 0.0,
+        "loud peers must lower the sender target"
+    );
+    assert!(
+        loud_assisted.0.abs() <= loud_baseline.0.abs() - 0.5,
+        "feedback must also improve an excessively loud sender"
+    );
+    assert!(
+        loud_assisted.0.abs() <= 2.0,
+        "loud sender must converge into dead band: {loud_assisted:?}"
+    );
     eprintln!("peer cascade baseline={baseline:?} assisted={assisted:?}");
 }

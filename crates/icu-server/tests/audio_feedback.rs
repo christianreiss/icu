@@ -53,6 +53,14 @@ async fn two_receivers_agree_then_deafen_excludes_one_and_old_client_gets_no_hin
         flags: icu_proto::UserFlags(icu_proto::UserFlags::DEAFENED),
     })
     .await;
+    // The remaining receiver must supply a fresh window. Server timer
+    // ticks and membership changes cannot turn its old report into one.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    b.send_msg(&ControlMsg::AudioLevelReport {
+        speaker: a.session,
+        level,
+    })
+    .await;
     hint(&mut a, Some(400), 1).await;
     // Unsupported peers may send a fabricated report, but cannot influence consensus.
     old.send_msg(&ControlMsg::AudioLevelReport {

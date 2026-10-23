@@ -378,7 +378,7 @@ impl Default for OverlaySettings {
             shy: false,
             shy_hold_ms: 1000,
             shy_return_ms: 3000,
-            show_self: false,
+            show_self: true,
         }
     }
 }
@@ -1577,7 +1577,12 @@ mod tests {
         assert!(!s.overlay.shy, "old settings.toml: tiles stay put");
         assert_eq!(s.overlay.shy_hold_ms, 1000);
         assert_eq!(s.overlay.shy_return_ms, 3000);
-        assert!(!s.overlay.show_self);
+        assert!(s.overlay.show_self);
+        let explicitly_hidden: Settings = toml::from_str("[overlay]\nshow_self = false\n").unwrap();
+        assert!(
+            !explicitly_hidden.overlay.show_self,
+            "a saved choice is retained"
+        );
         assert_eq!(s.overlay.size, 120);
         assert_eq!(s.overlay.speaking_size, None);
         assert_eq!(

@@ -132,7 +132,11 @@ impl SystemTuner {
         }
         if let Some((before, change)) = self.response.take() {
             // Natural speech varies: suspend only a large, contradictory response.
-            if w.speech_samples >= 24_000 && (w.rms_db() - before - change).abs() > 9.0 {
+            // A newly loud/clipped phrase is not evidence that the device
+            // ignored our previous write. Clipping must still lower capture
+            // gain, rather than suspend while the microphone is overdriven.
+            if !clipped && w.speech_samples >= 24_000 && (w.rms_db() - before - change).abs() > 9.0
+            {
                 self.suspended = true;
                 self.status = "Mikrofon prüfen: Pegel reagiert unerwartet".into();
                 return 0.0;
@@ -408,5 +412,29 @@ mod tests {
         d.fail = true;
         b.tick(&mut d, w, now + Duration::from_secs(3));
         assert!(b.suspended);
+    }
+
+    #[test]
+    fn clipping_after_a_quiet_phrase_overrides_response_validation() {
+        let mut d = Device::new();
+        let mut t = SystemTuner::default();
+        let now = Instant::now();
+        for i in 0..14 {
+            t.tick(&mut d, window(9.0, -36.0), now + Duration::from_secs(i));
+        }
+        assert!(
+            d.writes > 0,
+            "the quiet phrase must have raised capture gain"
+        );
+        assert!(t.response.is_some());
+        let mut loud = window(-12.0, -3.0);
+        loud.near_full = 100;
+        loud.peak = 1.0;
+        assert!(
+            t.tick(&mut d, loud, now + Duration::from_secs(14)) < 0.0,
+            "clipped capture must be reduced even after a large natural level jump"
+        );
+        assert!(!t.suspended);
+        t.restore(&mut d);
     }
 }

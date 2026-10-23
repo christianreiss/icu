@@ -225,6 +225,29 @@ Anschließend wurde das Setup interaktiv auf demselben Desktop geprüft:
 
 ## Empfangsfeedback und Mikrofonregelung (2026-09-28)
 
+Regressionen vom 2026-10-23: anhaltende VAD-bestätigte Sprache ohne Rauschpause,
+leise → übersteuert nach einer Systempegel-Anhebung, Ausgangskorrektur nach
+dem Stimmkompressor, Spitzenbegrenzung auch ohne Ausgangsnormalisierung,
+kurze Sprechpausen, Halten erfolgreicher Korrekturen, abgelaufene/mehrfach
+verwendete Hints und frische Ausreißer. Die Opus-Kaskade verwendet zwei Decoder
+und den echten Server-Konsens; sowohl −6 als auch +6 dB nachträglicher
+Pegelabweichung müssen mit Assistenz in das 2-dB-Totband kommen. Der Laut-Fall
+simuliert 80 s, damit drei unabhängige Fenster nach einem zwischenzeitlich
+passenden Satz neu bestätigt werden können. Prüfung ohne Mikrofonzugriff:
+
+```sh
+cargo test --locked --workspace
+cargo test --locked -p icu-client --test cascade peer_feedback -- --nocapture
+cargo test --locked -p icu-server --test audio_feedback
+```
+
+Für eine spätere Hardware-Diagnose protokolliert
+`RUST_LOG=icu_client::dsp::feedback=debug` je Regeltakt die lokale Messung,
+Empfangskorrektur, bisherige/neue Peer-Korrektur und den Entscheidungsgrund.
+Das Log enthält dabei keine Audiosamples. Laufende Gespräche für einen neuen
+Diagnoseprozess nicht unterbrechen; die normale Single-Instance-Regel gilt.
+Analyse und Grenzen: [Audio-Debugging 2026-10-23](../history/audio-balancing-debug-2026-10-23.md).
+
 Automatisiert: deterministische Controller-/Geräte-Doubles, drei Clients über
 QUIC, SendChain → Opus → zwei unabhängige Decoder und unterschiedliche lokale
 Lautstärken. Linux kann den explizit ignorierten Test
