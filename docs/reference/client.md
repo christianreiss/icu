@@ -161,8 +161,12 @@ Normalisierung/Lautstärke; PLC/FEC und künstliche Jitter-Ausgaben zählen nich
 Der Sender misst denselben Wert vor Opus. Eine Zielkorrektur verlangt drei
 übereinstimmende gültige Fenster, lokale Bestätigung innerhalb 2 dB und bei
 Verstärkung mindestens 3 dB Spitzenreserve. Totband: 2 dB, Schritt: 0,5 dB
-alle 2 s, Ausgangskorrektur maximal ±6 dB. Nach 6 s ohne gültigen Hint läuft
-die Korrektur in 0,5-dB-Schritten zurück. `SendChain::tune` setzt eine langsame
+alle 2 s, Ausgangskorrektur maximal ±6 dB. Die erste Entscheidung und ein
+Richtungswechsel brauchen drei passende Fenster. Weitere Schritte brauchen
+jeweils eine vollständige Messung der bereits angewandten Korrektur.
+Sprechpausen, fehlendes Feedback und Konflikte halten die Korrektur im selben
+Gespräch; dabei werden keine weiteren Schritte erlaubt. Erst explizites
+Abschalten neutralisiert sie in 0,5-dB-Schritten je zwei Sekunden. `SendChain::tune` setzt eine langsame
 Peer-Korrektur nach dem festen Stimmkompressor und vor dem Ausgangslimiter;
 damit komprimiert der Kompressor die Korrektur nicht wieder weg. Sie wird pro
 Block weich eingeblendet. Der lokale Mikrofon-AGC behält sein Ziel; ein zweiter
@@ -171,6 +175,45 @@ Systemregler um. Solange eine Peer-Korrektur wirkt, bleibt der Ausgangslimiter
 auch bei abgeschalteter Ausgangsnormalisierung aktiv. Fehlende lokale Sprache,
 widersprechende Messung, fehlende Spitzenreserve und die Regelgrenze erscheinen
 im Peer-Status statt pauschal als aktive Regelung.
+
+### Gute Audiopegel und verständlicher Status
+
+`audio.remember_good_levels` ist standardmäßig aktiv. Die lokale Datei
+`audio-calibration.toml` enthält höchstens 16 Profile, 30 Tage gültig,
+zugeordnet über Backend und tatsächliche Mikrofon-ID. Sie enthält weder
+Audiosamples noch Geräte-/Kontodaten anderer Teilnehmer und geht nicht mit
+Passports auf andere Rechner. Dateizugriffe sind privat, atomar und durch eine
+prozessübergreifende Sperre geschützt; sie laufen außerhalb der Audiothreads.
+
+Ein Profil wird nach mindestens 20 s und fünf gültigen, lokal bestätigten
+Empfangsfenstern im Zielbereich gespeichert. Softwaregain darf höchstens
+1 dB, Peer-Korrektur höchstens 0,5 dB schwanken. Capture-Clipping,
+Softwareüberlast oder starke Limiter-Eingriffe verhindern die Speicherung
+(maximal 1 dB Limiterreduktion und 1 % begrenzte Samples). Gespeicherter
+Softwaregain bezieht sich auf den ursprünglichen Systempegel, damit dessen
+Wiederherstellung den nächsten Start nicht verfälscht.
+
+Wiederverwendung verlangt dasselbe Mikrofon, passende Verarbeitung und einen
+Systempegel innerhalb 0,5 dB des gespeicherten Ausgangswerts. Positive
+Startverstärkung ist auf 6 dB begrenzt. Eine gespeicherte Peer-Korrektur ist nur
+ein Kandidat: Erst frisches, lokal bestätigtes Feedback in derselben Richtung
+erlaubt die üblichen 0,5-dB-Schritte. Hardwarepegel werden nicht aus Profilen
+zurückgeschrieben. Ohne stabile Geräteidentität oder bei kaputtem/abgelaufenem
+Profil lernt ICU normal neu.
+
+Unter „Pegel automatisch → Details“ liegen „Gute Mikrofonpegel merken“, „Letzten guten Zustand wiederherstellen“, „Für dieses Mikrofon neu
+lernen“ und „Audio-Diagnose kopieren“. Wiederherstellen übernimmt nur die
+Klangverarbeitung: Mute, PTT, Geräte und Tastenkürzel bleiben erhalten.
+„Neu lernen“ verwirft das Geräteprofil und setzt die adaptive Verarbeitung
+zurück; eigene Systemänderungen werden weiterhin nur bedingt zurückgestellt.
+
+Der typisierte Audiostatus trennt passenden Pegel, Nachregeln, gehaltene
+Korrektur, fehlende/widersprechende Messungen und Überlast. Ein farbiges Symbol
+mit zugänglicher Klartextbeschreibung steht direkt beim Regler; die Details
+zeigen Empfängerzahl und Korrekturen. Capture-Clipping, vor RNNoise begrenzte
+Softwareverstärkung und dauerhaft begrenzter Ausgang werden getrennt benannt.
+Mehr als 3 dB Limiterreduktion über eine Sekunde geeigneter Sprache sperrt
+weitere Anhebungen. Diagnosen enthalten Zahlen und Zustände, keine Audiosamples.
 
 VAD-bestätigte Sprache steuert Mikrofon-Leveler und lokale Feedbackmessung
 auch ohne vorherige Rauschpause. Sie lernt nicht den Rauschboden an; damit
@@ -258,7 +301,7 @@ GPU-Prüfung: `cargo test --locked -p icu-client --lib overlay::` prüft unter a
 
 Kachelgröße (2026-10-02, vorher fest klein/mittel/groß = 120/240/360 px): zwei Schieberegler setzen den Kamerakachel-Durchmesser in Layout-Pixeln, je 80–480 (`config::TILE_SIZES`): „Inaktive Sprecher“ (`overlay.size`, Standard 120) und „Aktive Sprecher“ (`overlay.speaking_size`, 2026-10-03; nicht gesetzt 20 % mehr als `overlay.size`, wie vor dem Regler; kleiner als die inaktive Größe ist erlaubt, die Kachel schrumpft dann beim Sprechen). Namensschilder ohne Kamera haben jeweils 60 % davon. Die Schrift des Namens folgt dem gerade gezeichneten Durchmesser, auch während der Sprechanimation: 4 px + Durchmesser/15, mindestens 12 px (12/20/28/36 px bei 120/240/360/480; 2026-10-03, vorher 9 px + Durchmesser/40, bei großen Kacheln verschwindend klein). Eine alte `settings.toml` mit `size = "small"`/`"medium"`/`"large"` wird als 120/240/360 gelesen und als Zahl zurückgeschrieben. Eine Größenänderung legt die Layer-Surface nicht neu an, sie ändert nur ihre Größe, und zwar im selben Commit wie das erste Bild der neuen Größe; der GPU-Pfad wartet dafür auf dieses eine Bild statt es asynchron zurückzulesen (höchstens 100 ms). Vorher (2026-10-03 behoben) ging die neue Größe allein hinaus, während der GPU-Pfad beim Ziehen gar kein Bild lieferte: KWin verschob bei `corner = "top"` das alte Bild seitlich, die Höhe sprang erst nach dem Loslassen nach. Configure-Größen übernimmt die Szene nicht mehr; sie sind ohnehin die angeforderten, beim Ziehen aber teils schon veraltet.
 
-Lage und Abstand (2026-10-06): Die Plätze der Kacheln folgen ihrer gerade animierten Größe, einschließlich Namensband, mit nur 2 Layout-Pixeln Abstand. Beim Sprechen wächst oder schrumpft die Kachel weich; die folgenden Kacheln gleiten mit, statt einen dauerhaft für die maximale Sprechgröße reservierten Abstand zu lassen. Die Reihenfolge bleibt unverändert. Kacheln liegen weiterhin an der Randseite des Overlays (oben/unten und links/rechts, bei oben/unten mittig waagrecht mittig), wachsen also zur Bildschirmmitte. Der GPU-Halo-Rand (24 px) liegt um die ganze Gruppe; die Nebelränder benachbarter Kacheln dürfen überlappen und schaffen keine zusätzlichen Lücken. „Abstand zum Rand“ (0–200 px) setzt `overlay.offset` für beide Achsen gleich; getrennte ältere Werte bleiben bis zum nächsten Bewegen des Reglers erhalten.
+Lage und Abstand (2026-10-06): Die Plätze der Kacheln folgen ihrer gerade animierten Größe, einschließlich Namensband, mit nur 2 Layout-Pixeln Abstand. Beim Sprechen wächst oder schrumpft die Kachel weich; die folgenden Kacheln gleiten mit, statt einen dauerhaft für die maximale Sprechgröße reservierten Abstand zu lassen. Die Reihenfolge bleibt unverändert. Kacheln liegen weiterhin an der Randseite des Overlays (oben/unten und links/rechts, bei oben/unten mittig waagrecht mittig), wachsen also zur Bildschirmmitte. Der GPU-Halo-Rand (30 px) liegt um die ganze Gruppe; die Nebelränder benachbarter Kacheln dürfen überlappen und schaffen keine zusätzlichen Lücken. „Abstand zum Rand“ (0–200 px) setzt `overlay.offset` für beide Achsen gleich; getrennte ältere Werte bleiben bis zum nächsten Bewegen des Reglers erhalten.
 
 Eigene Kachel (`overlay.show_self`, seit 2026-10-23 standardmäßig an, ⚙ → Overlay → „Mich im Overlay zeigen“; 2026-10-02): die eigene Kachel steht nach allen anderen, nach denselben Regeln — mit eingeschalteter Kamera das eigene Bild aus dem Vorschau-Slot des Aufnahme-Threads (`CameraHandle::preview_source`, nicht gespiegelt wie die Vorschau, kein Umweg über Encoder und Server), sonst ein Namensschild, sofern „Teilnehmer ohne Kamera“ an ist; „spricht“, solange das eigene Gate offen ist (`AppState::sending`). Die eigene Kachel löst kein `VideoDisplayed` aus. Allein im Raum zeigt das Overlay mit dieser Option nur sie.
 
@@ -408,7 +451,7 @@ Die drei Karten verwenden dasselbe Raster: Überschrift, Avatar bzw. Server-Icon
 [audio]       input_device, output_device, mode = "vad"|"ptt", vad_threshold, vad_auto = true, hangover_ms = 1000, attack_ms = 40, gain_db, denoise = true, voice_opt = true, voice_strength = "medium",
               aec = true, release_ms = 150, frame_ms = 20, cue_join = true, cue_tx = false, cue_mute = true,
               normalize_incoming = true, auto_level = true, normalize_outgoing = true,
-              peer_assistance = true, tune_system_mic = true,
+              peer_assistance = true, tune_system_mic = true, remember_good_levels = true,
               muted = false   # eigene Stummschaltung, schreibt nur die Engine; gilt beim nächsten Start (2026-09-27)
 [hotkeys]     ptt = {...}, mute = {...}, deafen = {...}, toggle_mode = {...}, camera = {...}, backend = "auto"|"portal"|"evdev"
 [camera]      device, enabled = false

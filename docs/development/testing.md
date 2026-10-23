@@ -254,6 +254,37 @@ Lautstärken. Linux kann den explizit ignorierten Test
 `capture_level_roundtrip_on_virtual_source` mit `ICU_LEVEL_TEST_SOURCE` ausführen;
 dieser akzeptiert nur eigens angelegte Quellen `icu-feedback-test-*`.
 
+### Geräteprofile und Messkennungen (2026-10-23)
+
+`cargo test --locked -p icu-client --test audio_calibration` simuliert zehn
+Minuten mit langen Sprechpausen, verlorenen/doppelten/verspäteten Berichten,
+alten Audiopaketen und Richtungswechsel. Nach mindestens 90 s muss ein
+korrigierbarer ±6-dB-Fehler im 2-dB-Totband liegen; stabile Abschnitte dürfen
+über 30 s höchstens 1 dB schwanken. Ein Engine-Test stellt gute Verarbeitung
+wieder her, ohne Mute/PTT zu ändern, und löscht nur das aktuelle Geräteprofil.
+Die Bibliothekstests prüfen Dateisperre, atomare Zusammenführung, Beschädigung,
+Ablauf, geänderte Systempegel und die begrenzte Wiederverwendung.
+
+`cargo test --locked -p icu-server --test audio_feedback` prüft die Control-
+Zustellung über QUIC, Capability/Deafen und tatsächliche Audio-Kennungen.
+Server-Unit-Tests verwerfen alte Generationen, doppelte/überlappende Fenster
+und verbrauchte Stimmen. Die Opus-Kaskade verwendet denselben Server-Konsens.
+
+`cargo test --locked -p icu-client --test ui_layout last_good_audio` prüft
+Wiederherstellen und Neulernen auch bei ausgeschaltetem RNNoise. Optional
+`ICU_UI_SHOTS=<neues Verzeichnis>` für helle/dunkle Vorschauen. Für den größeren
+Corona-Saum prüft `hardware_render_and_device_loss -- --ignored --nocapture`
+GPU-Rendering, Alpha, Farbübernahme, Framebudget und Geräteverlust. Nur bei
+vorhandener Hardware-GPU ausführen; `ICU_OVERLAY_SHOTS` speichert Vorschauen.
+
+Für den nativen PipeWire-Test funktionierte auf biest.eulie.de eine eigene
+Null-Sink plus daraus remappte Quelle mit Namen `icu-feedback-test-*`.
+Eine direkt als Quelle deklarierte Null-Sink hatte keine geeigneten Capture-
+Ports; `module-null-source` war nicht verfügbar. Die Remap-Quelle erlaubte
+−1 dB, Readback und exakte Wiederherstellung. Anschließend beide eigenen
+Module entfernen und unveränderte Standardquelle sowie fehlende Test-Nodes
+prüfen. Nie ein echtes Mikrofon als Ziel des ignorierten Schreibtests verwenden.
+
 Physische Freigabe bleibt separat offen:
 
 - [ ] Linux und Windows: A spricht zu B und C, leise/normal/laut, unterschiedliche

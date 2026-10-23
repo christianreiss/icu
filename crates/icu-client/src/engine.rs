@@ -272,6 +272,8 @@ pub struct AppState {
     pub backend: &'static str,
     /// Current automatic capture and peer-assistance status.
     pub tuning_status: String,
+    pub audio_health: crate::audio::health::AudioHealth,
+    pub can_restore_audio: bool,
     /// AEC could be created.
     pub aec_available: bool,
     /// AEC statistics.
@@ -383,6 +385,10 @@ pub enum Command {
     Reconnect,
     /// Replace the settings (device change, thresholds, …); effective at once.
     UpdateSettings(Box<Settings>),
+    /// Restore processing settings only; preserve mute, PTT and devices.
+    RestoreGoodAudio,
+    /// Forget calibration of the actual microphone and restart learning.
+    ForgetGoodAudio,
     /// Mic test („Mikrofontest“) on/off: the microphone after the whole
     /// send chain — what the others would hear, before Opus — also plays
     /// locally, at unity gain, whatever the gate, mute or deafen say. Off by
@@ -654,18 +660,71 @@ struct AudioTuning {
     peer: crate::dsp::feedback::PeerTuner,
     capture_delta: f32,
     software_gain_db: f32,
+    capture_identity: Option<crate::audio::level::CaptureLevel>,
+    warm_device: Option<String>,
+    seed_gain: Option<f32>,
+    clip_until: Option<Instant>,
+    overload_until: Option<Instant>,
+    software_until: Option<Instant>,
+    heavy_samples: usize,
+    limited_samples: usize,
+    dynamics_samples: usize,
+    max_reduction: f32,
+    system_gain_db: f32,
+    force_epoch: bool,
 }
 
 fn restore_capture(shared: &Arc<Shared>, backend: &Arc<Mutex<Box<dyn AudioBackend>>>) {
     let delta = lock(&shared.system_tuner).restore(&mut **lock(backend));
-    *lock(&shared.tuning) = AudioTuning {
+    let mut tuning = AudioTuning {
         capture_delta: delta,
         ..Default::default()
     };
+    tuning
+        .peer
+        .set_epoch(shared.gain_epoch.load(Ordering::Relaxed));
+    *lock(&shared.tuning) = tuning;
 }
 
 fn tune_capture(shared: &Arc<Shared>, local: &LocalState) {
     let a = &local.settings.audio;
+    let current = lock(&local.backend)
+        .capture_level()
+        .ok()
+        .flatten()
+        .filter(|c| c.valid());
+    {
+        let mut t = lock(&shared.tuning);
+        if t.capture_identity
+            .as_ref()
+            .zip(current.as_ref())
+            .is_some_and(|(old, new)| old.device != new.device || old.revision != new.revision)
+        {
+            t.peer = Default::default();
+            t.peer.set_epoch(shared.gain_epoch.load(Ordering::Relaxed));
+            t.force_epoch = true;
+            t.warm_device = None;
+        }
+        t.capture_identity = current.clone();
+        if let Some(c) = current.as_ref() {
+            let key =
+                crate::audio::calibration::device_key(shared.state.borrow().backend, &c.device);
+            if t.warm_device.as_ref() != Some(&key) {
+                t.warm_device = Some(key.clone());
+                if a.remember_good_levels && a.auto_level && a.denoise {
+                    if let Some((gain, peer)) = local.calibration.warm_start(
+                        &key,
+                        a,
+                        c.db,
+                        crate::net::conn::unix_now().max(0) as u64,
+                    ) {
+                        t.seed_gain = Some(gain);
+                        t.peer.seed_trim(peer);
+                    }
+                }
+            }
+        }
+    }
     let enabled = a.auto_level
         && a.denoise
         && a.tune_system_mic
@@ -675,14 +734,16 @@ fn tune_capture(shared: &Arc<Shared>, local: &LocalState) {
         let mut t = lock(&shared.tuning);
         t.capture_delta += delta;
         t.capture = Default::default();
-        let status = format!(
-            "Systemregelung aus · Software {:+.1} dB · Peer {:+.1} dB ({})",
-            t.software_gain_db,
-            t.peer.offset_db,
-            t.peer.status(Instant::now())
-        );
+        t.system_gain_db = 0.0;
+        let (software_db, offset) = (t.software_gain_db, t.peer.offset_db);
         drop(t);
-        shared.state.send_modify(|s| s.tuning_status = status);
+        shared.state.send_modify(|s| {
+            s.audio_health.system_status = "Systemregelung aus".into();
+            s.audio_health.system_gain_db = 0.0;
+            s.audio_health.software_gain_db = software_db;
+            s.audio_health.peer_trim_db = offset;
+            s.tuning_status = s.audio_health.diagnostic();
+        });
         return;
     }
     let w = std::mem::take(&mut lock(&shared.tuning).capture);
@@ -697,22 +758,93 @@ fn tune_capture(shared: &Arc<Shared>, local: &LocalState) {
         );
         (delta, tuner.status.clone(), tuner.delta_db())
     };
-    let (offset, software_db, peer_status) = {
+    let (offset, software_db) = {
         let mut t = lock(&shared.tuning);
         if delta != 0.0 {
             t.capture_delta += delta;
             t.outgoing = Default::default();
             t.capture = Default::default();
         }
-        (
-            t.peer.offset_db,
-            t.software_gain_db,
-            t.peer.status(Instant::now()),
-        )
+        t.system_gain_db = system_db;
+        (t.peer.offset_db, t.software_gain_db)
     };
     shared.state.send_modify(|s| {
-        s.tuning_status = format!("{status} · System {system_db:+.1} dB · Software {software_db:+.1} dB · Peer {offset:+.1} dB ({peer_status})")
+        s.audio_health.system_status = status;
+        s.audio_health.system_gain_db = system_db;
+        s.audio_health.software_gain_db = software_db;
+        s.audio_health.peer_trim_db = offset;
+        s.tuning_status = s.audio_health.diagnostic();
     });
+}
+
+fn update_audio_health(
+    t: &mut AudioTuning,
+    measured: Option<icu_proto::AudioLevel>,
+    enabled: bool,
+    now: Instant,
+    shared: &Arc<Shared>,
+) {
+    use crate::audio::health::{AudioHealth, State};
+    let remote = t.peer.correction(now);
+    let local = measured.map(|l| l.correction_cdb as f32 / 100.0);
+    let state = if t.clip_until.is_some_and(|until| now < until) {
+        State::InputClipping
+    } else if t.overload_until.is_some_and(|until| now < until) {
+        State::Limited
+    } else if t.software_until.is_some_and(|until| now < until) {
+        State::SoftwareOverload
+    } else if !shared.dsp.auto_level.load(Ordering::Relaxed)
+        || !shared.dsp.denoise.load(Ordering::Relaxed)
+    {
+        State::Disabled
+    } else if !enabled {
+        State::LocalOnly
+    } else if t.peer.conflicting(now) {
+        State::Conflicting
+    } else if remote.is_none() && t.peer.offset_db != 0.0 {
+        State::Held
+    } else if remote.is_none() {
+        State::NoFeedback
+    } else if measured.is_none() && t.peer.offset_db != 0.0 {
+        State::Held
+    } else if measured.is_none() {
+        State::NoLocalSpeech
+    } else if local
+        .zip(remote)
+        .is_some_and(|(l, r)| (l - r).abs() > 2.0 || (r.abs() > 2.0 && l.signum() != r.signum()))
+    {
+        State::Conflicting
+    } else if remote.is_some_and(|r| r.abs() <= 2.0) {
+        State::Good
+    } else if t.peer.status(now) == "Regelgrenze" {
+        State::Bound
+    } else {
+        State::Adjusting
+    };
+    let fraction = t.limited_samples as f32 / t.dynamics_samples.max(1) as f32;
+    let mut health = AudioHealth {
+        state,
+        reporters: t.peer.reporters(),
+        local_correction_db: local,
+        remote_correction_db: remote,
+        software_gain_db: t.software_gain_db,
+        peer_trim_db: t.peer.offset_db,
+        limiter_reduction_db: t.max_reduction,
+        limited_fraction: fraction,
+        feedback_age_secs: t.peer.hint_age_secs(now),
+        ..Default::default()
+    };
+    health.system_gain_db = t.system_gain_db;
+    shared.state.send_modify(|s| {
+        health.profile_saved = s.can_restore_audio;
+        health.profile_saved_at = s.audio_health.profile_saved_at;
+        health.system_status = s.audio_health.system_status.clone();
+        s.tuning_status = health.diagnostic();
+        s.audio_health = health;
+    });
+    t.limited_samples = 0;
+    t.dynamics_samples = 0;
+    t.max_reduction = 0.0;
 }
 
 /// Shared between all engine threads.
@@ -782,6 +914,7 @@ struct Shared {
     tuning: Mutex<AudioTuning>,
     system_tuner: Mutex<crate::audio::level::SystemTuner>,
     feedback_capable: AtomicBool,
+    gain_epoch: AtomicU32,
 }
 
 /// Received video, tagged with the connection it belongs to. Session IDs
@@ -929,6 +1062,8 @@ impl Engine {
             active_output: None,
             backend: backend_name,
             tuning_status: String::new(),
+            audio_health: Default::default(),
+            can_restore_audio: false,
             aec_available: false,
             aec_stats: AecStats::default(),
             aec_reference: false,
@@ -983,6 +1118,7 @@ impl Engine {
             tuning: Mutex::new(AudioTuning::default()),
             system_tuner: Mutex::new(crate::audio::level::SystemTuner::default()),
             feedback_capable: AtomicBool::new(false),
+            gain_epoch: AtomicU32::new(0),
             video_tier: AtomicU8::new(VideoTier::T0.as_u8()),
         });
 
@@ -1638,6 +1774,8 @@ fn dsp_thread(
     let mut diagnosis = crate::dsp::aec::Diagnosis::default();
     let mut aec_was_on = false;
     let mut loss_applied = 0u32;
+    let mut applied_send: Option<SendSettings> = None;
+    let mut applied_peer = 0.0;
     let start = Instant::now();
     let mut tone_ticks: u64 = 0;
 
@@ -1676,6 +1814,7 @@ fn dsp_thread(
                     a.reinitialize();
                 }
                 chain.restart();
+                applied_send = None;
                 *lock(&shared.tuning) = AudioTuning::default();
             }
             // Bound the backlog: after a stall of this thread, everything
@@ -1821,10 +1960,29 @@ fn dsp_thread(
             normalize_outgoing: ctl.normalize_outgoing.load(Ordering::Relaxed),
         };
         if let Ok(mut tuning) = shared.tuning.try_lock() {
-            chain.tune(
-                tuning.peer.offset_db,
-                std::mem::take(&mut tuning.capture_delta),
-            );
+            let delta = std::mem::take(&mut tuning.capture_delta);
+            let seed = tuning.seed_gain.take();
+            let force_epoch = std::mem::take(&mut tuning.force_epoch);
+            if applied_send != Some(send)
+                || applied_peer != tuning.peer.offset_db
+                || delta != 0.0
+                || seed.is_some()
+                || force_epoch
+            {
+                let epoch = shared
+                    .gain_epoch
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1);
+                tuning.peer.set_epoch(epoch);
+                tuning.outgoing = Default::default();
+                preroll.clear();
+                applied_send = Some(send);
+                applied_peer = tuning.peer.offset_db;
+            }
+            chain.tune(tuning.peer.offset_db, delta);
+            if let Some(db) = seed {
+                chain.warm_start(db);
+            }
         }
         let Analysis { prob, level } = chain.analyze(&mut block, &send);
         ctl.level_peak.store(level.peak_db);
@@ -1861,8 +2019,34 @@ fn dsp_thread(
         {
             if let Ok(mut tuning) = shared.tuning.try_lock() {
                 tuning.software_gain_db = chain.gains_db().0;
+                let now = Instant::now();
+                let dynamics = chain.dynamics();
+                if raw_capture.iter().any(|x| x.is_finite() && x.abs() >= 0.99) {
+                    tuning.clip_until = Some(now + Duration::from_secs(10));
+                }
+                if dynamics.headroom_limited {
+                    tuning.software_until = Some(now + Duration::from_secs(3));
+                }
+                if voice {
+                    tuning.dynamics_samples += dynamics.samples;
+                    tuning.limited_samples += dynamics.limited_samples;
+                    tuning.max_reduction = tuning.max_reduction.max(dynamics.reduction_db);
+                    if dynamics.reduction_db > 3.0 {
+                        tuning.heavy_samples += dynamics.samples;
+                    } else {
+                        tuning.heavy_samples = 0;
+                    }
+                    if tuning.heavy_samples >= 48_000 {
+                        tuning.overload_until = Some(now + Duration::from_secs(10));
+                    }
+                }
                 if raw_capture.iter().all(|x| x.is_finite()) {
-                    tuning.outgoing.observe(&block, Some(voice));
+                    tuning.outgoing.observe_at(
+                        &block,
+                        Some(voice),
+                        shared.gain_epoch.load(Ordering::Relaxed),
+                        ts.wrapping_add(frame_acc.len() as u32),
+                    );
                 }
                 tuning
                     .capture
@@ -2139,6 +2323,7 @@ fn send_audio(
     t_block: Instant,
 ) {
     let header = AudioHeader {
+        gain_epoch: shared.gain_epoch.load(Ordering::Relaxed),
         flags,
         speaker: 0,
         seq,
@@ -2246,7 +2431,8 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
                             let n = sp.decoder.decode(&p.payload, &mut fec_scratch).unwrap_or(0);
                             DebugStats::inc(&stats.frames_decoded);
                             if !deafened && sp.user_id != 0 {
-                                sp.feedback.observe(&fec_scratch[..n], None);
+                                sp.feedback
+                                    .observe_at(&fec_scratch[..n], None, p.gain_epoch, p.ts);
                             }
                             sp.quiet = frame_quiet(&fec_scratch[..n]);
                             queue_decoded(sp, n, &fec_scratch, false);
@@ -2485,10 +2671,13 @@ async fn net_task(
         muted_before_deafen: false,
         notifier: crate::notify::Notifier::default(),
         trial: None,
+        calibration: blocking(|| crate::audio::calibration::Store::load(&cfg.paths)),
+        calibration_learner: Default::default(),
         corona_seen: cfg.settings.overlay.frame_color,
         corona_pending: None,
     };
     local.update_viewing();
+    blocking(|| tune_capture(&shared, &local));
     let mut attempt: u32 = 0;
     let mut first = true;
     loop {
@@ -2799,6 +2988,8 @@ fn reconnect_with_new_identity() -> SessionEnd {
 }
 
 struct LocalState {
+    calibration: crate::audio::calibration::Store,
+    calibration_learner: crate::audio::calibration::Learner,
     flags: UserFlags,
     video_viewers: HashMap<Session, Instant>,
     last_display_report: HashMap<Session, Instant>,
@@ -3005,6 +3196,86 @@ async fn maybe_auto_renew(
 }
 
 impl LocalState {
+    fn current_audio_device(&self, shared: &Arc<Shared>) -> Option<String> {
+        let current = blocking(|| lock(&self.backend).capture_level().ok().flatten())
+            .filter(|c| c.valid())?;
+        Some(crate::audio::calibration::device_key(
+            shared.state.borrow().backend,
+            &current.device,
+        ))
+    }
+
+    fn learn_audio(
+        &mut self,
+        shared: &Arc<Shared>,
+        measured: Option<icu_proto::AudioLevel>,
+        enabled: bool,
+        now: Instant,
+    ) {
+        let (identity, gain, peer, remote, safe) = {
+            let t = lock(&shared.tuning);
+            (
+                t.capture_identity.clone(),
+                t.software_gain_db,
+                t.peer.offset_db,
+                t.peer.correction(now),
+                t.clip_until.is_none_or(|until| now >= until)
+                    && t.overload_until.is_none_or(|until| now >= until)
+                    && t.software_until.is_none_or(|until| now >= until),
+            )
+        };
+        let Some(identity) = identity else {
+            self.calibration_learner.reset();
+            return;
+        };
+        let key =
+            crate::audio::calibration::device_key(shared.state.borrow().backend, &identity.device);
+        let unix = crate::net::conn::unix_now().max(0) as u64;
+        let saved_at = self.calibration.profile(&key, unix).map(|p| p.saved_at);
+        let available = saved_at.is_some();
+        shared.state.send_modify(|s| {
+            s.can_restore_audio = available;
+            s.audio_health.profile_saved = available;
+            s.audio_health.profile_saved_at = saved_at;
+        });
+        if !enabled || !self.settings.audio.remember_good_levels {
+            self.calibration_learner.reset();
+            return;
+        }
+        let Some(level) = measured else {
+            return;
+        };
+        let health = shared.state.borrow().audio_health.clone();
+        let good = safe
+            && !identity.muted
+            && level.valid()
+            && level.near_full_permille == 0
+            && remote.is_some_and(|r| {
+                r.abs() <= 2.0 && (r - level.correction_cdb as f32 / 100.0).abs() <= 2.0
+            })
+            && health.limiter_reduction_db <= 1.0
+            && health.limited_fraction <= 0.01;
+        let system_delta = lock(&shared.system_tuner).delta_db();
+        let profile = crate::audio::calibration::Profile {
+            device: key,
+            saved_at: unix,
+            settings: crate::audio::calibration::ProcessingSettings::from(&self.settings.audio),
+            capture_db: identity.db - system_delta,
+            mic_gain_db: (gain + system_delta).clamp(-15.0, 15.0),
+            peer_trim_db: peer,
+        };
+        if let Some(profile) = self.calibration_learner.observe(profile, good, now) {
+            match self.calibration.save_profile(&self.paths, profile, unix) {
+                Ok(()) => shared.state.send_modify(|s| {
+                    s.can_restore_audio = true;
+                    s.audio_health.profile_saved = true;
+                    s.audio_health.profile_saved_at = Some(unix);
+                }),
+                Err(e) => tracing::warn!(error=%e,"cannot save last good audio calibration"),
+            }
+        }
+    }
+
     /// Recomputes `UserFlags::VIEWING` (overlay on or main window visible)
     /// and `UserFlags::PTT` (the talk mode). Returns `true` when a bit
     /// changed and `SetState` is due.
@@ -3137,6 +3408,51 @@ impl LocalState {
                     }
                 });
                 set_state = self.commit_settings(shared, false);
+            }
+            Command::RestoreGoodAudio => {
+                let device = self.current_audio_device(shared);
+                if let Some(profile) = device
+                    .and_then(|key| {
+                        self.calibration
+                            .profile(&key, crate::net::conn::unix_now().max(0) as u64)
+                    })
+                    .cloned()
+                {
+                    let mut restored = self.settings.clone();
+                    profile.settings.restore(&mut restored.audio);
+                    restore_capture(shared, &self.backend);
+                    set_state = self.replace_settings(restored, shared);
+                    shared.dsp.reinit_aec.store(true, Ordering::Relaxed);
+                }
+            }
+            Command::ForgetGoodAudio => {
+                let device = self.current_audio_device(shared);
+                let mut failed = false;
+                if let Some(key) = device {
+                    if let Err(e) = blocking(|| {
+                        self.calibration.forget(
+                            &self.paths,
+                            &key,
+                            crate::net::conn::unix_now().max(0) as u64,
+                        )
+                    }) {
+                        tracing::warn!(error=%e,"cannot forget audio calibration");
+                        failed = true;
+                        shared.state.send_modify(|s| {
+                            s.banner = Some(crate::problem::storage("Das Audio-Profil", &e))
+                        });
+                    }
+                }
+                if !failed {
+                    self.calibration_learner.reset();
+                    restore_capture(shared, &self.backend);
+                    shared.dsp.reinit_aec.store(true, Ordering::Relaxed);
+                    shared.state.send_modify(|s| {
+                        s.can_restore_audio = false;
+                        s.audio_health.profile_saved = false;
+                        s.audio_health.profile_saved_at = None;
+                    });
+                }
             }
             Command::UpdateSettings(new) => {
                 set_state = self.replace_settings(*new, shared);
@@ -3344,6 +3660,16 @@ impl LocalState {
         let reopen = new.audio.input_device != old.input_device
             || new.audio.output_device != old.output_device
             || new.audio.aec != old.aec;
+        if crate::audio::calibration::ProcessingSettings::from(&new.audio)
+            != crate::audio::calibration::ProcessingSettings::from(old)
+        {
+            self.calibration_learner.reset();
+            let mut t = lock(&shared.tuning);
+            t.peer = Default::default();
+            t.peer.set_epoch(shared.gain_epoch.load(Ordering::Relaxed));
+            t.force_epoch = true;
+            t.outgoing = Default::default();
+        }
         self.settings = new;
         self.commit_settings(shared, reopen)
     }
@@ -4108,18 +4434,25 @@ async fn run_session(
             _ = loss_tick.tick() => {
                 let now = Instant::now();
                 let enabled = local.settings.audio.auto_level && local.settings.audio.denoise
-                    && local.settings.audio.peer_assistance && !shared.dsp.muted.load(Ordering::Relaxed)
-                    && !shared.dsp.test_tone.load(Ordering::Relaxed);
+                    && local.settings.audio.peer_assistance;
+                let may_measure=!shared.dsp.muted.load(Ordering::Relaxed) && !shared.dsp.test_tone.load(Ordering::Relaxed);
                 {
                     let mut t = lock(&shared.tuning);
-                    let measured = t.outgoing.take();
+                    let measured=t.outgoing.take_window().filter(|(_,w)|may_measure && w.gain_epoch==t.peer.epoch()).map(|(l,_)|l);
+                    let overloaded=t.overload_until.is_some_and(|until|now<until)
+                        || t.clip_until.is_some_and(|until|now<until)
+                        || t.software_until.is_some_and(|until|now<until);
+                    t.peer.block_boost(overloaded);
                     t.peer.tick(measured, enabled, now);
+                    update_audio_health(&mut t, measured, enabled, now, shared);
+                    drop(t);
+                    blocking(|| local.learn_audio(shared, measured, enabled, now));
                 }
                 let levels: Vec<_> = lock(&shared.speakers).iter_mut()
-                    .filter_map(|(speaker, sp)| sp.feedback.take().map(|level| (*speaker,level))).collect();
+                    .filter_map(|(speaker, sp)| sp.feedback.take_window().map(|(level,window)| (*speaker,level,window))).collect();
                 if shared.feedback_capable.load(Ordering::Relaxed) && !shared.deafened.load(Ordering::Relaxed) {
-                    for (speaker,level) in levels {
-                        if conn::write_msg(&mut send, &ControlMsg::AudioLevelReport { speaker,level }).await.is_err() { break; }
+                    for (speaker,level,window) in levels {
+                        if conn::write_msg(&mut send, &ControlMsg::AudioLevelReport { speaker,level,window }).await.is_err() { break; }
                     }
                 }
 
@@ -4479,6 +4812,7 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                 let late = sp.jitter.stats().late;
                 sp.jitter.push(
                     Packet {
+                        gain_epoch: header.gain_epoch,
                         seq: header.seq,
                         ts: header.ts,
                         end: header.end(),
@@ -4817,11 +5151,18 @@ async fn handle_control(
                     .send_modify(|s| s.banner = Some(crate::problem::from_code(code, &detail)));
             }
         }
-        ControlMsg::AudioLevelHint { correction_cdb, .. } => {
+        ControlMsg::AudioLevelHint {
+            window,
+            correction_cdb,
+            reporters,
+        } => {
             if shared.feedback_capable.load(Ordering::Relaxed) {
-                lock(&shared.tuning)
-                    .peer
-                    .hint(correction_cdb, Instant::now());
+                lock(&shared.tuning).peer.hint_window(
+                    window,
+                    correction_cdb,
+                    reporters,
+                    Instant::now(),
+                );
             }
         }
         ControlMsg::LossHint { loss_permille } => {

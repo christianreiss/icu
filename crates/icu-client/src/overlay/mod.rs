@@ -47,7 +47,7 @@ mod gpu;
 /// [`scaled`] like every other overlay dimension so it tracks DPI and tile
 /// size instead of sitting fixed while everything around it grows/shrinks.
 const GAP: u32 = 2;
-const BORDER: u32 = 3;
+const BORDER: u32 = 4;
 /// Gap between a tile's border ring and its outside name-label band: flush,
 /// so the paper tag reads as attached to the tile rather than floating near
 /// it.

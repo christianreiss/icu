@@ -26,3 +26,28 @@ impl AudioLevel {
             && (1000..=2200).contains(&self.speech_ms)
     }
 }
+
+/// Identity and sender sample-clock bounds of one independent observation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioWindow {
+    /// Applied sender gain generation.
+    pub gain_epoch: u32,
+    /// First sender sample in this window.
+    pub first_ts: u32,
+    /// Exclusive last sample, including intervening non-speech samples.
+    pub end_ts: u32,
+    /// Monotonic observation identity per reporter and source.
+    pub report_id: u32,
+}
+impl AudioWindow {
+    /// Window spans one to 2.2 seconds on the sender clock.
+    pub fn valid(self) -> bool {
+        (48_000..=105_600).contains(&self.end_ts.wrapping_sub(self.first_ts))
+    }
+    /// Distinct, non-overlapping observation in the same generation.
+    pub fn newer_than(self, previous: Self) -> bool {
+        self.gain_epoch == previous.gain_epoch
+            && self.report_id.wrapping_sub(previous.report_id) as i32 > 0
+            && self.first_ts.wrapping_sub(previous.end_ts) as i32 >= 0
+    }
+}

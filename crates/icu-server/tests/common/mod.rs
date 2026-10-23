@@ -480,6 +480,7 @@ impl Client {
     /// Sends one audio datagram with explicit flags.
     pub fn send_audio_flags(&self, seq: u16, ts: u32, payload: &[u8], flags: u8) {
         let header = AudioHeader {
+            gain_epoch: 0,
             flags,
             speaker: 0,
             seq,

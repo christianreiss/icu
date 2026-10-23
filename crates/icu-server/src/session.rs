@@ -1191,12 +1191,17 @@ async fn control_loop(
             ControlMsg::Ping { nonce } => {
                 server.room.send_to(session, &pong(nonce));
             }
-            ControlMsg::AudioLevelReport { speaker, level } => {
+            ControlMsg::AudioLevelReport {
+                speaker,
+                level,
+                window,
+            } => {
                 if server.room.feedback_eligible(session, speaker) {
                     lock(&server.audio_feedback).report(
                         session,
                         speaker,
                         level,
+                        window,
                         std::time::Instant::now(),
                     );
                 }

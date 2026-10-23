@@ -587,13 +587,13 @@ impl SetupView {
                     |ui| widgets::named_toggle(ui, &mut audio.aec, "Echo-Unterdrückung"),
                 )
             });
-            ui.add_enabled_ui(audio.denoise, |ui| {
+            ui.add_enabled_ui(true, |ui| {
                 widgets::setting_row(
                     ui,
                     true,
                     "Pegel automatisch",
                     Some("Regelt dein Mikrofon nach, wenn du zu leise oder zu laut bist."),
-                    |ui| widgets::autotune_control(ui, audio, &state.tuning_status),
+                    |ui| widgets::autotune_control(ui, audio, state, cmds),
                 )
             });
             widgets::setting_row(

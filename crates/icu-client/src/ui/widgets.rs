@@ -690,11 +690,49 @@ pub fn action_capsule(ui: &mut Ui, buttons: &[CapsuleButton<'_>]) -> Vec<egui::R
 pub fn autotune_control(
     ui: &mut Ui,
     audio: &mut crate::config::AudioSettings,
-    status: &str,
+    state: &crate::engine::AppState,
+    cmds: &mut Vec<crate::engine::Command>,
 ) -> egui::Response {
-    let toggle = named_toggle(ui, &mut audio.auto_level, "Pegel automatisch");
+    let status = &state.tuning_status;
+    let toggle = ui
+        .add_enabled_ui(audio.denoise, |ui| {
+            named_toggle(ui, &mut audio.auto_level, "Pegel automatisch")
+        })
+        .inner;
+    use crate::audio::health::State;
+    let (symbol, color) = match state.audio_health.state {
+        State::Good => ("✓", egui::Color32::from_rgb(50, 160, 95)),
+        State::InputClipping | State::Limited | State::SoftwareOverload => {
+            ("!", egui::Color32::from_rgb(220, 75, 65))
+        }
+        State::Held | State::Disabled => ("Ⅱ", ui.visuals().weak_text_color()),
+        _ => ("…", egui::Color32::from_rgb(200, 150, 45)),
+    };
+    ui.label(egui::RichText::new(symbol).color(color))
+        .on_hover_text(state.audio_health.text())
+        .widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Label,
+                ui.is_enabled(),
+                state.audio_health.text(),
+            )
+        });
     ui.menu_button("Details",|ui| {
-        ui.set_max_width(320.0);
+        ui.set_max_width(360.0);
+        ui.label(state.audio_health.text());
+        if let Some(age)=state.audio_health.feedback_age_secs { ui.small(format!("Empfangsmessung vor {age:.1} s")); }
+        if let Some(at)=state.audio_health.profile_saved_at {
+            if let Ok(date)=time::OffsetDateTime::from_unix_timestamp(at as i64) { ui.small(format!("Guter Zustand gespeichert: {}",date.date())); }
+        }
+        ui.checkbox(&mut audio.remember_good_levels,"Gute Mikrofonpegel merken");
+        if ui.add_enabled(state.can_restore_audio,egui::Button::new("Letzten guten Zustand wiederherstellen")).clicked() {
+            cmds.push(crate::engine::Command::RestoreGoodAudio); ui.close();
+        }
+        if ui.button("Für dieses Mikrofon neu lernen").clicked() {
+            cmds.push(crate::engine::Command::ForgetGoodAudio); ui.close();
+        }
+        if ui.button("Audio-Diagnose kopieren").clicked() { ui.ctx().copy_text(state.audio_health.diagnostic()); }
+        ui.separator();
         ui.add_enabled_ui(audio.auto_level && audio.denoise, |ui| {
             ui.checkbox(&mut audio.peer_assistance,"Pegel mit Empfangsfeedback")
                 .on_hover_text("Empfänger bestätigen deinen Sprachpegel vor ihren eigenen Lautstärkereglern.");
@@ -1112,7 +1150,7 @@ pub fn avatar(
     // The ring sits outside the circle; reserving room for it keeps the row
     // from shifting when somebody starts talking.
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(size + 6.0, size + 6.0), Sense::hover());
+        ui.allocate_exact_size(egui::vec2(size + 8.0, size + 8.0), Sense::hover());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let center = rect.center();
@@ -1162,7 +1200,7 @@ pub fn avatar(
         if speaking {
             let tok = theme::tokens(ui.visuals());
             let color = ring.unwrap_or(tok.accent);
-            painter.circle_stroke(center, size / 2.0 + 2.0, Stroke::new(2.0, color));
+            painter.circle_stroke(center, size / 2.0 + 2.25, Stroke::new(2.5, color));
         }
     }
     response

@@ -742,6 +742,7 @@ fn voice_optimizer_presets_differ_through_the_chain() {
 
 /// Two independent decoders report pre-volume levels to the same sender.
 /// The third client has a very different listening volume; it must not steer A.
+#[cfg(unix)]
 #[test]
 fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
     use icu_client::dsp::feedback::{Measurement, PeerTuner};
@@ -777,8 +778,16 @@ fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
         let mut last_correction = 0.0;
         let mut max_peak = 0.0f32;
         let mut reports = 0;
+        let mut epoch = 1u32;
+        let mut applied_trim = 0.0;
+        tuner.set_epoch(epoch);
         for (i, input) in mic.samples.chunks(BLOCK).enumerate() {
             let mut block = input.to_vec();
+            if applied_trim != tuner.offset_db {
+                epoch += 1;
+                tuner.set_epoch(epoch);
+                applied_trim = tuner.offset_db;
+            }
             chain.tune(tuner.offset_db, 0.0);
             let a = chain.analyze(&mut block, &settings);
             let speech = vad::is_voice(0.5, a.prob, a.level);
@@ -786,38 +795,51 @@ fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
             for sample in &mut block {
                 *sample *= post_gain;
             }
-            local.observe(&block, Some(speech));
+            local.observe_at(&block, Some(speech), epoch, (i * BLOCK) as u32);
             pcm.extend_from_slice(&block);
             max_peak = block.iter().fold(max_peak, |p, x| p.max(x.abs()));
             if pcm.len() == FRAME {
                 let packet = encoder.encode(&pcm).unwrap();
                 let n = b.decode(packet, &mut decoded).unwrap();
-                bm.observe(&decoded[..n], None);
+                let frame_ts = ((i + 1) * BLOCK - FRAME) as u32;
+                let header = icu_proto::AudioHeader {
+                    gain_epoch: epoch,
+                    ts: frame_ts,
+                    ..Default::default()
+                };
+                feedback.observe_audio(1, header, now + Duration::from_millis((i + 1) as u64 * 10));
+                bm.observe_at(&decoded[..n], None, epoch, frame_ts);
                 rx.process(&mut decoded[..n]);
                 for x in &mut decoded[..n] {
                     *x *= volume;
                 }
                 let n = c.decode(packet, &mut decoded).unwrap();
-                cm.observe(&decoded[..n], None);
+                cm.observe_at(&decoded[..n], None, epoch, frame_ts);
                 pcm.clear();
             }
             if (i + 1) % 200 == 0 {
                 let own = local.take();
-                let bl = bm.take();
-                let cl = cm.take();
+                let bl = bm.take_window();
+                let cl = cm.take_window();
                 assert_eq!(bl, cl, "playback volume must not enter feedback");
                 let t = now + Duration::from_millis((i + 1) as u64 * 10);
-                if let Some(l) = bl {
+                if let Some((l, window)) = bl {
                     reports += 1;
                     last_correction = l.correction_cdb as f32 / 100.0;
-                    feedback.report(2, 1, l, t);
-                    feedback.report(3, 1, cl.unwrap(), t);
+                    feedback.report(2, 1, l, window, t);
+                    feedback.report(3, 1, cl.unwrap().0, cl.unwrap().1, t);
                 }
                 for (speaker, hint) in feedback.tick(t, |_, _| true) {
-                    if let (1, icu_proto::ControlMsg::AudioLevelHint { correction_cdb, .. }) =
-                        (speaker, hint)
+                    if let (
+                        1,
+                        icu_proto::ControlMsg::AudioLevelHint {
+                            window,
+                            correction_cdb,
+                            reporters,
+                        },
+                    ) = (speaker, hint)
                     {
-                        tuner.hint(correction_cdb, t);
+                        tuner.hint_window(window, correction_cdb, reporters, t);
                     }
                 }
                 tuner.tick(own, assisted, t);

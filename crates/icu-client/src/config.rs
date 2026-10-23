@@ -111,6 +111,8 @@ pub struct AudioSettings {
     pub auto_level: bool,
     /// Peer measurements refine automatic leveling.
     pub peer_assistance: bool,
+    /// Save bounded device-local last-known-good calibration.
+    pub remember_good_levels: bool,
     /// Temporarily tune system capture volume; restore on call end.
     pub tune_system_mic: bool,
     /// RNNoise on.
@@ -161,6 +163,7 @@ impl Default for AudioSettings {
             gain_db: 0.0,
             auto_level: true,
             peer_assistance: true,
+            remember_good_levels: true,
             tune_system_mic: true,
             denoise: true,
             aec: true,

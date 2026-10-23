@@ -19,7 +19,7 @@ Stand 2026-09-20. Abgeleitet aus `docs/research/transport.md`, `docs/history/wir
 | Datagram-Puffer | `datagram_receive_buffer_size` = 64 KiB auf beiden Seiten; `datagram_send_buffer_size` Server 64 KiB (die Sendewarteschlange trägt die Audio aller Sprecher an einen Empfänger), Client **8 KiB** (2026-09-24; nur die eigene Audio, 20–50 Pakete = 0,4–1 s). `send_datagram` verwirft bei vollem Puffer das älteste Datagram: 64 KiB wären beim Client 3–8 s Audio gewesen, die nach einem Netzhänger verspätet ankämen, der Jitter-Buffer des Empfängers (Klemme 200 ms, `drain_backlog`) sowieso verwirft und die als Burst das Ratenlimit des Servers (110/s) reißen. |
 | Streams | Client eröffnet genau einen bidirektionalen Control-Stream (der Server lässt nur einen zu, `max_concurrent_bidi_streams` = 1). Video: ein unidirektionaler Stream pro Frame, in beide Richtungen. `max_concurrent_uni_streams` = `2 × max_users + 4` pro Richtung: der Server setzt ihn aus seiner Config (bei `max_users` = 16 also 36), der Client mit der Obergrenze 64, also 132 — beim Handshake kennt er `max_users` noch nicht (2026-09-27 an den Code angeglichen). Server→Client-Uni-Streams trägt nur Video, und der Server hält je Sender und Empfänger höchstens `VIDEO_UNACKED_PER_PAIR` (2) Frames unbestätigt (§4); mehr als 2 × (Sender) Streams braucht ein Empfänger also nur kurz, bis er gelesene Streams freigibt. Das Protokoll deckelt die Zahl gleichzeitig aktiver Kameras nicht. |
 | Flusskontrolle | Server: `stream_receive_window` 64 KiB, `receive_window` 1 MiB je Verbindung, `send_window` 1 MiB (2026-09-26; quinns Defaults waren 1,25 MB je Stream und unbegrenzt je Verbindung, ein Teilnehmer konnte mit 36 Video-Streams ~47 MB Serverspeicher binden). Das ist Flusskontrolle, keine Größengrenze: ein Video-Frame von 512 KiB fließt fensterweise. Streams, die der Server nie liest (renew-only- und Registrierungssitzungen, §2.3), zählen gegen das Verbindungsfenster. |
-| Datagram-Größe | Laufzeitwert `max_datagram_size()` (Spike 2: 1162 B nach Handshake, 1414 B nach MTU-Discovery; mit dem Com-Tag endet die MTU-Discovery 16 B früher, also bei 1398 B, 2026-09-27). Audio-Datagrams sind ≤ 410 B. |
+| Datagram-Größe | Laufzeitwert `max_datagram_size()` (Spike 2: 1162 B nach Handshake, 1414 B nach MTU-Discovery; mit dem Com-Tag endet die MTU-Discovery 16 B früher, also bei 1398 B, 2026-09-27). Audio-Datagrams sind ≤ 414 B. |
 
 **Verbunden heißt `Welcome` empfangen.** Auf Client-Seite liefert `connect().await` auch dann `Ok`, wenn der Server das Client-Cert gleich darauf ablehnt (Spike 2). Der Client darf vor `Welcome` weder Audio senden noch „verbunden“ anzeigen.
 
@@ -113,8 +113,8 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | 35 | `UserRestrictionChanged` | S→C | `muted: bool`, `deafened: bool` | **Unicast** an alle eigenen Sitzungen des betroffenen Nutzers, bei jeder Änderung und direkt nach `Welcome`, solange eine Einschränkung besteht. Meldet, was durchgesetzt wird: bei `deafened` ist auch `muted` gesetzt (Nr. 33). Der Client schaltet sich stumm/taub und verweigert das Aufheben, bis ein Admin es aufhebt. |
 
 
-| 36 | `AudioLevelReport` | C→S | `speaker: Session`, `level: AudioLevel` | Optional, Capability Bit 0; Sprachpegel nach regulärem Opus-Decode, vor Normalisierung und Benutzerlautstärke. |
-| 37 | `AudioLevelHint` | S→C | `correction_cdb: Option<i16>`, `reporters: u16` | Optional, Capability Bit 0; Median-Korrektur für den eigenen Sender, `None` bei fehlender Einigung oder abgelaufenen Messungen. |
+| 36 | `AudioLevelReport` | C→S | `speaker: Session`, `level: AudioLevel`, `window: AudioWindow` | Optional, Capability Bit 0; Sprachpegel nach regulärem Opus-Decode, vor Normalisierung und Benutzerlautstärke. |
+| 37 | `AudioLevelHint` | S→C | `correction_cdb: Option<i16>`, `reporters: u16`, `window: AudioWindow` | Optional, Capability Bit 0; Median-Korrektur für den eigenen Sender, `None` bei fehlender Einigung oder abgelaufenen Messungen. |
 | 38 | `PeerCertificateRequest` | C→S | `session: u16` | Ab Minor 3: öffentliches Zertifikat einer aktuell anwesenden Sitzung abfragen. Reguläre Raumteilnehmer, unter dem Control-Ratenlimit; Registrierung und Renewal-only sind ausgeschlossen. |
 | 39 | `PeerCertificateResponse` | S→C | `session: u16`, `certificate_der: Option<Vec<u8>>` | Unicast-Antwort mit dem tatsächlich im TLS-Handshake dieser Sitzung verwendeten Leaf (DER, max. 8192 Bytes). `None` bei abwesender Sitzung oder nicht verfügbarem/zu großem Zertifikat. Keine privaten Schlüssel. Die Sitzung wird vom Server zugeordnet; Empfänger prüfen die Signatur gegen ihre lokale CA und die verfügbare signierte CRL. |
 | 40 | `VideoDisplayed` | C→S | `speaker: Session` | Ab Minor 4: der Client hat ein frisches Bild dieses Senders im Overlay zur Anzeige übergeben (der Hauptfenster-Vorschau-Avatar in der Teilnehmerliste meldet dies nicht — reine Vorschau, keine bestätigte Anzeige). Höchstens ein Bericht je Sekunde und Sender. Der Server akzeptiert ihn nur von einem aktuellen, nicht administrativ taubgeschalteten Videoempfänger bei eingeschalteter Senderkamera. |
@@ -124,13 +124,32 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 
 **Empfangsfeedback (2026-09-28):** `AudioLevel` enthält in dieser Reihenfolge `level_cdb: i16`, `correction_cdb: i16`, `peak_cdb: i16`, `near_full_permille: u16`, `speech_ms: u16`. Pegel/Spitze sind Centi-dBFS, Korrektur Centi-dB. Grenzen: Pegel −10000…1200, Korrektur −1200…1200, Spitze −10000…2400, Anteil 0…1000, Sprachdauer 1000…2200 ms. Bericht alle 2 s, nur bei mindestens 1 s geeigneter Sprache; keine Stille, NaN, PLC/FEC oder künstliche Jitter-Ausgabe. Die Spitze ist ein Clipping-Indiz, kein Beweis für dessen Ursache.
 
+**Messzuordnung ab Minor 6 (2026-10-23):** `AudioWindow` enthält in dieser
+Reihenfolge `gain_epoch: u32`, `first_ts: u32`, `end_ts: u32` (exklusiv) und
+`report_id: u32`. Zeitgrenzen beziehen sich auf die 48-kHz-Sample-Clock des
+Senders; das Fenster umfasst 48000…105600 Samples. Nur reguläre Audiopakete
+mit derselben Kennung dürfen in ein Fenster eingehen. Nach einem Wechsel
+werden 200 ms zum Einschwingen ausgeschlossen. Die Kennung ändert sich bei
+bewussten Pegel-/Verarbeitungseingriffen, nicht bei jeder AGC-Bewegung.
+Der Server leitet die aktuelle Kennung ausschließlich aus zugelassenem Audio
+ab. Er verwirft alte Kennungen, wiederholte/überlappende Fenster und Berichte,
+deren Ende mehr als sechs Sekunden hinter dem letzten Audiosample liegt
+(maximal 5760 Samples Vorlauf für den letzten decodierten Frame). Weitere
+Empfänger desselben Zeitfensters erzeugen keine zusätzlichen Bestätigungen.
+Hints tragen das neu ausgewertete Fenster; der Sender akzeptiert nur seine
+aktuelle Kennung. Ein Schritt darf erst auf ein vollständiges neues Fenster
+nach der vorherigen Korrektur folgen. Die Control-Feldreihenfolge und der
+14-Byte-Audioheader benötigen ein gemeinsames Update: Minor 5 und älter werden
+beidseitig mit `VERSION_UNSUPPORTED` abgewiesen. Das Opus-Payload bleibt gleich.
+
+
 Der Server speichert höchstens einen Bericht je aktuellem Sprecher/Empfänger-Paar und akzeptiert höchstens einen alle 2 s; Selbstberichte, unbekannte Sitzungen, unzulässige Werte und taube Empfänger zählen nicht. Beide Clients müssen Bit 0 in `Hello.caps` angekündigt haben. Berichte verfallen nach 6 s und werden beim Verlassen gelöscht. Höchstens alle 2 s erhalten unterstützende Sender einen Hint: Median, falls eine strikte Mehrheit höchstens 1 dB vom Median entfernt liegt (2 dB Gesamtspanne); zwei Empfänger müssen somit beide zustimmen. Eine positive oder negative Korrektur wird nur mit einem neu eingegangenen, zum Konsens gehörenden Bericht erneut geschickt; Timer-Ticks und neue Ausreißer erzeugen keine zusätzlichen Bestätigungsfenster aus alten Messungen. Fehlender Konsens oder Ablauf wird weiterhin als `None` gemeldet. Ein einzelner Bericht benötigt zusätzlich lokale Bestätigung im Sender. Hints sind Hinweise, keine Geräte-Steuerbefehle; der Sender begrenzt und bestätigt jede Korrektur selbst. Hints enthalten keine Nutzernamen oder Audiodaten.
 
 Varianten 19–28 (und 31, 33) sind die ersten C→S-Nachrichten, bei denen der sendende Client eine **andere** `user_id` benennt als seine eigene.
 
 Fehlercodes kommen wie Varianten additiv hinzu (§6, zuletzt `SERVER_ERROR` 2026-09-26); ein Client, der einen Code nicht kennt, behandelt ihn als nicht fatal.
 
-Capability-Bits (`caps`): Bit 0 (`CAP_AUDIO_FEEDBACK = 1`) für optionale Varianten 36/37. Diese werden nur bei gegenseitiger Unterstützung gesendet. v1-Baseline war `minor = 1`, aktuell ist `minor = 5` (eigene Coronafarbe, 2026-10-12; davor 4, Videobild-Anzeigebestätigung, 2026-09-28); ein Minor 0 existiert nicht, und alle 44 Variantennummern (0–43) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
+Capability-Bits (`caps`): Bit 0 (`CAP_AUDIO_FEEDBACK = 1`) für optionale Varianten 36/37. Diese werden nur bei gegenseitiger Unterstützung gesendet. v1-Baseline war `minor = 1`, aktuell ist `minor = 6` (eigene Coronafarbe, 2026-10-12; davor 4, Videobild-Anzeigebestätigung, 2026-09-28); ein Minor 0 existiert nicht, und alle 44 Variantennummern (0–43) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
 ### 2.3 Registrierung (revidiert 2026-09-24, nur Zertifikate)
 
@@ -202,7 +221,7 @@ Hält der Server das Zertifikat für abgelaufen, der Client (wegen Uhrzeitabweic
 
 ## 3. Audio-Datagram
 
-Genau ein Opus-Paket pro Datagram. Header 10 Byte, little-endian:
+Genau ein Opus-Paket pro Datagram. Header 14 Byte, little-endian:
 
 | Offset | Größe | Feld | Inhalt |
 | --- | --- | --- | --- |
@@ -211,9 +230,10 @@ Genau ein Opus-Paket pro Datagram. Header 10 Byte, little-endian:
 | 2 | 2 | `speaker` | Session-ID des Sprechers. **Client sendet 0, Server überschreibt in place.** |
 | 4 | 2 | `seq` | pro Sender +1 je Paket, Wrap |
 | 6 | 4 | `ts` | 48-kHz-Sample-Clock des Senders, +960 je 20-ms-Frame (+480 bei 10 ms); springt bei PTT-Pausen, `seq` nicht |
-| 10 | n | `opus` | Opus-Paket (TOC enthalten), 1 ≤ n ≤ 400 |
+| 10 | 4 | `gain_epoch` | Kennung der angewandten Pegelkorrektur; ab Minor 6 |
+| 14 | n | `opus` | Opus-Paket (TOC enthalten), 1 ≤ n ≤ 400 |
 
-Regeln: Server verwirft Datagrams < 11 B oder > 410 B; Empfänger unterscheidet Pause (`ts`-Sprung bei lückenloser `seq`) von Verlust (`seq`-Lücke). **Wrap:** `seq` und `ts` laufen über (bei 20 ms nach ~22 min bzw. ~24,8 h). Alle Vergleiche sind vorzeichenbehaftete Differenzen modulo 2^16 bzw. 2^32 (`(a.wrapping_sub(b)) as i16` bzw. `as i32`); eine Differenz jenseits der halben Wertebereichsbreite ist ein Rücksprung, kein Vorwärtssprung. Jitter-Buffer, Verlusterkennung und Re-Anchor rechnen ausschließlich so. Opus-Profil: 48 kHz mono, VOIP, Frame 20 ms Default (10 ms Client-Option ohne Protokolländerung, TOC trägt die Dauer), 48 kbit/s constrained VBR (unter 64 kbit/s, darüber wechselt Opus für Sprache mono auf CELT-only ohne FEC), FEC an mit `PACKET_LOSS_PERC` ≥ 3 % (sonst codiert libopus kein LBRR), DTX aus, Complexity 10. Empfänger: Decoder-Complexity 5 (Deep PLC), Jitter-Buffer mindestens 1 Frame.
+Regeln: Server verwirft Datagrams < 15 B oder > 414 B; Empfänger unterscheidet Pause (`ts`-Sprung bei lückenloser `seq`) von Verlust (`seq`-Lücke). **Wrap:** `seq` und `ts` laufen über (bei 20 ms nach ~22 min bzw. ~24,8 h). Alle Vergleiche sind vorzeichenbehaftete Differenzen modulo 2^16 bzw. 2^32 (`(a.wrapping_sub(b)) as i16` bzw. `as i32`); eine Differenz jenseits der halben Wertebereichsbreite ist ein Rücksprung, kein Vorwärtssprung. Jitter-Buffer, Verlusterkennung und Re-Anchor rechnen ausschließlich so. Opus-Profil: 48 kHz mono, VOIP, Frame 20 ms Default (10 ms Client-Option ohne Protokolländerung, TOC trägt die Dauer), 48 kbit/s constrained VBR (unter 64 kbit/s, darüber wechselt Opus für Sprache mono auf CELT-only ohne FEC), FEC an mit `PACKET_LOSS_PERC` ≥ 3 % (sonst codiert libopus kein LBRR), DTX aus, Complexity 10. Empfänger: Decoder-Complexity 5 (Deep PLC), Jitter-Buffer mindestens 1 Frame.
 
 Server-Relay pro Datagram: Länge/`kind` prüfen → Absender `Active` und nicht `muted` → Rate ≤ 110/s → `speaker` setzen → `send_datagram` an alle anderen `Active`, nicht `deafened`; Sendefehler pro Empfänger zählen, nie blockieren.
 
@@ -291,7 +311,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | --- | --- |
 | Control-Frame | ≤ 16 KiB |
 | Control-Messages | ≤ 50/s pro Client |
-| Audio-Datagrams | ≤ 110/s pro Client, ≤ 410 B |
+| Audio-Datagrams | ≤ 110/s pro Client, ≤ 414 B |
 | Video-Frames | ≤ 20/s pro Nutzer (über Reconnects hinweg), ≤ 512 KiB; nur bei `camera_on`; ≤ 4 gleichzeitig je Sender, ≤ 5 s je Frame (`timing.video_frame_timeout_ms`) |
 | Video-Bitrate | ≤ 400 kbit/s pro Nutzer (gleitend über 2 s, über Reconnects hinweg). Entschieden wird **vor** der Nutzlast: steht das Budget im Minus, stoppt der Server den Stream nach dem Header mit `RATE_LIMITED` und liest nichts weiter; ein angenommener Frame wird beim Eintreffen abgebucht, auch ins Minus, damit ein IDR größer als der 2-s-Burst durchgeht. Bewusste Festlegung als Missbrauchs-Deckel, nicht aus dem Research hergeleitet: Zielbitrate ist 150 kbit/s (§4), der Abstand fängt CBR-Spitzen bei 15 fps ab. |
 | Users | `max_users` (Default 16, Obergrenze 64); beim Erreichen `close(SERVER_FULL)` |
@@ -310,8 +330,8 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 ## 8. Versionierung
 
 - Major = ALPN-String (`icu/1`). Inkompatible Änderung → `icu/2`, Server bietet ggf. beide.
-- Minor: der Client nennt sein Protokoll-Minor in `Hello.minor`, der Server seins in `Welcome.server_minor`; `Welcome.minor` ist das ausgehandelte `min(client, server)`. Varianten oberhalb des ausgehandelten Minors werden nie gesendet. Ein Minor 0 gibt es nicht; aktuell ist `minor = 5`. Minor 5 hängt `UserInfo.corona_color` an, und `UserInfo` steckt mitten in `Welcome`: Client und Server von vor Minor 5 sind mit Minor-5-Gegenstellen nicht kompatibel und werden über das Mindest-Minor abgewiesen.
-- Mindestversionen, beidseitig durchgesetzt (2026-09-26). Jede Seite hat ein Mindest-Minor für die Gegenseite (`icu_proto::MIN_PEER_MINOR`, derzeit 5):
+- Minor: der Client nennt sein Protokoll-Minor in `Hello.minor`, der Server seins in `Welcome.server_minor`; `Welcome.minor` ist das ausgehandelte `min(client, server)`. Varianten oberhalb des ausgehandelten Minors werden nie gesendet. Ein Minor 0 gibt es nicht; aktuell ist `minor = 6`. Minor 5 hängt `UserInfo.corona_color` an, und `UserInfo` steckt mitten in `Welcome`: Client und Server von vor Minor 5 sind mit Minor-5-Gegenstellen nicht kompatibel und werden über das Mindest-Minor abgewiesen.
+- Mindestversionen, beidseitig durchgesetzt (2026-09-26). Jede Seite hat ein Mindest-Minor für die Gegenseite (`icu_proto::MIN_PEER_MINOR`, derzeit 6):
   - Der Server schließt mit `VERSION_UNSUPPORTED`, wenn `Hello.minor` darunter liegt, oder wenn die SemVer in `Hello.client` (`<name>/<semver> <os>`, Pre-Release-Suffix zählt nicht) unter `server.min_client` liegt oder sich nicht lesen lässt. Das gilt für jede Sitzung, Registrierung und renew-only eingeschlossen.
   - Der Client schließt selbst mit `VERSION_UNSUPPORTED`, wenn `Welcome.server_minor` darunter liegt, fatal, mit dem Hinweis, dass der Server aktualisiert werden muss.
   - Ein Client von vor Minor 2 dekodiert das längere `Welcome` ohne Fehler (postcard ignoriert überzählige Bytes); deshalb weist ihn der Server über `Hello.minor` ab. Umgekehrt kann ein Client ab Minor 2 das kürzere `Welcome` eines älteren Servers nicht dekodieren und zeigt das allgemeine „Update nötig“ — hingenommen, weil Client und Server im Lockstep ausgeliefert werden (§2.2).

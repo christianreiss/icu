@@ -290,6 +290,8 @@ fn state() -> AppState {
     };
     AppState {
         tuning_status: String::new(),
+        audio_health: Default::default(),
+        can_restore_audio: false,
         conn: ConnStatus::Connected,
         server: "icu.example.org:4711".into(),
         server_name: "icu.example.org".into(),
@@ -1672,5 +1674,56 @@ fn autotune_details_keep_controls_accessible_and_independent() {
         let settings = last_update(&cmds.borrow()).clone();
         assert!(!settings.audio.peer_assistance);
         assert!(settings.audio.tune_system_mic && settings.audio.auto_level);
+    }
+}
+
+#[test]
+fn last_good_audio_actions_work_even_with_denoise_disabled() {
+    for theme_name in THEMES {
+        let mut s = state();
+        s.settings.audio.denoise = false;
+        s.can_restore_audio = true;
+        s.audio_health.profile_saved = true;
+        s.audio_health.profile_saved_at = Some(1_800_000_000);
+        let commands = Rc::new(RefCell::new(Vec::new()));
+        let collected = commands.clone();
+        let mut view = SettingsView::new(
+            &s,
+            Arc::new(DebugStats::default()),
+            Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+        );
+        let mut h = harness(SETTINGS, theme_name, true, move |ui| {
+            collected.borrow_mut().extend(view.ui(ui, &s, false).cmds);
+        });
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Klang")
+            .click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Details")
+            .click();
+        h.run();
+        shot(&mut h, &format!("audio-last-good-{theme_name}"));
+        h.get_by_role_and_label(
+            egui::accesskit::Role::Button,
+            "Letzten guten Zustand wiederherstellen",
+        )
+        .click();
+        h.run();
+        assert!(commands
+            .borrow()
+            .iter()
+            .any(|c| matches!(c, icu_client::engine::Command::RestoreGoodAudio)));
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Details")
+            .click();
+        h.run();
+        h.get_by_role_and_label(
+            egui::accesskit::Role::Button,
+            "Für dieses Mikrofon neu lernen",
+        )
+        .click();
+        h.run();
+        assert!(commands
+            .borrow()
+            .iter()
+            .any(|c| matches!(c, icu_client::engine::Command::ForgetGoodAudio)));
     }
 }

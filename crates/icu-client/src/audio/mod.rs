@@ -1,11 +1,13 @@
 //! Audio backends and the capture/playback glue.
 
 pub mod backend;
+pub mod calibration;
 #[cfg(any(target_os = "windows", test))]
 mod channels;
 #[cfg(any(feature = "cpal-fallback", target_os = "windows"))]
 pub mod cpal_fallback;
 pub mod fake;
+pub mod health;
 pub mod level;
 #[cfg(target_os = "linux")]
 pub mod pipewire;

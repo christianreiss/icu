@@ -73,6 +73,12 @@ pub fn audio(
         return;
     }
 
+    server
+        .audio_feedback
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .observe_audio(sender, audio_header, std::time::Instant::now());
+
     // Overwrite `speaker` in place. `try_into_mut` succeeds while we hold the
     // only reference, which is the normal case straight out of
     // `read_datagram`; otherwise one copy.

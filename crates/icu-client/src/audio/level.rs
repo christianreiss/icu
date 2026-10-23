@@ -54,6 +54,7 @@ struct Owned {
 pub struct SystemTuner {
     owned: Option<Owned>,
     suspended: bool,
+    response_suspended: bool,
     speech_samples: usize,
     last_write: Option<Instant>,
     response: Option<(f32, f32)>,
@@ -79,7 +80,9 @@ impl SystemTuner {
             .map_or(0.0, |o| o.last.db - o.original.db)
     }
     pub fn tick(&mut self, backend: &mut dyn AudioBackend, w: CaptureWindow, now: Instant) -> f32 {
-        if self.suspended {
+        // A response-validation pause must not defeat later clipping
+        // protection. Manual changes and device/write faults still suspend.
+        if self.suspended && !(self.response_suspended && w.near_full > 0) {
             return 0.0;
         }
         let current = match backend.capture_level() {
@@ -87,6 +90,7 @@ impl SystemTuner {
             Ok(_) => {
                 if self.owned.is_some() {
                     self.suspended = true;
+                    self.response_suspended = false;
                 }
                 self.status = "Nur Software: kein geeigneter Mikrofonregler".into();
                 return 0.0;
@@ -94,6 +98,7 @@ impl SystemTuner {
             Err(e) => {
                 self.status = format!("Mikrofonregler nicht verfügbar: {e}");
                 self.suspended = true;
+                self.response_suspended = false;
                 return 0.0;
             }
         };
@@ -101,6 +106,7 @@ impl SystemTuner {
             if !current.same(&o.last) {
                 self.owned = None;
                 self.suspended = true;
+                self.response_suspended = false;
                 self.status = "Manuell geändert – Mikrofonregelung pausiert".into();
                 return 0.0;
             }
@@ -138,6 +144,8 @@ impl SystemTuner {
             if !clipped && w.speech_samples >= 24_000 && (w.rms_db() - before - change).abs() > 9.0
             {
                 self.suspended = true;
+                self.response_suspended = false;
+                self.response_suspended = true;
                 self.status = "Mikrofon prüfen: Pegel reagiert unerwartet".into();
                 return 0.0;
             }
@@ -193,6 +201,8 @@ impl SystemTuner {
                 let delta = actual.db - current.db;
                 self.owned.as_mut().unwrap().last = actual;
                 self.last_write = Some(now);
+                self.suspended = false;
+                self.response_suspended = false;
                 self.response = Some((w.rms_db(), delta));
                 self.speech_samples = 0;
                 self.noise_db = self.noise_db.map(|n| n + delta);
@@ -207,11 +217,13 @@ impl SystemTuner {
                 let delta = actual.db - current.db;
                 self.owned.as_mut().unwrap().last = actual;
                 self.suspended = true;
+                self.response_suspended = false;
                 self.status = "Mikrofonregler reagiert unerwartet – Software bleibt aktiv".into();
                 delta
             }
             _ => {
                 self.suspended = true;
+                self.response_suspended = false;
                 self.status = "Mikrofonregelung fehlgeschlagen – Software bleibt aktiv".into();
                 0.0
             }
@@ -436,5 +448,27 @@ mod tests {
         );
         assert!(!t.suspended);
         t.restore(&mut d);
+    }
+    #[test]
+    fn later_clipping_recovers_a_response_pause_but_never_a_manual_override() {
+        let mut d = Device::new();
+        let mut t = SystemTuner::default();
+        let now = Instant::now();
+        for i in 0..14 {
+            t.tick(&mut d, window(9.0, -36.0), now + Duration::from_secs(i));
+        }
+        t.tick(&mut d, window(-4.0, -18.0), now + Duration::from_secs(20));
+        assert!(t.suspended && t.response_suspended);
+        let mut clipped = window(-12.0, -3.0);
+        clipped.near_full = 50;
+        clipped.peak = 1.0;
+        assert!(t.tick(&mut d, clipped, now + Duration::from_secs(21)) < 0.0);
+        assert!(!t.suspended);
+        d.level.db = -10.0;
+        t.tick(&mut d, clipped, now + Duration::from_secs(23));
+        assert!(t.suspended && !t.response_suspended);
+        let writes = d.writes;
+        t.tick(&mut d, clipped, now + Duration::from_secs(25));
+        assert_eq!(d.writes, writes);
     }
 }

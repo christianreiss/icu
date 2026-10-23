@@ -65,6 +65,13 @@ pub struct Analysis {
     pub level: Level,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Dynamics {
+    pub reduction_db: f32,
+    pub limited_samples: usize,
+    pub samples: usize,
+    pub headroom_limited: bool,
+}
 /// The chain's state.
 pub struct SendChain {
     leveler: Normalizer,
@@ -84,6 +91,8 @@ pub struct SendChain {
     /// otherwise compress away corrections made to the microphone target.
     peer_gain: f32,
     applied_peer_gain: f32,
+    warm_gain: Option<f32>,
+    dynamics: Dynamics,
 }
 
 impl Default for SendChain {
@@ -109,6 +118,8 @@ impl SendChain {
             limiter_on: false,
             peer_gain: 1.0,
             applied_peer_gain: 1.0,
+            warm_gain: None,
+            dynamics: Dynamics::default(),
         }
     }
 
@@ -124,6 +135,8 @@ impl SendChain {
         self.out_limiter.reset();
         self.peer_gain = 1.0;
         self.applied_peer_gain = 1.0;
+        self.warm_gain = None;
+        self.dynamics = Dynamics::default();
     }
 
     /// First half: gain, auto level, denoise, meter.
@@ -135,6 +148,11 @@ impl SendChain {
         }
         if s.auto_level && !self.level_on {
             self.leveler.reset();
+        }
+        if s.auto_level {
+            if let Some(db) = self.warm_gain.take() {
+                self.leveler.warm_start(db);
+            }
         }
         self.level_on = s.auto_level;
         if s.auto_level {
@@ -162,7 +180,18 @@ impl SendChain {
 
     /// Second half: voice optimizer, outbound normalizer and limiter.
     /// `voice` is this block's VAD verdict.
+    pub fn warm_start(&mut self, db: f32) {
+        self.warm_gain = Some(db);
+    }
+    pub fn dynamics(&self) -> Dynamics {
+        self.dynamics
+    }
     pub fn finish(&mut self, block: &mut [f32], voice: bool, s: &SendSettings) {
+        self.dynamics = Dynamics {
+            samples: block.len(),
+            headroom_limited: s.auto_level && self.leveler.headroom_limited(),
+            ..Default::default()
+        };
         self.prev_voice = voice;
         // Nonlinear, so after AEC; after the meter and VAD, so its makeup
         // gain does not move the thresholds.
@@ -176,6 +205,10 @@ impl SendChain {
         self.voice_on = s.voice_opt;
         if s.voice_opt {
             self.voice_chain.process(block);
+            self.dynamics.reduction_db = self.voice_chain.limiter_reduction_db();
+            if self.dynamics.reduction_db > 0.1 {
+                self.dynamics.limited_samples = block.len();
+            }
         }
         // One local AGC and one slow remote trim, not two independent AGCs.
         // Ramp the trim over a block to avoid a click on a new hint. It must
@@ -215,6 +248,11 @@ impl SendChain {
         if limit {
             for x in block.iter_mut() {
                 *x = self.out_limiter.process(*x);
+                let reduction = self.out_limiter.reduction_db();
+                self.dynamics.reduction_db = self.dynamics.reduction_db.max(reduction);
+                if reduction > 0.1 && self.dynamics.limited_samples < self.dynamics.samples {
+                    self.dynamics.limited_samples += 1;
+                }
             }
         }
     }
@@ -292,6 +330,26 @@ mod tests {
         assert_eq!(chain.peer_gain, 1.0);
         chain.tune(f32::NAN, 0.0);
         assert_eq!(chain.peer_gain, 1.0);
+    }
+
+    #[test]
+    fn limiter_telemetry_exposes_sustained_reduction_separately_from_gain() {
+        let mut chain = SendChain::new();
+        chain.tune(6.0, 0.0);
+        let settings = SendSettings {
+            voice_opt: false,
+            ..Default::default()
+        };
+        let mut limited = 0;
+        for _ in 0..100 {
+            let mut block = [0.8; 480];
+            chain.finish(&mut block, true, &settings);
+            let d = chain.dynamics();
+            limited += d.limited_samples;
+            assert!(d.reduction_db > 3.0);
+            assert!(block.iter().all(|s| s.abs() <= 0.891251));
+        }
+        assert!(limited > 47_000);
     }
 
     /// One corrupt capture block (a float driver's NaN or ±Inf) reaches the

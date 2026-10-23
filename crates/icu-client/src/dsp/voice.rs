@@ -206,6 +206,10 @@ impl Limiter {
         (s * self.gain).clamp(-CEILING, CEILING)
     }
 
+    pub(crate) fn reduction_db(&self) -> f32 {
+        -20.0 * self.gain.max(1e-9).log10()
+    }
+
     pub(crate) fn reset(&mut self) {
         self.gain = 1.0;
     }
@@ -239,6 +243,10 @@ impl VoiceChain {
         self.hpf.reset();
         self.comp.reset();
         self.limiter.reset();
+    }
+
+    pub fn limiter_reduction_db(&self) -> f32 {
+        self.limiter.reduction_db()
     }
 
     /// Processes one block in place.

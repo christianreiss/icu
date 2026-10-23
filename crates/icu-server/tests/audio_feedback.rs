@@ -1,7 +1,7 @@
 //! Real QUIC control delivery and legacy capability isolation.
 mod common;
 use common::{Client, TestServer};
-use icu_proto::{AudioLevel, ControlMsg, CAP_AUDIO_FEEDBACK};
+use icu_proto::{AudioHeader, AudioLevel, AudioWindow, ControlMsg, CAP_AUDIO_FEEDBACK};
 use std::time::Duration;
 
 async fn capable(s: &TestServer, name: &str) -> Client {
@@ -13,12 +13,7 @@ async fn capable(s: &TestServer, name: &str) -> Client {
 async fn hint(c: &mut Client, value: Option<i16>, reporters: u16) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if c.recv_msg().await
-                == (ControlMsg::AudioLevelHint {
-                    correction_cdb: value,
-                    reporters,
-                })
-            {
+            if matches!(c.recv_msg().await, ControlMsg::AudioLevelHint { correction_cdb, reporters:r,.. } if correction_cdb==value && r==reporters) {
                 break;
             }
         }
@@ -40,10 +35,30 @@ async fn two_receivers_agree_then_deafen_excludes_one_and_old_client_gets_no_hin
         near_full_permille: 0,
         speech_ms: 1500,
     };
+    let window = AudioWindow {
+        gain_epoch: 1,
+        first_ts: 0,
+        end_ts: 96_000,
+        report_id: 0,
+    };
+    a.conn
+        .send_datagram(
+            AudioHeader {
+                gain_epoch: 1,
+                ts: 96_000,
+                ..Default::default()
+            }
+            .datagram(&[0x78])
+            .unwrap()
+            .into(),
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
     for client in [&mut b, &mut c] {
         client
             .send_msg(&ControlMsg::AudioLevelReport {
                 speaker: a.session,
+                window,
                 level,
             })
             .await;
@@ -56,8 +71,28 @@ async fn two_receivers_agree_then_deafen_excludes_one_and_old_client_gets_no_hin
     // The remaining receiver must supply a fresh window. Server timer
     // ticks and membership changes cannot turn its old report into one.
     tokio::time::sleep(Duration::from_millis(2100)).await;
+    let window = AudioWindow {
+        gain_epoch: 1,
+        first_ts: 96_000,
+        end_ts: 192_000,
+        report_id: 1,
+    };
+    a.conn
+        .send_datagram(
+            AudioHeader {
+                gain_epoch: 1,
+                ts: 192_000,
+                ..Default::default()
+            }
+            .datagram(&[0x78])
+            .unwrap()
+            .into(),
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
     b.send_msg(&ControlMsg::AudioLevelReport {
         speaker: a.session,
+        window,
         level,
     })
     .await;
@@ -65,6 +100,7 @@ async fn two_receivers_agree_then_deafen_excludes_one_and_old_client_gets_no_hin
     // Unsupported peers may send a fabricated report, but cannot influence consensus.
     old.send_msg(&ControlMsg::AudioLevelReport {
         speaker: a.session,
+        window,
         level: AudioLevel {
             correction_cdb: -1200,
             ..level

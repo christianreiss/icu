@@ -1,6 +1,6 @@
 //! Slow peer-assisted output trim. Measurements never depend on playback volume.
 use super::{meter, normalize::Normalizer};
-use icu_proto::AudioLevel;
+use icu_proto::{AudioLevel, AudioWindow};
 use std::time::{Duration, Instant};
 
 /// Enough to correct a moderate downstream level error without chasing
@@ -12,6 +12,11 @@ pub struct Measurement {
     samples: usize,
     near_full: usize,
     peak: f32,
+    epoch: Option<u32>,
+    first_ts: Option<u32>,
+    end_ts: u32,
+    settle_left: usize,
+    report_id: u32,
 }
 impl Default for Measurement {
     fn default() -> Self {
@@ -20,18 +25,61 @@ impl Default for Measurement {
             samples: 0,
             near_full: 0,
             peak: 0.0,
+            epoch: None,
+            first_ts: None,
+            end_ts: 0,
+            settle_left: 0,
+            report_id: 0,
         }
     }
 }
 impl Measurement {
     pub fn observe(&mut self, samples: &[f32], speech: Option<bool>) {
+        self.observe_at(samples, speech, 0, self.end_ts);
+    }
+    /// Observe only regular decoded audio, retaining its sender clock and gain.
+    pub fn observe_at(&mut self, samples: &[f32], speech: Option<bool>, epoch: u32, ts: u32) {
+        if self.epoch != Some(epoch) {
+            if self
+                .epoch
+                .is_some_and(|old| epoch.wrapping_sub(old) as i32 <= 0)
+            {
+                return;
+            }
+            self.estimator = Normalizer::new();
+            self.samples = 0;
+            self.near_full = 0;
+            self.peak = 0.0;
+            self.first_ts = None;
+            self.epoch = Some(epoch);
+            self.settle_left = 9600;
+        }
+        self.end_ts = ts.wrapping_add(samples.len() as u32);
+        if self.settle_left > 0 {
+            self.settle_left = self.settle_left.saturating_sub(samples.len());
+            return;
+        }
         if self.estimator.observe(samples, speech) {
+            self.first_ts.get_or_insert(ts);
             self.samples += samples.len();
             self.near_full += samples.iter().filter(|s| s.abs() >= 0.99).count();
             self.peak = samples.iter().fold(self.peak, |p, s| p.max(s.abs()));
         }
     }
+    pub fn take_window(&mut self) -> Option<(AudioLevel, AudioWindow)> {
+        let first_ts = self.first_ts;
+        let window = AudioWindow {
+            gain_epoch: self.epoch.unwrap_or(0),
+            first_ts: first_ts.unwrap_or(self.end_ts),
+            end_ts: self.end_ts,
+            report_id: self.report_id,
+        };
+        self.report_id = self.report_id.wrapping_add(1);
+        let level = self.take()?;
+        (first_ts.is_some() && window.valid()).then_some((level, window))
+    }
     pub fn take(&mut self) -> Option<AudioLevel> {
+        self.first_ts = None;
         let n = std::mem::take(&mut self.samples);
         let full = std::mem::take(&mut self.near_full);
         let peak = std::mem::take(&mut self.peak);
@@ -56,6 +104,14 @@ pub struct PeerTuner {
     direction: f32,
     last_used: Option<Instant>,
     decision: Option<&'static str>,
+    epoch: u32,
+    last_window: Option<AudioWindow>,
+    last_action: Option<Instant>,
+    tracking: bool,
+    reporters: u16,
+    boost_blocked: bool,
+    candidate_trim: Option<f32>,
+    received_at: Option<Instant>,
 }
 impl PeerTuner {
     pub fn status(&self, now: Instant) -> &'static str {
@@ -63,13 +119,76 @@ impl PeerTuner {
             .hint
             .is_none_or(|(_, t)| now.saturating_duration_since(t) >= Duration::from_secs(6))
         {
-            "kein gültiges Empfangsfeedback"
+            if self.offset_db != 0.0 {
+                "Guten Pegel während der Pause gehalten"
+            } else {
+                "warte auf Empfangsfeedback"
+            }
         } else {
             self.decision.unwrap_or("prüft")
         }
     }
 
+    pub fn block_boost(&mut self, blocked: bool) {
+        self.boost_blocked = blocked;
+    }
+    pub fn seed_trim(&mut self, db: f32) {
+        self.candidate_trim = db.is_finite().then_some(db.clamp(-6.0, 6.0));
+    }
+    pub fn hint_age_secs(&self, now: Instant) -> Option<f32> {
+        self.received_at
+            .map(|at| now.saturating_duration_since(at).as_secs_f32())
+    }
+    pub fn conflicting(&self, now: Instant) -> bool {
+        self.hint.is_none()
+            && self.reporters > 0
+            && self
+                .received_at
+                .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(6))
+    }
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+    pub fn reporters(&self) -> u16 {
+        self.reporters
+    }
+    pub fn correction(&self, now: Instant) -> Option<f32> {
+        self.hint
+            .filter(|(_, at)| now.saturating_duration_since(*at) < Duration::from_secs(6))
+            .map(|(c, _)| c)
+    }
+    pub fn set_epoch(&mut self, epoch: u32) {
+        if epoch != self.epoch {
+            self.epoch = epoch;
+            self.hint = None;
+            self.last_window = None;
+            self.last_used = None;
+            self.streak = 0;
+            self.reporters = 0;
+            self.received_at = None;
+        }
+    }
+    pub fn hint_window(
+        &mut self,
+        window: AudioWindow,
+        correction: Option<i16>,
+        reporters: u16,
+        now: Instant,
+    ) {
+        if window.gain_epoch != self.epoch {
+            return;
+        }
+        if correction.is_some() {
+            if !window.valid() || self.last_window.is_some_and(|old| !window.newer_than(old)) {
+                return;
+            }
+            self.last_window = Some(window);
+        }
+        self.reporters = reporters;
+        self.hint(correction, now);
+    }
     pub fn hint(&mut self, correction_cdb: Option<i16>, now: Instant) {
+        self.received_at = Some(now);
         self.hint = correction_cdb
             .filter(|c| (-1200..=1200).contains(c))
             .map(|c| (c as f32 / 100.0, now));
@@ -93,10 +212,22 @@ impl PeerTuner {
         let hint = self
             .hint
             .filter(|(_, t)| now.saturating_duration_since(*t) < Duration::from_secs(6));
-        if !enabled || hint.is_none() {
+        if !enabled {
             self.streak = 0;
+            self.tracking = false;
             self.decision = Some("aus");
-            self.offset_db -= self.offset_db.clamp(-0.5, 0.5);
+            if self
+                .last_action
+                .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(2))
+            {
+                self.offset_db -= self.offset_db.clamp(-0.5, 0.5);
+                self.last_action = Some(now);
+            }
+            return self.offset_db;
+        }
+        if hint.is_none() {
+            self.streak = 0;
+            self.decision = Some("Guten Pegel während der Pause gehalten");
             return self.offset_db;
         }
         let Some(l) = local.filter(|l| l.valid()) else {
@@ -117,7 +248,9 @@ impl PeerTuner {
             Some("im Zielbereich")
         } else if (own - remote).abs() > 2.0 || own.signum() != remote.signum() {
             Some("lokale Messung widerspricht")
-        } else if remote > 0.0 && (l.peak_cdb > -300 || l.near_full_permille > 0) {
+        } else if remote > 0.0
+            && (self.boost_blocked || l.peak_cdb > -300 || l.near_full_permille > 0)
+        {
             Some("zu wenig Spitzenreserve")
         } else {
             None
@@ -130,10 +263,20 @@ impl PeerTuner {
         if self.direction != remote.signum() {
             self.streak = 0;
             self.direction = remote.signum();
+            self.tracking = false;
+        }
+        if let Some(seed) = self.candidate_trim.take() {
+            if seed.signum() == remote.signum() && seed.abs() >= 0.5 {
+                self.tracking = true;
+            }
         }
         self.streak = self.streak.saturating_add(1);
         self.decision = Some("prüft");
-        if self.streak >= 3 {
+        if (self.streak >= 3 || self.tracking)
+            && self
+                .last_action
+                .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(2))
+        {
             let next =
                 (self.offset_db + remote.signum() * 0.5).clamp(-MAX_PEER_TRIM_DB, MAX_PEER_TRIM_DB);
             self.decision = Some(if next == self.offset_db {
@@ -142,6 +285,9 @@ impl PeerTuner {
                 "aktiv"
             });
             self.offset_db = next;
+            self.last_action = Some(now);
+            self.streak = 0;
+            self.tracking = true;
         }
         self.offset_db
     }
@@ -201,7 +347,7 @@ mod tests {
         }
     }
     #[test]
-    fn bounded_corroborated_and_expires() {
+    fn bounded_corroborated_and_held_during_silence() {
         let mut p = PeerTuner::default();
         let t = Instant::now();
         for i in 0..20 {
@@ -212,6 +358,10 @@ mod tests {
         assert_eq!(p.offset_db, MAX_PEER_TRIM_DB);
         for i in 0..12 {
             p.tick(None, true, t + Duration::from_secs(50 + i * 2));
+        }
+        assert_eq!(p.offset_db, MAX_PEER_TRIM_DB);
+        for i in 0..12 {
+            p.tick(None, false, t + Duration::from_secs(100 + i * 2));
         }
         assert_eq!(p.offset_db, 0.0);
     }
@@ -292,7 +442,7 @@ mod tests {
         }
         assert_eq!(p.offset_db, -MAX_PEER_TRIM_DB);
         assert_eq!(p.status(t + Duration::from_secs(78)), "Regelgrenze");
-        p.tick(None, false, t + Duration::from_secs(79));
+        p.tick(None, false, t + Duration::from_secs(80));
         assert_eq!(p.offset_db, -MAX_PEER_TRIM_DB + 0.5);
     }
 
@@ -353,5 +503,24 @@ mod tests {
                 "successful feedback must not cause relearning"
             );
         }
+    }
+    #[test]
+    fn sustained_limiter_block_prevents_boost_despite_apparent_peak_headroom() {
+        let mut p = PeerTuner::default();
+        p.block_boost(true);
+        let t = Instant::now();
+        for i in 0..10 {
+            let now = t + Duration::from_secs(i * 2);
+            p.hint(Some(400), now);
+            p.tick(Some(level(400)), true, now);
+        }
+        assert_eq!(p.offset_db, 0.0);
+        p.block_boost(false);
+        for i in 10..13 {
+            let now = t + Duration::from_secs(i * 2);
+            p.hint(Some(400), now);
+            p.tick(Some(level(400)), true, now);
+        }
+        assert_eq!(p.offset_db, 0.5);
     }
 }

@@ -17,7 +17,7 @@
 //! voice sags for seconds (measured 6 dB after a +15 dB jump,
 //! `tests/cascade.rs`). So the send side runs one leveler, and the receive
 //! side, which meets voices the sender already leveled, attacks slower and
-//! leaves a ±3 dB dead band around the target untouched. 48 kHz, any block
+//! leaves a ±2 dB dead band around the target untouched. 48 kHz, any block
 //! length, allocates nothing.
 
 use super::meter::{from_db, measure, to_db};
@@ -105,6 +105,7 @@ pub struct Normalizer {
     prev_win_min: f32,
     /// Samples seen in the current floor window.
     win_samples: usize,
+    headroom_limited: bool,
 }
 
 impl Default for Normalizer {
@@ -128,6 +129,7 @@ impl Normalizer {
             win_min: f32::INFINITY,
             prev_win_min: f32::INFINITY,
             win_samples: 0,
+            headroom_limited: false,
         }
     }
 
@@ -141,6 +143,17 @@ impl Normalizer {
         to_db(self.gain)
     }
 
+    /// Whether microphone boost was restricted to retain pre-denoiser headroom.
+    pub fn headroom_limited(&self) -> bool {
+        self.headroom_limited
+    }
+    /// Seed the estimate only, never the noise floor; used for a validated device profile.
+    pub fn warm_start(&mut self, db: f32) {
+        if db.is_finite() {
+            self.level_db = self.profile.target_db - db.clamp(self.profile.max_cut_db, 6.0);
+            self.gain = 1.0;
+        }
+    }
     /// Processes one block in place.
     pub fn process(&mut self, block: &mut [f32]) {
         self.process_hinted(block, None);
@@ -223,8 +236,18 @@ impl Normalizer {
             }
         }
         self.observe(block, voice);
-        let target = from_db(self.correction_db());
-        let start = self.gain;
+        let mut target = from_db(self.correction_db());
+        let mut start = self.gain;
+        self.headroom_limited = false;
+        if self.profile == Profile::MIC_LEVEL {
+            let peak = block.iter().fold(0.0f32, |p, x| p.max(x.abs()));
+            if peak > 0.0 {
+                let safe = from_db(-1.0) / peak;
+                self.headroom_limited = target > safe || start > safe;
+                target = target.min(safe);
+                start = start.min(safe);
+            }
+        }
         let step = (target - start) / block.len() as f32;
         for (i, s) in block.iter_mut().enumerate() {
             *s *= start + step * (i + 1) as f32;

@@ -21,13 +21,14 @@ use crate::{
 /// display reports and likewise requires a coordinated update. Minor 5 adds
 /// each user's own corona color (`UserInfo.corona_color`, `SetCoronaColor`,
 /// `UserCoronaColor`); `UserInfo` sits inside `Welcome`, so again a
-/// coordinated update.
-pub const MINOR: u16 = 5;
+/// coordinated update. Minor 6 attributes audio and feedback to applied gain
+/// generations and extends the audio header to 14 bytes; both ends update together.
+pub const MINOR: u16 = 6;
 
 /// Lowest protocol minor this build talks to, in both directions: the server
 /// closes a `Hello` below it with `VERSION_UNSUPPORTED`, the client a
 /// `Welcome` whose `server_minor` is below it (`docs/reference/protocol.md` §8).
-pub const MIN_PEER_MINOR: u16 = 5;
+pub const MIN_PEER_MINOR: u16 = 6;
 
 /// Peer-assisted audio measurements and hints (bit 0).
 pub const CAP_AUDIO_FEEDBACK: u32 = 1;
@@ -333,6 +334,8 @@ pub enum ControlMsg {
         speaker: Session,
         /// Measurement before receiver processing.
         level: crate::AudioLevel,
+        /// Gain generation and independent sender-clock measurement window.
+        window: crate::AudioWindow,
     },
     /// 37, S→C. None means expired/conflicting/insufficient reports.
     AudioLevelHint {
@@ -340,6 +343,8 @@ pub enum ControlMsg {
         correction_cdb: Option<i16>,
         /// Number of fresh eligible reporters.
         reporters: u16,
+        /// Gain generation and independent sender-clock measurement window.
+        window: crate::AudioWindow,
     },
     /// 38, C→S. Public certificate of an online room session, on demand.
     PeerCertificateRequest {
@@ -628,6 +633,12 @@ mod tests {
                 deafened: true,
             },
             ControlMsg::AudioLevelReport {
+                window: crate::AudioWindow {
+                    gain_epoch: 1,
+                    first_ts: 0,
+                    end_ts: 96_000,
+                    report_id: 1,
+                },
                 speaker: 2,
                 level: crate::AudioLevel {
                     level_cdb: -2600,
@@ -638,6 +649,12 @@ mod tests {
                 },
             },
             ControlMsg::AudioLevelHint {
+                window: crate::AudioWindow {
+                    gain_epoch: 1,
+                    first_ts: 0,
+                    end_ts: 96_000,
+                    report_id: 1,
+                },
                 correction_cdb: Some(200),
                 reporters: 2,
             },

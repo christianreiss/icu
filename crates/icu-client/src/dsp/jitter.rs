@@ -32,6 +32,7 @@ pub struct Packet {
     pub seq: u16,
     /// Sender sample clock.
     pub ts: u32,
+    pub gain_epoch: u32,
     /// Last packet of a talk spurt.
     pub end: bool,
     /// Opus payload.
@@ -726,6 +727,7 @@ mod tests {
 
     fn pkt(seq: u16, ts: u32, end: bool) -> Packet {
         Packet {
+            gain_epoch: 0,
             seq,
             ts,
             end,

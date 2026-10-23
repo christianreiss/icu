@@ -5,7 +5,7 @@ use super::*;
 use eframe::wgpu::{self, util::DeviceExt};
 use std::sync::mpsc as channel;
 
-pub(super) const HALO: u32 = 24;
+pub(super) const HALO: u32 = 30;
 pub(super) const GPU_TICK: Duration = Duration::from_nanos(1_000_000_000 / 30);
 /// How long a frame of a new size may hold up the overlay thread (see
 /// [`Renderer::draw`]); a slower one is presented a tick later as usual.

@@ -13,7 +13,7 @@ pub const KIND_AUDIO_V1: u8 = 0x01;
 pub const KIND_VIDEO_V1: u8 = 0x02;
 
 /// Audio header size in bytes.
-pub const AUDIO_HEADER_LEN: usize = 10;
+pub const AUDIO_HEADER_LEN: usize = 14;
 /// Smallest valid audio datagram: header plus one Opus byte.
 pub const AUDIO_MIN_DATAGRAM: usize = AUDIO_HEADER_LEN + 1;
 /// Largest Opus payload in one datagram.
@@ -59,6 +59,8 @@ pub struct AudioHeader {
     pub seq: u16,
     /// 48 kHz sample clock of the sender, wraps.
     pub ts: u32,
+    /// Applied sender gain generation (protocol minor 6).
+    pub gain_epoch: u32,
 }
 
 impl AudioHeader {
@@ -75,6 +77,7 @@ impl AudioHeader {
         out[2..4].copy_from_slice(&self.speaker.to_le_bytes());
         out[4..6].copy_from_slice(&self.seq.to_le_bytes());
         out[6..10].copy_from_slice(&self.ts.to_le_bytes());
+        out[10..14].copy_from_slice(&self.gain_epoch.to_le_bytes());
         out
     }
 
@@ -92,7 +95,7 @@ impl AudioHeader {
     /// Parses a datagram and returns header plus the Opus payload slice.
     ///
     /// Enforces the length window from `docs/reference/protocol.md` §3: the server drops
-    /// datagrams below 11 or above 410 bytes.
+    /// datagrams below 15 or above 414 bytes.
     pub fn decode(buf: &[u8]) -> Result<(AudioHeader, &[u8]), ProtoError> {
         if buf.len() < AUDIO_MIN_DATAGRAM || buf.len() > AUDIO_MAX_DATAGRAM {
             return Err(ProtoError::BadPayloadLen(buf.len()));
@@ -105,6 +108,7 @@ impl AudioHeader {
             speaker: u16::from_le_bytes([buf[2], buf[3]]),
             seq: u16::from_le_bytes([buf[4], buf[5]]),
             ts: u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]),
+            gain_epoch: u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]),
         };
         Ok((header, &buf[AUDIO_HEADER_LEN..]))
     }
@@ -209,12 +213,14 @@ mod tests {
         for header in [
             AudioHeader::default(),
             AudioHeader {
+                gain_epoch: 0,
                 flags: AUDIO_FLAG_END,
                 speaker: 0xBEEF,
                 seq: 0xCAFE,
                 ts: 0xDEAD_BEEF,
             },
             AudioHeader {
+                gain_epoch: 0,
                 flags: 0,
                 speaker: u16::MAX,
                 seq: u16::MAX,
@@ -264,17 +270,17 @@ mod tests {
         assert_eq!(payload, &[1, 2, 3]);
     }
 
-    /// `docs/reference/protocol.md` §3: drop below 11 and above 410 bytes.
+    /// `docs/reference/protocol.md` §3: drop below 15 and above 414 bytes.
     #[test]
     fn audio_length_window() {
         let ok_min = AudioHeader::default().datagram(&[0]).unwrap();
-        assert_eq!(ok_min.len(), 11);
+        assert_eq!(ok_min.len(), 15);
         assert!(AudioHeader::decode(&ok_min).is_ok());
 
         let ok_max = AudioHeader::default()
             .datagram(&[0; AUDIO_MAX_PAYLOAD])
             .unwrap();
-        assert_eq!(ok_max.len(), 410);
+        assert_eq!(ok_max.len(), 414);
         assert!(AudioHeader::decode(&ok_max).is_ok());
 
         assert!(matches!(
@@ -285,7 +291,7 @@ mod tests {
         too_big.push(0);
         assert!(matches!(
             AudioHeader::decode(&too_big),
-            Err(ProtoError::BadPayloadLen(411))
+            Err(ProtoError::BadPayloadLen(415))
         ));
         assert!(matches!(
             AudioHeader::default().datagram(&[]),
@@ -320,6 +326,7 @@ mod tests {
     #[test]
     fn speaker_overwrite_in_place() {
         let mut dg = AudioHeader {
+            gain_epoch: 0,
             speaker: 0,
             seq: 42,
             ts: 960,
