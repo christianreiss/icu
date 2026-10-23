@@ -7,6 +7,7 @@ Die frühen Wire-Entwürfe sind durch [protocol.md](../reference/protocol.md) er
 - [Audio feedback — implementation and verification, 2026-09-28](audio-feedback-verification-2026-09-28.md)
 - [Gute Audiopegel, Messkennungen und größere Corona (2026-10-23)](audio-calibration-2026-10-23.md)
 - [Audio-Pegel und Peer-Hints: Debugging 2026-10-23](audio-balancing-debug-2026-10-23.md)
+- [Sprachbeginn, Windows-Wiedergabe und Peer-Tuning: Vertiefung 2026-10-23](audio-quality-deep-dive-2026-10-23.md)
 - [Client: Implementierungsentscheidungen 2026-09-20 bis 2026-09-28](client-implementation-decisions.md)
 - [Code-Review 2026-09-23](review-2026-09-23.md)
 - [Server-Review 2026-09-24: Betrieb im offenen Internet](review-2026-09-24.md)

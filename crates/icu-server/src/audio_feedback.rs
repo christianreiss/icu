@@ -179,11 +179,15 @@ impl Feedback {
                                 || r.window.first_ts.wrapping_sub(p.end_ts) as i32 >= 0
                         })
                     })
-                    .min_by_key(|r| self.sources[&speaker].ts.wrapping_sub(r.window.end_ts));
+                    .min_by_key(|r| self.sources[&speaker].ts.wrapping_sub(r.window.end_ts) as i32);
                 let Some(report) = newest else {
                     continue;
                 };
                 window = report.window;
+                // Reports are numbered independently by each receiver. Hints
+                // need a server-owned sequence so a newly joined receiver's
+                // low counter cannot look like a replay to the sender.
+                window.report_id = previous.map_or(0, |p| p.report_id.wrapping_add(1));
                 self.last_hint.insert(speaker, window);
             }
             out.push((
@@ -248,6 +252,131 @@ mod tests {
             now,
         );
     }
+    #[test]
+    fn newest_hint_window_can_end_just_ahead_of_last_datagram() {
+        // Repeat across the sender sample clock wrap (about 25 hours).
+        for base in [0u32, u32::MAX - 96_479] {
+            let now = Instant::now();
+            let mut feedback = Feedback::default();
+            for session in [1, 2, 3] {
+                feedback.join(session, icu_proto::CAP_AUDIO_FEEDBACK);
+            }
+            let first = AudioWindow {
+                first_ts: base,
+                end_ts: base.wrapping_add(96_000),
+                ..window(1, 0)
+            };
+            let newest = AudioWindow {
+                first_ts: first.first_ts.wrapping_add(960),
+                end_ts: first.end_ts.wrapping_add(960),
+                ..first
+            };
+            feedback.observe_audio(
+                1,
+                AudioHeader {
+                    gain_epoch: 1,
+                    ts: first.end_ts,
+                    ..Default::default()
+                },
+                now,
+            );
+            feedback.report(2, 1, level(400), first, now);
+            feedback.report(3, 1, level(400), newest, now);
+            let hint = feedback
+                .tick(now, |_, _| true)
+                .into_iter()
+                .find(|(speaker, _)| *speaker == 1)
+                .unwrap()
+                .1;
+            match hint {
+                ControlMsg::AudioLevelHint {
+                    window,
+                    correction_cdb: Some(400),
+                    ..
+                } => assert_eq!(window.end_ts, newest.end_ts),
+                _ => panic!("expected agreeing feedback"),
+            }
+        }
+    }
+
+    #[test]
+    fn hint_sequence_wraps_and_restarts_only_for_a_new_gain_epoch() {
+        let now = Instant::now();
+        let mut feedback = Feedback::default();
+        for session in [1, 2] {
+            feedback.join(session, icu_proto::CAP_AUDIO_FEEDBACK);
+        }
+        audio(&mut feedback, 7, 0, now);
+        let previous = AudioWindow {
+            report_id: u32::MAX,
+            ..window(7, 0)
+        };
+        feedback.last_hint.insert(1, previous);
+        audio(&mut feedback, 7, 1, now);
+        feedback.report(
+            2,
+            1,
+            level(400),
+            AudioWindow {
+                report_id: 0,
+                ..window(7, 1)
+            },
+            now,
+        );
+        let hint = feedback
+            .tick(now, |_, _| true)
+            .into_iter()
+            .find(|(speaker, _)| *speaker == 1)
+            .unwrap()
+            .1;
+        match hint {
+            ControlMsg::AudioLevelHint {
+                window,
+                correction_cdb: Some(400),
+                ..
+            } => {
+                assert_eq!(window.report_id, 0);
+                assert!(window.newer_than(previous));
+            }
+            _ => panic!("expected feedback across counter wrap"),
+        }
+        let later = now + Duration::from_secs(2);
+        audio(&mut feedback, 8, 2, later);
+        feedback.report(2, 1, level(400), window(7, 2), later);
+        assert!(
+            feedback.reports.is_empty(),
+            "old gain epoch remains rejected"
+        );
+        feedback.report(
+            2,
+            1,
+            level(400),
+            AudioWindow {
+                report_id: 0,
+                ..window(8, 2)
+            },
+            later,
+        );
+        let hint = feedback
+            .tick(later, |_, _| true)
+            .into_iter()
+            .find(|(speaker, _)| *speaker == 1)
+            .unwrap()
+            .1;
+        assert!(matches!(
+            hint,
+            ControlMsg::AudioLevelHint {
+                window: AudioWindow {
+                    gain_epoch: 8,
+                    report_id: 0,
+                    ..
+                },
+                correction_cdb: Some(400),
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn delayed_duplicate_overlapping_and_old_epoch_reports_never_reconfirm() {
         let now = Instant::now();

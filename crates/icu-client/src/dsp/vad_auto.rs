@@ -2,9 +2,9 @@
 //! voice-probability signal and derives a threshold from it, so hands-free
 //! (VAD) mode does not need a manually tuned threshold per room/mic.
 //!
-//! Only samples taken while the gate is confirmed closed feed the floor
-//! (`Gate::is_open() == false`), so real speech never pollutes the
-//! estimate. A short cooldown after an open→closed transition skips
+//! Only samples outside admitted or above-threshold candidate speech feed
+//! the floor, so the VAD attack cannot train away its own speech onset.
+//! A short cooldown after a speech→quiet transition skips
 //! RNNoise's own trailing probability tail. A starvation watchdog nudges
 //! the floor up even while nominally open, so a threshold that started too
 //! low (gate never closes) cannot deadlock the tracker forever. It feeds on
@@ -62,9 +62,9 @@ impl AutoThreshold {
         }
     }
 
-    /// One 10 ms block. `gate_open` is the gate's openness as of the last
-    /// completed frame (up to one Opus frame stale — fine here). `prob` is
-    /// this block's RNNoise voice probability.
+    /// One 10 ms block. `gate_open` includes above-threshold candidate speech
+    /// even when the transmit gate is still arming or held shut by PTT/mute.
+    /// `prob` is this block's RNNoise voice probability.
     pub fn update(&mut self, now: Instant, gate_open: bool, prob: f32) {
         // A probability that is no number would leave the floor, and with
         // it the threshold, no number for good: `p >= NaN` never holds.

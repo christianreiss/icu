@@ -1990,13 +1990,8 @@ fn dsp_thread(
         ctl.vad_prob.store(prob.unwrap_or(0.0));
         let threshold = if ctl.vad_auto.load(Ordering::Relaxed) {
             if let Some(p) = prob {
-                let speaking = floor_sample_is_speech(
-                    gate.mode(),
-                    gate.is_open(),
-                    gate.is_muted(),
-                    p,
-                    auto_threshold.threshold(),
-                );
+                let speaking =
+                    floor_sample_is_speech(gate.is_open(), p, auto_threshold.threshold());
                 auto_threshold.update(t_block, speaking, p);
             }
             auto_threshold.threshold()
@@ -2228,24 +2223,12 @@ fn collect_block(
     acc.extend_from_slice(block);
 }
 
-/// Whether this block is speech as far as the VAD's noise-floor tracker
-/// (`dsp::vad_auto`) is concerned, so it is not absorbed into the floor. In
-/// VAD mode the gate says so. In PTT mode the gate only says whether the
-/// key is down: the user talking to the room with the key up would feed
-/// the floor with speech, drive the threshold up within a second and leave
-/// the VAD — and with it the leveler — blind when the key goes down. So
-/// there a block that clears the current threshold is speech too. The same
-/// holds in either mode while mute keeps the gate shut (`gate_muted`):
-/// talking while muted raised the threshold until the voice detector no
-/// longer heard it, and the "Stumm — du sprichst" cue went out mid-sentence.
-fn floor_sample_is_speech(
-    mode: Mode,
-    gate_open: bool,
-    gate_muted: bool,
-    prob: f32,
-    threshold: f32,
-) -> bool {
-    gate_open || ((mode == Mode::Ptt || gate_muted) && prob >= threshold)
+/// Keep both admitted and candidate speech out of the automatic noise floor.
+/// A closed gate may be waiting for the VAD attack, muted, or waiting for PTT;
+/// none makes an above-threshold block evidence of ambient noise. The
+/// AutoThreshold starvation watchdog still recovers from sustained noise.
+fn floor_sample_is_speech(gate_open: bool, prob: f32, threshold: f32) -> bool {
+    gate_open || prob >= threshold
 }
 
 /// Whether the voice detector still counts as hearing speech at `now`
@@ -5564,6 +5547,88 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn automatic_threshold_still_rejects_clicks_and_recovers_from_steady_noise() {
+        use super::{floor_sample_is_speech, vad_auto::AutoThreshold, Gate, Mode};
+        use std::time::{Duration, Instant};
+
+        for attack_ms in [40, 80] {
+            let start = Instant::now();
+            let mut auto = AutoThreshold::new(start);
+            let mut gate = Gate::new(Mode::Vad, Duration::ZERO, Duration::ZERO);
+            gate.set_attack(Duration::from_millis(attack_ms));
+            let mut frame_voice = false;
+            let mut heard_noise = false;
+            for block in 0..1100 {
+                let now = start + Duration::from_millis(block * 10);
+                let prob = if block < 2 {
+                    0.9
+                } else if block < 100 {
+                    0.02
+                } else {
+                    0.5
+                };
+                auto.update(
+                    now,
+                    floor_sample_is_speech(gate.is_open(), prob, auto.threshold()),
+                    prob,
+                );
+                frame_voice |= prob >= auto.threshold();
+                if block % 2 == 1 {
+                    gate.update(now, frame_voice);
+                    frame_voice = false;
+                }
+                if block < 100 {
+                    assert!(!gate.is_open(), "a short click must not open the gate");
+                } else {
+                    heard_noise |= gate.is_open();
+                }
+            }
+            assert!(
+                heard_noise,
+                "exercise recovery after a false speech detection"
+            );
+            assert!(
+                !gate.is_open(),
+                "watchdog must recover despite candidate protection"
+            );
+            assert!(auto.threshold() > 0.5);
+        }
+    }
+
+    #[test]
+    fn automatic_threshold_preserves_speech_during_vad_attack() {
+        use super::{floor_sample_is_speech, vad_auto::AutoThreshold, Gate, Mode};
+        use std::time::{Duration, Instant};
+
+        for attack_ms in [40, 80] {
+            let start = Instant::now();
+            let mut auto = AutoThreshold::new(start);
+            let mut gate = Gate::new(Mode::Vad, Duration::ZERO, Duration::ZERO);
+            gate.set_attack(Duration::from_millis(attack_ms));
+            let mut frame_voice = false;
+            for block in 0..20 {
+                let now = start + Duration::from_millis(block * 10);
+                let prob = 0.25; // Quiet speech just above the initial threshold.
+                auto.update(
+                    now,
+                    floor_sample_is_speech(gate.is_open(), prob, auto.threshold()),
+                    prob,
+                );
+                frame_voice |= prob >= auto.threshold();
+                if block % 2 == 1 {
+                    gate.update(now, frame_voice);
+                    frame_voice = false;
+                }
+            }
+            assert!(
+                gate.is_open(),
+                "{attack_ms} ms attack swallowed sustained speech"
+            );
+            assert!(auto.threshold() < 0.25);
+        }
+    }
+
+    #[test]
     fn video_viewers_expire_without_new_display_reports() {
         use super::{fresh_video_viewers, HashMap, Instant};
         use std::time::Duration;
@@ -5583,15 +5648,15 @@ mod tests {
 
     #[test]
     fn ptt_users_off_air_speech_does_not_feed_the_noise_floor() {
-        use super::{floor_sample_is_speech, Mode};
-        // VAD mode: the gate decides.
-        assert!(floor_sample_is_speech(Mode::Vad, true, false, 0.1, 0.3));
-        assert!(!floor_sample_is_speech(Mode::Vad, false, false, 0.9, 0.3));
+        use super::floor_sample_is_speech;
+        // VAD mode: candidate speech is protected during the attack too.
+        assert!(floor_sample_is_speech(true, 0.1, 0.3));
+        assert!(floor_sample_is_speech(false, 0.9, 0.3));
         // PTT mode, key up: a block over the threshold is speech all the
         // same; a quiet one feeds the floor.
-        assert!(floor_sample_is_speech(Mode::Ptt, false, false, 0.9, 0.3));
-        assert!(!floor_sample_is_speech(Mode::Ptt, false, false, 0.1, 0.3));
-        assert!(floor_sample_is_speech(Mode::Ptt, true, false, 0.1, 0.3));
+        assert!(floor_sample_is_speech(false, 0.9, 0.3));
+        assert!(!floor_sample_is_speech(false, 0.1, 0.3));
+        assert!(floor_sample_is_speech(true, 0.1, 0.3));
     }
 
     /// Talking while muted in voice activation: the shut gate is no sign of
@@ -5599,10 +5664,10 @@ mod tests {
     /// keeps hearing it — the "Stumm — du sprichst" cue stays on.
     #[test]
     fn muted_speech_does_not_feed_the_noise_floor() {
-        use super::{floor_sample_is_speech, vad_auto::AutoThreshold, Mode};
+        use super::{floor_sample_is_speech, vad_auto::AutoThreshold};
         use std::time::{Duration, Instant};
-        assert!(floor_sample_is_speech(Mode::Vad, false, true, 0.9, 0.3));
-        assert!(!floor_sample_is_speech(Mode::Vad, false, true, 0.1, 0.3));
+        assert!(floor_sample_is_speech(false, 0.9, 0.3));
+        assert!(!floor_sample_is_speech(false, 0.1, 0.3));
         let t0 = Instant::now();
         let mut auto = AutoThreshold::new(t0);
         let start = auto.threshold();
@@ -5610,11 +5675,7 @@ mod tests {
         for i in 0..300u64 {
             let t = t0 + Duration::from_millis(10 * i);
             let th = auto.threshold();
-            auto.update(
-                t,
-                floor_sample_is_speech(Mode::Vad, false, true, 0.95, th),
-                0.95,
-            );
+            auto.update(t, floor_sample_is_speech(false, 0.95, th), 0.95);
         }
         assert_eq!(
             auto.threshold(),

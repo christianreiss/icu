@@ -14,6 +14,62 @@ fn level(c: f32) -> AudioLevel {
     }
 }
 #[test]
+fn changing_reporters_keeps_peer_hint_sequence_monotonic() {
+    let start = Instant::now();
+    let mut server = Feedback::default();
+    for session in [1, 2, 3] {
+        server.join(session, CAP_AUDIO_FEEDBACK);
+    }
+    let mut tuner = PeerTuner::default();
+    tuner.set_epoch(1);
+    let mut previous = None;
+    for (i, (reporter, report_id)) in [(2, 100), (3, 0), (3, 1)].into_iter().enumerate() {
+        let now = start + Duration::from_secs(i as u64 * 2);
+        let window = AudioWindow {
+            gain_epoch: 1,
+            first_ts: i as u32 * 96_000,
+            end_ts: (i as u32 + 1) * 96_000,
+            report_id,
+        };
+        server.observe_audio(
+            1,
+            AudioHeader {
+                gain_epoch: 1,
+                ts: window.end_ts,
+                ..Default::default()
+            },
+            now,
+        );
+        server.report(reporter, 1, level(4.0), window, now);
+        let hint = server
+            .tick(now, |_, _| true)
+            .into_iter()
+            .find_map(|(speaker, hint)| match hint {
+                ControlMsg::AudioLevelHint {
+                    window,
+                    correction_cdb: Some(400),
+                    reporters,
+                } if speaker == 1 => Some((window, reporters)),
+                _ => None,
+            })
+            .expect("fresh agreeing report must produce a hint");
+        if let Some(previous) = previous {
+            assert!(
+                hint.0.newer_than(previous),
+                "receiver-local counters cannot order server hints"
+            );
+        }
+        previous = Some(hint.0);
+        tuner.hint_window(hint.0, Some(400), hint.1, now);
+        tuner.tick(Some(level(4.0)), true, now);
+    }
+    assert_eq!(
+        tuner.offset_db, 0.5,
+        "three independent windows must corroborate"
+    );
+}
+
+#[test]
 fn ten_minutes_hold_success_across_pauses_reject_delays_and_reverse_cleanly() {
     let start = Instant::now();
     let mut server = Feedback::default();

@@ -136,6 +136,9 @@ ab. Er verwirft alte Kennungen, wiederholte/überlappende Fenster und Berichte,
 deren Ende mehr als sechs Sekunden hinter dem letzten Audiosample liegt
 (maximal 5760 Samples Vorlauf für den letzten decodierten Frame). Weitere
 Empfänger desselben Zeitfensters erzeugen keine zusätzlichen Bestätigungen.
+Berichtszähler gelten pro Empfänger und Sender. Hints erhalten dagegen eine
+eigene Server-Sequenz pro Sender und Pegelkennung: ein Empfängerwechsel darf
+mit einem niedrigeren Berichtszähler keine frischen Hints sperren.
 Hints tragen das neu ausgewertete Fenster; der Sender akzeptiert nur seine
 aktuelle Kennung. Ein Schritt darf erst auf ein vollständiges neues Fenster
 nach der vorherigen Korrektur folgen. Die Control-Feldreihenfolge und der

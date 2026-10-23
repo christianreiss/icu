@@ -753,7 +753,7 @@ struct Stream {
     device_id: String,
     /// Captured samples not yet handed on as a whole block.
     pending: Vec<f32>,
-    /// One block for the playback callback.
+    /// Endpoint-sized mono scratch; allocated before the audio callback.
     block: Vec<f32>,
 }
 
@@ -962,7 +962,7 @@ impl Stream {
                 device_name,
                 device_id: device_id(&device)?,
                 pending: Vec::with_capacity(BLOCK_SAMPLES * 8),
-                block: vec![0.0; BLOCK_SAMPLES],
+                block: vec![0.0; buffer_frames as usize],
             };
             if let Some(render) = &stream.render {
                 // Start on silence so the first period is not a gap.
@@ -1102,15 +1102,7 @@ impl Stream {
             }
             let data = render.GetBuffer(frames as u32)?;
             let out = std::slice::from_raw_parts_mut(data as *mut f32, frames * self.channels);
-            for chunk in out.chunks_exact_mut(BLOCK_SAMPLES * self.channels) {
-                self.block.fill(0.0);
-                cb(&mut self.block);
-                for (frame, s) in chunk.chunks_exact_mut(self.channels).zip(&self.block) {
-                    for (out, voice) in frame.iter_mut().zip(&self.voice) {
-                        *out = if *voice { *s } else { 0.0 };
-                    }
-                }
-            }
+            super::channels::render_voice(&mut self.block[..frames], out, &self.voice, cb);
             render.ReleaseBuffer(frames as u32, 0)?;
             Ok(frames)
         }

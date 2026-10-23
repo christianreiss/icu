@@ -85,6 +85,8 @@ Fallback-Backend den Ausfall im Hauptfenster.
 Windows nutzt WASAPI Shared Mode, bevorzugt `IAudioClient3` bei float32/48 kHz,
 sonst `IAudioClient` mit Systemkonvertierung. Mikrofon: Kanal 0; Wiedergabe: FL/FR,
 sonst FC beziehungsweise das erste Kanalpaar. Surround und LFE bleiben still.
+Eine Wiedergabeanforderung erreicht den Mixer mit ihrer gesamten Framezahl;
+auch große Endpoint-Puffer werden nicht als viele kleine Anforderungen verborgen.
 Die Referenz ist der System-Loopback des Ausgabe-Endpoints, alle 2 ms abgefragt.
 Default-Wechsel folgen `eConsole`. CPAL ist der Rückfall, wenn der WASAPI-Watcher
 nicht startet; eigene Resampling-Planungen gehören nicht zum aktuellen Pfad.
@@ -95,9 +97,12 @@ nicht startet; eigene Resampling-Planungen gehören nicht zum aktuellen Pfad.
   zusätzliches AGC. AEC und Denoise laufen auch bei geschlossenem Sendegate weiter.
 - RNNoise arbeitet mit auf ±32768 skalierten Samples; seine Wahrscheinlichkeit
   speist die VAD. Der erste Ausgabeblock nach Filterstart wird durch Stille
-  ersetzt. Nicht endliche Eingangswerte werden bereinigt.
+  ersetzt. Nach einer Denoise-Pause startet der Filter neu, damit keine alten
+  Überlappungssamples wiedergegeben werden. Nicht endliche Eingangswerte werden bereinigt.
 - Die automatische VAD-Schwelle verfolgt den Rauschboden. Sprache bei Stumm,
   fehlender Verbindung oder losgelassener PTT-Taste zählt nicht als Rauschen.
+  Das gilt auch für Sprachkandidaten während des VAD-Anlaufs: die Schwelle
+  darf leise Sprache nicht weglernen, bevor das Gate öffnen kann.
   Die Sprachanzeige hält über den VAD-Nachlauf, auch während Stumm.
 - Stimmoptimierung ist standardmäßig an, Stärke mittel. Hochpass 80 Hz,
   Kompressor und Limiter folgen AEC und VAD; leicht/mittel/stark verwenden

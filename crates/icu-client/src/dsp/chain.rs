@@ -80,6 +80,7 @@ pub struct SendChain {
     /// of the VAD.
     prev_voice: bool,
     denoiser: Denoiser,
+    denoise_on: bool,
     voice_chain: VoiceChain,
     voice_on: bool,
     strength: VoiceStrength,
@@ -109,6 +110,7 @@ impl SendChain {
             level_on: false,
             prev_voice: false,
             denoiser: Denoiser::new(),
+            denoise_on: false,
             voice_chain: VoiceChain::new(VoiceStrength::default()),
             voice_on: false,
             strength: VoiceStrength::default(),
@@ -128,6 +130,7 @@ impl SendChain {
     /// would hit the new one. The denoiser starts over too.
     pub fn restart(&mut self) {
         self.denoiser = Denoiser::new();
+        self.denoise_on = false;
         self.leveler.reset();
         self.prev_voice = false;
         self.voice_chain.reset();
@@ -158,6 +161,12 @@ impl SendChain {
         if s.auto_level {
             self.leveler.process_hinted(block, Some(self.prev_voice));
         }
+        if s.denoise && !self.denoise_on {
+            // RNNoise retains overlap audio and recurrent state. A bypass gap
+            // breaks that timeline; re-enabling must start from current audio.
+            self.denoiser = Denoiser::new();
+        }
+        self.denoise_on = s.denoise;
         let prob = if s.denoise {
             let p = self.denoiser.process(block);
             if p.is_finite() {
@@ -280,6 +289,43 @@ impl SendChain {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn denoise_reenable_discards_audio_before_bypass() {
+        let mut chain = SendChain::new();
+        let mut settings = SendSettings {
+            auto_level: false,
+            voice_opt: false,
+            normalize_outgoing: false,
+            ..SendSettings::default()
+        };
+        for frame in 0..30 {
+            let mut block = [0.0; 480];
+            for (i, sample) in block.iter_mut().enumerate() {
+                *sample = ((frame * 480 + i) as f32 * 1000.0 / 48_000.0 * std::f32::consts::TAU)
+                    .sin()
+                    * 0.5;
+            }
+            chain.analyze(&mut block, &settings);
+        }
+        settings.denoise = false;
+        for _ in 0..100 {
+            chain.analyze(&mut [0.0; 480], &settings);
+        }
+        settings.denoise = true;
+        let mut fresh = SendChain::new();
+        for _ in 0..20 {
+            let mut resumed = [0.0; 480];
+            let mut expected = [0.0; 480];
+            let actual = chain.analyze(&mut resumed, &settings);
+            let baseline = fresh.analyze(&mut expected, &settings);
+            assert!(
+                resumed == expected,
+                "re-enabling denoise replayed pre-bypass audio"
+            );
+            assert_eq!(actual.prob, baseline.prob);
+        }
+    }
+
     use super::*;
     use crate::dsp::testsignal;
 

@@ -36,7 +36,7 @@ pub struct AudioWindow {
     pub first_ts: u32,
     /// Exclusive last sample, including intervening non-speech samples.
     pub end_ts: u32,
-    /// Monotonic observation identity per reporter and source.
+    /// Monotonic identity per reporter/source for reports; server/source for hints.
     pub report_id: u32,
 }
 impl AudioWindow {

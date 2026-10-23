@@ -36,6 +36,25 @@ pub fn voice_channels(channels: usize, mask: Option<u32>) -> Vec<bool> {
     (0..channels).map(|c| chosen.contains(&c)).collect()
 }
 
+/// Render one endpoint request using preallocated mono scratch, then map it
+/// to the audible channels. The callback must see the complete request so
+/// the mixer can keep enough audio queued for the device's actual period.
+pub fn render_voice(
+    mono: &mut [f32],
+    out: &mut [f32],
+    voice: &[bool],
+    callback: &mut dyn FnMut(&mut [f32]),
+) {
+    debug_assert_eq!(out.len(), mono.len() * voice.len());
+    mono.fill(0.0);
+    callback(mono);
+    for (frame, sample) in out.chunks_exact_mut(voice.len()).zip(mono) {
+        for (output, enabled) in frame.iter_mut().zip(voice) {
+            *output = if *enabled { *sample } else { 0.0 };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,6 +64,29 @@ mod tests {
     const SURROUND_5_1: u32 = 0x3f;
     /// FL FR FC LFE BL BR SL SR.
     const SURROUND_7_1: u32 = 0x63f;
+
+    #[test]
+    fn large_endpoint_request_reaches_mixer_whole_and_preserves_channel_routing() {
+        for frames in [240, 480, 1440, 1920] {
+            let mut mono = vec![9.0; frames];
+            let mut out = vec![9.0; frames * 6];
+            let voice = voice_channels(6, Some(SURROUND_5_1));
+            let mut calls = vec![];
+            render_voice(&mut mono, &mut out, &voice, &mut |samples| {
+                calls.push(samples.len());
+                assert!(samples.iter().all(|sample| *sample == 0.0));
+                samples.fill(0.25);
+            });
+            assert_eq!(
+                calls,
+                [frames],
+                "device demand must not be hidden by chunking"
+            );
+            for frame in out.as_chunks::<6>().0 {
+                assert_eq!(*frame, [0.25, 0.25, 0.0, 0.0, 0.0, 0.0]);
+            }
+        }
+    }
 
     #[test]
     fn the_voice_goes_to_the_front_pair_only() {
