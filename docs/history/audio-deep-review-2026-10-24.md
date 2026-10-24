@@ -66,11 +66,15 @@ Der native Windows-Pump wird zusätzlich mit der Repository-Toolchain geprüft.
 
 ## Prüfkommandos und Grenzen
 
-Auf dem Audio-Branch bestanden: 143 DSP-Tests (2 bewusst ignoriert), beide
+Auf dem kombinierten Audio-/UI-/Security-Branch bestanden: 144 DSP-Tests
+(2 bewusst ignoriert), beide
 portablen Pakettests, die Engine-Regression, Clippy mit `-D warnings` und
 `cpal-fallback`, Windows-GNU-All-Targets-Check sowie Format-/Diff-Prüfungen.
-Die sieben Opus-Kaskadentests bestanden vor der abschließenden Verschärfung
-des Ton-/Lückenschutzes; der übergeordnete Gesamtprüflauf prüft den Endstand.
+Die sieben Opus-Kaskadentests bestanden auch nach der abschließenden
+Verschärfung des Ton-/Lückenschutzes. Die danach ergänzte eng begrenzte
+Nichtzahl-Reset-Sicherung wurde mit einer ohne sie fehlschlagenden Regression
+(Exitcode 101) und erneutem DSP-/Clippy-/Windows-Lauf geprüft. Der übergeordnete
+Gesamtprüflauf prüft den Endstand vollständig.
 
 - `cargo test --locked -p icu-client --lib dsp::`
 - `cargo test --locked -p icu-client --lib audio::packet::tests`

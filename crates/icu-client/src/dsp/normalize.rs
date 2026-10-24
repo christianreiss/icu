@@ -248,6 +248,7 @@ impl Normalizer {
         for s in block.iter_mut() {
             if !s.is_finite() {
                 *s = 0.0;
+                self.unhinted = false;
             }
         }
         self.observe(block, voice);
@@ -438,6 +439,36 @@ mod tests {
             }
             assert_eq!(n.gain_db(), 0.0, "interference kind {kind}");
         }
+    }
+
+    #[test]
+    fn sanitizing_a_corrupt_sample_clears_previous_voicing_evidence() {
+        let mut n = Normalizer::new();
+        let mut phase = 0.0f32;
+        let mut warmed = false;
+        for b in 0..200 {
+            let mut block = [0.0; BLOCK];
+            for (i, s) in block.iter_mut().enumerate() {
+                let t = (b * BLOCK + i) as f32 / SR;
+                let pitch = 180.0 + 20.0 * (t * std::f32::consts::TAU * 1.3).sin();
+                phase = (phase + pitch / SR).fract();
+                *s = (phase * std::f32::consts::TAU).sin() * 0.05;
+            }
+            n.process(&mut block);
+            if n.voicing.observe(&[]) {
+                warmed = true;
+                break;
+            }
+        }
+        assert!(warmed, "test must establish a voiced run first");
+        let mut corrupt = [f32::NAN];
+        n.process_hinted(&mut corrupt, None);
+        assert_eq!(corrupt, [0.0]);
+        assert!(
+            !n.voicing.observe(&[]),
+            "sanitizing must break the voiced run"
+        );
+        assert!(n.gain_db().is_finite());
     }
 
     #[test]
