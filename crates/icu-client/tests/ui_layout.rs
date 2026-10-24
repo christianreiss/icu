@@ -135,6 +135,26 @@ fn shot<S>(harness: &mut Harness<'_, S>, name: &str) {
     image.save(format!("{dir}/{name}.png")).unwrap();
 }
 
+/// Layout fixtures answer the view's refresh with the same authoritative list
+/// on the next frame, so full moderation controls remain covered by fitting tests.
+fn user_with_refreshed_list(
+    view: &mut UserView,
+    ui: &mut egui::Ui,
+    state: &mut AppState,
+    send: &impl Fn(Command),
+) -> icu_client::ui::user::UserOutput {
+    let commands = RefCell::new(Vec::new());
+    let output = view.ui(ui, state, &|_| None, &|c| commands.borrow_mut().push(c));
+    for command in commands.into_inner() {
+        if matches!(command, Command::RequestUserList) {
+            state.user_list_generation = state.user_list_generation.wrapping_add(1);
+            ui.ctx().request_repaint();
+        }
+        send(command);
+    }
+    output
+}
+
 /// The tallest a window may grow to: a 1080p screen minus title bar and
 /// panel.
 const MAX_HEIGHT: f32 = 980.0;
@@ -362,6 +382,7 @@ fn state() -> AppState {
         last_invite: None,
         invite_error: None,
         user_list: users,
+        user_list_generation: 1,
         user_action_error: None,
         restricted_muted: false,
         restricted_deafened: false,
@@ -676,7 +697,7 @@ fn user_window_fits() {
                 let send = |c: Command| {
                     let _ = cmd.send(c);
                 };
-                *out.borrow_mut() = view.ui(ui, &s, &|_| None, &send).overflow;
+                *out.borrow_mut() = user_with_refreshed_list(&mut view, ui, &mut s, &send).overflow;
             });
             h.run();
             let what = format!("user/{label}/{theme_name}");
@@ -1488,7 +1509,7 @@ fn user_path_details_and_missing_data() {
                         viewport.monitor_size = Some(egui::vec2(1920.0, 1080.0));
                     }
                 });
-                view.ui(ui, &s, &|_| None, &|_| {});
+                user_with_refreshed_list(&mut view, ui, &mut s, &|_| {});
                 assert!(
                     ui.min_rect().right() <= ui.max_rect().right() + 0.5,
                     "user path overflows horizontally"
@@ -1551,7 +1572,7 @@ fn user_path_cards_align_with_wrapping_and_scaling() {
             s.server = "voice-server-mit-langem-namen.example.org:4711".into();
             let mut view = UserView::new(2);
             let mut h = harness_scaled([width, 980.0], theme_name, true, scale, move |ui| {
-                view.ui(ui, &s, &|_| None, &|_| {});
+                user_with_refreshed_list(&mut view, ui, &mut s, &|_| {});
                 assert!(ui.min_rect().right() <= ui.max_rect().right() + 0.5);
             });
             h.run();
@@ -1683,6 +1704,8 @@ fn user_path_keeps_volume_moderation_and_certificate_copy() {
             }
         });
     });
+    s.borrow_mut().user_list_generation += 1;
+    h.run();
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Für mich stummschalten")
         .click();
     h.run();
@@ -1726,6 +1749,155 @@ fn user_path_keeps_volume_moderation_and_certificate_copy() {
         clipboard.borrow().contains(&expected),
         "copy keeps the complete unwrapped SHA-256 fingerprint"
     );
+}
+
+#[test]
+fn moderation_waits_for_loaded_restrictions_and_preserves_deafen() {
+    for theme_name in THEMES {
+        for cached in [false, true] {
+            let mut initial = state();
+            if !cached {
+                initial.user_list.clear();
+            }
+            let current = Rc::new(RefCell::new(initial));
+            let state_in = current.clone();
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            let captured = sent.clone();
+            let mut view = UserView::new(2);
+            let mut h = harness([USER[0], 980.0], theme_name, true, move |ui| {
+                view.ui(ui, &state_in.borrow(), &|_| None, &|c| {
+                    captured.borrow_mut().push(c)
+                });
+            });
+            assert!(sent
+                .borrow()
+                .iter()
+                .any(|c| matches!(c, Command::RequestUserList)));
+            assert!(h
+                .query_by_label(&format!(
+                    "{}  Stummschalten",
+                    egui_phosphor::regular::MICROPHONE_SLASH
+                ))
+                .is_none());
+            h.get_by_label("Moderationsstatus wird geladen …");
+            shot(&mut h, &format!("moderation-loading-{cached}-{theme_name}"));
+
+            let mut restricted = summary(2, "Anna");
+            restricted.deafened = true;
+            current.borrow_mut().user_list = vec![restricted];
+            // Even a populated (possibly stale) list is not a response to this view.
+            h.run();
+            h.get_by_label("Moderationsstatus wird geladen …");
+            current.borrow_mut().user_list_generation += 1;
+            h.run();
+            h.get_by_label(&format!(
+                "{}  Stummschalten",
+                egui_phosphor::regular::MICROPHONE_SLASH
+            ))
+            .click();
+            h.run();
+            assert!(sent.borrow().iter().any(|c| matches!(
+                c,
+                Command::SetUserRestriction {
+                    user_id: 2,
+                    muted: true,
+                    deafened: true
+                }
+            )));
+            assert!(!sent.borrow().iter().any(|c| matches!(
+                c,
+                Command::SetUserRestriction {
+                    deafened: false,
+                    ..
+                }
+            )));
+            shot(
+                &mut h,
+                &format!("moderation-preserves-deafen-{cached}-{theme_name}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn own_participant_shows_system_microphone_mute() {
+    for theme_name in THEMES {
+        let mut s = state();
+        s.peers.truncate(1);
+        s.system_muted = true;
+        let (mut h, _) = main_window(s, theme_name);
+        h.get_by_label("Chris").hover();
+        h.run_steps(4);
+        h.get_by_label("stummgeschaltet");
+        shot(&mut h, &format!("own-system-mute-{theme_name}"));
+    }
+}
+
+#[test]
+fn context_moderation_waits_for_its_refresh_and_preserves_deafen() {
+    let current = Rc::new(RefCell::new(state()));
+    let state_in = current.clone();
+    let (cmd, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let opened_in = opened.clone();
+    let mut view = MainView::default();
+    let mut h = harness([MAIN[0], 700.0], "dark", false, move |ui| {
+        let env = MainEnv {
+            cmd: &cmd,
+            video_tier: icu_client::video::VideoTier::T0,
+            video: &|_| None,
+            self_video: None,
+            settings_open: false,
+            user_open: None,
+            overlay_available: true,
+        };
+        if let Some(id) = view.ui(ui, &state_in.borrow(), &env).open_user {
+            opened_in.borrow_mut().push(id);
+        }
+    });
+    h.get_by_label("Anna").click();
+    h.run();
+    assert_eq!(
+        *opened.borrow(),
+        [2],
+        "the name opens the same peer view as the row"
+    );
+    h.get_by_label("Anna").click_secondary();
+    h.run();
+    h.get_by_label("Moderationsstatus wird geladen …");
+    assert!(matches!(commands.try_recv(), Ok(Command::RequestUserList)));
+    assert!(h
+        .query_by_label(&format!(
+            "{}  Stummschalten",
+            egui_phosphor::regular::MICROPHONE_SLASH
+        ))
+        .is_none());
+
+    {
+        let mut state = current.borrow_mut();
+        state
+            .user_list
+            .iter_mut()
+            .find(|u| u.user_id == 2)
+            .unwrap()
+            .deafened = true;
+        state.user_list_generation += 1;
+    }
+    h.run();
+    h.get_by_label(&format!(
+        "{}  Stummschalten",
+        egui_phosphor::regular::MICROPHONE_SLASH
+    ))
+    .click();
+    h.run();
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(Command::SetUserRestriction {
+            user_id: 2,
+            muted: true,
+            deafened: true
+        })
+    ));
 }
 
 #[test]

@@ -16,6 +16,7 @@ pub mod testsignal;
 pub mod vad;
 pub mod vad_auto;
 pub mod voice;
+mod voicing;
 
 /// Largest sample magnitude the send side passes on: +12 dBFS, far above
 /// what a microphone delivers and far below where a filter overflows.

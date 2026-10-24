@@ -1298,6 +1298,7 @@ impl SettingsView {
                 if capture_label == Some(label) {
                     if let Some(Ok(result)) = &capture {
                         result.apply(binding);
+                        self.capture_error = result.portal_warning(portal);
                     }
                 }
                 let action = binding_row(
@@ -1341,7 +1342,7 @@ impl SettingsView {
             widgets::group_card(ui, "Tasten lesen über", |ui| {
                 let linux = cfg!(target_os = "linux");
                 if linux {
-                    widgets::setting_row(ui, false, "Methode", None, |ui| {
+                    let changed = widgets::setting_row(ui, false, "Methode", None, |ui| {
                         widgets::segmented(
                             ui,
                             &mut self.draft.hotkeys.backend,
@@ -1351,7 +1352,12 @@ impl SettingsView {
                                 (HotkeyBackend::Evdev, "evdev"),
                             ],
                         )
-                    });
+                    })
+                    .changed();
+                    if changed {
+                        self.capture = None;
+                        self.capture_error = None;
+                    }
                 }
                 widgets::setting_row(ui, linux, "Aktiv", None, |ui| {
                     let tok = theme::tokens(ui.visuals());
@@ -3259,6 +3265,15 @@ impl Captured {
         self.trigger.is_some()
     }
 
+    pub(super) fn portal_warning(&self, portal: bool) -> Option<String> {
+        (portal && !self.has_trigger()).then(|| {
+            "Diese Taste kann ICU der Arbeitsumgebung nicht vorschlagen. Die bisherige \
+             Portal-Belegung bleibt erhalten. Nimm eine Buchstaben-, Ziffern- oder F-Taste \
+             — oder lass ICU die Tasten direkt lesen (evdev)."
+                .to_string()
+        })
+    }
+
     /// Writes itself into `binding`. A trigger is only replaced when there
     /// is a new one: evdev and portal bindings live side by side.
     pub(super) fn apply(&self, binding: &mut crate::config::KeyBinding) {
@@ -3621,6 +3636,7 @@ mod tests {
             last_invite: None,
             invite_error: None,
             user_list: Vec::new(),
+            user_list_generation: 0,
             user_action_error: None,
             restricted_muted: false,
             restricted_deafened: false,
@@ -3755,6 +3771,94 @@ mod tests {
         assert!(view.capture_error.is_none());
         assert_eq!(view.draft.hotkeys.ptt.key, "KEY_F9");
         assert_eq!(view.draft.hotkeys.ptt.trigger.as_deref(), Some("F9"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn changing_the_advanced_backend_discards_late_capture_results() {
+        use egui_kittest::{kittest::Queryable, Harness};
+
+        let (state, mut view) = capture_fixture();
+        view.draft.ui.show_advanced = true;
+        let original = view.draft.hotkeys.ptt.clone();
+        let capture = pending_capture();
+        let late_result = capture.slot.clone();
+        view.capture = Some(capture);
+        view.capture_error = Some("Previous attempt failed".into());
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(850.0, 1100.0))
+            .build_ui_state(
+                |ui, (state, view, initialized): &mut (AppState, SettingsView, bool)| {
+                    if !*initialized {
+                        crate::ui::fonts::install(ui.ctx());
+                        *initialized = true;
+                        return;
+                    }
+                    view.hotkeys_tab(ui, state, &mut Vec::new());
+                },
+                (state, view, false),
+            );
+        h.run_steps(4);
+        h.get_by_label("Portal").click();
+        h.run_steps(4);
+        assert_eq!(h.state().1.draft.hotkeys.backend, HotkeyBackend::Portal);
+        assert!(h.state().1.capture.is_none());
+        assert!(h.state().1.capture_error.is_none());
+        *late_result.lock().unwrap() = Some(Ok("KEY_F9".into()));
+        h.run_steps(4);
+        assert_eq!(h.state().1.draft.hotkeys.ptt, original);
+    }
+
+    #[test]
+    fn unsupported_portal_capture_explains_why_the_old_trigger_remains() {
+        use egui_kittest::{kittest::Queryable, Harness};
+
+        for (theme_name, key) in [("light", "BTN_SIDE"), ("dark", "KEY_RIGHTCTRL")] {
+            let (mut state, mut view) = capture_fixture();
+            state.hotkey_backend = "portal".into();
+            let old_trigger = view.draft.hotkeys.ptt.trigger.clone();
+            let capture = pending_capture();
+            *capture.slot.lock().unwrap() = Some(Ok(key.into()));
+            view.capture = Some(capture);
+            let mut h = Harness::builder()
+                .with_size(egui::vec2(850.0, 800.0))
+                .with_theme(if theme_name == "light" {
+                    egui::Theme::Light
+                } else {
+                    egui::Theme::Dark
+                })
+                .build_ui_state(
+                    move |ui, (state, view, initialized): &mut (AppState, SettingsView, bool)| {
+                        if !*initialized {
+                            crate::ui::fonts::install(ui.ctx());
+                            theme::apply(ui.ctx(), theme_name);
+                            *initialized = true;
+                            return;
+                        }
+                        view.hotkeys_tab(ui, state, &mut Vec::new());
+                    },
+                    (state, view, false),
+                );
+            h.run();
+            assert_eq!(h.state().1.draft.hotkeys.ptt.trigger, old_trigger);
+            assert_eq!(h.state().1.draft.hotkeys.ptt.key, key);
+            let warning = h
+                .state()
+                .1
+                .capture_error
+                .as_deref()
+                .expect("unsupported Portal capture must warn");
+            assert!(warning.contains("Arbeitsumgebung"));
+            assert!(warning.contains("evdev"));
+            h.get_by_label(warning);
+            if let Ok(dir) = std::env::var("ICU_UI_SHOTS") {
+                std::fs::create_dir_all(&dir).unwrap();
+                h.render()
+                    .unwrap()
+                    .save(format!("{dir}/portal-capture-warning-{theme_name}.png"))
+                    .unwrap();
+            }
+        }
     }
 
     /// „für 60 s“ only where ICU takes a copied secret off the clipboard

@@ -965,6 +965,56 @@ async fn a_default_endpoint_change_reopens_the_audio_group_once() {
     drop(engine);
 }
 
+/// Native capture discontinuities use the coordinated reopen path without
+/// becoming a persistent device-error banner or changing the user's mute.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_discontinuities_restart_the_audio_group_and_preserve_mute() {
+    use icu_client::audio::{BackendEvent, StreamKind};
+    use std::sync::{Arc, Mutex};
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let (events, rx) = std::sync::mpsc::channel();
+    let backend = Devices {
+        list: Arc::new(Mutex::new(vec![])),
+        opened: opened.clone(),
+        events: Some(rx),
+    };
+    let mut settings = test_settings();
+    settings.audio.aec = true;
+    settings.audio.muted = true;
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, settings, paths);
+    cfg.server_addr = Some(server.addr());
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).unwrap();
+    wait_connected(&engine).await;
+    for stream in [StreamKind::Capture, StreamKind::Reference] {
+        opened.lock().unwrap().clear();
+        events
+            .send(BackendEvent::StreamDiscontinuity { stream })
+            .unwrap();
+        tokio::time::timeout(SOON, async {
+            while opened.lock().unwrap().len() < 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec![
+                (StreamKind::Capture, None),
+                (StreamKind::Reference, None),
+                (StreamKind::Playback, None),
+            ],
+        );
+        let state = engine.snapshot();
+        assert!(state.muted);
+        assert!(state.banner.is_none());
+    }
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
 /// A backend whose microphone does not open while `mic` is off — a
 /// desktop without one — recording every open like [`Devices`]. No audio
 /// flows.

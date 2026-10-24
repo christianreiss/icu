@@ -106,6 +106,8 @@ pub struct Normalizer {
     /// Samples seen in the current floor window.
     win_samples: usize,
     headroom_limited: bool,
+    voicing: super::voicing::Voicing,
+    unhinted: bool,
 }
 
 impl Default for Normalizer {
@@ -130,6 +132,8 @@ impl Normalizer {
             prev_win_min: f32::INFINITY,
             win_samples: 0,
             headroom_limited: false,
+            voicing: Default::default(),
+            unhinted: true,
         }
     }
 
@@ -162,9 +166,20 @@ impl Normalizer {
     /// Measures without changing samples; shared by feedback and actual leveling.
     pub fn observe(&mut self, block: &[f32], voice: Option<bool>) -> bool {
         if block.is_empty() || block.iter().any(|x| !x.is_finite()) {
+            self.unhinted = false;
             return false;
         }
         let rms_db = measure(block).rms_db;
+        let voice = if voice.is_some() {
+            self.unhinted = false;
+            voice
+        } else {
+            if !self.unhinted {
+                self.voicing = Default::default();
+                self.unhinted = true;
+            }
+            self.voicing.observe(block).then_some(true)
+        };
 
         // Exact silence (jitter-buffer gaps, a closed gate) says nothing
         // about the speaker's noise floor: neither counted nor clocked, so
@@ -233,6 +248,7 @@ impl Normalizer {
         for s in block.iter_mut() {
             if !s.is_finite() {
                 *s = 0.0;
+                self.unhinted = false;
             }
         }
         self.observe(block, voice);
@@ -306,6 +322,153 @@ mod tests {
         let mut n = Normalizer::with(Profile::OUTBOUND);
         run(&mut n, talk(-34.0, -70.0, 10.0));
         assert!(n.gain_db() > 9.0, "gain {}", n.gain_db());
+    }
+
+    /// Compressed vowels can have a constant block RMS and digitally silent
+    /// pauses. They need evidence other than a lower nonzero noise floor.
+    #[test]
+    fn clean_contoured_voice_does_not_become_its_own_receive_noise_floor() {
+        for (db, wanted) in [(-34.0, 10.0), (-10.0, -10.0)] {
+            let mut n = Normalizer::new();
+            let mut phase = 0.0f32;
+            for b in 0..2000 {
+                let mut block = [0.0; BLOCK];
+                if b % 200 < 150 {
+                    for (i, s) in block.iter_mut().enumerate() {
+                        let t = (b * BLOCK + i) as f32 / SR;
+                        let pitch = 180.0 + 20.0 * (t * std::f32::consts::TAU * 1.3).sin();
+                        phase = (phase + pitch / SR).fract();
+                        let p = phase * std::f32::consts::TAU;
+                        *s = p.sin() + 0.4 * (2.0 * p).sin() + 0.2 * (3.0 * p).sin();
+                    }
+                    let scale = from_db(db) / from_db(measure(&block).rms_db);
+                    for x in &mut block {
+                        *x *= scale;
+                    }
+                }
+                n.process(&mut block);
+            }
+            assert!((n.gain_db() - wanted).abs() < 1.0, "{db}: {}", n.gain_db());
+        }
+    }
+
+    #[test]
+    fn speech_recovers_after_noise_contaminated_the_receive_floor() {
+        let mut n = Normalizer::new();
+        run(&mut n, talk(-100.0, -22.0, 4.0));
+        let mut phase = 0.0f32;
+        for b in 0..1500 {
+            let mut block = [0.0; BLOCK];
+            for (i, s) in block.iter_mut().enumerate() {
+                let t = (b * BLOCK + i) as f32 / SR;
+                let pitch = 180.0 + 20.0 * (t * std::f32::consts::TAU * 1.3).sin();
+                phase = (phase + pitch / SR).fract();
+                let p = phase * std::f32::consts::TAU;
+                *s = p.sin() + 0.4 * (2.0 * p).sin() + 0.2 * (3.0 * p).sin();
+            }
+            let scale = from_db(-34.0) / from_db(measure(&block).rms_db);
+            for s in &mut block {
+                *s *= scale;
+            }
+            n.process(&mut block);
+        }
+        assert!((9.0..10.1).contains(&n.gain_db()), "gain {}", n.gain_db());
+    }
+
+    #[test]
+    fn receive_gain_agrees_for_ten_and_twenty_ms_blocks_and_clears_stale_voicing() {
+        let mut phase = 0.0f32;
+        let mut source = Vec::new();
+        for b in 0..1500 {
+            let mut block = [0.0; BLOCK];
+            for (i, s) in block.iter_mut().enumerate() {
+                let t = (b * BLOCK + i) as f32 / SR;
+                let pitch = 180.0 + 20.0 * (t * std::f32::consts::TAU * 1.3).sin();
+                phase = (phase + pitch / SR).fract();
+                let p = phase * std::f32::consts::TAU;
+                *s = p.sin() + 0.4 * (2.0 * p).sin() + 0.2 * (3.0 * p).sin();
+            }
+            let scale = from_db(-34.0) / from_db(measure(&block).rms_db);
+            source.extend(block.map(|s| s * scale));
+        }
+        let mut gains = Vec::new();
+        for quantum in [480, 960] {
+            let mut n = Normalizer::new();
+            for block in source.chunks(quantum) {
+                n.process(&mut block.to_vec());
+            }
+            gains.push(n.gain_db());
+            assert!(n.gain_db() > 9.0);
+            n.observe(&[0.0; BLOCK], Some(false));
+            assert!(
+                !n.observe(&source[..BLOCK], None),
+                "concealment must not freeze old voicing confidence"
+            );
+        }
+        assert!((gains[0] - gains[1]).abs() < 0.1, "{gains:?}");
+    }
+
+    #[test]
+    fn switched_tones_and_out_of_band_sweeps_do_not_raise_receive_gain() {
+        for kind in 0..3 {
+            let mut n = Normalizer::new();
+            let mut phase = 0.0f32;
+            for b in 0..1000 {
+                let mut block = [0.0; BLOCK];
+                for (i, s) in block.iter_mut().enumerate() {
+                    let t = (b * BLOCK + i) as f32 / SR;
+                    let hz = match kind {
+                        0 => {
+                            if b < 500 {
+                                180.0
+                            } else {
+                                200.0
+                            }
+                        }
+                        1 => 8000.0 + 180.0 + 20.0 * (t * std::f32::consts::TAU * 1.3).sin(),
+                        _ => 16000.0 + 180.0 + 20.0 * (t * std::f32::consts::TAU * 1.3).sin(),
+                    };
+                    phase = (phase + hz / SR).fract();
+                    *s = (phase * std::f32::consts::TAU).sin();
+                }
+                let scale = from_db(-34.0) / from_db(measure(&block).rms_db);
+                for s in &mut block {
+                    *s *= scale;
+                }
+                n.process(&mut block);
+            }
+            assert_eq!(n.gain_db(), 0.0, "interference kind {kind}");
+        }
+    }
+
+    #[test]
+    fn sanitizing_a_corrupt_sample_clears_previous_voicing_evidence() {
+        let mut n = Normalizer::new();
+        let mut phase = 0.0f32;
+        let mut warmed = false;
+        for b in 0..200 {
+            let mut block = [0.0; BLOCK];
+            for (i, s) in block.iter_mut().enumerate() {
+                let t = (b * BLOCK + i) as f32 / SR;
+                let pitch = 180.0 + 20.0 * (t * std::f32::consts::TAU * 1.3).sin();
+                phase = (phase + pitch / SR).fract();
+                *s = (phase * std::f32::consts::TAU).sin() * 0.05;
+            }
+            n.process(&mut block);
+            if n.voicing.observe(&[]) {
+                warmed = true;
+                break;
+            }
+        }
+        assert!(warmed, "test must establish a voiced run first");
+        let mut corrupt = [f32::NAN];
+        n.process_hinted(&mut corrupt, None);
+        assert_eq!(corrupt, [0.0]);
+        assert!(
+            !n.voicing.observe(&[]),
+            "sanitizing must break the voiced run"
+        );
+        assert!(n.gain_db().is_finite());
     }
 
     #[test]

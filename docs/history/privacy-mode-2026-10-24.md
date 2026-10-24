@@ -41,8 +41,8 @@ hier nicht geprüft. Es erfolgte kein Deployment und keine Protokolländerung.
 
 ## Lokale Verifikation
 
-- `cargo test --locked --workspace`: 961 bestanden, 0 fehlgeschlagen,
-  12 explizit ignoriert (vor Integration der parallelen Audio-/UI-Fixes).
+- `cargo test --locked --workspace`: 980 bestanden, 0 fehlgeschlagen,
+  13 explizit ignoriert, einschließlich der parallelen Audio-/UI-Fixes.
 - `cargo clippy --locked --workspace --all-targets -- -D warnings`,
   `cargo fmt --all -- --check` und `git diff --check`: bestanden.
 - `cargo check --locked -p icu-client --no-default-features` sowie mit
