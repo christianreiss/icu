@@ -26,7 +26,7 @@ DOWNLOADS = ROOT / "web" / "downloads"
 CLASSES = [
     (r"icu-{v}-windows-x86_64-setup\.exe", "client", "windows", "setup"),
     (r"icu-{v}-windows-x86_64\.zip", "client", "windows", "zip"),
-    (r"icu-{v}-\d+\.fc(\d+)\.x86_64\.rpm", "client", "fedora", "rpm"),
+    (r"icu(?:-client)?-{v}-\d+\.fc(\d+)\.x86_64\.rpm", "client", "fedora", "rpm"),
     (r"icu_{v}-\d+\+deb(\d+)_amd64\.deb", "client", "debian", "deb"),
     (r"icu-server-{v}-\d+\.x86_64\.rpm", "server", "linux-rpm", "rpm"),
     (r"icu-server_{v}-\d+_amd64\.deb", "server", "linux-deb", "deb"),

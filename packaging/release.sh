@@ -130,7 +130,7 @@ host's FQDN, if it resolves to this host) and \`sudo systemctl enable --now icu-
 \`icu-$VERSION-windows-x86_64.zip\` and start \`icu.exe\`. SmartScreen warns about
 an unknown publisher on the first start: "More info" → "Run anyway". Details:
 \`README.txt\` in the ZIP. Alternatively, \`icu-$VERSION-windows-x86_64-setup.exe\`
-installs per-user (no admin rights, Start Menu entry, uninstall via
+installs system-wide (administrator rights required, Start Menu entry, uninstall via
 Settings/Control Panel) — same unsigned SmartScreen warning either way.
 
 **Verify** before installing: \`SHA256SUMS.sig\` is an SSH signature of
