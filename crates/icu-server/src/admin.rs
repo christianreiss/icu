@@ -797,6 +797,7 @@ pub async fn set_restriction(
                 .room
                 .broadcast(&ControlMsg::UserState { session, flags });
         }
+        server.refresh_loss_hints();
         Ok((muted, deafened))
     })
     .await?;

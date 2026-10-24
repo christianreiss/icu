@@ -7,7 +7,7 @@
 //! reports for a speaker have expired.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -74,6 +74,9 @@ impl LossTracker {
         now: Instant,
         listeners: impl Fn(Session) -> usize,
     ) -> Option<u16> {
+        if loss_permille > 1000 {
+            return None;
+        }
         self.reports
             .insert((speaker, reporter), (loss_permille, now));
         self.recompute(speaker, Some(ttl), now, listeners(speaker))
@@ -95,18 +98,41 @@ impl LossTracker {
         now: Instant,
         listeners: impl Fn(Session) -> usize,
     ) -> Vec<(Session, u16)> {
-        let mut touched: Vec<Session> = Vec::new();
-        self.reports.retain(|(speaker, _), (_, when)| {
-            let alive = now.saturating_duration_since(*when) < ttl;
-            if !alive && !touched.contains(speaker) {
-                touched.push(*speaker);
-            }
-            alive
+        self.refresh_at(ttl, now, listeners, |_, _| true)
+    }
+
+    /// Remove expired reports and votes from peers that no longer receive
+    /// the speaker's audio. Recompute existing hints even when no vote was
+    /// removed: a listener joining or deafening changes the consensus size.
+    pub fn refresh(
+        &mut self,
+        ttl: Duration,
+        listeners: impl Fn(Session) -> usize,
+        eligible: impl Fn(Session, Session) -> bool,
+    ) -> Vec<(Session, u16)> {
+        self.refresh_at(ttl, Instant::now(), listeners, eligible)
+    }
+
+    fn refresh_at(
+        &mut self,
+        ttl: Duration,
+        now: Instant,
+        listeners: impl Fn(Session) -> usize,
+        eligible: impl Fn(Session, Session) -> bool,
+    ) -> Vec<(Session, u16)> {
+        let speakers: HashSet<_> = self
+            .reports
+            .keys()
+            .map(|(speaker, _)| *speaker)
+            .chain(self.sent.keys().copied())
+            .collect();
+        self.reports.retain(|(speaker, reporter), (_, when)| {
+            now.saturating_duration_since(*when) < ttl && eligible(*reporter, *speaker)
         });
-        touched
+        speakers
             .into_iter()
             .filter_map(|speaker| {
-                self.recompute(speaker, Some(ttl), now, listeners(speaker))
+                self.recompute(speaker, None, now, listeners(speaker))
                     .map(|value| (speaker, value))
             })
             .collect()
@@ -206,6 +232,46 @@ mod tests {
         let mut tracker = LossTracker::default();
         assert_eq!(tracker.report_at(1, 2, 50, TTL, t0, two), Some(50));
         assert_eq!(tracker.report_at(1, 2, 50, TTL, t0, two), None);
+    }
+
+    #[test]
+    fn invalid_loss_cannot_replace_or_extend_a_valid_vote() {
+        let t0 = Instant::now();
+        let mut tracker = LossTracker::default();
+        assert_eq!(tracker.report_at(1, 2, 80, TTL, t0, two), Some(80));
+        assert_eq!(tracker.report_at(1, 2, 1001, TTL, t0 + TTL / 2, two), None);
+        assert_eq!(tracker.expire_at(TTL, t0 + TTL, two), vec![(1, 0)]);
+    }
+
+    #[test]
+    fn ineligible_votes_are_removed_and_cannot_return_after_undeafen() {
+        let t0 = Instant::now();
+        let mut tracker = LossTracker::default();
+        tracker.report_at(1, 2, 1000, TTL, t0, two);
+        assert_eq!(
+            tracker.refresh_at(TTL, t0, two, |reporter, _| reporter != 2),
+            vec![(1, 0)]
+        );
+        assert!(tracker.reports.is_empty());
+        assert!(tracker.refresh_at(TTL, t0, two, |_, _| true).is_empty());
+        assert_eq!(tracker.report_at(1, 2, 80, TTL, t0, two), Some(80));
+    }
+
+    #[test]
+    fn a_changed_listener_count_recomputes_the_existing_consensus() {
+        let t0 = Instant::now();
+        let mut tracker = LossTracker::default();
+        assert_eq!(tracker.report_at(1, 2, 1000, TTL, t0, |_| 3), Some(0));
+        assert_eq!(
+            tracker.refresh_at(TTL, t0, two, |_, _| true),
+            vec![(1, 1000)],
+            "a non-reporting listener deafened, so one of two now agrees"
+        );
+        assert_eq!(
+            tracker.refresh_at(TTL, t0, |_| 3, |_, _| true),
+            vec![(1, 0)],
+            "the listener returned, so one of three no longer agrees"
+        );
     }
 
     /// §10: once every report for a speaker has expired, the server sends
