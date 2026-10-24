@@ -53,9 +53,9 @@ type Toggle = (
 /// fit without a scroll bar, and it is no wider than the control dock needs;
 /// long names end in „…“ (`tests/ui_layout.rs`). A bigger room grows it after
 /// connecting (`App::fit_to_list`).
-pub const MAIN_SIZE: [f32; 2] = [360.0, 440.0];
+pub const MAIN_SIZE: [f32; 2] = [360.0, 492.0];
 /// The smallest the main window can be made.
-pub const MAIN_MIN_SIZE: [f32; 2] = [360.0, 340.0];
+pub const MAIN_MIN_SIZE: [f32; 2] = [360.0, 392.0];
 /// What the settings window opens with: every page fits without a scroll
 /// bar at this size unless expert rows or a long member list make it grow
 /// (`tests/ui_layout.rs`).
@@ -1489,7 +1489,7 @@ impl MainView {
                     (
                         icon::MICROPHONE_SLASH,
                         "Stumm".into(),
-                        state.muted,
+                        state.muted || state.privacy_active,
                         widgets::Role::Danger,
                         widgets::RecDot::Off,
                         state
@@ -1546,8 +1546,14 @@ impl MainView {
                         ui.horizontal(|ui| {
                             for (glyph, label, active, role, rec, hint, cmd) in toggles {
                                 let size = egui::vec2(col, TILE_H);
-                                let mut tile =
-                                    widgets::tile(ui, glyph, &label, active, role, rec, size);
+                                let blocked = state.privacy_active
+                                    && matches!(cmd, Some(Command::SetMuted(_) | Command::SetCamera(_)));
+                                let mut tile = ui.add_enabled_ui(!blocked, |ui| {
+                                    widgets::tile(ui, glyph, &label, active, role, rec, size)
+                                }).inner;
+                                if blocked {
+                                    tile = tile.on_hover_text("Während Privacy gesperrt.");
+                                }
                                 if let Some(hint) = hint {
                                     tile = tile.on_hover_text(hint);
                                 }
@@ -1558,6 +1564,18 @@ impl MainView {
                                 }
                             }
                         });
+                        let privacy = widgets::tile(
+                            ui,
+                            icon::EYE_SLASH,
+                            if state.privacy_active { "Privacy an · Mikrofon stumm" } else { "Privacy" },
+                            state.privacy_active,
+                            widgets::Role::Danger,
+                            widgets::RecDot::Off,
+                            egui::vec2(ui.available_width(), 44.0),
+                        ).on_hover_text("Mikrofon stummschalten und aktives Video durch TV-Rauschen ersetzen. Erneut klicken stellt den vorherigen Zustand wieder her.");
+                        if privacy.clicked() {
+                            send(Command::SetPrivacy(!state.privacy_active));
+                        }
                         ptt
                     })
                     .inner;
@@ -1577,7 +1595,7 @@ impl MainView {
         let own = state.me.as_ref().map(|_| {
             [
                 state.deafened,
-                state.muted || state.system_muted,
+                state.muted || state.system_muted || state.privacy_active,
                 state.camera_on,
                 state.is_admin,
             ]
@@ -1714,7 +1732,7 @@ fn speak_row(
     let speak = widgets::Speak {
         ptt,
         open,
-        muted: state.muted || state.setup_active,
+        muted: state.muted || state.setup_active || state.privacy_active,
         offline,
         alone,
         level: if ptt {
@@ -1967,7 +1985,7 @@ pub(super) fn participant_for<'a>(
             name: &me.name,
             user_id: me.user_id,
             speaking: state.sending,
-            muted: state.muted,
+            muted: state.muted || state.privacy_active,
             deafened: state.deafened,
             camera: state.camera_on,
             mode: Some(state.settings.audio.mode.into()),

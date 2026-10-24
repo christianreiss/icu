@@ -4,6 +4,22 @@
 
 Welche Features enthält ICU v1, was heißt für jedes davon „perfekt" (messbar, wo möglich), was wird ausdrücklich abgelehnt und warum, und welche Grauzonen-Features bekommen welche Empfehlung? Fehlt gegenüber Mumble und TeamSpeak etwas Essentielles?
 
+## Privacy-Modus
+
+Der Button **Privacy** unter den vier Medienschaltern sperrt die
+Mikrofonübertragung und ersetzt eine aktive Kamera durch animiertes TV-Rauschen
+mit Scanlines und dem festen Hinweis **PRIVACY MODE ON**. Gegenstelle,
+Self-Video und Kameravorschau sehen dieselbe Bildquelle. Die echte Kamera wird
+währenddessen freigegeben; auch die Vorschau öffnet sie nicht. Eine vorher
+abgeschaltete Kamera bleibt abgeschaltet.
+
+Erneutes Klicken hebt nur die Privacy-Sperre auf. Vorherige Stummschaltung und
+Kameraeinstellung bleiben erhalten, ebenso Admin-Sperren und zwischenzeitliches
+Taubschalten. Mikrofon- und Kamera-Hotkeys können Privacy nicht umgehen.
+Empfangenes Audio bleibt von Privacy unberührt. Privacy bleibt bei Reconnects
+aktiv, wird aber nicht gespeichert und ist nach einem vollständigen Neustart aus.
+Bereits vor dem Umschalten übertragene Medien lassen sich nicht zurückrufen.
+
 ## Kandidaten
 
 Grundsatz (README): „Nur die Features, die wirklich gebraucht werden. Die sind dafür perfekt." Kandidatenmenge = Liste aus der Aufgabenstellung (enthalten, abgelehnt, Grauzone) plus alles, was die Mumble-Audio-/Shortcut-/Overlay-Doku und die TeamSpeak-Feature-Übersicht zusätzlich nennen.

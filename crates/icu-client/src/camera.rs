@@ -404,6 +404,100 @@ impl FrameSource for SyntheticSource {
     }
 }
 
+/// A camera-independent privacy picture. The label is burned into the pixels,
+/// so older clients and every video surface see the same unmistakable state.
+pub struct PrivacySource {
+    tick: u32,
+    start: Instant,
+}
+
+impl Default for PrivacySource {
+    fn default() -> Self {
+        Self {
+            tick: 0,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl PrivacySource {
+    fn picture(tick: u32) -> RgbFrame {
+        let (w, h) = (WIDTH as usize, HEIGHT as usize);
+        let mut rgb = vec![0; w * h * 3];
+        // Coarse, low-contrast noise compresses well at the existing video
+        // bitrates. Scanlines and a slow rolling band suggest an analogue TV
+        // without full-screen flashes or making the steady label flicker.
+        for y in 0..h {
+            for x in 0..w {
+                let mut hash = ((x / 4) as u32).wrapping_mul(374_761_393)
+                    ^ ((y / 4) as u32).wrapping_mul(668_265_263)
+                    ^ tick.wrapping_mul(2_246_822_519);
+                hash = (hash ^ (hash >> 13)).wrapping_mul(1_274_126_177);
+                let mut v = 64 + ((hash >> 24) % 112) as u8;
+                if y % 4 == 0 {
+                    v /= 2;
+                }
+                if (y + tick as usize * 2) % h < 10 {
+                    v = v.saturating_sub(24);
+                }
+                rgb[(y * w + x) * 3..(y * w + x) * 3 + 3].fill(v);
+            }
+        }
+        let label = "PRIVACY MODE ON";
+        let scale = 3;
+        let left = (w - (label.len() * 6 - 1) * scale) / 2;
+        let top = (h - 7 * scale) / 2;
+        for y in top - 10..top + 7 * scale + 10 {
+            rgb[y * w * 3..(y + 1) * w * 3].fill(18);
+        }
+        for (i, c) in label.chars().enumerate() {
+            let rows = match c {
+                'P' => [30, 17, 17, 30, 16, 16, 16],
+                'R' => [30, 17, 17, 30, 20, 18, 17],
+                'I' => [31, 4, 4, 4, 4, 4, 31],
+                'V' => [17, 17, 17, 17, 17, 10, 4],
+                'A' => [14, 17, 17, 31, 17, 17, 17],
+                'C' => [14, 17, 16, 16, 16, 17, 14],
+                'Y' => [17, 17, 10, 4, 4, 4, 4],
+                'M' => [17, 27, 21, 21, 17, 17, 17],
+                'O' => [14, 17, 17, 17, 17, 17, 14],
+                'D' => [30, 17, 17, 17, 17, 17, 30],
+                'E' => [31, 16, 16, 30, 16, 16, 31],
+                'N' => [17, 25, 25, 21, 19, 19, 17],
+                _ => [0; 7],
+            };
+            for (y, row) in rows.iter().enumerate() {
+                for x in 0..5 {
+                    if row & (1 << (4 - x)) != 0 {
+                        for dy in 0..scale {
+                            let offset =
+                                ((top + y * scale + dy) * w + left + (i * 6 + x) * scale) * 3;
+                            rgb[offset..offset + scale * 3].fill(240);
+                        }
+                    }
+                }
+            }
+        }
+        RgbFrame {
+            width: w,
+            height: h,
+            rgb,
+        }
+    }
+}
+
+impl FrameSource for PrivacySource {
+    fn next_frame(&mut self) -> Result<RgbFrame, String> {
+        let deadline = self.start + Duration::from_millis(1000 / FPS as u64) * self.tick;
+        if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+        let frame = Self::picture(self.tick);
+        self.tick = self.tick.wrapping_add(1);
+        Ok(frame)
+    }
+}
+
 /// Frames per second `tier` encodes: the capture rate thinned by its
 /// [`VideoTier::frame_divisor`]; 0 at `T4`.
 pub fn frame_rate(tier: VideoTier) -> f32 {
@@ -569,6 +663,11 @@ pub fn run_sender(
             tracing::info!(failed, "camera frames again");
             failed = 0;
         }
+        // A revoked source may have been blocked inside next_frame. It must
+        // publish neither a stale preview nor another encoded camera frame.
+        if !link.source_current() {
+            return Ok(());
+        }
         preview.put(frame.clone());
 
         let new_tier = if live.load(Ordering::Relaxed) {
@@ -665,6 +764,7 @@ struct Capture {
     live: Arc<AtomicBool>,
     /// The device setting it was opened for.
     device: Option<String>,
+    epoch: usize,
     /// `PreviewSlot::seq` when it started: if the thread fails after
     /// that moved, the camera did work, and the failure streak starts over.
     seq_at_start: u64,
@@ -736,14 +836,26 @@ impl CameraHandle {
 
     /// Starts with an explicit source, sending (tests).
     pub fn start_with(&mut self, source: Box<dyn FrameSource>) {
-        self.spawn(source, None, true);
+        let epoch = self.link.shared_epoch();
+        let source = if epoch % 2 == 1 {
+            Box::new(PrivacySource::default()) as Box<dyn FrameSource>
+        } else {
+            source
+        };
+        self.spawn(source, None, true, epoch);
     }
 
-    fn spawn(&mut self, source: Box<dyn FrameSource>, device: Option<String>, live: bool) {
+    fn spawn(
+        &mut self,
+        source: Box<dyn FrameSource>,
+        device: Option<String>,
+        live: bool,
+        epoch: usize,
+    ) {
         self.stop();
         let stop = Arc::new(AtomicBool::new(false));
         let live = Arc::new(AtomicBool::new(live));
-        let link = self.link.clone();
+        let link = self.link.for_epoch(epoch);
         let preview = self.preview.clone();
         let (stop_t, live_t) = (stop.clone(), live.clone());
         let thread = std::thread::Builder::new()
@@ -755,6 +867,7 @@ impl CameraHandle {
             stop,
             live,
             device,
+            epoch,
             seq_at_start: self.preview.seq.load(Ordering::Acquire),
         });
     }
@@ -762,8 +875,13 @@ impl CameraHandle {
     /// Opens `device` (an index, default 0, or `synthetic`) and starts
     /// sending from it.
     pub fn start(&mut self, device: Option<&str>) -> Result<(), String> {
-        let source = (self.opener)(device)?;
-        self.spawn(source, device.map(str::to_owned), true);
+        let epoch = self.link.shared_epoch();
+        let source = if epoch % 2 == 1 {
+            Box::new(PrivacySource::default()) as Box<dyn FrameSource>
+        } else {
+            (self.opener)(device)?
+        };
+        self.spawn(source, device.map(str::to_owned), true, epoch);
         Ok(())
     }
 
@@ -814,6 +932,15 @@ impl CameraHandle {
         }
         self.last = (camera_on, self.preview_wanted, device.clone());
 
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|c| c.epoch != state.privacy_epoch)
+        {
+            self.stop();
+            self.retry.reset();
+        }
+
         // A thread that ended by itself: the camera stopped delivering.
         if self.thread.as_ref().is_some_and(|c| c.thread.is_finished()) {
             if let Some(capture) = self.thread.take() {
@@ -838,15 +965,24 @@ impl CameraHandle {
             }
             return;
         }
-        if self.thread.as_ref().is_some_and(|c| c.device != device) {
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|c| c.device != device || c.epoch != state.privacy_epoch)
+        {
             self.stop();
         }
         if !self.running() {
             if !self.retry.may_try(Instant::now()) {
                 return;
             }
-            match (self.opener)(device.as_deref()) {
-                Ok(source) => self.spawn(source, device, camera_on),
+            let source = if state.privacy_active {
+                Ok(Box::new(PrivacySource::default()) as Box<dyn FrameSource>)
+            } else {
+                (self.opener)(device.as_deref())
+            };
+            match source {
+                Ok(source) => self.spawn(source, device, camera_on, state.privacy_epoch),
                 Err(e) => {
                     self.failed(e);
                     return;

@@ -310,6 +310,21 @@ pub async fn accept_loop<S: VideoSink>(conn: quinn::Connection, sink: S) {
     }
 }
 
+/// Dropping a Quinn stream normally finishes it. An incomplete or revoked
+/// video frame must instead reset, including write errors and task cancellation.
+struct PendingFrame {
+    stream: quinn::SendStream,
+    finished: bool,
+}
+
+impl Drop for PendingFrame {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.stream.reset(0u32.into());
+        }
+    }
+}
+
 /// Sends frames, one uni stream each. Drops the frame when flow control
 /// blocks (`docs/reference/client.md` §8). Shared by reference: the camera
 /// thread sends on it while the session task may be taking it down.
@@ -329,6 +344,22 @@ impl Sender {
 
     /// Sends one H.264 access unit.
     pub async fn send(&self, keyframe: bool, ts: u32, data: &[u8]) -> Result<(), String> {
+        self.send_until(keyframe, ts, data, std::future::pending(), |send| {
+            send.finish().map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    /// Like `send`, but resets an in-flight frame when its source is revoked.
+    pub(crate) async fn send_until(
+        &self,
+        keyframe: bool,
+        ts: u32,
+        data: &[u8],
+        cancelled: impl std::future::Future<Output = ()>,
+        finish: impl FnOnce(&mut quinn::SendStream) -> Result<(), String>,
+    ) -> Result<(), String> {
+        tokio::pin!(cancelled);
         let header = VideoHeader {
             flags: if keyframe {
                 icu_proto::header::VIDEO_FLAG_KEYFRAME
@@ -340,21 +371,38 @@ impl Sender {
             ts,
             codec: VIDEO_CODEC_H264,
         };
-        let mut send =
-            match tokio::time::timeout(Duration::from_millis(50), self.conn.open_uni()).await {
+        let send = tokio::select! {
+            biased;
+            () = &mut cancelled => return Err("camera source changed".into()),
+            opened = tokio::time::timeout(Duration::from_millis(50), self.conn.open_uni()) => match opened {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => return Err(e.to_string()),
                 Err(_) => return Err("flow control: frame dropped".into()),
-            };
+            },
+        };
+        let mut pending = PendingFrame {
+            stream: send,
+            finished: false,
+        };
+        let send = &mut pending.stream;
         let _ = send.set_priority(-1);
         // Header and body as two writes on the stream: no copy of the frame
         // into a joined buffer.
-        send.write_all(&header.encode())
-            .await
-            .map_err(|e| e.to_string())?;
-        send.write_all(data).await.map_err(|e| e.to_string())?;
-        send.finish().map_err(|e| e.to_string())?;
-        Ok(())
+        let written = tokio::select! {
+            biased;
+            () = &mut cancelled => {
+                let _ = send.reset(0u32.into());
+                return Err("camera source changed".into());
+            }
+            result = async {
+                send.write_all(&header.encode()).await?;
+                send.write_all(data).await
+            } => result,
+        };
+        written.map_err(|e| e.to_string())?;
+        let result = finish(send);
+        pending.finished = result.is_ok();
+        result
     }
 }
 
@@ -646,6 +694,82 @@ impl VideoTextures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise real flow-control stalls: both an explicit source revocation
+    /// and dropping the entire sending task must reset, never implicitly FIN.
+    #[tokio::test]
+    async fn cancelled_video_writes_reset_instead_of_finishing_partial_frames() {
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let der = cert.cert.der().clone();
+        let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+        let mut config =
+            quinn::ServerConfig::with_single_cert(vec![der.clone()], key.into()).unwrap();
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(64u32.into());
+        transport.receive_window(128u32.into());
+        config.transport_config(Arc::new(transport));
+        let server = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(
+            quinn::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap(),
+        );
+        let connect = client
+            .connect(server.local_addr().unwrap(), "localhost")
+            .unwrap();
+        let (outgoing, incoming) =
+            tokio::join!(connect, async { server.accept().await.unwrap().await });
+        let outgoing = outgoing.unwrap();
+        let incoming = incoming.unwrap();
+        for abort_task in [false, true] {
+            let sender = Sender::new(outgoing.clone());
+            let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                sender
+                    .send_until(
+                        true,
+                        0,
+                        &vec![0x42; 4096],
+                        async {
+                            let _ = cancelled.await;
+                        },
+                        |s| s.finish().map_err(|e| e.to_string()),
+                    )
+                    .await
+            });
+            let mut recv = tokio::time::timeout(Duration::from_secs(2), incoming.accept_uni())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut header = [0; VIDEO_HEADER_LEN];
+            tokio::time::timeout(Duration::from_secs(2), recv.read_exact(&mut header))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!task.is_finished(), "body is blocked by the receive window");
+            if abort_task {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                cancel.send(()).unwrap();
+                assert!(task.await.unwrap().is_err());
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), recv.read_to_end(8192))
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(_)))
+                ),
+                "partial frame must reset: {result:?}"
+            );
+        }
+        outgoing.close(0u32.into(), b"done");
+        incoming.close(0u32.into(), b"done");
+    }
 
     fn frame(keyframe: bool) -> EncodedFrame {
         EncodedFrame {

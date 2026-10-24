@@ -207,6 +207,10 @@ pub struct AppState {
     pub muted: bool,
     /// Temporary setup inhibition, independent of the user's persisted mute.
     pub setup_active: bool,
+    /// Session-local privacy guard; does not overwrite saved mute/camera choices.
+    pub privacy_active: bool,
+    /// Source epoch: frames from an older camera/privacy source are discarded.
+    pub privacy_epoch: usize,
     /// Local deafen.
     pub deafened: bool,
     /// The OS mutes the recording device (`UserFlags::SYSTEM_MUTED`).
@@ -338,7 +342,7 @@ impl AppState {
             Some(State::Disabled)
         } else if self.conn != ConnStatus::Connected || !audio.peer_assistance {
             Some(State::LocalOnly)
-        } else if self.setup_active || self.muted || self.deafened {
+        } else if self.setup_active || self.privacy_active || self.muted || self.deafened {
             Some(if self.audio_health.peer_trim_db != 0.0 {
                 State::Held
             } else {
@@ -384,6 +388,8 @@ pub enum Command {
     VideoDisplayed(Session),
     /// Mute/unmute.
     SetMuted(bool),
+    /// Temporarily inhibit audio and replace active camera video with TV static.
+    SetPrivacy(bool),
     /// Prevent transmission during setup without changing the user's mute.
     SetSetupActive(bool),
     /// Deafen/undeafen.
@@ -527,6 +533,8 @@ impl AtomicF32 {
 pub struct DspControl {
     muted: AtomicBool,
     setup_active: AtomicBool,
+    /// Odd while privacy is active. Every transition invalidates captured media.
+    privacy_epoch: AtomicUsize,
     ptt_down: AtomicBool,
     /// A connection is up; without one the gate stays shut, so nothing is
     /// encoded and the UI never claims to be sending into the void.
@@ -576,6 +584,7 @@ impl DspControl {
             // after the start only the mute commands move it.
             muted: AtomicBool::new(s.audio.muted),
             setup_active: AtomicBool::new(false),
+            privacy_epoch: AtomicUsize::new(0),
             ptt_down: AtomicBool::new(false),
             online: AtomicBool::new(false),
             audience: AtomicBool::new(false),
@@ -611,7 +620,9 @@ impl DspControl {
     }
 
     fn transmission_muted(&self) -> bool {
-        self.muted.load(Ordering::Relaxed) || self.setup_active.load(Ordering::Relaxed)
+        self.muted.load(Ordering::Relaxed)
+            || self.setup_active.load(Ordering::Relaxed)
+            || self.privacy_epoch.load(Ordering::SeqCst) % 2 == 1
     }
 
     fn apply_settings(&self, s: &Settings) {
@@ -1132,6 +1143,8 @@ impl Engine {
             // A mute kept from the last run shows from the first frame.
             muted: settings.audio.muted,
             setup_active: false,
+            privacy_active: false,
+            privacy_epoch: 0,
             deafened: false,
             ptt_down: false,
             sending: false,
@@ -1886,6 +1899,7 @@ fn dsp_thread(
     // The network may connect during AEC/encoder initialization. Initial
     // offline capture must still be discarded at the first eligible block.
     let mut capture_was_muted = true;
+    let mut capture_epoch = ctl.privacy_epoch.load(Ordering::SeqCst);
 
     loop {
         if ctl.stop.load(Ordering::Relaxed) {
@@ -2033,7 +2047,9 @@ fn dsp_thread(
             continue;
         }
         let capture_muted = ctl.transmission_muted() || !ctl.online.load(Ordering::Relaxed);
-        if capture_was_muted && !capture_muted {
+        let block_epoch = ctl.privacy_epoch.load(Ordering::SeqCst);
+        let privacy_changed = std::mem::replace(&mut capture_epoch, block_epoch) != block_epoch;
+        if privacy_changed || (capture_was_muted && !capture_muted) {
             // Audio processed for meters/the mic test while muted may still
             // live in the capture ring, partial frame or filter history.
             discard_capture(&mut cap, &mut frame_acc, &mut ts, BLOCK);
@@ -2317,7 +2333,7 @@ fn dsp_thread(
                                     seq,
                                     ts.wrapping_sub((n - i as u32) * frame_samples as u32),
                                     packet,
-                                    t_block,
+                                    (t_block, block_epoch),
                                 );
                                 seq = seq.wrapping_add(1);
                             }
@@ -2339,7 +2355,15 @@ fn dsp_thread(
                         } else {
                             0
                         };
-                        send_audio(&shared, &stats, flags, seq, ts, packet, t_block);
+                        send_audio(
+                            &shared,
+                            &stats,
+                            flags,
+                            seq,
+                            ts,
+                            packet,
+                            (t_block, block_epoch),
+                        );
                         seq = seq.wrapping_add(1);
                     }
                     Err(e) => tracing::warn!(%e, "opus encode"),
@@ -2497,8 +2521,9 @@ fn send_audio(
     seq: u16,
     ts: u32,
     packet: &[u8],
-    t_block: Instant,
+    captured: (Instant, usize),
 ) {
+    let (t_block, epoch) = captured;
     let header = AudioHeader {
         gain_epoch: shared.gain_epoch.load(Ordering::Relaxed),
         flags,
@@ -2512,6 +2537,11 @@ fn send_audio(
     // `into()` moves the buffer, so take its length first.
     let wire_bytes = datagram.len() as u64;
     let conn = lock(&shared.conn);
+    // Serialized with SetPrivacy: no block from an earlier privacy epoch
+    // can be submitted after the switch, even when toggled twice quickly.
+    if epoch % 2 == 1 || shared.dsp.privacy_epoch.load(Ordering::SeqCst) != epoch {
+        return;
+    }
     if let Some(c) = conn.as_ref() {
         if c.send_datagram(datagram.into()).is_ok() {
             DebugStats::inc(&stats.datagrams_sent);
@@ -3517,6 +3547,25 @@ impl LocalState {
     fn handle_local(&mut self, cmd: Command, shared: &Arc<Shared>) -> bool {
         let mut set_state = false;
         match cmd {
+            Command::SetPrivacy(active) => {
+                // The connection lock is the audio send boundary. Stored user
+                // mute/camera choices remain untouched, so leaving restores them.
+                let _conn = lock(&shared.conn);
+                if shared.state.borrow().privacy_active != active {
+                    let epoch = shared.dsp.privacy_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                    shared.state.send_modify(|s| {
+                        s.privacy_active = active;
+                        s.privacy_epoch = epoch;
+                        s.sending = false;
+                    });
+                    shared.keyframe_request.store(true, Ordering::Relaxed);
+                    set_state = true;
+                }
+            }
+            Command::SetMuted(false) | Command::ToggleMute
+                if shared.state.borrow().privacy_active => {}
+            Command::SetCamera(_) | Command::ToggleCamera
+                if shared.state.borrow().privacy_active => {}
             Command::SetSetupActive(active) => {
                 shared.dsp.setup_active.store(active, Ordering::Relaxed);
                 shared.state.send_modify(|s| s.setup_active = active);
@@ -3769,6 +3818,14 @@ impl LocalState {
         });
     }
 
+    /// Effective wire mute includes privacy without changing the saved choice.
+    fn wire_flags(&self, shared: &Shared) -> UserFlags {
+        self.flags.with_bit(
+            UserFlags::MUTED,
+            self.flags.muted() || shared.state.borrow().privacy_active,
+        )
+    }
+
     /// The mute the next start begins with: the current one — or, while
     /// deafened, the one from before deafening, since a restart undeafens
     /// and undeafening restores that one.
@@ -3804,6 +3861,9 @@ impl LocalState {
             .store(self.settings.audio.normalize_incoming, Ordering::Relaxed);
         if reopen {
             self.reopen_streams(shared);
+        }
+        if shared.state.borrow().privacy_active {
+            self.settings.camera.enabled = self.flags.camera_on();
         }
         let camera_changed = self.flags.camera_on() != self.settings.camera.enabled;
         self.flags = self
@@ -4141,7 +4201,7 @@ async fn run_session(
         Err(e) => return SessionEnd::Retry(e.problem()),
     };
     let sni = crate::net::server_name_for(&local.identity.server.server_name);
-    let hello_flags = local.flags;
+    let hello_flags = local.wire_flags(shared);
     let hello_name = local.name.clone();
     let connect = conn::connect(
         &endpoint,
@@ -4387,7 +4447,7 @@ async fn run_session(
     let mut set_state_budget = SetStateBudget::new(Instant::now());
     if flush_state(
         &mut send,
-        local.flags,
+        local.wire_flags(shared),
         &mut sent_flags,
         &mut set_state_budget,
     )
@@ -4453,7 +4513,7 @@ async fn run_session(
     let end = loop {
         // A flag change the budget could not send yet goes out as soon as the
         // next token is there.
-        let state_due = (!same_settable(local.flags, sent_flags))
+        let state_due = (!same_settable(local.wire_flags(shared), sent_flags))
             .then(|| set_state_budget.ready_at(Instant::now()));
         let corona_due = local.corona_pending.map(|picked| picked + CORONA_DEBOUNCE);
         tokio::select! {
@@ -4754,7 +4814,7 @@ async fn run_session(
         // bit — reaches the server here, within the budget.
         if flush_state(
             &mut send,
-            local.flags,
+            local.wire_flags(shared),
             &mut sent_flags,
             &mut set_state_budget,
         )
@@ -5605,12 +5665,46 @@ impl From<NetError> for EngineError {
 /// What the camera thread needs from the engine (M4).
 #[derive(Clone)]
 pub struct CameraLink {
+    source_epoch: Option<usize>,
     shared: Arc<Shared>,
     runtime: tokio::runtime::Handle,
     cmd: mpsc::UnboundedSender<Command>,
 }
 
 impl CameraLink {
+    #[cfg(feature = "camera")]
+    pub(crate) fn shared_epoch(&self) -> usize {
+        self.shared.state.borrow().privacy_epoch
+    }
+
+    /// Binds a capture source to the state it was opened for.
+    #[cfg(feature = "camera")]
+    pub(crate) fn for_epoch(&self, epoch: usize) -> Self {
+        Self {
+            source_epoch: Some(epoch),
+            ..self.clone()
+        }
+    }
+
+    /// Whether a captured frame still belongs to the active source.
+    #[cfg(feature = "camera")]
+    pub(crate) fn source_current(&self) -> bool {
+        let state = self.shared.state.borrow();
+        match self.source_epoch {
+            Some(epoch) => state.privacy_epoch == epoch,
+            None => !state.privacy_active,
+        }
+    }
+
+    fn send_allowed(&self) -> bool {
+        let state = self.shared.state.borrow();
+        state.camera_on
+            && match self.source_epoch {
+                Some(epoch) => state.privacy_epoch == epoch,
+                None => !state.privacy_active,
+            }
+    }
+
     /// Sends a command to the engine (the camera switching itself off).
     pub fn command(&self, cmd: Command) {
         let _ = self.cmd.send(cmd);
@@ -5620,13 +5714,37 @@ impl CameraLink {
     /// connected or when flow control dropped it.
     pub fn send_frame(&self, keyframe: bool, ts: u32, data: &[u8]) -> Result<(), String> {
         // A frame encoded just before the camera went off stays here.
-        if !self.shared.state.borrow().camera_on {
+        if !self.send_allowed() {
             return Err("camera off".into());
         }
         let Some(sender) = lock(&self.shared.video_tx).clone() else {
             return Err("not connected".into());
         };
-        let r = self.runtime.block_on(sender.send(keyframe, ts, data));
+        let mut state = self.shared.state.subscribe();
+        let cancelled = async {
+            loop {
+                // Drop the watch read guard before consulting shared state:
+                // a waiting writer must never meet a recursive read lock.
+                drop(state.borrow_and_update());
+                if !self.send_allowed() {
+                    return;
+                }
+                if state.changed().await.is_err() {
+                    return;
+                }
+            }
+        };
+        let r = self
+            .runtime
+            .block_on(sender.send_until(keyframe, ts, data, cancelled, |send| {
+                let _gate = lock(&self.shared.conn);
+                if !self.send_allowed() {
+                    let _ = send.reset(0u32.into());
+                    Err("camera source changed".into())
+                } else {
+                    send.finish().map_err(|e| e.to_string())
+                }
+            }));
         match &r {
             Ok(()) => {
                 DebugStats::inc(&self.shared.stats.video_sent);
@@ -5738,6 +5856,7 @@ impl Engine {
     /// Link for the camera thread.
     pub fn camera_link(&self) -> CameraLink {
         CameraLink {
+            source_epoch: None,
             shared: self.shared.clone(),
             runtime: self.runtime(),
             cmd: self.cmd_tx.clone(),

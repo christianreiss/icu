@@ -3596,6 +3596,8 @@ mod tests {
             video_viewers: Vec::new(),
             muted: false,
             setup_active: false,
+            privacy_active: false,
+            privacy_epoch: 0,
             deafened: false,
             system_muted: false,
             ptt_down: false,

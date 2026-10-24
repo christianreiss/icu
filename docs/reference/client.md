@@ -313,6 +313,24 @@ Bindung: Aufnahme-Modus in den Settings („Taste drücken“), Speicherung als 
 
 Kamera und Overlay behalten ihre Einstellungen beim nächsten Start (2026-09-28): Gerätewahl, Kamera an/aus, Overlay an/aus und dessen Darstellung stehen in `settings.toml`. Kamera-Button, Hotkey und der Schalter „Kamera einschalten“ in den Einstellungen ändern denselben gespeicherten Zustand; die lokale Vorschau bleibt temporär. Der erste Client-Zustand und `Hello` übernehmen den gespeicherten Kameraschalter.
 
+### Privacy-Quelle
+
+`Command::SetPrivacy(bool)` setzt einen sitzungsweiten Schutz in `AppState`,
+unabhängig vom gespeicherten Audio-Mute und Kamera-Schalter. Die Engine meldet
+währenddessen den effektiven Mute auch im `Hello` und `SetState`.
+Eine Privacy-Epoche invalidiert alte Audio-Blöcke und Kameraquellen. Vor dem
+Freigeben verwirft der DSP Capture-Ring, Teilframes, Pre-Roll und Filterhistorie;
+der finale Datagramm-Versand prüft die Epoche unter derselben Sperre wie der
+Privacy-Wechsel. Laufende Video-Streams werden bei Quellenwechsel zurückgesetzt,
+und ihr Abschluss prüft die Quelle erneut unter dieser Sperre.
+
+`CameraHandle::sync` ersetzt die echte Quelle durch `PrivacySource`, schließt die
+Kamera und leert die Vorschau. Die Quelle erzeugt 320×240-Graustufenrauschen mit
+Scanlines und eingebranntem `PRIVACY MODE ON`. Lokale Vorschau und H.264-Encoder
+verwenden dieselben Pixel. Jeder Quellenwechsel startet einen frischen Encoder
+mit Keyframe; bestehende Bitraten-, Zuschauer- und Pausenregeln gelten weiter.
+Dafür ist keine Protokoll- oder Serveränderung nötig.
+
 ## 9. Overlay
 
 Eigener Thread, eigene Compositor-Verbindung, kein winit. Inhalt: runde, opake Kacheln der Teilnehmer mit Kamera (mittig quadratisch beschnitten wie die kleinen Avatare, `ui/widgets.rs::avatar`), und kleinere runde Namensschilder für Teilnehmer ohne Kamera, auch während sie schweigen (Initialen statt Bild, `overlay.voice_plates`, Standard an; Kreisdurchmesser 60 % der Kamerakachel); der Name steht dabei nicht mehr auf einem Streifen über dem Bild, sondern außerhalb, auf einem papierfarbenen Schildchen, das bündig an der Kachel sitzt und nur so breit ist wie der Name selbst: der Bogen beginnt um 6 Uhr (unterhalb der Mitte) und läuft von dort ausschließlich gegen den Uhrzeigersinn die rechte Seite hoch, mit „…" gekürzt, wenn er den Bogen sprengt (2026-09-28: vorher ein abgedunkelter Streifen über dem Bild, dazu waren beide Hintergründe teiltransparent; noch am selben Tag ersetzt durch den außenliegenden, um 6 Uhr zentrierten symmetrischen Bogen mit Lücke zur Kachel und fest auf die maximale Bogenlänge reserviertem Hintergrund — jetzt einseitig ab 6 Uhr, bündig und namensbreit). Jede Kachel, mit oder ohne Kamera, wächst sanft auf ihre Sprechgröße (Regler „Aktive Sprecher“, ohne Einstellung 20 % größer), während ihr Teilnehmer spricht, und schrumpft ebenso sanft zurück, sobald er aufhört (2026-09-28: gedämpfte Annäherung an das Ziel, ~300–500 ms je Richtung; der reservierte Platz ist immer der der größeren der beiden Größen, damit das Wachsen kein Neuplatzieren der Kacheln oder ein Resize des Overlay-Fensters auslöst). Namensschilder ohne Kamera folgen denselben Regeln für Abdunkeln bei Stille und Sprechhervorhebung; Sprechbeginn und -ende ändern weder die sichtbaren Teilnehmer noch die Fenstergröße. Rendering (2026-09-28): Bei kompatibler Hardware rendert wgpu die gesamte Overlay-Szene (Kamerabilder, Kreise, Schildchen und Text) in eine transparente GPU-Textur. Ein animierter Nebel in der eingestellten Rahmenfarbe ersetzt den Speaking-Rahmen, mit 150 ms Einblenden und 700 ms Ausblenden; ein erneuter Sprechbeginn setzt die Helligkeit ohne Sprung fort. Die Kamera-Kacheln bleiben flach, Namen und Gesichter bleiben frei. 24 skalierte Pixel zusätzlicher Platz je Seite halten den Nebel innerhalb einer festen Kachelfläche. Text wird aus der eingebetteten Inter mit ab_glyph rasterisiert und als GPU-Textur zwischengespeichert. Video-Dekodierung bleibt unverändert. GPU-Bilder werden über höchstens zwei asynchrone Readback-Aufträge als premultiplied BGRA an die bisherigen Plattformfenster übergeben; das Ziel sind 30 fps unabhängig von der Kamera-Bildrate. Nur tatsächlich präsentierte Bilder lösen `VideoDisplayed` aus. Ohne Hardwareadapter, bei Initialisierungsfehler, Geräteverlust oder Readback-Timeout bleibt beziehungsweise wird die bisherige CPU-Komposition (`overlay::compose`, 15 fps, Speaking-Rahmen) aktiv. Pro Overlay-Start gibt es einen GPU-Initialisierungsversuch; keine neue Einstellung und keine Protokolländerung.

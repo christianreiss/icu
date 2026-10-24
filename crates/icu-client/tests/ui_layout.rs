@@ -308,6 +308,8 @@ fn state() -> AppState {
         deafened: false,
         system_muted: false,
         setup_active: false,
+        privacy_active: false,
+        privacy_epoch: 0,
         input_clipping: false,
         ptt_down: false,
         sending: false,
@@ -436,6 +438,13 @@ fn main_window_fits() {
     let mut overflows = Overflows::default();
     let cases: Vec<(&str, AppState)> = vec![
         ("four", four()),
+        ("privacy", {
+            let mut s = four();
+            s.privacy_active = true;
+            s.privacy_epoch = 1;
+            s.camera_on = true;
+            s
+        }),
         ("alone", {
             let mut s = state();
             s.peers.clear();
@@ -474,6 +483,84 @@ fn main_window_fits() {
         }
     }
     overflows.assert_none();
+}
+
+/// Privacy remains reachable at minimum size and inhibits the ordinary media
+/// switches without narrowing the four existing tiles.
+#[test]
+fn privacy_button_controls_and_minimum_layout() {
+    for theme_name in THEMES {
+        let state = Rc::new(RefCell::new(four()));
+        let rendered = state.clone();
+        let (cmd, mut rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let mut view = MainView::default();
+        let mut h = harness(
+            icu_client::ui::main_window::MAIN_MIN_SIZE,
+            theme_name,
+            false,
+            move |root| {
+                let env = MainEnv {
+                    cmd: &cmd,
+                    video_tier: icu_client::video::VideoTier::T0,
+                    video: &|_| None,
+                    self_video: None,
+                    settings_open: false,
+                    user_open: None,
+                    overlay_available: true,
+                };
+                view.ui(root, &rendered.borrow(), &env);
+            },
+        );
+        h.get_by_label("Privacy").click();
+        h.run();
+        assert!(std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|c| matches!(c, Command::SetPrivacy(true))));
+        state.borrow_mut().privacy_active = true;
+        h.run();
+        assert!(h.get_by_label("Stumm").accesskit_node().is_disabled());
+        assert!(h.get_by_label("Kamera").accesskit_node().is_disabled());
+        shot(&mut h, &format!("privacy-minimum-{theme_name}"));
+        h.get_by_label("Privacy an · Mikrofon stumm").click();
+        h.run();
+        assert!(std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|c| matches!(c, Command::SetPrivacy(false))));
+    }
+}
+
+/// The normal participant self-view renders the same burned-in privacy image.
+#[cfg(feature = "camera")]
+#[test]
+fn privacy_self_video_is_visible_in_the_main_window() {
+    use icu_client::camera::{FrameSource, PrivacySource};
+    for theme_name in THEMES {
+        let frame = PrivacySource::default().next_frame().unwrap();
+        let image = egui::ColorImage::from_rgb([frame.width, frame.height], &frame.rgb);
+        let mut texture = None;
+        let mut state = four();
+        state.privacy_active = true;
+        state.privacy_epoch = 1;
+        state.camera_on = true;
+        let (cmd, _rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let mut view = MainView::default();
+        let mut h = harness(MAIN, theme_name, false, move |root| {
+            let texture = texture.get_or_insert_with(|| {
+                root.ctx()
+                    .load_texture("privacy-self", image.clone(), egui::TextureOptions::LINEAR)
+            });
+            let env = MainEnv {
+                cmd: &cmd,
+                video_tier: icu_client::video::VideoTier::T0,
+                video: &|_| None,
+                self_video: Some(egui::load::SizedTexture::from_handle(texture)),
+                settings_open: false,
+                user_open: None,
+                overlay_available: true,
+            };
+            assert!(view.ui(root, &state, &env).list_overflow <= 0.0);
+        });
+        h.get_by_label("Privacy an · Mikrofon stumm");
+        shot(&mut h, &format!("privacy-self-video-{theme_name}"));
+    }
 }
 
 /// More than four people do not fit the window as it opens; after

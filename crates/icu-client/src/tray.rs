@@ -209,7 +209,11 @@ impl Tray {
 
     /// Updates icon and check marks from the state.
     pub fn update(&mut self, state: &AppState) {
-        let look = Look::of(&state.conn, state.muted, state.deafened);
+        let look = Look::of(
+            &state.conn,
+            state.muted || state.privacy_active,
+            state.deafened,
+        );
         if self.last.as_ref() == Some(&look) {
             return;
         }
