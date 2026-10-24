@@ -94,6 +94,11 @@ CPAL gibt Stimme ebenfalls nur auf dem ersten Kanalpaar aus und meldet
 Streamfehler an die automatische Wiederöffnung. Der Capture-Fallback setzt
 weiterhin einen vom Backend unterstützten float32/48-kHz-Eingang voraus.
 
+Meldet WASAPI eine Zeitlücke in einem bereits laufenden Capture- oder
+Referenzstream, verwirft ICU dessen gepufferte Samples und öffnet Mikrofon,
+AEC-Referenz und Wiedergabe gemeinsam neu. Ein Startflag im ersten Paket
+löst diese Wiederöffnung nicht aus. Mute und Gerätewahl bleiben erhalten.
+
 ### Verarbeitung und Senden
 
 - AEC3 verarbeitet 480er-Blöcke in ±1.0, mit eigener Delayschätzung und ohne
@@ -243,8 +248,14 @@ weitere Anhebungen. Diagnosen enthalten Zahlen und Zustände, keine Audiosamples
 VAD-bestätigte Sprache steuert Mikrofon-Leveler und lokale Feedbackmessung
 auch ohne vorherige Rauschpause. Sie lernt nicht den Rauschboden an; damit
 friert die Regelung bei anhaltender Sprache nicht ein. Die absolute
-Mindestlautstärke bleibt wirksam. Ohne VAD-Bestätigung (Empfang) gilt weiterhin
-der Mindestabstand zum Rauschboden; negative VAD-Urteile halten den Schätzer.
+Mindestlautstärke bleibt wirksam. Im Empfang ergänzen kohärente
+Tonhöhenbewegungen über mehrere Fenster den Mindestabstand zum Rauschboden.
+So bleibt auch stark komprimierte, saubere Sprache messbar. Stationäre Töne,
+Brumm und die geprüften hochfrequenten Aliase liefern keinen solchen Beleg;
+eine universelle Trennung von Sprache und Geräuschen ist das nicht. Ohne
+diesen Beleg gilt weiterhin der Mindestabstand zum Rauschboden. Negative
+VAD-Urteile halten den Schätzer; nach Lücken beginnt die zusätzliche
+Sprachbestätigung neu. Zielpegel und Verstärkungsgrenzen bleiben gleich.
 
 `audio::level::SystemTuner` überträgt dauerhafte digitale Korrektur langsam auf
 den Systemregler: erst nach 10 s geeigneter Sprache aufwärts, normalerweise
@@ -503,6 +514,13 @@ verbleibende Desktop-Prüfungen stehen in der Live-Test-Checkliste.
 Die Nutzeransicht (`ui/user.rs`) zeigt links den ausgewählten Nutzer, mittig den Server und rechts den lokalen Nutzer. Standard 900×640, Minimum 760×520; lange Inhalte umbrechen, Details dürfen scrollen. Phosphor-Icons, Sprachstatus, RTT je Serverstrecke und Audio-Empfangsverlust stehen direkt im Pfad. Lautstärke und berechtigte Moderation bleiben erhalten. Die CA-Verzweigung öffnet Zertifikatsdetails im selben Fenster; Felder und Fingerabdruck-Kopieren teilen sich den Renderer mit der Verbindungsansicht.
 
 Die drei Karten verwenden dasselbe Raster: Überschrift, Avatar bzw. Server-Icon mit Name, Rolle, Status, Medien bzw. Adresse, Sitzungsdaten und Zertifikatsstatus. Jede Zeile übernimmt die Höhe ihrer längsten Zelle; Umbrüche verschieben alle drei Folgezellen gemeinsam. Kartenabstand und Innenrand betragen 12 px, Zeilenabstände 8 px. RTT-Anzeigen liegen unter den jeweiligen Strecken, Zertifikatsauswahl und CA-Verzweigung auf den Kartenachsen. Transporthinweis und Verbindungsdetails gehören zur Vertrauenskarte. Auch die Nutzeransicht ohne Moderation darf für die gemeinsamen Zeilen und Lautstärkeregelung wachsen; bei begrenzter Bildschirmhöhe bleibt sie scrollbar.
+
+Administrative Aktionen im Nutzerfenster und Kontextmenü warten zunächst auf
+eine neue Nutzerlisten-Antwort; eine gefüllte alte Liste gilt nicht als
+Bestätigung. Fehlende Restriktionswerte bleiben unbekannt. Das geöffnete Fenster
+aktualisiert seinen Status regelmäßig. Die andere geladene Einschränkung bleibt
+beim Umschalten erhalten; gleichzeitige Änderungen mehrerer Admins zwischen
+Antwort und Klick sind mit dem bestehenden Zwei-Felder-Befehl nicht atomar.
 
 `RequestPeerCertificate` fragt einmal pro Sitzung an, mit sichtbarem Lade-/Fehlerzustand und manuellem Wiederholen nach acht Sekunden. `Peer.certificate` hält geprüfte öffentliche Daten, wird beim Verlassen/Neuverbinden verworfen und bei CRL-Updates neu geprüft. Parsing läuft in der Engine. Gültigkeits- und CRL-Zeitgrenzen werden bei der Anzeige ausgewertet. Bei Auswahl des eigenen Nutzers markieren beide Außenkarten dieselbe Verbindung. Signaturprüfung ersetzt keine direkte Peer-Authentifizierung; die Sitzungszuordnung stammt vom Server.
 
