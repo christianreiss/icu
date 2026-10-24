@@ -1912,6 +1912,12 @@ fn ring(color: Option<icu_proto::Rgb>) -> Option<egui::Color32> {
 /// last `UserListResponse` says.
 #[derive(Clone, Copy)]
 pub(super) struct Moderation {
+    pub(super) generation: u64,
+    pub(super) restriction: Option<Restriction>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Restriction {
     pub(super) muted: bool,
     pub(super) deafened: bool,
 }
@@ -1967,7 +1973,7 @@ pub(super) fn participant_for<'a>(
             name: &me.name,
             user_id: me.user_id,
             speaking: state.sending,
-            muted: state.muted,
+            muted: state.muted || state.system_muted,
             deafened: state.deafened,
             camera: state.camera_on,
             mode: Some(state.settings.audio.mode.into()),
@@ -2009,8 +2015,11 @@ pub(super) fn participant_for<'a>(
         moderation: state.is_admin.then(|| {
             let row = state.user_list.iter().find(|u| u.user_id == p.info.user_id);
             Moderation {
-                muted: row.is_some_and(|u| u.muted),
-                deafened: row.is_some_and(|u| u.deafened),
+                generation: state.user_list_generation,
+                restriction: row.map(|u| Restriction {
+                    muted: u.muted,
+                    deafened: u.deafened,
+                }),
             }
         }),
         // The flag arrives with `UserState`, so the picture goes the
@@ -2132,6 +2141,7 @@ fn participant_row(
                                 } else {
                                     RichText::new(p.name).size(14.0)
                                 })
+                                .selectable(false)
                                 .truncate(),
                             )
                         })
@@ -2254,16 +2264,24 @@ fn participant_row(
     }
     if row.response.clicked() {
         clicked = Some(p.user_id);
-        if !active && p.moderation.is_some() {
-            send(Command::RequestUserList);
-        }
     }
     if let Some(m) = p.moderation {
+        let refresh_id = ui.id().with(("moderation-refresh", p.user_id));
         if row.response.secondary_clicked() {
+            ui.data_mut(|d| d.insert_temp(refresh_id, m.generation));
             send(Command::RequestUserList);
         }
-        row.response
-            .context_menu(|ui| moderation_menu(ui, p.user_id, m, send));
+        let refreshed = ui
+            .data(|d| d.get_temp::<u64>(refresh_id))
+            .is_some_and(|generation| generation != m.generation);
+        row.response.context_menu(|ui| {
+            moderation_menu(
+                ui,
+                p.user_id,
+                refreshed.then_some(m.restriction).flatten(),
+                send,
+            )
+        });
     }
     ui.data_mut(|d| d.insert_temp(rect_id, r));
     clicked
@@ -2277,10 +2295,14 @@ fn participant_row(
 pub(super) fn moderation_menu(
     ui: &mut egui::Ui,
     user_id: icu_proto::UserId,
-    m: Moderation,
+    restriction: Option<Restriction>,
     send: &impl Fn(Command),
 ) {
     ui.set_min_width(220.0);
+    let Some(m) = restriction else {
+        ui.label("Moderationsstatus wird geladen …");
+        return;
+    };
     let restrict = |muted: bool, deafened: bool| {
         send(Command::SetUserRestriction {
             user_id,

@@ -1160,6 +1160,7 @@ async fn control_loop(
                     server
                         .room
                         .broadcast(&ControlMsg::UserState { session, flags });
+                    server.refresh_loss_hints();
                 }
             }
             ControlMsg::SetCoronaColor { color } => {
@@ -1215,10 +1216,13 @@ async fn control_loop(
                 speaker,
                 loss_permille,
             } => {
+                let mut loss = lock(&server.loss);
+                if loss_permille > 1000 || !server.room.feedback_eligible(session, speaker) {
+                    continue;
+                }
                 let ttl = server.config.timing.loss_report_ttl();
                 let listeners = |speaker| server.room.audio_listeners(speaker);
-                let hint =
-                    lock(&server.loss).report(speaker, session, loss_permille, ttl, listeners);
+                let hint = loss.report(speaker, session, loss_permille, ttl, listeners);
                 if let Some(loss_permille) = hint {
                     server
                         .room

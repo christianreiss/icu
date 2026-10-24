@@ -143,6 +143,22 @@ impl Server {
         self.started.elapsed()
     }
 
+    /// Listener state changes invalidate both their votes and the consensus
+    /// size. Keep publication under the loss lock so a stale report cannot
+    /// overtake the recovery hint from a concurrent deafen.
+    pub(crate) fn refresh_loss_hints(&self) {
+        let mut loss = lock(&self.loss);
+        let hints = loss.refresh(
+            self.config.timing.loss_report_ttl(),
+            |speaker| self.room.audio_listeners(speaker),
+            |reporter, speaker| self.room.feedback_eligible(reporter, speaker),
+        );
+        for (speaker, loss_permille) in hints {
+            self.room
+                .send_to(speaker, &icu_proto::ControlMsg::LossHint { loss_permille });
+        }
+    }
+
     /// Builds a server that owns the state but serves nothing, for CLI
     /// commands running while no server is up (§5).
     pub fn offline(config: Config) -> Result<Arc<Server>> {
@@ -523,7 +539,6 @@ fn open_com_key(config: &Config, store: &Store) -> Result<icu_proto::com::ComKey
 /// buckets.
 async fn housekeeping(server: Arc<Server>) {
     let silence = server.config.timing.speaking_silence();
-    let ttl = server.config.timing.loss_report_ttl();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut prune_counter = 0u32;
@@ -541,12 +556,7 @@ async fn housekeeping(server: Arc<Server>) {
 
         // The expiry of a report is a change: the speaker must learn that it
         // can stop paying for FEC (`docs/reference/protocol.md` §2.2).
-        let hints = lock(&server.loss).expire(ttl, |speaker| server.room.audio_listeners(speaker));
-        for (speaker, loss_permille) in hints {
-            server
-                .room
-                .send_to(speaker, &icu_proto::ControlMsg::LossHint { loss_permille });
-        }
+        server.refresh_loss_hints();
 
         let hints = lock(&server.audio_feedback)
             .tick(Instant::now(), |r, s| server.room.feedback_eligible(r, s));
