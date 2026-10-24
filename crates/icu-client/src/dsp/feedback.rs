@@ -411,6 +411,46 @@ mod tests {
     }
 
     #[test]
+    fn clean_receive_speech_produces_feedback_after_each_gain_epoch() {
+        let mut m = Measurement::default();
+        let mut phase = 0.0f32;
+        let mut ts = 0;
+        for epoch in 0..2 {
+            let mut reports = 0;
+            for b in 0..1200 {
+                let mut block = [0.0; 480];
+                for (i, s) in block.iter_mut().enumerate() {
+                    let t = (b * 480 + i) as f32 / 48_000.0;
+                    let hz = 180.0 + 20.0 * (t * std::f32::consts::TAU * 1.3).sin();
+                    phase = (phase + hz / 48_000.0).fract();
+                    let p = phase * std::f32::consts::TAU;
+                    *s = p.sin() + 0.4 * (2.0 * p).sin() + 0.2 * (3.0 * p).sin();
+                }
+                let scale = meter::from_db(-34.0) / meter::from_db(meter::measure(&block).rms_db);
+                for s in &mut block {
+                    *s *= scale;
+                }
+                m.observe_at(&block, None, epoch, ts);
+                ts += 480;
+                if b % 200 == 199 {
+                    if let Some((level, window)) = m.take_window() {
+                        assert_eq!(window.gain_epoch, epoch);
+                        assert!(level.valid());
+                        if b > 600 {
+                            assert!((850..=1050).contains(&level.correction_cdb), "{level:?}");
+                        }
+                        reports += 1;
+                    }
+                }
+            }
+            assert!(
+                reports >= 4,
+                "epoch {epoch} produced only {reports} windows"
+            );
+        }
+    }
+
+    #[test]
     fn clipping_blocks_boost_but_allows_cut_and_reports_the_reason() {
         let t = Instant::now();
         let mut p = PeerTuner::default();

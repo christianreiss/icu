@@ -9,6 +9,8 @@ pub mod cpal_fallback;
 pub mod fake;
 pub mod health;
 pub mod level;
+#[cfg(any(target_os = "windows", test))]
+mod packet;
 #[cfg(target_os = "linux")]
 pub mod pipewire;
 #[cfg(target_os = "linux")]

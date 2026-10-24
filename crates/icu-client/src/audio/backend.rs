@@ -39,6 +39,12 @@ pub enum BackendEvent {
     /// A default endpoint changed. Reopen all streams together so microphone,
     /// playback and echo reference start a new timing epoch.
     DefaultDeviceChanged,
+    /// An established stream lost its capture clock. Reopen the audio group
+    /// together instead of combining microphone and reference across the gap.
+    StreamDiscontinuity {
+        /// Which capture stream detected the gap.
+        stream: StreamKind,
+    },
     /// A stream ended with an error; the engine may reopen it.
     StreamError {
         /// Which stream.

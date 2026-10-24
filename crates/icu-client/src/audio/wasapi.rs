@@ -42,7 +42,8 @@ use windows::{
                 AudioClientProperties, EDataFlow, ERole, IAudioCaptureClient, IAudioClient,
                 IAudioClient2, IAudioClient3, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
                 IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator,
-                AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+                AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
                 AUDCLNT_STREAMOPTIONS_NONE, AUDCLNT_STREAMOPTIONS_RAW, DEVICE_STATE,
@@ -670,6 +671,8 @@ enum Ended {
     DefaultChanged,
     /// The device is gone (unplugged, disabled).
     DeviceLost,
+    /// Capture no longer shares the previous microphone/reference clock.
+    Discontinuity,
     /// Anything else.
     Failed(String),
 }
@@ -718,6 +721,9 @@ fn run_stream(
         Ended::DefaultChanged => {
             let _ = events.send(BackendEvent::DefaultDeviceChanged);
         }
+        Ended::Discontinuity => {
+            let _ = events.send(BackendEvent::StreamDiscontinuity { stream: spec.kind });
+        }
         Ended::DeviceLost | Ended::Failed(_) => {
             let message = match ended {
                 Ended::Failed(message) => message,
@@ -753,6 +759,7 @@ struct Stream {
     device_id: String,
     /// Captured samples not yet handed on as a whole block.
     pending: Vec<f32>,
+    capture_timeline: super::packet::CaptureTimeline,
     /// Endpoint-sized mono scratch; allocated before the audio callback.
     block: Vec<f32>,
 }
@@ -962,6 +969,7 @@ impl Stream {
                 device_name,
                 device_id: device_id(&device)?,
                 pending: Vec::with_capacity(BLOCK_SAMPLES * 8),
+                capture_timeline: Default::default(),
                 block: vec![0.0; buffer_frames as usize],
             };
             if let Some(render) = &stream.render {
@@ -1013,7 +1021,11 @@ impl Stream {
                 None => std::thread::sleep(LOOPBACK_POLL),
             }
             let moved_audio = match callback {
-                Callback::Capture(cb) => self.read(cb),
+                Callback::Capture(cb) => match self.read(cb) {
+                    Ok(Some(frames)) => Ok(frames),
+                    Ok(None) => return Ended::Discontinuity,
+                    Err(e) => Err(e),
+                },
                 Callback::Playback(cb) => self.write(cb),
             };
             match moved_audio {
@@ -1032,9 +1044,9 @@ impl Stream {
 
     /// Takes every packet waiting and hands on whole blocks: channel 0 of
     /// a microphone, the average of all channels of the loopback mix.
-    fn read(&mut self, cb: &mut CaptureCallback) -> windows::core::Result<usize> {
+    fn read(&mut self, cb: &mut CaptureCallback) -> windows::core::Result<Option<usize>> {
         let Some(capture) = &self.capture else {
-            return Ok(0);
+            return Ok(Some(0));
         };
         let channels = self.channels;
         let mut received = 0;
@@ -1046,6 +1058,13 @@ impl Stream {
                 let mut frames = 0u32;
                 let mut flags = 0u32;
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+                if self.capture_timeline.begin_packet(
+                    &mut self.pending,
+                    flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
+                ) {
+                    capture.ReleaseBuffer(frames)?;
+                    return Ok(None);
+                }
                 let n = frames as usize;
                 received += n;
                 if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data.is_null() {
@@ -1082,7 +1101,7 @@ impl Stream {
             cb(&self.pending[..whole]);
             self.pending.drain(..whole);
         }
-        Ok(received)
+        Ok(Some(received))
     }
 
     /// Fills the free part of the endpoint buffer, whole blocks only, the

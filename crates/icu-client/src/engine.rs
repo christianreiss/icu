@@ -1302,6 +1302,10 @@ impl Engine {
                             BackendEvent::DefaultDeviceChanged => {
                                 schedule_reopen(Duration::from_millis(100));
                             }
+                            BackendEvent::StreamDiscontinuity { stream } => {
+                                tracing::debug!(?stream, "audio capture timeline changed");
+                                schedule_reopen(Duration::from_millis(100));
+                            }
                             BackendEvent::DevicesChanged(list) => {
                                 shared.state.send_modify(|s| s.devices = list);
                                 // Decided against the backend's current list
