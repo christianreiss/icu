@@ -25,6 +25,8 @@ pub struct UserView {
     user_id: icu_proto::UserId,
     requested: Option<(icu_proto::Session, Instant)>,
     connection: Option<Instant>,
+    moderation_generation: Option<u64>,
+    moderation_requested: Option<Instant>,
     selected: Option<Certificate>,
     copied: Option<(String, Instant)>,
 }
@@ -47,6 +49,8 @@ impl UserView {
             user_id,
             requested: None,
             connection: None,
+            moderation_generation: None,
+            moderation_requested: None,
             selected: None,
             copied: None,
         }
@@ -80,9 +84,29 @@ impl UserView {
         let connected_at = state.conn_info.as_ref().map(|info| info.connected_at);
         if self.connection != connected_at {
             self.requested = None;
+            self.moderation_generation = None;
+            self.moderation_requested = None;
             self.connection = connected_at;
         }
         let own = p.user_id == me.user_id;
+        if !own && state.is_admin {
+            self.moderation_generation
+                .get_or_insert(state.user_list_generation);
+            let loaded = self.moderation_generation != Some(state.user_list_generation)
+                && p.moderation.is_some_and(|m| m.restriction.is_some());
+            let every = Duration::from_secs(if loaded { 10 } else { 2 });
+            if self
+                .moderation_requested
+                .is_none_or(|t| t.elapsed() >= every)
+            {
+                send(Command::RequestUserList);
+                self.moderation_requested = Some(Instant::now());
+            }
+            ui.ctx().request_repaint_after(every);
+        } else {
+            self.moderation_generation = None;
+            self.moderation_requested = None;
+        }
         let peer_result = state
             .peers
             .iter()
@@ -224,12 +248,16 @@ impl UserView {
                 volume_card(ui, &p, v, send);
             }
             if let Some(m) = p.moderation {
+                let restriction = self
+                    .moderation_generation
+                    .filter(|generation| *generation != m.generation)
+                    .and(m.restriction);
                 widgets::group_card(ui, "Moderation", |ui| {
                     egui::Frame::new()
                         .inner_margin(egui::Margin::symmetric(12, 8))
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 4.0;
-                            moderation_menu(ui, p.user_id, m, send);
+                            moderation_menu(ui, p.user_id, restriction, send);
                         });
                 });
             }

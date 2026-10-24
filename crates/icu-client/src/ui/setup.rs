@@ -451,12 +451,7 @@ impl SetupView {
                 self.capture = None;
                 // The portal is asked with a trigger; a lone modifier or a
                 // mouse button has none, so it could never fire there.
-                self.capture_error = (portal && !key.has_trigger()).then(|| {
-                    "Diese Taste kann ICU der Arbeitsumgebung nicht vorschlagen. Nimm eine \
-                     Buchstaben-, Ziffern- oder F-Taste — oder lass ICU die Tasten direkt \
-                     lesen (evdev)."
-                        .to_string()
-                });
+                self.capture_error = key.portal_warning(portal);
             }
             Some(Err(e)) => {
                 self.capture = None;

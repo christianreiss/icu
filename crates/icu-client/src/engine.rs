@@ -262,6 +262,9 @@ pub struct AppState {
     /// Every registered user, from the last `UserListResponse`, for the
     /// Nutzer tab. Empty until the tab has requested it at least once.
     pub user_list: Vec<icu_proto::UserSummary>,
+    /// Advances on every actual user-list response, including unchanged lists.
+    /// Moderation views use it to wait for their initial refresh.
+    pub user_list_generation: u64,
     /// Rejection of the most recent user-manager action (promote/demote/
     /// disable/enable/revoke) — kept separate from `invite_error` so the two
     /// admin features never clobber each other's error slot.
@@ -1154,6 +1157,7 @@ impl Engine {
             last_invite: None,
             invite_error: None,
             user_list: Vec::new(),
+            user_list_generation: 0,
             user_action_error: None,
             restricted_muted: false,
             system_muted: false,
@@ -5447,7 +5451,10 @@ async fn handle_control(
             shared.state.send_modify(|s| s.user_action_error = None);
         }
         ControlMsg::UserListResponse { users } => {
-            shared.state.send_modify(|s| s.user_list = users);
+            shared.state.send_modify(|s| {
+                s.user_list = users;
+                s.user_list_generation = s.user_list_generation.wrapping_add(1);
+            });
         }
         ControlMsg::AdminActionError { code, detail, .. } => {
             tracing::warn!(code, %detail, "admin action rejected");
