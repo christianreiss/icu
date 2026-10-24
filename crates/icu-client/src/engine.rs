@@ -678,6 +678,9 @@ struct Speaker {
     volume: f32,
     /// Loudness normalization, ahead of `volume`.
     norm: Normalizer,
+    /// The previous user/master gain belongs to this speaker, never to its
+    /// current position in the mixer's unordered input list.
+    volume_ramp: mixer::GainRamp,
     feedback: crate::dsp::feedback::Measurement,
     /// Queued samples up to the end of the last concealed or FEC-recovered
     /// frame; `norm` holds while they play.
@@ -737,6 +740,7 @@ impl Speaker {
             indicator: None,
             volume,
             norm: Normalizer::new(),
+            volume_ramp: mixer::GainRamp::default(),
             feedback: crate::dsp::feedback::Measurement::default(),
             concealed: 0,
             report_base: (0, 0),
@@ -2699,11 +2703,13 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
                 } else {
                     sp.norm.reset();
                 }
-                *gain = if deafened {
+                let volume = if deafened {
                     0.0
                 } else {
                     mixer::volume_gain(sp.volume) * master
                 };
+                sp.volume_ramp.apply(buf, volume);
+                *gain = 1.0;
             }
         }
         // Cues are heard even when deafened.

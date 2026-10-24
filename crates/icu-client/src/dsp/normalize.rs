@@ -142,6 +142,13 @@ impl Normalizer {
         *self = Normalizer::with(self.profile);
     }
 
+    /// Forget temporal speech evidence across missing audio, keeping the
+    /// learned level and noise floor. A later block cannot complete a pitch
+    /// trajectory that started before a gap in the sender's sample clock.
+    pub fn reset_voice_history(&mut self) {
+        self.unhinted = false;
+    }
+
     /// Current gain in dB (for tests and diagnostics).
     pub fn gain_db(&self) -> f32 {
         to_db(self.gain)

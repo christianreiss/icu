@@ -54,6 +54,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 sha2.workspace = true
 time.workspace = true
+tempfile.workspace = true
 
 # Audio
 opusic-sys = { version = "0.7.5", features = ["bundled", "dred"] }
@@ -140,7 +141,6 @@ windows-core = "0.62.2"
 ab_glyph = { version = "0.2.32", optional = true }
 
 [dev-dependencies]
-tempfile.workspace = true
 # Headless rendering of every window for `tests/ui_layout.rs`; `wgpu` only
 # for the optional screenshots (`ICU_UI_SHOTS=<dir>`).
 egui_kittest = { version = "0.36.2", features = ["eframe", "wgpu"] }

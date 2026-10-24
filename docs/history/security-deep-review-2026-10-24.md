@@ -53,3 +53,36 @@ Build und kein Test mit physischen Clients wurde in diesem Teilauftrag ausgefüh
 Keine Produktionsdienste, Pakete oder Benutzerdaten wurden verändert. Es gab
 keinen Push und kein Deployment. Rücknahme durch Revert des zugehörigen Commits
 und Neubau des Servers; keine Datenmigration erforderlich.
+
+## Nachprüfung auf 0.1.17: Keyframes nur für Videoempfänger
+
+Die unabhängige Nachprüfung auf `0bacf42` fand dieselbe fehlende
+Empfängerbindung beim `KeyframeRequest`: Ein Teilnehmer ohne `viewing` oder
+mit administrativer Taubschaltung konnte trotzdem ein IDR für jede fremde
+Kamera anfordern. Die Anfrage verbrauchte dabei das gemeinsame Limit des
+Sprechers und konnte eine anschließende Anfrage eines tatsächlichen Zuschauers
+verdrängen. Auch eine ausgeschaltete Kamera belegte durch solche Anfragen
+bereits ihr Limit für den späteren Start.
+
+Der Server verwendet nun dieselbe Empfängerprüfung wie bei `VideoDisplayed`.
+Prüfung, Limitbuchung und Weiterleitung laufen unter einer gemeinsamen
+Raumsperre. Ohne fremde aktive Kamera, `viewing` oder bei administrativer
+Taubschaltung bleibt die Anfrage wirkungslos und verbraucht kein Limit.
+Die selbst gewählte Taubschaltung betrifft weiterhin nur Audio; ein solcher
+Zuschauer darf weiterhin ein IDR anfordern. Wire-Format und Protokollversion
+bleiben gleich.
+
+Drei echte QUIC-Regressionen scheiterten vor der Korrektur mit Exitcode 101:
+Nicht-Zuschauer, administrativ tauber Zuschauer und ausgeschaltete Kamera.
+Geordnete Ping/Pong-Barrieren belegen, dass die unberechtigte Anfrage
+verarbeitet wurde; sie ersetzen eine zeitabhängige Vermutung über ausbleibende
+Nachrichten. Danach muss eine berechtigte Anfrage sofort ankommen, obwohl das
+Testlimit 60 Sekunden beträgt. Ein weiterer Test erhält ausdrücklich die
+Berechtigung eines selbst taubgeschalteten Zuschauers.
+
+Auf `biest.eulie.de` bestanden anschließend alle sechs mit `keyframe`
+gefilterten Tests und der vollständige Lauf
+`cargo test --locked -p icu-server --test relay_video`: **26 bestanden,
+0 fehlgeschlagen**. Die Logs liegen unter
+`target/review-logs/keyframe-before.log`, `keyframe-after.log` und
+`relay-video.log`. Die übergreifenden Checks gehören zum Integrationslauf.

@@ -400,6 +400,10 @@ impl SettingsView {
         let mut cmds = Vec::new();
         self.debug_window_open = debug_window_open;
         self.sync.adopt(&mut self.draft, &state.settings);
+        if state.privacy_active {
+            // Do not restart a local preview automatically when Privacy ends.
+            self.camera_preview = false;
+        }
 
         // A live demote can orphan the tab: it is only in the rail while
         // `state.is_admin`, so bounce back to Allgemein instead of rendering
@@ -1441,11 +1445,15 @@ impl SettingsView {
                         "Kamera einschalten",
                         None,
                         |ui| {
-                            widgets::named_toggle(
-                                ui,
-                                &mut self.draft.camera.enabled,
-                                "Kamera einschalten",
-                            )
+                            ui.add_enabled_ui(!state.privacy_active, |ui| {
+                                widgets::named_toggle(
+                                    ui,
+                                    &mut self.draft.camera.enabled,
+                                    "Kamera einschalten",
+                                )
+                            })
+                            .inner
+                            .on_disabled_hover_text("Während Privacy gesperrt.")
                         },
                     );
                 });
@@ -1477,10 +1485,15 @@ impl SettingsView {
                                 } else {
                                     (icon::EYE, "Vorschau")
                                 };
-                                let r = ui.add_sized(
-                                    [PREVIEW_W, 28.0],
-                                    egui::Button::new(format!("{glyph}  {label}")),
-                                );
+                                let r = ui
+                                    .add_enabled_ui(!state.privacy_active, |ui| {
+                                        ui.add_sized(
+                                            [PREVIEW_W, 28.0],
+                                            egui::Button::new(format!("{glyph}  {label}")),
+                                        )
+                                    })
+                                    .inner
+                                    .on_disabled_hover_text("Während Privacy gesperrt.");
                                 if r.on_hover_text("Nur du siehst das Bild; gesendet wird nichts")
                                     .clicked()
                                 {
@@ -1490,6 +1503,12 @@ impl SettingsView {
                         });
                     });
             });
+            if state.privacy_active {
+                widgets::help_note(
+                    ui,
+                    "Privacy ist an: Einschalten und Vorschau sind gesperrt. Eine aktive Kamera zeigt TV-Rauschen. Beende Privacy im Hauptfenster, um die Kamera wieder zu nutzen.",
+                );
+            }
         });
     }
 

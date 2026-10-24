@@ -455,6 +455,10 @@ Enter aktiviert im Beitrittsfenster nur das fokussierte Bedienelement; die
 Option zur Einstellungsübernahme importiert dadurch keine Identität.
 Exportdateien sind unter Unix 0600, unter Windows durch die Profil-ACL geschützt;
 DPAPI schützt die lokale Identität, nicht den zum Weitergeben bestimmten Export.
+Export und Konfiguration werden über eine exklusiv neu angelegte temporäre Datei
+im Zielverzeichnis atomar ersetzt. Bereits vorhandene temporäre Dateien und
+Symlinks werden nicht wiederverwendet; fehlgeschlagene Schreibvorgänge räumen
+ihre eigene temporäre Datei auf.
 
 Der Admin-Tab trennt Mitglieder, offene Einladungen, gesperrte und entfernte
 Zugänge. Einladungen lassen sich kopieren oder als `.icu` speichern; ihr Inhalt

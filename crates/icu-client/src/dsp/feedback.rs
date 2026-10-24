@@ -54,6 +54,12 @@ impl Measurement {
             self.epoch = Some(epoch);
             self.settle_left = 9600;
         }
+        if ts != self.end_ts {
+            // PLC/FEC and quiet jitter-buffer periods do not reach this
+            // estimator. Preserve the level, but do not stitch their two
+            // sides into a continuous voiced contour.
+            self.estimator.reset_voice_history();
+        }
         self.end_ts = ts.wrapping_add(samples.len() as u32);
         if self.settle_left > 0 {
             self.settle_left = self.settle_left.saturating_sub(samples.len());
@@ -447,6 +453,75 @@ mod tests {
                 reports >= 4,
                 "epoch {epoch} produced only {reports} windows"
             );
+        }
+    }
+
+    #[test]
+    fn lost_frames_cannot_join_separate_stationary_tones_into_speech() {
+        let mut m = Measurement::default();
+        let mut phase = 0.0f32;
+        for b in 0..1000 {
+            // Two packets of one stationary tone, then a missing packet.
+            // The mixer excludes PLC/FEC from feedback, so only the sender
+            // clock reveals that these are separate 40-ms observations.
+            if b % 3 != 2 {
+                let hz = 180.0 + 20.0 * ((b / 3) as f32 * 0.2).sin();
+                let mut block = [0.0; 960];
+                for s in &mut block {
+                    phase = (phase + hz / 48_000.0).fract();
+                    let p = phase * std::f32::consts::TAU;
+                    *s = p.sin() + 0.4 * (2.0 * p).sin() + 0.2 * (3.0 * p).sin();
+                }
+                let scale = meter::from_db(-34.0) / meter::from_db(meter::measure(&block).rms_db);
+                for s in &mut block {
+                    *s *= scale;
+                }
+                m.observe_at(&block, None, 0, b * 960);
+            }
+            if b % 100 == 99 {
+                assert!(
+                    m.take_window().is_none(),
+                    "a timestamp gap must break the pitch trajectory"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn timestamp_gaps_preserve_the_learned_level() {
+        let mut m = Measurement::default();
+        for b in 0..500 {
+            m.observe_at(&[0.02; 960], Some(true), 7, b * 960);
+        }
+        let learned = m.estimator.level_db();
+        assert!(learned < -30.0);
+        let correction = m.estimator.correction_db();
+        m.observe_at(&[0.0; 960], None, 7, 600 * 960);
+        assert_eq!(m.estimator.level_db(), learned);
+        assert_eq!(m.estimator.correction_db(), correction);
+    }
+
+    #[test]
+    fn a_wrapping_sender_clock_keeps_contiguous_voice_evidence() {
+        let mut plain = Measurement::default();
+        let mut wrapped = Measurement::default();
+        let mut phase = 0.0f32;
+        let origin = u32::MAX - 48_000;
+        for b in 0..400u32 {
+            let mut block = [0.0; 960];
+            for (i, s) in block.iter_mut().enumerate() {
+                let t = (b * 960 + i as u32) as f32 / 48_000.0;
+                let hz = 180.0 + 20.0 * (t * std::f32::consts::TAU * 1.3).sin();
+                phase = (phase + hz / 48_000.0).fract();
+                *s = (phase * std::f32::consts::TAU).sin() * 0.05;
+            }
+            plain.observe_at(&block, None, 0, b * 960);
+            wrapped.observe_at(&block, None, 0, origin.wrapping_add(b * 960));
+            if b % 100 == 99 {
+                let expected = plain.take_window().expect("continuous voiced signal").0;
+                let actual = wrapped.take_window().expect("wrapped voiced signal").0;
+                assert_eq!(actual, expected);
+            }
         }
     }
 

@@ -348,7 +348,9 @@ async fn no_congestion_sends_no_video_congestion_hint() {
 async fn a_keyframe_request_is_forwarded_to_the_speaker() {
     let server = TestServer::start().await;
     let mut alice = server.client("alice").await;
-    let mut bob = server.client("bob").await;
+    let mut bob = viewer(&server, "bob").await;
+    let speaker = alice.session;
+    camera_on(&mut alice, speaker).await;
 
     bob.send_msg(&ControlMsg::KeyframeRequest {
         speaker: alice.session,
@@ -368,6 +370,117 @@ async fn a_keyframe_request_is_forwarded_to_the_speaker() {
     })
     .await;
     alice.expect_silence().await;
+    server.shutdown().await;
+}
+
+/// Ordered control-stream barriers prove the request was processed and did
+/// not reach the sender, without waiting out the keyframe rate limit.
+async fn ignored_keyframe_request(sender: &mut common::Client, requester: &mut common::Client) {
+    requester
+        .send_msg(&ControlMsg::KeyframeRequest {
+            speaker: sender.session,
+        })
+        .await;
+    requester.send_msg(&ControlMsg::Ping { nonce: 701 }).await;
+    requester
+        .recv_matching(|m| matches!(m, ControlMsg::Pong { nonce: 701, .. }))
+        .await
+        .expect("the request was processed before the pong");
+    sender.send_msg(&ControlMsg::Ping { nonce: 702 }).await;
+    let next = sender
+        .recv_matching(|m| {
+            matches!(
+                m,
+                ControlMsg::KeyframeRequest { .. } | ControlMsg::Pong { nonce: 702, .. }
+            )
+        })
+        .await;
+    assert!(
+        matches!(next, Some(ControlMsg::Pong { nonce: 702, .. })),
+        "an ineligible viewer must not request a keyframe: {next:?}"
+    );
+}
+
+async fn received_keyframe_request(sender: &mut common::Client, requester: &mut common::Client) {
+    requester
+        .send_msg(&ControlMsg::KeyframeRequest {
+            speaker: sender.session,
+        })
+        .await;
+    let next = sender
+        .recv_matching(|m| matches!(m, ControlMsg::KeyframeRequest { .. }))
+        .await;
+    assert!(
+        matches!(next, Some(ControlMsg::KeyframeRequest { speaker: 0 })),
+        "an eligible viewer retains the sender's keyframe allowance: {next:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_non_viewer_cannot_spend_the_keyframe_allowance() {
+    let server = TestServer::start_with(|c| c.timing.keyframe_min_interval_ms = 60_000).await;
+    let mut alice = server.client("alice").await;
+    let mut bob = server.client("bob").await;
+    let mut carol = viewer(&server, "carol").await;
+    let speaker = alice.session;
+    camera_on(&mut alice, speaker).await;
+
+    ignored_keyframe_request(&mut alice, &mut bob).await;
+    received_keyframe_request(&mut alice, &mut carol).await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_admin_deafened_viewer_cannot_spend_the_keyframe_allowance() {
+    let server = TestServer::start_with(|c| c.timing.keyframe_min_interval_ms = 60_000).await;
+    let mut alice = server.client("alice").await;
+    let mut bob = viewer(&server, "bob").await;
+    let mut carol = viewer(&server, "carol").await;
+    let speaker = alice.session;
+    camera_on(&mut alice, speaker).await;
+    icu_server::admin::set_restriction(server.handle.server(), None, bob.user_id, |_| {
+        (false, true)
+    })
+    .await
+    .expect("admin deafens Bob");
+
+    ignored_keyframe_request(&mut alice, &mut bob).await;
+    received_keyframe_request(&mut alice, &mut carol).await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_camera_off_request_does_not_spend_the_later_keyframe_allowance() {
+    let server = TestServer::start_with(|c| c.timing.keyframe_min_interval_ms = 60_000).await;
+    let mut alice = server.client("alice").await;
+    let mut bob = viewer(&server, "bob").await;
+
+    ignored_keyframe_request(&mut alice, &mut bob).await;
+    let speaker = alice.session;
+    camera_on(&mut alice, speaker).await;
+    received_keyframe_request(&mut alice, &mut bob).await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_self_deafened_viewer_can_still_request_a_keyframe() {
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let mut bob = viewer(&server, "bob").await;
+    let speaker = alice.session;
+    camera_on(&mut alice, speaker).await;
+    bob.send_msg(&ControlMsg::SetState {
+        flags: UserFlags(UserFlags::VIEWING | UserFlags::DEAFENED),
+    })
+    .await;
+    let viewer = bob.session;
+    bob.recv_matching(|m| {
+        matches!(m, ControlMsg::UserState { session, flags } if *session == viewer && flags.deafened())
+    })
+    .await
+    .expect("self-deafen affects audio only");
+
+    received_keyframe_request(&mut alice, &mut bob).await;
     server.shutdown().await;
 }
 

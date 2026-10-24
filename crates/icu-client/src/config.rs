@@ -1432,34 +1432,115 @@ mod key_seal {
 
 /// Writes `data` to `path` via a temporary file and rename.
 pub fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<(), ConfigError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    // Exclusive creation prevents a stale/public file or symlink from being
+    // reused for private material, and concurrent writers never share a path.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".icu-");
+    #[cfg(unix)]
     {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(if private { 0o600 } else { 0o644 });
-        }
-        // Windows: the profile's ACL already keeps others out of
-        // %APPDATA%; the private key is sealed with DPAPI on top.
-        #[cfg(not(unix))]
-        let _ = private;
-        let mut file = options.open(&tmp)?;
-        use io::Write;
-        file.write_all(data)?;
-        file.sync_all()?;
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(if private {
+            0o600
+        } else {
+            0o644
+        }));
     }
-    fs::rename(&tmp, path)?;
+    // Windows retains the destination directory's inherited ACL. Local
+    // identity keys are additionally sealed with DPAPI before this call.
+    #[cfg(not(unix))]
+    let _ = private;
+    let mut file = builder.tempfile_in(parent)?;
+    use io::Write;
+    file.write_all(data)?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|e| e.error)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_does_not_reuse_a_public_temporary_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passport.icu");
+        let stale = path.with_extension("tmp");
+        fs::write(&stale, b"unrelated existing file").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_atomic(&path, b"private test material", true).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"private test material");
+        assert_eq!(fs::read(&stale).unwrap(), b"unrelated existing file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_does_not_follow_a_temporary_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("passport.icu");
+        let sentinel = dir.path().join("sentinel");
+        fs::write(&sentinel, b"keep this file").unwrap();
+        symlink(&sentinel, path.with_extension("tmp")).unwrap();
+
+        write_atomic(&path, b"private test material", true).unwrap();
+
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep this file");
+        assert!(!fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&path).unwrap(), b"private test material");
+    }
+
+    #[test]
+    fn atomic_write_cleans_up_after_a_failed_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("occupied");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("keep"), b"existing content").unwrap();
+
+        assert!(write_atomic(&destination, b"private test material", true).is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(
+            fs::read(destination.join("keep")).unwrap(),
+            b"existing content"
+        );
+    }
+
+    #[test]
+    fn atomic_write_concurrent_writers_publish_complete_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for byte in 0..8 {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    write_atomic(path, &[byte; 4096], false).unwrap();
+                });
+            }
+        });
+        let contents = fs::read(&path).unwrap();
+        assert_eq!(contents.len(), 4096);
+        assert!(contents.iter().all(|byte| *byte == contents[0]));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     /// The com key of the test identities.
     fn com() -> ComKey {

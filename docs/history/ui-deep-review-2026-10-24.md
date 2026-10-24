@@ -69,3 +69,30 @@ Native Windows-Desktoptests, physische Audio-/Hotkeygeräte, Paketbau und
 Deployment gehören nicht zu diesem Quellcode-Nachweis. Es wurden keine
 laufenden Dienste oder installierten Pakete geändert. Rücknahme durch Revert
 des UI-Commits und Neubau; keine Benutzerdatenmigration erforderlich.
+
+## Nachprüfung des integrierten Privacy-Modus
+
+Auf `0bacf42` blieben zwei Darstellungsfehler: Die Kamera-Seite erlaubte
+weiterhin Einschalten und Vorschau während Privacy, obwohl diese Bedienung
+nicht die normale Kamera freigab. Die Sprechfläche wertete außerdem eine
+gehaltene PTT-Taste als Sendebeleg und übersah die System-Stummschaltung.
+Dadurch konnte sie bei ausgeschaltetem Systemmikrofon „Sendet“ anzeigen;
+bei lokalem Mute oder Privacy blieb die aktive Sendefarbe sichtbar.
+
+Die Kamera-Seite sperrt jetzt Einschalten und Vorschau mit einer sichtbaren
+Erklärung. Eine bereits laufende lokale Vorschau endet und startet nach
+Privacy nicht von selbst neu. Die Gerätewahl bleibt für die spätere Nutzung
+verfügbar. Auch die gesperrten Schalter im Hauptfenster zeigen ihren Hinweis
+beim Darüberfahren. Die Sprechfläche verwendet den tatsächlichen Sendezustand
+und berücksichtigt lokale, System-, Setup- und Privacy-Stummschaltung. Die
+eigene Teilnehmerzeile und das Nutzerfenster berücksichtigen dieselbe Sperre,
+damit sie nicht gleichzeitig „Spricht“ und „Stummgeschaltet“ anzeigen. Auch
+bei anderen Teilnehmern haben gemeldete Mute-/Taub-Zustände Vorrang vor einem
+noch nachlaufenden Sprechindikator.
+
+Die ergänzten UI-Regressionen prüfen in beiden Themes die gerenderte
+Beschriftung und Flächenfarbe für PTT/VAD und alle Stummschaltungen sowie
+PTT ohne gesendete Pakete und den noch sendenden Nachlauf. Der Kameratest
+bedient eine Vorschau, aktiviert Privacy, prüft die gesperrten Controls und
+verifiziert, dass die Vorschau anschließend erst nach einem neuen Klick
+beginnt. Der gemeinsame Endbericht dokumentiert die ausgeführten Prüfungen.

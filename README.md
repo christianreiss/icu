@@ -9,7 +9,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](Cargo.toml)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-informational.svg)](#installation)
-[![Version](https://img.shields.io/badge/version-0.1.2-brightgreen.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.1.17-brightgreen.svg)](Cargo.toml)
 
 </div>
 
@@ -93,12 +93,14 @@ Vollständige, mit Zahlen belegte Liste inklusive bewusst abgelehnter Features:
 ## Installation
 
 Überblick und Downloads: https://icu.uggs.io (Quelle: [`web/`](web/README.md)).
-Pakete unter https://github.com/christianreiss/icu/releases: der Client `icu`
-für Fedora 42/43 (`.rpm`) und Debian 13 (`.deb`) sowie als portables, unsigniertes
+Pakete unter https://github.com/christianreiss/icu/releases: der Client für
+Fedora 42/43 (`icu-client`, `.rpm`) und Debian 13 (`icu`, `.deb`) sowie als portables, unsigniertes
 ZIP für Windows 10/11 (SmartScreen beim ersten Start: „Weitere Informationen“ →
-„Trotzdem ausführen“) oder, alternativ, ein ebenfalls unsigniertes Setup pro
-Benutzer (Startmenü-Eintrag, Deinstallation über Einstellungen/Systemsteuerung,
-keine Administratorrechte; SmartScreen warnt bei beiden gleich), der Server `icu-server` für
+„Trotzdem ausführen“) oder, alternativ, ein ebenfalls unsigniertes Setup für
+alle Benutzer (Installation unter `C:\Program Files\ICU`, Startmenü-Eintrag und
+Deinstallation über Einstellungen/Systemsteuerung; benötigt Administratorrechte).
+Das portable ZIP benötigt keine Installation; SmartScreen warnt bei beiden Varianten.
+Der Server `icu-server` ist für
 Fedora, AlmaLinux 10+ (`.rpm`) und Debian 12+ (`.deb`) (Einrichtung:
 `deploy/README.md` §0), sowie eine interaktive Admin-Shell
 (`icu-server shell`, kurz `icu-cli`, [Server-Referenz](docs/reference/server.md#51-shell)) und

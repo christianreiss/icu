@@ -548,6 +548,204 @@ fn privacy_button_controls_and_minimum_layout() {
     }
 }
 
+/// A held PTT key is an input, not evidence that audio is leaving. All mute
+/// sources must also keep the send surface quiet, including the OS microphone.
+#[test]
+fn speak_surface_reflects_transmission_and_all_mute_sources() {
+    fn visit(
+        shape: &egui::Shape,
+        rect: egui::Rect,
+        labels: &mut Vec<String>,
+        fills: &mut Vec<egui::Color32>,
+    ) {
+        match shape {
+            egui::Shape::Vec(children) => {
+                for child in children {
+                    visit(child, rect, labels, fills);
+                }
+            }
+            egui::Shape::Text(text) if rect.contains(text.pos) => {
+                labels.push(text.galley.job.text.clone());
+            }
+            egui::Shape::Rect(surface) if surface.rect == rect => fills.push(surface.fill),
+            _ => {}
+        }
+    }
+    for theme_name in THEMES {
+        for mode in [ModeSetting::Ptt, ModeSetting::Vad] {
+            for guard in ["none", "local", "system", "setup", "privacy"] {
+                let mut s = four();
+                s.settings.audio.mode = mode;
+                s.ptt_down = true;
+                // Even a lagging sending snapshot cannot override a mute.
+                s.sending = true;
+                s.muted = guard == "local";
+                s.system_muted = guard == "system";
+                s.setup_active = guard == "setup";
+                s.privacy_active = guard == "privacy";
+                let (mut h, _) = main_window(s.clone(), theme_name);
+                h.run();
+                let rect = h.get_by_label("Sprechen").rect();
+                let mut labels = Vec::new();
+                let mut fills = Vec::new();
+                for shape in &h.output().shapes {
+                    visit(&shape.shape, rect, &mut labels, &mut fills);
+                }
+                let expected = if guard == "none" { "Sendet" } else { "Stumm" };
+                assert!(
+                    labels.iter().any(|text| text.ends_with(expected)),
+                    "{theme_name}/{mode:?}/{guard}: {labels:?}"
+                );
+                let style = h.ctx.style_of(egui_theme(theme_name));
+                let tokens = theme::tokens(&style.visuals);
+                let fill = if guard == "none" {
+                    tokens.accent
+                } else {
+                    tokens.surface_hi
+                };
+                let fill = if guard == "setup" {
+                    fill.gamma_multiply(style.visuals.disabled_alpha())
+                } else {
+                    fill
+                };
+                assert!(
+                    fills.contains(&fill),
+                    "{theme_name}/{mode:?}/{guard}: {fills:?}"
+                );
+                if mode == ModeSetting::Ptt && guard == "system" {
+                    shot(&mut h, &format!("speak-system-muted-{theme_name}"));
+                }
+                if mode == ModeSetting::Ptt {
+                    let mut view = UserView::new(1);
+                    let user = harness(USER, theme_name, true, move |ui| {
+                        view.ui(ui, &s, &|_| None, &|_| {});
+                    });
+                    let expected = if guard == "none" {
+                        "Spricht"
+                    } else {
+                        "Stummgeschaltet"
+                    };
+                    let mut statuses = Vec::new();
+                    for shape in &user.output().shapes {
+                        visit(
+                            &shape.shape,
+                            user.ctx.content_rect(),
+                            &mut statuses,
+                            &mut Vec::new(),
+                        );
+                    }
+                    assert_eq!(statuses.iter().filter(|text| *text == expected).count(), 2);
+                    if guard != "none" {
+                        assert!(!statuses.iter().any(|text| text == "Spricht"));
+                    }
+                }
+            }
+        }
+        for (held, sending, expected) in [(true, false, "Halten"), (false, true, "Sendet")] {
+            let mut s = four();
+            s.settings.audio.mode = ModeSetting::Ptt;
+            s.ptt_down = held;
+            s.sending = sending;
+            let (mut h, _) = main_window(s, theme_name);
+            h.run();
+            let rect = h.get_by_label("Sprechen").rect();
+            let mut labels = Vec::new();
+            for shape in &h.output().shapes {
+                visit(&shape.shape, rect, &mut labels, &mut Vec::new());
+            }
+            assert!(
+                labels.iter().any(|text| text.ends_with(expected)),
+                "{theme_name}/held={held}/sending={sending}: {labels:?}"
+            );
+        }
+        // Received speech indicators can trail a peer's mute/deafen update.
+        // The participant row and path view must prefer that authoritative flag.
+        for (flag, expected) in [
+            (UserFlags::MUTED, "Stummgeschaltet"),
+            (UserFlags::SYSTEM_MUTED, "Stummgeschaltet"),
+            (UserFlags::DEAFENED, "Hört nicht zu"),
+        ] {
+            let mut s = four();
+            s.peers[0].speaking = true;
+            s.peers[0].info.flags = s.peers[0].info.flags.with_bit(flag, true);
+            let mut view = UserView::new(2);
+            let user = harness(USER, theme_name, true, move |ui| {
+                view.ui(ui, &s, &|_| None, &|_| {});
+            });
+            let mut labels = Vec::new();
+            for shape in &user.output().shapes {
+                visit(
+                    &shape.shape,
+                    user.ctx.content_rect(),
+                    &mut labels,
+                    &mut Vec::new(),
+                );
+            }
+            assert_eq!(labels.iter().filter(|text| *text == expected).count(), 1);
+            assert!(!labels.iter().any(|text| text == "Spricht"));
+        }
+    }
+}
+
+/// The settings page follows the same Privacy guard as the main window and
+/// ends an existing preview instead of silently restarting it after Privacy.
+#[cfg(feature = "camera")]
+#[test]
+fn privacy_camera_settings_lock_and_stop_preview() {
+    for theme_name in THEMES {
+        let state = Rc::new(RefCell::new(state()));
+        let rendered = state.clone();
+        let output = Rc::new(RefCell::new(None));
+        let captured = output.clone();
+        let mut view = SettingsView::new(
+            &state.borrow(),
+            Arc::new(DebugStats::default()),
+            Paths::new(Some(std::env::temp_dir().join("icu-ui-layout"))),
+        );
+        let mut h = harness(SETTINGS, theme_name, true, move |ui| {
+            *captured.borrow_mut() = Some(view.ui(ui, &rendered.borrow(), false));
+        });
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Kamera")
+            .click();
+        h.run();
+        let preview_label = format!("{}  Vorschau", egui_phosphor::regular::EYE);
+        h.get_by_label(&preview_label).click();
+        h.run();
+        assert!(output.borrow().as_ref().unwrap().camera_preview);
+
+        state.borrow_mut().privacy_active = true;
+        h.run();
+        assert!(!output.borrow().as_ref().unwrap().camera_preview);
+        assert!(output.borrow().as_ref().unwrap().cmds.is_empty());
+        assert!(h
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "Kamera einschalten")
+            .accesskit_node()
+            .is_disabled());
+        assert!(h
+            .get_by_label(&preview_label)
+            .accesskit_node()
+            .is_disabled());
+        h.get_by_label_contains("Privacy ist an: Einschalten und Vorschau sind gesperrt.");
+        assert!(output.borrow().as_ref().unwrap().overflow <= 0.5);
+        shot(&mut h, &format!("settings-camera-privacy-{theme_name}"));
+
+        state.borrow_mut().privacy_active = false;
+        h.run();
+        assert!(!output.borrow().as_ref().unwrap().camera_preview);
+        assert!(!h
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, "Kamera einschalten")
+            .accesskit_node()
+            .is_disabled());
+        assert!(!h
+            .get_by_label(&preview_label)
+            .accesskit_node()
+            .is_disabled());
+        h.get_by_label(&preview_label).click();
+        h.run();
+        assert!(output.borrow().as_ref().unwrap().camera_preview);
+    }
+}
+
 /// The normal participant self-view renders the same burned-in privacy image.
 #[cfg(feature = "camera")]
 #[test]

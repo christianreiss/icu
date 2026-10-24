@@ -1552,7 +1552,7 @@ impl MainView {
                                     widgets::tile(ui, glyph, &label, active, role, rec, size)
                                 }).inner;
                                 if blocked {
-                                    tile = tile.on_hover_text("Während Privacy gesperrt.");
+                                    tile = tile.on_disabled_hover_text("Während Privacy gesperrt.");
                                 }
                                 if let Some(hint) = hint {
                                     tile = tile.on_hover_text(hint);
@@ -1595,7 +1595,7 @@ impl MainView {
         let own = state.me.as_ref().map(|_| {
             [
                 state.deafened,
-                state.muted || state.system_muted || state.privacy_active,
+                microphone_muted(state),
                 state.camera_on,
                 state.is_admin,
             ]
@@ -1709,6 +1709,11 @@ fn conn_status(state: &AppState, tok: &theme::Tokens) -> (Color32, String, Strin
 // Bottom bar
 // ---------------------------------------------------------------------------
 
+/// Include temporary and system inhibition before the audio report catches up.
+fn microphone_muted(state: &AppState) -> bool {
+    state.muted || state.system_muted || state.setup_active || state.privacy_active
+}
+
 /// The speak surface plus the PTT/VAD tile beside it, `tile_w` wide. Returns the
 /// surface's response only in push-to-talk mode — in voice activation there
 /// is nothing to press, so it is a readout instead of a button that would do
@@ -1721,18 +1726,16 @@ fn speak_row(
 ) -> Option<egui::Response> {
     let ptt = Mode::from(state.settings.audio.mode) == Mode::Ptt;
     let offline = state.conn != ConnStatus::Connected;
+    let muted = microphone_muted(state);
     // Alone in the room the engine sends nothing (`DspControl::audience`).
     let alone = !offline && state.peers.is_empty();
-    let open = !offline
-        && !alone
-        && !state.setup_active
-        && if ptt { state.ptt_down } else { state.sending };
+    let open = !offline && !alone && !muted && state.sending;
     let key = super::ptt_key_label(&state.settings.hotkeys, &state.hotkey_backend);
     let (vad_level, vad_threshold) = state.vad_meter();
     let speak = widgets::Speak {
         ptt,
         open,
-        muted: state.muted || state.setup_active || state.privacy_active,
+        muted,
         offline,
         alone,
         level: if ptt {
@@ -1755,6 +1758,11 @@ fn speak_row(
         }
         ui.label(if state.setup_active {
             "Einrichtung offen — Mikrofontests werden nur lokal wiedergegeben.".to_string()
+        } else if state.privacy_active {
+            "Privacy ist an — dein Mikrofon wird nicht übertragen.".to_string()
+        } else if state.system_muted {
+            "Das Mikrofon ist im System stummgeschaltet — dort wieder einschalten, um zu sprechen."
+                .to_string()
         } else if offline {
             format!(
                 "Nicht verbunden — es wird nichts gesendet\nPegel {:.0} dBFS",
@@ -1990,8 +1998,8 @@ pub(super) fn participant_for<'a>(
         return Some(Participant {
             name: &me.name,
             user_id: me.user_id,
-            speaking: state.sending,
-            muted: state.muted || state.system_muted || state.privacy_active,
+            speaking: state.sending && !microphone_muted(state),
+            muted: microphone_muted(state),
             deafened: state.deafened,
             camera: state.camera_on,
             mode: Some(state.settings.audio.mode.into()),
@@ -2016,7 +2024,10 @@ pub(super) fn participant_for<'a>(
     Some(Participant {
         name: &p.info.name,
         user_id: p.info.user_id,
-        speaking: p.speaking,
+        speaking: p.speaking
+            && !p.info.flags.muted()
+            && !p.info.flags.system_muted()
+            && !p.info.flags.deafened(),
         muted: p.info.flags.muted() || p.info.flags.system_muted(),
         deafened: p.info.flags.deafened(),
         camera: p.info.flags.camera_on(),

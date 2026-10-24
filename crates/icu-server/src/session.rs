@@ -1207,10 +1207,10 @@ async fn control_loop(
                     );
                 }
             }
-            // Both name a speaker, and both key server state by it: only a
-            // peer that is in the room right now counts, or a client could
-            // fill the maps with all 65 535 ids.
-            ControlMsg::LossReport { speaker, .. } | ControlMsg::KeyframeRequest { speaker }
+            // Loss reports key server state by the speaker: only a peer
+            // that is in the room right now counts, or a client could fill
+            // the maps with all 65 535 ids.
+            ControlMsg::LossReport { speaker, .. }
                 if speaker == session || server.room.flags(speaker).is_none() => {}
             ControlMsg::LossReport {
                 speaker,
@@ -1230,9 +1230,11 @@ async fn control_loop(
                 }
             }
             ControlMsg::KeyframeRequest { speaker } => {
-                server
-                    .room
-                    .keyframe_request(speaker, server.config.timing.keyframe_min_interval());
+                server.room.keyframe_request(
+                    session,
+                    speaker,
+                    server.config.timing.keyframe_min_interval(),
+                );
             }
             ControlMsg::RenewRequest { csr_der } => {
                 handle_renew(server, session, identity, &csr_der).await;

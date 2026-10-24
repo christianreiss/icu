@@ -149,6 +149,19 @@ struct RoomState {
     members: BTreeMap<Session, Member>,
 }
 
+impl RoomState {
+    /// The same recipient rule as video relay, with an active camera source.
+    fn video_recipient(&self, viewer: Session, speaker: Session) -> bool {
+        self.members
+            .get(&speaker)
+            .is_some_and(|m| m.flags.camera_on())
+            && self
+                .members
+                .get(&viewer)
+                .is_some_and(|m| viewer != speaker && m.flags.viewing() && !m.forced.deafened())
+    }
+}
+
 /// The one room.
 #[derive(Debug)]
 pub struct Room {
@@ -435,15 +448,7 @@ impl Room {
 
     /// Only a current relay recipient may attest to displaying a sender's video.
     pub fn video_display_eligible(&self, viewer: Session, speaker: Session) -> bool {
-        let state = self.lock();
-        state
-            .members
-            .get(&speaker)
-            .is_some_and(|m| m.flags.camera_on())
-            && state
-                .members
-                .get(&viewer)
-                .is_some_and(|m| viewer != speaker && m.flags.viewing() && !m.forced.deafened())
+        self.lock().video_recipient(viewer, speaker)
     }
 
     /// Applies a client requested state change. Returns the new flags when
@@ -566,12 +571,21 @@ impl Room {
         changed
     }
 
-    /// Forwards a `KeyframeRequest` to `speaker`, at most once per
-    /// `min_interval` (§6.5). The speaker learns "someone needs a keyframe",
-    /// not who asked.
-    pub fn keyframe_request(&self, speaker: Session, min_interval: Duration) -> bool {
+    /// Forwards a current video recipient's `KeyframeRequest` to `speaker`,
+    /// at most once per `min_interval` (§6.5). Permission and rate booking
+    /// share the room lock: an excluded viewer cannot spend that allowance.
+    /// The speaker learns "someone needs a keyframe", not who asked.
+    pub fn keyframe_request(
+        &self,
+        viewer: Session,
+        speaker: Session,
+        min_interval: Duration,
+    ) -> bool {
         let now = Instant::now();
         let mut state = self.lock();
+        if !state.video_recipient(viewer, speaker) {
+            return false;
+        }
         let Some(member) = state.members.get_mut(&speaker) else {
             return false;
         };
