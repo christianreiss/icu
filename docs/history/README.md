@@ -4,6 +4,7 @@ Ergebnisse, Entscheidungen und offene Punkte gelten für den jeweils genannten
 Stand. Aktuelle Referenzen stehen unter [reference/](../README.md).
 Die frühen Wire-Entwürfe sind durch [protocol.md](../reference/protocol.md) ersetzt.
 
+- [Deep-Review: Audio, Security und UI/UX — 2026-10-24](deep-review-2026-10-24.md)
 - [Audio feedback — implementation and verification, 2026-09-28](audio-feedback-verification-2026-09-28.md)
 - [Gute Audiopegel, Messkennungen und größere Corona (2026-10-23)](audio-calibration-2026-10-23.md)
 - [Audio-Pegel und Peer-Hints: Debugging 2026-10-23](audio-balancing-debug-2026-10-23.md)

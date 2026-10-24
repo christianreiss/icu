@@ -461,10 +461,16 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Loads the file, or the defaults if it does not exist.
+    /// Loads the file with bounded, finite numeric settings, or the defaults
+    /// if it does not exist. Valid TOML can still contain NaN or unsafe delays.
     pub fn load(paths: &Paths) -> Result<Settings, ConfigError> {
         match fs::read_to_string(paths.settings()) {
-            Ok(text) => toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string())),
+            Ok(text) => {
+                let mut settings: Settings =
+                    toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+                settings.clamp_numbers();
+                Ok(settings)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Settings::default()),
             Err(e) => Err(ConfigError::Io(e)),
         }
@@ -1539,6 +1545,42 @@ mod tests {
         assert!(text.contains("[volumes]"));
         assert!(text.contains("setup_done = true"));
         assert!(text.contains("close_action = \"minimize\""));
+    }
+
+    #[test]
+    fn loaded_numbers_are_safe_for_audio_processing() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(dir.path().to_path_buf()));
+        for nonfinite in ["nan", "inf", "-inf"] {
+            fs::write(
+                paths.settings(),
+                format!(
+                    "[audio]\ngain_db = {nonfinite}\nvad_threshold = {nonfinite}\n\
+                     output_volume = {nonfinite}\nrelease_ms = 4294967295\n\
+                     hangover_ms = 4294967295\nattack_ms = 4294967295\nframe_ms = 7\n\
+                     muted = true\nmode = \"ptt\"\n[volumes]\n\"5\" = {nonfinite}\n\"6\" = 999999\n"
+                ),
+            )
+            .unwrap();
+            let (loaded, problem) = Settings::load_or_recover(&paths).unwrap();
+            let defaults = AudioSettings::default();
+            assert_eq!(loaded.audio.gain_db, defaults.gain_db);
+            assert_eq!(loaded.audio.vad_threshold, defaults.vad_threshold);
+            assert_eq!(loaded.audio.output_volume, defaults.output_volume);
+            assert_eq!(loaded.audio.release_ms, 1000);
+            assert_eq!(loaded.audio.hangover_ms, 3000);
+            assert_eq!(loaded.audio.attack_ms, 200);
+            assert_eq!(loaded.audio.frame_ms, 20);
+            assert_eq!(loaded.volume(5), 100.0);
+            assert_eq!(loaded.volume(6), 200.0);
+            assert!(
+                loaded.audio.muted,
+                "validation must preserve the user's mute"
+            );
+            assert_eq!(loaded.audio.mode, ModeSetting::Ptt);
+            assert!(problem.is_none(), "valid TOML must not be moved aside");
+            assert!(paths.settings().exists());
+        }
     }
 
     #[test]
