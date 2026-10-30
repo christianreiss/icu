@@ -127,3 +127,56 @@ pub fn is_machine_installed_exe(exe: &std::path::Path) -> bool {
         _ => false,
     }
 }
+
+/// Unlike association detection, updates must not treat an unreadable machine
+/// registration as a portable installation. Explicitly read the 64-bit view.
+pub fn update_install_location() -> Result<Option<std::path::PathBuf>, String> {
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    let path = HSTRING::from(r"Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU");
+    let name = HSTRING::from("InstallLocation");
+    let flags = RRF_RT_REG_SZ | windows::Win32::System::Registry::RRF_SUBKEY_WOW6464KEY;
+    let mut size = 0u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            &path,
+            &name,
+            flags,
+            None,
+            None,
+            Some(&mut size),
+        )
+    };
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if status != ERROR_SUCCESS || size == 0 || size > 65536 {
+        return Err(format!(
+            "Die Windows-Installation konnte nicht eindeutig erkannt werden: {status:?}"
+        ));
+    }
+    let mut buffer = vec![0u16; (size as usize).div_ceil(2)];
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            &path,
+            &name,
+            flags,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "Die Windows-Installation konnte nicht gelesen werden: {status:?}"
+        ));
+    }
+    let len = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+    let value = String::from_utf16(&buffer[..len])
+        .map_err(|_| "Ungültiger Installationspfad in der Windows-Registrierung.")?;
+    if value.is_empty() {
+        return Err("Leerer Installationspfad in der Windows-Registrierung.".into());
+    }
+    Ok(Some(std::path::PathBuf::from(value)))
+}

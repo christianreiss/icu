@@ -22,6 +22,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
+
+[ -z "${ICU_UPDATE_ACCEPTANCE_ROOT:-}" ] || {
+    echo "private update acceptance channels are forbidden in release packages" >&2
+    exit 1
+}
 TARGET=x86_64-pc-windows-gnu
 
 VERSION=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)

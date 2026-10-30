@@ -138,7 +138,9 @@ pub fn paint_well(ui: &Ui, rect: egui::Rect, radius: u8) {
 /// used, so every control after it would start at a different x. It also
 /// sets the row height before the controls arrive, so they center on it.
 pub fn label_column(ui: &mut Ui, width: f32, height: f32, label: &str) {
-    let (col, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    let (col, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), label));
     ui.painter().text(
         col.left_center(),
         egui::Align2::LEFT_CENTER,

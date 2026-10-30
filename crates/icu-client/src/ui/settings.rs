@@ -11,7 +11,7 @@ use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
 use icu_proto::UserId;
 
-use super::{theme, widgets};
+use super::{design, theme, widgets};
 use crate::{
     audio::DeviceKind,
     config::{
@@ -44,7 +44,7 @@ const PREVIEW_W: f32 = 176.0;
 /// offers, in pixels.
 const EDGE_MAX: u32 = 200;
 /// Width of the settings sidebar.
-const NAV_W: f32 = 184.0;
+const NAV_W: f32 = 200.0;
 /// Content column cap: cards wider than this only put more empty space
 /// between a label and its control.
 const CONTENT_MAX_W: f32 = 600.0;
@@ -61,15 +61,180 @@ const CORNER_PICKER_W: f32 = CORNER_SWATCH * 6.0 + CORNER_GAP * 6.0 + CORNER_SPL
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Tab {
     Audio,
-    Sound,
-    Ducking,
-    Hotkeys,
     Camera,
     Overlay,
     General,
     Users,
     About,
 }
+
+/// Local index: labels are the actual row targets, never commands or URLs.
+const SEARCH_TARGETS: &[(Tab, &str, &str, Option<&str>)] = &[
+    (
+        Tab::Audio,
+        "Mikrofon",
+        "eingang aufnahme mic input usb headset mikrofontest testen",
+        None,
+    ),
+    (
+        Tab::Audio,
+        "Lautsprecher",
+        "kopfhörer ausgabe hören output",
+        None,
+    ),
+    (
+        Tab::Audio,
+        "Wiedergabelautstärke",
+        "laut leise hören ausgang volumen",
+        None,
+    ),
+    (
+        Tab::Audio,
+        "Mikrofonkanal",
+        "kanal stereo links rechts",
+        Some("audio"),
+    ),
+    (
+        Tab::Audio,
+        "Sprechmodus",
+        "ptt taste push to talk vad sprachaktivierung automatisch",
+        None,
+    ),
+    (
+        Tab::Audio,
+        "Rauschunterdrückung",
+        "rauschen lüfter tastatur geräusche",
+        None,
+    ),
+    (
+        Tab::Audio,
+        "Echo-Unterdrückung",
+        "echo aec lautsprecher",
+        None,
+    ),
+    (
+        Tab::Audio,
+        "Pegel automatisch",
+        "automatik mikrofonpegel lautheit",
+        None,
+    ),
+    (
+        Tab::Audio,
+        "Selbst gleich laut ankommen",
+        "normalisierung senden lautheit",
+        None,
+    ),
+    (
+        Tab::Audio,
+        "Andere gleich laut hören",
+        "normalisierung empfang lautheit",
+        None,
+    ),
+    (
+        Tab::Audio,
+        "Stimmoptimierung",
+        "stimme kompressor klang",
+        None,
+    ),
+    (
+        Tab::Audio,
+        "Absenkung",
+        "ducking andere apps musik spiele leiser",
+        Some("ducking"),
+    ),
+    (
+        Tab::Audio,
+        "Echo-Messwerte",
+        "echo aec diagnose messwerte",
+        Some("voice"),
+    ),
+    (
+        Tab::Camera,
+        "Gerät",
+        "kamera camera webcam videogerät",
+        None,
+    ),
+    (
+        Tab::Camera,
+        "Kamera einschalten",
+        "kamera bild automatik helligkeit",
+        None,
+    ),
+    (
+        Tab::Overlay,
+        "Push-to-Talk",
+        "ptt taste tasten hotkeys tastatur aufnehmen",
+        Some("keys"),
+    ),
+    (
+        Tab::Overlay,
+        "Methode",
+        "tasten portal evdev backend",
+        Some("keys"),
+    ),
+    (
+        Tab::Overlay,
+        "Mich im Overlay zeigen",
+        "overlay eigene kachel",
+        None,
+    ),
+    (
+        Tab::Overlay,
+        "Sprech-Corona",
+        "overlay farbe rahmen",
+        Some("overlay"),
+    ),
+    (
+        Tab::Overlay,
+        "Dem Mauszeiger ausweichen",
+        "overlay shy maus",
+        Some("overlay"),
+    ),
+    (
+        Tab::General,
+        "Farben",
+        "theme design hell dunkel system aussehen",
+        None,
+    ),
+    (Tab::General, "Anzeigename", "name profil benutzer", None),
+    (
+        Tab::General,
+        "Beim Schließen",
+        "tray fenster schließen beenden hintergrund",
+        None,
+    ),
+    (
+        Tab::General,
+        "Töne",
+        "benachrichtigungen töne hinweise kommen gehen",
+        None,
+    ),
+    (
+        Tab::General,
+        "Auf ein anderes Gerät mitnehmen",
+        "passport export zugang identität",
+        None,
+    ),
+    (
+        Tab::General,
+        "Passport von einem anderen Gerät",
+        "passport import zugang einspielen",
+        None,
+    ),
+    (Tab::General, "Version", "über icu version release", None),
+    (
+        Tab::General,
+        "Updates",
+        "update aktualisieren version prüfen",
+        None,
+    ),
+    (
+        Tab::About,
+        "RTT",
+        "diagnose ping netzwerk latenz bericht",
+        None,
+    ),
+];
 
 /// Cached, ~2s-refreshed text for the About tab's Diagnose group — avoids
 /// locking the three histogram mutexes every frame at 60fps.
@@ -87,6 +252,9 @@ struct DiagnoseCache {
 
 /// Draft state of the settings panel.
 pub struct SettingsView {
+    pub update: crate::update::Snapshot,
+    update_action: Option<crate::update::Action>,
+    update_confirm: bool,
     /// Working copy, applied on change.
     pub draft: Settings,
     /// Name field (applied with the button, not on every keystroke).
@@ -121,6 +289,8 @@ pub struct SettingsView {
     seen_invite: Option<String>,
     /// Active tab.
     tab: Tab,
+    search: String,
+    details: std::collections::HashSet<&'static str>,
     /// Which hotkey rows currently show their editable fields.
     expanded_bindings: std::collections::HashSet<&'static str>,
     stats: Arc<DebugStats>,
@@ -189,6 +359,9 @@ pub struct SettingsView {
 /// What one frame of the settings window asks the main window to do.
 #[derive(Default)]
 pub struct SettingsOutput {
+    pub update_action: Option<crate::update::Action>,
+    /// Close only this settings window; changes are already applied.
+    pub close: bool,
     /// Commands for the engine.
     pub cmds: Vec<Command>,
     /// Whether the debug window should be open after this frame.
@@ -289,6 +462,9 @@ impl SettingsView {
             .map(|m| m.name.clone())
             .unwrap_or_default();
         SettingsView {
+            update: Default::default(),
+            update_action: None,
+            update_confirm: false,
             draft: state.settings.clone(),
             sync: DraftSync::new(&state.settings),
             open_setup: false,
@@ -305,6 +481,14 @@ impl SettingsView {
             invite_status: None,
             seen_invite: None,
             tab: Tab::Audio,
+            search: String::new(),
+            details: if state.settings.ui.show_advanced {
+                ["audio", "voice", "ducking", "keys", "overlay", "app"]
+                    .into_iter()
+                    .collect()
+            } else {
+                Default::default()
+            },
             expanded_bindings: std::collections::HashSet::new(),
             stats,
             paths,
@@ -336,6 +520,7 @@ impl SettingsView {
     /// Opens Allgemein with the passport paste field ready: the way back
     /// after a certificate was renewed on another device.
     pub fn open_import(&mut self) {
+        self.search.clear();
         self.select_tab(Tab::General);
         self.import_open = true;
         self.focus_import = true;
@@ -344,6 +529,9 @@ impl SettingsView {
     fn select_tab(&mut self, tab: Tab) {
         if self.tab == tab {
             return;
+        }
+        if self.tab == Tab::Camera {
+            self.camera_preview = false;
         }
         self.tab = tab;
         // A reader can finish after the user leaves. Dropping its result
@@ -398,6 +586,7 @@ impl SettingsView {
     /// Draws the panel content. `debug_window_open` is what `App` knows;
     /// the answer comes back in the output.
     pub fn ui(&mut self, ui: &mut Ui, state: &AppState, debug_window_open: bool) -> SettingsOutput {
+        design::settings_style(ui);
         let mut cmds = Vec::new();
         self.debug_window_open = debug_window_open;
         self.sync.adopt(&mut self.draft, &state.settings);
@@ -413,56 +602,89 @@ impl SettingsView {
             self.select_tab(Tab::General);
         }
 
-        // The pages people come for first; Nutzer only for admins.
         let mut tabs = vec![
-            (Tab::Audio, icon::MICROPHONE, "Audio"),
-            (Tab::Sound, icon::WAVEFORM, "Klang"),
-            (Tab::Ducking, icon::SPEAKER_HIGH, "Absenkung"),
-            (Tab::Hotkeys, icon::COMMAND, "Tastenkürzel"),
+            (Tab::Audio, icon::MICROPHONE, "Stimme & Hören"),
             (Tab::Camera, icon::VIDEO_CAMERA, "Kamera"),
-            (Tab::Overlay, icon::SQUARES_FOUR, "Overlay"),
-            (Tab::General, icon::GEAR_FINE, "Allgemein"),
-            (Tab::About, icon::QUESTION, "Über ICU"),
+            (Tab::Overlay, icon::SQUARES_FOUR, "Overlay & Tasten"),
+            (Tab::General, icon::GEAR_FINE, "App"),
+            (Tab::About, icon::QUESTION, "Diagnose"),
         ];
         if state.is_admin {
-            tabs.insert(6, (Tab::Users, icon::USERS_THREE, "Nutzer"));
+            tabs.push((Tab::Users, icon::USERS_THREE, "Administration"));
         }
-
         egui::Panel::left("settings_nav")
             .resizable(false)
             .exact_size(NAV_W)
             .frame(
                 egui::Frame::new()
-                    .fill(ui.visuals().extreme_bg_color)
-                    .inner_margin(egui::Margin::symmetric(10, 12)),
+                    .fill(design::surface(ui.visuals()))
+                    .inner_margin(egui::Margin::symmetric(10, 16)),
             )
+            .show_separator_line(true)
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.label(
+                    RichText::new("Einstellungen")
+                        .font(egui::FontId::new(15.0, super::fonts::semibold())),
+                );
+                ui.add_space(12.0);
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .id_salt("settings_search")
+                        .hint_text("Einstellungen suchen …")
+                        .min_size(egui::vec2(0.0, 34.0))
+                        .font(egui::FontId::proportional(13.0))
+                        .desired_width(f32::INFINITY),
+                );
+                search.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::TextEdit,
+                        true,
+                        "Einstellungen suchen",
+                    )
+                });
+                if search.changed() && !self.search.is_empty() {
+                    self.capture = None;
+                    self.capture_error = None;
+                    self.camera_preview = false;
+                }
+                if search.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.search.clear();
+                    ui.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::NONE, egui::Key::Escape);
+                    });
+                }
+                ui.add_space(12.0);
                 for (tab, glyph, label) in tabs {
-                    if widgets::nav_item(ui, glyph, label, self.tab == tab) {
+                    if design::nav_item(ui, glyph, label, self.tab == tab && self.search.is_empty())
+                    {
+                        self.search.clear();
                         self.select_tab(tab);
                     }
                 }
-                // The expert switch sits at the foot of the sidebar: it
-                // changes every page, so it belongs to none of them.
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                    let tok = theme::tokens(ui.visuals());
-                    ui.label(
-                        RichText::new("Zeigt technische Einstellungen und Diagnose.")
-                            .size(11.0)
-                            .color(tok.dim_text),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Erweitert").size(13.0));
-                        widgets::rtl(ui, 24.0, |ui| {
-                            widgets::named_toggle(ui, &mut self.draft.ui.show_advanced, "Erweitert")
-                                .on_hover_text("Erweiterte Einstellungen anzeigen")
-                        });
-                    });
-                    ui.add_space(4.0);
-                    ui.separator();
-                });
             });
+
+        let close = egui::Panel::bottom("settings_footer")
+            .frame(
+                egui::Frame::new()
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::symmetric(24, 12)),
+            )
+            .show_separator_line(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Änderungen werden sofort übernommen.")
+                            .size(12.0)
+                            .color(theme::tokens(ui.visuals()).dim_text),
+                    );
+                    widgets::rtl(ui, 36.0, |ui| {
+                        design::button(ui, widgets::ButtonKind::Primary, "", "Schließen").clicked()
+                    })
+                })
+                .inner
+            })
+            .inner;
 
         let page = egui::ScrollArea::vertical()
             .id_salt(("settings_page", self.tab))
@@ -470,53 +692,150 @@ impl SettingsView {
             .show(ui, |ui| {
                 egui::Frame::new()
                     .inner_margin(egui::Margin {
-                        left: 22,
-                        right: 22,
-                        top: 18,
+                        left: 32,
+                        right: 32,
+                        top: 24,
                         bottom: 24,
                     })
                     .show(ui, |ui| {
                         ui.set_max_width(ui.available_width().min(CONTENT_MAX_W));
-                        match self.tab {
-                            Tab::Audio => self.audio_tab(ui, state, &mut cmds),
-                            Tab::Sound => self.sound_tab(ui, state, &mut cmds),
-                            Tab::Ducking => self.ducking_tab(ui, state),
-                            Tab::Hotkeys => self.hotkeys_tab(ui, state, &mut cmds),
-                            Tab::Camera => self.camera_tab(ui, state),
-                            Tab::Overlay => self.overlay_tab(ui),
-                            Tab::General => self.general_tab(ui, state, &mut cmds),
-                            Tab::Users => self.users_tab(ui, state, &mut cmds),
-                            Tab::About => self.about_tab(ui, state),
-                        }
+                        ui.push_id(self.tab, |ui| {
+                            if !self.search.is_empty() {
+                                self.search_results(ui);
+                            } else {
+                                match self.tab {
+                                    Tab::Audio => {
+                                        self.audio_tab(ui, state, &mut cmds);
+                                        self.sound_tab(ui, state, &mut cmds);
+                                        self.ducking_tab(ui, state);
+                                    }
+                                    Tab::Camera => self.camera_tab(ui, state),
+                                    Tab::Overlay => {
+                                        self.overlay_tab(ui);
+                                        self.hotkeys_tab(ui, state, &mut cmds);
+                                    }
+                                    Tab::General => {
+                                        self.general_tab(ui, state, &mut cmds);
+                                        self.notifications(ui);
+                                        self.about_info(ui, state);
+                                    }
+                                    Tab::Users => self.users_tab(ui, state, &mut cmds),
+                                    Tab::About => self.about_tab(ui, state),
+                                }
+                            }
+                        });
                     });
             });
 
         cmds.extend(self.sync.commit(&self.draft));
-        // A page taller than the window (expert rows, a long member list)
-        // grows the window instead of hiding its end behind a scroll bar.
+        // The viewport stays stable. Each category keeps its own scroll position.
         let overflow = page.content_size.y - page.inner_rect.height();
-        super::grow_to_fit(ui.ctx(), overflow);
         SettingsOutput {
+            update_action: self.update_action.take(),
+            close,
             cmds,
             debug_window_open: self.debug_window_open,
             logout: std::mem::take(&mut self.logout_requested),
-            camera_preview: self.tab == Tab::Camera && self.camera_preview,
-            mic_test_page: matches!(self.tab, Tab::Audio | Tab::Sound),
+            camera_preview: self.search.is_empty()
+                && self.tab == Tab::Camera
+                && self.camera_preview,
+            mic_test_page: self.search.is_empty() && self.tab == Tab::Audio,
             overflow,
             open_setup: std::mem::take(&mut self.open_setup),
         }
     }
 
-    fn audio_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
-        let adv = self.draft.ui.show_advanced;
+    fn details_button(&mut self, ui: &mut Ui, key: &'static str) -> bool {
+        let title = match key {
+            "audio" => "Aufnahme & Sprechmodus",
+            "voice" => "Sprachaufbereitung",
+            "ducking" => "Andere Apps beim Sprechen absenken",
+            "keys" => "Tastenkürzel",
+            "overlay" => "Overlay-Darstellung",
+            _ => "App-Details",
+        };
+        ui.push_id(("details", key), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(title)
+                        .size(13.0)
+                        .color(theme::tokens(ui.visuals()).muted_text),
+                );
+                widgets::rtl(ui, 34.0, |ui| {
+                    let open = self.details.contains(key);
+                    let response = design::button(
+                        ui,
+                        widgets::ButtonKind::Neutral,
+                        "",
+                        if open {
+                            "Details schließen"
+                        } else {
+                            "Details"
+                        },
+                    );
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            true,
+                            format!("Details: {title}"),
+                        )
+                    });
+                    if response.clicked() {
+                        if open {
+                            self.details.remove(key);
+                        } else {
+                            self.details.insert(key);
+                        }
+                    }
+                });
+            });
+        });
+        ui.add_space(8.0);
+        self.details.contains(key)
+    }
+
+    fn search_results(&mut self, ui: &mut Ui) {
         widgets::page_header(
             ui,
-            "Audio",
+            "Einstellungen suchen",
+            "Ein Treffer öffnet die passende Einstellung.",
+            |_| {},
+        );
+        let query = self.search.to_lowercase();
+        let mut count = 0;
+        for &(tab, label, terms, details) in SEARCH_TARGETS {
+            if !query
+                .split_whitespace()
+                .all(|word| format!("{label} {terms}").to_lowercase().contains(word))
+            {
+                continue;
+            }
+            count += 1;
+            if design::button(ui, widgets::ButtonKind::Neutral, "", label).clicked() {
+                self.capture = None;
+                self.capture_error = None;
+                self.select_tab(tab);
+                if let Some(key) = details {
+                    self.details.insert(key);
+                }
+                self.search.clear();
+                design::jump_to(ui.ctx(), label);
+            }
+        }
+        if count == 0 {
+            ui.label("Keine passende Einstellung gefunden.");
+        }
+    }
+
+    fn audio_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
+        widgets::page_header(
+            ui,
+            "Stimme & Hören",
             "Mikrofon, Lautsprecher und wann du zu hören bist.",
             |ui| {
                 // The step-by-step way through the same choices, the one a
                 // new install opens with (`super::setup`).
-                if widgets::button(
+                if design::button(
                     ui,
                     widgets::ButtonKind::Neutral,
                     icon::MAGIC_WAND,
@@ -529,6 +848,8 @@ impl SettingsView {
                 }
             },
         );
+        let adv = self.details_button(ui, "audio");
+
         let inputs: Vec<_> = state
             .devices
             .iter()
@@ -540,21 +861,21 @@ impl SettingsView {
             .filter(|d| d.kind == DeviceKind::Output)
             .collect();
 
-        widgets::group_card(ui, "Geräte", |ui| {
+        design::group_card(ui, "Geräte", |ui| {
             // The mic test sits next to the microphone: hearing yourself
             // answers „bin ich zu leise, klinge ich blechern?" without a
             // second person; it plays what the others get, after the whole
             // send chain.
-            device_combo(
+            settings_device_combo(
                 ui,
                 false,
                 "Mikrofon",
                 &mut self.draft.audio.input_device,
                 &inputs,
-                |ui| mic_test_button(ui, state.mic_test, cmds),
+                |ui| mic_test_button(ControlStyle::Reference, ui, state.mic_test, cmds),
             );
             if adv {
-                widgets::setting_row(ui, true, "Mikrofonkanal", Some("Automatisch nutzt einen stabilen Eingang; manuell wählst du einen einzelnen Kanal."), |ui| {
+                design::setting_row(ui, true, "Mikrofonkanal", Some("Automatisch nutzt einen stabilen Eingang; manuell wählst du einen einzelnen Kanal."), |ui| {
                     let mut automatic = self.draft.audio.input_channel.is_none();
                     let mut changed = ui.checkbox(&mut automatic, "Automatisch").changed();
                     if changed { self.draft.audio.input_channel = if automatic { None } else { Some(0) }; }
@@ -566,7 +887,7 @@ impl SettingsView {
                     changed
                 });
             }
-            device_combo(
+            settings_device_combo(
                 ui,
                 true,
                 "Lautsprecher",
@@ -574,27 +895,27 @@ impl SettingsView {
                 &outputs,
                 |_| {},
             );
-            widgets::slider_row(
+            design::slider_row(
                 ui,
                 true,
-                "Lautstärke",
+                "Wiedergabelautstärke",
                 &mut self.draft.audio.output_volume,
                 0.0..=200.0,
                 " %",
             );
         });
 
-        widgets::group_card(ui, "Sprechen", |ui| {
-            widgets::setting_row(
+        design::group_card(ui, "Sprechen", |ui| {
+            design::setting_row(
                 ui,
                 false,
-                "Senden",
+                "Sprechmodus",
                 Some(match self.draft.audio.mode {
                     ModeSetting::Ptt => "Du bist nur zu hören, solange du die Taste hältst.",
                     ModeSetting::Vad => "Du bist automatisch zu hören, sobald du sprichst.",
                 }),
                 |ui| {
-                    widgets::segmented(
+                    design::segmented(
                         ui,
                         &mut self.draft.audio.mode,
                         &[
@@ -608,14 +929,14 @@ impl SettingsView {
                 // The key is what people look for next to the mode, so it is
                 // shown here and changed with one click on its own page.
                 let key = super::ptt_key_label(&self.draft.hotkeys, &state.hotkey_backend);
-                widgets::setting_row(ui, true, "Taste", None, |ui| {
-                    let width = widgets::button_width(ui, icon::PENCIL_SIMPLE, "Ändern")
+                design::setting_row(ui, true, "Taste", None, |ui| {
+                    let width = design::button_width(ui, icon::PENCIL_SIMPLE, "Ändern")
                         + 8.0
                         + widgets::chip_width(ui, std::slice::from_ref(&key));
                     widgets::row_group(ui, width, |ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         widgets::chip(ui, &key, 0.0);
-                        if widgets::button(
+                        if design::button(
                             ui,
                             widgets::ButtonKind::Neutral,
                             icon::PENCIL_SIMPLE,
@@ -623,23 +944,25 @@ impl SettingsView {
                         )
                         .clicked()
                         {
-                            self.select_tab(Tab::Hotkeys);
+                            self.select_tab(Tab::Overlay);
                             self.expanded_bindings.insert("Push-to-Talk");
+                            self.details.insert("keys");
+                            design::jump_to(ui.ctx(), "Push-to-Talk");
                         }
                     });
                 });
             } else {
                 ui.add_enabled_ui(self.draft.audio.denoise, |ui| {
-                    widgets::setting_row(
+                    design::setting_row(
                         ui,
                         true,
                         "Schwelle automatisch",
                         Some("Passt sich laufend an deine Umgebung an. Braucht die Rauschunterdrückung."),
-                        |ui| widgets::named_toggle(ui, &mut self.draft.audio.vad_auto, "Schwelle automatisch"),
+                        |ui| design::named_toggle(ui, &mut self.draft.audio.vad_auto, "Schwelle automatisch"),
                     )
                 });
                 if self.draft.audio.denoise && !self.draft.audio.vad_auto {
-                    widgets::slider_row(
+                    design::slider_row(
                         ui,
                         true,
                         "Schwelle",
@@ -665,11 +988,11 @@ impl SettingsView {
                     && self.draft.audio.denoise
                     && self.draft.audio.vad_auto
                 {
-                    widgets::setting_row(ui, divider(), "Aktuelle Schwelle", None, |ui| {
+                    design::setting_row(ui, divider(), "Aktuelle Schwelle", None, |ui| {
                         widgets::chip(ui, &format!("{:.2}", state.vad_threshold), 0.0)
                     });
                 }
-                widgets::slider_row(
+                design::slider_row(
                     ui,
                     divider(),
                     "Verstärkung",
@@ -684,7 +1007,7 @@ impl SettingsView {
                     "Manuelle Eingangsverstärkung vor der Klangaufbereitung."
                 });
                 let mut release = self.draft.audio.release_ms as f32;
-                if widgets::slider_row(
+                if design::slider_row(
                     ui,
                     divider(),
                     "PTT-Nachlauf",
@@ -697,7 +1020,7 @@ impl SettingsView {
                     self.draft.audio.release_ms = release as u32;
                 }
                 let mut hangover = self.draft.audio.hangover_ms as f32;
-                if widgets::slider_row(
+                if design::slider_row(
                     ui,
                     divider(),
                     "VAD-Nachlauf",
@@ -710,15 +1033,19 @@ impl SettingsView {
                     self.draft.audio.hangover_ms = hangover as u32;
                 }
                 let mut attack = self.draft.audio.attack_ms as f32;
-                if widgets::slider_row(ui, divider(), "VAD-Anlauf", &mut attack, 0.0..=200.0, " ms")
+                if design::slider_row(ui, divider(), "VAD-Anlauf", &mut attack, 0.0..=200.0, " ms")
                     .changed()
                 {
                     self.draft.audio.attack_ms = attack as u32;
                 }
             }
         });
+    }
 
-        widgets::group_card(ui, "Hinweise", |ui| {
+    /// What the voice goes through on the way out and in, and the cue
+    /// sounds: switches that are right by default and rarely touched.
+    fn notifications(&mut self, ui: &mut Ui) {
+        design::group_card(ui, "Hinweise", |ui| {
             let audio = &mut self.draft.audio;
             let cues = [
                 (
@@ -737,7 +1064,7 @@ impl SettingsView {
                     "Zwei Töne beim Stummschalten und wieder Einschalten",
                 ),
             ];
-            widgets::setting_row(ui, false, "Töne", None, |ui| {
+            design::setting_row(ui, false, "Töne", None, |ui| {
                 const GAP: f32 = 6.0;
                 let width = cues
                     .iter()
@@ -757,13 +1084,13 @@ impl SettingsView {
                     },
                 );
             });
-            widgets::setting_row(
+            design::setting_row(
                 ui,
                 true,
                 "Meldung bei Kommen und Gehen",
                 Some("Zusätzlich zum Ton eine Benachrichtigung – hilfreich, solange ICU im Tray liegt."),
                 |ui| {
-                    widgets::named_toggle(
+                    design::named_toggle(
                         ui,
                         &mut self.draft.ui.notify_join,
                         "Meldung bei Kommen und Gehen",
@@ -773,12 +1100,10 @@ impl SettingsView {
         });
     }
 
-    /// What the voice goes through on the way out and in, and the cue
-    /// sounds: switches that are right by default and rarely touched.
     fn ducking_tab(&mut self, ui: &mut Ui, state: &AppState) {
-        let adv = self.draft.ui.show_advanced;
-        widgets::group_card(ui, "Andere Anwendungen beim Sprechen absenken", |ui| {
-            widgets::setting_row(ui, false, "Absenkung", Some("Musik, Spiele und andere Anwendungen auf deinen Lautsprechern werden während eines Gesprächs leiser."), |ui| {
+        let adv = self.details_button(ui, "ducking");
+        design::group_card(ui, "Andere Anwendungen beim Sprechen absenken", |ui| {
+            design::setting_row(ui, false, "Absenkung", Some("Musik, Spiele und andere Anwendungen auf deinen Lautsprechern werden während eines Gesprächs leiser."), |ui| {
                 let mut changed = false;
                 egui::ComboBox::from_id_salt("audio-ducking")
                     .selected_text(self.draft.audio.ducking.label())
@@ -821,27 +1146,18 @@ impl SettingsView {
     }
 
     fn sound_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
-        let adv = self.draft.ui.show_advanced;
-        widgets::page_header(
-            ui,
-            "Klang",
-            "Wie deine Stimme aufbereitet wird und wie die anderen bei dir ankommen.",
-            // The test keeps running across Audio and Klang, so every switch
-            // below is heard the moment it flips.
-            |ui| mic_test_button(ui, state.mic_test, cmds),
-        );
-        widgets::group_card(ui, "Aufbereitung", |ui| {
-            widgets::setting_row(
+        let adv = self.details_button(ui, "voice");
+
+        design::group_card(ui, "Aufbereitung", |ui| {
+            design::setting_row(
                 ui,
                 false,
                 "Rauschunterdrückung",
                 Some("Filtert Tastatur, Lüfter und Hintergrundgeräusche heraus."),
-                |ui| {
-                    widgets::named_toggle(ui, &mut self.draft.audio.denoise, "Rauschunterdrückung")
-                },
+                |ui| design::named_toggle(ui, &mut self.draft.audio.denoise, "Rauschunterdrückung"),
             );
             ui.add_enabled_ui(state.aec_available, |ui| {
-                widgets::setting_row(
+                design::setting_row(
                     ui,
                     true,
                     "Echo-Unterdrückung",
@@ -850,7 +1166,7 @@ impl SettingsView {
                     } else {
                         "Auf dieser Installation nicht verfügbar."
                     }),
-                    |ui| widgets::named_toggle(ui, &mut self.draft.audio.aec, "Echo-Unterdrückung"),
+                    |ui| design::named_toggle(ui, &mut self.draft.audio.aec, "Echo-Unterdrückung"),
                 )
             });
             let tok = theme::tokens(ui.visuals());
@@ -882,7 +1198,7 @@ impl SettingsView {
                         );
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            if widgets::button(
+                            if design::button(
                                 ui,
                                 widgets::ButtonKind::Neutral,
                                 icon::SPEAKER_SLASH,
@@ -893,13 +1209,8 @@ impl SettingsView {
                                 self.draft.audio.aec = false;
                                 self.aec_hint_dismissed = true;
                             }
-                            if widgets::button(
-                                ui,
-                                widgets::ButtonKind::Neutral,
-                                icon::X,
-                                "Anlassen",
-                            )
-                            .clicked()
+                            if design::button(ui, widgets::ButtonKind::Neutral, icon::X, "Anlassen")
+                                .clicked()
                             {
                                 self.aec_hint_dismissed = true;
                             }
@@ -908,15 +1219,15 @@ impl SettingsView {
                 }
             }
             ui.add_enabled_ui(true, |ui| {
-                widgets::setting_row(
+                design::setting_row(
                     ui,
                     true,
                     "Pegel automatisch",
                     Some("Regelt dein Mikrofon nach, wenn du zu leise oder zu laut bist."),
-                    |ui| widgets::autotune_control(ui, &mut self.draft.audio, state, cmds),
+                    |ui| design::autotune_control(ui, &mut self.draft.audio, state, cmds),
                 )
             });
-            widgets::setting_row(
+            design::setting_row(
                 ui,
                 true,
                 "Selbst gleich laut ankommen",
@@ -927,36 +1238,36 @@ impl SettingsView {
                     "Gleicht deine Stimme vor dem Senden aus und begrenzt Lautstärkespitzen."
                 }),
                 |ui| {
-                    widgets::named_toggle(
+                    design::named_toggle(
                         ui,
                         &mut self.draft.audio.normalize_outgoing,
                         "Selbst gleich laut ankommen",
                     )
                 },
             );
-            widgets::setting_row(
+            design::setting_row(
                 ui,
                 true,
                 "Andere gleich laut hören",
                 Some("Bringt alle auf eine ähnliche Lautstärke, leise wie laute."),
                 |ui| {
-                    widgets::named_toggle(
+                    design::named_toggle(
                         ui,
                         &mut self.draft.audio.normalize_incoming,
                         "Andere gleich laut hören",
                     )
                 },
             );
-            widgets::setting_row(
+            design::setting_row(
                 ui,
                 true,
                 "Stimmoptimierung",
                 Some("Gleicht leise und laute Stellen aus, damit du gleichmäßig klingst."),
-                |ui| widgets::named_toggle(ui, &mut self.draft.audio.voice_opt, "Stimmoptimierung"),
+                |ui| design::named_toggle(ui, &mut self.draft.audio.voice_opt, "Stimmoptimierung"),
             );
             if self.draft.audio.voice_opt {
-                widgets::setting_row(ui, true, "Stärke", None, |ui| {
-                    widgets::segmented(
+                design::setting_row(ui, true, "Stärke", None, |ui| {
+                    design::segmented(
                         ui,
                         &mut self.draft.audio.voice_strength,
                         &[
@@ -969,13 +1280,13 @@ impl SettingsView {
             }
             if adv {
                 widgets::advanced_caption(ui);
-                widgets::setting_row(
+                design::setting_row(
                     ui,
                     false,
                     "Opus-Frame",
                     Some("10 ms senkt die Latenz, kostet aber etwas Bandbreite."),
                     |ui| {
-                        widgets::segmented(
+                        design::segmented(
                             ui,
                             &mut self.draft.audio.frame_ms,
                             &[(20u8, "20 ms"), (10u8, "10 ms")],
@@ -983,7 +1294,7 @@ impl SettingsView {
                     },
                 );
                 if let (Some(erl), Some(erle)) = (state.aec_stats.erl_db, state.aec_stats.erle_db) {
-                    widgets::setting_row(ui, true, "Echo-Messwerte", None, |ui| {
+                    design::setting_row(ui, true, "Echo-Messwerte", None, |ui| {
                         let delay = state
                             .aec_stats
                             .delay_ms
@@ -1006,14 +1317,14 @@ impl SettingsView {
     /// clear, and a settings window is exactly the thing people have open
     /// during a screen share.
     fn device_card(&mut self, ui: &mut Ui, cmds: &mut Vec<Command>) {
-        widgets::group_card(ui, "Dieses Gerät", |ui| {
-            widgets::setting_row(ui, false, "Auf ein anderes Gerät mitnehmen", None, |ui| {
-                let width = widgets::button_width(ui, icon::COPY, "Kopieren")
+        design::group_card(ui, "Dieses Gerät", |ui| {
+            design::setting_row(ui, false, "Auf ein anderes Gerät mitnehmen", None, |ui| {
+                let width = design::button_width(ui, icon::COPY, "Kopieren")
                     + 6.0
-                    + widgets::button_width(ui, icon::EXPORT, "Speichern");
+                    + design::button_width(ui, icon::EXPORT, "Speichern");
                 widgets::row_group(ui, width, |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    if widgets::button(ui, widgets::ButtonKind::Neutral, icon::COPY, "Kopieren")
+                    if design::button(ui, widgets::ButtonKind::Neutral, icon::COPY, "Kopieren")
                         .on_hover_text(if super::native_wayland() {
                             "Als Text in die Zwischenablage, mit deinen Einstellungen; unter \
                              Wayland kann ICU sie nicht sicher wieder leeren"
@@ -1035,7 +1346,7 @@ impl SettingsView {
                             Err(e) => self.passport_status = Some(e),
                         }
                     }
-                    if widgets::button(ui, widgets::ButtonKind::Neutral, icon::EXPORT, "Speichern")
+                    if design::button(ui, widgets::ButtonKind::Neutral, icon::EXPORT, "Speichern")
                         .on_hover_text(SAVE_HELP)
                         .clicked()
                     {
@@ -1057,15 +1368,15 @@ impl SettingsView {
                     }
                 });
             });
-            widgets::setting_row(ui, true, "Passport von einem anderen Gerät", None, |ui| {
+            design::setting_row(ui, true, "Passport von einem anderen Gerät", None, |ui| {
                 let (glyph, label) = if self.import_open {
                     (icon::X, "Schließen")
                 } else {
                     (icon::DOWNLOAD, "Einspielen")
                 };
-                let width = widgets::button_width(ui, glyph, label);
+                let width = design::button_width(ui, glyph, label);
                 widgets::row_group(ui, width, |ui| {
-                    if widgets::button(ui, widgets::ButtonKind::Neutral, glyph, label).clicked() {
+                    if design::button(ui, widgets::ButtonKind::Neutral, glyph, label).clicked() {
                         self.import_open = !self.import_open;
                         self.import_preview = None;
                         self.passport_import.clear();
@@ -1142,6 +1453,7 @@ impl SettingsView {
                     );
                     if std::mem::take(&mut self.focus_import) {
                         field.request_focus();
+                        field.scroll_to_me(Some(egui::Align::Center));
                     }
                     edited = field.changed();
                 });
@@ -1177,13 +1489,13 @@ impl SettingsView {
         // The import option: the passport's settings come along unless
         // switched off here.
         if carries_settings {
-            widgets::setting_row(
+            design::setting_row(
                 ui,
                 true,
                 "Einstellungen übernehmen",
                 Some(SETTINGS_HELP),
                 |ui| {
-                    widgets::named_toggle(ui, &mut self.import_settings, "Einstellungen übernehmen")
+                    design::named_toggle(ui, &mut self.import_settings, "Einstellungen übernehmen")
                 },
             );
         }
@@ -1207,10 +1519,10 @@ impl SettingsView {
         } else {
             "Ersetzt Schlüssel, Zertifikat und Serverdaten dieses Geräts"
         };
-        widgets::setting_row(ui, true, "Diesen Server übernehmen?", None, |ui| {
-            let width = widgets::button_width(ui, icon::CHECK, "Übernehmen");
+        design::setting_row(ui, true, "Diesen Server übernehmen?", None, |ui| {
+            let width = design::button_width(ui, icon::CHECK, "Übernehmen");
             widgets::row_group(ui, width, |ui| {
-                if widgets::button(ui, widgets::ButtonKind::Danger, icon::CHECK, "Übernehmen")
+                if design::button(ui, widgets::ButtonKind::Danger, icon::CHECK, "Übernehmen")
                     .on_hover_text(replaces)
                     .clicked()
                 {
@@ -1237,11 +1549,11 @@ impl SettingsView {
             // Let the armed button fall back on its own after 3 s.
             super::repaint_after(ui.ctx(), Duration::from_millis(250));
         }
-        widgets::setting_row(ui, true, "Von diesem Gerät abmelden", None, |ui| {
+        design::setting_row(ui, true, "Von diesem Gerät abmelden", None, |ui| {
             let label = if confirming { "Wirklich?" } else { "Abmelden" };
-            let width = widgets::button_width(ui, icon::SIGN_OUT, label);
+            let width = design::button_width(ui, icon::SIGN_OUT, label);
             widgets::row_group(ui, width, |ui| {
-                if widgets::button(ui, widgets::ButtonKind::Danger, icon::SIGN_OUT, label)
+                if design::button(ui, widgets::ButtonKind::Danger, icon::SIGN_OUT, label)
                     .on_hover_text("Löscht Schlüssel und Zertifikat auf diesem Gerät")
                     .clicked()
                 {
@@ -1311,17 +1623,12 @@ impl SettingsView {
     }
 
     fn hotkeys_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
-        let adv = self.draft.ui.show_advanced;
-        widgets::page_header(
-            ui,
-            "Tastenkürzel",
-            "Sprechen, Stummschalten und mehr per Taste – auch wenn ICU im Hintergrund läuft. \
-             Änderungen gelten sofort.",
-            |_| {},
-        );
+        let adv = self.details_button(ui, "keys");
+
         let backend = state.hotkey_backend.as_str();
         let backend_before = self.draft.hotkeys.backend;
         hotkey_notice(
+            ControlStyle::Reference,
             ui,
             backend,
             &mut self.draft.hotkeys.backend,
@@ -1344,7 +1651,7 @@ impl SettingsView {
             self.capture = None;
             self.capture_error = result.as_ref().err().cloned();
         }
-        widgets::group_card(ui, "Belegung", |ui| {
+        design::group_card(ui, "Belegung", |ui| {
             let hotkeys = &mut self.draft.hotkeys;
             use crate::hotkey::Action;
             let rows: [(&'static str, Action, &mut crate::config::KeyBinding); 5] = [
@@ -1367,6 +1674,7 @@ impl SettingsView {
                     }
                 }
                 let action = binding_row(
+                    ControlStyle::Reference,
                     ui,
                     i > 0,
                     label,
@@ -1404,11 +1712,11 @@ impl SettingsView {
         });
 
         if adv {
-            widgets::group_card(ui, "Tasten lesen über", |ui| {
+            design::group_card(ui, "Tasten lesen über", |ui| {
                 let linux = cfg!(target_os = "linux");
                 if linux {
-                    let changed = widgets::setting_row(ui, false, "Methode", None, |ui| {
-                        widgets::segmented(
+                    let changed = design::setting_row(ui, false, "Methode", None, |ui| {
+                        design::segmented(
                             ui,
                             &mut self.draft.hotkeys.backend,
                             &[
@@ -1424,7 +1732,7 @@ impl SettingsView {
                         self.capture_error = None;
                     }
                 }
-                widgets::setting_row(ui, linux, "Aktiv", None, |ui| {
+                design::setting_row(ui, linux, "Aktiv", None, |ui| {
                     let tok = theme::tokens(ui.visuals());
                     let (color, text) = match backend {
                         "" => (tok.connecting, "abgeschaltet"),
@@ -1463,13 +1771,7 @@ impl SettingsView {
 
     #[cfg_attr(not(feature = "camera"), allow(unused_variables))]
     fn camera_tab(&mut self, ui: &mut Ui, state: &AppState) {
-        widgets::page_header(
-            ui,
-            "Kamera",
-            "Deine Kamera auswählen, einschalten und das Bild prüfen.",
-            |_| {},
-        );
-        widgets::group_card(ui, "Kamera", |ui| {
+        design::group_card(ui, "Kamera", |ui| {
             // Keep the preview alongside the controls where it fits;
             // compact windows put it underneath instead of squeezing the
             // picker beyond its column.
@@ -1496,18 +1798,18 @@ impl SettingsView {
                             self.cameras_stale = false;
                             self.cameras = crate::camera::list();
                         }
-                        widgets::setting_row(ui, false, "Gerät", None, |ui| {
+                        design::setting_row(ui, false, "Gerät", None, |ui| {
                             camera_combo(ui, &mut self.draft.camera.device, &self.cameras)
                         });
                     }
-                    widgets::setting_row(
+                    design::setting_row(
                         ui,
                         cfg!(feature = "camera"),
                         "Kamera einschalten",
                         None,
                         |ui| {
                             ui.add_enabled_ui(!state.privacy_active, |ui| {
-                                widgets::named_toggle(
+                                design::named_toggle(
                                     ui,
                                     &mut self.draft.camera.enabled,
                                     "Kamera einschalten",
@@ -1548,9 +1850,11 @@ impl SettingsView {
                                 };
                                 let r = ui
                                     .add_enabled_ui(!state.privacy_active, |ui| {
-                                        ui.add_sized(
-                                            [PREVIEW_W, 28.0],
-                                            egui::Button::new(format!("{glyph}  {label}")),
+                                        design::button(
+                                            ui,
+                                            widgets::ButtonKind::Neutral,
+                                            glyph,
+                                            label,
                                         )
                                     })
                                     .inner
@@ -1574,14 +1878,15 @@ impl SettingsView {
     }
 
     fn overlay_tab(&mut self, ui: &mut Ui) {
-        let adv = self.draft.ui.show_advanced;
         widgets::page_header(
             ui,
-            "Overlay",
+            "Overlay & Tasten",
             "Teilnehmer-Kacheln, die über anderen Fenstern schweben.",
             |_| {},
         );
-        widgets::group_card(ui, "Anzeige", |ui| {
+        let adv = self.details_button(ui, "overlay");
+
+        design::group_card(ui, "Anzeige", |ui| {
             if !self.overlay_available {
                 widgets::help_note(
                     ui,
@@ -1599,7 +1904,7 @@ impl SettingsView {
             }
             // Where it shows sits beside the switch: a row of its own would
             // push this page past the screen once the sliders are there.
-            widgets::setting_row(
+            design::setting_row(
                 ui,
                 false,
                 "Anzeigen",
@@ -1609,7 +1914,7 @@ impl SettingsView {
                 ),
                 |ui| {
                     let toggle =
-                        widgets::named_toggle(ui, &mut self.draft.overlay.enabled, "Anzeigen");
+                        design::named_toggle(ui, &mut self.draft.overlay.enabled, "Anzeigen");
                     ui.add_space(16.0);
                     ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {
                         widgets::row_group(ui, CORNER_PICKER_W, |ui| {
@@ -1622,8 +1927,8 @@ impl SettingsView {
                 },
             );
             ui.add_enabled_ui(self.draft.overlay.enabled, |ui| {
-                widgets::setting_row(ui, true, "Mich im Overlay zeigen", None, |ui| {
-                    widgets::named_toggle(
+                design::setting_row(ui, true, "Mich im Overlay zeigen", None, |ui| {
+                    design::named_toggle(
                         ui,
                         &mut self.draft.overlay.show_self,
                         "Mich im Overlay zeigen",
@@ -1633,8 +1938,8 @@ impl SettingsView {
                     "Deine eigene Kachel erscheint im Overlay nach allen anderen: \
                      dein Kamerabild, ohne Kamera ein Kreis mit deinen Initialen",
                 );
-                widgets::setting_row(ui, true, "Teilnehmer ohne Kamera", None, |ui| {
-                    widgets::named_toggle(
+                design::setting_row(ui, true, "Teilnehmer ohne Kamera", None, |ui| {
+                    design::named_toggle(
                         ui,
                         &mut self.draft.overlay.voice_plates,
                         "Teilnehmer ohne Kamera",
@@ -1646,7 +1951,7 @@ impl SettingsView {
                 // size stays 20 % above the other one.
                 let sizes = *TILE_SIZES.start() as f32..=*TILE_SIZES.end() as f32;
                 let mut size = self.draft.overlay.size as f32;
-                widgets::slider_row(
+                design::slider_row(
                     ui,
                     true,
                     "Inaktive Sprecher",
@@ -1657,7 +1962,7 @@ impl SettingsView {
                 .on_hover_text("Durchmesser einer Kachel, solange die Person schweigt");
                 self.draft.overlay.size = size.round() as u32;
                 let mut speaking = self.draft.overlay.speaking_diameter() as f32;
-                if widgets::slider_row(ui, true, "Aktive Sprecher", &mut speaking, sizes, " px")
+                if design::slider_row(ui, true, "Aktive Sprecher", &mut speaking, sizes, " px")
                     .on_hover_text("Durchmesser einer Kachel, während die Person spricht")
                     .changed()
                 {
@@ -1667,7 +1972,7 @@ impl SettingsView {
                 // from an older file stay until the slider is touched.
                 let [x, y] = self.draft.overlay.offset;
                 let mut edge = x.max(y).min(EDGE_MAX) as f32;
-                if widgets::slider_row(
+                if design::slider_row(
                     ui,
                     true,
                     "Abstand zum Rand",
@@ -1685,8 +1990,8 @@ impl SettingsView {
                 // settings, without adding a separate color row. The switch
                 // only decides whether this overlay draws coronas; the color
                 // is how everybody else sees this user, so it stays usable.
-                widgets::setting_row(ui, true, "Sprech-Corona", None, |ui| {
-                    let toggle = widgets::named_toggle(
+                design::setting_row(ui, true, "Sprech-Corona", None, |ui| {
+                    let toggle = design::named_toggle(
                         ui,
                         &mut self.draft.overlay.speaking_frame,
                         "Sprech-Corona",
@@ -1719,9 +2024,9 @@ impl SettingsView {
                 }
                 widgets::advanced_caption(ui);
                 let edge = matches!(self.draft.overlay.corner, Corner::Top | Corner::Bottom);
-                widgets::setting_row(ui, true, "Anordnung", None, |ui| {
+                design::setting_row(ui, true, "Anordnung", None, |ui| {
                     ui.add_enabled_ui(!edge, |ui| {
-                        widgets::segmented(
+                        design::segmented(
                             ui,
                             &mut self.draft.overlay.expand,
                             &[
@@ -1732,15 +2037,15 @@ impl SettingsView {
                     })
                     .inner
                 });
-                widgets::setting_row(ui, true, "Stille Personen abdunkeln", None, |ui| {
-                    widgets::named_toggle(
+                design::setting_row(ui, true, "Stille Personen abdunkeln", None, |ui| {
+                    design::named_toggle(
                         ui,
                         &mut self.draft.overlay.dim_non_speaking,
                         "Stille Personen abdunkeln",
                     )
                 });
-                widgets::setting_row(ui, true, "Dem Mauszeiger ausweichen", None, |ui| {
-                    widgets::named_toggle(
+                design::setting_row(ui, true, "Dem Mauszeiger ausweichen", None, |ui| {
+                    design::named_toggle(
                         ui,
                         &mut self.draft.overlay.shy,
                         "Dem Mauszeiger ausweichen",
@@ -1752,7 +2057,7 @@ impl SettingsView {
                     ui.columns(2, |columns| {
                         let holds = SHY_HOLDS;
                         let mut hold = self.draft.overlay.shy_hold_ms as f32;
-                        if widgets::slider_row(
+                        if design::slider_row(
                             &mut columns[0],
                             false,
                             "Wechselsperre",
@@ -1766,7 +2071,7 @@ impl SettingsView {
                             self.draft.overlay.shy_hold_ms = hold.round() as u32;
                         }
                         let mut delay = self.draft.overlay.shy_return_ms as f32 / 1000.0;
-                        if widgets::slider_row(
+                        if design::slider_row(
                             &mut columns[1],
                             false,
                             "Zurück nach",
@@ -1796,17 +2101,18 @@ impl SettingsView {
             self.name_synced = current.to_string();
         }
 
-        let adv = self.draft.ui.show_advanced;
         widgets::page_header(
             ui,
-            "Allgemein",
+            "App",
             "Dein Name, wie ICU aussieht und was dieses Gerät betrifft.",
             |_| {},
         );
-        widgets::group_card(ui, "Du und ICU", |ui| {
+        let adv = self.details_button(ui, "app");
+
+        design::group_card(ui, "Du und ICU", |ui| {
             let editable = state.me.is_some() && !state.rename_pending;
-            widgets::setting_row(ui, false, "Anzeigename", None, |ui| {
-                let width = FIELD_W + 6.0 + widgets::button_width(ui, icon::CHECK, "");
+            design::setting_row(ui, false, "Anzeigename", None, |ui| {
+                let width = FIELD_W + 6.0 + design::button_width(ui, icon::CHECK, "Ändern");
                 widgets::row_group(ui, width, |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let field = ui
@@ -1825,7 +2131,7 @@ impl SettingsView {
                         != state.me.as_ref().map_or("", |m| &m.name);
                     let apply = ui
                         .add_enabled_ui(editable && changed, |ui| {
-                            widgets::button(ui, widgets::ButtonKind::Primary, icon::CHECK, "")
+                            design::button(ui, widgets::ButtonKind::Primary, icon::CHECK, "Ändern")
                         })
                         .inner
                         .on_hover_text(if state.rename_pending {
@@ -1852,16 +2158,16 @@ impl SettingsView {
                     "Der Name steht im Zertifikat: eine Änderung stellt ein neues aus. \
                      Geräte mit einem älteren Passport brauchen danach einen neuen.",
                 );
-                widgets::setting_row(ui, true, "Server", None, |ui| {
+                design::setting_row(ui, true, "Server", None, |ui| {
                     widgets::chip(ui, &state.server, 0.0)
                 });
-                widgets::setting_row(ui, true, "Nutzer-ID", None, |ui| {
+                design::setting_row(ui, true, "Nutzer-ID", None, |ui| {
                     let id = state.me.as_ref().map(|m| m.user_id.to_string());
                     widgets::chip(ui, id.as_deref().unwrap_or("—"), 0.0)
                 });
                 // A desktop-integration knob, on by default: here rather
                 // than among the everyday rows, which „Beim Schließen“ fills.
-                widgets::setting_row(
+                design::setting_row(
                     ui,
                     true,
                     "Einladungen mit ICU öffnen",
@@ -1869,7 +2175,7 @@ impl SettingsView {
                         "Ein Doppelklick auf eine Einladung oder einen Passport (.icu) öffnet ICU.",
                     ),
                     |ui| {
-                        widgets::named_toggle(
+                        design::named_toggle(
                             ui,
                             &mut self.draft.ui.register_uri_handler,
                             "Einladungen mit ICU öffnen",
@@ -1878,13 +2184,13 @@ impl SettingsView {
                 );
                 ui.separator();
             }
-            widgets::setting_row(ui, !adv, "Farben", None, |ui| {
+            design::setting_row(ui, !adv, "Farben", None, |ui| {
                 let mut theme = match self.draft.ui.theme.as_str() {
                     "light" => "light",
                     "dark" => "dark",
                     _ => "system",
                 };
-                let r = widgets::segmented(
+                let r = design::segmented(
                     ui,
                     &mut theme,
                     &[
@@ -1898,13 +2204,13 @@ impl SettingsView {
                 }
                 r
             });
-            widgets::setting_row(ui, true, "Beim Schließen", None, |ui| {
+            design::setting_row(ui, true, "Beim Schließen", None, |ui| {
                 let mut action = match self.draft.ui.close_action.as_str() {
                     "minimize" => "minimize",
                     "quit" => "quit",
                     _ => "tray",
                 };
-                let r = widgets::segmented(
+                let r = design::segmented(
                     ui,
                     &mut action,
                     &[
@@ -1926,13 +2232,13 @@ impl SettingsView {
                      „AppIndicator“) und minimiert stattdessen in die Taskleiste.",
                 );
             }
-            widgets::setting_row(
+            design::setting_row(
                 ui,
                 true,
                 "Minimiert starten",
                 Some("ICU startet im Infobereich, wo es keinen gibt, minimiert in der Taskleiste."),
                 |ui| {
-                    widgets::named_toggle(
+                    design::named_toggle(
                         ui,
                         &mut self.draft.ui.start_minimized,
                         "Minimiert starten",
@@ -2000,13 +2306,13 @@ impl SettingsView {
             |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 if self.invite_open {
-                    if widgets::button(ui, widgets::ButtonKind::Neutral, icon::X, "Schließen")
+                    if design::button(ui, widgets::ButtonKind::Neutral, icon::X, "Schließen")
                         .clicked()
                     {
                         self.invite_open = false;
                         self.fresh_invite = false;
                     }
-                } else if widgets::button(
+                } else if design::button(
                     ui,
                     widgets::ButtonKind::Primary,
                     icon::USER_PLUS,
@@ -2037,7 +2343,7 @@ impl SettingsView {
         }
 
         if state.user_list.is_empty() {
-            widgets::group_card(ui, "Mitglieder", |ui| {
+            design::group_card(ui, "Mitglieder", |ui| {
                 egui::Frame::new()
                     .inner_margin(egui::Margin::symmetric(12, 22))
                     .show(ui, |ui| {
@@ -2054,7 +2360,7 @@ impl SettingsView {
             return;
         }
 
-        widgets::group_card(ui, &format!("Mitglieder · {}", members.len()), |ui| {
+        design::group_card(ui, &format!("Mitglieder · {}", members.len()), |ui| {
             for (i, user) in members.iter().enumerate() {
                 self.member_row(ui, i > 0, user, Some(user.user_id) == me, cmds);
             }
@@ -2072,7 +2378,7 @@ impl SettingsView {
         });
 
         if !banned.is_empty() {
-            widgets::group_card(ui, &format!("Gesperrt · {}", banned.len()), |ui| {
+            design::group_card(ui, &format!("Gesperrt · {}", banned.len()), |ui| {
                 for (i, user) in banned.iter().enumerate() {
                     self.member_row(ui, i > 0, user, false, cmds);
                 }
@@ -2080,7 +2386,7 @@ impl SettingsView {
         }
 
         if !pending.is_empty() {
-            widgets::group_card(
+            design::group_card(
                 ui,
                 &format!("Offene Einladungen · {}", pending.len()),
                 |ui| {
@@ -2232,7 +2538,7 @@ impl SettingsView {
                             } else {
                                 "Entfernen"
                             };
-                            if widgets::button(ui, widgets::ButtonKind::Danger, icon::TRASH, label)
+                            if design::button(ui, widgets::ButtonKind::Danger, icon::TRASH, label)
                                 .clicked()
                             {
                                 self.confirm_revoke = None;
@@ -2241,7 +2547,7 @@ impl SettingsView {
                                 });
                                 cmds.push(Command::RequestUserList);
                             }
-                            if widgets::button(ui, widgets::ButtonKind::Neutral, "", "Abbrechen")
+                            if design::button(ui, widgets::ButtonKind::Neutral, "", "Abbrechen")
                                 .clicked()
                             {
                                 self.confirm_revoke = None;
@@ -2258,7 +2564,7 @@ impl SettingsView {
                             return;
                         }
                         if user.pending {
-                            if widgets::button(ui, widgets::ButtonKind::Neutral, "", "Zurückziehen")
+                            if design::button(ui, widgets::ButtonKind::Neutral, "", "Zurückziehen")
                                 .on_hover_text("Die Einladung wird ungültig")
                                 .clicked()
                             {
@@ -2359,7 +2665,7 @@ impl SettingsView {
     /// settings window is exactly what people have open during a screen
     /// share.
     fn invite_card(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
-        widgets::group_card(ui, "Neue Person einladen", |ui| {
+        design::group_card(ui, "Neue Person einladen", |ui| {
             let tok = theme::tokens(ui.visuals());
             if let (true, Some((bundle, expires))) = (self.fresh_invite, &state.last_invite) {
                 egui::Frame::new()
@@ -2388,7 +2694,7 @@ impl SettingsView {
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            if widgets::button(
+                            if design::button(
                                 ui,
                                 widgets::ButtonKind::Primary,
                                 icon::COPY,
@@ -2399,7 +2705,7 @@ impl SettingsView {
                                 let copied = copy_secret(ui.ctx(), bundle.clone());
                                 self.invite_status = Some(copied_status(copied));
                             }
-                            if widgets::button(
+                            if design::button(
                                 ui,
                                 widgets::ButtonKind::Neutral,
                                 icon::EXPORT,
@@ -2413,7 +2719,7 @@ impl SettingsView {
                                         Err(e) => crate::problem::storage("Die Einladung", &e).text,
                                     });
                             }
-                            if widgets::button(
+                            if design::button(
                                 ui,
                                 widgets::ButtonKind::Neutral,
                                 icon::USER_PLUS,
@@ -2434,7 +2740,7 @@ impl SettingsView {
                 return;
             }
 
-            widgets::setting_row(
+            design::setting_row(
                 ui,
                 false,
                 "Name",
@@ -2448,8 +2754,8 @@ impl SettingsView {
                     )
                 },
             );
-            widgets::setting_row(ui, true, "Gültig für", None, |ui| {
-                widgets::segmented(ui, &mut self.invite_ttl_s, &INVITE_TTLS)
+            design::setting_row(ui, true, "Gültig für", None, |ui| {
+                design::segmented(ui, &mut self.invite_ttl_s, &INVITE_TTLS)
             });
             if let Some(err) = &state.invite_error {
                 widgets::card_note(ui, |ui| {
@@ -2476,7 +2782,7 @@ impl SettingsView {
                         widgets::rtl(ui, 30.0, |ui| {
                             if ui
                                 .add_enabled_ui(valid, |ui| {
-                                    widgets::button(
+                                    design::button(
                                         ui,
                                         widgets::ButtonKind::Primary,
                                         icon::TICKET,
@@ -2498,24 +2804,21 @@ impl SettingsView {
         });
     }
 
-    fn about_tab(&mut self, ui: &mut Ui, state: &AppState) {
-        let adv = self.draft.ui.show_advanced;
-        widgets::page_header(
-            ui,
-            "Über ICU",
-            if adv {
-                "Version, Lizenzen und Messwerte zur Verbindung."
-            } else {
-                "Version und Lizenzen."
-            },
-            |_| {},
-        );
-        widgets::group_card(ui, "ICU", |ui| {
-            widgets::setting_row(ui, false, "Version", None, |ui| {
+    fn about_info(&mut self, ui: &mut Ui, state: &AppState) {
+        design::group_card(ui, "ICU", |ui| {
+            design::setting_row(ui, false, "Version", None, |ui| {
                 widgets::chip(ui, env!("CARGO_PKG_VERSION"), 0.0)
             });
-            if adv {
-                widgets::setting_row(ui, true, "Audio-Backend", None, |ui| {
+            design::setting_row(ui, true, "Updates", None, |ui| {
+                self.update_action = super::updates::settings(
+                    ui,
+                    &self.update,
+                    matches!(state.conn, crate::engine::ConnStatus::Connected),
+                    &mut self.update_confirm,
+                );
+            });
+            if self.details.contains("app") {
+                design::setting_row(ui, true, "Audio-Backend", None, |ui| {
                     widgets::chip(ui, state.backend, 0.0)
                 });
             }
@@ -2533,36 +2836,41 @@ impl SettingsView {
                 );
             });
         });
+    }
 
-        if !adv {
-            return;
-        }
+    fn about_tab(&mut self, ui: &mut Ui, state: &AppState) {
+        widgets::page_header(
+            ui,
+            "Diagnose",
+            "Status, Messwerte und Berichte zur Verbindung.",
+            |_| {},
+        );
         self.refresh_diagnose();
 
-        widgets::group_card(ui, "Diagnose", |ui| {
-            widgets::setting_row(ui, false, "RTT", None, |ui| {
+        design::group_card(ui, "Diagnose", |ui| {
+            design::setting_row(ui, false, "RTT", None, |ui| {
                 let rtt = state.rtt_ms.map(|r| format!("{r:.0} ms"));
                 widgets::chip(ui, rtt.as_deref().unwrap_or("n/a"), 0.0)
             });
-            widgets::setting_row(ui, true, "Jitter p50/p95", None, |ui| {
+            design::setting_row(ui, true, "Jitter p50/p95", None, |ui| {
                 widgets::chip(ui, &self.diagnose.jitter, 0.0)
             });
-            widgets::setting_row(ui, true, "Capture→Send p50/max", None, |ui| {
+            design::setting_row(ui, true, "Capture→Send p50/max", None, |ui| {
                 widgets::chip(ui, &self.diagnose.capture_send, 0.0)
             });
-            widgets::setting_row(ui, true, "DSP-Block p50/max", None, |ui| {
+            design::setting_row(ui, true, "DSP-Block p50/max", None, |ui| {
                 widgets::chip(ui, &self.diagnose.dsp_block, 0.0)
             });
-            widgets::setting_row(ui, true, "FEC-Auslegung", None, |ui| {
+            design::setting_row(ui, true, "FEC-Auslegung", None, |ui| {
                 widgets::chip(ui, &self.diagnose.packet_loss, 0.0)
             });
-            widgets::setting_row(ui, true, "FEC/PLC", None, |ui| {
+            design::setting_row(ui, true, "FEC/PLC", None, |ui| {
                 widgets::chip(ui, &self.diagnose.fec_plc, 0.0)
             });
-            widgets::setting_row(ui, true, "Referenz-Underruns", None, |ui| {
+            design::setting_row(ui, true, "Referenz-Underruns", None, |ui| {
                 widgets::chip(ui, &self.diagnose.ref_underruns, 0.0)
             });
-            widgets::setting_row(ui, true, "Reconnects", None, |ui| {
+            design::setting_row(ui, true, "Reconnects", None, |ui| {
                 widgets::chip(ui, &self.diagnose.reconnects, 0.0)
             });
 
@@ -2570,13 +2878,13 @@ impl SettingsView {
             widgets::card_note(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    if widgets::button(ui, widgets::ButtonKind::Neutral, icon::COPY, "Bericht")
+                    if design::button(ui, widgets::ButtonKind::Neutral, icon::COPY, "Bericht")
                         .on_hover_text("Den vollen Statistikbericht in die Zwischenablage")
                         .clicked()
                     {
                         ui.ctx().copy_text(self.stats.report());
                     }
-                    if widgets::button(
+                    if design::button(
                         ui,
                         widgets::ButtonKind::Neutral,
                         icon::EXPORT,
@@ -2592,7 +2900,7 @@ impl SettingsView {
                                 Err(e) => crate::problem::storage("Die Statistik", &e).text,
                             });
                     }
-                    if widgets::button(
+                    if design::button(
                         ui,
                         if self.debug_window_open {
                             widgets::ButtonKind::Primary
@@ -2966,7 +3274,30 @@ fn corner_picker(ui: &mut Ui, corner: &mut Corner) {
 /// "portal-declined" or "none"; the empty string means it was never started
 /// (`--no-hotkeys`). `choice` is the draft's backend setting, `mode` its
 /// sending mode.
+/// Shared setup helpers keep their original controls; the reference design
+/// is explicitly selected only by the settings window.
+#[derive(Clone, Copy)]
+pub(super) enum ControlStyle {
+    Standard,
+    Reference,
+}
+impl ControlStyle {
+    fn button(
+        self,
+        ui: &mut Ui,
+        kind: widgets::ButtonKind,
+        glyph: &str,
+        label: &str,
+    ) -> egui::Response {
+        match self {
+            Self::Standard => widgets::button(ui, kind, glyph, label),
+            Self::Reference => design::button(ui, kind, glyph, label),
+        }
+    }
+}
+
 pub(super) fn hotkey_notice(
+    style: ControlStyle,
     ui: &mut Ui,
     backend: &str,
     choice: &mut HotkeyBackend,
@@ -3012,24 +3343,26 @@ pub(super) fn hotkey_notice(
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                if widgets::button(
-                    ui,
-                    widgets::ButtonKind::Primary,
-                    icon::ARROW_CLOCKWISE,
-                    "Erneut fragen",
-                )
-                .clicked()
+                if style
+                    .button(
+                        ui,
+                        widgets::ButtonKind::Primary,
+                        icon::ARROW_CLOCKWISE,
+                        "Erneut fragen",
+                    )
+                    .clicked()
                 {
                     cmds.push(Command::RetryHotkeys);
                 }
-                if widgets::button(
-                    ui,
-                    widgets::ButtonKind::Neutral,
-                    icon::COMMAND,
-                    "Tasten direkt lesen (evdev)",
-                )
-                .on_hover_text("Liest jeden Tastendruck mit; braucht die Gruppe input")
-                .clicked()
+                if style
+                    .button(
+                        ui,
+                        widgets::ButtonKind::Neutral,
+                        icon::COMMAND,
+                        "Tasten direkt lesen (evdev)",
+                    )
+                    .on_hover_text("Liest jeden Tastendruck mit; braucht die Gruppe input")
+                    .clicked()
                 {
                     *choice = HotkeyBackend::Evdev;
                 }
@@ -3056,14 +3389,15 @@ pub(super) fn hotkey_notice(
             );
             if *mode == ModeSetting::Ptt {
                 ui.add_space(6.0);
-                if widgets::button(
-                    ui,
-                    widgets::ButtonKind::Primary,
-                    icon::WAVEFORM,
-                    "Stattdessen automatisch senden",
-                )
-                .on_hover_text("Sprachaktivierung: du bist zu hören, sobald du sprichst")
-                .clicked()
+                if style
+                    .button(
+                        ui,
+                        widgets::ButtonKind::Primary,
+                        icon::WAVEFORM,
+                        "Stattdessen automatisch senden",
+                    )
+                    .on_hover_text("Sprachaktivierung: du bist zu hören, sobald du sprichst")
+                    .clicked()
                 {
                     *mode = ModeSetting::Vad;
                 }
@@ -3099,13 +3433,14 @@ pub(super) fn evdev_notice(ui: &mut Ui) {
 
 /// „Testen“, or „Beenden“ while `on`: the mic test, which plays the own
 /// voice the way the others get it, after the whole send chain.
-pub(super) fn mic_test_button(ui: &mut Ui, on: bool, cmds: &mut Vec<Command>) {
+pub(super) fn mic_test_button(style: ControlStyle, ui: &mut Ui, on: bool, cmds: &mut Vec<Command>) {
     let (kind, glyph, label) = if on {
         (widgets::ButtonKind::Primary, icon::STOP, "Beenden")
     } else {
         (widgets::ButtonKind::Neutral, icon::HEADPHONES, "Testen")
     };
-    if widgets::button(ui, kind, glyph, label)
+    if style
+        .button(ui, kind, glyph, label)
         .on_hover_text(
             "Mikrofontest: du hörst dich so, wie die anderen dich hören. \
              Endet von selbst nach einer Minute.",
@@ -3117,6 +3452,41 @@ pub(super) fn mic_test_button(ui: &mut Ui, on: bool, cmds: &mut Vec<Command>) {
 }
 
 /// A device choice; `extra` goes left of the list, in the same row.
+fn settings_device_combo(
+    ui: &mut Ui,
+    divider: bool,
+    label: &str,
+    selected: &mut Option<String>,
+    devices: &[&crate::audio::DeviceInfo],
+    extra: impl FnOnce(&mut Ui),
+) {
+    let (current, hint) = device_choice_text(selected.as_deref(), devices);
+    design::setting_row(ui, divider, label, None, |ui| {
+        let combo = egui::ComboBox::from_id_salt(label)
+            .selected_text(current)
+            .width(240.0)
+            .truncate()
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(selected.is_none(), "System-Standard")
+                    .clicked()
+                {
+                    *selected = None;
+                }
+                for d in devices {
+                    let is = selected.as_deref() == Some(d.id.as_str());
+                    if ui.selectable_label(is, &d.description).clicked() {
+                        *selected = Some(d.id.clone());
+                    }
+                }
+            });
+        if let Some(hint) = hint {
+            combo.response.on_hover_text(hint);
+        }
+        extra(ui);
+    });
+}
+
 pub(super) fn device_combo(
     ui: &mut Ui,
     divider: bool,
@@ -3502,6 +3872,7 @@ const BINDING_LABEL_W: f32 = 124.0;
 /// pressed, and for experts the raw text fields behind the pencil.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn binding_row(
+    style: ControlStyle,
     ui: &mut Ui,
     divider: bool,
     label: &'static str,
@@ -3516,7 +3887,7 @@ pub(super) fn binding_row(
         ui.separator();
     }
     let mut action = BindingAction::None;
-    egui::Frame::new()
+    let drawn = egui::Frame::new()
         .inner_margin(egui::Margin::symmetric(12, 8))
         .show(ui, |ui| {
             let stacked = ui.available_width() < 500.0;
@@ -3590,7 +3961,8 @@ pub(super) fn binding_row(
                         }
                     }
                     if capturing {
-                        if widgets::button(ui, widgets::ButtonKind::Neutral, icon::X, "Abbrechen")
+                        if style
+                            .button(ui, widgets::ButtonKind::Neutral, icon::X, "Abbrechen")
                             .clicked()
                         {
                             action = BindingAction::Cancel;
@@ -3613,19 +3985,15 @@ pub(super) fn binding_row(
                         {
                             action = BindingAction::Clear;
                         }
-                        if widgets::button(
-                            ui,
-                            widgets::ButtonKind::Neutral,
-                            icon::RECORD,
-                            "Aufnehmen",
-                        )
-                        .on_hover_text(if cfg!(windows) {
-                            "Die nächste gedrückte Taste, Tastenkombination oder Maustaste \
+                        if style
+                            .button(ui, widgets::ButtonKind::Neutral, icon::RECORD, "Aufnehmen")
+                            .on_hover_text(if cfg!(windows) {
+                                "Die nächste gedrückte Taste, Tastenkombination oder Maustaste \
                              übernehmen"
-                        } else {
-                            "Die nächste gedrückte Taste oder Maustaste übernehmen"
-                        })
-                        .clicked()
+                            } else {
+                                "Die nächste gedrückte Taste oder Maustaste übernehmen"
+                            })
+                            .clicked()
                         {
                             action = BindingAction::Record;
                         }
@@ -3671,6 +4039,9 @@ pub(super) fn binding_row(
                 });
             }
         });
+    if matches!(style, ControlStyle::Reference) {
+        design::reveal_setting(ui, label, &drawn.response);
+    }
     action
 }
 
@@ -3801,7 +4172,7 @@ mod tests {
         for via_import in [false, true] {
             let (state, mut view) = capture_fixture();
             let original = view.draft.hotkeys.ptt.clone();
-            view.select_tab(Tab::Hotkeys);
+            view.select_tab(Tab::Overlay);
             let capture = pending_capture();
             let late_result = capture.slot.clone();
             view.capture = Some(capture);
@@ -3818,7 +4189,7 @@ mod tests {
             // The native reader can finish after the page was closed.
             // Returning to Hotkeys must not adopt its now-obsolete key.
             *late_result.lock().unwrap() = Some(Ok("KEY_F9".into()));
-            view.select_tab(Tab::Hotkeys);
+            view.select_tab(Tab::Overlay);
             let mut output = ui_context().run_ui(Default::default(), |ui| {
                 view.hotkeys_tab(ui, &state, &mut Vec::new());
             });
@@ -3831,7 +4202,7 @@ mod tests {
     #[test]
     fn successful_capture_retry_clears_the_previous_error() {
         let (state, mut view) = capture_fixture();
-        view.select_tab(Tab::Hotkeys);
+        view.select_tab(Tab::Overlay);
         let mut failed = pending_capture();
         failed.started = Instant::now() - Duration::from_secs(11);
         *failed.slot.lock().unwrap() = Some(Err("No keyboard available".into()));

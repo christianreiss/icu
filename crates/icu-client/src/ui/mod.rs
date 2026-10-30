@@ -2,11 +2,14 @@
 //! (`docs/reference/client.md` §10).
 
 pub mod connection;
+pub mod design;
 pub mod fonts;
 pub mod main_window;
+pub(crate) mod native;
 pub mod settings;
 pub mod setup;
 pub mod theme;
+pub mod updates;
 pub mod user;
 pub mod widgets;
 #[cfg(windows)]

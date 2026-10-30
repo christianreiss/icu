@@ -25,6 +25,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 
+[ -z "${ICU_UPDATE_ACCEPTANCE_ROOT:-}" ] || {
+    echo "private update acceptance channels are forbidden in release packages" >&2
+    exit 1
+}
+
 RELEASE=${RELEASE:-1}
 DISTS=${DISTS:-"fc42 fc43 debian13"}
 RUST_ALPINE=docker.io/library/rust:1.98.1-alpine

@@ -33,6 +33,17 @@ struct EventTargets {
     menu: mpsc::Sender<MenuId>,
     tray: mpsc::Sender<TrayIconEvent>,
     wake: Box<dyn Fn() + Send + Sync>,
+    actions: Option<MenuActions>,
+}
+
+struct MenuActions {
+    #[cfg(feature = "gui")]
+    show: MenuId,
+    #[cfg(feature = "gui")]
+    quit: MenuId,
+    mute: MenuId,
+    deafen: MenuId,
+    cmd: UnboundedSender<Command>,
 }
 
 struct EventRegistration(Arc<EventTargets>);
@@ -42,11 +53,13 @@ impl EventRegistration {
         menu: mpsc::Sender<MenuId>,
         tray: mpsc::Sender<TrayIconEvent>,
         wake: impl Fn() + Send + Sync + 'static,
+        actions: Option<MenuActions>,
     ) -> Self {
         let targets = Arc::new(EventTargets {
             menu,
             tray,
             wake: Box::new(wake),
+            actions,
         });
         *ACTIVE_EVENTS.lock().unwrap() = Some(targets.clone());
         INSTALL_HANDLERS.call_once(|| {
@@ -69,6 +82,22 @@ impl Drop for EventRegistration {
 fn dispatch_menu(event: MenuEvent) {
     let active = ACTIVE_EVENTS.lock().unwrap().clone();
     if let Some(active) = active {
+        if let Some(actions) = &active.actions {
+            if event.id == actions.mute {
+                let _ = actions.cmd.send(Command::ToggleMute);
+                (active.wake)();
+                return;
+            }
+            if event.id == actions.deafen {
+                let _ = actions.cmd.send(Command::ToggleDeafen);
+                (active.wake)();
+                return;
+            }
+            #[cfg(feature = "gui")]
+            if event.id == actions.show || event.id == actions.quit {
+                crate::ui::native::dispatch(event.id == actions.show);
+            }
+        }
         let _ = active.menu.send(event.id);
         (active.wake)();
     }
@@ -101,11 +130,20 @@ fn shows_window(event: &TrayIconEvent) -> bool {
 }
 
 fn dispatch_tray(event: TrayIconEvent) {
+    #[cfg(all(feature = "gui", target_os = "linux"))]
+    if let TrayIconEvent::ActivationToken { token, .. } = &event {
+        if ACTIVE_EVENTS.lock().unwrap().is_some() {
+            crate::ui::native::activation_token(token.clone());
+        }
+        return;
+    }
     if !shows_window(&event) {
         return;
     }
     let active = ACTIVE_EVENTS.lock().unwrap().clone();
     if let Some(active) = active {
+        #[cfg(feature = "gui")]
+        crate::ui::native::dispatch(true);
         let _ = active.tray.send(event);
         (active.wake)();
     }
@@ -159,7 +197,20 @@ impl Tray {
             .map_err(|e| e.to_string())?;
         let (menu_tx, menu_rx) = mpsc::channel();
         let (tray_tx, tray_rx) = mpsc::channel();
-        let events = EventRegistration::new(menu_tx, tray_tx, wake);
+        let events = EventRegistration::new(
+            menu_tx,
+            tray_tx,
+            wake,
+            Some(MenuActions {
+                #[cfg(feature = "gui")]
+                show: show.id().clone(),
+                #[cfg(feature = "gui")]
+                quit: quit.id().clone(),
+                mute: mute.id().clone(),
+                deafen: deafen.id().clone(),
+                cmd: cmd.clone(),
+            }),
+        );
         let host = Arc::new(AtomicBool::new(host_present()));
         watch_host(host.clone(), ctx);
         Ok(Tray {
@@ -443,7 +494,7 @@ mod tests {
     fn native_handlers_follow_the_replacement_tray() {
         let (first_tx, first_rx) = mpsc::channel();
         let (first_tray, _) = mpsc::channel();
-        let first = EventRegistration::new(first_tx, first_tray, || {});
+        let first = EventRegistration::new(first_tx, first_tray, || {}, None);
         dispatch_menu(MenuEvent {
             id: MenuId::new("first"),
         });
@@ -453,9 +504,14 @@ mod tests {
         let (next_tray, _) = mpsc::channel();
         let wakes = Arc::new(AtomicUsize::new(0));
         let count = wakes.clone();
-        let next = EventRegistration::new(next_tx, next_tray, move || {
-            count.fetch_add(1, Ordering::Relaxed);
-        });
+        let next = EventRegistration::new(
+            next_tx,
+            next_tray,
+            move || {
+                count.fetch_add(1, Ordering::Relaxed);
+            },
+            None,
+        );
         // Finishing destruction of an older window must not unregister
         // the replacement's handlers.
         drop(first);
@@ -475,5 +531,40 @@ mod tests {
             next_rx.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+
+        // A minimized compositor may never draw the UI. Audio commands must
+        // reach the engine directly, without anyone polling the menu queue.
+        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let (menu_tx, menu_rx) = mpsc::channel();
+        let (tray_tx, _) = mpsc::channel();
+        let _direct = EventRegistration::new(
+            menu_tx,
+            tray_tx,
+            || {},
+            Some(MenuActions {
+                #[cfg(feature = "gui")]
+                show: MenuId::new("show"),
+                #[cfg(feature = "gui")]
+                quit: MenuId::new("quit"),
+                mute: MenuId::new("mute"),
+                deafen: MenuId::new("deafen"),
+                cmd: commands,
+            }),
+        );
+        dispatch_menu(MenuEvent {
+            id: MenuId::new("mute"),
+        });
+        dispatch_menu(MenuEvent {
+            id: MenuId::new("deafen"),
+        });
+        assert!(matches!(received.try_recv().unwrap(), Command::ToggleMute));
+        assert!(matches!(
+            received.try_recv().unwrap(),
+            Command::ToggleDeafen
+        ));
+        assert!(
+            menu_rx.try_recv().is_err(),
+            "no duplicate action on the next UI frame"
+        );
     }
 }

@@ -41,6 +41,13 @@ confidence-threshold = 0.9
 name = "target-lexicon"
 allow = ["Apache-2.0 WITH LLVM-exception"]
 
+# HTTPS updater: Mozilla trust-anchor data from webpki-roots 1.0.11.
+# CDLA-Permissive-2.0 requires including its text with the data; cargo-about
+# ships it in THIRD-PARTY-LICENSES. Keep this exception specific to the data crate.
+[[licenses.exceptions]]
+name = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
 # nokhwa (Default-Feature `decoding`) dekodiert MJPEG ueber mozjpeg; IJG ist
 # die libjpeg-Lizenz und gilt nur fuer diese beiden Crates (Client, Feature
 # `camera`).

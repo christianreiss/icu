@@ -93,8 +93,10 @@ ssh-keygen -Y sign -f "$ICU_RELEASE_KEY" -n icu-release "$OUT/SHA256SUMS" \
 ssh-keygen -Y verify -f "$ALLOWED_SIGNERS" -I icu-release -n icu-release \
     -s "$OUT/SHA256SUMS.sig" < "$OUT/SHA256SUMS" \
     || die "SHA256SUMS.sig does not verify against $ALLOWED_SIGNERS: is $ICU_RELEASE_KEY the release key?"
+log "authenticate updater metadata"
+python3 web/tools/publish-release.py "$VERSION" --prepare-only
 assets=()
-for f in "${files[@]}" SHA256SUMS SHA256SUMS.sig; do assets+=("$OUT/$f"); done
+for f in "${files[@]}" SHA256SUMS SHA256SUMS.sig latest.json; do assets+=("$OUT/$f"); done
 
 log "GitHub repository $GH_REPO"
 if ! gh repo view "$GH_REPO" >/dev/null 2>&1; then

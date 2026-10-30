@@ -19,7 +19,7 @@ use super::{
     main_window::CLIP_DB,
     settings::{
         binding_row, device_combo, elevated_notice, evdev_notice, hotkey_notice, mic_test_button,
-        BindingAction, Capture, DraftSync,
+        BindingAction, Capture, ControlStyle, DraftSync,
     },
     theme, widgets,
 };
@@ -340,7 +340,7 @@ impl SetupView {
                 "Mikrofon",
                 &mut self.draft.audio.input_device,
                 &inputs,
-                |ui| mic_test_button(ui, state.mic_test, cmds),
+                |ui| mic_test_button(ControlStyle::Standard, ui, state.mic_test, cmds),
             );
             widgets::setting_row(ui, true, "Verarbeiteter Pegel", None, |ui| {
                 let tok = theme::tokens(ui.visuals());
@@ -434,6 +434,7 @@ impl SetupView {
     fn key_card(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         let backend = state.hotkey_backend.as_str();
         hotkey_notice(
+            ControlStyle::Standard,
             ui,
             backend,
             &mut self.draft.hotkeys.backend,
@@ -463,6 +464,7 @@ impl SetupView {
         widgets::group_card(ui, "Deine Taste", |ui| {
             let binding = &mut self.draft.hotkeys.ptt;
             match binding_row(
+                ControlStyle::Standard,
                 ui,
                 false,
                 PTT_LABEL,
@@ -574,7 +576,7 @@ impl SetupView {
             "Wie du klingst",
             "Die Vorgaben passen für die meisten. Mit „Testen“ hörst du dich so, wie die \
              anderen dich hören — schalte dabei um und vergleiche.",
-            |ui| mic_test_button(ui, state.mic_test, cmds),
+            |ui| mic_test_button(ControlStyle::Standard, ui, state.mic_test, cmds),
         );
         widgets::group_card(ui, "Aufbereitung", |ui| {
             let audio = &mut self.draft.audio;

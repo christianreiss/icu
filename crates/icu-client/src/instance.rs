@@ -394,7 +394,7 @@ pub use windows::{claim_in, Listener};
 /// secret), but not with this user as its owner. Pipes have no half-close:
 /// the pipe runs in message mode and a request is one message.
 #[cfg(windows)]
-mod windows {
+pub(crate) mod windows {
     use super::{
         encode, other_version, parse, read_answer, refusal, Answer, Claim, Request, MAX_REQUEST,
         VERSION,
@@ -468,7 +468,7 @@ mod windows {
     }
 
     /// The user this process runs as, as a SID string.
-    fn user_sid() -> io::Result<String> {
+    pub(crate) fn user_sid() -> io::Result<String> {
         // SAFETY: the token handle is owned (closed on drop); TOKEN_USER is
         // read from a buffer of the size Windows asked for, aligned for it.
         unsafe {

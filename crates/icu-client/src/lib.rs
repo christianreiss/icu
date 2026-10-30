@@ -26,6 +26,7 @@ pub mod sync;
 pub mod tray;
 #[cfg(feature = "gui")]
 pub mod ui;
+pub mod update;
 pub mod uri;
 pub mod video;
 #[cfg(windows)]

@@ -4,6 +4,7 @@
 //! settings change and must not rebuild the atlas.
 
 const INTER_REGULAR: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Regular.ttf");
+const INTER_MEDIUM: &[u8] = include_bytes!("../../assets/fonts/inter/Inter-Medium.ttf");
 /// Also rasterizes the names in the overlay (`crate::overlay`).
 pub(crate) const INTER_SEMIBOLD: &[u8] =
     include_bytes!("../../assets/fonts/inter/Inter-SemiBold.ttf");
@@ -13,8 +14,14 @@ pub fn semibold() -> egui::FontFamily {
     egui::FontFamily::Name("Inter-SemiBold".into())
 }
 
+/// Medium weight used by the reference design.
+pub fn medium() -> egui::FontFamily {
+    egui::FontFamily::Name("Inter-Medium".into())
+}
+
 /// Installs Inter + Phosphor into `ctx`'s font atlas.
 pub fn install(ctx: &egui::Context) {
+    egui_extras::install_image_loaders(ctx);
     let mut fonts = egui::FontDefinitions::default();
 
     fonts.font_data.insert(
@@ -24,6 +31,11 @@ pub fn install(ctx: &egui::Context) {
     fonts.font_data.insert(
         "Inter-SemiBold".into(),
         egui::FontData::from_static(INTER_SEMIBOLD).into(),
+    );
+
+    fonts.font_data.insert(
+        "Inter-Medium".into(),
+        egui::FontData::from_static(INTER_MEDIUM).into(),
     );
 
     // Registers "phosphor" font data + a `Name("phosphor")` family; the
@@ -53,6 +65,10 @@ pub fn install(ctx: &egui::Context) {
     fonts
         .families
         .insert(egui::FontFamily::Proportional, proportional);
+
+    let mut medium = vec!["Inter-Medium".to_string(), "phosphor".to_string()];
+    medium.extend(defaults.clone());
+    fonts.families.insert(self::medium(), medium);
 
     let mut semibold = vec!["Inter-SemiBold".to_string(), "phosphor".to_string()];
     semibold.extend(defaults);
@@ -135,6 +151,7 @@ mod tests {
     fn inter_maps_nothing_in_the_private_use_area() {
         for (name, bytes) in [
             ("Inter-Regular", INTER_REGULAR),
+            ("Inter-Medium", INTER_MEDIUM),
             ("Inter-SemiBold", INTER_SEMIBOLD),
         ] {
             use skrifa::MetadataProvider;

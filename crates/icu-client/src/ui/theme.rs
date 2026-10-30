@@ -52,49 +52,49 @@ pub struct Tokens {
 /// Corner-radius scale. Four steps, nested smallest-inside-largest: a chip
 /// inside a control inside a row inside a card. Every rounded thing in the
 /// app picks one of these, so no call site has to invent a radius.
-pub const R_CHIP: u8 = 6;
+pub const R_CHIP: u8 = 5;
 /// Buttons, segmented tracks, combo boxes.
-pub const R_CTRL: u8 = 9;
+pub const R_CTRL: u8 = 8;
 /// Participant rows, banners, the big speak/control buttons.
-pub const R_ROW: u8 = 11;
+pub const R_ROW: u8 = 9;
 /// `widgets::group_card` and the settings rail.
-pub const R_CARD: u8 = 13;
+pub const R_CARD: u8 = 8;
 
 /// Returns the palette for the current theme (`visuals.dark_mode`).
 pub fn tokens(visuals: &Visuals) -> Tokens {
     if visuals.dark_mode {
         Tokens {
-            accent: Color32::from_rgb(0x2e, 0x9b, 0xff),
-            on_accent: Color32::from_rgb(0x06, 0x12, 0x1f),
-            accent_tint: Color32::from_rgb(0x10, 0x1b, 0x29),
-            accent_tint_2: Color32::from_rgb(0x13, 0x24, 0x38),
-            connected: Color32::from_rgb(0x46, 0xb6, 0x7c),
-            connecting: Color32::from_rgb(0xe3, 0xa3, 0x3b),
-            error: Color32::from_rgb(0xe5, 0x56, 0x5b),
-            error_tint: Color32::from_rgb(0x22, 0x12, 0x14),
-            warning_tint: Color32::from_rgb(0x20, 0x19, 0x0d),
-            level: Color32::from_rgb(0x58, 0xc0, 0x89),
-            muted_text: Color32::from_rgb(0xa2, 0xa9, 0xb8),
-            dim_text: Color32::from_rgb(0x76, 0x7e, 0x8f),
+            accent: Color32::from_rgb(0x5a, 0xd0, 0x8f),
+            on_accent: Color32::from_rgb(0x08, 0x19, 0x0f),
+            accent_tint: Color32::from_rgb(0x14, 0x23, 0x1b),
+            accent_tint_2: Color32::from_rgb(0x2c, 0x3a, 0x32),
+            connected: Color32::from_rgb(0x5a, 0xd0, 0x8f),
+            connecting: Color32::from_rgb(0xe3, 0xa8, 0x3f),
+            error: Color32::from_rgb(0xf0, 0x6a, 0x72),
+            error_tint: Color32::from_rgb(0x2a, 0x16, 0x19),
+            warning_tint: Color32::from_rgb(0x22, 0x1d, 0x12),
+            level: Color32::from_rgb(0x5a, 0xd0, 0x8f),
+            muted_text: Color32::from_rgb(0xa3, 0xa4, 0xaa),
+            dim_text: Color32::from_rgb(0x8a, 0x8b, 0x92),
             hover_overlay: Color32::from_white_alpha(14),
-            surface_hi: Color32::from_rgb(0x24, 0x28, 0x31),
+            surface_hi: Color32::from_rgb(0x20, 0x21, 0x25),
         }
     } else {
         Tokens {
-            accent: Color32::from_rgb(0x16, 0x68, 0xc7),
+            accent: Color32::from_rgb(0x13, 0x7a, 0x43),
             on_accent: Color32::WHITE,
-            accent_tint: Color32::from_rgb(0xe9, 0xf1, 0xfb),
-            accent_tint_2: Color32::from_rgb(0xdc, 0xe9, 0xf8),
-            connected: Color32::from_rgb(0x1b, 0x7a, 0x4b),
-            connecting: Color32::from_rgb(0x8a, 0x5b, 0x08),
-            error: Color32::from_rgb(0xc0, 0x34, 0x2f),
-            error_tint: Color32::from_rgb(0xfb, 0xec, 0xeb),
-            warning_tint: Color32::from_rgb(0xfb, 0xf1, 0xdf),
-            level: Color32::from_rgb(0x2c, 0x9a, 0x63),
-            muted_text: Color32::from_rgb(0x4e, 0x57, 0x66),
-            dim_text: Color32::from_rgb(0x6e, 0x77, 0x86),
+            accent_tint: Color32::from_rgb(0xe5, 0xf2, 0xea),
+            accent_tint_2: Color32::from_rgb(0xcf, 0xe6, 0xd8),
+            connected: Color32::from_rgb(0x13, 0x7a, 0x43),
+            connecting: Color32::from_rgb(0xb7, 0x74, 0x00),
+            error: Color32::from_rgb(0xc2, 0x34, 0x3b),
+            error_tint: Color32::from_rgb(0xfb, 0xeb, 0xeb),
+            warning_tint: Color32::from_rgb(0xfb, 0xf3, 0xe2),
+            level: Color32::from_rgb(0x13, 0x7a, 0x43),
+            muted_text: Color32::from_rgb(0x52, 0x53, 0x5a),
+            dim_text: Color32::from_rgb(0x69, 0x6a, 0x71),
             hover_overlay: Color32::from_black_alpha(12),
-            surface_hi: Color32::from_rgb(0xec, 0xee, 0xf2),
+            surface_hi: Color32::from_rgb(0xec, 0xec, 0xea),
         }
     }
 }
@@ -112,7 +112,7 @@ pub fn apply(ctx: &egui::Context, theme: &str) {
     ctx.set_visuals_of(egui::Theme::Dark, dark_visuals());
     ctx.set_visuals_of(egui::Theme::Light, light_visuals());
     ctx.all_styles_mut(|style| {
-        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.item_spacing = egui::vec2(12.0, 8.0);
         style.spacing.button_padding = egui::vec2(12.0, 8.0);
         style.spacing.interact_size.y = 30.0;
         style.spacing.combo_height = 320.0;
@@ -132,8 +132,8 @@ fn text_styles() -> BTreeMap<TextStyle, FontId> {
             TextStyle::Small,
             FontId::new(11.0, FontFamily::Proportional),
         ),
-        (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(13.5, semibold.clone())),
+        (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(14.0, semibold.clone())),
         (TextStyle::Heading, FontId::new(17.0, semibold)),
         (
             TextStyle::Monospace,
@@ -159,17 +159,17 @@ pub fn caps_text(text: &str) -> egui::RichText {
 fn dark_visuals() -> Visuals {
     let mut v = Visuals::dark();
     let t = tokens(&v);
-    v.panel_fill = Color32::from_rgb(0x0b, 0x0c, 0x10);
+    v.panel_fill = Color32::from_rgb(0x10, 0x11, 0x13);
     v.window_fill = v.panel_fill;
-    v.extreme_bg_color = Color32::from_rgb(0x07, 0x08, 0x0b);
-    v.faint_bg_color = Color32::from_rgb(0x1a, 0x1d, 0x24);
-    v.override_text_color = Some(Color32::from_rgb(0xec, 0xee, 0xf3));
+    v.extreme_bg_color = Color32::from_rgb(0x16, 0x17, 0x1a);
+    v.faint_bg_color = Color32::from_rgb(0x1b, 0x1c, 0x20);
+    v.override_text_color = Some(Color32::from_rgb(0xec, 0xec, 0xea));
     v.hyperlink_color = t.accent;
     v.selection.bg_fill = t.accent.gamma_multiply(0.5);
     v.selection.stroke = Stroke::new(1.0, t.accent);
     v.window_corner_radius = CornerRadius::same(R_ROW);
     v.menu_corner_radius = CornerRadius::same(R_CTRL);
-    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0x2e, 0x32, 0x3d));
+    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0x2a, 0x2b, 0x30));
 
     for w in [
         &mut v.widgets.inactive,
@@ -179,14 +179,14 @@ fn dark_visuals() -> Visuals {
     ] {
         w.corner_radius = CornerRadius::same(R_CTRL);
     }
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x25, 0x29, 0x32));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x22, 0x23, 0x27));
     // Differentiate the "track" role (bg_fill: checkbox/slider background)
     // from the "button chrome" role (weak_bg_fill) — stock egui keeps these
     // equal in every state.
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x2e, 0x32, 0x3d));
-    v.widgets.inactive.weak_bg_fill = Color32::from_gray(38);
-    v.widgets.inactive.bg_fill = Color32::from_gray(24);
-    v.widgets.hovered.weak_bg_fill = Color32::from_gray(48);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x2a, 0x2b, 0x30));
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x20, 0x21, 0x25);
+    v.widgets.inactive.bg_fill = Color32::from_rgb(0x16, 0x17, 0x1a);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x2a, 0x2b, 0x30);
     v.widgets.active.weak_bg_fill = t.accent.gamma_multiply(0.85);
     v.widgets.active.fg_stroke = Stroke::new(1.0, t.on_accent);
     v
@@ -195,17 +195,17 @@ fn dark_visuals() -> Visuals {
 fn light_visuals() -> Visuals {
     let mut v = Visuals::light();
     let t = tokens(&v);
-    v.panel_fill = Color32::from_rgb(0xf6, 0xf7, 0xf9);
+    v.panel_fill = Color32::from_rgb(0xf6, 0xf6, 0xf4);
     v.window_fill = v.panel_fill;
-    v.extreme_bg_color = Color32::from_rgb(0xec, 0xee, 0xf2);
+    v.extreme_bg_color = Color32::WHITE;
     v.faint_bg_color = Color32::from_rgb(0xff, 0xff, 0xff);
-    v.override_text_color = Some(Color32::from_rgb(0x14, 0x16, 0x1b));
+    v.override_text_color = Some(Color32::from_rgb(0x18, 0x18, 0x1b));
     v.hyperlink_color = t.accent;
     v.selection.bg_fill = t.accent.gamma_multiply(0.35);
     v.selection.stroke = Stroke::new(1.0, t.accent);
     v.window_corner_radius = CornerRadius::same(R_ROW);
     v.menu_corner_radius = CornerRadius::same(R_CTRL);
-    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0xcf, 0xd5, 0xdf));
+    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0xdf, 0xdf, 0xdb));
     for w in [
         &mut v.widgets.inactive,
         &mut v.widgets.hovered,
@@ -214,8 +214,8 @@ fn light_visuals() -> Visuals {
     ] {
         w.corner_radius = CornerRadius::same(R_CTRL);
     }
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xe4, 0xe7, 0xec));
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xcf, 0xd5, 0xdf));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xe9, 0xe9, 0xe5));
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0xdf, 0xdf, 0xdb));
     v.widgets.active.weak_bg_fill = t.accent;
     v.widgets.active.fg_stroke = Stroke::new(1.0, t.on_accent);
     v

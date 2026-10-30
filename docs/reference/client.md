@@ -352,13 +352,14 @@ Bedienung: an/aus (Button, Hotkey optional), Ecke (4 Optionen und oben/unten mit
 
 ### Hauptfenster und Nutzeransicht
 
-Das eframe/egui-Fenster startet mit 360×440 px, Minimum 360×340
-(`main_window::MAIN_SIZE`, `MAIN_MIN_SIZE`). Vier Teilnehmer passen ohne
-Scrollbalken; weitere Teilnehmer oder längere Banner lassen es wachsen.
-Der Kopf hat eine Statusleiste mit Verbindungsdauer, RTT, Empfangsbalken und
-Rollen-/Videohinweisen; darunter stehen Servername und die gemeinsame Kapsel
-für Hell/Dunkel, Einstellungen und Beenden. Die Statusleiste öffnet die
-Verbindungsdetails. Inter und Phosphor sind eingebettet, einschließlich Lizenz.
+Das Hauptfenster startet mit 400×580 px, Minimum 400×360. Die Gestaltung folgt
+ab 0.1.20 der ICU-Vorlage: kompakter Kopf mit Server/Status/RTT und getrennten
+Einstellungs-/Beenden-Symbolen, Teilnehmerliste mit 52-px-Zeilen und eine feste
+Aktionsleiste. Deren fünf 44×44-Symbolknöpfe bedienen Mikrofon, Wiedergabe,
+Kamera, Overlay und Privatsphäre. SVGs, Radien, Konturen und aktive/gesperrte
+Zustände entsprechen der Vorlage; Status und Teilnehmer kommen aus dem echten
+Clientzustand. Inter ist eingebettet. Scrollbereiche nehmen zusätzliche
+Teilnehmer und Hinweise auf; das Fenster wächst nicht automatisch.
 
 Teilnehmer zeigen Sprechstatus, Stumm/Taub, Kamera, Ping und lokale Lautstärke.
 Frisches Video ersetzt den Initialen-Avatar; die eigene Zeile verwendet die
@@ -371,22 +372,28 @@ Allein im Raum zeigt sie „Allein“ und sendet nichts.
 
 ### Einstellungen und Einrichtung
 
-Einstellungen sind ein eigenes Fenster mit Seitenleiste: Audio, Klang,
-Tastenkürzel, Kamera, Overlay, Allgemein, Nutzer (nur Admins) und Über ICU.
-Kamera enthält Gerätewahl, Ein-/Ausschalten und Vorschau. Overlay bündelt
-Anzeige, Position, eigene Kachel, Teilnehmer ohne Kamera, Kachelgrößen und
-Randabstand sowie „Sprech-Corona“ mit dem Farbwähler „Coronafarbe“; erweitert
-kommen Anordnung, Abdunkeln und
-Maus-Ausweichen mit Wechselsperre und Rückkehrzeit hinzu.
-„Erweitert“ ergänzt technische Felder innerhalb derselben Karten. Änderungen
-wirken sofort; Änderungen aus Tray, Hotkeys und Hauptfenster werden übernommen,
-statt durch einen veralteten Entwurf überschrieben zu werden. Der Mikrofontest
-bleibt auf Audio und Klang aktiv, damit Klangänderungen hörbar vergleichbar sind.
-Jede Seite behält ihre eigene Scrollposition. Bei schmalem Fenster stehen
-Beschriftungen über den Reglern; Tastaturfokus ist auch auf selbst gezeichneten
-Schaltern und Symbolknöpfen sichtbar. Eine laufende Kürzelaufnahme endet beim
-Seitenwechsel. Unter Windows bleiben dabei aufgenommene Modifikatortasten Teil
-des Kürzels.
+Einstellungen öffnen mit 820×620 px, Minimum 640×480, und den Kategorien
+**Stimme & Hören**, **Kamera**, **Overlay & Tasten**, **App**, **Diagnose** und
+rollenabhängig **Admin**. Die Seitenleiste ist 200 px breit. Flache Abschnitte,
+zusammengehörige Zeilen, neutrale Segmentauswahl und die Schalter/Symbolknöpfe
+verwenden das Design der Hauptansicht. Änderungen wirken sofort; der Footer
+benennt dies ausdrücklich und bietet **Schließen**.
+
+Die Suche berücksichtigt auch Synonyme und aufgeklappte Details, wechselt zum
+passenden Abschnitt und hebt den Treffer hervor. Sie führt keine Aktion aus.
+Details werden pro Bereich und Scrollpositionen pro Kategorie nur für die
+Ansicht gespeichert. Das frühere globale „Erweitert“ dient einmalig als
+Startvorgabe; Navigation und Aufklappen schreiben keine Einstellungen.
+
+Stimme & Hören bündelt Geräte, Mikrofontest, Sprachverarbeitung und Ducking.
+Kamera enthält Gerätewahl, Ein-/Ausschalten und Vorschau. Overlay & Tasten
+bündelt Anzeige, Position, Größen, Sprech-Corona und die jeweiligen Details
+sowie Kürzel. App enthält Verhalten, Erscheinungsbild und Update-Prüfung.
+Diagnose sammelt technische Informationen; Admin bleibt an die Serverrolle
+gebunden. Kürzelaufnahmen und Vorschauen enden beim Verlassen ihrer Ansicht.
+Änderungen aus Tray, Hotkeys und Hauptfenster werden weiterhin übernommen und
+nicht durch einen veralteten Entwurf überschrieben. Die Ersteinrichtung behält
+ihre eigene, einfache Bedienung.
 
 Ohne Rauschunterdrückung arbeitet die Sprachaktivierung mit einer festen
 Energieschwelle von −40 dBFS. Hauptfenster und Einrichtung zeigen dann den
@@ -511,6 +518,14 @@ Antwort und Klick sind mit dem bestehenden Zwei-Felder-Befehl nicht atomar.
 
 `RequestPeerCertificate` fragt einmal pro Sitzung an, mit sichtbarem Lade-/Fehlerzustand und manuellem Wiederholen nach acht Sekunden. `Peer.certificate` hält geprüfte öffentliche Daten, wird beim Verlassen/Neuverbinden verworfen und bei CRL-Updates neu geprüft. Parsing läuft in der Engine. Gültigkeits- und CRL-Zeitgrenzen werden bei der Anzeige ausgewertet. Bei Auswahl des eigenen Nutzers markieren beide Außenkarten dieselbe Verbindung. Signaturprüfung ersetzt keine direkte Peer-Authentifizierung; die Sitzungszuordnung stammt vom Server.
 
+### Updates
+
+Windows bietet ab 0.1.20 nach einer asynchronen, signaturgeprüften Suche einen
+bestätigten Download-/Installations-/Neustartablauf. Laufende Verbindungen werden
+nicht allein wegen eines neuen Releases beendet. Linux zeigt ausschließlich
+einen schließbaren Paketverwaltungs-Hinweis. Details, Release-Schlüssel und
+Wiederherstellung: [Client-Updates](../development/updates.md).
+
 ## 11. Konfiguration
 
 Seit 2026-10-24 werden auch syntaktisch gültige lokale Zahlen beim Laden auf
@@ -600,3 +615,7 @@ Die früher hier gesammelten Soll/Ist-Vergleiche stehen im
 [historischen Entscheidungsprotokoll](../history/client-implementation-decisions.md).
 Die Abschnitte oben beschreiben das aktuelle Verhalten; neue Änderungen werden
 im jeweiligen Fachabschnitt dokumentiert.
+
+Die HTTPS-Vertrauensanker aus `webpki-roots` stehen unter CDLA-Permissive-2.0.
+Dafür gilt eine auf dieses Daten-Crate begrenzte Ausnahme in `deny.toml`; der
+Lizenztext wird über `cargo-about` in `THIRD-PARTY-LICENSES` mitgeliefert.

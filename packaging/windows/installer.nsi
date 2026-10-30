@@ -65,14 +65,25 @@ ShowUnInstDetails show
 !insertmacro MUI_LANGUAGE "German"
 !insertmacro MUI_LANGUAGE "English"
 
+!include "packaging/windows/update.nsh"
+
 Function .onInit
   SetShellVarContext all
   SetRegView 64
+  Call UpdateInit
 FunctionEnd
 
 Function un.onInit
   SetShellVarContext all
   SetRegView 64
+  System::Call 'kernel32::CreateMutexW(p 0, i 0, w "Global\ICU.Setup.Transaction") p.r0 ?e'
+  Pop $1
+  StrCpy $InstallMutex $0
+  ${If} $0 == 0
+  ${OrIf} $1 == 183
+    SetErrorLevel 21
+    Abort "Eine ICU-Installation läuft bereits. Bitte deren Abschluss abwarten."
+  ${EndIf}
 FunctionEnd
 
 VIProductVersion "${VIVERSION}"
@@ -89,25 +100,71 @@ VIAddVersionKey "LegalCopyright"  "Apache-2.0"
 ; content-addressed, not a fixed name — not something to replicate here).
 !macro RefuseIfRunning path
   ${If} ${FileExists} "${path}"
-    ClearErrors
-    Delete "${path}"
-    ${If} ${Errors}
-      MessageBox MB_OK|MB_ICONEXCLAMATION \
-        "ICU läuft noch (siehe Infobereich der Taskleiste). Bitte beenden und erneut versuchen." /SD IDOK
+    System::Call 'kernel32::CreateFileW(w "${path}", i 0x40000000, i 1, p 0, i 3, i 0, p 0) p.r0'
+    ${If} $0 == -1
+      MessageBox MB_OK|MB_ICONEXCLAMATION "ICU läuft noch. Bitte alle ICU-Fenster beenden und erneut versuchen." /SD IDOK
+      SetErrorLevel 22
       Abort
     ${EndIf}
+    System::Call 'kernel32::CloseHandle(p r0)'
   ${EndIf}
 !macroend
 
 Section "ICU (erforderlich)" SEC_APP
   SectionIn RO
-  SetOutPath "$INSTDIR"
-  !insertmacro RefuseIfRunning "$INSTDIR\icu.exe"
+  ReadRegStr $OldVersion HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "DisplayVersion"
+  ReadRegDWORD $OldSize HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "EstimatedSize"
+  CreateDirectory "$INSTDIR"
+  StrCpy $Stage "$INSTDIR\.icu-update-stage"
+  ; Exclusive creation: never recursively remove an unrelated existing folder.
+  System::Call 'kernel32::CreateDirectoryW(w "$Stage", p 0) i.r0'
+  ${If} $0 == 0
+    SetErrorLevel 23
+    Abort "Ein unterbrochenes Update liegt unter $Stage. Die bisherige Sicherung wurde beibehalten; siehe Wiederherstellungsanleitung."
+  ${EndIf}
+  CreateDirectory "$Stage\new"
+  CreateDirectory "$Stage\old"
+  SetOutPath "$Stage\new"
+  ClearErrors
   File "${STAGE}\icu.exe"
   File "${STAGE}\LICENSE"
   File "${STAGE}\THIRD-PARTY-LICENSES.txt"
   File "/oname=NSIS-COPYING.txt" "${NOTICE}"
-
+  WriteUninstaller "$Stage\new\uninstall.exe"
+  ${If} ${Errors}
+    Goto stage_failed
+  ${EndIf}
+  !insertmacro BackupFile icu.exe
+  !insertmacro BackupFile LICENSE
+  !insertmacro BackupFile THIRD-PARTY-LICENSES.txt
+  !insertmacro BackupFile NSIS-COPYING.txt
+  !insertmacro BackupFile uninstall.exe
+  FileOpen $0 "$Stage\previous-version.txt" w
+  FileWrite $0 "$OldVersion$\r$\n$OldSize$\r$\n"
+  FileClose $0
+  !insertmacro FlushFile "$Stage\previous-version.txt" stage_failed
+  ${If} $UpdateNonce != ""
+    System::Call 'kernel32::SetEvent(p $EventStaged)'
+    !insertmacro WaitUpdateEvent $EventParent 450 stage_failed
+  ${Else}
+    ; Manual setup has no broker to close a running client. Test before any
+    ; exchange, and clean only the fresh staging directory on refusal.
+    ${If} ${FileExists} "$INSTDIR\icu.exe"
+      System::Call 'kernel32::CreateFileW(w "$INSTDIR\icu.exe", i 0x40000000, i 1, p 0, i 3, i 0, p 0) p.r0'
+      ${If} $0 == -1
+        Goto stage_failed
+      ${EndIf}
+      System::Call 'kernel32::CloseHandle(p r0)'
+    ${EndIf}
+  ${EndIf}
+  !insertmacro SwapFile icu.exe
+  !insertmacro SwapFile LICENSE
+  !insertmacro SwapFile THIRD-PARTY-LICENSES.txt
+  !insertmacro SwapFile NSIS-COPYING.txt
+  !insertmacro SwapFile uninstall.exe
+  SetOutPath "$INSTDIR"
+  ClearErrors
+  ${If} $OldVersion == ""
   CreateDirectory "$SMPROGRAMS"
   ; This NSIS 3.11 build's CreateShortcut only takes the pre-3.08 parameter
   ; set (link, target, params, icon_file, icon_index, showmode, hotkey,
@@ -121,9 +178,7 @@ Section "ICU (erforderlich)" SEC_APP
   CreateShortCut "$SMPROGRAMS\ICU.lnk" "$INSTDIR\icu.exe" "" "$INSTDIR\icu.exe" 0 \
       SW_SHOWNORMAL "" "ICU"
 
-  WriteUninstaller "$INSTDIR\uninstall.exe"
 
-  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
   WriteRegStr   HKLM "Software\Classes\.icu" "" "ICU.Invite"
   WriteRegStr   HKLM "Software\Classes\.icu" "Content Type" "application/x-icu"
   WriteRegStr   HKLM "Software\Classes\ICU.Invite" "" "ICU-Einladung oder -Passport"
@@ -136,11 +191,49 @@ Section "ICU (erforderlich)" SEC_APP
   WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
   WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "InstallLocation" "$INSTDIR"
   WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "DisplayIcon" "$INSTDIR\icu.exe"
-  WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "DisplayVersion" "${VERSION}"
   WriteRegStr   HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "Publisher" "ICU"
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "NoModify" 1
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "NoRepair" 1
+  ${EndIf}
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "DisplayVersion" "${VERSION}"
+  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+  ${GetSize} "$Stage" "/S=0K" $3 $1 $2
+  IntOp $0 $0 - $3
   WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\ICU" "EstimatedSize" "$0"
+  ${If} ${Errors}
+    Goto rollback
+  ${EndIf}
+  ${If} $UpdateNonce != ""
+    System::Call 'kernel32::SetEvent(p $EventReplaced)'
+    !insertmacro WaitUpdateEvent $EventHealthy 600 rollback
+  ${EndIf}
+  ; Keep the backups until the broker observed a healthy, unelevated GUI.
+  RMDir /r "$Stage"
+  SetErrorLevel 0
+  Goto finished
+  rollback:
+    SetOutPath "$INSTDIR"
+    ${If} $UpdateNonce != ""
+      System::Call 'kernel32::SetEvent(p $EventFailed)'
+      ; Give the broker time to stop its own failed candidate before replacing
+      ; its image. If the broker crashed, its Job Object already stopped it.
+      !insertmacro WaitUpdateEvent $EventRollback 150 restore_now
+    ${EndIf}
+  restore_now:
+    Call RestoreProgramFiles
+    ${If} $RestoreFailed == 0
+      RMDir /r "$Stage"
+      SetErrorLevel 24
+      Abort "Update fehlgeschlagen. Die bisherige Installation wurde wiederhergestellt."
+    ${EndIf}
+    SetErrorLevel 25
+    Abort "Update fehlgeschlagen. Die Sicherungen unter $Stage bleiben erhalten."
+  stage_failed:
+    SetOutPath "$INSTDIR"
+    RMDir /r "$Stage"
+    SetErrorLevel 26
+    Abort "Update-Vorbereitung abgebrochen. ICU und seine Nutzerdaten bleiben unverändert."
+  finished:
 SectionEnd
 
 ; Unchecked by default: matches the "no automatic clutter, pin manually"
@@ -152,6 +245,12 @@ SectionEnd
 
 Section "Uninstall"
   !insertmacro RefuseIfRunning "$INSTDIR\icu.exe"
+  ClearErrors
+  Delete "$INSTDIR\icu.exe"
+  ${If} ${Errors}
+    SetErrorLevel 22
+    Abort "ICU konnte nicht entfernt werden. Die Installation wurde beibehalten."
+  ${EndIf}
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\THIRD-PARTY-LICENSES.txt"
   Delete "$INSTDIR\NSIS-COPYING.txt"

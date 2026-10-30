@@ -24,24 +24,31 @@ python3 -m http.server 8765 --directory web   # http://127.0.0.1:8765/
 
 ## Release veröffentlichen
 
-Nach `./build.sh` (Pakete unter `dist/<version>/`):
+Nach `./build.sh --plain` auf einem sauberen, committeten Quellstand:
 
 ```bash
-web/tools/publish-release.py            # Version aus Cargo.toml
-web/tools/publish-release.py 0.1.3      # oder eine andere
+python3 web/tools/publish-release.py --prepare-only  # dist/<version> signieren
+python3 web/tools/publish-release.py                 # lokalen Kanal veröffentlichen
 ```
 
-Das Skript prüft jede Datei gegen `dist/<version>/SHA256SUMS`, kopiert sie samt
-`SHA256SUMS` und `BUILDINFO.*` nach `web/downloads/<version>/` und schreibt
-`web/downloads/latest.json`. Die Download-Sektion, die Versionsnummern in den
-Befehlen und die Prüfsummen kommen ausschließlich aus dieser Datei. Ältere
-Versionen bleiben liegen. Gibt es `SHA256SUMS.sig`, wird sie mitkopiert und in
-`latest.json` vermerkt; die Seite behauptet aber keine Signaturprüfung, solange
-`packaging/allowed_signers` fehlt (siehe `deploy/README.md` §0).
+Alle sieben Pakete und die drei BUILDINFO-Dateien müssen vollständig sein und
+zum aktuellen Quellcommit gehören. `DIRTY`, Prüfsummenfehler und Downgrades
+werden abgewiesen. `ICU_RELEASE_KEY` bezeichnet den privaten Ed25519-Schlüssel
+außerhalb des Repositorys (Standard `~/.ssh/icu-release`). Sein öffentlicher
+Anteil muss dem im Client eingebetteten `packaging/update-signing.pub`
+entsprechen. Der Publisher signiert `SHA256SUMS` und die exakten Payloadbytes
+von `latest.json`; bisherige Webseitenfelder bleiben kompatibel.
 
-Steht in `BUILDINFO.*` `DIRTY`, meldet das Skript es und die Seite zeigt es
-unter „Downloads prüfen“ an. `packaging/release.sh` würde so einen Build
-ablehnen.
+Pakete, BUILDINFO, Prüfsummen und Signatur werden zuerst nach
+`web/downloads/<version>/` geschrieben. Erst danach wird `latest.json` atomisch
+ersetzt. Bereits veröffentlichte Paketbytes sind unveränderlich; ältere
+Versionen bleiben liegen. Beim Übertragen auf einen Webserver gilt dieselbe
+Reihenfolge: Dateien vollständig prüfen, Manifest zuletzt freischalten.
+
+Vertrauensmodell, Schlüsselwechsel, Windows-Wiederherstellung und Abnahme:
+[Client-Updates](../docs/development/updates.md). Die aktuelle produktive Seite
+liegt auf `https://misc.alpha-labs.net/icu/`; deren separat gepflegtes Layout
+wird bei einer Paketveröffentlichung erhalten.
 
 ## Ausliefern
 

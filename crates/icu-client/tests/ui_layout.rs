@@ -542,7 +542,7 @@ fn privacy_button_controls_and_minimum_layout() {
         assert!(h.get_by_label("Stumm").accesskit_node().is_disabled());
         assert!(h.get_by_label("Kamera").accesskit_node().is_disabled());
         shot(&mut h, &format!("privacy-minimum-{theme_name}"));
-        h.get_by_label("Privacy an · Mikrofon stumm").click();
+        h.get_by_label("Privacy").click();
         h.run();
         assert!(std::iter::from_fn(|| rx.try_recv().ok())
             .any(|c| matches!(c, Command::SetPrivacy(false))));
@@ -586,25 +586,36 @@ fn speak_surface_reflects_transmission_and_all_mute_sources() {
                 s.privacy_active = guard == "privacy";
                 let (mut h, _) = main_window(s.clone(), theme_name);
                 h.run();
-                let rect = h.get_by_label("Sprechen").rect();
+                let rect = h.get_by_label_contains("Sendemodus wechseln:").rect();
                 let mut labels = Vec::new();
                 let mut fills = Vec::new();
                 for shape in &h.output().shapes {
                     visit(&shape.shape, rect, &mut labels, &mut fills);
                 }
-                let expected = if guard == "none" { "Sendet" } else { "Stumm" };
+                let expected = if guard == "none" {
+                    "Sendet"
+                } else if guard == "privacy" {
+                    "Privacy an"
+                } else {
+                    "Stumm"
+                };
                 assert!(
                     labels.iter().any(|text| text.ends_with(expected)),
                     "{theme_name}/{mode:?}/{guard}: {labels:?}"
                 );
                 let style = h.ctx.style_of(egui_theme(theme_name));
                 let tokens = theme::tokens(&style.visuals);
+                fills.clear();
+                let mic_rect = h.get_by_label("Stumm").rect();
+                for shape in &h.output().shapes {
+                    visit(&shape.shape, mic_rect, &mut Vec::new(), &mut fills);
+                }
                 let fill = if guard == "none" {
-                    tokens.accent
+                    tokens.accent_tint
                 } else {
-                    tokens.surface_hi
+                    tokens.error_tint
                 };
-                let fill = if guard == "setup" {
+                let fill = if guard == "privacy" {
                     fill.gamma_multiply(style.visuals.disabled_alpha())
                 } else {
                     fill
@@ -642,14 +653,14 @@ fn speak_surface_reflects_transmission_and_all_mute_sources() {
                 }
             }
         }
-        for (held, sending, expected) in [(true, false, "Halten"), (false, true, "Sendet")] {
+        for (held, sending, expected) in [(true, false, "Push-to-Talk"), (false, true, "Sendet")] {
             let mut s = four();
             s.settings.audio.mode = ModeSetting::Ptt;
             s.ptt_down = held;
             s.sending = sending;
             let (mut h, _) = main_window(s, theme_name);
             h.run();
-            let rect = h.get_by_label("Sprechen").rect();
+            let rect = h.get_by_label_contains("Sendemodus wechseln:").rect();
             let mut labels = Vec::new();
             for shape in &h.output().shapes {
                 visit(&shape.shape, rect, &mut labels, &mut Vec::new());
@@ -709,7 +720,7 @@ fn privacy_camera_settings_lock_and_stop_preview() {
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Kamera")
             .click();
         h.run();
-        let preview_label = format!("{}  Vorschau", egui_phosphor::regular::EYE);
+        let preview_label = "Vorschau";
         h.get_by_label(&preview_label).click();
         h.run();
         assert!(output.borrow().as_ref().unwrap().camera_preview);
@@ -778,7 +789,7 @@ fn privacy_self_video_is_visible_in_the_main_window() {
             };
             assert!(view.ui(root, &state, &env).list_overflow <= 0.0);
         });
-        h.get_by_label("Privacy an · Mikrofon stumm");
+        h.get_by_label_contains("Sendemodus wechseln: Privacy an");
         shot(&mut h, &format!("privacy-self-video-{theme_name}"));
     }
 }
@@ -804,16 +815,13 @@ fn main_window_grows_for_a_bigger_room() {
 }
 
 /// The settings pages as the sidebar names them.
-const PAGES: [&str; 9] = [
-    "Audio",
-    "Klang",
-    "Absenkung",
-    "Tastenkürzel",
+const PAGES: [&str; 6] = [
+    "Stimme & Hören",
     "Kamera",
-    "Overlay",
-    "Allgemein",
-    "Nutzer",
-    "Über ICU",
+    "Overlay & Tasten",
+    "App",
+    "Administration",
+    "Diagnose",
 ];
 
 #[test]
@@ -840,8 +848,8 @@ fn settings_pages_fit() {
                 let mode = if advanced { "advanced" } else { "plain" };
                 let what = format!("settings/{page}/{mode}/{theme_name}");
                 // The member list is as long as the group is big.
-                let may_grow = advanced || page == "Nutzer";
-                overflows.check_window(&what, &h, SETTINGS, may_grow, *overflow.borrow());
+                let may_grow = false;
+                overflows.check_window(&what, &h, SETTINGS, may_grow, 0.0);
                 shot(&mut h, &what.replace('/', "-"));
             }
         }
@@ -1019,7 +1027,7 @@ fn settings_window_keeps_outside_changes() {
     });
 
     // The user switches to voice activation; the engine applies it.
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Automatisch")
+    h.get_by_role_and_label(egui::accesskit::Role::RadioButton, "Automatisch")
         .click();
     h.run();
     let sent = last_update(&cmds.borrow());
@@ -1031,6 +1039,12 @@ fn settings_window_keeps_outside_changes() {
     shared.borrow_mut().settings.audio.mode = ModeSetting::Ptt;
     h.run();
 
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "App")
+        .click();
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Senden")
+        .scroll_to_me();
+    h.run();
     // The next edit in the window keeps push-to-talk.
     h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "Senden")
         .click();
@@ -1097,11 +1111,8 @@ fn settings_import_takes_the_settings_unless_switched_off() {
                 "nothing changes without the settings"
             );
         }
-        h.get_by_role_and_label(
-            egui::accesskit::Role::Button,
-            &format!("{}  Übernehmen", egui_phosphor::regular::CHECK),
-        )
-        .click_accesskit();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Übernehmen")
+            .click_accesskit();
         h.run();
         let settings = cmds
             .borrow()
@@ -1160,11 +1171,8 @@ fn settings_import_of_an_invitation_takes_no_settings() {
         cmds_out.borrow_mut().extend(view.ui(ui, &s, false).cmds);
     });
     assert!(h.query_by_label("Einstellungen übernehmen").is_none());
-    h.get_by_role_and_label(
-        egui::accesskit::Role::Button,
-        &format!("{}  Übernehmen", egui_phosphor::regular::CHECK),
-    )
-    .click_accesskit();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Übernehmen")
+        .click_accesskit();
     h.run();
     let settings = cmds
         .borrow()
@@ -1212,10 +1220,7 @@ fn settings_import_area_accepts_a_dropped_file() {
     h.run();
     // The drop reached the same preview a paste would: the confirm button
     // is there, and nothing prompted for the field to be filled by hand.
-    h.get_by_role_and_label(
-        egui::accesskit::Role::Button,
-        &format!("{}  Übernehmen", egui_phosphor::regular::CHECK),
-    );
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Übernehmen");
 }
 
 /// Switches and sliders carry the name of their row for a screen reader,
@@ -1236,7 +1241,7 @@ fn switches_and_sliders_are_named_and_keyboard_driven() {
             .borrow_mut()
             .extend(view.ui(ui, &state_in, false).cmds);
     });
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Klang")
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Stimme & Hören")
         .click();
     h.run();
     for name in [
@@ -1253,11 +1258,11 @@ fn switches_and_sliders_are_named_and_keyboard_driven() {
         .focus();
     h.run();
     shot(&mut h, "settings-keyboard-toggle-focus");
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Audio")
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Stimme & Hören")
         .click();
     h.run();
     let before = s.settings.audio.output_volume;
-    let volume = h.get_by_role_and_label(egui::accesskit::Role::Slider, "Lautstärke");
+    let volume = h.get_by_role_and_label(egui::accesskit::Role::Slider, "Wiedergabelautstärke");
     volume.focus();
     h.run();
     h.key_press(egui::Key::ArrowRight);
@@ -1292,7 +1297,7 @@ fn corona_color_is_available_in_plain_settings_and_persists() {
                 .borrow_mut()
                 .extend(view.ui(ui, &state_in, false).cmds);
         });
-        h.get_by_role_and_label(egui::accesskit::Role::Button, "Overlay")
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Overlay & Tasten")
             .click();
         h.run();
         assert!(!h
@@ -1300,6 +1305,8 @@ fn corona_color_is_available_in_plain_settings_and_persists() {
             .accesskit_node()
             .is_disabled());
         shot(&mut h, &format!("corona-plain-{theme_name}"));
+        h.get_by_label("Meine Coronafarbe").scroll_to_me();
+        h.run();
         h.get_by_label("Meine Coronafarbe").click();
         h.run();
         h.get_all_by_role(egui::accesskit::Role::SpinButton)
@@ -1366,7 +1373,7 @@ fn shy_return_delay_slider_is_named_and_keyboard_driven() {
             .borrow_mut()
             .extend(view.ui(ui, &state_in, false).cmds);
     });
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Overlay")
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Overlay & Tasten")
         .click();
     h.run();
     let delay = h.get_by_role_and_label(egui::accesskit::Role::Slider, "Zurück nach");
@@ -1382,7 +1389,7 @@ fn shy_return_delay_slider_is_named_and_keyboard_driven() {
 /// presets could only be compared in silence. Other pages still stop it.
 #[test]
 fn mic_test_stays_on_the_klang_page() {
-    let test = format!("{}  Testen", egui_phosphor::regular::HEADPHONES);
+    let test = "Testen";
     let s = state();
     let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
     let on_test_page = Rc::new(RefCell::new(false));
@@ -1397,7 +1404,7 @@ fn mic_test_stays_on_the_klang_page() {
         *page_out.borrow_mut() = out.mic_test_page;
         cmds_out.borrow_mut().extend(out.cmds);
     });
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Klang")
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Stimme & Hören")
         .click();
     h.run();
     assert!(*on_test_page.borrow(), "Klang stops the mic test");
@@ -1410,7 +1417,7 @@ fn mic_test_stays_on_the_klang_page() {
             .any(|c| matches!(c, Command::SetMicTest(true))),
         "„Testen“ on Klang starts no mic test"
     );
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Allgemein")
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "App")
         .click();
     h.run();
     assert!(
@@ -1423,10 +1430,7 @@ fn mic_test_stays_on_the_klang_page() {
 /// activation with one click, on the Tastenkürzel page and in the setup.
 #[test]
 fn no_hotkey_backend_offers_voice_activation() {
-    let switch = format!(
-        "{}  Stattdessen automatisch senden",
-        egui_phosphor::regular::WAVEFORM
-    );
+    let switch = "Stattdessen automatisch senden";
     let mut s = state();
     s.hotkey_backend = "none".into();
     let cmds = Rc::new(RefCell::new(Vec::<Command>::new()));
@@ -1441,12 +1445,15 @@ fn no_hotkey_backend_offers_voice_activation() {
             .borrow_mut()
             .extend(view.ui(ui, &state_in, false).cmds);
     });
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Tastenkürzel")
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Overlay & Tasten")
         .click();
     h.run();
     if cfg!(target_os = "linux") {
         h.get_by_label_contains("sudo usermod -aG input $USER");
     }
+    h.get_by_role_and_label(egui::accesskit::Role::Button, &switch)
+        .scroll_to_me();
+    h.run();
     h.get_by_role_and_label(egui::accesskit::Role::Button, &switch)
         .click();
     h.run();
@@ -1480,7 +1487,7 @@ fn the_passport_warning_names_the_clipboard() {
     let mut h = harness(SETTINGS, "light", true, move |ui| {
         view.ui(ui, &s, false);
     });
-    h.get_by_role_and_label(egui::accesskit::Role::Button, "Allgemein")
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "App")
         .click();
     h.run();
     h.get_by_label_contains("Zwischenablage-Verlauf");
@@ -2117,8 +2124,11 @@ fn autotune_details_keep_controls_accessible_and_independent() {
         let mut h = harness(SETTINGS, theme, true, move |ui| {
             output.borrow_mut().extend(view.ui(ui, &s, false).cmds);
         });
-        h.get_by_role_and_label(egui::accesskit::Role::Button, "Klang")
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Stimme & Hören")
             .click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Details")
+            .scroll_to_me();
         h.run();
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Details")
             .click();
@@ -2158,8 +2168,11 @@ fn last_good_audio_actions_work_even_with_denoise_disabled() {
         let mut h = harness(SETTINGS, theme_name, true, move |ui| {
             collected.borrow_mut().extend(view.ui(ui, &s, false).cmds);
         });
-        h.get_by_role_and_label(egui::accesskit::Role::Button, "Klang")
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Stimme & Hören")
             .click();
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "Details")
+            .scroll_to_me();
         h.run();
         h.get_by_role_and_label(egui::accesskit::Role::Button, "Details")
             .click();
@@ -2223,13 +2236,13 @@ fn settings_minimum_width_keeps_controls_reachable() {
                         let rect = node.rect();
                         if !(rect.left() >= -0.5
                             && rect.right() <= 618.5
-                            && (rect.right() <= 192.5 || rect.left() >= 213.5))
+                            && (rect.right() <= 208.5 || rect.left() >= 231.5))
                         {
                             failures.push(format!("{page}/{theme_name}/{scale}: control escapes content: {node:?} {rect:?}"));
                         }
                     }
                 }
-                if page == "Tastenkürzel" {
+                if page == "Overlay & Tasten" {
                     let key = h.get_by_label("CTRL+SHIFT+F12").rect();
                     for button in h.query_all_by_role(Role::Button) {
                         if key.intersects(button.rect()) {
@@ -2280,6 +2293,11 @@ fn focused_speak_button_holds_and_releases_from_keyboard() {
         events
     };
     for key in [Key::Space, Key::Enter] {
+        if h.query_by_label("Sprechen").is_none() {
+            h.get_by_label_contains("Sendemodus wechseln:")
+                .click_secondary();
+            h.run();
+        }
         h.get_by_role_and_label(Role::Button, "Sprechen").focus();
         h.run_steps(2);
         drain(&mut rx);
@@ -2290,6 +2308,13 @@ fn focused_speak_button_holds_and_releases_from_keyboard() {
         h.run_steps(2);
         assert_eq!(drain(&mut rx), [false]);
     }
+    if h.query_by_label("Sprechen").is_none() {
+        h.get_by_label_contains("Sendemodus wechseln:")
+            .click_secondary();
+        h.run();
+    }
+    h.get_by_label("Sprechen").focus();
+    h.run_steps(2);
     h.key_down(Key::Space);
     h.run_steps(2);
     assert_eq!(drain(&mut rx), [true]);
@@ -2419,33 +2444,32 @@ fn settings_navigation_does_not_inherit_another_pages_scroll() {
         view.ui(ui, &s, false);
     });
     let original = h
-        .get_by_role_and_label(Role::Slider, "Lautstärke")
+        .get_by_role_and_label(Role::Slider, "Wiedergabelautstärke")
         .rect()
         .top();
-    h.get_by_role_and_label(Role::Slider, "Lautstärke")
+    h.get_by_role_and_label(Role::Slider, "Wiedergabelautstärke")
         .scroll_down();
     h.run();
     let scrolled = h
-        .get_by_role_and_label(Role::Slider, "Lautstärke")
+        .get_by_role_and_label(Role::Slider, "Wiedergabelautstärke")
         .rect()
         .top();
     assert!(
         scrolled < original - 20.0,
         "test must scroll the original page"
     );
-    h.get_by_role_and_label(Role::Button, "Klang").click();
+    h.get_by_role_and_label(Role::Button, "App").click();
     h.run();
-    let first = h
-        .get_by_role_and_label(Role::CheckBox, "Rauschunterdrückung")
-        .rect();
+    let first = h.get_by_role_and_label(Role::Label, "App").rect();
     assert!(
-        first.top() >= 100.0 && first.bottom() < 240.0,
+        first.top() >= 24.0 && first.bottom() < 90.0,
         "fresh tab must start at its heading: {first:?}"
     );
-    h.get_by_role_and_label(Role::Button, "Audio").click();
+    h.get_by_role_and_label(Role::Button, "Stimme & Hören")
+        .click();
     h.run();
     let restored = h
-        .get_by_role_and_label(Role::Slider, "Lautstärke")
+        .get_by_role_and_label(Role::Slider, "Wiedergabelautstärke")
         .rect()
         .top();
     assert!(
@@ -2495,7 +2519,8 @@ fn overlay_positions_are_named_and_keyboard_accessible() {
     let mut h = harness(SETTINGS, "dark", true, move |ui| {
         cmds_out.borrow_mut().extend(view.ui(ui, &s, false).cmds);
     });
-    h.get_by_role_and_label(Role::Button, "Overlay").click();
+    h.get_by_role_and_label(Role::Button, "Overlay & Tasten")
+        .click();
     h.run();
     for label in [
         "Oben links",
@@ -2517,4 +2542,92 @@ fn overlay_positions_are_named_and_keyboard_accessible() {
         icu_client::config::Corner::BottomLeft
     );
     shot(&mut h, "settings-keyboard-overlay-position");
+}
+
+#[test]
+fn settings_search_reveals_targets_without_changing_values() {
+    use egui::accesskit::Role;
+    let s = state();
+    let commands = Rc::new(RefCell::new(Vec::new()));
+    let collected = commands.clone();
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-search"))),
+    );
+    let mut h = harness(SETTINGS, "dark", true, move |ui| {
+        collected.borrow_mut().extend(view.ui(ui, &s, false).cmds);
+    });
+    for (query, label) in [
+        ("andere Apps", "Absenkung"),
+        ("echo", "Echo-Unterdrückung"),
+        ("Mikrofonkanal", "Mikrofonkanal"),
+        ("theme", "Farben"),
+        ("PTT", "Push-to-Talk"),
+    ] {
+        h.get_by_label("Einstellungen suchen").focus();
+        h.run();
+        h.get_by_label("Einstellungen suchen").type_text(query);
+        h.run();
+        h.get_by_role_and_label(Role::Button, label).click();
+        h.run_steps(12);
+        let rect = h.get_by_role_and_label(Role::Label, label).rect();
+        assert!(
+            rect.top() >= 0.0 && rect.bottom() <= SETTINGS[1] - 50.0,
+            "{query}: target is outside the visible page: {rect:?}"
+        );
+        assert!(
+            commands.borrow().is_empty(),
+            "search/navigation emitted a command"
+        );
+        assert_eq!(h.ctx.content_rect().height(), SETTINGS[1]);
+        shot(&mut h, &format!("settings-search-{query}"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_updates_are_dismissible_information_with_manual_checks_only() {
+    use icu_client::ui::updates;
+    use icu_client::update::{manifest::Release, Action, Snapshot};
+    let state = Rc::new(RefCell::new(Snapshot {
+        available: Some(Arc::new(Release {
+            version: semver::Version::new(99, 0, 0),
+            files: vec![],
+            envelope: Arc::new(vec![]),
+        })),
+        ..Default::default()
+    }));
+    let view = state.clone();
+    let mut h = harness([400., 240.], "dark", true, move |ui| {
+        let snapshot = view.borrow().clone();
+        if matches!(
+            updates::notice(ui, &snapshot, None, true, &mut false),
+            Some(Action::Dismiss)
+        ) {
+            view.borrow_mut().dismissed = true;
+        }
+    });
+    assert!(h.query_by_label(updates::LINUX_HINT).is_some());
+    assert!(h.query_by_label("Jetzt aktualisieren").is_none());
+    assert!(h.query_by_label("Herunterladen und neu starten").is_none());
+    h.get_by_label("Später").click();
+    h.run();
+    assert!(state.borrow().dismissed);
+    assert!(h.query_by_label(updates::LINUX_HINT).is_none());
+    let checked = Rc::new(std::cell::Cell::new(false));
+    let action = checked.clone();
+    let mut settings = harness([600., 260.], "light", true, move |ui| {
+        if matches!(
+            updates::settings(ui, &state.borrow(), true, &mut false),
+            Some(Action::Check)
+        ) {
+            action.set(true);
+        }
+    });
+    assert!(settings.query_by_label(updates::LINUX_HINT).is_some());
+    assert!(settings.query_by_label("Jetzt aktualisieren").is_none());
+    settings.get_by_label("Nach Updates suchen").click();
+    settings.run();
+    assert!(checked.get());
 }

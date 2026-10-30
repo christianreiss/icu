@@ -15,6 +15,7 @@ use egui_phosphor::regular as icon;
 
 use super::{
     connection::{fmt_uptime, wrap_fingerprint, ConnectionView},
+    design::{self, ActionState, Icon},
     fonts,
     settings::SettingsView,
     setup::SetupView,
@@ -30,36 +31,16 @@ use crate::{
     video::VideoTier,
 };
 
-/// The speak surface and the mode tile beside it.
-const SPEAK_H: f32 = 52.0;
-/// The control tiles along the bottom.
-const TILE_H: f32 = 54.0;
-/// The one gap of the control dock's grid, both ways.
-const DOCK_GAP: f32 = 8.0;
-/// A bottom-row toggle: glyph, tooltip, on, color role, rec dot, hover
-/// text, and the command a click sends (`None` when the feature is compiled
-/// out).
-type Toggle = (
-    &'static str,
-    String,
-    bool,
-    widgets::Role,
-    widgets::RecDot,
-    Option<String>,
-    Option<Command>,
-);
-
 /// What the main window opens with: four people — oneself and three more —
 /// fit without a scroll bar, and it is no wider than the control dock needs;
-/// long names end in „…“ (`tests/ui_layout.rs`). A bigger room grows it after
-/// connecting (`App::fit_to_list`).
-pub const MAIN_SIZE: [f32; 2] = [360.0, 492.0];
+/// long names end in „…“ (`tests/ui_layout.rs`). Larger rooms scroll.
+pub const MAIN_SIZE: [f32; 2] = [400.0, 580.0];
 /// The smallest the main window can be made.
-pub const MAIN_MIN_SIZE: [f32; 2] = [360.0, 392.0];
+pub const MAIN_MIN_SIZE: [f32; 2] = [400.0, 360.0];
 /// What the settings window opens with: every page fits without a scroll
 /// bar at this size unless expert rows or a long member list make it grow
 /// (`tests/ui_layout.rs`).
-pub const SETTINGS_SIZE: [f32; 2] = [820.0, 680.0];
+pub const SETTINGS_SIZE: [f32; 2] = [820.0, 620.0];
 /// What the Verbindung window opens with: its first page fits; the longer
 /// ones grow it.
 pub const CONNECTION_SIZE: [f32; 2] = [720.0, 780.0];
@@ -89,6 +70,8 @@ pub enum Exit {
 /// Runs the main window. `show` overrides `start_minimized`: right after
 /// logging back in the window must not vanish to the tray.
 pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String> {
+    #[cfg(windows)]
+    let show = show || crate::update::windows::restarting();
     let start_minimized = engine.snapshot().settings.ui.start_minimized && !show;
     // Where the tray cannot take the window, „Minimiert starten“ starts in
     // the task bar/dock instead of on screen.
@@ -108,7 +91,7 @@ pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String
     let engine_for_app = engine.clone();
     let logged_out = Arc::new(AtomicBool::new(false));
     let logged_out_app = logged_out.clone();
-    eframe::run_native(
+    super::native::run_native(
         "ICU",
         options,
         Box::new(move |cc| {
@@ -142,6 +125,7 @@ pub fn run(engine: Engine, debug_stats: bool, show: bool) -> Result<Exit, String
 }
 
 struct App {
+    updater: crate::update::Updater,
     engine: Arc<Mutex<Option<Engine>>>,
     state_rx: tokio::sync::watch::Receiver<AppState>,
     /// The snapshot every panel draws from. Cloned out of the watch channel
@@ -279,6 +263,7 @@ impl App {
         let cmd = e.command_sender();
         let stats = e.stats();
         let frames = e.video_frames_source();
+        let update_config = e.paths().config_dir;
         #[cfg(feature = "camera")]
         let camera_link = e.camera_link();
         drop(guard);
@@ -337,7 +322,11 @@ impl App {
         };
         let videos = crate::video::VideoTextures::new(frames);
         let setup = (!state.settings.ui.setup_done).then(|| SetupView::new(&state));
+        let update_ctx = cc.egui_ctx.clone();
+        let updater =
+            crate::update::Updater::new(update_config, move || update_ctx.request_repaint());
         App {
+            updater,
             engine,
             state,
             state_rx,
@@ -655,6 +644,8 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        crate::update::windows::healthy_frame(root.ctx());
         let ctx = root.ctx().clone();
         #[cfg(windows)]
         if !self.positioned {
@@ -703,7 +694,9 @@ impl eframe::App for App {
             user_open: self.user.as_ref().map(|v| v.user_id()),
             overlay_available: self.overlay_available(),
         };
+        self.view.update = self.updater.snapshot();
         let out = self.view.ui(root, &self.state, &env);
+        self.updater.act(out.update_action);
 
         if out.toggle_settings {
             self.settings = match self.settings.take() {
@@ -933,6 +926,9 @@ impl App {
         // closure with no borrow conflict against `self.settings`.
         let debug_open = self.debug_window_open;
         let state = &self.state;
+        if let Some(view) = &mut self.settings {
+            view.update = self.updater.snapshot();
+        }
         let settings = &mut self.settings;
         let mut out = None;
         let still_open = immediate_window(
@@ -953,6 +949,8 @@ impl App {
         let Some(out) = out else {
             return false;
         };
+        self.updater.act(out.update_action);
+        let still_open = still_open && !out.close;
         for c in out.cmds {
             if let Command::UpdateSettings(s) = &c {
                 // A slider drag emits this every frame it moves; only a real
@@ -1081,7 +1079,14 @@ fn immediate_window(
         builder,
         |vctx, _class| {
             if let Some(body) = body.take() {
-                egui::CentralPanel::default().show(vctx, body);
+                let panel = egui::CentralPanel::default();
+                if id == "icu-settings" {
+                    panel
+                        .frame(egui::Frame::central_panel(&vctx.style()).inner_margin(0))
+                        .show(vctx, body);
+                } else {
+                    panel.show(vctx, body);
+                }
             }
             if vctx.input(|i| i.viewport().close_requested()) {
                 still_open = false;
@@ -1101,6 +1106,8 @@ fn immediate_window(
 /// stay in `App`.
 #[derive(Default)]
 pub struct MainView {
+    pub update: crate::update::Snapshot,
+    update_confirm: bool,
     /// The on-screen speak button is being held.
     ptt_held: bool,
     /// Pointer holds survive dragging off the button, but never window blur.
@@ -1132,6 +1139,7 @@ pub struct MainEnv<'a> {
 /// What one frame of the main view asks of the app around it.
 #[derive(Debug, Default)]
 pub struct MainOutput {
+    pub update_action: Option<crate::update::Action>,
     /// The gear was clicked: open or close the settings.
     pub toggle_settings: bool,
     /// The connection status was clicked: open or close its window.
@@ -1209,180 +1217,112 @@ impl MainView {
         };
 
         egui::Panel::top("status")
-            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(root.visuals().panel_fill)
+                    .inner_margin(egui::Margin {
+                        left: 20,
+                        right: 10,
+                        top: 10,
+                        bottom: 10,
+                    }),
+            )
+            .show_separator_line(true)
             .show(root, |ui| {
                 let tok = theme::tokens(ui.visuals());
                 let (color, short, detail) = conn_status(state, &tok);
                 let connected = state.conn == ConnStatus::Connected;
-                let uptime = state
-                    .conn_info
-                    .as_ref()
-                    .filter(|_| connected)
-                    .map(|info| fmt_uptime(info.connected_at.elapsed()));
-                // The round trip as the server measured it, the same number
-                // the own row's bars stand for.
                 let rtt = state
                     .server_rtt_ms
                     .or(state.rtt_ms.map(|ms| ms.round() as u16))
                     .filter(|_| connected);
-                // Own outgoing video quality tier, set by
-                // `crate::quality::QualityController`. Automatic, no settings
-                // toggle (`docs/reference/features.md`'s bias against exposing
-                // adaptive behavior as a dial) — but shown, since a tier-down
-                // is visible to other people as this client's video degrading.
-                let video_hint = match env.video_tier {
-                    VideoTier::T0 => None,
-                    VideoTier::T4 => Some("Video pausiert — das Netz trägt es gerade nicht."),
-                    _ => Some("Video reduziert — weniger Bitrate für eine stabile Stimme."),
-                };
-                // Right to left from the signal: the video tier, then the own
-                // role on this server — an admin sees it at a glance, not
-                // only behind the Nutzer tab.
-                let mut indicators = Vec::new();
-                if video_hint.is_some() {
-                    indicators.push((icon::VIDEO_CAMERA_SLASH, tok.connecting));
-                }
-                if state.is_admin {
-                    indicators.push((icon::SHIELD_STAR, tok.accent));
-                }
-
-                // Two lines, the way the top of a phone reads: a status bar
-                // with the connection, then the title row with the server
-                // and the actions. Everything on a line shares its height.
-                ui.add_space(2.0);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    let bar = widgets::status_bar(
-                        ui,
-                        &widgets::StatusBar {
-                            color,
-                            word: &short,
-                            extra: uptime.as_deref(),
-                            signal: rtt.map(|ms| (rtt_bars(ms), ms)),
-                            indicators: &indicators,
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    let text_width = (ui.available_width() - 102.0).max(24.0);
+                    let status = ui.allocate_ui_with_layout(
+                        egui::vec2(text_width, design::ACTION_SIZE),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            ui.spacing_mut().interact_size.y = 14.0;
+                            ui.add_space(3.0);
+                            ui.set_min_width(text_width);
+                            ui.set_max_width(text_width);
+                            ui.spacing_mut().item_spacing.y = 3.0;
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&state.server_name)
+                                        .font(egui::FontId::new(15.0, fonts::semibold())),
+                                )
+                                .truncate(),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let (dot, _) = ui.allocate_exact_size(
+                                    egui::vec2(7.0, 14.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(dot.center(), 3.5, color);
+                                let word = match short.as_str() {
+                                    "verbunden" => "Verbunden",
+                                    "verbinde" => "Verbindet …",
+                                    "getrennt" => "Getrennt",
+                                    other => other,
+                                };
+                                ui.label(RichText::new(word).size(12.0).color(tok.muted_text));
+                                if let Some(ms) = rtt {
+                                    ui.label(RichText::new("·").size(12.0).color(tok.dim_text));
+                                    ui.label(
+                                        RichText::new(format!("{ms} ms"))
+                                            .font(egui::FontId::monospace(11.5))
+                                            .color(tok.muted_text),
+                                    );
+                                }
+                            });
                         },
                     );
-                    // Clickable in every state, not just Connected: a failed
-                    // or retrying connection is exactly when the details are
-                    // worth a window instead of a one-line tooltip.
-                    if bar
-                        .on_hover_ui(|ui| {
-                            let mut lines = vec![if detail.is_empty() {
-                                short.clone()
-                            } else {
-                                format!("{short} — {detail}")
-                            }];
-                            if let Some(ms) = rtt {
-                                lines.push(format!("Ping {ms} ms"));
-                            }
-                            if let Some(hint) = video_hint {
-                                lines.push(hint.to_string());
-                            }
-                            if state.is_admin {
-                                lines.push("Du bist Admin auf diesem Server".to_string());
-                            }
-                            lines.push(String::new());
-                            lines.push("Klicken für Verbindungsdetails".to_string());
-                            ui.label(lines.join("\n"));
-                        })
+                    let mut hint = detail;
+                    if let Some(info) = state.conn_info.as_ref().filter(|_| connected) {
+                        hint.push_str(&format!(
+                            "\nVerbunden seit {}",
+                            fmt_uptime(info.connected_at.elapsed())
+                        ));
+                    }
+                    hint.push_str("\nVerbindungsdetails öffnen");
+                    if ui
+                        .interact(
+                            status.response.rect,
+                            ui.id().with("connection_details"),
+                            egui::Sense::click(),
+                        )
+                        .on_hover_text(hint)
                         .clicked()
                     {
                         out.toggle_connection = true;
                     }
-
-                    // An explicit height, not `with_layout`: that claims the
-                    // parent's entire remaining height, and `Align::Center`
-                    // then centers the row inside it (`widgets::rtl`).
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), widgets::CAPSULE_H),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add_space(widgets::HEADER_INSET);
-                            // The server gets what the actions leave and ends
-                            // in „…“ in a narrow window, whole on hover.
-                            let gap = ui.spacing().item_spacing.x;
-                            let room =
-                                ui.available_width() - widgets::action_capsule_width(3) - gap;
-                            ui.scope(|ui| {
-                                ui.set_max_width(room.max(24.0));
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&state.server_name)
-                                            .font(egui::FontId::new(16.0, fonts::semibold())),
-                                    )
-                                    .truncate(),
-                                );
-                            });
-                            widgets::rtl(ui, widgets::CAPSULE_H, |ui| {
-                                // Flips whatever is on screen right now, so
-                                // from `system` it always does something
-                                // visible.
-                                let (glyph, hint, next) = if ui.visuals().dark_mode {
-                                    (icon::SUN, "Hell", "light")
-                                } else {
-                                    (icon::MOON, "Dunkel", "dark")
-                                };
-                                let button =
-                                    |glyph, label, active, danger| widgets::CapsuleButton {
-                                        glyph,
-                                        label,
-                                        active,
-                                        danger,
-                                    };
-                                let clicked: Vec<bool> = widgets::action_capsule(
-                                    ui,
-                                    &[
-                                        button(glyph, hint, false, false),
-                                        button(
-                                            icon::GEAR_FINE,
-                                            "Einstellungen",
-                                            env.settings_open,
-                                            false,
-                                        ),
-                                        button(icon::POWER, "Beenden (Strg+Q)", false, true),
-                                    ],
-                                )
-                                .iter()
-                                .map(egui::Response::clicked)
-                                .collect();
-                                if clicked[0] {
-                                    out.theme = Some(next);
-                                }
-                                if clicked[1] {
-                                    out.toggle_settings = true;
-                                }
-                                if clicked[2] {
-                                    out.quit = true;
-                                }
-                            });
-                        },
-                    );
+                    ui.add_space(10.0);
+                    if design::header_action(ui, Icon::Settings, "Einstellungen", env.settings_open)
+                        .clicked()
+                    {
+                        out.toggle_settings = true;
+                    }
+                    if design::header_action(ui, Icon::Power, "Beenden (Strg+Q)", false).clicked() {
+                        out.quit = true;
+                    }
                 });
-                ui.add_space(4.0);
-
-                if let Some(min) = &state.update_required {
-                    widgets::banner(
-                        ui,
-                        widgets::BannerKind::Warning,
-                        "Update nötig",
-                        &format!(
-                            "Der Server verlangt mindestens Version {min} (diese: {}).",
-                            env!("CARGO_PKG_VERSION")
-                        ),
-                        None::<fn()>,
-                    );
-                    ui.add_space(2.0);
-                    ui.hyperlink_to(
-                        format!("{}  Neue Version herunterladen", icon::DOWNLOAD_SIMPLE),
-                        concat!(env!("CARGO_PKG_REPOSITORY"), "/releases"),
-                    );
-                }
+                out.update_action = super::updates::notice(
+                    ui,
+                    &self.update,
+                    state.update_required.as_deref(),
+                    matches!(state.conn, ConnStatus::Connected),
+                    &mut self.update_confirm,
+                );
                 // Non-techies do not hover: a connection that will not come
                 // back on its own says why right here, not only in the
                 // pill's tooltip.
                 let reconnect = |ui: &mut egui::Ui| {
                     ui.add_space(4.0);
-                    if widgets::button(
+                    if design::button(
                         ui,
                         widgets::ButtonKind::Neutral,
                         icon::ARROW_CLOCKWISE,
@@ -1408,7 +1348,7 @@ impl MainView {
                         ui.horizontal(|ui| {
                             reconnect(ui);
                             ui.add_space(4.0);
-                            if widgets::button(
+                            if design::button(
                                 ui,
                                 widgets::ButtonKind::Neutral,
                                 icon::DOWNLOAD,
@@ -1452,144 +1392,86 @@ impl MainView {
                 }
             });
 
-        // As much room under the dock as beside it.
-        let dock_frame = egui::Frame::side_top_panel(root.style());
-        let side = dock_frame.inner_margin.left;
         egui::Panel::bottom("controls")
-            .show_separator_line(false)
-            .frame(dock_frame.inner_margin(egui::Margin {
-                top: 0,
-                bottom: side,
-                ..dock_frame.inner_margin
-            }))
+            .show_separator_line(true)
+            .frame(egui::Frame::new().fill(design::surface(root.visuals()))
+                .inner_margin(egui::Margin { left: 8, right: 12, top: 12, bottom: 12 }))
             .show(root, |ui| {
-                let (rec, rec_hint) = camera_feedback(
-                    state.camera_on,
-                    state.conn == ConnStatus::Connected,
-                    &state.peers,
-                    &state.video_viewers,
-                    env.video_tier,
-                );
-                let camera_label = match rec {
-                    widgets::RecDot::Off => "Kamera".to_string(),
-                    widgets::RecDot::Idle => "Video: 0".to_string(),
-                    widgets::RecDot::Live => {
-                        let n = state
-                            .peers
-                            .iter()
-                            .filter(|p| {
-                                p.info.flags.viewing()
-                                    && state.video_viewers.contains(&p.info.session)
-                            })
-                            .count();
-                        format!("Video: {n}")
-                    }
+                let tok = theme::tokens(ui.visuals());
+                let ptt_mode = Mode::from(state.settings.audio.mode) == Mode::Ptt;
+                let online = state.conn == ConnStatus::Connected;
+                let muted = microphone_muted(state);
+                let sending = online && !state.peers.is_empty() && !muted && state.sending;
+                let key = super::ptt_key_label(&state.settings.hotkeys, &state.hotkey_backend);
+                let mode = if ptt_mode { "Push-to-Talk" } else { "Automatisch" };
+                let (title, hint, ink) = if state.privacy_active {
+                    ("Privacy an", "Mikro aus · Bild verrauscht".into(), tok.error)
+                } else if state.deafened {
+                    ("Taub", "Du hörst und sendest nichts".into(), tok.error)
+                } else if muted {
+                    ("Stumm", format!("{mode} pausiert"), tok.error)
+                } else if !online {
+                    ("Nicht verbunden", "Es wird nichts gesendet".into(), tok.muted_text)
+                } else if sending {
+                    ("Sendet", if ptt_mode { format!("Push-to-Talk · {key}") } else { mode.into() }, tok.accent)
+                } else {
+                    (mode, if state.peers.is_empty() { "Allein im Raum".into() }
+                        else if ptt_mode { format!("Taste {key}") }
+                        else { "Sendet, wenn du sprichst".into() }, ui.visuals().text_color())
                 };
-                let toggles: [Toggle; 4] = [
-                    (
-                        icon::MICROPHONE_SLASH,
-                        "Stumm".into(),
-                        state.muted || state.privacy_active,
-                        widgets::Role::Danger,
-                        widgets::RecDot::Off,
-                        state
-                            .restricted_muted
-                            .then(|| "Ein Admin hat dich stummgeschaltet.".to_string()),
-                        Some(Command::SetMuted(!state.muted)),
-                    ),
-                    (
-                        icon::SPEAKER_SLASH,
-                        "Taub".into(),
-                        state.deafened,
-                        widgets::Role::Danger,
-                        widgets::RecDot::Off,
-                        state
-                            .restricted_deafened
-                            .then(|| "Ein Admin hat dich taubgeschaltet.".to_string()),
-                        Some(Command::SetDeafened(!state.deafened)),
-                    ),
-                    (
-                        icon::VIDEO_CAMERA,
-                        camera_label,
-                        state.camera_on,
-                        widgets::Role::Accent,
-                        rec,
-                        rec_hint.clone(),
-                        cfg!(feature = "camera").then(|| Command::SetCamera(!state.camera_on)),
-                    ),
-                    (
-                        icon::SQUARES_FOUR,
-                        "Overlay".into(),
-                        state.settings.overlay.enabled,
-                        widgets::Role::Accent,
-                        widgets::RecDot::Off,
-                        None,
-                        (cfg!(feature = "overlay") && env.overlay_available)
-                            .then_some(Command::SetOverlay(!state.settings.overlay.enabled)),
-                    ),
-                ];
-                let toggles: Vec<_> = toggles.into_iter().filter(|t| t.6.is_some()).collect();
-
-                // One card, one grid: the tiles share their column width and
-                // gap with the speak row above, so every edge in the dock
-                // lines up with another.
-                let ptt = egui::Frame::new()
-                    .fill(ui.visuals().faint_bg_color)
-                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                    .corner_radius(egui::CornerRadius::same(theme::R_CARD))
-                    .inner_margin(egui::Margin::same(DOCK_GAP as i8))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(DOCK_GAP, DOCK_GAP);
-                        let n = toggles.len().max(1) as f32;
-                        let col = ((ui.available_width() - (n - 1.0) * DOCK_GAP) / n).floor();
-                        let ptt = ui.horizontal(|ui| speak_row(ui, state, &send, col)).inner;
-                        ui.horizontal(|ui| {
-                            for (glyph, label, active, role, rec, hint, cmd) in toggles {
-                                let size = egui::vec2(col, TILE_H);
-                                let blocked = state.privacy_active
-                                    && matches!(cmd, Some(Command::SetMuted(_) | Command::SetCamera(_)));
-                                let mut tile = ui.add_enabled_ui(!blocked, |ui| {
-                                    widgets::tile(ui, glyph, &label, active, role, rec, size)
-                                }).inner;
-                                if blocked {
-                                    tile = tile.on_disabled_hover_text("Während Privacy gesperrt.");
-                                }
-                                if let Some(hint) = hint {
-                                    tile = tile.on_hover_text(hint);
-                                }
-                                if tile.clicked() {
-                                    if let Some(c) = cmd {
-                                        send(c);
-                                    }
-                                }
-                            }
-                        });
-                        let privacy = widgets::tile(
-                            ui,
-                            icon::EYE_SLASH,
-                            if state.privacy_active { "Privacy an · Mikrofon stumm" } else { "Privacy" },
-                            state.privacy_active,
-                            widgets::Role::Danger,
-                            widgets::RecDot::Off,
-                            egui::vec2(ui.available_width(), 44.0),
-                        ).on_hover_text("Mikrofon stummschalten und aktives Video durch TV-Rauschen ersetzen. Erneut klicken stellt den vorherigen Zustand wieder her.");
-                        if privacy.clicked() {
-                            send(Command::SetPrivacy(!state.privacy_active));
-                        }
-                        ptt
-                    })
-                    .inner;
-                // Hold semantics: a press that starts on the button keeps the
-                // gate open until the primary button is released anywhere, even
-                // if the pointer drifts off the widget or egui stops treating it
-                // as "down on" (observed in the live test: transmission ended
-                // after a few seconds while the button was still held).
-                if let Some(command) = self.update_ptt(ptt.as_ref(), ui.ctx()) {
-                    send(command);
-                }
-                if self.ptt_held {
-                    ui.ctx().request_repaint();
-                }
+                let mut ptt_response = None;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = design::ACTION_GAP;
+                    let width = (ui.available_width() - 280.0).max(44.0);
+                    let mode = design::mode_button(ui, width, title, &hint, ink)
+                        .on_hover_text(format!("{title} · {hint}\nKlicken: Sendemodus wechseln.\nRechtsklick oder Umschalt+F10: Bildschirm-Sprechtaste."));
+                    if mode.clicked() { send(Command::ToggleMode); }
+                    let menu_id = mode.id.with("screen-ptt");
+                    if mode.has_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::F10)) {
+                        egui::Popup::open_id(ui.ctx(), menu_id);
+                    }
+                    egui::Popup::context_menu(&mode).id(menu_id)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+                        ui.label("Bildschirm-Sprechtaste");
+                        ui.label("Zum Sprechen gedrückt halten.");
+                        let enabled = ptt_mode && online && !muted && !state.peers.is_empty();
+                        ptt_response = Some(ui.add_enabled_ui(enabled, |ui| {
+                            design::button(ui, widgets::ButtonKind::Primary, "", "Sprechen")
+                        }).inner.on_disabled_hover_text("Benötigt Push-to-Talk, eine Verbindung und jemanden im Raum; das Mikrofon muss freigegeben sein."));
+                    });
+                    let mic_state = if muted && !state.deafened { ActionState::Muted }
+                        else if sending { ActionState::Sending } else { ActionState::Off };
+                    let mic = ui.add_enabled_ui(!state.privacy_active, |ui| design::action(ui,
+                        if muted && !state.deafened { Icon::MicOff } else { Icon::Mic }, "Stumm", mic_state)).inner
+                        .on_disabled_hover_text("Während Privacy gesperrt.");
+                    if state.restricted_muted { mic.clone().on_hover_text("Ein Admin hat dich stummgeschaltet."); }
+                    if mic.clicked() { send(Command::SetMuted(!state.muted)); }
+                    if design::action(ui, if state.deafened { Icon::Deaf } else { Icon::Speaker }, "Taub",
+                        if state.deafened { ActionState::Muted } else { ActionState::Off })
+                        .on_hover_text(if state.restricted_deafened { "Ein Admin hat dich taubgeschaltet." } else { "Wiedergabe und Mikrofon stummschalten" })
+                        .clicked() { send(Command::SetDeafened(!state.deafened)); }
+                    design::action_separator(ui);
+                    let (_, camera_hint) = camera_feedback(state.camera_on, online, &state.peers,
+                        &state.video_viewers, env.video_tier);
+                    if ui.add_enabled_ui(cfg!(feature = "camera") && !state.privacy_active, |ui| {
+                        design::action(ui, Icon::Camera, "Kamera", if state.camera_on && !state.privacy_active {
+                            ActionState::Active } else { ActionState::Off })
+                    }).inner.on_hover_text(camera_hint.unwrap_or_else(|| "Kamera ein- oder ausschalten".into()))
+                        .on_disabled_hover_text(if state.privacy_active { "Während Privacy gesperrt." } else { "Dieser Build enthält keine Kamerafunktion." })
+                        .clicked() { send(Command::SetCamera(!state.camera_on)); }
+                    if ui.add_enabled_ui(cfg!(feature = "overlay") && env.overlay_available, |ui| {
+                        design::action(ui, Icon::Overlay, "Overlay", if state.settings.overlay.enabled {
+                            ActionState::Active } else { ActionState::Off })
+                    }).inner.on_disabled_hover_text("Overlay ist auf diesem Desktop nicht verfügbar.")
+                        .clicked() { send(Command::SetOverlay(!state.settings.overlay.enabled)); }
+                    design::action_separator(ui);
+                    if design::action(ui, Icon::Privacy, "Privacy", if state.privacy_active {
+                        ActionState::Privacy } else { ActionState::Off })
+                        .on_hover_text("Mikrofon stummschalten und aktives Video durch TV-Rauschen ersetzen. Erneut klicken stellt den vorherigen Zustand wieder her.")
+                        .clicked() { send(Command::SetPrivacy(!state.privacy_active)); }
+                });
+                if let Some(command) = self.update_ptt(ptt_response.as_ref(), ui.ctx()) { send(command); }
+                if self.ptt_held { ui.ctx().request_repaint(); }
             });
 
         let own = state.me.as_ref().map(|_| {
@@ -1617,21 +1499,38 @@ impl MainView {
                 }),
             )
             .show(root, |ui| {
-                // The people get a card of their own, the same surface as the
-                // control dock below, so the window reads as two calm blocks.
                 egui::Frame::new()
-                    .fill(ui.visuals().faint_bg_color)
-                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                    .corner_radius(egui::CornerRadius::same(theme::R_CARD))
-                    .inner_margin(egui::Margin::same(6))
+                    .inner_margin(egui::Margin::ZERO)
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.spacing_mut().interact_size.y = 14.0;
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.label(
+                                RichText::new("Im Raum")
+                                    .size(12.0)
+                                    .color(theme::tokens(ui.visuals()).muted_text),
+                            );
+                            widgets::rtl(ui, 18.0, |ui| {
+                                ui.add_space(12.0);
+                                ui.label(
+                                    RichText::new(
+                                        (state.peers.len() + usize::from(state.me.is_some()))
+                                            .to_string(),
+                                    )
+                                    .size(12.0)
+                                    .color(theme::tokens(ui.visuals()).dim_text),
+                                );
+                            });
+                        });
+                        ui.add_space(6.0);
                         let visible = ui.available_height();
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 let top = ui.cursor().top();
-                                ui.spacing_mut().item_spacing.y = 4.0;
-                                ui.add_space(2.0);
+                                ui.spacing_mut().item_spacing.y = 2.0;
                                 if let Some(me) = &state.me {
                                     if let Some(participant) = participant_for(
                                         state,
@@ -1712,122 +1611,6 @@ fn conn_status(state: &AppState, tok: &theme::Tokens) -> (Color32, String, Strin
 /// Include temporary and system inhibition before the audio report catches up.
 fn microphone_muted(state: &AppState) -> bool {
     state.muted || state.system_muted || state.setup_active || state.privacy_active
-}
-
-/// The speak surface plus the PTT/VAD tile beside it, `tile_w` wide. Returns the
-/// surface's response only in push-to-talk mode — in voice activation there
-/// is nothing to press, so it is a readout instead of a button that would do
-/// nothing.
-fn speak_row(
-    ui: &mut egui::Ui,
-    state: &AppState,
-    send: &impl Fn(Command),
-    tile_w: f32,
-) -> Option<egui::Response> {
-    let ptt = Mode::from(state.settings.audio.mode) == Mode::Ptt;
-    let offline = state.conn != ConnStatus::Connected;
-    let muted = microphone_muted(state);
-    // Alone in the room the engine sends nothing (`DspControl::audience`).
-    let alone = !offline && state.peers.is_empty();
-    let open = !offline && !alone && !muted && state.sending;
-    let key = super::ptt_key_label(&state.settings.hotkeys, &state.hotkey_backend);
-    let (vad_level, vad_threshold) = state.vad_meter();
-    let speak = widgets::Speak {
-        ptt,
-        open,
-        muted,
-        offline,
-        alone,
-        level: if ptt {
-            theme::meter_fraction(state.level.rms_db)
-        } else {
-            vad_level
-        },
-        threshold: (!ptt).then_some(vad_threshold),
-        key: ptt.then_some(key.as_str()),
-        clipping: !offline && (state.input_clipping || state.level.peak_db >= CLIP_DB),
-    };
-    // Built only while hovered: three floats formatted per frame otherwise.
-    let tooltip = |ui: &mut egui::Ui| {
-        if speak.clipping {
-            ui.label(if state.input_clipping {
-                "Mikrofoneingang übersteuert — den Eingangspegel am Gerät oder im System senken."
-            } else {
-                "Übersteuert — leiser sprechen oder das Mikrofon herunterregeln."
-            });
-        }
-        ui.label(if state.setup_active {
-            "Einrichtung offen — Mikrofontests werden nur lokal wiedergegeben.".to_string()
-        } else if state.privacy_active {
-            "Privacy ist an — dein Mikrofon wird nicht übertragen.".to_string()
-        } else if state.system_muted {
-            "Das Mikrofon ist im System stummgeschaltet — dort wieder einschalten, um zu sprechen."
-                .to_string()
-        } else if offline {
-            format!(
-                "Nicht verbunden — es wird nichts gesendet\nPegel {:.0} dBFS",
-                state.level.rms_db
-            )
-        } else if alone {
-            format!(
-                "Allein im Raum — es wird nichts gesendet\nPegel {:.0} dBFS",
-                state.level.rms_db
-            )
-        } else if ptt {
-            format!(
-                "Push-to-Talk — halten zum Sprechen\nPegel {:.0} dBFS",
-                state.level.rms_db
-            )
-        } else if !state.settings.audio.denoise {
-            format!(
-                "Sprachaktivierung nach Mikrofonpegel\nSchwelle {:.0} dBFS\nPegel {:.0} dBFS",
-                crate::dsp::vad::ENERGY_THRESHOLD_DB,
-                state.level.rms_db
-            )
-        } else {
-            format!(
-                "Sprachaktivierung\nStimme {:.2}, Schwelle {:.2}{}\nPegel {:.0} dBFS",
-                state.vad_prob,
-                state.vad_threshold,
-                if state.settings.audio.vad_auto {
-                    " (automatisch)"
-                } else {
-                    ""
-                },
-                state.level.rms_db
-            )
-        });
-    };
-
-    let size = egui::vec2(ui.available_width() - tile_w - DOCK_GAP, SPEAK_H);
-    let response = ui
-        .add_enabled_ui(!state.setup_active, |ui| {
-            widgets::speak_surface(ui, &speak, size)
-        })
-        .inner
-        .on_hover_ui(tooltip)
-        .on_disabled_hover_ui(tooltip);
-    let (glyph, label, next) = if ptt {
-        (icon::HAND_TAP, "PTT", "Umschalten auf Sprachaktivierung")
-    } else {
-        (icon::WAVEFORM, "VAD", "Umschalten auf Push-to-Talk")
-    };
-    let size = egui::vec2(tile_w, SPEAK_H);
-    if widgets::tile(
-        ui,
-        glyph,
-        label,
-        false,
-        widgets::Role::Accent,
-        widgets::RecDot::Off,
-        size,
-    )
-    .on_hover_text(next)
-    .clicked()
-    {
-        send(Command::ToggleMode);
-    }
-    ptt.then_some(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -2114,7 +1897,7 @@ fn badge_columns(rows: impl Iterator<Item = [bool; 4]>) -> Vec<Badge> {
 fn participant_row(
     ui: &mut egui::Ui,
     p: Participant<'_>,
-    columns: &[Badge],
+    _columns: &[Badge],
     active: bool,
     send: &impl Fn(Command),
 ) -> Option<icu_proto::UserId> {
@@ -2133,160 +1916,178 @@ fn participant_row(
     } else {
         Color32::TRANSPARENT
     };
-    // The whole row is the click target. The scope senses clicks before its
-    // children are added, so the volume button and the slider inside still
-    // take their own clicks first.
+    // Preserve the full row and its moderation menu as the action targets.
+    // The reference uses a fixed three-column status grid, leaving names room.
     let row = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
         egui::Frame::new()
             .fill(fill)
-            .corner_radius(egui::CornerRadius::same(theme::R_ROW))
-            .inner_margin(egui::Margin::symmetric(8, 4))
+            .corner_radius(9)
+            .inner_margin(egui::Margin::symmetric(12, 0))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let mut hint = String::new();
-                    if let Some(s) = p.subtitle() {
-                        hint.push_str(s);
-                    }
-                    let avatar =
-                        widgets::avatar(ui, p.name, p.user_id, p.speaking, p.ring, 30.0, p.video);
-                    ui.add_space(2.0);
-                    // The name gets what the icons on the right leave — ping
-                    // 22, volume 28, an 18 slot for the mode and one per badge
-                    // column, 6 apart — and ends in „…“ in a narrow window,
-                    // whole on hover.
-                    let gap = ui.spacing().item_spacing.x;
-                    let slots = 1.0 + columns.len() as f32;
-                    let mut rest = 22.0 + 28.0 + 18.0 * slots + 6.0 * (slots + 1.0) + gap;
-                    if p.speaking {
-                        rest += widgets::SPEAKING_BARS_W + gap;
-                    }
-                    let room = (ui.available_width() - rest).max(24.0);
-                    let name = ui
-                        .scope(|ui| {
-                            ui.set_max_width(room);
-                            ui.add(
-                                egui::Label::new(if p.mode.is_some() {
-                                    theme::strong_text(p.name)
-                                } else {
-                                    RichText::new(p.name).size(14.0)
-                                })
-                                .selectable(false)
-                                .truncate(),
-                            )
-                        })
-                        .inner;
-                    if !hint.is_empty() {
-                        avatar.on_hover_text(&hint);
-                        name.on_hover_text(&hint);
-                    }
-                    if p.speaking {
-                        widgets::speaking_bars(ui);
-                    }
-                    widgets::rtl(ui, 36.0, |ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        // Server-measured RTT (`docs/reference/protocol.md` §2.2 `UserRtt`), not
-                        // a client self-report: every viewer sees the same number
-                        // for a given peer. Signal bars in a fixed box, the exact
-                        // number on hover. Far right, the column every row has.
-                        let (bars, _) = ui.allocate_exact_size(
-                            egui::vec2(widgets::SIGNAL_BARS_W, 20.0),
-                            egui::Sense::hover(),
+                ui.set_min_height(52.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 52.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.set_height(52.0);
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        if p.video.is_some() {
+                            widgets::avatar(
+                                ui, p.name, p.user_id, p.speaking, p.ring, 32.0, p.video,
+                            );
+                        } else {
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
+                            ui.painter()
+                                .circle_filled(rect.center(), 16.0, tok.surface_hi);
+                            if p.speaking {
+                                ui.painter().circle_stroke(
+                                    rect.center(),
+                                    18.0,
+                                    egui::Stroke::new(2.0, p.ring.unwrap_or(tok.accent)),
+                                );
+                            }
+                            let initial = p
+                                .name
+                                .chars()
+                                .next()
+                                .unwrap_or('?')
+                                .to_uppercase()
+                                .to_string();
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                initial,
+                                egui::FontId::new(13.0, fonts::medium()),
+                                tok.muted_text,
+                            );
+                        }
+                        let name_width = (ui.available_width() - 94.0).max(24.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(name_width, 24.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_min_width(name_width);
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                let badges = if p.mode.is_some() { 30.0 } else { 0.0 }
+                                    + if p.is_admin { 22.0 } else { 0.0 };
+                                ui.scope(|ui| {
+                                    ui.set_max_width((name_width - badges).max(10.0));
+                                    ui.add(
+                                        egui::Label::new(RichText::new(p.name).font(
+                                            egui::FontId::new(
+                                                14.0,
+                                                if p.speaking {
+                                                    fonts::semibold()
+                                                } else {
+                                                    fonts::medium()
+                                                },
+                                            ),
+                                        ))
+                                        .selectable(false)
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(p.name)
+                                });
+                                if p.mode.is_some() {
+                                    egui::Frame::new()
+                                        .corner_radius(5)
+                                        .stroke(egui::Stroke::new(
+                                            1.0,
+                                            ui.visuals().widgets.inactive.bg_stroke.color,
+                                        ))
+                                        .inner_margin(egui::Margin::symmetric(4, 1))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                RichText::new("du").size(11.0).color(tok.dim_text),
+                                            );
+                                        });
+                                }
+                                if p.is_admin {
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        egui::vec2(14.0, 14.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    Icon::Shield.paint(ui, rect, tok.dim_text);
+                                    response.on_hover_text("Admin");
+                                }
+                            },
                         );
-                        if let Some(ms) = p.rtt_ms {
-                            widgets::signal_bars(ui, bars, rtt_bars(ms));
-                            ui.interact(
-                                bars,
-                                ui.id().with(("rtt", p.user_id)),
-                                egui::Sense::hover(),
-                            )
-                            .on_hover_ui(|ui| {
-                                ui.label(format!("Ping {ms} ms"));
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+                        if p.deafened || p.muted {
+                            (if p.deafened { Icon::Deaf } else { Icon::MicOff }).paint(
+                                ui,
+                                rect.shrink(1.0),
+                                tok.dim_text,
+                            );
+                            response.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Label,
+                                    true,
+                                    if p.deafened {
+                                        "hört nicht zu"
+                                    } else {
+                                        "stummgeschaltet"
+                                    },
+                                )
+                            });
+                            response.on_hover_text(if p.deafened {
+                                "Hört nicht zu"
+                            } else {
+                                "Stummgeschaltet"
                             });
                         }
-                        // Not the crossed-out speaker: that is the badge for
-                        // "this person hears nothing". At 0 % the handle shows
-                        // the speaker with an x — muted for you only.
-                        if let Some(vol) = p.volume {
-                            let glyph = if vol <= 0.0 {
-                                icon::SPEAKER_X
-                            } else {
-                                icon::SPEAKER_HIGH
-                            };
-                            if widgets::icon_button(ui, glyph, "Lautstärke ändern", 28.0, active)
-                                .on_hover_ui(|ui| {
-                                    ui.label(if vol <= 0.0 {
-                                        "Für dich stumm".to_string()
-                                    } else {
-                                        format!("Lautstärke {vol:.0} %")
-                                    });
-                                })
-                                .clicked()
-                            {
-                                clicked = Some(p.user_id);
-                            }
-                        } else {
-                            // Own row has no volume handle; keep its column so
-                            // ping and icons line up with every other row. An
-                            // allocation, not `add_space`: only an allocation
-                            // gets the item spacing the button gets.
-                            ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+                        if p.camera {
+                            Icon::Camera.paint(ui, rect.shrink(1.0), tok.dim_text);
+                            response.on_hover_text("Kamera an");
                         }
-                        // A fixed grid: every row reserves every slot, lit or
-                        // not, so each icon sits in the same column in every
-                        // row and a missing one leaves a gap instead of
-                        // shifting its neighbours.
-                        let slot = |ui: &mut egui::Ui, text: Option<RichText>| {
-                            ui.allocate_ui_with_layout(
-                                egui::vec2(18.0, 20.0),
-                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
-                                |ui| match text {
-                                    Some(text) => ui.label(text),
-                                    None => ui.allocate_response(
-                                        ui.available_size(),
-                                        egui::Sense::hover(),
-                                    ),
-                                },
-                            )
-                            .inner
-                        };
-                        let (mode_glyph, mode_hint) = if p.ptt {
-                            (icon::HAND_TAP, "Push-to-Talk")
-                        } else {
-                            (icon::WAVEFORM, "Sprachaktivierung")
-                        };
-                        slot(
-                            ui,
-                            Some(RichText::new(mode_glyph).size(15.0).color(tok.dim_text)),
-                        )
-                        .on_hover_text(mode_hint);
-                        for &badge in columns {
-                            let (on, color, glyph, hint) = match badge {
-                                Badge::Deafened => {
-                                    (p.deafened, tok.error, icon::SPEAKER_SLASH, "hört nicht zu")
-                                }
-                                Badge::Muted => (
-                                    p.muted,
-                                    tok.error,
-                                    icon::MICROPHONE_SLASH,
-                                    "stummgeschaltet",
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 20.0), egui::Sense::hover());
+                        let lit = p.rtt_ms.map(|ms| rtt_bars(ms).min(4)).unwrap_or(0);
+                        for i in 0..4 {
+                            let height = 4.0 + i as f32 * 3.0;
+                            let bar = egui::Rect::from_min_size(
+                                egui::pos2(
+                                    rect.left() + i as f32 * 5.0,
+                                    rect.center().y + 6.5 - height,
                                 ),
-                                Badge::Camera => {
-                                    (p.camera, tok.dim_text, icon::VIDEO_CAMERA, "Kamera an")
-                                }
-                                Badge::Admin => {
-                                    (p.is_admin, tok.dim_text, icon::SHIELD_STAR, "Admin")
-                                }
-                            };
-                            let glyph = RichText::new(glyph).size(15.0).color(color);
-                            let r = slot(ui, on.then_some(glyph));
-                            if on {
-                                r.on_hover_text(hint);
-                            }
+                                egui::vec2(3.0, height),
+                            );
+                            ui.painter().rect_filled(
+                                bar,
+                                1,
+                                if i < lit {
+                                    tok.muted_text
+                                } else {
+                                    tok.surface_hi
+                                },
+                            );
                         }
-                    });
-                });
+                        response.on_hover_text(
+                            p.rtt_ms
+                                .map(|ms| format!("Ping {ms} ms"))
+                                .unwrap_or_else(|| "Ping noch nicht verfügbar".into()),
+                        );
+                    },
+                );
             });
     });
+    row.response.clone().on_hover_text(format!(
+        "{} · {}{} · {}\nKlicken: Person und Lautstärke",
+        p.name,
+        if p.ptt {
+            "Push-to-Talk"
+        } else {
+            "Sprachaktivierung"
+        },
+        p.volume
+            .map(|volume| format!(" · {volume:.0} % für dich"))
+            .unwrap_or_default(),
+        p.subtitle().unwrap_or("Bereit")
+    ));
     let r = row.response.rect;
     if row.response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2437,7 +2238,7 @@ pub fn run_enroll(
             .with_inner_size([560.0, 600.0])
             .with_min_inner_size([480.0, 520.0]),
     );
-    eframe::run_native(
+    super::native::run_native(
         "ICU",
         options,
         Box::new(move |cc| {
@@ -2449,7 +2250,12 @@ pub fn run_enroll(
             let ctx = cc.egui_ctx.clone();
             crate::signals::set_waker(move || ctx.request_repaint());
             crate::signals::listen();
+            let update_config = paths.config_dir.clone();
             let mut app = EnrollApp::new(paths, server_addr, result_app);
+            let update_ctx = cc.egui_ctx.clone();
+            app.updater = Some(crate::update::Updater::new(update_config, move || {
+                update_ctx.request_repaint()
+            }));
             if let Some(text) = text {
                 app.paste(text);
             }
@@ -2487,6 +2293,8 @@ enum EnrollStep {
 /// file on it; check where it leads, pick a name, join. `pub` for
 /// `tests/ui_layout.rs`.
 pub struct EnrollApp {
+    updater: Option<crate::update::Updater>,
+    update_confirm: bool,
     window_restore: WindowRestore,
     #[cfg(windows)]
     positioned: bool,
@@ -2537,6 +2345,8 @@ impl EnrollApp {
         let current = Identity::load(&paths).ok().flatten();
         let settings = crate::config::Settings::load(&paths).unwrap_or_default();
         EnrollApp {
+            updater: None,
+            update_confirm: false,
             window_restore: WindowRestore::default(),
             #[cfg(windows)]
             positioned: false,
@@ -2692,6 +2502,8 @@ impl eframe::App for EnrollApp {
     }
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        crate::update::windows::healthy_frame(root.ctx());
         let ctx = root.ctx().clone();
         #[cfg(windows)]
         if !self.positioned {
@@ -2752,6 +2564,22 @@ impl eframe::App for EnrollApp {
         let join_ok = !busy && (!needs_name || name_ok);
         let mut join = false;
         let mut back = false;
+
+        // Updates must also be reachable before an invitation is pasted.
+        if let Some(updater) = &self.updater {
+            let snapshot = updater.snapshot();
+            if (snapshot.available.is_some() && !snapshot.dismissed) || self.update_confirm {
+                egui::Panel::bottom("enroll_update").show(root, |ui| {
+                    updater.act(super::updates::notice(
+                        ui,
+                        &snapshot,
+                        None,
+                        false,
+                        &mut self.update_confirm,
+                    ));
+                });
+            }
+        }
 
         // The actions sit at the bottom edge, so the window has a floor
         // instead of trailing off into empty panel. The paste step has none:
@@ -3208,6 +3036,7 @@ mod tests {
             ptt_held: true,
             ptt_pointer_held: true,
             ptt_key_held: Some(egui::Key::Space),
+            ..Default::default()
         };
         assert!(matches!(view.release_ptt(), Some(Command::Ptt(false))));
         assert!(!view.ptt_pointer_held);

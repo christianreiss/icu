@@ -31,6 +31,9 @@ use icu_client::{
 #[derive(Debug, Parser)]
 #[command(name = "icu", version, about, long_about = None)]
 struct Cli {
+    /// Private first-frame acknowledgement to the authenticated update broker.
+    #[arg(long, hide = true)]
+    update_ready: Option<String>,
     /// Private child process that restores temporary application gains on EOF.
     #[arg(long, hide = true)]
     ducking_worker: bool,
@@ -103,6 +106,14 @@ fn main() -> ExitCode {
         };
         SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR)
     };
+    #[cfg(windows)]
+    if let Some(result) = icu_client::update::windows::special_entry() {
+        return if result.is_ok() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     #[cfg(windows)]
     let console = attach_console();
     // Toasts and the taskbar button go by ICU's app id (`notify`).
@@ -475,6 +486,8 @@ fn init_tracing(file: Option<std::fs::File>) {
     allow(unused_mut, unused_variables, clippy::never_loop)
 )]
 fn run(cli: Cli) -> Result<(), String> {
+    #[cfg(windows)]
+    icu_client::update::windows::startup(cli.update_ready.as_deref())?;
     let paths = Paths::new(cli.config_dir.clone());
     std::fs::create_dir_all(&paths.config_dir).map_err(|e| e.to_string())?;
     // An unreadable settings.toml does not stop a desktop start: it is moved

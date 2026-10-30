@@ -9,7 +9,7 @@ TOML-Dateien.
 
 ## 0. Pakete (rpm/deb)
 
-Fertige Pakete liegen unter https://github.com/christianreiss/icu/releases:
+Fertige Pakete liegen auf [der ICU-Downloadseite](https://misc.alpha-labs.net/icu/):
 `icu-server` (ein statisches Binary, dasselbe Paket für Fedora, AlmaLinux 10+
 und Debian 12+) und der Client `icu` je Distro (Fedora 42, Fedora 43, Debian 13).
 
@@ -61,8 +61,8 @@ nur ein neuer Lauf; ohne CI also etwa wöchentlich auf dem letzten Tag:
 **Downloads prüfen** (seit 2026-09-27). Ein Release trägt `SHA256SUMS`, die
 SSH-Signatur `SHA256SUMS.sig` mit dem Release-Schlüssel des Maintainers
 (Namensraum `icu-release`) und je Build eine `BUILDINFO.<teil>` mit Commit,
-Compiler und den Dateien dieses Builds; der Git-Tag ist signiert
-(`git tag -v v<ver>`). Den öffentlichen Schlüssel einmal aus dem Repository
+Compiler und den Dateien dieses Builds; bei einem über `packaging/release.sh` veröffentlichten Release ist zusätzlich der
+Git-Tag signiert (`git tag -v v<ver>`). Den öffentlichen Schlüssel einmal aus dem Repository
 nehmen (`packaging/allowed_signers`) und aufbewahren; seinen Fingerabdruck
 (`cut -d' ' -f3,4 allowed_signers | ssh-keygen -lf -`) auf einem zweiten Weg
 beim Maintainer abgleichen. Eine Kopie, die neben den Downloads liegt,
@@ -77,7 +77,9 @@ Erwartet: `Good "icu-release" signature for icu-release …` und `OK` je
 heruntergeladener Datei. Unter Windows statt `sha256sum`:
 `certutil -hashfile icu-<ver>-windows-x86_64.zip SHA256` mit der Zeile in
 `SHA256SUMS` vergleichen (`ssh-keygen` bringt der OpenSSH-Client von
-Windows mit; dort ungeprüft).
+Windows mit). Ab 0.1.20 authentifiziert der Windows-Updater seine Artefakte
+über signierte Metadaten mit eingebettetem Schlüssel. Linux bleibt bei der
+Paketverwaltung. Siehe [Release- und Update-Anleitung](../docs/development/updates.md).
 
 ## 1. Bauen
 
