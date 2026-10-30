@@ -49,6 +49,8 @@ pub enum Pop {
     Lost {
         /// The lost sequence number.
         seq: u16,
+        /// Missing media duration at 48 kHz; independent of the successor.
+        samples: u32,
         /// The packet after the lost one, if present.
         fec_source: Option<Packet>,
     },
@@ -92,7 +94,7 @@ pub struct JitterConfig {
     /// Upper clamp for the target delay.
     pub max_delay: Duration,
     /// Consecutive lost frames after which the spurt is given up (100 ms).
-    pub max_loss_frames: u32,
+    pub max_loss: Duration,
 }
 
 impl Default for JitterConfig {
@@ -101,7 +103,7 @@ impl Default for JitterConfig {
             frame_samples: 960,
             start_frames: 2,
             max_delay: Duration::from_millis(200),
-            max_loss_frames: 5,
+            max_loss: Duration::from_millis(100),
         }
     }
 }
@@ -121,11 +123,13 @@ const MAX_EARLY: Duration = Duration::from_millis((BUCKETS as f64 * BUCKET_MS) a
 const FORGET: f64 = 0.997;
 /// Consecutive pops with more than target + 2 frames queued before one
 /// packet is skipped to shed the excess: half a second at 20 ms frames.
-const EXCESS_POPS: u32 = 25;
+const EXCESS_TIME: Duration = Duration::from_millis(500);
 /// Pops a due stretch or skip waits for a quiet frame before it goes ahead
 /// in the middle of speech: a second at 20 ms frames. A pause between
 /// words normally comes sooner; a speaker who never pauses gets the
 /// adjustment anyway rather than the underrun it prevents.
+const QUIET_TIME: Duration = Duration::from_secs(1);
+#[cfg(test)]
 const QUIET_PATIENCE: u32 = 50;
 /// Half of the stall memory: the tallest spike of the current and the
 /// previous half-window sets the target, so a stall is remembered for
@@ -154,13 +158,13 @@ pub struct JitterBuffer {
     cfg: JitterConfig,
     /// Queued packets keyed by their unwrapped sequence number, with their
     /// arrival time.
-    queue: BTreeMap<i64, (Packet, Instant)>,
+    queue: BTreeMap<i64, (Packet, Instant, u32)>,
     /// Unwrapping helper: last seen (seq, unwrapped).
     last_seen: Option<(u16, i64)>,
     /// Next sequence number to play while a spurt is active.
     next: Option<i64>,
     /// Consecutive misses inside a spurt.
-    misses: u32,
+    misses: Duration,
     anchor: Option<Anchor>,
     /// Arrival of the first queued packet while prefilling.
     prefill_since: Option<Instant>,
@@ -179,9 +183,9 @@ pub struct JitterBuffer {
     /// Frames inserted by underruns this spurt and not yet shed again.
     grown: u32,
     /// Consecutive pops that found more than target + 2 frames queued.
-    excess_pops: u32,
+    excess_time: Duration,
     /// Pops a due stretch has waited for a quiet frame.
-    stretch_wait: u32,
+    stretch_wait: Duration,
     /// The last pop concealed a frame without advancing (underrun or
     /// stretch): another concealment continues it instead of starting a
     /// second interruption.
@@ -190,6 +194,11 @@ pub struct JitterBuffer {
     /// as lost). Survives the end of a spurt: a straggler from a finished
     /// spurt is late, not the start of a new one.
     played_hwm: Option<i64>,
+    last_received_samples: u32,
+    next_ts: Option<u32>,
+    observed_at: Option<Instant>,
+    shrink_since: Option<Instant>,
+    last_shrink: Option<Instant>,
 }
 
 impl JitterBuffer {
@@ -201,7 +210,7 @@ impl JitterBuffer {
             queue: BTreeMap::new(),
             last_seen: None,
             next: None,
-            misses: 0,
+            misses: Duration::ZERO,
             anchor: None,
             prefill_since: None,
             hist: [0.0; BUCKETS],
@@ -214,10 +223,15 @@ impl JitterBuffer {
             last_end: false,
             last_delay: None,
             grown: 0,
-            excess_pops: 0,
-            stretch_wait: 0,
+            excess_time: Duration::ZERO,
+            stretch_wait: Duration::ZERO,
             concealing: false,
             played_hwm: None,
+            last_received_samples: cfg.frame_samples,
+            next_ts: None,
+            observed_at: None,
+            shrink_since: None,
+            last_shrink: None,
         }
     }
 
@@ -277,11 +291,22 @@ impl JitterBuffer {
 
     /// Queues a packet that arrived at `now`.
     pub fn push(&mut self, packet: Packet, now: Instant) {
+        self.push_with_duration(packet, self.cfg.frame_samples, now);
+    }
+
+    /// Queue with the duration from this packet's own codec header. Reordering
+    /// cannot change the duration of older queued packets or of missing slots.
+    pub fn push_with_duration(&mut self, packet: Packet, samples: u32, now: Instant) {
+        let samples = if (120..=5760).contains(&samples) && samples.is_multiple_of(120) {
+            samples
+        } else {
+            self.cfg.frame_samples
+        };
         // Pause detection: gapless seq, ts jumped further than one frame.
         if let (Some((last_seq, _)), Some(last_ts)) = (self.last_seen, self.last_ts) {
             let gapless = seq_diff(packet.seq, last_seq) == 1;
             let step = ts_diff(packet.ts, last_ts);
-            if gapless && step > 0 && step != self.cfg.frame_samples as i32 {
+            if gapless && step > 0 && step != self.last_received_samples as i32 {
                 // A pause: the spurt ended without us seeing END (or with it).
                 self.end_spurt();
             }
@@ -321,10 +346,27 @@ impl JitterBuffer {
                 Duration::ZERO
             };
             self.observe(delay, now);
-            // Mid-spurt the target only grows; it shrinks in pauses.
             let before = self.target;
             self.adapt();
-            self.target = self.target.max(before);
+            let candidate = self.target;
+            if candidate + Duration::from_millis(5) < before {
+                let since = *self.shrink_since.get_or_insert(now);
+                let ready = now.saturating_duration_since(since) >= Duration::from_secs(2)
+                    && self
+                        .last_shrink
+                        .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(1));
+                self.target = if ready {
+                    self.last_shrink = Some(now);
+                    before
+                        .saturating_sub(Duration::from_millis(10))
+                        .max(candidate)
+                } else {
+                    before
+                };
+            } else {
+                self.shrink_since = None;
+                self.target = candidate.max(before);
+            }
             if delay >= Duration::from_millis(25) {
                 tracing::debug!(
                     seq = packet.seq,
@@ -346,9 +388,10 @@ impl JitterBuffer {
         }
         if ts_diff(packet.ts, self.last_ts.unwrap_or(packet.ts)) >= 0 {
             self.last_ts = Some(packet.ts);
+            self.last_received_samples = samples;
+            self.last_end = packet.end;
         }
-        self.last_end = packet.end;
-        self.queue.insert(u, (packet, now));
+        self.queue.insert(u, (packet, now, samples));
     }
 
     fn observe(&mut self, delay: Duration, now: Instant) {
@@ -368,8 +411,13 @@ impl JitterBuffer {
         if delay > self.spike_threshold() {
             self.spike_cur = self.spike_cur.max(delay);
         }
+        let elapsed = self.observed_at.map_or(Duration::from_millis(20), |t| {
+            now.saturating_duration_since(t)
+        });
+        self.observed_at = Some(now);
+        let forget = FORGET.powf(elapsed.as_secs_f64() / 0.020);
         for b in self.hist.iter_mut() {
-            *b *= FORGET;
+            *b *= forget;
         }
         let idx = ((delay.as_secs_f64() * 1000.0 / BUCKET_MS) as usize).min(BUCKETS - 1);
         self.hist[idx] += 1.0;
@@ -454,13 +502,14 @@ impl JitterBuffer {
         }
         self.next = None;
         self.anchor = None;
-        self.misses = 0;
+        self.next_ts = None;
+        self.misses = Duration::ZERO;
         // The next short spurt may already be queued behind this END. It
         // must retain an arrival clock even if no further packet arrives.
-        self.prefill_since = self.queue.values().map(|(_, at)| *at).min();
+        self.prefill_since = self.queue.values().map(|(_, at, _)| *at).min();
         self.grown = 0;
-        self.excess_pops = 0;
-        self.stretch_wait = 0;
+        self.excess_time = Duration::ZERO;
+        self.stretch_wait = Duration::ZERO;
         self.concealing = false;
     }
 
@@ -470,13 +519,26 @@ impl JitterBuffer {
         let Some(anchor) = self.anchor else {
             return Duration::ZERO;
         };
-        let ahead = (slot - anchor.seq).clamp(0, u32::MAX as i64) as u32;
-        now.saturating_duration_since(anchor.arrival + frame * ahead)
+        let ts = self.queue.get(&slot).map(|(p, _, _)| p.ts).or(self.next_ts);
+        let offset = ts.map_or_else(
+            || frame * (slot - anchor.seq).clamp(0, u32::MAX as i64) as u32,
+            |ts| Duration::from_micros(ts_diff(ts, anchor.ts).max(0) as u64 * 1_000_000 / 48_000),
+        );
+        now.saturating_duration_since(anchor.arrival + offset)
+    }
+
+    fn queued_duration(&self, first: i64) -> Duration {
+        let samples: u64 = self
+            .queue
+            .range(first..)
+            .map(|(_, (_, _, n))| *n as u64)
+            .sum();
+        Duration::from_micros(samples * 1_000_000 / 48_000)
     }
 
     /// Caps the queue at `max_delay` (or target + 2 frames, if larger): past
     /// that, drops the oldest packets down to target + 1 frame (at least one
-    /// packet stays). Without this a stall longer than `max_loss_frames` ends
+    /// packet stays). Without this a stall longer than `max_loss` ends
     /// the spurt, the burst that follows is queued whole and the next prefill
     /// starts at its oldest packet: packets then arrive as fast as they play,
     /// and the backlog lasts until the next pause. Runs before the prefill for
@@ -487,10 +549,10 @@ impl JitterBuffer {
     /// third frame until caught up, would be gentler.
     fn drain_backlog(&mut self, frame: Duration) {
         let cap = self.cfg.max_delay.max(self.target + frame * 2);
-        if self.grown > 0 || frame * self.queue.len() as u32 <= cap {
+        if self.grown > 0 || self.queued_duration(i64::MIN) <= cap {
             return;
         }
-        while self.queue.len() > 1 && frame * self.queue.len() as u32 > self.target + frame {
+        while self.queue.len() > 1 && self.queued_duration(i64::MIN) > self.target + frame {
             if let Some((k, _)) = self.queue.pop_first() {
                 // Dropped counts as consumed: a late twin must not be queued
                 // behind the packets that replaced it.
@@ -520,6 +582,22 @@ impl JitterBuffer {
     /// that is due waits up to `QUIET_PATIENCE` pops for one, so the
     /// adjustment lands in a pause instead of a word.
     pub fn pop_quiet(&mut self, now: Instant, quiet: bool) -> Pop {
+        self.pop_quiet_at(now, now, quiet)
+    }
+
+    /// Decode ahead of a native playback callback. Audio already queued after
+    /// this buffer contributes to the scheduled playout margin: a large callback
+    /// drains several blocks at once, but that batching is not network jitter.
+    /// Only proactive stretching uses this deadline. Packet availability,
+    /// prefill and measured arrival-to-decode latency still use real `now`.
+    pub fn pop_quiet_at(&mut self, now: Instant, playout_at: Instant, quiet: bool) -> Pop {
+        if let Some((_, (_, _, samples))) = self
+            .queue
+            .iter()
+            .find(|(k, _)| self.next.is_none_or(|n| **k == n))
+        {
+            self.cfg.frame_samples = *samples;
+        }
         let frame = self.frame_duration();
         self.drain_backlog(frame);
         if self.next.is_none() {
@@ -535,19 +613,20 @@ impl JitterBuffer {
                 .prefill_since
                 .map(|t| now.saturating_duration_since(t))
                 .unwrap_or_default();
-            let queued = frame * self.queue.len() as u32;
+            let queued = self.queued_duration(i64::MIN);
             if waited < self.target && queued < self.target + frame {
                 return Pop::Silence;
             }
-            let (first_pkt, first_arrival) = &self.queue[&first];
+            let (first_pkt, first_arrival, _) = &self.queue[&first];
+            self.next_ts = Some(first_pkt.ts);
             self.anchor = Some(Anchor {
                 arrival: *first_arrival,
                 ts: first_pkt.ts,
                 seq: first,
             });
             self.next = Some(first);
-            self.misses = 0;
-            self.stretch_wait = 0;
+            self.misses = Duration::ZERO;
+            self.stretch_wait = Duration::ZERO;
             self.concealing = false;
             self.stats.spurts += 1;
             tracing::debug!(
@@ -563,30 +642,35 @@ impl JitterBuffer {
         // packet before decode (RFC 6716 §4.4.1): at once when underruns
         // grew it (`grown`); otherwise — a burst at spurt start, a sender
         // whose clock runs fast — only once more than target + 2 frames
-        // has been queued for `EXCESS_POPS` pops, so a jitter spike the
+        // has been queued for `EXCESS_TIME` pops, so a jitter spike the
         // target is still absorbing is not mistaken for it, and preferably
         // at a quiet frame. Two frames, because the playout sits up to a
         // frame past the target after a prefill or stretch, and the queue
         // is measured in whole frames.
-        let queued = frame * self.queue.range(next..).count() as u32;
+        let queued = self.queued_duration(next);
         let excess = queued > self.target + 2 * frame;
-        self.excess_pops = if excess { self.excess_pops + 1 } else { 0 };
+        self.excess_time = if excess {
+            self.excess_time + frame
+        } else {
+            Duration::ZERO
+        };
         let shed = excess
             && (self.grown > 0
-                || (self.excess_pops >= EXCESS_POPS
-                    && (quiet || self.excess_pops >= EXCESS_POPS + QUIET_PATIENCE)));
-        if shed && self.queue.remove(&next).is_some() {
+                || (self.excess_time >= EXCESS_TIME
+                    && (quiet || self.excess_time >= EXCESS_TIME + QUIET_TIME)));
+        if let Some((skipped, _, samples)) = shed.then(|| self.queue.remove(&next)).flatten() {
+            self.next_ts = Some(skipped.ts.wrapping_add(samples));
             tracing::debug!(
                 seq = (next & 0xFFFF) as u16,
                 queued_ms = queued.as_millis() as u64,
                 target_ms = self.target.as_millis() as u64,
                 grown = self.grown,
-                excess_pops = self.excess_pops,
+                excess_ms = self.excess_time.as_millis() as u64,
                 played = self.stats.played,
                 "jitter skip"
             );
             self.grown = self.grown.saturating_sub(1);
-            self.excess_pops = 0;
+            self.excess_time = Duration::ZERO;
             self.stats.skipped += 1;
             next += 1;
             self.next = Some(next);
@@ -603,7 +687,7 @@ impl JitterBuffer {
         // missing one is an underrun below.
         if self.queue.contains_key(&next) {
             let depth = self
-                .margin(next, now, frame)
+                .margin(next, playout_at.max(now), frame)
                 .max(queued.saturating_sub(frame));
             let short = if self.concealing {
                 depth < self.target
@@ -611,7 +695,7 @@ impl JitterBuffer {
                 depth + frame < self.target
             };
             if short {
-                if quiet || self.concealing || self.stretch_wait >= QUIET_PATIENCE {
+                if quiet || self.concealing || self.stretch_wait >= QUIET_TIME {
                     tracing::debug!(
                         seq = (next & 0xFFFF) as u16,
                         depth_ms = depth.as_millis() as u64,
@@ -619,23 +703,26 @@ impl JitterBuffer {
                         played = self.stats.played,
                         "jitter stretch"
                     );
-                    self.stretch_wait = 0;
+                    self.stretch_wait = Duration::ZERO;
                     self.concealing = true;
                     self.grown = 0;
                     self.stats.stretched += 1;
                     return Pop::Lost {
                         seq: (next & 0xFFFF) as u16,
+                        samples: self.cfg.frame_samples,
                         fec_source: None,
                     };
                 }
-                self.stretch_wait += 1;
+                self.stretch_wait += frame;
             } else {
-                self.stretch_wait = 0;
+                self.stretch_wait = Duration::ZERO;
             }
         }
-        if let Some((pkt, arrived)) = self.queue.remove(&next) {
+        if let Some((pkt, arrived, samples)) = self.queue.remove(&next) {
+            self.cfg.frame_samples = samples;
+            self.next_ts = Some(pkt.ts.wrapping_add(samples));
             self.last_delay = Some(now.saturating_duration_since(arrived));
-            self.misses = 0;
+            self.misses = Duration::ZERO;
             self.concealing = false;
             self.stats.played += 1;
             let end = pkt.end;
@@ -651,11 +738,11 @@ impl JitterBuffer {
             .queue
             .range(next + 1..)
             .next()
-            .map(|(k, (p, _))| (*k, p.clone()));
+            .map(|(k, (p, _, _))| (*k, p.clone()));
         match later {
             Some((k, _)) if k - next > self.max_gap(frame) => {
                 // Further ahead than the buffer ever holds: not a loss burst
-                // (that ends the spurt after `max_loss_frames` misses) but a
+                // (that ends the spurt after `max_loss` misses) but a
                 // `seq` that jumped. Walked slot by slot, one packet 32 767
                 // ahead concealed as many frames — 11 minutes of Deep PLC in
                 // the mixer. A new spurt starts at it instead.
@@ -671,8 +758,22 @@ impl JitterBuffer {
             Some((k, pkt)) => {
                 // A later packet is here: `next` is lost, not late.
                 self.stats.lost += 1;
-                self.misses = 0;
+                self.misses = Duration::ZERO;
                 self.concealing = false;
+                // Timestamps delimit a single missing slot even across 10/20 ms
+                // transitions. Multiple missing durations are unknowable: retain
+                // the previous decoded duration until an adjacent timestamp helps.
+                let samples = if k == next + 1 {
+                    self.next_ts
+                        .map(|ts| ts_diff(pkt.ts, ts))
+                        .filter(|n| (120..=5760).contains(n) && n % 120 == 0)
+                        .map(|n| n as u32)
+                        .unwrap_or(self.cfg.frame_samples)
+                } else {
+                    self.cfg.frame_samples
+                };
+                self.next_ts = self.next_ts.map(|ts| ts.wrapping_add(samples));
+                self.cfg.frame_samples = samples;
                 let fec_source = if k == next + 1 { Some(pkt) } else { None };
                 let seq = (next & 0xFFFF) as u16;
                 tracing::debug!(
@@ -684,7 +785,11 @@ impl JitterBuffer {
                 );
                 self.next = Some(next + 1);
                 self.played_hwm = Some(next);
-                Pop::Lost { seq, fec_source }
+                Pop::Lost {
+                    seq,
+                    samples,
+                    fec_source,
+                }
             }
             None => {
                 if self.last_end {
@@ -692,8 +797,8 @@ impl JitterBuffer {
                     self.end_spurt();
                     return Pop::Silence;
                 }
-                self.misses += 1;
-                if self.misses > self.cfg.max_loss_frames {
+                self.misses += frame;
+                if self.misses > self.cfg.max_loss {
                     self.end_spurt();
                     return Pop::Silence;
                 }
@@ -709,13 +814,14 @@ impl JitterBuffer {
                     seq,
                     target_ms = self.target.as_millis() as u64,
                     grown = self.grown,
-                    misses = self.misses,
+                    misses_ms = self.misses.as_millis() as u64,
                     played = self.stats.played,
                     last_delay_ms = self.last_delay.map_or(0, |d| d.as_millis() as u64),
                     "jitter underrun"
                 );
                 Pop::Lost {
                     seq,
+                    samples: self.cfg.frame_samples,
                     fec_source: None,
                 }
             }
@@ -726,6 +832,47 @@ impl JitterBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_playback_counts_as_margin_without_inventing_missing_packets() {
+        let t0 = Instant::now();
+        let make = |seq: u16| Packet {
+            gain_epoch: 0,
+            seq,
+            ts: seq as u32 * 960,
+            end: false,
+            payload: vec![],
+        };
+        let mut jb = JitterBuffer::new(JitterConfig::default());
+        jb.push(make(0), t0);
+        jb.push(make(1), t0 + Duration::from_millis(20));
+        assert!(matches!(
+            jb.pop(t0 + Duration::from_millis(40)),
+            Pop::Packet(_)
+        ));
+        // A native callback caused the mixer to refill early. Its existing
+        // 30 ms of audio still plays before this packet: stretching now would
+        // manufacture a loss despite 70 ms of total arrival-to-playout margin.
+        jb.target = Duration::from_millis(80);
+        assert!(matches!(
+            jb.pop_quiet_at(
+                t0 + Duration::from_millis(60),
+                t0 + Duration::from_millis(90),
+                true
+            ),
+            Pop::Packet(_)
+        ));
+        assert_eq!(jb.stats().stretched, 0);
+        assert!(matches!(
+            jb.pop_quiet_at(
+                t0 + Duration::from_millis(80),
+                t0 + Duration::from_millis(110),
+                true
+            ),
+            Pop::Lost { .. }
+        ));
+        assert_eq!(jb.stats().underruns, 1);
+    }
 
     fn pkt(seq: u16, ts: u32, end: bool) -> Packet {
         Packet {
@@ -743,6 +890,175 @@ mod tests {
 
     fn buffer() -> JitterBuffer {
         JitterBuffer::new(JitterConfig::default())
+    }
+
+    #[test]
+    fn realistic_clock_drift_remains_bounded_for_ten_minutes() {
+        for samples in [480u32, 960] {
+            for ppm in [-200i32, -100, -50, 50, 100, 200] {
+                let start = Instant::now();
+                let period = samples as f64 / 48000.0;
+                let sender_period = period / (1.0 + ppm as f64 / 1_000_000.0);
+                let mut jb = JitterBuffer::new(JitterConfig {
+                    frame_samples: samples,
+                    ..Default::default()
+                });
+                let mut sent = 0u32;
+                let mut max_delay = Duration::ZERO;
+                let mut peak_target = Duration::ZERO;
+                for tick in 0..(600.0 / period) as u32 {
+                    let elapsed = tick as f64 * period;
+                    while sent as f64 * sender_period <= elapsed {
+                        let at = start + Duration::from_secs_f64(sent as f64 * sender_period);
+                        jb.push_with_duration(pkt(sent as u16, sent * samples, false), samples, at);
+                        sent += 1;
+                    }
+                    if let Pop::Packet(_) = jb.pop(start + Duration::from_secs_f64(elapsed)) {
+                        max_delay = max_delay.max(jb.last_delay().unwrap_or_default());
+                    }
+                    peak_target = peak_target.max(jb.target());
+                }
+                let stats = jb.stats();
+                let adjustments = stats.skipped + stats.underruns + stats.stretched;
+                let drift_frames =
+                    (600.0 * ppm.unsigned_abs() as f64 / 1_000_000.0 / period).ceil() as u64;
+                eprintln!("clock {ppm:+}ppm frame={samples}: max_delay={max_delay:?} peak_target={peak_target:?} corrections={adjustments} stats={stats:?}");
+                assert_eq!(stats.lost, 0);
+                assert_eq!(stats.dropped, 0);
+                assert_eq!(stats.spurts, 1);
+                assert!(max_delay <= ms(120), "drift became accumulating latency");
+                assert!(
+                    adjustments <= drift_frames + 6,
+                    "oscillating correction: {adjustments} vs {drift_frames} physical drift frames"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reordered_duration_changes_preserve_missing_slot_timestamps() {
+        for (old, new) in [(960, 480), (480, 960)] {
+            let t0 = Instant::now();
+            let mut jb = JitterBuffer::new(JitterConfig {
+                frame_samples: old,
+                ..Default::default()
+            });
+            jb.push_with_duration(pkt(0, 0, false), old, t0);
+            jb.push_with_duration(pkt(1, old, false), old, t0);
+            assert!(matches!(
+                jb.pop(t0 + ms(40)),
+                Pop::Packet(Packet { seq: 0, .. })
+            ));
+            assert!(matches!(
+                jb.pop(t0 + ms(60)),
+                Pop::Packet(Packet { seq: 1, .. })
+            ));
+            // Frame 2 is the first at the new duration and is lost. Arrival
+            // order 4,3 must not rewrite the missing duration using frame 4.
+            jb.push_with_duration(pkt(4, 2 * old + 2 * new, true), new, t0 + ms(75));
+            jb.push_with_duration(pkt(3, 2 * old + new, false), new, t0 + ms(76));
+            let mut recovered = None;
+            for step in 0..20 {
+                if let Pop::Lost {
+                    seq: 2,
+                    samples,
+                    fec_source: Some(source),
+                } = jb.pop(t0 + ms(80 + step * 20))
+                {
+                    assert_eq!(source.seq, 3);
+                    recovered = Some(samples);
+                    break;
+                }
+            }
+            assert_eq!(recovered, Some(new), "{old} -> {new}");
+        }
+    }
+
+    #[test]
+    fn tail_concealment_has_the_same_time_budget_at_ten_and_twenty_ms() {
+        for samples in [480, 960] {
+            let t0 = Instant::now();
+            let mut jb = JitterBuffer::new(JitterConfig {
+                frame_samples: samples,
+                ..Default::default()
+            });
+            let dt = Duration::from_micros(samples as u64 * 1_000_000 / 48_000);
+            jb.push_with_duration(pkt(0, 0, false), samples, t0);
+            let mut now = t0 + ms(40);
+            assert!(matches!(jb.pop(now), Pop::Packet(_)));
+            let mut concealed = Duration::ZERO;
+            loop {
+                now += dt;
+                match jb.pop(now) {
+                    Pop::Lost { samples, .. } => {
+                        concealed += Duration::from_micros(samples as u64 * 1_000_000 / 48_000)
+                    }
+                    Pop::Silence => break,
+                    _ => panic!("unexpected packet"),
+                }
+            }
+            assert_eq!(concealed, ms(100));
+        }
+    }
+
+    #[test]
+    fn target_recovers_during_a_continuous_monologue_after_a_single_stall() {
+        for samples in [480u32, 960] {
+            let t0 = Instant::now();
+            let dt_ms = samples as u64 / 48;
+            let mut jb = JitterBuffer::new(JitterConfig {
+                frame_samples: samples,
+                ..Default::default()
+            });
+            let arrivals: Vec<_> = (0..90000 / dt_ms)
+                .map(|i| {
+                    let due = i * dt_ms;
+                    (
+                        (if (1000..1120).contains(&due) {
+                            1120
+                        } else {
+                            due
+                        }),
+                        i as u16,
+                    )
+                })
+                .collect();
+            let mut at = 0;
+            let mut peak = Duration::ZERO;
+            let mut steady_max = Duration::ZERO;
+            for now_ms in (0..90000).step_by(dt_ms as usize) {
+                let now = t0 + ms(now_ms);
+                while at < arrivals.len() && arrivals[at].0 <= now_ms {
+                    let (due, seq) = arrivals[at];
+                    jb.push_with_duration(
+                        pkt(seq, seq as u32 * samples, false),
+                        samples,
+                        t0 + ms(due),
+                    );
+                    at += 1;
+                }
+                let _ = jb.pop(now);
+                peak = peak.max(jb.target());
+                if now_ms >= 70000 {
+                    steady_max = steady_max.max(jb.target());
+                }
+            }
+            eprintln!(
+                "{dt_ms}ms frames: spike target {:?}, recovered target {:?}, {:?}",
+                peak,
+                steady_max,
+                jb.stats()
+            );
+            assert!(peak >= ms(100));
+            assert!(
+                steady_max <= ms(40),
+                "target stuck after expired spike: {steady_max:?}"
+            );
+            assert!(
+                jb.stats.spurts <= 2,
+                "must recover during continuous playback"
+            );
+        }
     }
 
     #[test]
@@ -797,7 +1113,9 @@ mod tests {
         assert!(matches!(jb.pop(t0 + ms(60)), Pop::Packet(p) if p.seq == 0));
         assert!(matches!(jb.pop(t0 + ms(80)), Pop::Packet(p) if p.seq == 1));
         match jb.pop(t0 + ms(100)) {
-            Pop::Lost { seq, fec_source } => {
+            Pop::Lost {
+                seq, fec_source, ..
+            } => {
                 assert_eq!(seq, 2);
                 assert_eq!(fec_source.map(|p| p.seq), Some(3));
             }

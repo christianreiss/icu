@@ -3,6 +3,7 @@ members = ["crates/icu-proto", "crates/icu-server", "crates/icu-client"]
 # Die Spikes unter experiments/ sind eigenstaendige Pakete und gehoeren nicht
 # in diesen Workspace; ohne exclude meldet cargo dort "believes it's in a workspace".
 exclude = [
+    "vendor/quinn-proto",
     "experiments/spike-aec",
     "experiments/spike-audio",
     "experiments/spike-camera",
@@ -12,8 +13,12 @@ exclude = [
 ]
 resolver = "2"
 
+[patch.crates-io]
+# Audio datagrams expire before QUIC packet construction, even during stalls.
+quinn-proto = { path = "vendor/quinn-proto" }
+
 [workspace.package]
-version = "0.1.18"
+version = "0.1.19"
 edition = "2021"
 rust-version = "1.98"
 license = "Apache-2.0"

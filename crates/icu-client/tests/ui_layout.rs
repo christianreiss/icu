@@ -310,6 +310,7 @@ fn state() -> AppState {
     };
     AppState {
         tuning_status: String::new(),
+        ducking_status: Default::default(),
         audio_health: Default::default(),
         can_restore_audio: false,
         conn: ConnStatus::Connected,
@@ -803,9 +804,10 @@ fn main_window_grows_for_a_bigger_room() {
 }
 
 /// The settings pages as the sidebar names them.
-const PAGES: [&str; 8] = [
+const PAGES: [&str; 9] = [
     "Audio",
     "Klang",
+    "Absenkung",
     "Tastenkürzel",
     "Kamera",
     "Overlay",

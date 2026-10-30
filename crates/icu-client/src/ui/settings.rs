@@ -62,6 +62,7 @@ const CORNER_PICKER_W: f32 = CORNER_SWATCH * 6.0 + CORNER_GAP * 6.0 + CORNER_SPL
 enum Tab {
     Audio,
     Sound,
+    Ducking,
     Hotkeys,
     Camera,
     Overlay,
@@ -416,6 +417,7 @@ impl SettingsView {
         let mut tabs = vec![
             (Tab::Audio, icon::MICROPHONE, "Audio"),
             (Tab::Sound, icon::WAVEFORM, "Klang"),
+            (Tab::Ducking, icon::SPEAKER_HIGH, "Absenkung"),
             (Tab::Hotkeys, icon::COMMAND, "Tastenkürzel"),
             (Tab::Camera, icon::VIDEO_CAMERA, "Kamera"),
             (Tab::Overlay, icon::SQUARES_FOUR, "Overlay"),
@@ -478,6 +480,7 @@ impl SettingsView {
                         match self.tab {
                             Tab::Audio => self.audio_tab(ui, state, &mut cmds),
                             Tab::Sound => self.sound_tab(ui, state, &mut cmds),
+                            Tab::Ducking => self.ducking_tab(ui, state),
                             Tab::Hotkeys => self.hotkeys_tab(ui, state, &mut cmds),
                             Tab::Camera => self.camera_tab(ui, state),
                             Tab::Overlay => self.overlay_tab(ui),
@@ -550,6 +553,19 @@ impl SettingsView {
                 &inputs,
                 |ui| mic_test_button(ui, state.mic_test, cmds),
             );
+            if adv {
+                widgets::setting_row(ui, true, "Mikrofonkanal", Some("Automatisch nutzt einen stabilen Eingang; manuell wählst du einen einzelnen Kanal."), |ui| {
+                    let mut automatic = self.draft.audio.input_channel.is_none();
+                    let mut changed = ui.checkbox(&mut automatic, "Automatisch").changed();
+                    if changed { self.draft.audio.input_channel = if automatic { None } else { Some(0) }; }
+                    if let Some(channel) = &mut self.draft.audio.input_channel {
+                        let mut display = *channel + 1;
+                        changed |= ui.add(egui::DragValue::new(&mut display).range(1..=64).prefix("Kanal ")).changed();
+                        *channel = display - 1;
+                    }
+                    changed
+                });
+            }
             device_combo(
                 ui,
                 true,
@@ -759,6 +775,51 @@ impl SettingsView {
 
     /// What the voice goes through on the way out and in, and the cue
     /// sounds: switches that are right by default and rarely touched.
+    fn ducking_tab(&mut self, ui: &mut Ui, state: &AppState) {
+        let adv = self.draft.ui.show_advanced;
+        widgets::group_card(ui, "Andere Anwendungen beim Sprechen absenken", |ui| {
+            widgets::setting_row(ui, false, "Absenkung", Some("Musik, Spiele und andere Anwendungen auf deinen Lautsprechern werden während eines Gesprächs leiser."), |ui| {
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("audio-ducking")
+                    .selected_text(self.draft.audio.ducking.label())
+                    .show_ui(ui, |ui| {
+                        for (mode, label) in crate::audio::ducking::Mode::ALL {
+                            changed |= ui.selectable_value(&mut self.draft.audio.ducking, mode, label).changed();
+                        }
+                    });
+                changed
+            });
+            if self.draft.audio.ducking != crate::audio::ducking::Mode::Off {
+                let status = &state.ducking_status;
+                if status.attenuation_db > 0.1 && status.sessions > 0 {
+                    ui.label(format!(
+                        "Gerade um {:.1} dB abgesenkt · {} Anwendungen",
+                        status.attenuation_db, status.sessions
+                    ));
+                }
+                if !status.detail.is_empty() {
+                    ui.weak(&status.detail);
+                }
+                if adv {
+                    let evidence = if status.transmitting && status.receiving {
+                        "eigene und empfangene Sprache"
+                    } else if status.transmitting {
+                        "eigene Sprache"
+                    } else if status.receiving {
+                        "empfangene Sprache"
+                    } else {
+                        "keine aktuelle Sprache"
+                    };
+                    ui.weak(format!(
+                        "Auslöser: {evidence} · {} Streams · Ausgabe: {}",
+                        status.sessions,
+                        status.route.as_deref().unwrap_or("Systemstandard")
+                    ));
+                }
+            }
+        });
+    }
+
     fn sound_tab(&mut self, ui: &mut Ui, state: &AppState, cmds: &mut Vec<Command>) {
         let adv = self.draft.ui.show_advanced;
         widgets::page_header(
@@ -2581,9 +2642,12 @@ impl SettingsView {
         self.diagnose.packet_loss =
             format!("{} %", self.stats.packet_loss_perc.load(Ordering::Relaxed));
         self.diagnose.fec_plc = format!(
-            "{} / {}",
+            "{} / {} · FEC-Versuche {}, rekonstruiert {} ms, Fallback {}",
             DebugStats::get(&self.stats.frames_fec),
             DebugStats::get(&self.stats.frames_plc),
+            DebugStats::get(&self.stats.frames_fec_attempted),
+            DebugStats::get(&self.stats.frames_fec_samples) / 48,
+            DebugStats::get(&self.stats.frames_fec_fallback),
         );
         self.diagnose.ref_underruns = DebugStats::get(&self.stats.reference_underruns).to_string();
         self.diagnose.reconnects = DebugStats::get(&self.stats.reconnects).to_string();
@@ -3664,6 +3728,7 @@ mod tests {
             active_output: None,
             backend: "test",
             tuning_status: String::new(),
+            ducking_status: Default::default(),
             audio_health: Default::default(),
             can_restore_audio: false,
             aec_available: false,

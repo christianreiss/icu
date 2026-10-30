@@ -23,12 +23,14 @@ use crate::{
 /// `UserCoronaColor`); `UserInfo` sits inside `Welcome`, so again a
 /// coordinated update. Minor 6 attributes audio and feedback to applied gain
 /// generations and extends the audio header to 14 bytes; both ends update together.
-pub const MINOR: u16 = 6;
+/// Minor 7 makes feedback policy 2 mandatory: short speech-only RMS windows,
+/// raw target error, independently consumed reporter windows and matched hints.
+pub const MINOR: u16 = 7;
 
 /// Lowest protocol minor this build talks to, in both directions: the server
 /// closes a `Hello` below it with `VERSION_UNSUPPORTED`, the client a
 /// `Welcome` whose `server_minor` is below it (`docs/reference/protocol.md` §8).
-pub const MIN_PEER_MINOR: u16 = 6;
+pub const MIN_PEER_MINOR: u16 = 7;
 
 /// Peer-assisted audio measurements and hints (bit 0).
 pub const CAP_AUDIO_FEEDBACK: u32 = 1;
@@ -328,7 +330,7 @@ pub enum ControlMsg {
         /// Enforced deafen.
         deafened: bool,
     },
-    /// 36, C→S. Two-second pre-playback speech measurement; capability bit 0.
+    /// 36, C→S. Pre-playback speech RMS; at most every two seconds, capability bit 0.
     AudioLevelReport {
         /// Current speaker session.
         speaker: Session,
@@ -345,6 +347,10 @@ pub enum ControlMsg {
         reporters: u16,
         /// Gain generation and independent sender-clock measurement window.
         window: crate::AudioWindow,
+        /// Reporters within the two-dB consensus interval (not all reporters).
+        agreeing: u16,
+        /// Minimum suitable speech duration among agreeing reporters.
+        speech_ms: u16,
     },
     /// 38, C→S. Public certificate of an online room session, on demand.
     PeerCertificateRequest {
@@ -657,6 +663,8 @@ mod tests {
                 },
                 correction_cdb: Some(200),
                 reporters: 2,
+                agreeing: 2,
+                speech_ms: 1500,
             },
             ControlMsg::PeerCertificateRequest { session: 7 },
             ControlMsg::PeerCertificateResponse {

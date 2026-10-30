@@ -114,7 +114,7 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 
 
 | 36 | `AudioLevelReport` | C→S | `speaker: Session`, `level: AudioLevel`, `window: AudioWindow` | Optional, Capability Bit 0; Sprachpegel nach regulärem Opus-Decode, vor Normalisierung und Benutzerlautstärke. |
-| 37 | `AudioLevelHint` | S→C | `correction_cdb: Option<i16>`, `reporters: u16`, `window: AudioWindow` | Optional, Capability Bit 0; Median-Korrektur für den eigenen Sender, `None` bei fehlender Einigung oder abgelaufenen Messungen. |
+| 37 | `AudioLevelHint` | S→C | `correction_cdb: Option<i16>`, `reporters: u16`, `window: AudioWindow`, `agreeing: u16`, `speech_ms: u16` | Optional, Capability Bit 0; Median-Korrektur für den eigenen Sender, `None` bei fehlender Einigung oder abgelaufenen Messungen. |
 | 38 | `PeerCertificateRequest` | C→S | `session: u16` | Ab Minor 3: öffentliches Zertifikat einer aktuell anwesenden Sitzung abfragen. Reguläre Raumteilnehmer, unter dem Control-Ratenlimit; Registrierung und Renewal-only sind ausgeschlossen. |
 | 39 | `PeerCertificateResponse` | S→C | `session: u16`, `certificate_der: Option<Vec<u8>>` | Unicast-Antwort mit dem tatsächlich im TLS-Handshake dieser Sitzung verwendeten Leaf (DER, max. 8192 Bytes). `None` bei abwesender Sitzung oder nicht verfügbarem/zu großem Zertifikat. Keine privaten Schlüssel. Die Sitzung wird vom Server zugeordnet; Empfänger prüfen die Signatur gegen ihre lokale CA und die verfügbare signierte CRL. |
 | 40 | `VideoDisplayed` | C→S | `speaker: Session` | Ab Minor 4: der Client hat ein frisches Bild dieses Senders im Overlay zur Anzeige übergeben (der Hauptfenster-Vorschau-Avatar in der Teilnehmerliste meldet dies nicht — reine Vorschau, keine bestätigte Anzeige). Höchstens ein Bericht je Sekunde und Sender. Der Server akzeptiert ihn nur von einem aktuellen, nicht administrativ taubgeschalteten Videoempfänger bei eingeschalteter Senderkamera. |
@@ -122,37 +122,46 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | 42 | `SetCoronaColor` | C→S | `color: Option<[u8; 3]>` | Ab Minor 5 (2026-10-12): die eigene Coronafarbe (sRGB), `None` = Standard des Clients. Der Server speichert sie am Nutzer (`users.toml`, `UserRecord.corona_color`) und gibt sie fortan in jedem `UserInfo` dieses Nutzers mit. Eine unveränderte Farbe schreibt und sendet nichts. Eigenes Limit: Burst 3, danach 1/s; mehr ist `RATE_LIMITED` wie jede Überschreitung. Ein fehlgeschlagener Schreibvorgang antwortet `Error { SERVER_ERROR }` und ändert nichts. |
 | 43 | `UserCoronaColor` | S→C | `session: Session`, `color: Option<[u8; 3]>` | Ab Minor 5: Broadcast an alle, je Sitzung des Nutzers eine Nachricht, auch an dessen eigene Sitzungen (ein zweites Gerät übernimmt die Farbe). Store, Raum und Broadcast unter dem Store-Lock wie `AdminSetRestriction`. |
 
-**Empfangsfeedback (2026-09-28):** `AudioLevel` enthält in dieser Reihenfolge `level_cdb: i16`, `correction_cdb: i16`, `peak_cdb: i16`, `near_full_permille: u16`, `speech_ms: u16`. Pegel/Spitze sind Centi-dBFS, Korrektur Centi-dB. Grenzen: Pegel −10000…1200, Korrektur −1200…1200, Spitze −10000…2400, Anteil 0…1000, Sprachdauer 1000…2200 ms. Bericht alle 2 s, nur bei mindestens 1 s geeigneter Sprache; keine Stille, NaN, PLC/FEC oder künstliche Jitter-Ausgabe. Die Spitze ist ein Clipping-Indiz, kein Beweis für dessen Ursache.
+**Empfangsfeedback, Policy 2 / Minor 7 (2026-10-30):** `AudioLevel` enthält
+`level_cdb: i16`, `correction_cdb: i16`, `peak_cdb: i16`,
+`near_full_permille: u16`, `speech_ms: u16`. Gemessen wird RMS geeigneter
+Sprachsamples nach regulärem Decode, vor allen Empfangsreglern; keine LUFS- oder
+Hüllkurvenmessung. `correction_cdb` ist der rohe Fehler zu −22 dBFS, begrenzt auf
+±12 dB. Der finale Akzeptanzbereich beträgt einmalig ±1,5 dB. Erlaubt sind
+100…2200 ms geeignete Sprache; die Sprachmenge gewichtet die Bestätigung.
+PLC/FEC, künstliche Jitter-Ausgabe, Stille und nichtendliche Werte sind ungeeignet.
+Der maximale Sprachsample-Peak ist ein Clipping-Indiz, kein True-Peak-Nachweis.
 
-**Messzuordnung ab Minor 6 (2026-10-23):** `AudioWindow` enthält in dieser
-Reihenfolge `gain_epoch: u32`, `first_ts: u32`, `end_ts: u32` (exklusiv) und
-`report_id: u32`. Zeitgrenzen beziehen sich auf die 48-kHz-Sample-Clock des
-Senders; das Fenster umfasst 48000…105600 Samples. Nur reguläre Audiopakete
-mit derselben Kennung dürfen in ein Fenster eingehen. Nach einem Wechsel
-werden 200 ms zum Einschwingen ausgeschlossen. Die Kennung ändert sich bei
-bewussten Pegel-/Verarbeitungseingriffen, nicht bei jeder AGC-Bewegung.
-Der Server leitet die aktuelle Kennung ausschließlich aus zugelassenem Audio
-ab. Er verwirft alte Kennungen, wiederholte/überlappende Fenster und Berichte,
-deren Ende mehr als sechs Sekunden hinter dem letzten Audiosample liegt
-(maximal 5760 Samples Vorlauf für den letzten decodierten Frame). Weitere
-Empfänger desselben Zeitfensters erzeugen keine zusätzlichen Bestätigungen.
-Berichtszähler gelten pro Empfänger und Sender. Hints erhalten dagegen eine
-eigene Server-Sequenz pro Sender und Pegelkennung: ein Empfängerwechsel darf
-mit einem niedrigeren Berichtszähler keine frischen Hints sperren.
-Hints tragen das neu ausgewertete Fenster; der Sender akzeptiert nur seine
-aktuelle Kennung. Ein Schritt darf erst auf ein vollständiges neues Fenster
-nach der vorherigen Korrektur folgen. Die Control-Feldreihenfolge und der
-14-Byte-Audioheader benötigen ein gemeinsames Update: Minor 5 und älter werden
-beidseitig mit `VERSION_UNSUPPORTED` abgewiesen. Das Opus-Payload bleibt gleich.
+`AudioWindow` enthält `gain_epoch: u32`, `first_ts: u32`, `end_ts: u32`
+(exklusiv), `report_id: u32` auf der 48-kHz-Sampleclock. Fenster umfassen
+4800…105600 Samples; ein Epoch-Wechsel verwirft alte Evidenz und schließt die
+ersten 200 ms aus. Die Kennung ändert sich bei bewussten Gain-/DSP-Eingriffen,
+nicht bei jedem AGC-Schritt. Sechs Sekunden skalare lokale Historie ermöglichen
+den Vergleich mit genau dem entfernten Fenster; PCM wird dafür nicht gespeichert.
 
+Der Server akzeptiert höchstens einen Bericht pro Sprecher/Empfänger alle 2 s.
+Selbstberichte, unbekannte/taube Teilnehmer und veraltete Kennungen zählen nicht.
+Alter wird gegen Empfangszeit und den fortschreitenden Sender-Timestamp geprüft.
+Verbrauchsgrenzen sind **pro Reporter**, damit versetzte Fenster weiter beitragen.
+Vergleichbare Fenster überlappen mindestens zur Hälfte des kürzeren Fensters.
+Der Median braucht eine strikte Mehrheit innerhalb ±1 dB; bei zwei Empfängern
+müssen beide zustimmen. Neue Ausreißer oder Timer erzeugen keine neue Evidenz.
+`reporters` zählt Beteiligte, `agreeing` Zustimmende, `speech_ms` die konservative
+Sprachmenge. Hints besitzen eine eigene Sender-/Epoch-Sequenz und dürfen zeitlich
+überlappen, wenn sie frische unabhängige Reporterbeiträge enthalten. Der Sender
+verbraucht jeden Hint einmal und korrigiert erst bei passender lokaler Evidenz.
+Profile zählen ein Messfenster ebenfalls nur einmal.
 
-Der Server speichert höchstens einen Bericht je aktuellem Sprecher/Empfänger-Paar und akzeptiert höchstens einen alle 2 s; Selbstberichte, unbekannte Sitzungen, unzulässige Werte und taube Empfänger zählen nicht. Beide Clients müssen Bit 0 in `Hello.caps` angekündigt haben. Berichte verfallen nach 6 s und werden beim Verlassen gelöscht. Höchstens alle 2 s erhalten unterstützende Sender einen Hint: Median, falls eine strikte Mehrheit höchstens 1 dB vom Median entfernt liegt (2 dB Gesamtspanne); zwei Empfänger müssen somit beide zustimmen. Eine positive oder negative Korrektur wird nur mit einem neu eingegangenen, zum Konsens gehörenden Bericht erneut geschickt; Timer-Ticks und neue Ausreißer erzeugen keine zusätzlichen Bestätigungsfenster aus alten Messungen. Fehlender Konsens oder Ablauf wird weiterhin als `None` gemeldet. Ein einzelner Bericht benötigt zusätzlich lokale Bestätigung im Sender. Hints sind Hinweise, keine Geräte-Steuerbefehle; der Sender begrenzt und bestätigt jede Korrektur selbst. Hints enthalten keine Nutzernamen oder Audiodaten.
+Die geänderte Semantik und Hint-Feldfolge erfordern **Client und Server gemeinsam
+ab Minor 7**. Minor 6 und älter werden mit `VERSION_UNSUPPORTED` abgewiesen.
+Audioheader (14 Bytes), Opus-Payload, ALPN und Passportformat bleiben unverändert.
+Capability Bit 0 (`CAP_AUDIO_FEEDBACK`) steuert weiterhin die optionalen Varianten.
 
 Varianten 19–28 (und 31, 33) sind die ersten C→S-Nachrichten, bei denen der sendende Client eine **andere** `user_id` benennt als seine eigene.
 
 Fehlercodes kommen wie Varianten additiv hinzu (§6, zuletzt `SERVER_ERROR` 2026-09-26); ein Client, der einen Code nicht kennt, behandelt ihn als nicht fatal.
 
-Capability-Bits (`caps`): Bit 0 (`CAP_AUDIO_FEEDBACK = 1`) für optionale Varianten 36/37. Diese werden nur bei gegenseitiger Unterstützung gesendet. v1-Baseline war `minor = 1`, aktuell ist `minor = 6` (eigene Coronafarbe, 2026-10-12; davor 4, Videobild-Anzeigebestätigung, 2026-09-28); ein Minor 0 existiert nicht, und alle 44 Variantennummern (0–43) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
+Capability-Bits (`caps`): Bit 0 (`CAP_AUDIO_FEEDBACK = 1`) für optionale Varianten 36/37. Diese werden nur bei gegenseitiger Unterstützung gesendet. v1-Baseline war `minor = 1`, aktuell ist `minor = 7` (Sprachmessung Policy 2, 2026-10-30); ein Minor 0 existiert nicht, und alle 44 Variantennummern (0–43) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
 ### 2.3 Registrierung (revidiert 2026-09-24, nur Zertifikate)
 
@@ -334,7 +343,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 
 - Major = ALPN-String (`icu/1`). Inkompatible Änderung → `icu/2`, Server bietet ggf. beide.
 - Minor: der Client nennt sein Protokoll-Minor in `Hello.minor`, der Server seins in `Welcome.server_minor`; `Welcome.minor` ist das ausgehandelte `min(client, server)`. Varianten oberhalb des ausgehandelten Minors werden nie gesendet. Ein Minor 0 gibt es nicht; aktuell ist `minor = 6`. Minor 5 hängt `UserInfo.corona_color` an, und `UserInfo` steckt mitten in `Welcome`: Client und Server von vor Minor 5 sind mit Minor-5-Gegenstellen nicht kompatibel und werden über das Mindest-Minor abgewiesen.
-- Mindestversionen, beidseitig durchgesetzt (2026-09-26). Jede Seite hat ein Mindest-Minor für die Gegenseite (`icu_proto::MIN_PEER_MINOR`, derzeit 6):
+- Mindestversionen, beidseitig durchgesetzt (2026-09-26). Jede Seite hat ein Mindest-Minor für die Gegenseite (`icu_proto::MIN_PEER_MINOR`, derzeit 7):
   - Der Server schließt mit `VERSION_UNSUPPORTED`, wenn `Hello.minor` darunter liegt, oder wenn die SemVer in `Hello.client` (`<name>/<semver> <os>`, Pre-Release-Suffix zählt nicht) unter `server.min_client` liegt oder sich nicht lesen lässt. Das gilt für jede Sitzung, Registrierung und renew-only eingeschlossen.
   - Der Client schließt selbst mit `VERSION_UNSUPPORTED`, wenn `Welcome.server_minor` darunter liegt, fatal, mit dem Hinweis, dass der Server aktualisiert werden muss.
   - Ein Client von vor Minor 2 dekodiert das längere `Welcome` ohne Fehler (postcard ignoriert überzählige Bytes); deshalb weist ihn der Server über `Hello.minor` ab. Umgekehrt kann ein Client ab Minor 2 das kürzere `Welcome` eines älteren Servers nicht dekodieren und zeigt das allgemeine „Update nötig“ — hingenommen, weil Client und Server im Lockstep ausgeliefert werden (§2.2).

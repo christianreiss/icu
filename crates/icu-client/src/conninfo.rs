@@ -443,6 +443,8 @@ pub struct ConnStats {
     pub video_rx_kbps: f32,
     /// Own outgoing audio still queued unsent.
     pub datagram_queue_bytes: u64,
+    /// Audio datagrams discarded at their local QUIC queue age deadline.
+    pub datagrams_expired: u64,
     /// The smoothed condition `crate::quality` steers on.
     pub cond: NetworkCondition,
 }

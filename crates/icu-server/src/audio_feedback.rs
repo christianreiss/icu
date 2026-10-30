@@ -23,6 +23,7 @@ pub struct Feedback {
     reports: HashMap<(Session, Session), Report>,
     seen: HashMap<(Session, Session), AudioWindow>,
     last_hint: HashMap<Session, AudioWindow>,
+    consumed: HashMap<(Session, Session), AudioWindow>,
     last_tick: Option<Instant>,
 }
 impl Feedback {
@@ -36,6 +37,8 @@ impl Feedback {
         self.reports
             .retain(|(s, r), _| *s != session && *r != session);
         self.seen.retain(|(s, r), _| *s != session && *r != session);
+        self.consumed
+            .retain(|(s, r), _| *s != session && *r != session);
     }
     fn capable(&self, s: Session) -> bool {
         self.caps
@@ -54,6 +57,7 @@ impl Feedback {
                 }
                 self.reports.retain(|(s, _), _| *s != speaker);
                 self.seen.retain(|(s, _), _| *s != speaker);
+                self.consumed.retain(|(s, _), _| *s != speaker);
                 self.last_hint.remove(&speaker);
             } else if (header.ts.wrapping_sub(old.ts) as i32) < 0 {
                 return;
@@ -123,7 +127,14 @@ impl Feedback {
         eligible: impl Fn(Session, Session) -> bool,
     ) -> Vec<(Session, ControlMsg)> {
         self.reports.retain(|(s, r), report| {
-            now.saturating_duration_since(report.at) < Duration::from_secs(6) && eligible(*r, *s)
+            now.saturating_duration_since(report.at) < Duration::from_secs(6)
+                && self.sources.get(s).is_some_and(|source| {
+                    source.epoch == report.window.gain_epoch
+                        && now.saturating_duration_since(source.at) < Duration::from_secs(6)
+                        && (-5760..=icu_proto::audio_level::MAX_AGE_SAMPLES as i32)
+                            .contains(&(source.ts.wrapping_sub(report.window.end_ts) as i32))
+                })
+                && eligible(*r, *s)
         });
         if self
             .last_tick
@@ -143,65 +154,119 @@ impl Feedback {
             let current: Vec<_> = self
                 .reports
                 .iter()
-                .filter(|((s, _), _)| *s == speaker)
-                .map(|(_, r)| *r)
+                .filter(|(key, report)| {
+                    key.0 == speaker
+                        && self
+                            .consumed
+                            .get(key)
+                            .is_none_or(|old| report.window.newer_than(*old))
+                })
+                .map(|(key, report)| (*key, *report))
                 .collect();
-            let previous = self.last_hint.get(&speaker);
+            let previous = self.last_hint.get(&speaker).copied();
+            let Some((_, newest)) = current.iter().min_by_key(|(_, r)| {
+                self.sources[&speaker].ts.wrapping_sub(r.window.end_ts) as i32
+            }) else {
+                // Already-consumed votes are never re-emitted. An empty live
+                // set still explicitly reports expiry to the sender.
+                if !self.reports.keys().any(|(s, _)| *s == speaker) {
+                    out.push((
+                        speaker,
+                        ControlMsg::AudioLevelHint {
+                            window: AudioWindow {
+                                gain_epoch: self.sources.get(&speaker).map_or(0, |s| s.epoch),
+                                ..Default::default()
+                            },
+                            correction_cdb: None,
+                            reporters: 0,
+                            agreeing: 0,
+                            speech_ms: 0,
+                        },
+                    ));
+                }
+                continue;
+            };
+            // A newly joined listener's old phrase is not a fresh correction.
+            // End progression permits shifted windows; a global FIRST-sample
+            // watermark would starve every reporter except the latest phase.
+            if previous.is_some_and(|old| newest.window.end_ts.wrapping_sub(old.end_ts) as i32 <= 0)
+            {
+                continue;
+            }
             let reports: Vec<_> = current
                 .iter()
-                .copied()
-                .filter(|r| {
-                    previous.is_none_or(|p| {
-                        r.window.gain_epoch != p.gain_epoch
-                            || r.window.first_ts.wrapping_sub(p.end_ts) as i32 >= 0
+                .filter(|(_, report)| comparable(report.window, newest.window))
+                .collect();
+            let values: Vec<_> = reports
+                .iter()
+                .map(|(_, r)| r.level.correction_cdb)
+                .collect();
+            let correction = consensus(&values);
+            let agreeing: Vec<_> = reports
+                .iter()
+                .filter(|(_, r)| {
+                    correction.is_some_and(|c| {
+                        (i32::from(r.level.correction_cdb) - i32::from(c)).abs() <= 100
                     })
                 })
                 .collect();
-            // Cached votes are retained for rate limiting/expiry, but never
-            // counted again as part of a new consensus.
-            if reports.is_empty() && !current.is_empty() {
+            let representative = agreeing
+                .iter()
+                .min_by_key(|(_, r)| self.sources[&speaker].ts.wrapping_sub(r.window.end_ts) as i32)
+                .map_or(newest, |(_, report)| report);
+            let mut window = representative.window;
+            window.report_id = previous.map_or(0, |old| old.report_id.wrapping_add(1));
+            // Each reporter owns its consumption cursor. Consume conflicting
+            // observations too: repeatedly polling is not new evidence.
+            for (key, report) in &reports {
+                self.consumed.insert(*key, report.window);
+            }
+            // It is possible that only a newer outlier advanced. Do not turn
+            // the older majority into another gain confirmation.
+            if correction.is_some()
+                && previous.is_some_and(|old| window.end_ts.wrapping_sub(old.end_ts) as i32 <= 0)
+            {
                 continue;
             }
-            let values: Vec<_> = reports.iter().map(|r| r.level.correction_cdb).collect();
-            let correction = consensus(&values);
-            let mut window = AudioWindow {
-                gain_epoch: self.sources.get(&speaker).map_or(0, |s| s.epoch),
-                ..Default::default()
-            };
-            if let Some(c) = correction {
-                let previous = self.last_hint.get(&speaker);
-                let newest = reports
-                    .iter()
-                    .filter(|r| (r.level.correction_cdb as i32 - c as i32).abs() <= 100)
-                    .filter(|r| {
-                        previous.is_none_or(|p| {
-                            r.window.gain_epoch != p.gain_epoch
-                                || r.window.first_ts.wrapping_sub(p.end_ts) as i32 >= 0
-                        })
-                    })
-                    .min_by_key(|r| self.sources[&speaker].ts.wrapping_sub(r.window.end_ts) as i32);
-                let Some(report) = newest else {
-                    continue;
-                };
-                window = report.window;
-                // Reports are numbered independently by each receiver. Hints
-                // need a server-owned sequence so a newly joined receiver's
-                // low counter cannot look like a replay to the sender.
-                window.report_id = previous.map_or(0, |p| p.report_id.wrapping_add(1));
-                self.last_hint.insert(speaker, window);
-            }
+            self.last_hint.insert(speaker, window);
             out.push((
                 speaker,
                 ControlMsg::AudioLevelHint {
                     window,
                     correction_cdb: correction,
-                    reporters: values.len() as u16,
+                    reporters: reports.len() as u16,
+                    agreeing: agreeing.len() as u16,
+                    // Confidence is capped by the weakest agreeing observation;
+                    // several receivers do not multiply suitable speech duration.
+                    speech_ms: agreeing
+                        .iter()
+                        .map(|(_, r)| r.level.speech_ms)
+                        .min()
+                        .unwrap_or(0),
                 },
             ));
         }
         out
     }
 }
+/// Compare observation intervals in the newest window's clock domain, including
+/// wraparound. Require at least half the shorter window in common.
+fn comparable(a: AudioWindow, b: AudioWindow) -> bool {
+    if a.gain_epoch != b.gain_epoch {
+        return false;
+    }
+    let a_start = a.first_ts.wrapping_sub(b.first_ts) as i32;
+    let a_end = a.end_ts.wrapping_sub(b.first_ts) as i32;
+    let b_end = b.end_ts.wrapping_sub(b.first_ts) as i32;
+    let overlap = a_end.min(b_end) - a_start.max(0);
+    let minimum = (a
+        .end_ts
+        .wrapping_sub(a.first_ts)
+        .min(b.end_ts.wrapping_sub(b.first_ts))
+        / 2) as i32;
+    overlap >= minimum
+}
+
 fn consensus(values: &[i16]) -> Option<i16> {
     if values.is_empty() {
         return None;
@@ -454,6 +519,137 @@ mod tests {
                 ControlMsg::AudioLevelHint {
                     correction_cdb: Some(400),
                     reporters: 1,
+                    ..
+                }
+            )));
+    }
+    #[test]
+    fn shifted_windows_keep_all_three_reporters_across_ticks_and_clock_wrap() {
+        for base in [0u32, u32::MAX - 192_000] {
+            let now = Instant::now();
+            let mut f = Feedback::default();
+            for session in 1..=4 {
+                f.join(session, icu_proto::CAP_AUDIO_FEEDBACK);
+            }
+            for cycle in 0..12u32 {
+                let end = base.wrapping_add((cycle + 1) * 96_000 + 24_000);
+                let at = now + Duration::from_millis(u64::from(cycle) * 2100);
+                f.observe_audio(
+                    1,
+                    AudioHeader {
+                        gain_epoch: 1,
+                        ts: end,
+                        ..Default::default()
+                    },
+                    at,
+                );
+                // Distinct report timers, delivery delays and a late join.
+                for (reporter, phase, delay) in [(2, 0, 30), (3, 12_000, 80), (4, 24_000, 150)] {
+                    if reporter == 4 && cycle < 2 {
+                        continue;
+                    }
+                    let first_ts = base.wrapping_add(cycle * 96_000 + phase);
+                    let w = AudioWindow {
+                        gain_epoch: 1,
+                        first_ts,
+                        end_ts: first_ts.wrapping_add(96_000),
+                        report_id: cycle,
+                    };
+                    f.report(
+                        reporter,
+                        1,
+                        level(400),
+                        w,
+                        at + Duration::from_millis(delay),
+                    );
+                }
+                let hints = f.tick(at + Duration::from_millis(200), |_, _| true);
+                let hint = hints.into_iter().find(|(s, _)| *s == 1).unwrap().1;
+                assert!(
+                    matches!(hint, ControlMsg::AudioLevelHint {
+                    correction_cdb: Some(400), reporters, agreeing, ..
+                } if reporters == if cycle < 2 { 2 } else { 3 } && agreeing == reporters),
+                    "cycle {cycle}: {hint:?}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn short_nonoverlapping_phrases_are_not_a_consensus() {
+        let now = Instant::now();
+        let mut f = Feedback::default();
+        for session in 1..=4 {
+            f.join(session, icu_proto::CAP_AUDIO_FEEDBACK);
+        }
+        f.observe_audio(
+            1,
+            AudioHeader {
+                gain_epoch: 1,
+                ts: 96_000,
+                ..Default::default()
+            },
+            now,
+        );
+        for (reporter, first_ts) in [(2, 0), (3, 24_000), (4, 48_000)] {
+            f.report(
+                reporter,
+                1,
+                AudioLevel {
+                    speech_ms: 200,
+                    ..level(400)
+                },
+                AudioWindow {
+                    gain_epoch: 1,
+                    first_ts,
+                    end_ts: first_ts + 9600,
+                    report_id: 0,
+                },
+                now,
+            );
+        }
+        let hints = f.tick(now, |_, _| true);
+        assert!(hints.iter().any(|(s, h)| *s == 1
+            && matches!(
+                h,
+                ControlMsg::AudioLevelHint {
+                    reporters: 1,
+                    agreeing: 1,
+                    speech_ms: 200,
+                    ..
+                }
+            )));
+    }
+    #[test]
+    fn conflicts_consume_votes_and_expired_source_cannot_reconfirm() {
+        let now = Instant::now();
+        let mut f = Feedback::default();
+        for session in 1..=3 {
+            f.join(session, icu_proto::CAP_AUDIO_FEEDBACK);
+        }
+        audio(&mut f, 1, 0, now);
+        f.report(2, 1, level(400), window(1, 0), now);
+        f.report(3, 1, level(-400), window(1, 0), now);
+        assert!(f.tick(now, |_, _| true).iter().any(|(s, h)| *s == 1
+            && matches!(
+                h,
+                ControlMsg::AudioLevelHint {
+                    correction_cdb: None,
+                    reporters: 2,
+                    agreeing: 0,
+                    ..
+                }
+            )));
+        assert!(f
+            .tick(now + Duration::from_secs(2), |_, _| true)
+            .iter()
+            .all(|(s, _)| *s != 1));
+        assert!(f
+            .tick(now + Duration::from_secs(6), |_, _| true)
+            .iter()
+            .all(|(_, h)| matches!(
+                h,
+                ControlMsg::AudioLevelHint {
+                    correction_cdb: None,
                     ..
                 }
             )));

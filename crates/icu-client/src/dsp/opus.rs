@@ -195,10 +195,30 @@ impl Encoder {
     }
 }
 
+/// Whether a valid packet carries SILK low-bit-rate redundancy. This is not
+/// proof that a decoder can use it; see `Decoder::last_fec_samples`.
+pub fn packet_has_fec(packet: &[u8]) -> bool {
+    if packet.is_empty() || packet.len() > i32::MAX as usize {
+        return false;
+    }
+    // SAFETY: pointer/length describe the packet; libopus validates the framing.
+    unsafe { ffi::opus_packet_has_lbrr(packet.as_ptr(), packet.len() as i32) > 0 }
+}
+
+/// Runtime-linked codec version, useful when comparing native feature builds.
+pub fn version() -> &'static str {
+    // SAFETY: libopus returns a process-lifetime NUL-terminated version string.
+    unsafe { std::ffi::CStr::from_ptr(ffi::opus_get_version_string()) }
+        .to_str()
+        .unwrap_or("unknown libopus")
+}
+
 /// Per speaker decoder with PLC and FEC.
 pub struct Decoder {
     inner: RawDecoder,
     last_frame: usize,
+    last_celt_only: bool,
+    last_fec_samples: usize,
 }
 
 impl Decoder {
@@ -224,6 +244,8 @@ impl Decoder {
         Ok(Decoder {
             inner,
             last_frame: 960,
+            last_celt_only: false,
+            last_fec_samples: 0,
         })
     }
 
@@ -245,24 +267,73 @@ impl Decoder {
     pub fn decode(&mut self, packet: &[u8], out: &mut [f32]) -> Result<usize, Error> {
         let n = self.inner.decode_float(packet, out, false)?;
         self.last_frame = n;
+        self.last_celt_only = packet.first().is_some_and(|toc| toc & 0x80 != 0);
+        self.last_fec_samples = 0;
         Ok(n)
     }
 
-    /// Recovers the lost frame `n` from packet `n+1`'s in-band FEC.
+    /// Recover using the successor's duration when no missing-slot timestamp is
+    /// available. Production playout uses `decode_fec_for` instead.
     pub fn decode_fec(&mut self, next_packet: &[u8], out: &mut [f32]) -> Result<usize, Error> {
-        // The frame length comes from the peer's packet (up to 120 ms);
-        // clamped so the slice stays in bounds and libopus decides instead.
         let frame = packet_samples(next_packet)
             .unwrap_or(self.last_frame)
             .min(out.len());
-        self.inner
-            .decode_float(next_packet, &mut out[..frame], true)
+        self.decode_fec_for(next_packet, out, frame)
     }
 
-    /// Packet loss concealment for one frame.
+    /// Decode exactly the lost slot, whose duration can differ from its successor.
+    /// Libopus requires this duration for FEC/PLC to retain decoder timing.
+    pub fn decode_fec_for(
+        &mut self,
+        next_packet: &[u8],
+        out: &mut [f32],
+        samples: usize,
+    ) -> Result<usize, Error> {
+        self.last_fec_samples = 0;
+        if samples == 0 || samples > out.len() || !samples.is_multiple_of(120) {
+            return Err(Error(ffi::OPUS_BAD_ARG));
+        }
+        // Mirror libopus 1.6's FEC eligibility conditions. A CELT predecessor,
+        // CELT successor, or a shorter missing slot forces PLC. Larger slots
+        // have a PLC prefix and only their last codec frame contains FEC.
+        let codec_frame = if next_packet.is_empty() {
+            0
+        } else {
+            // SAFETY: a nonempty packet provides the TOC byte read by this API.
+            unsafe { ffi::opus_packet_get_samples_per_frame(next_packet.as_ptr(), RATE as i32) }
+                .max(0) as usize
+        };
+        let recovered =
+            packet_has_fec(next_packet) && !self.last_celt_only && samples >= codec_frame;
+        let n = self
+            .inner
+            .decode_float(next_packet, &mut out[..samples], true)?;
+        self.last_frame = n;
+        self.last_fec_samples = if recovered { codec_frame.min(n) } else { 0 };
+        Ok(n)
+    }
+
+    /// Number of samples recovered from real in-band redundancy in the last
+    /// FEC decode. Zero means PLC fallback; a smaller value than the returned
+    /// length means a PLC prefix followed by FEC. No attempt counter is implied.
+    pub fn last_fec_samples(&self) -> usize {
+        self.last_fec_samples
+    }
+
+    /// Packet loss concealment for the previously decoded frame duration.
     pub fn conceal(&mut self, out: &mut [f32]) -> Result<usize, Error> {
-        let frame = self.last_frame.min(out.len());
-        self.inner.decode_float(&[], &mut out[..frame], false)
+        self.conceal_for(out, self.last_frame.min(out.len()))
+    }
+
+    /// Conceal a missing slot of an explicitly known duration.
+    pub fn conceal_for(&mut self, out: &mut [f32], samples: usize) -> Result<usize, Error> {
+        self.last_fec_samples = 0;
+        if samples == 0 || samples > out.len() || !samples.is_multiple_of(120) {
+            return Err(Error(ffi::OPUS_BAD_ARG));
+        }
+        let n = self.inner.decode_float(&[], &mut out[..samples], false)?;
+        self.last_frame = n;
+        Ok(n)
     }
 
     /// Duration in samples of `packet`.
@@ -275,6 +346,47 @@ impl Decoder {
 mod tests {
     use super::*;
     use crate::dsp::testsignal::{harmonic_voice, pearson, rms, speechlike};
+
+    #[test]
+    fn fec_provenance_and_explicit_missing_duration_are_truthful() {
+        assert!(
+            version().contains("1.6"),
+            "bundled codec drift: {}",
+            version()
+        );
+        assert!(!packet_has_fec(&[]));
+        for samples in [480, 960] {
+            let mut encoder = Encoder::new().unwrap();
+            encoder.set_loss_permille(200).unwrap();
+            let signal = speechlike(48000, 913, 3.0, 0.0, 0.15);
+            let mut decoder = Decoder::new().unwrap();
+            let mut out = vec![0.0; 5760];
+            let mut actual = 0;
+            for (index, frame) in signal.chunks_exact(samples).enumerate() {
+                let packet = encoder.encode(frame).unwrap().to_vec();
+                if index % 5 == 3 {
+                    assert_eq!(
+                        decoder.decode_fec_for(&packet, &mut out, samples).unwrap(),
+                        samples
+                    );
+                    if decoder.last_fec_samples() > 0 {
+                        actual += 1;
+                        assert!(packet_has_fec(&packet));
+                    }
+                }
+                decoder.decode(&packet, &mut out).unwrap();
+            }
+            assert!(actual > 0, "no redundancy at {samples} samples");
+            // A 10-ms missing slot before a 20-ms codec frame cannot be FEC:
+            // libopus explicitly falls back to PLC instead of writing 20 ms.
+            let packet = encoder.encode(&signal[..960]).unwrap().to_vec();
+            assert_eq!(decoder.decode_fec_for(&packet, &mut out, 480).unwrap(), 480);
+            assert_eq!(decoder.last_fec_samples(), 0);
+            assert_eq!(decoder.conceal_for(&mut out, 960).unwrap(), 960);
+            assert_eq!(decoder.last_fec_samples(), 0);
+            assert!(decoder.conceal_for(&mut out, 481).is_err());
+        }
+    }
 
     /// A peer's 60 ms packet must not panic FEC recovery into a buffer
     /// sized for 20 ms.

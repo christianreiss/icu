@@ -22,6 +22,33 @@
 
 use super::meter::{from_db, measure, to_db};
 
+/// Conservative activity for ducking. This changes no speech samples or gain.
+/// Only a coherent moving pitch confirms speech; noise-floor excursions, a
+/// transmission gate, typing, and concealment cannot start attenuation.
+#[derive(Default)]
+pub struct SpeechActivity {
+    voicing: super::voicing::Voicing,
+    tail_samples: usize,
+}
+impl SpeechActivity {
+    /// Feed original decoded audio, before playback gains. `valid_original`
+    /// must be false for PLC, FEC, missing packets and known discontinuities.
+    pub fn observe(&mut self, block: &[f32], valid_original: bool) -> bool {
+        if !valid_original || block.is_empty() || block.iter().any(|s| !s.is_finite()) {
+            *self = Self::default();
+            return false;
+        }
+        let voiced = self.voicing.observe(block);
+        let audible = measure(block).rms_db > -65.0;
+        if voiced && audible {
+            self.tail_samples = 5760; // Up to 120 ms for unvoiced speech tails.
+        } else {
+            self.tail_samples = self.tail_samples.saturating_sub(block.len());
+        }
+        audible && (voiced || self.tail_samples > 0)
+    }
+}
+
 /// Target, bounds and speed of one normalizer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Profile {
@@ -57,6 +84,13 @@ impl Profile {
         fall_s: 2.0,
         dead_band_db: 2.0,
         speech_min_db: -40.0,
+    };
+    /// Feedback speech selection, with explicit/voicing evidence for clean quiet
+    /// speech. This profile measures only; it never applies receive gain.
+    pub const FEEDBACK: Profile = Profile {
+        speech_min_db: -65.0,
+        dead_band_db: 0.0,
+        ..Self::RECEIVE
     };
     /// Mic auto leveling: down within a word (a louder voice is caught
     /// before the receive side reacts), up over seconds. −20 dBFS on the
@@ -172,6 +206,10 @@ impl Normalizer {
 
     /// Measures without changing samples; shared by feedback and actual leveling.
     pub fn observe(&mut self, block: &[f32], voice: Option<bool>) -> bool {
+        self.observe_confident(block, voice, false)
+    }
+
+    fn observe_confident(&mut self, block: &[f32], voice: Option<bool>, clean: bool) -> bool {
         if block.is_empty() || block.iter().any(|x| !x.is_finite()) {
             self.unhinted = false;
             return false;
@@ -206,7 +244,13 @@ impl Normalizer {
         let floor = self.win_min.min(self.prev_win_min);
 
         let p = self.profile;
-        let eligible = rms_db > p.speech_min_db
+        // Low-level bootstrap is explicitly corroborated by the send chain's
+        // recent RNNoise/SNR evidence. A boolean VAD alone cannot enable it.
+        let bootstrap = clean
+            && p == Profile::MIC_LEVEL
+            && voice == Some(true)
+            && (-65.0..=p.speech_min_db).contains(&rms_db);
+        let eligible = (rms_db > p.speech_min_db || bootstrap)
             && match voice {
                 Some(true) => true,
                 Some(false) => false,
@@ -218,7 +262,13 @@ impl Normalizer {
             } else {
                 alpha(p.fall_s, block.len())
             };
-            self.level_db += a * (rms_db - self.level_db);
+            let change = a * (rms_db - self.level_db);
+            self.level_db += if bootstrap {
+                // At most 2 dB per suitable speech-second, never during noise.
+                change.max(-2.0 * block.len() as f32 / SR)
+            } else {
+                change
+            };
         }
 
         eligible
@@ -249,6 +299,12 @@ impl Normalizer {
     /// Like [`Normalizer::process`]; `Some(false)` (the VAD hears no voice)
     /// holds the level estimate. The noise floor keeps tracking either way.
     pub fn process_hinted(&mut self, block: &mut [f32], voice: Option<bool>) {
+        self.process_confident(block, voice, false);
+    }
+
+    /// `clean` is fresh high-confidence speech with adequate pre-leveler SNR.
+    /// Only MIC_LEVEL uses it, and only below its ordinary speech floor.
+    pub fn process_confident(&mut self, block: &mut [f32], voice: Option<bool>, clean: bool) {
         if block.is_empty() {
             return;
         }
@@ -258,7 +314,7 @@ impl Normalizer {
                 self.unhinted = false;
             }
         }
-        self.observe(block, voice);
+        self.observe_confident(block, voice, clean);
         let mut target = from_db(self.correction_db());
         let mut start = self.gain;
         self.headroom_limited = false;
@@ -677,5 +733,37 @@ mod tests {
         let mut n = Normalizer::with(Profile::MIC_LEVEL);
         n.reset();
         assert_eq!(n.profile, Profile::MIC_LEVEL);
+    }
+    #[test]
+    fn quiet_bootstrap_requires_clean_evidence_and_has_a_rate_limit() {
+        for db in [-65.0, -60.0, -55.0, -50.0] {
+            let mut n = Normalizer::with(Profile::MIC_LEVEL);
+            for _ in 0..200 {
+                n.process_confident(&mut [from_db(db); BLOCK], Some(true), false);
+            }
+            assert_eq!(n.gain_db(), 0.0);
+            for _ in 0..200 {
+                n.process_confident(&mut [from_db(db); BLOCK], Some(true), true);
+            }
+            assert!((3.9..=4.01).contains(&n.gain_db()), "{db}: {}", n.gain_db());
+            let held = n.gain_db();
+            for _ in 0..200 {
+                n.process_confident(&mut [from_db(db); BLOCK], Some(false), true);
+            }
+            assert!((n.gain_db() - held).abs() < 0.001);
+            for _ in 0..1500 {
+                n.process_confident(&mut [from_db(db); BLOCK], Some(true), true);
+            }
+            assert!(n.gain_db() <= 15.001);
+        }
+        let mut n = Normalizer::new();
+        for _ in 0..200 {
+            n.process_confident(&mut [from_db(-60.0); BLOCK], Some(true), true);
+        }
+        assert_eq!(
+            n.gain_db(),
+            0.0,
+            "explicit bootstrap belongs only to microphone leveling"
+        );
     }
 }

@@ -175,36 +175,17 @@ Queue auf 0,5 s begrenzt. Der Mikrofontest bleibt auf Audio und Klang aktiv.
 
 ### Empfangsfeedback und Systemmikrofon
 
-`audio.peer_assistance` und `audio.tune_system_mic` sind standardmäßig aktiv,
-wirken aber nur mit `auto_level && denoise`. Die UI bietet beide Schalter
-separat und zeigt Systemkorrektur, digitale Korrektur und Peer-Zielkorrektur.
-Die Setup-Zusammenfassung nennt die aktiven Funktionen. Manuelle ICU-Verstärkung
-wird nicht überschrieben.
+Die [Audio-Policy](audio-quality.md) beschreibt die aktuelle Signalfolge,
+Messpunkte, Zuständigkeiten, Kanalwahl und Ducking. Policy 2 misst geeignete
+Quellsprache als RMS und akzeptiert einmalig ±1,5 dB um −22 dBFS. Schon 100 ms
+geeignete Sprache ergeben ein nach Sprachmenge gewichtetes Fenster. Server und
+Sender gleichen zeitlich und nach Gain-Epoche passende Beobachtungen ab;
+Empfangsnormalisierung, Benutzerregler und Ducking verändern dieses Feedback nicht.
 
-`dsp::feedback::Measurement` nutzt den Schätzer des Empfangsnormalisierers ohne
-Samples zu ändern. Empfänger messen direkt nach regulärem Opus-Decode, vor
-Normalisierung/Lautstärke; PLC/FEC und künstliche Jitter-Ausgaben zählen nicht.
-Der Sender misst denselben Wert vor Opus. Eine Zielkorrektur verlangt drei
-übereinstimmende gültige Fenster, lokale Bestätigung innerhalb 2 dB und bei
-Verstärkung mindestens 3 dB Spitzenreserve. Totband: 2 dB, Schritt: 0,5 dB
-alle 2 s, Ausgangskorrektur maximal ±6 dB. Die erste Entscheidung und ein
-Richtungswechsel brauchen drei passende Fenster. Weitere Schritte brauchen
-jeweils eine vollständige Messung der bereits angewandten Korrektur.
-Sprechpausen, fehlendes Feedback und Konflikte halten die Korrektur im selben
-Gespräch; dabei werden keine weiteren Schritte erlaubt. Erst explizites
-Abschalten neutralisiert sie in 0,5-dB-Schritten je zwei Sekunden. `SendChain::tune` setzt eine langsame
-Peer-Korrektur nach dem festen Stimmkompressor und vor dem Ausgangslimiter;
-damit komprimiert der Kompressor die Korrektur nicht wieder weg. Sie wird pro
-Block weich eingeblendet. Der lokale Mikrofon-AGC behält sein Ziel; ein zweiter
-schneller AGC entsteht nicht. Peer-Korrekturen lernen weder die VAD noch den
-Systemregler um. Solange eine Peer-Korrektur wirkt, bleibt der Ausgangslimiter
-auch bei abgeschalteter Ausgangsnormalisierung aktiv. Fehlende lokale Sprache,
-widersprechende Messung, fehlende Spitzenreserve und die Regelgrenze erscheinen
-im Peer-Status statt pauschal als aktive Regelung.
-Bei einer neuen Verbindung wird nur das Empfangsfeedback zurückgesetzt.
-Die nächste DSP-Verarbeitung erhält eine frische Pegelkennung, damit gültige
-Hints auch ohne Einstellungsänderung angenommen werden. Lokale Kalibrierung
-und noch ausstehende Kompensation nativer Mikrofonänderungen bleiben erhalten.
+Die Systemmikrofonregelung behält ihre bedingte Restore-Verantwortung, auch wenn
+alte Lern-/Noise-Evidenz bei Pause, Streamwechsel oder Störung verworfen wird.
+Kurze Antwortstücke bleiben für die Prüfung eines eigenen Hardware-Schritts
+begrenzt erhalten. Einzelne Clippingimpulse lösen keine dauerhafte Pegelsenkung aus.
 
 ### Gute Audiopegel und verständlicher Status
 
@@ -223,8 +204,10 @@ Softwareüberlast oder starke Limiter-Eingriffe verhindern die Speicherung
 Softwaregain bezieht sich auf den ursprünglichen Systempegel, damit dessen
 Wiederherstellung den nächsten Start nicht verfälscht.
 
-Wiederverwendung verlangt dasselbe Mikrofon, passende Verarbeitung und einen
-Systempegel innerhalb 0,5 dB des gespeicherten Ausgangswerts. Positive
+Wiederverwendung verlangt dasselbe Mikrofon und denselben tatsächlich gewählten
+Eingangskanal, dieselbe Policy-Version, passende Verarbeitung und einen
+Systempegel innerhalb 0,5 dB des gespeicherten Ausgangswerts. Alte oder unbekannte Policy-
+Versionen werden nicht als Warmstart übernommen. Positive
 Startverstärkung ist auf 6 dB begrenzt. Eine gespeicherte Peer-Korrektur ist nur
 ein Kandidat: Erst frisches, lokal bestätigtes Feedback in derselben Richtung
 erlaubt die üblichen 0,5-dB-Schritte. Hardwarepegel werden nicht aus Profilen

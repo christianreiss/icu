@@ -1,8 +1,10 @@
 //! Platform neutral audio backend interface (`docs/reference/client.md` §3).
 //!
-//! A backend owns the device streams and calls back with mono f32 blocks at
-//! 48 kHz. The callbacks run on the backend's own (usually real-time) thread
-//! and must be lock free; the engine only pushes into ring buffers there.
+//! A backend owns device streams and exchanges 48 kHz f32 audio: selected
+//! mono microphone input, mono voice playback, and independent native
+//! channels for the echo reference. Callbacks run on the backend's own
+//! (usually real-time) thread and must be lock free; the engine only pushes
+//! into ring buffers there.
 
 use std::fmt;
 
@@ -39,6 +41,9 @@ pub enum BackendEvent {
     /// A default endpoint changed. Reopen all streams together so microphone,
     /// playback and echo reference start a new timing epoch.
     DefaultDeviceChanged,
+    /// Automatic microphone selection changed on the running stream.
+    /// Reset capture/DSP evidence, but keep the stream and selector alive.
+    CaptureChannelChanged { channel: u16 },
     /// An established stream lost its capture clock. Reopen the audio group
     /// together instead of combining microphone and reference across the gap.
     StreamDiscontinuity {
@@ -67,6 +72,11 @@ pub enum StreamKind {
 
 /// Called with each captured block (mono f32, ±1.0).
 pub type CaptureCallback = Box<dyn FnMut(&[f32]) + Send + 'static>;
+/// Independent render lanes. Ring occupancies count frames rather than
+/// channel samples, preserving the microphone/reference clock relation.
+pub const MAX_REFERENCE_CHANNELS: usize = 8;
+pub type ReferenceFrame = [f32; MAX_REFERENCE_CHANNELS];
+pub type ReferenceCallback = Box<dyn FnMut(&[ReferenceFrame], usize) + Send + 'static>;
 /// Called to fill each playback block (mono f32, ±1.0); the slice is zeroed.
 pub type PlaybackCallback = Box<dyn FnMut(&mut [f32]) + Send + 'static>;
 
@@ -103,6 +113,20 @@ pub trait AudioBackend: Send {
     /// Current device list.
     fn devices(&self) -> Vec<DeviceInfo>;
 
+    /// Set before opening capture; explicit indices are zero based.
+    fn set_capture_channel(&mut self, channel: Option<u16>) -> Result<(), BackendError> {
+        if channel.is_some_and(|channel| channel != 0) {
+            return Err(BackendError(
+                "Mikrofonkanal wird von diesem Backend nicht unterstützt".into(),
+            ));
+        }
+        Ok(())
+    }
+    /// Actual selected channel, when known; part of calibration identity.
+    fn capture_channel_index(&self) -> Option<u16> {
+        None
+    }
+
     /// Opens the microphone stream. `device` is a [`DeviceInfo::id`] or
     /// `None` for the default.
     fn open_capture(
@@ -116,7 +140,7 @@ pub trait AudioBackend: Send {
     fn open_reference(
         &mut self,
         sink: Option<&str>,
-        cb: CaptureCallback,
+        cb: ReferenceCallback,
     ) -> Result<(), BackendError>;
 
     /// Opens the playback stream.

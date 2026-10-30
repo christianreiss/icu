@@ -134,6 +134,12 @@ pub struct DebugStats {
     pub frames_decoded: AtomicU64,
     /// Frames recovered from FEC.
     pub frames_fec: AtomicU64,
+    /// FEC decode attempts, including packets without usable redundancy.
+    pub frames_fec_attempted: AtomicU64,
+    /// Samples recovered from actual redundancy (excludes any PLC prefix).
+    pub frames_fec_samples: AtomicU64,
+    /// FEC attempts that produced PLC only.
+    pub frames_fec_fallback: AtomicU64,
     /// Frames concealed by PLC.
     pub frames_plc: AtomicU64,
     /// Playback callbacks that found the ring partly empty (audible gap).
@@ -229,12 +235,15 @@ impl DebugStats {
         let jitter_delay = self.jitter_delay.lock().unwrap().summary();
         let capture_to_send = self.capture_to_send.lock().unwrap().summary();
         format!(
-            "icu stats: sent={} recv={} bad={} decoded={} fec={} plc={} played={} play_underruns={} jb_late={} jb_underruns={} jb_stretched={} jb_skipped={} jb_dropped={} jb_lost={} dsp_blocks={} ref_underruns={} cap_overruns={} ref_overruns={} cap_backlog={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
+            "icu stats: sent={} recv={} bad={} decoded={} fec={} fec_attempted={} fec_samples={} fec_fallback={} plc={} played={} play_underruns={} jb_late={} jb_underruns={} jb_stretched={} jb_skipped={} jb_dropped={} jb_lost={} dsp_blocks={} ref_underruns={} cap_overruns={} ref_overruns={} cap_backlog={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
             Self::get(&self.datagrams_sent),
             Self::get(&self.datagrams_received),
             Self::get(&self.datagrams_bad),
             Self::get(&self.frames_decoded),
             Self::get(&self.frames_fec),
+            Self::get(&self.frames_fec_attempted),
+            Self::get(&self.frames_fec_samples),
+            Self::get(&self.frames_fec_fallback),
             Self::get(&self.frames_plc),
             Self::get(&self.samples_played),
             Self::get(&self.playback_underruns),

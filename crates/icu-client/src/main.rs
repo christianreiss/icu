@@ -31,6 +31,9 @@ use icu_client::{
 #[derive(Debug, Parser)]
 #[command(name = "icu", version, about, long_about = None)]
 struct Cli {
+    /// Private child process that restores temporary application gains on EOF.
+    #[arg(long, hide = true)]
+    ducking_worker: bool,
     /// Invite (registration bundle) or passport to take over: an `.icu`
     /// file, or `-` for its text on standard input. Never the text itself:
     /// it carries a private key, and arguments are visible to every local
@@ -111,6 +114,12 @@ fn main() -> ExitCode {
         )
     };
     let cli = Cli::parse();
+    if cli.ducking_worker {
+        return match icu_client::audio::ducking::run_worker() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     // A terminal shows the log as it comes; without one it goes to a file.
     #[cfg(windows)]
     let terminal = console;

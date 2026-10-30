@@ -50,6 +50,14 @@ struct Owned {
     last: CaptureLevel,
     _lease: File,
 }
+struct Response {
+    before_db: f32,
+    change_db: f32,
+    at: Instant,
+}
+const EVIDENCE_AGE: Duration = Duration::from_secs(5);
+const RESPONSE_AGE: Duration = Duration::from_secs(20);
+const LEARNING_AGE: Duration = Duration::from_secs(30);
 #[derive(Default)]
 pub struct SystemTuner {
     owned: Option<Owned>,
@@ -57,11 +65,22 @@ pub struct SystemTuner {
     response_suspended: bool,
     speech_samples: usize,
     last_write: Option<Instant>,
-    response: Option<(f32, f32)>,
-    noise_db: Option<f32>,
+    response: Option<Response>,
+    noise_db: Option<(f32, Instant)>,
+    last_speech: Option<Instant>,
+    learning_since: Option<Instant>,
     pub status: String,
 }
 impl SystemTuner {
+    /// Drop measurements across mute, capture gaps or a changed device timeline.
+    /// Ownership is retained, so a later restore still respects user changes.
+    pub fn invalidate_evidence(&mut self) {
+        self.speech_samples = 0;
+        self.noise_db = None;
+        self.response = None;
+        self.last_speech = None;
+        self.learning_since = None;
+    }
     /// Restores only our own last value, never overwriting another application's change.
     pub fn restore(&mut self, backend: &mut dyn AudioBackend) -> f32 {
         let mut delta = 0.0;
@@ -80,9 +99,37 @@ impl SystemTuner {
             .map_or(0.0, |o| o.last.db - o.original.db)
     }
     pub fn tick(&mut self, backend: &mut dyn AudioBackend, w: CaptureWindow, now: Instant) -> f32 {
+        if self
+            .last_speech
+            .is_some_and(|at| now.saturating_duration_since(at) > EVIDENCE_AGE)
+            || self
+                .learning_since
+                .is_some_and(|at| now.saturating_duration_since(at) > LEARNING_AGE)
+        {
+            self.speech_samples = 0;
+            self.last_speech = None;
+            self.learning_since = None;
+        }
+        if self
+            .noise_db
+            .is_some_and(|(_, at)| now.saturating_duration_since(at) > EVIDENCE_AGE)
+        {
+            self.noise_db = None;
+        }
+        if self
+            .response
+            .as_ref()
+            .is_some_and(|r| now.saturating_duration_since(r.at) > RESPONSE_AGE)
+        {
+            self.response = None;
+        }
+        // A one-sample table/key impulse is a peak, not evidence for a
+        // hardware correction. Sustained clipping can still be corrected
+        // if severe distortion has made the VAD stop recognizing speech.
+        let clipped = w.sustained_clipping();
         // A response-validation pause must not defeat later clipping
         // protection. Manual changes and device/write faults still suspend.
-        if self.suspended && !(self.response_suspended && w.near_full > 0) {
+        if self.suspended && !(self.response_suspended && clipped) {
             return 0.0;
         }
         let current = match backend.capture_level() {
@@ -118,37 +165,44 @@ impl SystemTuner {
         self.status = format!("Lernt · {}", current.kind);
         // Windows of wall time, not an unlimited accumulated backlog.
         if w.samples > 105_600 {
-            self.speech_samples = 0;
+            self.invalidate_evidence();
             return 0.0;
         }
         if w.noise_samples >= 12_000 {
-            self.noise_db = Some(crate::dsp::meter::to_db(
-                (w.noise_energy / w.noise_samples as f64).sqrt() as f32,
+            self.noise_db = Some((
+                crate::dsp::meter::to_db((w.noise_energy / w.noise_samples as f64).sqrt() as f32),
+                now,
             ));
         }
-        let clipped = w.near_full > 0;
         if w.speech_samples < 12_000 && !clipped {
             return 0.0;
         }
         self.speech_samples = self.speech_samples.saturating_add(w.speech_samples);
+        if w.speech_samples > 0 {
+            self.last_speech = Some(now);
+            self.learning_since.get_or_insert(now);
+        }
         if self.last_write.is_some_and(|t| {
             now.saturating_duration_since(t) < Duration::from_secs(if clipped { 1 } else { 5 })
         }) {
             return 0.0;
         }
-        if let Some((before, change)) = self.response.take() {
+        if let Some(response) = self.response.as_ref() {
+            if !clipped && w.speech_samples < 24_000 {
+                self.status = "Warte auf passende Sprache zur Pegelprüfung".into();
+                return 0.0;
+            }
             // Natural speech varies: suspend only a large, contradictory response.
             // A newly loud/clipped phrase is not evidence that the device
             // ignored our previous write. Clipping must still lower capture
             // gain, rather than suspend while the microphone is overdriven.
-            if !clipped && w.speech_samples >= 24_000 && (w.rms_db() - before - change).abs() > 9.0
-            {
+            if !clipped && (w.rms_db() - response.before_db - response.change_db).abs() > 9.0 {
                 self.suspended = true;
-                self.response_suspended = false;
                 self.response_suspended = true;
                 self.status = "Mikrofon prüfen: Pegel reagiert unerwartet".into();
                 return 0.0;
             }
+            self.response = None;
         }
         let correction = w.gain_db();
         if !clipped && correction.abs() <= 3.0 {
@@ -160,7 +214,9 @@ impl SystemTuner {
             && (self.speech_samples < 480_000
                 || w.peak > 0.5
                 || w.rms_db() < -50.0
-                || self.noise_db.is_none_or(|noise| w.rms_db() - noise < 10.0))
+                || self
+                    .noise_db
+                    .is_none_or(|(noise, _)| w.rms_db() - noise < 10.0))
         {
             return 0.0;
         }
@@ -203,9 +259,14 @@ impl SystemTuner {
                 self.last_write = Some(now);
                 self.suspended = false;
                 self.response_suspended = false;
-                self.response = Some((w.rms_db(), delta));
+                self.response = Some(Response {
+                    before_db: w.rms_db(),
+                    change_db: delta,
+                    at: now,
+                });
                 self.speech_samples = 0;
-                self.noise_db = self.noise_db.map(|n| n + delta);
+                self.learning_since = None;
+                self.noise_db = self.noise_db.map(|(n, at)| (n + delta, at));
                 delta
             }
             Ok(actual)
@@ -300,7 +361,7 @@ mod tests {
         fn open_reference(
             &mut self,
             _: Option<&str>,
-            _: CaptureCallback,
+            _: ReferenceCallback,
         ) -> Result<(), BackendError> {
             Ok(())
         }
@@ -342,6 +403,7 @@ mod tests {
             gain_sum: 36_000.0 * gain as f64,
             noise_samples: 12_000,
             noise_energy: 12_000.0 * 10f64.powf((db - 25.0) as f64 / 10.0),
+            ..Default::default()
         }
     }
     #[test]
@@ -397,7 +459,8 @@ mod tests {
         }
         assert_eq!(d.writes, 0, "no noise boost");
         let mut w = window(10.0, -5.0);
-        w.near_full = 3;
+        w.near_full = 48;
+        w.max_clip_streak_samples = 4_800;
         w.peak = 1.0;
         assert!(
             t.tick(&mut d, w, start + Duration::from_secs(50)) < 0.0,
@@ -415,7 +478,8 @@ mod tests {
         let mut b = SystemTuner::default();
         let now = Instant::now();
         let mut w = window(0.0, -2.0);
-        w.near_full = 5;
+        w.near_full = 48;
+        w.max_clip_streak_samples = 4_800;
         assert!(a.tick(&mut d, w, now) < 0.0);
         let n = d.writes;
         assert_eq!(b.tick(&mut d, w, now), 0.0);
@@ -441,6 +505,7 @@ mod tests {
         assert!(t.response.is_some());
         let mut loud = window(-12.0, -3.0);
         loud.near_full = 100;
+        loud.max_clip_streak_samples = 4_800;
         loud.peak = 1.0;
         assert!(
             t.tick(&mut d, loud, now + Duration::from_secs(14)) < 0.0,
@@ -461,6 +526,7 @@ mod tests {
         assert!(t.suspended && t.response_suspended);
         let mut clipped = window(-12.0, -3.0);
         clipped.near_full = 50;
+        clipped.max_clip_streak_samples = 4_800;
         clipped.peak = 1.0;
         assert!(t.tick(&mut d, clipped, now + Duration::from_secs(21)) < 0.0);
         assert!(!t.suspended);
@@ -470,5 +536,83 @@ mod tests {
         let writes = d.writes;
         t.tick(&mut d, clipped, now + Duration::from_secs(25));
         assert_eq!(d.writes, writes);
+    }
+
+    #[test]
+    fn short_answer_does_not_consume_pending_hardware_validation() {
+        let mut d = Device::new();
+        let mut t = SystemTuner::default();
+        let now = Instant::now();
+        for i in 0..14 {
+            t.tick(&mut d, window(9.0, -36.0), now + Duration::from_secs(i));
+        }
+        assert!(t.response.is_some());
+        let mut short = window(-4.0, -18.0);
+        short.speech_samples = 14_400;
+        short.speech_energy = 14_400.0 * 10f64.powf(-1.8);
+        t.tick(&mut d, short, now + Duration::from_secs(20));
+        assert!(
+            t.response.is_some(),
+            "300 ms cannot discard the pending check"
+        );
+        assert!(!t.suspended);
+        let mut enough = short;
+        enough.speech_samples = 28_800;
+        enough.speech_energy *= 2.0;
+        t.tick(&mut d, enough, now + Duration::from_secs(21));
+        assert!(t.suspended && t.response_suspended);
+        t.restore(&mut d);
+    }
+
+    #[test]
+    fn old_speech_and_quiet_room_cannot_authorize_a_later_boost() {
+        let mut d = Device::new();
+        let mut t = SystemTuner::default();
+        let now = Instant::now();
+        for i in 0..13 {
+            t.tick(&mut d, window(9.0, -36.0), now + Duration::from_secs(i));
+        }
+        assert_eq!(d.writes, 0);
+        let mut speech = window(9.0, -36.0);
+        speech.noise_samples = 0;
+        speech.noise_energy = 0.0;
+        t.tick(&mut d, speech, now + Duration::from_secs(60));
+        assert_eq!(d.writes, 0);
+        assert_eq!(t.speech_samples, speech.speech_samples);
+        assert!(t.noise_db.is_none());
+    }
+
+    #[test]
+    fn isolated_clipped_impulses_do_not_rachet_microphone_down() {
+        let mut d = Device::new();
+        let mut t = SystemTuner::default();
+        let now = Instant::now();
+        for i in 0..30 {
+            let impulse = CaptureWindow {
+                samples: 48_000,
+                near_full: 1,
+                peak: 1.0,
+                ..Default::default()
+            };
+            t.tick(&mut d, impulse, now + Duration::from_secs(i));
+        }
+        assert_eq!(d.writes, 0);
+        let mut repeated = CaptureWindow::default();
+        let mut click = [0.0; 480];
+        click[..100].fill(1.0);
+        for _ in 0..100 {
+            repeated.observe(&click, false, 0.0);
+            repeated.observe(&[0.0; 480], false, 0.0);
+        }
+        assert_eq!(repeated.near_full, 10_000);
+        assert!(!repeated.sustained_clipping());
+        assert_eq!(t.tick(&mut d, repeated, now + Duration::from_secs(30)), 0.0);
+        let mut sustained = CaptureWindow::default();
+        for _ in 0..10 {
+            sustained.observe(&[1.0; 480], false, 0.0);
+        }
+        assert!(sustained.sustained_clipping());
+        assert!(t.tick(&mut d, sustained, now + Duration::from_secs(31)) < 0.0);
+        t.restore(&mut d);
     }
 }

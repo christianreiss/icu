@@ -50,6 +50,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "tim
 clap.workspace = true
 toml.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 sha2.workspace = true
@@ -59,7 +60,7 @@ tempfile.workspace = true
 # Audio
 opusic-sys = { version = "0.7.5", features = ["bundled", "dred"] }
 nnnoiseless = { version = "0.5.2", default-features = false }
-webrtc-audio-processing = { version = "~2.1", features = ["bundled"], optional = true }
+webrtc-audio-processing = { version = "~2.1", features = ["bundled", "experimental-aec3-config"], optional = true }
 webrtc-audio-processing-config = { version = "~2.1", optional = true }
 ringbuf = "0.5"
 cpal = { version = "0.18.2", optional = true }

@@ -39,14 +39,18 @@ mod linux {
 
     impl Stats {
         fn block(&mut self, data: &[f32]) {
+            let e: f64 = data.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+            self.observe(data.len(), e / data.len().max(1) as f64);
+        }
+
+        fn observe(&mut self, frames: usize, mean_energy: f64) {
             let now = Instant::now();
             if let Some(last) = self.last {
                 self.intervals_us.push((now - last).as_secs_f64() * 1e6);
             }
             self.last = Some(now);
-            self.sizes.push(data.len());
-            let e: f64 = data.iter().map(|s| (*s as f64) * (*s as f64)).sum();
-            self.rms_sum += (e / data.len().max(1) as f64).sqrt();
+            self.sizes.push(frames);
+            self.rms_sum += mean_energy.sqrt();
             self.blocks += 1;
         }
 
@@ -108,7 +112,19 @@ mod linux {
             .expect("open capture");
         let r = refr.clone();
         backend
-            .open_reference(None, Box::new(move |data| r.lock().unwrap().block(data)))
+            .open_reference(
+                None,
+                Box::new(move |data, channels| {
+                    let e: f64 = data
+                        .iter()
+                        .flat_map(|f| &f[..channels])
+                        .map(|s| (*s as f64).powi(2))
+                        .sum();
+                    r.lock()
+                        .unwrap()
+                        .observe(data.len(), e / (data.len() * channels).max(1) as f64);
+                }),
+            )
             .expect("open reference");
         let p = play.clone();
         let mut phase = 0.0f32;

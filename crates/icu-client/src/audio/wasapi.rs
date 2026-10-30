@@ -1,6 +1,7 @@
 //! WASAPI backend (Windows, `docs/reference/client.md` §3): shared mode,
-//! one thread per stream, 48 kHz mono f32 in 240-sample blocks like every
-//! backend.
+//! one thread per stream, 48 kHz f32. Capture selects one native input;
+//! playback maps mono voice to the front speakers; the echo reference
+//! preserves every native output channel (up to eight).
 //!
 //! - Capture and playback are event driven. Where the device's mix format
 //!   runs at 48 kHz, `IAudioClient3::InitializeSharedAudioStream` asks the
@@ -24,7 +25,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     thread::JoinHandle,
@@ -40,14 +41,15 @@ use windows::{
             Audio::{
                 eCapture, eConsole, eRender, AudioCategory_GameChat, AudioCategory_Other,
                 AudioClientProperties, EDataFlow, ERole, IAudioCaptureClient, IAudioClient,
-                IAudioClient2, IAudioClient3, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
-                IMMNotificationClient, IMMNotificationClient_Impl, MMDeviceEnumerator,
-                AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
-                AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
+                IAudioClient2, IAudioClient3, IAudioClientDuckingControl, IAudioRenderClient,
+                IMMDevice, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
+                MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY,
+                AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                AUDCLNT_STREAMOPTIONS_NONE, AUDCLNT_STREAMOPTIONS_RAW, DEVICE_STATE,
-                DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
+                AUDCLNT_STREAMOPTIONS_NONE, AUDCLNT_STREAMOPTIONS_RAW,
+                AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS, DEVICE_STATE, DEVICE_STATE_ACTIVE,
+                WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
             },
             KernelStreaming::WAVE_FORMAT_EXTENSIBLE,
             Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT},
@@ -65,7 +67,7 @@ use windows::{
 
 use super::backend::{
     AudioBackend, BackendError, BackendEvent, CaptureCallback, DeviceInfo, DeviceKind,
-    PlaybackCallback, StreamKind, BLOCK_SAMPLES, SAMPLE_RATE,
+    PlaybackCallback, ReferenceCallback, ReferenceFrame, StreamKind, BLOCK_SAMPLES, SAMPLE_RATE,
 };
 
 /// How long a stream thread waits for its event before looking at the stop
@@ -400,6 +402,8 @@ pub struct WasapiBackend {
     defaults: Arc<Defaults>,
     streams: HashMap<StreamKind, Running>,
     capture_device: Option<String>,
+    capture_channel: Option<u16>,
+    selected_channel: Arc<AtomicU16>,
     /// Dropped after the streams.
     _watcher: Watcher,
 }
@@ -416,6 +420,8 @@ impl WasapiBackend {
             defaults,
             streams: HashMap::new(),
             capture_device: None,
+            capture_channel: None,
+            selected_channel: Arc::new(AtomicU16::new(u16::MAX)),
             _watcher: watcher,
         })
     }
@@ -432,6 +438,8 @@ impl WasapiBackend {
         let spec = Spec {
             kind,
             device: device.map(str::to_string),
+            capture_channel: self.capture_channel,
+            selected_channel: self.selected_channel.clone(),
         };
         let (stop_t, defaults, events) =
             (stop.clone(), self.defaults.clone(), self.events_tx.clone());
@@ -477,20 +485,29 @@ impl AudioBackend for WasapiBackend {
         })
     }
 
+    fn set_capture_channel(&mut self, channel: Option<u16>) -> Result<(), BackendError> {
+        self.capture_channel = channel;
+        Ok(())
+    }
+    fn capture_channel_index(&self) -> Option<u16> {
+        let channel = self.selected_channel.load(Ordering::Relaxed);
+        (channel != u16::MAX).then_some(channel)
+    }
     fn open_capture(
         &mut self,
         device: Option<&str>,
         cb: CaptureCallback,
     ) -> Result<(), BackendError> {
+        self.selected_channel.store(u16::MAX, Ordering::Relaxed);
         self.open(StreamKind::Capture, device, Callback::Capture(cb))
     }
 
     fn open_reference(
         &mut self,
         sink: Option<&str>,
-        cb: CaptureCallback,
+        cb: ReferenceCallback,
     ) -> Result<(), BackendError> {
-        self.open(StreamKind::Reference, sink, Callback::Capture(cb))
+        self.open(StreamKind::Reference, sink, Callback::Reference(cb))
     }
 
     fn open_playback(
@@ -632,12 +649,15 @@ fn endpoint_level(
 
 enum Callback {
     Capture(CaptureCallback),
+    Reference(ReferenceCallback),
     Playback(PlaybackCallback),
 }
 
 /// What a stream thread opens.
 struct Spec {
     kind: StreamKind,
+    capture_channel: Option<u16>,
+    selected_channel: Arc<AtomicU16>,
     /// Endpoint id; `None` follows the default device.
     device: Option<String>,
 }
@@ -711,7 +731,7 @@ fn run_stream(
     tracing::info!(stream = spec.name(), device = %stream.device_name,
         channels = stream.channels, period = stream.period, mode = stream.mode,
         "wasapi stream open");
-    let ended = stream.pump(&mut callback, &stop, || {
+    let ended = stream.pump(&mut callback, &stop, &events, || {
         spec.device.is_none() && defaults.of(spec.flow()).load(Ordering::SeqCst) != generation
     });
     // The engine owns recovery, including clearing the audio rings and resetting
@@ -759,6 +779,9 @@ struct Stream {
     device_id: String,
     /// Captured samples not yet handed on as a whole block.
     pending: Vec<f32>,
+    reference: Vec<ReferenceFrame>,
+    selector: Option<super::channels::CaptureSelector>,
+    selected_channel: Arc<AtomicU16>,
     capture_timeline: super::packet::CaptureTimeline,
     /// Endpoint-sized mono scratch; allocated before the audio callback.
     block: Vec<f32>,
@@ -870,6 +893,22 @@ impl Stream {
             }
             let mix = mix_format(&client)?;
             let channels = mix.format.nChannels.max(1);
+            if spec.loopback() && channels > 8 {
+                return Err(format!(
+                    "AEC reference has {channels} channels; maximum is 8"
+                ));
+            }
+            let selector = if spec.kind == StreamKind::Capture {
+                Some(
+                    super::channels::CaptureSelector::new(
+                        spec.capture_channel,
+                        usize::from(channels),
+                    )
+                    .map_err(|e| e.to_string())?,
+                )
+            } else {
+                None
+            };
             let mut mode = "autoconvert";
             let mut period = 0u32;
             let mut initialized = false;
@@ -929,6 +968,16 @@ impl Stream {
                     .map_err(|e| format!("Initialize: {e}"))?;
                 period = SAMPLE_RATE / 100;
             }
+            // Windows 11 exposes a per-stream opt-out. ICU controls its
+            // own opt-in ducking; never change the system communications
+            // preference or the levels of unrelated sessions here.
+            if let Ok(ducking) = client.GetService::<IAudioClientDuckingControl>() {
+                if let Err(error) = ducking.SetDuckingOptionsForCurrentStream(
+                    AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS,
+                ) {
+                    tracing::debug!(%error, "WASAPI per-stream ducking opt-out unavailable");
+                }
+            }
             let event = if spec.loopback() {
                 None
             } else {
@@ -968,7 +1017,12 @@ impl Stream {
                 loopback: spec.loopback(),
                 device_name,
                 device_id: device_id(&device)?,
-                pending: Vec::with_capacity(BLOCK_SAMPLES * 8),
+                pending: Vec::with_capacity(
+                    buffer_frames as usize + period as usize + BLOCK_SAMPLES * 2,
+                ),
+                reference: vec![[0.0; 8]; 1024],
+                selector,
+                selected_channel: spec.selected_channel.clone(),
                 capture_timeline: Default::default(),
                 block: vec![0.0; buffer_frames as usize],
             };
@@ -990,6 +1044,7 @@ impl Stream {
         &mut self,
         callback: &mut Callback,
         stop: &AtomicBool,
+        events: &mpsc::Sender<BackendEvent>,
         moved: impl Fn() -> bool,
     ) -> Ended {
         let mut last_check = Instant::now();
@@ -1021,7 +1076,12 @@ impl Stream {
                 None => std::thread::sleep(LOOPBACK_POLL),
             }
             let moved_audio = match callback {
-                Callback::Capture(cb) => match self.read(cb) {
+                Callback::Capture(cb) => match self.read(cb, events) {
+                    Ok(Some(frames)) => Ok(frames),
+                    Ok(None) => return Ended::Discontinuity,
+                    Err(e) => Err(e),
+                },
+                Callback::Reference(cb) => match self.read_reference(cb) {
                     Ok(Some(frames)) => Ok(frames),
                     Ok(None) => return Ended::Discontinuity,
                     Err(e) => Err(e),
@@ -1042,9 +1102,12 @@ impl Stream {
         }
     }
 
-    /// Takes every packet waiting and hands on whole blocks: channel 0 of
-    /// a microphone, the average of all channels of the loopback mix.
-    fn read(&mut self, cb: &mut CaptureCallback) -> windows::core::Result<Option<usize>> {
+    /// Takes microphone packets and selects one native input channel.
+    fn read(
+        &mut self,
+        cb: &mut CaptureCallback,
+        events: &mpsc::Sender<BackendEvent>,
+    ) -> windows::core::Result<Option<usize>> {
         let Some(capture) = &self.capture else {
             return Ok(Some(0));
         };
@@ -1067,39 +1130,83 @@ impl Stream {
                 }
                 let n = frames as usize;
                 received += n;
+                if self.pending.len() + n > self.pending.capacity() {
+                    capture.ReleaseBuffer(frames)?;
+                    return Ok(None);
+                }
                 if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data.is_null() {
-                    self.pending.extend(std::iter::repeat_n(0.0, n));
+                    self.pending.resize(self.pending.len() + n, 0.0);
                 } else {
                     let samples = std::slice::from_raw_parts(data as *const f32, n * channels);
-                    if self.loopback {
-                        let scale = 1.0 / channels as f32;
-                        self.pending.extend(
-                            samples
-                                .chunks_exact(channels)
-                                .map(|f| f.iter().sum::<f32>() * scale),
-                        );
-                    } else {
-                        self.pending
-                            .extend(samples.chunks_exact(channels).map(|f| f[0]));
+                    let selector = self.selector.as_mut().expect("capture selector");
+                    if selector.update(samples, &self.selected_channel, events) {
+                        self.pending.clear();
                     }
+                    self.pending.extend(
+                        samples
+                            .chunks_exact(channels)
+                            .map(|frame| frame[selector.channel()]),
+                    );
                 }
                 capture.ReleaseBuffer(frames)?;
+                // Flush inside the packet loop: a delayed device wake must
+                // not make the real-time vector grow without a bound.
+                let min = (self.period as usize).div_ceil(BLOCK_SAMPLES).max(2) * BLOCK_SAMPLES;
+                let whole = self.pending.len() / BLOCK_SAMPLES * BLOCK_SAMPLES;
+                if whole >= min {
+                    cb(&self.pending[..whole]);
+                    self.pending.drain(..whole);
+                }
             }
         }
-        // The engine pairs microphone and reference per push
-        // (`dsp::refalign`) and waits up to 1.5 microphone pushes for the
-        // reference. The two WASAPI threads run on their own phases, so a
-        // microphone push spans at least the device period (resampled
-        // packets vary around it), never a single block.
-        let min = if self.loopback {
-            BLOCK_SAMPLES
-        } else {
-            (self.period as usize).div_ceil(BLOCK_SAMPLES).max(2) * BLOCK_SAMPLES
+        Ok(Some(received))
+    }
+
+    /// Preserve all native loopback channels before AEC. A stereo sum can
+    /// erase antiphase audio; dividing by a surround count dilutes fronts.
+    fn read_reference(
+        &mut self,
+        cb: &mut ReferenceCallback,
+    ) -> windows::core::Result<Option<usize>> {
+        let Some(capture) = &self.capture else {
+            return Ok(Some(0));
         };
-        let whole = self.pending.len() / BLOCK_SAMPLES * BLOCK_SAMPLES;
-        if whole >= min {
-            cb(&self.pending[..whole]);
-            self.pending.drain(..whole);
+        let mut received = 0;
+        unsafe {
+            while capture.GetNextPacketSize()? > 0 {
+                let mut data = std::ptr::null_mut();
+                let mut frames = 0;
+                let mut flags = 0;
+                capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+                if self.capture_timeline.begin_packet(
+                    &mut self.pending,
+                    flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
+                ) {
+                    capture.ReleaseBuffer(frames)?;
+                    return Ok(None);
+                }
+                let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null();
+                let samples = if silent {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(data as *const f32, frames as usize * self.channels)
+                };
+                for start in (0..frames as usize).step_by(self.reference.len()) {
+                    let count = (frames as usize - start).min(self.reference.len());
+                    for (i, frame) in self.reference[..count].iter_mut().enumerate() {
+                        frame.fill(0.0);
+                        if !silent {
+                            frame[..self.channels].copy_from_slice(
+                                &samples
+                                    [(start + i) * self.channels..(start + i + 1) * self.channels],
+                            );
+                        }
+                    }
+                    cb(&self.reference[..count], self.channels);
+                }
+                received += frames as usize;
+                capture.ReleaseBuffer(frames)?;
+            }
         }
         Ok(Some(received))
     }
@@ -1189,10 +1296,13 @@ mod tests {
         backend
             .open_reference(
                 None,
-                Box::new(move |samples| {
+                Box::new(move |samples, channels| {
                     counter.fetch_add(samples.len(), Ordering::Relaxed);
                     nonzero.fetch_add(
-                        samples.iter().filter(|x| x.abs() > 0.00001).count(),
+                        samples
+                            .iter()
+                            .filter(|frame| frame[..channels].iter().any(|x| x.abs() > 0.00001))
+                            .count(),
                         Ordering::Relaxed,
                     );
                 }),
@@ -1235,7 +1345,13 @@ mod tests {
             StreamKind::Playback,
             StreamKind::Reference,
         ] {
-            let mut stream = Stream::open(&Spec { kind, device: None }).unwrap();
+            let mut stream = Stream::open(&Spec {
+                kind,
+                device: None,
+                capture_channel: None,
+                selected_channel: Arc::new(AtomicU16::new(u16::MAX)),
+            })
+            .unwrap();
             // SAFETY: this thread owns the initialized, started client.
             unsafe { stream.client.Stop().unwrap() };
             let stop = Arc::new(AtomicBool::new(false));
@@ -1246,9 +1362,10 @@ mod tests {
             });
             let mut callback = match kind {
                 StreamKind::Playback => Callback::Playback(Box::new(|samples| samples.fill(0.0))),
-                _ => Callback::Capture(Box::new(|_| {})),
+                StreamKind::Capture => Callback::Capture(Box::new(|_| {})),
+                StreamKind::Reference => Callback::Reference(Box::new(|_, _| {})),
             };
-            let ended = stream.pump(&mut callback, &stop, || false);
+            let ended = stream.pump(&mut callback, &stop, &mpsc::channel().0, || false);
             timer.join().unwrap();
             match kind {
                 StreamKind::Reference => assert!(

@@ -13,6 +13,10 @@ const MAX_AGE: u64 = 30 * 24 * 3600;
 /// Processing only: restoring a profile cannot unmute, change PTT, or select devices.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessingSettings {
+    #[serde(default)]
+    policy_version: u16,
+    #[serde(default)]
+    input_channel: Option<u16>,
     gain_db: f32,
     denoise: bool,
     aec: bool,
@@ -29,6 +33,8 @@ pub struct ProcessingSettings {
 impl From<&AudioSettings> for ProcessingSettings {
     fn from(a: &AudioSettings) -> Self {
         Self {
+            policy_version: icu_proto::audio_level::POLICY_VERSION,
+            input_channel: a.input_channel,
             gain_db: a.gain_db,
             denoise: a.denoise,
             aec: a.aec,
@@ -60,7 +66,9 @@ impl ProcessingSettings {
         a.vad_threshold = self.vad_threshold;
     }
     fn valid(&self) -> bool {
-        self.gain_db.is_finite()
+        self.policy_version == icu_proto::audio_level::POLICY_VERSION
+            && self.input_channel.is_none_or(|channel| channel < 64)
+            && self.gain_db.is_finite()
             && (-20.0..=20.0).contains(&self.gain_db)
             && self.vad_threshold.is_finite()
             && (0.0..=1.0).contains(&self.vad_threshold)
@@ -91,10 +99,18 @@ impl Profile {
     }
 }
 pub fn device_key(backend: &str, actual_device: &str) -> String {
+    device_channel_key(backend, actual_device, None)
+}
+/// Include the actually selected input, even when automatic channel selection
+/// was requested. Unresolved channels must not warm-start another input.
+pub fn device_channel_key(backend: &str, actual_device: &str, channel: Option<u16>) -> String {
     let mut h = Sha256::new();
     h.update(backend);
     h.update([0]);
     h.update(actual_device);
+    h.update([0]);
+    h.update(icu_proto::audio_level::POLICY_VERSION.to_le_bytes());
+    h.update(channel.unwrap_or(u16::MAX).to_le_bytes());
     format!("{:x}", h.finalize())
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,16 +219,40 @@ impl Store {
 struct Candidate {
     profile: Profile,
     first: Instant,
+    last: Instant,
     windows: u32,
 }
 #[derive(Default)]
 pub struct Learner {
     candidate: Option<Candidate>,
+    last_window: Option<icu_proto::AudioWindow>,
     last_save: Option<Instant>,
 }
 impl Learner {
     pub fn reset(&mut self) {
         self.candidate = None;
+    }
+    /// Count each matched remote observation once, independently of timer ticks.
+    pub fn observe_window(
+        &mut self,
+        profile: Profile,
+        good: bool,
+        window: icu_proto::AudioWindow,
+        now: Instant,
+    ) -> Option<Profile> {
+        if !window.valid()
+            || self.last_window.is_some_and(|old| {
+                if window.gain_epoch == old.gain_epoch {
+                    !window.newer_hint_than(old)
+                } else {
+                    window.gain_epoch.wrapping_sub(old.gain_epoch) as i32 <= 0
+                }
+            })
+        {
+            return None;
+        }
+        self.last_window = Some(window);
+        self.observe(profile, good, now)
     }
     /// Call only for actual fresh speech windows; silence does not fabricate votes.
     pub fn observe(&mut self, profile: Profile, good: bool, now: Instant) -> Option<Profile> {
@@ -221,7 +261,8 @@ impl Learner {
             return None;
         }
         let same = self.candidate.as_ref().is_some_and(|c| {
-            c.profile.device == profile.device
+            now.saturating_duration_since(c.last) <= Duration::from_secs(6)
+                && c.profile.device == profile.device
                 && c.profile.settings == profile.settings
                 && (c.profile.capture_db - profile.capture_db).abs() <= 0.5
                 && (c.profile.mic_gain_db - profile.mic_gain_db).abs() <= 1.0
@@ -231,10 +272,12 @@ impl Learner {
             self.candidate = Some(Candidate {
                 profile: profile.clone(),
                 first: now,
+                last: now,
                 windows: 0,
             });
         }
         let c = self.candidate.as_mut()?;
+        c.last = now;
         c.windows += 1;
         if c.windows >= 5
             && now.saturating_duration_since(c.first) >= Duration::from_secs(20)
@@ -342,5 +385,49 @@ mod tests {
         lease.try_lock().unwrap();
         assert!(first.save_profile(&paths, p, now).is_err());
         assert!(Store::load(&paths).profile(&second_key, now).is_some());
+    }
+    #[test]
+    fn policy_and_actual_channel_are_part_of_profile_compatibility() {
+        assert_ne!(
+            device_channel_key("fake", "mic", Some(0)),
+            device_channel_key("fake", "mic", Some(1))
+        );
+        let mut p = profile(100);
+        p.settings.policy_version = 0;
+        assert!(
+            !p.valid(100),
+            "old metric profiles cannot warm start policy 2"
+        );
+        let mut a = AudioSettings::default();
+        let first = ProcessingSettings::from(&a);
+        a.input_channel = Some(1);
+        assert_ne!(first, ProcessingSettings::from(&a));
+    }
+    #[test]
+    fn stale_good_windows_do_not_accumulate_profile_confidence() {
+        let mut learner = Learner::default();
+        let now = Instant::now();
+        for i in 0..20 {
+            assert!(learner
+                .observe(profile(100), true, now + Duration::from_secs(i * 10))
+                .is_none());
+        }
+    }
+    #[test]
+    fn replayed_good_window_is_not_new_profile_confidence() {
+        let mut learner = Learner::default();
+        let now = Instant::now();
+        let window = icu_proto::AudioWindow {
+            gain_epoch: 1,
+            first_ts: 0,
+            end_ts: 96_000,
+            report_id: 0,
+        };
+        for tick in 0..60 {
+            assert!(learner
+                .observe_window(profile(100), true, window, now + Duration::from_secs(tick))
+                .is_none());
+        }
+        assert_eq!(learner.candidate.as_ref().unwrap().windows, 1);
     }
 }

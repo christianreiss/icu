@@ -208,21 +208,34 @@ mod diagnosis_tests {
 #[cfg(feature = "aec")]
 mod real {
     use super::{AecStats, FRAME};
+    use crate::audio::backend::{ReferenceFrame, MAX_REFERENCE_CHANNELS};
     use webrtc_audio_processing::{Config, Processor};
     use webrtc_audio_processing_config::EchoCanceller;
 
     /// The echo canceller.
     pub struct Aec {
         apm: Processor,
-        render: [Vec<f32>; 1],
+        render: [Vec<f32>; MAX_REFERENCE_CHANNELS],
         capture: [Vec<f32>; 1],
     }
 
     impl Aec {
         /// Creates the APM with only the echo canceller enabled.
         pub fn new() -> Result<Aec, String> {
-            let apm = Processor::new(48_000).map_err(|e| format!("{e:?}"))?;
+            // AEC3's default detector needs two uninterrupted seconds of
+            // different L/R content before leaving mono. Syllables never
+            // satisfy that, and rear-only surround is not detected at all.
+            // The backend already supplies the actual native layout.
+            let mut aec_config =
+                webrtc_audio_processing::experimental::EchoCanceller3Config::default();
+            aec_config.multi_channel.detect_stereo_content = false;
+            let apm =
+                Processor::with_aec3_config(48_000, aec_config).map_err(|e| format!("{e:?}"))?;
             apm.set_config(Config {
+                pipeline: webrtc_audio_processing_config::Pipeline {
+                    multi_channel_render: true,
+                    ..Default::default()
+                },
                 echo_canceller: Some(EchoCanceller::Full {
                     stream_delay_ms: None,
                 }),
@@ -233,7 +246,7 @@ mod real {
             });
             Ok(Aec {
                 apm,
-                render: [vec![0.0; FRAME]],
+                render: std::array::from_fn(|_| vec![0.0; FRAME]),
                 capture: [vec![0.0; FRAME]],
             })
         }
@@ -243,7 +256,41 @@ mod real {
             debug_assert_eq!(reference.len(), FRAME);
             debug_assert_eq!(capture.len(), FRAME);
             self.render[0].copy_from_slice(reference);
-            let _ = self.apm.process_render_frame(&mut self.render);
+            let _ = self.apm.process_render_frame(&mut self.render[..1]);
+            self.capture[0].copy_from_slice(capture);
+            if self.apm.process_capture_frame(&mut self.capture).is_ok() {
+                capture.copy_from_slice(&self.capture[0]);
+            }
+        }
+
+        /// Keep render channels independent: a stereo antiphase signal must
+        /// not disappear before AEC sees it, nor should surround be diluted.
+        pub fn process_multichannel(
+            &mut self,
+            reference: &[ReferenceFrame],
+            channels: usize,
+            capture: &mut [f32],
+        ) {
+            debug_assert_eq!(reference.len(), FRAME);
+            debug_assert_eq!(capture.len(), FRAME);
+            if reference.len() != FRAME
+                || capture.len() != FRAME
+                || !(1..=MAX_REFERENCE_CHANNELS).contains(&channels)
+            {
+                return;
+            }
+            for (channel, render) in self.render[..channels].iter_mut().enumerate() {
+                for (dst, frame) in render.iter_mut().zip(reference) {
+                    *dst = frame[channel];
+                }
+            }
+            if self
+                .apm
+                .process_render_frame(&mut self.render[..channels])
+                .is_err()
+            {
+                return;
+            }
             self.capture[0].copy_from_slice(capture);
             if self.apm.process_capture_frame(&mut self.capture).is_ok() {
                 capture.copy_from_slice(&self.capture[0]);
@@ -282,6 +329,14 @@ mod real {
         }
         /// No-op.
         pub fn process(&mut self, _reference: &[f32], _capture: &mut [f32]) {}
+        /// No-op.
+        pub fn process_multichannel(
+            &mut self,
+            _reference: &[crate::audio::backend::ReferenceFrame],
+            _channels: usize,
+            _capture: &mut [f32],
+        ) {
+        }
         /// No-op.
         pub fn reinitialize(&mut self) {}
         /// Empty.
@@ -383,6 +438,34 @@ mod tests {
 
     fn win(x: &[f32], from_s: f64, to_s: f64) -> &[f32] {
         &x[(from_s * SR as f64) as usize..((to_s * SR as f64) as usize).min(x.len())]
+    }
+
+    #[test]
+    fn independent_reference_channels_preserve_antiphase_and_surround_echo() {
+        let scene = build_scene(80.0, false);
+        for (channels, active, antiphase) in [(2, 0, true), (6, 4, false), (8, 7, false)] {
+            let mut aec = Aec::new().unwrap();
+            let mut out = vec![0.0; N];
+            let mut reference = vec![[0.0; 8]; FRAME];
+            for (block, capture) in out.as_chunks_mut::<FRAME>().0.iter_mut().enumerate() {
+                let start = block * FRAME;
+                for (frame, sample) in reference.iter_mut().zip(&scene.far[start..start + FRAME]) {
+                    frame.fill(0.0);
+                    frame[active] = *sample;
+                    if antiphase {
+                        frame[1] = -*sample;
+                    }
+                }
+                capture.copy_from_slice(&scene.mic[start..start + FRAME]);
+                aec.process_multichannel(&reference, channels, capture);
+            }
+            let erle = erle_db(win(&scene.mic, 8.0, 10.0), win(&out, 8.0, 10.0));
+            eprintln!("{channels}-channel reference, active {active}, antiphase={antiphase}: ERLE {erle:.1}dB");
+            assert!(
+                erle >= 20.0,
+                "independent render channels lost: {erle:.1}dB"
+            );
+        }
     }
 
     /// (a) steady-state ERLE ≥ 25 dB in single talk. Measured 28.9 dB

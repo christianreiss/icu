@@ -16,7 +16,7 @@ use std::{
 
 use super::backend::{
     AudioBackend, BackendError, BackendEvent, CaptureCallback, DeviceInfo, DeviceKind,
-    PlaybackCallback, StreamKind, BLOCK_SAMPLES, SAMPLE_RATE,
+    PlaybackCallback, ReferenceCallback, StreamKind, BLOCK_SAMPLES, SAMPLE_RATE,
 };
 
 /// A source of capture samples. Called once per block with the running sample
@@ -47,7 +47,7 @@ impl FakeProbe {
 
 struct Shared {
     capture: Mutex<Option<CaptureCallback>>,
-    reference: Mutex<Option<CaptureCallback>>,
+    reference: Mutex<Option<ReferenceCallback>>,
     playback: Mutex<Option<PlaybackCallback>>,
     generator: Mutex<Option<Generator>>,
     running: AtomicBool,
@@ -136,6 +136,7 @@ fn run(shared: Arc<Shared>) {
     let mut tick: u64 = 0;
     let mut block = vec![0.0f32; shared.block];
     let mut out = vec![0.0f32; shared.block];
+    let mut reference = vec![[0.0f32; 8]; shared.block];
     while shared.running.load(Ordering::Relaxed) {
         let deadline = start + period * (tick as u32 + 1);
         let now = Instant::now();
@@ -155,12 +156,10 @@ fn run(shared: Arc<Shared>) {
                 .extend_from_slice(&out);
         }
         if let Some(cb) = shared.reference.lock().unwrap().as_mut() {
-            if shared.loop_reference {
-                cb(&out);
-            } else {
-                block.fill(0.0);
-                cb(&block);
+            for (frame, sample) in reference.iter_mut().zip(&out) {
+                frame[0] = if shared.loop_reference { *sample } else { 0.0 };
             }
+            cb(&reference, 1);
         }
         if let Some(cb) = shared.capture.lock().unwrap().as_mut() {
             if let Some(g) = shared.generator.lock().unwrap().as_mut() {
@@ -175,6 +174,9 @@ fn run(shared: Arc<Shared>) {
 }
 
 impl AudioBackend for FakeBackend {
+    fn capture_channel_index(&self) -> Option<u16> {
+        Some(0)
+    }
     fn name(&self) -> &'static str {
         "fake"
     }
@@ -206,7 +208,7 @@ impl AudioBackend for FakeBackend {
     fn open_reference(
         &mut self,
         _sink: Option<&str>,
-        cb: CaptureCallback,
+        cb: ReferenceCallback,
     ) -> Result<(), BackendError> {
         *self.shared.reference.lock().unwrap() = Some(cb);
         Ok(())

@@ -106,7 +106,7 @@ async fn unmute_does_not_transmit_a_muted_half_frame() {
     use icu_client::{
         audio::{
             AudioBackend, BackendError, BackendEvent, CaptureCallback, DeviceInfo,
-            PlaybackCallback, StreamKind,
+            PlaybackCallback, ReferenceCallback, StreamKind,
         },
         config::ModeSetting,
         dsp::opus,
@@ -133,7 +133,7 @@ async fn unmute_does_not_transmit_a_muted_half_frame() {
         fn open_reference(
             &mut self,
             _: Option<&str>,
-            _: CaptureCallback,
+            _: ReferenceCallback,
         ) -> Result<(), BackendError> {
             Ok(())
         }

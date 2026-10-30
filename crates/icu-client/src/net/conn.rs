@@ -165,6 +165,7 @@ pub fn client_config_with_crl(
     ));
     transport.datagram_receive_buffer_size(Some(pl::DATAGRAM_BUFFER_BYTES));
     transport.datagram_send_buffer_size(pl::CLIENT_DATAGRAM_SEND_BUFFER_BYTES);
+    transport.datagram_send_max_age(Some(Duration::from_millis(pl::AUDIO_QUEUE_MAX_AGE_MS)));
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(pl::max_uni_streams(
         pl::MAX_MAX_USERS,
     )));

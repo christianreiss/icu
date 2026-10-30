@@ -95,6 +95,8 @@ impl From<crate::dsp::gate::Mode> for ModeSetting {
 pub struct AudioSettings {
     /// Capture device id, `None` = default.
     pub input_device: Option<String>,
+    /// Zero-based microphone channel; None selects a stable active channel.
+    pub input_channel: Option<u16>,
     /// Playback device id, `None` = default.
     pub output_device: Option<String>,
     /// PTT or VAD.
@@ -140,6 +142,8 @@ pub struct AudioSettings {
     pub cue_mute: bool,
     /// Master playback volume in percent.
     pub output_volume: f32,
+    /// Temporarily lower other applications while real speech is audible/sent.
+    pub ducking: crate::audio::ducking::Mode,
     /// Bring every incoming voice to a common loudness
     /// (`dsp::normalize`), before the per-user volume.
     pub normalize_incoming: bool,
@@ -156,6 +160,7 @@ impl Default for AudioSettings {
     fn default() -> Self {
         AudioSettings {
             input_device: None,
+            input_channel: None,
             output_device: None,
             mode: ModeSetting::Vad,
             vad_threshold: 0.5,
@@ -177,6 +182,7 @@ impl Default for AudioSettings {
             cue_tx: false,
             cue_mute: true,
             output_volume: 100.0,
+            ducking: crate::audio::ducking::Mode::Auto,
             normalize_incoming: true,
             normalize_outgoing: true,
             muted: false,
@@ -538,6 +544,7 @@ impl Settings {
     /// one list of what a passport leaves behind (`docs/reference/protocol.md` §2.3.1).
     fn keep_machine_fields(&mut self, from: &Settings) {
         self.audio.input_device.clone_from(&from.audio.input_device);
+        self.audio.input_channel = from.audio.input_channel;
         self.audio
             .output_device
             .clone_from(&from.audio.output_device);
@@ -639,6 +646,7 @@ impl Settings {
     fn clamp_numbers(&mut self) {
         let defaults = AudioSettings::default();
         let audio = &mut self.audio;
+        audio.input_channel = audio.input_channel.map(|channel| channel.min(63));
         audio.output_volume = clamped(audio.output_volume, 0.0, 200.0, defaults.output_volume);
         audio.vad_threshold = clamped(audio.vad_threshold, 0.0, 1.0, defaults.vad_threshold);
         audio.gain_db = clamped(audio.gain_db, -20.0, 20.0, defaults.gain_db);

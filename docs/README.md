@@ -58,3 +58,5 @@ abgeschlossene Arbeitspläne gehören nicht in die aktuelle Referenz.
 Historische Befehlsprotokolle behalten ihre damaligen Pfade. Bei erneutem Ausführen
 gelten die neue Bauanleitung und diese Zuordnung. Die Inhalte lokaler Testumgebungen
 werden beim Umzug erhalten; gespeicherte Konfigurationen erhalten die neuen Pfade.
+
+Audio: [Signalwege und Ducking-Policy](reference/audio-quality.md) · [Messbericht 2026-10-30](history/audio-quality-2026-10-30.md).

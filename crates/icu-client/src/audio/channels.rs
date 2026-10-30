@@ -4,9 +4,114 @@
 //! itself.
 
 /// Speaker bits of `WAVEFORMATEXTENSIBLE::dwChannelMask` (`ksmedia.h`).
+#[cfg(any(target_os = "windows", feature = "cpal-fallback", test))]
 const SPEAKER_FRONT_LEFT: u32 = 0x1;
+#[cfg(any(target_os = "windows", feature = "cpal-fallback", test))]
 const SPEAKER_FRONT_RIGHT: u32 = 0x2;
+#[cfg(any(target_os = "windows", feature = "cpal-fallback", test))]
 const SPEAKER_FRONT_CENTER: u32 = 0x4;
+
+/// Capture channel selection without destructive summing of unrelated or
+/// opposite-phase microphone inputs. Automatic selection uses an energy
+/// margin and 200 ms of consistent evidence before changing an established
+/// channel. Changes reset DSP evidence without restarting the native stream.
+pub(super) struct CaptureSelector {
+    requested: Option<u16>,
+    selected: Option<usize>,
+    candidate: usize,
+    candidate_frames: usize,
+    channels: usize,
+}
+impl CaptureSelector {
+    pub(super) fn new(
+        requested: Option<u16>,
+        channels: usize,
+    ) -> Result<Self, super::BackendError> {
+        if channels == 0 || channels > 64 || requested.is_some_and(|c| usize::from(c) >= channels) {
+            return Err(super::BackendError(format!(
+                "Mikrofonkanal nicht verfügbar ({channels} Kanäle)"
+            )));
+        }
+        Ok(Self {
+            requested,
+            selected: requested.map(usize::from),
+            candidate: 0,
+            candidate_frames: 0,
+            channels,
+        })
+    }
+    pub(super) fn selected(&self) -> Option<u16> {
+        self.selected.map(|c| c as u16)
+    }
+    /// Publish identity before notifying the engine. Keeping this selector
+    /// alive avoids repeatedly switching from the initial channel after a
+    /// stream reopen. All native backends share the same nonterminal event.
+    pub(super) fn update(
+        &mut self,
+        interleaved: &[f32],
+        selected: &std::sync::atomic::AtomicU16,
+        events: &std::sync::mpsc::Sender<super::BackendEvent>,
+    ) -> bool {
+        let changed = self.observe(interleaved);
+        selected.store(
+            self.selected().unwrap_or(u16::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if changed {
+            let _ = events.send(super::BackendEvent::CaptureChannelChanged {
+                channel: self.channel() as u16,
+            });
+        }
+        changed
+    }
+    /// Returns true only when an established selection changes.
+    pub(super) fn observe(&mut self, interleaved: &[f32]) -> bool {
+        if self.requested.is_some() {
+            return false;
+        }
+        let frames = interleaved.len() / self.channels;
+        if frames == 0 {
+            return false;
+        }
+        let mut energy = [0.0f64; 64];
+        for frame in interleaved.chunks_exact(self.channels) {
+            for (e, sample) in energy.iter_mut().zip(frame) {
+                if sample.is_finite() {
+                    *e += f64::from(*sample).powi(2);
+                }
+            }
+        }
+        let strongest = (0..self.channels)
+            .max_by(|&a, &b| energy[a].total_cmp(&energy[b]))
+            .unwrap_or(0);
+        if energy[strongest] / (frames as f64) < 1e-10 {
+            return false;
+        }
+        let Some(current) = self.selected else {
+            self.selected = Some(strongest);
+            return false;
+        };
+        if strongest == current || energy[strongest] < energy[current] * 4.0 {
+            self.candidate_frames = 0;
+            return false;
+        }
+        if self.candidate != strongest {
+            self.candidate = strongest;
+            self.candidate_frames = 0;
+        }
+        self.candidate_frames += frames;
+        if self.candidate_frames >= 9_600 {
+            self.selected = Some(strongest);
+            self.candidate_frames = 0;
+            true
+        } else {
+            false
+        }
+    }
+    pub(super) fn channel(&self) -> usize {
+        self.selected.unwrap_or(0)
+    }
+}
 
 /// For each of `channels` interleaved channels, whether the voice is
 /// written there (the rest stay silent). `mask` is the format's
@@ -15,6 +120,7 @@ const SPEAKER_FRONT_CENTER: u32 = 0x4;
 /// the mask's bits belong to no speaker. Without a usable mask the first
 /// two channels count as the front pair, as they do in every Windows
 /// layout.
+#[cfg(any(target_os = "windows", feature = "cpal-fallback", test))]
 pub fn voice_channels(channels: usize, mask: Option<u32>) -> Vec<bool> {
     let speaker = |bit: u32| -> Option<usize> {
         let mask = mask.filter(|m| m & bit != 0)?;
@@ -39,6 +145,7 @@ pub fn voice_channels(channels: usize, mask: Option<u32>) -> Vec<bool> {
 /// Render one endpoint request using preallocated mono scratch, then map it
 /// to the audible channels. The callback must see the complete request so
 /// the mixer can keep enough audio queued for the device's actual period.
+#[cfg(any(target_os = "windows", test))]
 pub fn render_voice(
     mono: &mut [f32],
     out: &mut [f32],
@@ -64,6 +171,68 @@ mod tests {
     const SURROUND_5_1: u32 = 0x3f;
     /// FL FR FC LFE BL BR SL SR.
     const SURROUND_7_1: u32 = 0x63f;
+
+    #[test]
+    fn microphone_selects_non_silent_input_and_respects_explicit_choice() {
+        let stereo: Vec<f32> = (0..480).flat_map(|_| [0.0, 0.2]).collect();
+        let mut automatic = CaptureSelector::new(None, 2).unwrap();
+        assert!(!automatic.observe(&stereo));
+        assert_eq!(automatic.channel(), 1);
+        let mut explicit = CaptureSelector::new(Some(0), 2).unwrap();
+        explicit.observe(&stereo);
+        assert_eq!(explicit.channel(), 0);
+        assert!(CaptureSelector::new(Some(2), 2).is_err());
+        // Duplicated or antiphase signals are selected, never averaged away.
+        let antiphase: Vec<f32> = (0..480).flat_map(|_| [0.2, -0.2]).collect();
+        automatic.observe(&antiphase);
+        assert_eq!(automatic.channel(), 1);
+    }
+
+    #[test]
+    fn an_impulse_cannot_move_an_established_microphone_channel() {
+        let first: Vec<f32> = (0..480).flat_map(|_| [0.1, 0.0]).collect();
+        let second: Vec<f32> = (0..480).flat_map(|_| [0.0, 0.2]).collect();
+        let mut selector = CaptureSelector::new(None, 2).unwrap();
+        selector.observe(&first);
+        assert!(!selector.observe(&second));
+        assert_eq!(selector.channel(), 0);
+        selector.observe(&first);
+        for _ in 0..19 {
+            assert!(!selector.observe(&second));
+        }
+        assert!(selector.observe(&second));
+        assert_eq!(selector.channel(), 1);
+    }
+
+    #[test]
+    fn switching_channels_notifies_once_without_restarting_the_selector() {
+        use std::sync::{
+            atomic::{AtomicU16, Ordering},
+            mpsc,
+        };
+        let (events, receiver) = mpsc::channel();
+        let selected = AtomicU16::new(u16::MAX);
+        let first: Vec<f32> = (0..480).flat_map(|_| [0.1, 0.0]).collect();
+        let second: Vec<f32> = (0..480).flat_map(|_| [0.0, 0.2]).collect();
+        let mut selector = CaptureSelector::new(None, 2).unwrap();
+        assert!(!selector.update(&first, &selected, &events));
+        for _ in 0..19 {
+            assert!(!selector.update(&second, &selected, &events));
+        }
+        assert!(selector.update(&second, &selected, &events));
+        assert_eq!(selected.load(Ordering::Relaxed), 1);
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            super::super::BackendEvent::CaptureChannelChanged { channel: 1 }
+        ));
+        // Continue using the established native stream after the engine
+        // resets its DSP epoch. A reopen would throw away this selection.
+        for _ in 0..200 {
+            assert!(!selector.update(&second, &selected, &events));
+            assert_eq!(selector.channel(), 1);
+        }
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn large_endpoint_request_reaches_mixer_whole_and_preserves_channel_routing() {

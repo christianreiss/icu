@@ -5,6 +5,9 @@ pub const KNEE: f32 = 0.8;
 
 /// Soft limiter: linear below [`KNEE`], `tanh` above, never exceeds ±1.0.
 pub fn limit(x: f32) -> f32 {
+    if !x.is_finite() {
+        return 0.0;
+    }
     let a = x.abs();
     if a <= KNEE {
         x
@@ -20,11 +23,14 @@ pub fn limit(x: f32) -> f32 {
 pub fn mix<'a>(inputs: impl IntoIterator<Item = (&'a [f32], f32)>, out: &mut [f32]) {
     out.fill(0.0);
     for (samples, gain) in inputs {
-        if gain == 0.0 {
+        if gain == 0.0 || !gain.is_finite() {
             continue;
         }
         for (o, s) in out.iter_mut().zip(samples.iter()) {
-            *o += s * gain;
+            let scaled = s * gain;
+            if scaled.is_finite() {
+                *o += scaled;
+            }
         }
     }
     for o in out.iter_mut() {
@@ -34,7 +40,11 @@ pub fn mix<'a>(inputs: impl IntoIterator<Item = (&'a [f32], f32)>, out: &mut [f3
 
 /// Converts a per-user volume in percent (0–200) into a linear gain.
 pub fn volume_gain(percent: f32) -> f32 {
-    (percent / 100.0).clamp(0.0, 2.0)
+    if percent.is_finite() {
+        (percent / 100.0).clamp(0.0, 2.0)
+    } else {
+        0.0
+    }
 }
 
 /// Smooth user/master volume changes over one mixer block, independently
@@ -73,6 +83,21 @@ impl GainRamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_input_cannot_poison_other_speakers() {
+        let mut out = [0.0; 3];
+        mix(
+            [
+                (&[0.1, 0.2, 0.3][..], 1.0),
+                (&[f32::NAN, f32::INFINITY, 0.1][..], 1.0),
+            ],
+            &mut out,
+        );
+        assert_eq!(out, [0.1, 0.2, 0.4]);
+        assert_eq!(volume_gain(f32::NAN), 0.0);
+        assert_eq!(limit(f32::NAN), 0.0);
+    }
 
     #[test]
     fn limiter_is_linear_below_knee_and_bounded_above() {

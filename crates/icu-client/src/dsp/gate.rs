@@ -41,6 +41,13 @@ enum State {
     },
     Open,
     Releasing(Instant),
+    /// Keep the existing tail audible while checking a new candidate. A
+    /// short keyboard impulse must not restart the full hangover clock.
+    Rearming {
+        until: Instant,
+        since: Instant,
+        audio: Duration,
+    },
 }
 
 /// The gate.
@@ -126,7 +133,10 @@ impl Gate {
     /// Whether the gate currently lets audio through. Not while it is still
     /// arming: the first voiced frames are held back.
     pub fn is_open(&self) -> bool {
-        matches!(self.state, State::Open | State::Releasing(_))
+        matches!(
+            self.state,
+            State::Open | State::Releasing(_) | State::Rearming { .. }
+        )
     }
 
     /// Forget a discontinued capture timeline, keeping the user's controls.
@@ -195,6 +205,29 @@ impl Gate {
                 self.state = State::Open;
                 Decision::Send
             }
+            (State::Releasing(until), true) if !attack.is_zero() => {
+                self.state = State::Rearming {
+                    until,
+                    since: now,
+                    audio: Duration::ZERO,
+                };
+                Decision::Send
+            }
+            (
+                State::Rearming {
+                    until,
+                    since,
+                    audio,
+                },
+                true,
+            ) if now.saturating_duration_since(since).max(audio + frame) < attack => {
+                self.state = State::Rearming {
+                    until,
+                    since,
+                    audio: audio + frame,
+                };
+                Decision::Send
+            }
             (_, true) => {
                 self.state = State::Open;
                 Decision::Send
@@ -209,11 +242,12 @@ impl Gate {
                     Decision::Send
                 }
             }
-            (State::Releasing(until), false) => {
+            (State::Releasing(until) | State::Rearming { until, .. }, false) => {
                 if now >= until || self.muted {
                     self.state = State::Closed;
                     Decision::SendEnd
                 } else {
+                    self.state = State::Releasing(until);
                     Decision::Send
                 }
             }
@@ -227,6 +261,28 @@ mod tests {
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    #[test]
+    fn isolated_candidates_do_not_extend_the_hangover() {
+        let now = Instant::now();
+        let mut gate = Gate::new(Mode::Vad, ms(150), ms(200));
+        gate.set_attack(ms(40));
+        for n in 0..=4 {
+            gate.update_audio(now + ms(n * 10), true, ms(10));
+        }
+        assert!(gate.is_open());
+        gate.update_audio(now + ms(50), false, ms(10));
+        for n in 6..25 {
+            assert_eq!(
+                gate.update_audio(now + ms(n * 10), n % 5 == 0, ms(10)),
+                Decision::Send
+            );
+        }
+        assert_eq!(
+            gate.update_audio(now + ms(250), false, ms(10)),
+            Decision::SendEnd
+        );
     }
 
     #[test]

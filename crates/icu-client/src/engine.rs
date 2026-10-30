@@ -291,6 +291,8 @@ pub struct AppState {
     pub backend: &'static str,
     /// Current automatic capture and peer-assistance status.
     pub tuning_status: String,
+    /// Temporary attenuation of other applications, measured by the guardian.
+    pub ducking_status: crate::audio::ducking::Status,
     pub audio_health: crate::audio::health::AudioHealth,
     pub can_restore_audio: bool,
     /// AEC could be created.
@@ -494,6 +496,8 @@ pub enum Command {
     HotkeyBackend(String),
     /// Reopen the audio streams after a backend error (`icu-audio-events`).
     ReopenStreams,
+    /// A live capture stream selected another channel; keep that stream open.
+    CaptureChannelChanged(u16),
     /// Try the streams that did not open again, only those
     /// (`icu-audio-events`, internal).
     RetryStreams,
@@ -566,6 +570,10 @@ pub struct DspControl {
     loss_permille: AtomicU32,
     level_peak: AtomicF32,
     level_rms: AtomicF32,
+    raw_rms: AtomicF32,
+    raw_peak: AtomicF32,
+    post_aec_rms: AtomicF32,
+    output_rms: AtomicF32,
     vad_prob: AtomicF32,
     sending: AtomicBool,
     aec_available: AtomicBool,
@@ -609,6 +617,10 @@ impl DspControl {
             loss_permille: AtomicU32::new(0),
             level_peak: AtomicF32::new(-100.0),
             level_rms: AtomicF32::new(-100.0),
+            raw_rms: AtomicF32::new(-100.0),
+            raw_peak: AtomicF32::new(-100.0),
+            post_aec_rms: AtomicF32::new(-100.0),
+            output_rms: AtomicF32::new(-100.0),
             vad_prob: AtomicF32::new(0.0),
             sending: AtomicBool::new(false),
             aec_available: AtomicBool::new(false),
@@ -678,6 +690,8 @@ struct Speaker {
     volume: f32,
     /// Loudness normalization, ahead of `volume`.
     norm: Normalizer,
+    /// Speech selection only, independent of user/master gains and normalization.
+    duck_voice: crate::dsp::normalize::SpeechActivity,
     /// The previous user/master gain belongs to this speaker, never to its
     /// current position in the mixer's unordered input list.
     volume_ramp: mixer::GainRamp,
@@ -740,6 +754,7 @@ impl Speaker {
             indicator: None,
             volume,
             norm: Normalizer::new(),
+            duck_voice: Default::default(),
             volume_ramp: mixer::GainRamp::default(),
             feedback: crate::dsp::feedback::Measurement::default(),
             concealed: 0,
@@ -809,6 +824,7 @@ fn tune_capture(shared: &Arc<Shared>, local: &LocalState) {
         .ok()
         .flatten()
         .filter(|c| c.valid());
+    let capture_channel = lock(&local.backend).capture_channel_index();
     {
         let mut t = lock(&shared.tuning);
         if t.capture_identity
@@ -823,11 +839,15 @@ fn tune_capture(shared: &Arc<Shared>, local: &LocalState) {
         }
         t.capture_identity = current.clone();
         if let Some(c) = current.as_ref() {
-            let key =
-                crate::audio::calibration::device_key(shared.state.borrow().backend, &c.device);
+            let key = crate::audio::calibration::device_channel_key(
+                shared.state.borrow().backend,
+                &c.device,
+                capture_channel,
+            );
             if t.warm_device.as_ref() != Some(&key) {
                 t.warm_device = Some(key.clone());
-                if a.remember_good_levels && a.auto_level && a.denoise {
+                if capture_channel.is_some() && a.remember_good_levels && a.auto_level && a.denoise
+                {
                     if let Some((gain, peer)) = local.calibration.warm_start(
                         &key,
                         a,
@@ -885,6 +905,7 @@ fn tune_capture(shared: &Arc<Shared>, local: &LocalState) {
     };
     shared.state.send_modify(|s| {
         s.audio_health.system_status = status;
+        s.audio_health.capture_channel = capture_channel;
         s.audio_health.system_gain_db = system_db;
         s.audio_health.software_gain_db = software_db;
         s.audio_health.peer_trim_db = offset;
@@ -924,12 +945,13 @@ fn update_audio_health(
         State::Held
     } else if measured.is_none() {
         State::NoLocalSpeech
-    } else if local
-        .zip(remote)
-        .is_some_and(|(l, r)| (l - r).abs() > 2.0 || (r.abs() > 2.0 && l.signum() != r.signum()))
-    {
+    } else if local.zip(remote).is_some_and(|(l, r)| {
+        (l - r).abs() > 2.0
+            || (r.abs() > icu_proto::audio_level::ACCEPT_CDB as f32 / 100.0
+                && l.signum() != r.signum())
+    }) {
         State::Conflicting
-    } else if remote.is_some_and(|r| r.abs() <= 2.0) {
+    } else if remote.is_some_and(|r| r.abs() <= icu_proto::audio_level::ACCEPT_CDB as f32 / 100.0) {
         State::Good
     } else if t.peer.status(now) == "Regelgrenze" {
         State::Bound
@@ -940,6 +962,15 @@ fn update_audio_health(
     let mut health = AudioHealth {
         state,
         reporters: t.peer.reporters(),
+        agreeing: t.peer.agreeing(),
+        speech_ms: measured.map_or(0, |m| m.speech_ms),
+        gain_epoch: t.peer.epoch(),
+        observation_window: t.peer.window(),
+        raw_rms_db: Some(shared.dsp.raw_rms.load()),
+        raw_peak_db: Some(shared.dsp.raw_peak.load()),
+        post_aec_rms_db: Some(shared.dsp.post_aec_rms.load()),
+        output_rms_db: Some(shared.dsp.output_rms.load()),
+        capture_channel: shared.state.borrow().audio_health.capture_channel,
         local_correction_db: local,
         remote_correction_db: remote,
         software_gain_db: t.software_gain_db,
@@ -1007,8 +1038,10 @@ struct Shared {
     cap_prod: Arc<Mutex<HeapProd<f32>>>,
     /// Samples callbacks could not enqueue, consumed by the DSP clock.
     capture_dropped: Arc<AtomicUsize>,
-    ref_prod: Arc<Mutex<HeapProd<f32>>>,
-    play_cons: Arc<Mutex<HeapCons<f32>>>,
+    ref_prod: Arc<Mutex<HeapProd<crate::audio::backend::ReferenceFrame>>>,
+    reference_channels: Arc<AtomicUsize>,
+    ducking: Arc<crate::audio::ducking::Signals>,
+    play_cons: Arc<Mutex<HeapCons<[f32; 2]>>>,
     /// Largest block the playback callback has asked for since the mixer
     /// last took it ([`RecentRequest`]); the mixer keeps at least that much
     /// plus a block queued, whatever the graph quantum.
@@ -1107,6 +1140,7 @@ pub struct Engine {
     /// with it), for [`Engine::shutdown`] to wait on without a runtime.
     net_done: Option<std::sync::mpsc::Receiver<()>>,
     threads: Vec<std::thread::JoinHandle<()>>,
+    ducking_service: Option<crate::audio::ducking::Service>,
     backend: Arc<Mutex<Box<dyn AudioBackend>>>,
     /// Where this instance's config/data live (`--config-dir` or default).
     /// Only the spawned connection task holds its own copy for persisting
@@ -1135,6 +1169,7 @@ impl Engine {
         mut backend: Box<dyn AudioBackend>,
     ) -> Result<Engine, EngineError> {
         let settings = cfg.settings.clone();
+        let synthetic_audio = cfg.test_tone;
         let paths = cfg.paths.clone();
         let dsp = Arc::new(DspControl::from_settings(&settings, cfg.test_tone));
         let stats = Arc::new(DebugStats::default());
@@ -1184,6 +1219,7 @@ impl Engine {
             active_output: None,
             backend: backend_name,
             tuning_status: String::new(),
+            ducking_status: Default::default(),
             audio_health: Default::default(),
             can_restore_audio: false,
             aec_available: false,
@@ -1201,11 +1237,12 @@ impl Engine {
         let (state_tx, state_rx) = watch::channel(initial);
         // Ring buffers between backend callbacks and the DSP/mixer threads.
         let (cap_prod, cap_cons) = HeapRb::<f32>::new(48_000).split();
-        let (ref_prod, ref_cons) = HeapRb::<f32>::new(48_000).split();
+        let (ref_prod, ref_cons) =
+            HeapRb::<crate::audio::backend::ReferenceFrame>::new(48_000).split();
         // The playback ring only ever holds `lead` (2 blocks, or one graph
         // quantum + 1 block); 1 s of capacity just makes sure `lead` is never
         // clamped below what a large quantum (Bluetooth, pro audio) asks for.
-        let (play_prod, play_cons) = HeapRb::<f32>::new(48_000).split();
+        let (play_prod, play_cons) = HeapRb::<[f32; 2]>::new(48_000).split();
         // The mic test's hand-off from the DSP thread to the mixer: lock
         // free, allocated once here.
         let (mic_prod, mic_cons) = HeapRb::<f32>::new(8 * BLOCK).split();
@@ -1233,6 +1270,8 @@ impl Engine {
             cap_prod: Arc::new(Mutex::new(cap_prod)),
             capture_dropped: Arc::new(AtomicUsize::new(0)),
             ref_prod: Arc::new(Mutex::new(ref_prod)),
+            reference_channels: Arc::new(AtomicUsize::new(1)),
+            ducking: Arc::new(crate::audio::ducking::Signals::default()),
             play_cons: Arc::new(Mutex::new(play_cons)),
             play_request: Arc::new(AtomicUsize::new(0)),
             failed_streams: AtomicU8::new(0),
@@ -1323,6 +1362,9 @@ impl Engine {
                             BackendEvent::DefaultDeviceChanged => {
                                 schedule_reopen(Duration::from_millis(100));
                             }
+                            BackendEvent::CaptureChannelChanged { channel } => {
+                                let _ = reopen_tx.send(Command::CaptureChannelChanged(channel));
+                            }
                             BackendEvent::StreamDiscontinuity { stream } => {
                                 tracing::debug!(?stream, "audio capture timeline changed");
                                 schedule_reopen(Duration::from_millis(100));
@@ -1408,6 +1450,32 @@ impl Engine {
             });
         }
 
+        let ducking_service = if matches!(backend_name, "pipewire" | "wasapi") && !synthetic_audio {
+            let input_shared = shared.clone();
+            let status_shared = shared.clone();
+            crate::audio::ducking::Service::start(
+                move || ducking_input(&input_shared),
+                move |status| {
+                    status_shared.state.send_if_modified(|state| {
+                        if state.ducking_status == status {
+                            false
+                        } else {
+                            state.ducking_status = status;
+                            true
+                        }
+                    });
+                },
+            )
+            .ok()
+        } else {
+            if backend_name == "cpal" {
+                shared.state.send_modify(|s| {
+                    s.ducking_status.detail =
+                        "Absenkung für diesen Ausgabeweg nicht verfügbar".into()
+                });
+            }
+            None
+        };
         Ok(Engine {
             shared,
             cmd_tx,
@@ -1415,6 +1483,7 @@ impl Engine {
             runtime: Some(runtime),
             net_done: Some(net_done),
             threads,
+            ducking_service,
             backend,
             paths,
         })
@@ -1470,6 +1539,11 @@ impl Engine {
         self.shared.video.lock().unwrap().latest()
     }
 
+    /// Sample-free evidence consumed by the native ducking controller.
+    pub fn ducking_input(&self) -> crate::audio::ducking::Input {
+        ducking_input(&self.shared)
+    }
+
     /// Stops everything.
     pub fn shutdown(mut self) {
         self.stop();
@@ -1491,6 +1565,8 @@ impl Engine {
     /// channel, not the runtime: callers may be inside another runtime.
     fn stop(&mut self) {
         self.shared.closing.store(true, Ordering::SeqCst);
+        self.shared.ducking.clear();
+        self.ducking_service.take();
         let _ = self.cmd_tx.send(Command::Quit);
         if let Some(done) = self.net_done.take() {
             if done.recv_timeout(NET_STOP_WAIT) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
@@ -1502,6 +1578,25 @@ impl Engine {
             rt.shutdown_background();
         }
         restore_capture(&self.shared, &self.backend);
+    }
+}
+
+fn ducking_input(shared: &Shared) -> crate::audio::ducking::Input {
+    let state = shared.state.borrow();
+    let (tx, rx) = shared.ducking.snapshot();
+    let online =
+        shared.dsp.online.load(Ordering::Relaxed) && !shared.closing.load(Ordering::Relaxed);
+    crate::audio::ducking::Input {
+        mode: state.settings.audio.ducking,
+        route: state.active_output.clone(),
+        online,
+        transmitting_voice: online && tx && !shared.dsp.transmission_muted(),
+        speech_db: if !online || state.deafened || state.settings.audio.output_volume <= 0.0 {
+            None
+        } else {
+            rx
+        },
+        noisy_room: false,
     }
 }
 
@@ -1561,12 +1656,14 @@ const FAILED_PLAYBACK: u8 = 4;
 fn open_capture_stream(
     backend: &mut dyn AudioBackend,
     input: Option<&str>,
+    channel: Option<u16>,
     shared: &Arc<Shared>,
 ) -> Result<(), crate::audio::BackendError> {
     let stats = shared.stats.clone();
     let cap_prod = shared.cap_prod.clone();
     let dropped = shared.capture_dropped.clone();
     let cycle = shared.cycle.clone();
+    backend.set_capture_channel(channel)?;
     backend.open_capture(
         input,
         Box::new(move |block| {
@@ -1592,11 +1689,13 @@ fn open_reference_stream(
     shared: &Arc<Shared>,
 ) -> Result<(), crate::audio::BackendError> {
     let ref_prod = shared.ref_prod.clone();
+    let channels = shared.reference_channels.clone();
     let cycle = shared.cycle.clone();
     let stats = shared.stats.clone();
     backend.open_reference(
         output,
-        Box::new(move |block| {
+        Box::new(move |block, count| {
+            channels.store(count, Ordering::Relaxed);
             let pushed = ref_prod
                 .try_lock()
                 .map(|mut p| p.push_slice(block))
@@ -1618,7 +1717,9 @@ fn open_playback_stream(
     shared: &Arc<Shared>,
 ) -> Result<(), crate::audio::BackendError> {
     let play_cons = shared.play_cons.clone();
+    let ctl = shared.dsp.clone();
     let play_request = shared.play_request.clone();
+    let ducking = shared.ducking.clone();
     let stats = shared.stats.clone();
     // The new device may run a smaller quantum; let the mixer's lead shrink
     // back to it instead of keeping the old device's for the session.
@@ -1627,10 +1728,28 @@ fn open_playback_stream(
         output,
         Box::new(move |out| {
             play_request.fetch_max(out.len(), Ordering::Relaxed);
+            // Audio and its speech power travel in the same ring item. A stalled
+            // output therefore cannot duck on audio it has not actually played.
+            let mut speech_power = 0.0;
+            let mut output_power = 0.0;
             let n = match play_cons.try_lock() {
-                Ok(mut c) => c.pop_slice(out),
+                Ok(mut c) => {
+                    let count = c.occupied_len().min(out.len());
+                    for dst in &mut out[..count] {
+                        let [sample, power] = c.try_pop().unwrap_or([0.0; 2]);
+                        *dst = sample;
+                        speech_power += power;
+                        output_power += sample * sample;
+                    }
+                    count
+                }
                 Err(_) => 0,
             };
+            ctl.output_rms
+                .store(10.0 * (output_power / out.len().max(1) as f32).max(1e-10).log10());
+            if speech_power > 0.0 && !out.is_empty() {
+                ducking.played(speech_power / out.len() as f32);
+            }
             if n < out.len() {
                 // The mixer always queues (silence included): a gap.
                 DebugStats::inc(&stats.playback_underruns);
@@ -1665,7 +1784,12 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
         tracing::info!(saved = ?settings.audio.output_device, "speaker missing, using the default");
     }
     let mut failed = 0;
-    if let Err(e) = open_capture_stream(backend, input.as_deref(), shared) {
+    if let Err(e) = open_capture_stream(
+        backend,
+        input.as_deref(),
+        settings.audio.input_channel,
+        shared,
+    ) {
         tracing::warn!(error = %e, "cannot open capture");
         failed |= FAILED_CAPTURE;
         shared
@@ -1728,7 +1852,12 @@ fn retry_failed_streams(backend: &mut dyn AudioBackend, settings: &Settings, sha
     let mut still = 0;
     let mut restart_dsp = false;
     if failed & FAILED_CAPTURE != 0 {
-        match open_capture_stream(backend, input.as_deref(), shared) {
+        match open_capture_stream(
+            backend,
+            input.as_deref(),
+            settings.audio.input_channel,
+            shared,
+        ) {
             Ok(()) => {
                 tracing::info!("microphone opened on a retry");
                 restart_dsp = true;
@@ -1833,7 +1962,7 @@ impl StreamRetry {
 fn dsp_thread(
     shared: Arc<Shared>,
     mut cap: HeapCons<f32>,
-    mut reference: HeapCons<f32>,
+    mut reference: HeapCons<crate::audio::backend::ReferenceFrame>,
     mut mic_test: HeapProd<f32>,
     test_tone: bool,
 ) {
@@ -1878,7 +2007,7 @@ fn dsp_thread(
     };
     let mut tone_pos = 0usize;
     let mut block = vec![0.0f32; BLOCK];
-    let mut ref_block = vec![0.0f32; BLOCK];
+    let mut ref_block = vec![[0.0f32; crate::audio::backend::MAX_REFERENCE_CHANNELS]; BLOCK];
     let mut frame_acc: Vec<f32> = Vec::with_capacity(960);
     // The frame length `frame_acc` is being collected for.
     let mut acc_frame = 0usize;
@@ -1888,6 +2017,8 @@ fn dsp_thread(
     let mut seq: u16 = 0;
     let mut ts: u32 = 0;
     let mut voice_in_frame = false;
+    let mut duck_voice_in_frame = false;
+    let mut duck_voice = crate::dsp::normalize::SpeechActivity::default();
     let mut ref_underruns_window = 0u32;
     let mut window_start = Instant::now();
     let mut last_state_push = Instant::now();
@@ -1935,7 +2066,7 @@ fn dsp_thread(
                 cap.pop_slice(&mut sink);
             }
             reference.clear();
-            ref_block.fill(0.0);
+            ref_block.fill([0.0; crate::audio::backend::MAX_REFERENCE_CHANNELS]);
         } else {
             // Pair the capture block with the reference block of the same
             // graph cycle (`dsp::refalign`).
@@ -1969,10 +2100,13 @@ fn dsp_thread(
                 } else {
                     chain.reset_history();
                     lock(&shared.tuning).capture_discontinuity();
+                    lock(&shared.system_tuner).invalidate_evidence();
                 }
                 gate.reset();
                 preroll.clear();
                 voice_in_frame = false;
+                duck_voice_in_frame = false;
+                duck_voice = Default::default();
                 voice_since_push = false;
                 last_voice = None;
                 prev_sent = false;
@@ -1994,9 +2128,12 @@ fn dsp_thread(
                 skip_capture(&mut frame_acc, &mut ts, excess);
                 preroll.clear();
                 voice_in_frame = false;
+                duck_voice_in_frame = false;
+                duck_voice = Default::default();
                 gate.reset();
                 chain.reset_history();
                 lock(&shared.tuning).capture_discontinuity();
+                lock(&shared.system_tuner).invalidate_evidence();
             }
             let mut waited = 0u32;
             let mut ready_since: Option<Instant> = None;
@@ -2027,7 +2164,7 @@ fn dsp_thread(
                             // No capture for 2 s: keep the pipeline alive
                             // with silence.
                             block.fill(0.0);
-                            ref_block.fill(0.0);
+                            ref_block.fill([0.0; crate::audio::backend::MAX_REFERENCE_CHANNELS]);
                             break;
                         }
                     }
@@ -2039,7 +2176,7 @@ fn dsp_thread(
                     }
                     refalign::Step::Silent { underrun } => {
                         cap.pop_slice(&mut block);
-                        ref_block.fill(0.0);
+                        ref_block.fill([0.0; crate::audio::backend::MAX_REFERENCE_CHANNELS]);
                         if underrun {
                             DebugStats::inc(&stats.reference_underruns);
                             ref_underruns_window += 1;
@@ -2068,12 +2205,15 @@ fn dsp_thread(
             reference.clear();
             chain.reset_history();
             lock(&shared.tuning).capture_discontinuity();
+            lock(&shared.system_tuner).invalidate_evidence();
             if let Some(a) = aec.as_mut() {
                 a.reinitialize();
             }
             gate.reset();
             preroll.clear();
             voice_in_frame = false;
+            duck_voice_in_frame = false;
+            duck_voice = Default::default();
             capture_was_muted = false;
             continue;
         }
@@ -2082,8 +2222,13 @@ fn dsp_thread(
         // ever see numbers within ±4 (`dsp::sanitize`).
         let mut raw_capture = [0.0; BLOCK];
         raw_capture.copy_from_slice(&block);
+        let raw_level = meter::measure(&raw_capture);
+        ctl.raw_rms.store(raw_level.rms_db);
+        ctl.raw_peak.store(raw_level.peak_db);
         crate::dsp::sanitize(&mut block);
-        crate::dsp::sanitize(&mut ref_block);
+        for frame in &mut ref_block {
+            crate::dsp::sanitize(frame);
+        }
         let t_block = Instant::now();
         let input_clipped = raw_capture.iter().any(|x| x.is_finite() && x.abs() >= 0.99);
         if !test_tone && input_clipped {
@@ -2122,10 +2267,15 @@ fn dsp_thread(
                 }
                 ref_energy += ref_block
                     .iter()
+                    .flatten()
                     .map(|&x| (x as f64) * (x as f64))
                     .sum::<f64>();
-                ref_samples += BLOCK;
-                a.process(&ref_block, &mut block);
+                ref_samples += BLOCK * shared.reference_channels.load(Ordering::Relaxed).max(1);
+                a.process_multichannel(
+                    &ref_block,
+                    shared.reference_channels.load(Ordering::Relaxed),
+                    &mut block,
+                );
                 if last_aec_stats.elapsed() > Duration::from_secs(2) {
                     last_aec_stats = Instant::now();
                     let st = a.stats();
@@ -2148,6 +2298,8 @@ fn dsp_thread(
             }
         }
 
+        ctl.post_aec_rms.store(meter::measure(&block).rms_db);
+
         // 3. Gain, auto level, denoise, VAD (`dsp::chain`).
         let send = SendSettings {
             gain: ctl.gain.load(),
@@ -2160,6 +2312,8 @@ fn dsp_thread(
         if applied_send.is_some_and(|old| old.denoise != send.denoise) {
             reset_capture_detection(&mut gate, &mut auto_threshold, t_block);
             voice_in_frame = false;
+            duck_voice_in_frame = false;
+            duck_voice = Default::default();
         }
         if let Ok(mut tuning) = shared.tuning.try_lock() {
             let delta = std::mem::take(&mut tuning.capture_delta);
@@ -2186,29 +2340,29 @@ fn dsp_thread(
                 chain.warm_start(db);
             }
         }
-        let Analysis { prob, level } = chain.analyze(&mut block, &send);
+        let analysis = chain.analyze(&mut block, &send);
+        let Analysis { prob, level } = analysis;
         ctl.level_peak.store(level.peak_db);
         ctl.level_rms.store(level.rms_db);
         ctl.vad_prob.store(prob.unwrap_or(0.0));
-        let threshold = if ctl.vad_auto.load(Ordering::Relaxed) {
-            if let Some(p) = prob {
-                let speaking =
-                    floor_sample_is_speech(gate.is_open(), p, auto_threshold.threshold());
-                auto_threshold.update(t_block, speaking, p);
-            }
-            auto_threshold.threshold()
-        } else {
-            ctl.vad_threshold.load()
-        };
+        let manual = (!ctl.vad_auto.load(Ordering::Relaxed)).then(|| ctl.vad_threshold.load());
+        let (threshold, voice) =
+            analysis.classify(&mut auto_threshold, t_block, gate.is_open(), manual);
         ctl.vad_effective_threshold.store(threshold);
-        let voice = vad::is_voice(threshold, prob, level);
         voice_in_frame |= voice && !capture_muted;
+        let moving_voice = !test_tone && duck_voice.observe(&block, !capture_muted);
+        duck_voice_in_frame |=
+            voice && !capture_muted && (prob.is_some_and(|p| p >= 0.6) || moving_voice);
         voice_since_push |= voice;
         if voice {
             last_voice = Some(t_block);
         }
         // Voice optimizer, outbound normalization and limiter.
-        chain.finish(&mut block, voice, &send);
+        if ctl.vad_mode.load(Ordering::Relaxed) {
+            chain.finish_vad(&mut block, voice, &send);
+        } else {
+            chain.finish(&mut block, voice, &send);
+        }
         if !test_tone
             && ctl.online.load(Ordering::Relaxed)
             && !ctl.transmission_muted()
@@ -2299,9 +2453,11 @@ fn dsp_thread(
             let muted = ctl.transmission_muted() || !online;
             gate.set_muted(muted);
             let was_open = gate.is_open();
+            let frame_has_voice = voice_in_frame;
+            let frame_has_duck_voice = std::mem::take(&mut duck_voice_in_frame);
             let decision = gate.update_audio(
                 now,
-                voice_in_frame,
+                frame_has_voice,
                 Duration::from_micros(frame_samples as u64 * 1_000_000 / 48_000),
             );
             voice_in_frame = false;
@@ -2367,7 +2523,7 @@ fn dsp_thread(
                         } else {
                             0
                         };
-                        send_audio(
+                        let sent = send_audio(
                             &shared,
                             &stats,
                             flags,
@@ -2376,6 +2532,9 @@ fn dsp_thread(
                             packet,
                             (t_block, block_epoch),
                         );
+                        if sent && frame_has_duck_voice && !muted && !test_tone {
+                            shared.ducking.transmitted();
+                        }
                         seq = seq.wrapping_add(1);
                     }
                     Err(e) => tracing::warn!(%e, "opus encode"),
@@ -2457,6 +2616,7 @@ fn reset_capture_detection(gate: &mut Gate, threshold: &mut vad_auto::AutoThresh
 /// A closed gate may be waiting for the VAD attack, muted, or waiting for PTT;
 /// none makes an above-threshold block evidence of ambient noise. The
 /// AutoThreshold starvation watchdog still recovers from sustained noise.
+#[cfg(test)]
 fn floor_sample_is_speech(gate_open: bool, prob: f32, threshold: f32) -> bool {
     gate_open || prob >= threshold
 }
@@ -2534,7 +2694,7 @@ fn send_audio(
     ts: u32,
     packet: &[u8],
     captured: (Instant, usize),
-) {
+) -> bool {
     let (t_block, epoch) = captured;
     let header = AudioHeader {
         gain_epoch: shared.gain_epoch.load(Ordering::Relaxed),
@@ -2544,7 +2704,7 @@ fn send_audio(
         ts,
     };
     let Ok(datagram) = header.datagram(packet) else {
-        return;
+        return false;
     };
     // `into()` moves the buffer, so take its length first.
     let wire_bytes = datagram.len() as u64;
@@ -2552,7 +2712,7 @@ fn send_audio(
     // Serialized with SetPrivacy: no block from an earlier privacy epoch
     // can be submitted after the switch, even when toggled twice quickly.
     if epoch % 2 == 1 || shared.dsp.privacy_epoch.load(Ordering::SeqCst) != epoch {
-        return;
+        return false;
     }
     if let Some(c) = conn.as_ref() {
         if c.send_datagram(datagram.into()).is_ok() {
@@ -2563,18 +2723,22 @@ fn send_audio(
                 .lock()
                 .unwrap()
                 .record(t_block.elapsed());
+            return true;
         }
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
 // Mixer thread
 // ---------------------------------------------------------------------------
 
-fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: HeapCons<f32>) {
+fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test: HeapCons<f32>) {
     let _priority = crate::audio::rt::promote_current_thread("icu-mixer");
     let stats = shared.stats.clone();
     let mut out = vec![0.0f32; BLOCK];
+    let mut speech_mix = [0.0f32; BLOCK];
+    let mut played = [[0.0f32; 2]; BLOCK];
     let mut mic_buf = vec![0.0f32; BLOCK];
     // The mic test plays once two blocks are queued, and primes again after
     // running dry: capture and playback callbacks do not tick in lockstep.
@@ -2629,6 +2793,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
         let master = shared.output_gain.load();
         let normalize = shared.normalize_incoming.load(Ordering::Relaxed);
         let mut n_inputs = 0;
+        speech_mix.fill(0.0);
         {
             let mut speakers = lock(&shared.speakers);
             for (session, sp) in speakers.iter_mut() {
@@ -2642,7 +2807,13 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
                 }
                 let before = sp.jitter.stats();
                 while sp.pending.len() < BLOCK {
-                    match sp.jitter.pop_quiet(now, sp.quiet) {
+                    match sp.jitter.pop_quiet_at(
+                        now,
+                        now + Duration::from_secs_f64(
+                            (play.occupied_len() + sp.pending.len()) as f64 / 48_000.0,
+                        ),
+                        sp.quiet,
+                    ) {
                         Pop::Packet(p) => {
                             if let Some(d) = sp.jitter.last_delay() {
                                 stats.jitter_delay.lock().unwrap().record(d);
@@ -2656,17 +2827,40 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
                             sp.quiet = frame_quiet(&fec_scratch[..n]);
                             queue_decoded(sp, n, &fec_scratch, false);
                         }
-                        Pop::Lost { fec_source, .. } => {
+                        Pop::Lost {
+                            fec_source,
+                            samples,
+                            ..
+                        } => {
                             let n = match fec_source {
                                 Some(next) => {
-                                    DebugStats::inc(&stats.frames_fec);
-                                    sp.decoder
-                                        .decode_fec(&next.payload, &mut fec_scratch)
-                                        .unwrap_or(0)
+                                    DebugStats::inc(&stats.frames_fec_attempted);
+                                    let decoded = sp
+                                        .decoder
+                                        .decode_fec_for(
+                                            &next.payload,
+                                            &mut fec_scratch,
+                                            samples as usize,
+                                        )
+                                        .unwrap_or(0);
+                                    let recovered = sp.decoder.last_fec_samples();
+                                    if recovered > 0 {
+                                        DebugStats::inc(&stats.frames_fec);
+                                        DebugStats::add(
+                                            &stats.frames_fec_samples,
+                                            recovered as u64,
+                                        );
+                                    } else {
+                                        DebugStats::inc(&stats.frames_fec_fallback);
+                                        DebugStats::inc(&stats.frames_plc);
+                                    }
+                                    decoded
                                 }
                                 None => {
                                     DebugStats::inc(&stats.frames_plc);
-                                    sp.decoder.conceal(&mut fec_scratch).unwrap_or(0)
+                                    sp.decoder
+                                        .conceal_for(&mut fec_scratch, samples as usize)
+                                        .unwrap_or(0)
                                 }
                             };
                             sp.quiet = frame_quiet(&fec_scratch[..n]);
@@ -2698,6 +2892,9 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
                 // loud the speaker is: the normalizer holds on it.
                 let hint = if sp.concealed > 0 { Some(false) } else { None };
                 sp.concealed = sp.concealed.saturating_sub(have);
+                let speech = sp
+                    .duck_voice
+                    .observe(buf, hint != Some(false) && have == BLOCK);
                 if normalize {
                     sp.norm.process_hinted(buf, hint);
                 } else {
@@ -2709,6 +2906,11 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
                     mixer::volume_gain(sp.volume) * master
                 };
                 sp.volume_ramp.apply(buf, volume);
+                if speech && volume > 0.0 && shared.dsp.online.load(Ordering::Relaxed) {
+                    for (sum, sample) in speech_mix.iter_mut().zip(buf.iter()) {
+                        *sum += *sample;
+                    }
+                }
                 *gain = 1.0;
             }
         }
@@ -2764,7 +2966,10 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<f32>, mut mic_test: Heap
             .play_peak
             .fetch_max(peak.to_bits(), Ordering::Relaxed);
         if play.occupied_len() < lead {
-            let n = play.push_slice(&out);
+            for ((item, sample), speech) in played.iter_mut().zip(&out).zip(&speech_mix) {
+                *item = [*sample, speech.clamp(-1.0, 1.0).powi(2)];
+            }
+            let n = play.push_slice(&played);
             DebugStats::add(&stats.samples_played, n as u64);
         }
 
@@ -3430,16 +3635,17 @@ impl LocalState {
     fn current_audio_device(&self, shared: &Arc<Shared>) -> Option<String> {
         let current = blocking(|| lock(&self.backend).capture_level().ok().flatten())
             .filter(|c| c.valid())?;
-        Some(crate::audio::calibration::device_key(
+        Some(crate::audio::calibration::device_channel_key(
             shared.state.borrow().backend,
             &current.device,
+            lock(&self.backend).capture_channel_index(),
         ))
     }
 
     fn learn_audio(
         &mut self,
         shared: &Arc<Shared>,
-        measured: Option<icu_proto::AudioLevel>,
+        measured: Option<(icu_proto::AudioLevel, icu_proto::AudioWindow)>,
         enabled: bool,
         now: Instant,
     ) {
@@ -3462,8 +3668,16 @@ impl LocalState {
             });
             return;
         };
-        let key =
-            crate::audio::calibration::device_key(shared.state.borrow().backend, &identity.device);
+        let channel = lock(&self.backend).capture_channel_index();
+        if channel.is_none() {
+            self.calibration_learner.reset();
+            return;
+        }
+        let key = crate::audio::calibration::device_channel_key(
+            shared.state.borrow().backend,
+            &identity.device,
+            channel,
+        );
         let unix = crate::net::conn::unix_now().max(0) as u64;
         let saved_at = self.calibration.profile(&key, unix).map(|p| p.saved_at);
         shared.state.send_modify(|s| {
@@ -3473,7 +3687,7 @@ impl LocalState {
             self.calibration_learner.reset();
             return;
         }
-        let Some(level) = measured else {
+        let Some((level, window)) = measured else {
             return;
         };
         let health = shared.state.borrow().audio_health.clone();
@@ -3482,7 +3696,8 @@ impl LocalState {
             && level.valid()
             && level.near_full_permille == 0
             && remote.is_some_and(|r| {
-                r.abs() <= 2.0 && (r - level.correction_cdb as f32 / 100.0).abs() <= 2.0
+                r.abs() <= icu_proto::audio_level::ACCEPT_CDB as f32 / 100.0
+                    && (r - level.correction_cdb as f32 / 100.0).abs() <= 1.5
             })
             && health.limiter_reduction_db <= 1.0
             && health.limited_fraction <= 0.01;
@@ -3495,7 +3710,10 @@ impl LocalState {
             mic_gain_db: (gain + system_delta).clamp(-15.0, 15.0),
             peer_trim_db: peer,
         };
-        if let Some(profile) = self.calibration_learner.observe(profile, good, now) {
+        if let Some(profile) = self
+            .calibration_learner
+            .observe_window(profile, good, window, now)
+        {
             match self.calibration.save_profile(&self.paths, profile, unix) {
                 Ok(()) => shared.state.send_modify(|s| {
                     s.can_restore_audio = true;
@@ -3744,6 +3962,16 @@ impl LocalState {
                 tracing::info!("reopening audio streams after a stream error");
                 self.reopen_streams(shared);
             }
+            Command::CaptureChannelChanged(channel) => {
+                // Reopening would reset the automatic selector to channel zero
+                // and repeat forever when the live mic is on channel two.
+                self.calibration_learner.reset();
+                restore_capture(shared, &self.backend);
+                shared.dsp.reinit_aec.store(true, Ordering::Relaxed);
+                shared
+                    .state
+                    .send_modify(|s| s.audio_health.capture_channel = Some(channel));
+            }
             Command::RetryStreams => self.retry_streams(shared),
             Command::DevicesChanged => {
                 // A saved device came back or went away: follow it. Anything
@@ -3922,14 +4150,17 @@ impl LocalState {
     /// them opened anew. Returns whether `SetState` is due.
     fn replace_settings(&mut self, new: Settings, shared: &Arc<Shared>) -> bool {
         let old = &self.settings.audio;
-        let reopen = new.audio.input_device != old.input_device
+        let reopen = new.audio.input_channel != old.input_channel
+            || new.audio.input_device != old.input_device
             || new.audio.output_device != old.output_device
             || new.audio.aec != old.aec;
         if crate::audio::calibration::ProcessingSettings::from(&new.audio)
             != crate::audio::calibration::ProcessingSettings::from(old)
         {
             self.calibration_learner.reset();
+            lock(&shared.system_tuner).invalidate_evidence();
             let mut t = lock(&shared.tuning);
+            t.capture = Default::default();
             t.peer = Default::default();
             t.peer.set_epoch(shared.gain_epoch.load(Ordering::Relaxed));
             t.force_epoch = true;
@@ -4703,15 +4934,16 @@ async fn run_session(
                 let may_measure=!shared.dsp.transmission_muted() && !shared.dsp.test_tone.load(Ordering::Relaxed);
                 {
                     let mut t = lock(&shared.tuning);
-                    let measured=t.outgoing.take_window().filter(|(_,w)|may_measure && w.gain_epoch==t.peer.epoch()).map(|(l,_)|l);
+                    let _ = t.outgoing.take_window();
                     let overloaded=t.overload_until.is_some_and(|until|now<until)
                         || t.clip_until.is_some_and(|until|now<until)
                         || t.software_until.is_some_and(|until|now<until);
                     t.peer.block_boost(overloaded);
-                    t.peer.tick(measured, enabled, now);
-                    update_audio_health(&mut t, measured, enabled, now, shared);
+                    let matched = t.peer.window().and_then(|w| t.outgoing.measure_window(w).map(|l|(l,w))).filter(|_|may_measure);
+                    t.peer.tick_matched(matched, enabled, now);
+                    update_audio_health(&mut t, matched.map(|(l,_)|l), enabled, now, shared);
                     drop(t);
-                    blocking(|| local.learn_audio(shared, measured, enabled, now));
+                    blocking(|| local.learn_audio(shared, matched, enabled, now));
                 }
                 let levels: Vec<_> = lock(&shared.speakers).iter_mut()
                     .filter_map(|(speaker, sp)| sp.feedback.take_window().map(|(level,window)| (*speaker,level,window))).collect();
@@ -4805,6 +5037,7 @@ async fn run_session(
                         video_tx_kbps: rate(now.video_tx, prev_bytes.video_tx),
                         video_rx_kbps: rate(now.video_rx, prev_bytes.video_rx),
                         datagram_queue_bytes: sample.datagram_queue_bytes,
+                        datagrams_expired: stats.datagrams_expired,
                         cond,
                     };
                     prev_bytes = now;
@@ -5073,9 +5306,8 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                 sp.ended = header.end();
                 // The TOC byte gives the peer's frame length (no decode).
                 let samples = sp.decoder.nb_samples(&payload);
-                sp.jitter.set_frame_samples(samples as u32);
                 let late = sp.jitter.stats().late;
-                sp.jitter.push(
+                sp.jitter.push_with_duration(
                     Packet {
                         gain_epoch: header.gain_epoch,
                         seq: header.seq,
@@ -5083,6 +5315,7 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                         end: header.end(),
                         payload,
                     },
+                    samples as u32,
                     now,
                 );
                 DebugStats::add(&shared.stats.jitter_late, sp.jitter.stats().late - late);
@@ -5420,12 +5653,16 @@ async fn handle_control(
             window,
             correction_cdb,
             reporters,
+            agreeing,
+            speech_ms,
         } => {
             if shared.feedback_capable.load(Ordering::Relaxed) {
-                lock(&shared.tuning).peer.hint_window(
+                lock(&shared.tuning).peer.hint_observation(
                     window,
                     correction_cdb,
                     reporters,
+                    agreeing,
+                    speech_ms,
                     Instant::now(),
                 );
             }

@@ -16,6 +16,7 @@ use super::{
     voice::{Limiter, VoiceChain, VoiceStrength},
 };
 use crate::config::AudioSettings;
+use std::time::Instant;
 
 /// The switches of the chain, read from the settings every block.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -64,6 +65,30 @@ pub struct Analysis {
     /// Level after gain, leveling and denoise: what the meter shows.
     pub level: Level,
 }
+impl Analysis {
+    /// Shared production/test decision. Candidate speech must not teach the
+    /// adaptive floor while the transmit gate is still arming.
+    pub fn classify(
+        &self,
+        auto: &mut super::vad_auto::AutoThreshold,
+        now: Instant,
+        gate_open: bool,
+        manual_threshold: Option<f32>,
+    ) -> (f32, bool) {
+        let threshold = if let Some(threshold) = manual_threshold {
+            threshold
+        } else {
+            if let Some(prob) = self.prob {
+                auto.update(now, gate_open || prob >= auto.threshold(), prob);
+            }
+            auto.threshold()
+        };
+        (
+            threshold,
+            super::vad::is_voice(threshold, self.prob, self.level),
+        )
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Dynamics {
@@ -94,6 +119,11 @@ pub struct SendChain {
     applied_peer_gain: f32,
     warm_gain: Option<f32>,
     dynamics: Dynamics,
+    probability: Option<f32>,
+    noise_db: Option<f32>,
+    noise_age: usize,
+    nonspeech_samples: usize,
+    nonspeech_gain: f32,
 }
 
 impl Default for SendChain {
@@ -122,6 +152,11 @@ impl SendChain {
             applied_peer_gain: 1.0,
             warm_gain: None,
             dynamics: Dynamics::default(),
+            probability: None,
+            noise_db: None,
+            noise_age: 0,
+            nonspeech_samples: 0,
+            nonspeech_gain: 1.0,
         }
     }
 
@@ -147,6 +182,11 @@ impl SendChain {
         self.voice_chain.reset();
         self.out_limiter.reset();
         self.dynamics = Dynamics::default();
+        self.probability = None;
+        self.noise_db = None;
+        self.noise_age = 0;
+        self.nonspeech_samples = 0;
+        self.nonspeech_gain = 1.0;
     }
 
     /// First half: gain, auto level, denoise, meter.
@@ -165,8 +205,18 @@ impl SendChain {
             }
         }
         self.level_on = s.auto_level;
+        let input_level = meter::measure(block);
+        self.noise_age = self.noise_age.saturating_add(block.len());
+        let clean = self.prev_voice
+            && self.probability.is_some_and(|p| p >= 0.8)
+            && self.noise_age <= 144_000
+            && input_level.rms_db >= -65.0
+            && self
+                .noise_db
+                .is_some_and(|noise| input_level.rms_db - noise >= 15.0);
         if s.auto_level {
-            self.leveler.process_hinted(block, Some(self.prev_voice));
+            self.leveler
+                .process_confident(block, Some(self.prev_voice), clean);
         }
         if s.denoise && !self.denoise_on {
             // RNNoise retains overlap audio and recurrent state. A bypass gap
@@ -188,6 +238,13 @@ impl SendChain {
         } else {
             None
         };
+        if prob.is_some_and(|p| p < 0.08) && !self.prev_voice && input_level.rms_db.is_finite() {
+            self.noise_db = Some(self.noise_db.map_or(input_level.rms_db, |old| {
+                old + 0.1 * (input_level.rms_db - old)
+            }));
+            self.noise_age = 0;
+        }
+        self.probability = prob;
         Analysis {
             prob,
             level: meter::measure(block),
@@ -201,6 +258,34 @@ impl SendChain {
     }
     pub fn dynamics(&self) -> Dynamics {
         self.dynamics
+    }
+    /// During a VAD hangover, attenuate only sustained low-confidence
+    /// non-speech. Consonants/short pauses retain 120 ms of protection and
+    /// all candidate speech immediately restores unity. PTT uses `finish`.
+    pub fn finish_vad(&mut self, block: &mut [f32], voice: bool, s: &SendSettings) {
+        self.finish(block, voice, s);
+        let certain_noise = !voice && self.probability.is_some_and(|p| p < 0.15);
+        if certain_noise {
+            self.nonspeech_samples = self.nonspeech_samples.saturating_add(block.len());
+        } else {
+            self.nonspeech_samples = 0;
+        }
+        let target = if self.nonspeech_samples >= 5_760 {
+            meter::from_db(-18.0)
+        } else {
+            1.0
+        };
+        // Slow 60 ms attenuation; one-block (10 ms) restoration preserves
+        // the onset and prevents a hard discontinuity in encoded audio.
+        let step = if target < self.nonspeech_gain {
+            (1.0 - meter::from_db(-18.0)) / 2_880.0
+        } else {
+            1.0 / 480.0
+        };
+        for x in block {
+            self.nonspeech_gain += (target - self.nonspeech_gain).clamp(-step, step);
+            *x *= self.nonspeech_gain;
+        }
     }
     pub fn finish(&mut self, block: &mut [f32], voice: bool, s: &SendSettings) {
         self.dynamics = Dynamics {

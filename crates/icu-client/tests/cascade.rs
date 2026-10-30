@@ -19,7 +19,6 @@ use icu_client::dsp::{
     normalize::Normalizer,
     opus,
     testsignal::{rms, voice, Rng, SR},
-    vad,
     vad_auto::AutoThreshold,
     voice::VoiceStrength,
 };
@@ -123,12 +122,9 @@ fn send(mic: &Mic, settings: &SendSettings, loss_permille: u16) -> Stream {
         block.copy_from_slice(&mic.samples[b * BLOCK..(b + 1) * BLOCK]);
         let now = t0 + BLOCK_DT * b as u32;
         let a = chain.analyze(&mut block, settings);
-        if let Some(p) = a.prob {
-            auto.update(now, gate.is_open(), p);
-        }
-        let voice = vad::is_voice(auto.threshold(), a.prob, a.level);
+        let (_, voice) = a.classify(&mut auto, now, gate.is_open(), None);
         voice_in_frame |= voice;
-        chain.finish(&mut block, voice, settings);
+        chain.finish_vad(&mut block, voice, settings);
         stream.gains.push(chain.gains_db());
         stream.voice.push(voice);
         stream
@@ -138,7 +134,8 @@ fn send(mic: &Mic, settings: &SendSettings, loss_permille: u16) -> Stream {
         acc.extend_from_slice(&block);
         if acc.len() >= FRAME {
             let was_open = gate.is_open();
-            let decision = gate.update(now, voice_in_frame);
+            let decision =
+                gate.update_audio(now, voice_in_frame, BLOCK_DT * (FRAME / BLOCK) as u32);
             voice_in_frame = false;
             let sending = decision != Decision::Silent;
             let mut slot = Vec::new();
@@ -554,13 +551,22 @@ fn concealed_frames_are_not_boosted() {
 /// 200 %, where it works on every loud syllable.
 #[test]
 fn simultaneous_loud_speakers_do_not_clip() {
-    let streams: Vec<Stream> = (0..4)
+    let streams: Vec<Stream> = (0..8)
         .map(|i| {
             let mic = microphone(8.0, 41 + i, -55.0, |_| Some(-10.0));
             send(&mic, &SendSettings::default(), 0)
         })
         .collect();
-    for (n, volume) in [(2usize, 100.0f32), (4, 100.0), (2, 200.0), (4, 200.0)] {
+    for (n, volume) in [
+        (1usize, 100.0f32),
+        (2, 100.0),
+        (4, 100.0),
+        (8, 100.0),
+        (1, 200.0),
+        (2, 200.0),
+        (4, 200.0),
+        (8, 200.0),
+    ] {
         let parts: Vec<Vec<f32>> = streams[..n]
             .iter()
             .map(|s| receive(s, |_| Loss::None, volume).0)
@@ -775,6 +781,7 @@ fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
         let mut pcm = Vec::new();
         let mut decoded = vec![0.0; 5760];
         let now = Instant::now();
+        let mut auto = AutoThreshold::new(now);
         let mut last_correction = 0.0;
         let mut max_peak = 0.0f32;
         let mut reports = 0;
@@ -790,8 +797,8 @@ fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
             }
             chain.tune(tuner.offset_db, 0.0);
             let a = chain.analyze(&mut block, &settings);
-            let speech = vad::is_voice(0.5, a.prob, a.level);
-            chain.finish(&mut block, speech, &settings);
+            let (_, speech) = a.classify(&mut auto, now + BLOCK_DT * i as u32, false, Some(0.5));
+            chain.finish_vad(&mut block, speech, &settings);
             for sample in &mut block {
                 *sample *= post_gain;
             }
@@ -836,10 +843,19 @@ fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
                             window,
                             correction_cdb,
                             reporters,
+                            agreeing,
+                            speech_ms,
                         },
                     ) = (speaker, hint)
                     {
-                        tuner.hint_window(window, correction_cdb, reporters, t);
+                        tuner.hint_observation(
+                            window,
+                            correction_cdb,
+                            reporters,
+                            agreeing,
+                            speech_ms,
+                            t,
+                        );
                     }
                 }
                 tuner.tick(own, assisted, t);

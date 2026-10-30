@@ -49,6 +49,7 @@ fn changing_reporters_keeps_peer_hint_sequence_monotonic() {
                     window,
                     correction_cdb: Some(400),
                     reporters,
+                    ..
                 } if speaker == 1 => Some((window, reporters)),
                 _ => None,
             })
@@ -154,6 +155,7 @@ fn ten_minutes_hold_success_across_pauses_reject_delays_and_reverse_cleanly() {
                     window,
                     correction_cdb,
                     reporters,
+                    ..
                 },
             ) = (speaker, msg)
             {
@@ -202,10 +204,12 @@ fn gain_generation_discards_partial_windows_and_old_audio() {
     for i in 0..50 {
         m.observe_at(&samples, Some(true), 5, 72_000 + i * 480);
     }
-    assert!(
-        m.take_window().is_none(),
-        "old and new gains cannot add up to one valid window"
-    );
+    let (short, window) = m
+        .take_window()
+        .expect("new generation alone has a valid short observation");
+    assert_eq!(short.speech_ms, 480, "old and new gains cannot add up");
+    assert_eq!(window.gain_epoch, 5);
+    assert!(window.first_ts >= 72_960);
     for i in 0..200 {
         m.observe_at(&samples, Some(true), 5, 96_000 + i * 480);
     }
@@ -347,10 +351,11 @@ async fn reconnect_accepts_feedback_for_the_running_audio_generation() {
 async fn engine_restores_good_processing_and_forgets_only_current_microphone() {
     use icu_client::{
         audio::{
-            calibration::{device_key, ProcessingSettings, Profile, Store},
+            calibration::{device_channel_key, ProcessingSettings, Profile, Store},
             fake::FakeBackend,
             level::CaptureLevel,
-            AudioBackend, BackendError, CaptureCallback, DeviceInfo, PlaybackCallback, StreamKind,
+            AudioBackend, BackendError, CaptureCallback, DeviceInfo, PlaybackCallback,
+            ReferenceCallback, StreamKind,
         },
         config::ModeSetting,
         engine::{Command, Engine, EngineConfig},
@@ -363,6 +368,12 @@ async fn engine_restores_good_processing_and_forgets_only_current_microphone() {
         fn devices(&self) -> Vec<DeviceInfo> {
             self.0.devices()
         }
+        fn set_capture_channel(&mut self, channel: Option<u16>) -> Result<(), BackendError> {
+            self.0.set_capture_channel(channel)
+        }
+        fn capture_channel_index(&self) -> Option<u16> {
+            self.0.capture_channel_index()
+        }
         fn open_capture(
             &mut self,
             d: Option<&str>,
@@ -373,7 +384,7 @@ async fn engine_restores_good_processing_and_forgets_only_current_microphone() {
         fn open_reference(
             &mut self,
             d: Option<&str>,
-            cb: CaptureCallback,
+            cb: ReferenceCallback,
         ) -> Result<(), BackendError> {
             self.0.open_reference(d, cb)
         }
@@ -413,8 +424,8 @@ async fn engine_restores_good_processing_and_forgets_only_current_microphone() {
     settings.audio.mode = ModeSetting::Ptt;
     let mut good = settings.audio.clone();
     good.gain_db = 3.0;
-    let key = device_key("fake", "calibration-mic");
-    let other = device_key("fake", "other-mic");
+    let key = device_channel_key("fake", "calibration-mic", Some(0));
+    let other = device_channel_key("fake", "other-mic", Some(0));
     let now = icu_client::net::conn::unix_now().max(0) as u64;
     let mut store = Store::default();
     for device in [&key, &other] {
@@ -449,4 +460,118 @@ async fn engine_restores_good_processing_and_forgets_only_current_microphone() {
     assert!(store.profile(&other, now).is_some());
     engine.shutdown();
     server.handle.shutdown().await;
+}
+
+/// Exercise the actual measurement/consensus/attributed tuner path for short
+/// conversational turns. Acceptance is measured from emitted sample energy,
+/// independently of the controller's correction field and receive AGC.
+#[test]
+fn short_turns_converge_with_bounded_suitable_speech_and_one_acceptance_band() {
+    let start = Instant::now();
+    let mut converged_levels = Vec::new();
+    for speech_ms in [200u32, 400, 800] {
+        for input_db in [-28.0f32, -16.0] {
+            let mut local = Measurement::default();
+            let mut receive = Measurement::default();
+            let mut server = Feedback::default();
+            for id in [1, 2] {
+                server.join(id, CAP_AUDIO_FEEDBACK);
+            }
+            let mut tuner = PeerTuner::default();
+            let mut epoch = 1;
+            tuner.set_epoch(epoch);
+            let mut first = None;
+            let mut suitable_ms = 0;
+            let mut converged = None;
+            for turn in 0..60u32 {
+                let now = start + Duration::from_secs((turn as u64 + 1) * 2);
+                let amplitude = 10.0f32.powf((input_db + tuner.offset_db) / 20.0);
+                let mut speech_energy = 0.0f64;
+                let mut speech_samples = 0;
+                for block in 0..200u32 {
+                    let speaking = block * 10 < speech_ms;
+                    let samples = [if speaking { amplitude } else { 0.0 }; 480];
+                    let ts = turn * 96_000 + block * 480;
+                    local.observe_at(&samples, Some(speaking), epoch, ts);
+                    receive.observe_at(&samples, Some(speaking), epoch, ts);
+                    if speaking {
+                        speech_energy += samples.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
+                        speech_samples += samples.len();
+                    }
+                }
+                suitable_ms += speech_ms;
+                let rms_db = 10.0 * (speech_energy / speech_samples as f64).log10();
+                if (rms_db + 22.0).abs() <= 1.501 {
+                    converged = Some((turn + 1, suitable_ms, rms_db));
+                    break;
+                }
+                server.observe_audio(
+                    1,
+                    AudioHeader {
+                        gain_epoch: epoch,
+                        ts: (turn + 1) * 96_000,
+                        ..Default::default()
+                    },
+                    now,
+                );
+                let (level, window) = receive
+                    .take_window()
+                    .expect("every short answer independently reports");
+                first.get_or_insert((turn + 1, suitable_ms));
+                server.report(2, 1, level, window, now);
+                for (speaker, hint) in server.tick(now, |_, _| true) {
+                    if let (
+                        1,
+                        ControlMsg::AudioLevelHint {
+                            window,
+                            correction_cdb,
+                            reporters,
+                            agreeing,
+                            speech_ms,
+                        },
+                    ) = (speaker, hint)
+                    {
+                        tuner.hint_observation(
+                            window,
+                            correction_cdb,
+                            reporters,
+                            agreeing,
+                            speech_ms,
+                            now,
+                        );
+                    }
+                }
+                let old = tuner.offset_db;
+                let matched = tuner
+                    .window()
+                    .and_then(|w| local.measure_window(w).map(|l| (l, w)));
+                tuner.tick_matched(matched, true, now);
+                if old != tuner.offset_db {
+                    epoch += 1;
+                    tuner.set_epoch(epoch);
+                }
+            }
+            let (turns, suitable, db) =
+                converged.expect("bounded independent short speech must converge");
+            assert_eq!(first, Some((1, speech_ms)));
+            assert!(
+                suitable <= 15_000,
+                "{speech_ms} ms: {suitable} ms suitable speech"
+            );
+            eprintln!("short speech={speech_ms}ms input={input_db}dB: first=2s/{speech_ms}ms speech, converged={}s/{suitable}ms speech, active RMS={db:.2}dBFS", turns * 2);
+            converged_levels.push(db);
+        }
+    }
+    let min = converged_levels
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let max = converged_levels
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        max - min <= 3.001,
+        "one intended acceptance band: {min}..{max}"
+    );
 }

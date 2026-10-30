@@ -10,6 +10,42 @@ mod common;
 use std::time::Duration;
 
 use common::*;
+
+/// A live selector switch must not reopen and reset selection to channel zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capture_channel_selection_keeps_the_native_stream_open() {
+    use icu_client::audio::BackendEvent;
+    use std::sync::{Arc, Mutex};
+    let server = TestServer::start().await;
+    let (identity, paths, _dir) = server.enroll("alice").await;
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let (events, rx) = std::sync::mpsc::channel();
+    let backend = Devices {
+        list: Arc::new(Mutex::new(vec![])),
+        opened: opened.clone(),
+        events: Some(rx),
+    };
+    let mut settings = test_settings();
+    settings.audio.aec = true;
+    settings.audio.muted = true;
+    let mut cfg = icu_client::engine::EngineConfig::new(identity, settings, paths);
+    cfg.server_addr = Some(server.addr());
+    let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).unwrap();
+    wait_connected(&engine).await;
+    opened.lock().unwrap().clear();
+    events
+        .send(BackendEvent::CaptureChannelChanged { channel: 1 })
+        .unwrap();
+    wait_for(&engine, SOON, |s| s.audio_health.capture_channel == Some(1)).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(
+        opened.lock().unwrap().is_empty(),
+        "channel selection reopened audio"
+    );
+    assert!(engine.snapshot().muted);
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
 use icu_client::{audio::fake::FakeBackend, engine::Command, stats::DebugStats};
 use icu_proto::{ControlMsg, Session};
 
@@ -188,7 +224,7 @@ async fn shutting_down_releases_the_audio_backend() {
 
     use icu_client::audio::{
         AudioBackend, BackendError, BackendEvent, CaptureCallback, DeviceInfo, PlaybackCallback,
-        StreamKind,
+        ReferenceCallback, StreamKind,
     };
 
     /// The fake backend, telling when it is dropped.
@@ -207,6 +243,12 @@ async fn shutting_down_releases_the_audio_backend() {
         fn devices(&self) -> Vec<DeviceInfo> {
             self.0.devices()
         }
+        fn set_capture_channel(&mut self, channel: Option<u16>) -> Result<(), BackendError> {
+            self.0.set_capture_channel(channel)
+        }
+        fn capture_channel_index(&self) -> Option<u16> {
+            self.0.capture_channel_index()
+        }
         fn open_capture(
             &mut self,
             device: Option<&str>,
@@ -217,7 +259,7 @@ async fn shutting_down_releases_the_audio_backend() {
         fn open_reference(
             &mut self,
             sink: Option<&str>,
-            cb: CaptureCallback,
+            cb: ReferenceCallback,
         ) -> Result<(), BackendError> {
             self.0.open_reference(sink, cb)
         }
@@ -699,7 +741,7 @@ impl icu_client::audio::AudioBackend for Devices {
     fn open_reference(
         &mut self,
         sink: Option<&str>,
-        _cb: icu_client::audio::CaptureCallback,
+        _cb: icu_client::audio::ReferenceCallback,
     ) -> Result<(), icu_client::audio::BackendError> {
         let kind = icu_client::audio::StreamKind::Reference;
         self.opened
@@ -1050,7 +1092,7 @@ impl icu_client::audio::AudioBackend for NoMic {
     fn open_reference(
         &mut self,
         sink: Option<&str>,
-        _cb: icu_client::audio::CaptureCallback,
+        _cb: icu_client::audio::ReferenceCallback,
     ) -> Result<(), icu_client::audio::BackendError> {
         let kind = icu_client::audio::StreamKind::Reference;
         self.opened

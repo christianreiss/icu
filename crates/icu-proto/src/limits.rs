@@ -99,6 +99,10 @@ pub const DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
 /// post-stall backlog anyway, so queueing more only sends stale audio late
 /// and bursts past the server's per-second rate limit (`docs/reference/protocol.md` §1).
 pub const CLIENT_DATAGRAM_SEND_BUFFER_BYTES: usize = 8 * 1024;
+/// Maximum residence of audio in each outgoing QUIC datagram queue.
+/// Enforced by the vendored Quinn deadline at packet construction, independently
+/// of payload size, speaker count, and whether more packets are enqueued.
+pub const AUDIO_QUEUE_MAX_AGE_MS: u64 = 100;
 
 /// Silence after which a speaker is considered to have stopped, and below
 /// which a new datagram starts a talk spurt (`docs/reference/protocol.md` §2.1).

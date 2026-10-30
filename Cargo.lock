@@ -2503,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "icu-client"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "ab_glyph",
  "arboard",
@@ -2534,6 +2534,7 @@ dependencies = [
  "ringbuf",
  "rustls",
  "serde",
+ "serde_json",
  "sha2",
  "skrifa",
  "smithay-client-toolkit 0.21.1",
@@ -2555,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "icu-proto"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "base64 0.22.1",
  "postcard",
@@ -2570,7 +2571,7 @@ dependencies = [
 
 [[package]]
 name = "icu-server"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "bytes",
  "clap",
@@ -4468,8 +4469,6 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",

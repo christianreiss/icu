@@ -2,10 +2,10 @@
 
 pub mod backend;
 pub mod calibration;
-#[cfg(any(target_os = "windows", feature = "cpal-fallback", test))]
 mod channels;
 #[cfg(any(feature = "cpal-fallback", target_os = "windows"))]
 pub mod cpal_fallback;
+pub mod ducking;
 pub mod fake;
 pub mod health;
 pub mod level;
@@ -15,13 +15,15 @@ mod packet;
 pub mod pipewire;
 #[cfg(target_os = "linux")]
 mod pipewire_level;
+#[cfg(any(target_os = "windows", feature = "cpal-fallback", test))]
+mod resample;
 pub mod rt;
 #[cfg(target_os = "windows")]
 pub mod wasapi;
 
 pub use backend::{
     AudioBackend, BackendError, BackendEvent, CaptureCallback, DeviceInfo, DeviceKind,
-    PlaybackCallback, StreamKind, BLOCK_SAMPLES, SAMPLE_RATE,
+    PlaybackCallback, ReferenceCallback, ReferenceFrame, StreamKind, BLOCK_SAMPLES, SAMPLE_RATE,
 };
 
 /// Opens the platform's native backend.

@@ -8,7 +8,8 @@
 //!
 //! Stream properties (Spike 8): `node.latency = 240/48000`,
 //! `node.rate = 1/48000`, `node.group = icu`, `media.role = Communication`,
-//! format F32LE mono 48 kHz. The reference stream sets
+//! format F32LE 48 kHz. Capture and reference negotiate native channels;
+//! playback requests mono voice. The reference stream sets
 //! `stream.capture.sink = true`; with no target device it connects to the
 //! monitor ports of the default sink and follows default-sink changes
 //! itself, and with an explicit output device (same one playback uses) it
@@ -26,6 +27,7 @@ use std::{
     collections::HashMap,
     rc::Rc,
     sync::{
+        atomic::{AtomicU16, Ordering},
         mpsc::{self, Receiver, Sender},
         Arc, Mutex,
     },
@@ -38,7 +40,7 @@ use pw::{properties::properties, spa};
 
 use super::backend::{
     AudioBackend, BackendError, BackendEvent, CaptureCallback, DeviceInfo, DeviceKind,
-    PlaybackCallback, StreamKind, BLOCK_SAMPLES, SAMPLE_RATE,
+    PlaybackCallback, ReferenceCallback, ReferenceFrame, StreamKind, BLOCK_SAMPLES, SAMPLE_RATE,
 };
 use crate::sync::lock;
 
@@ -48,6 +50,8 @@ enum Cmd {
         kind: StreamKind,
         device: Option<String>,
         handler: Handler,
+        capture_channel: Option<u16>,
+        selected_channel: Arc<AtomicU16>,
         reply: Sender<Result<(), BackendError>>,
     },
     Close(StreamKind),
@@ -63,6 +67,7 @@ enum Cmd {
 
 enum Handler {
     Capture(CaptureCallback),
+    Reference(ReferenceCallback),
     Playback(PlaybackCallback),
 }
 
@@ -70,6 +75,12 @@ enum Handler {
 struct StreamData {
     handler: Handler,
     scratch: Vec<f32>,
+    mono: Vec<f32>,
+    reference: Vec<ReferenceFrame>,
+    capture_channel: Option<u16>,
+    selected_channel: Arc<AtomicU16>,
+    selector: Option<super::channels::CaptureSelector>,
+    channels: usize,
     kind: StreamKind,
     events: Sender<BackendEvent>,
 }
@@ -88,6 +99,8 @@ pub struct PipeWireBackend {
     devices: Arc<Mutex<HashMap<u32, DeviceInfo>>>,
     events: Option<Receiver<BackendEvent>>,
     thread: Option<JoinHandle<()>>,
+    capture_channel: Option<u16>,
+    selected_channel: Arc<AtomicU16>,
 }
 
 impl PipeWireBackend {
@@ -112,6 +125,8 @@ impl PipeWireBackend {
             devices,
             events: Some(ev_rx),
             thread: Some(thread),
+            capture_channel: None,
+            selected_channel: Arc::new(AtomicU16::new(u16::MAX)),
         })
     }
 
@@ -145,6 +160,8 @@ impl PipeWireBackend {
                 kind,
                 device: device.map(str::to_string),
                 handler,
+                capture_channel: self.capture_channel,
+                selected_channel: self.selected_channel.clone(),
                 reply,
             })
             .map_err(|_| BackendError("pipewire thread gone".into()))?;
@@ -175,20 +192,29 @@ impl AudioBackend for PipeWireBackend {
         list
     }
 
+    fn set_capture_channel(&mut self, channel: Option<u16>) -> Result<(), BackendError> {
+        self.capture_channel = channel;
+        Ok(())
+    }
+    fn capture_channel_index(&self) -> Option<u16> {
+        let channel = self.selected_channel.load(Ordering::Relaxed);
+        (channel != u16::MAX).then_some(channel)
+    }
     fn open_capture(
         &mut self,
         device: Option<&str>,
         cb: CaptureCallback,
     ) -> Result<(), BackendError> {
+        self.selected_channel.store(u16::MAX, Ordering::Relaxed);
         self.open(StreamKind::Capture, device, Handler::Capture(cb))
     }
 
     fn open_reference(
         &mut self,
         sink: Option<&str>,
-        cb: CaptureCallback,
+        cb: ReferenceCallback,
     ) -> Result<(), BackendError> {
-        self.open(StreamKind::Reference, sink, Handler::Capture(cb))
+        self.open(StreamKind::Reference, sink, Handler::Reference(cb))
     }
 
     fn open_playback(
@@ -484,6 +510,8 @@ fn pw_thread(
             kind,
             device,
             handler,
+            capture_channel,
+            selected_channel,
             reply,
         } => {
             let mut map = streams_cmd.borrow_mut();
@@ -493,6 +521,8 @@ fn pw_thread(
                 kind,
                 device.as_deref(),
                 handler,
+                capture_channel,
+                selected_channel,
                 events_cmd.clone(),
             );
             let _ = match result {
@@ -580,6 +610,8 @@ fn open_stream(
     kind: StreamKind,
     device: Option<&str>,
     handler: Handler,
+    capture_channel: Option<u16>,
+    selected_channel: Arc<AtomicU16>,
     events: Sender<BackendEvent>,
 ) -> Result<LiveStream, BackendError> {
     let (name, category, direction) = match kind {
@@ -598,13 +630,17 @@ fn open_stream(
         *pw::keys::NODE_GROUP => "icu",
         *pw::keys::NODE_LATENCY => latency.as_str(),
         *pw::keys::NODE_RATE => rate.as_str(),
-        *pw::keys::AUDIO_CHANNELS => "1",
+
     };
+    if kind == StreamKind::Playback {
+        props.insert(*pw::keys::AUDIO_CHANNELS, "1");
+    }
     if kind == StreamKind::Reference {
         props.insert(*pw::keys::STREAM_CAPTURE_SINK, "true");
     }
     if let Some(target) = device {
         props.insert(*pw::keys::TARGET_OBJECT, target);
+        props.insert("node.dont-fallback", "true");
     }
 
     let stream = pw::stream::StreamRc::new(core, name, props)
@@ -612,9 +648,15 @@ fn open_stream(
 
     let data = StreamData {
         handler,
-        // Sized for PipeWire's largest default quantum (8192) so the
-        // real-time callback never reallocates, whatever the graph runs.
-        scratch: Vec::with_capacity(8192),
+        // Fixed scratch is allocated before real-time processing. Larger
+        // graph quanta are handled in bounded chunks, without Vec growth.
+        scratch: vec![0.0; 1024 * 64],
+        mono: vec![0.0; 8192],
+        reference: vec![[0.0; 8]; 1024],
+        capture_channel,
+        selected_channel,
+        selector: None,
+        channels: 0,
         kind,
         events,
     };
@@ -628,6 +670,51 @@ fn open_stream(
                 });
             }
         })
+        .param_changed(|_, data, id, param| {
+            if id != spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let Some(param) = param else {
+                data.channels = 0;
+                return;
+            };
+            let mut format = spa::param::audio::AudioInfoRaw::new();
+            if format.parse(param).is_err() {
+                return;
+            }
+            let channels = format.channels() as usize;
+            tracing::debug!(stream = ?data.kind, channels, format = ?format.format(), positions = ?&format.position()[..channels.min(64)], "negotiated native audio layout");
+            let max = if data.kind == StreamKind::Reference {
+                8
+            } else {
+                64
+            };
+            if !(1..=max).contains(&channels) || format.rate() != SAMPLE_RATE {
+                data.channels = 0;
+                let _ = data.events.send(BackendEvent::StreamError {
+                    stream: data.kind,
+                    message: format!(
+                        "Nicht unterstütztes Audioformat: {} Hz, {channels} Kanäle",
+                        format.rate()
+                    ),
+                });
+                return;
+            }
+            if data.kind == StreamKind::Capture {
+                match super::channels::CaptureSelector::new(data.capture_channel, channels) {
+                    Ok(selector) => data.selector = Some(selector),
+                    Err(error) => {
+                        data.channels = 0;
+                        let _ = data.events.send(BackendEvent::StreamError {
+                            stream: data.kind,
+                            message: error.to_string(),
+                        });
+                        return;
+                    }
+                }
+            }
+            data.channels = channels;
+        })
         .process(|stream, data| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
@@ -638,44 +725,79 @@ fn open_stream(
                 return;
             }
             let d = &mut datas[0];
+            let channels = data.channels;
+            if channels == 0 {
+                return;
+            }
+            let size = d.chunk().size() as usize;
+            let offset = d.chunk().offset() as usize;
             match &mut data.handler {
                 Handler::Capture(cb) => {
-                    let n = d.chunk().size() as usize / 4;
-                    let offset = d.chunk().offset() as usize;
-                    let Some(bytes) = d.data() else { return };
-                    // A chunk offset past the mapped buffer would panic the
-                    // real-time thread even for an empty slice; clamp it and
-                    // take what is there.
+                    let Some(bytes) = d.data() else {
+                        return;
+                    };
                     let offset = offset.min(bytes.len());
-                    let n = n.min((bytes.len() - offset) / 4);
-                    data.scratch.clear();
-                    data.scratch.extend(
-                        bytes[offset..offset + n * 4]
-                            .as_chunks::<4>()
-                            .0
-                            .iter()
-                            .map(|c| f32::from_le_bytes(*c)),
-                    );
-                    cb(&data.scratch);
+                    let size = size.min(bytes.len() - offset);
+                    for raw in bytes[offset..offset + size].chunks(1024 * channels * 4) {
+                        let frames = raw.len() / (channels * 4);
+                        let count = frames * channels;
+                        for (sample, raw) in
+                            data.scratch[..count].iter_mut().zip(raw.as_chunks::<4>().0.iter())
+                        {
+                            *sample = f32::from_le_bytes(*raw);
+                        }
+                        let Some(selector) = &mut data.selector else {
+                            return;
+                        };
+                        selector.update(&data.scratch[..count], &data.selected_channel, &data.events);
+                        for (sample, frame) in data.mono[..frames]
+                            .iter_mut()
+                            .zip(data.scratch[..count].chunks_exact(channels))
+                        {
+                            *sample = frame[selector.channel()];
+                        }
+                        cb(&data.mono[..frames]);
+                    }
+                }
+                Handler::Reference(cb) => {
+                    let Some(bytes) = d.data() else {
+                        return;
+                    };
+                    let offset = offset.min(bytes.len());
+                    let size = size.min(bytes.len() - offset);
+                    for raw in bytes[offset..offset + size].chunks(1024 * channels * 4) {
+                        let frames = raw.len() / (channels * 4);
+                        for (frame, raw) in data.reference[..frames]
+                            .iter_mut()
+                            .zip(raw.chunks_exact(channels * 4))
+                        {
+                            frame.fill(0.0);
+                            for (sample, bytes) in
+                                frame[..channels].iter_mut().zip(raw.as_chunks::<4>().0.iter())
+                            {
+                                *sample = f32::from_le_bytes(*bytes);
+                            }
+                        }
+                        cb(&data.reference[..frames], channels);
+                    }
                 }
                 Handler::Playback(cb) => {
-                    let Some(bytes) = d.data() else { return };
+                    let Some(bytes) = d.data() else {
+                        return;
+                    };
                     let capacity = bytes.len() / 4;
                     let n = if requested == 0 {
                         BLOCK_SAMPLES.min(capacity)
                     } else {
                         requested.min(capacity)
                     };
-                    data.scratch.clear();
-                    data.scratch.resize(n, 0.0);
-                    cb(&mut data.scratch);
-                    for (dst, s) in bytes
-                        .as_chunks_mut::<4>()
-                        .0
-                        .iter_mut()
-                        .zip(data.scratch.iter())
-                    {
-                        *dst = s.to_le_bytes();
+                    for raw in bytes[..n * 4].chunks_mut(data.mono.len() * 4) {
+                        let frames = raw.len() / 4;
+                        data.mono[..frames].fill(0.0);
+                        cb(&mut data.mono[..frames]);
+                        for (dst, sample) in raw.as_chunks_mut::<4>().0.iter_mut().zip(&data.mono[..frames]) {
+                            dst.copy_from_slice(&sample.to_le_bytes());
+                        }
                     }
                     let chunk = d.chunk_mut();
                     *chunk.offset_mut() = 0;
@@ -690,10 +812,14 @@ fn open_stream(
     let mut audio_info = spa::param::audio::AudioInfoRaw::new();
     audio_info.set_format(spa::param::audio::AudioFormat::F32LE);
     audio_info.set_rate(SAMPLE_RATE);
-    audio_info.set_channels(1);
-    let mut position = [0; spa::param::audio::MAX_CHANNELS];
-    position[0] = spa::sys::SPA_AUDIO_CHANNEL_MONO;
-    audio_info.set_position(position);
+    if kind == StreamKind::Playback {
+        audio_info.set_channels(1);
+        let mut position = [0; spa::param::audio::MAX_CHANNELS];
+        position[0] = spa::sys::SPA_AUDIO_CHANNEL_MONO;
+        audio_info.set_position(position);
+    }
+    // Capture/reference leave channels unspecified, negotiating the native
+    // endpoint layout instead of asking PipeWire to downmix it to mono.
     let obj = spa::pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: spa::param::ParamType::EnumFormat.as_raw(),
@@ -729,6 +855,171 @@ fn open_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feed a task-owned stereo loopback (L=-R) from pw-cat before this
+    /// test. It exercises actual PipeWire format negotiation and callbacks,
+    /// while no physical microphone or speaker is opened.
+    #[test]
+    #[ignore = "needs task-owned ICU_CAPTURE_TEST_SOURCE and ICU_REFERENCE_TEST_SINK with stereo antiphase audio"]
+    fn native_stereo_capture_and_reference_keep_independent_channels() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let source = std::env::var("ICU_CAPTURE_TEST_SOURCE").unwrap();
+        let sink = std::env::var("ICU_REFERENCE_TEST_SINK").unwrap();
+        assert!(source.starts_with("icu-voice-test-"));
+        assert!(sink.starts_with("icu-voice-test-"));
+        let capture = Arc::new(AtomicUsize::new(0));
+        let reference = Arc::new(AtomicUsize::new(0));
+        let reference_active = Arc::new(AtomicUsize::new(0));
+        let reference_total = Arc::new(AtomicUsize::new(0));
+        let reference_same = Arc::new(AtomicUsize::new(0));
+        let reference_energy = Arc::new(Mutex::new([0.0f64; 3]));
+        let c = capture.clone();
+        let r = reference.clone();
+        let active = reference_active.clone();
+        let total = reference_total.clone();
+        let same = reference_same.clone();
+        let energy = reference_energy.clone();
+        let mut backend = PipeWireBackend::new().unwrap();
+        backend.set_capture_channel(Some(1)).unwrap();
+        backend
+            .open_capture(
+                Some(&source),
+                Box::new(move |samples| {
+                    c.fetch_add(
+                        samples.iter().filter(|sample| sample.abs() > 0.05).count(),
+                        Ordering::Relaxed,
+                    );
+                }),
+            )
+            .unwrap();
+        backend
+            .open_reference(
+                Some(&sink),
+                Box::new(move |frames, channels| {
+                    assert_eq!(channels, 2);
+                    total.fetch_add(frames.len(), Ordering::Relaxed);
+                    if let Ok(mut energy) = energy.try_lock() {
+                        for frame in frames {
+                            energy[0] += f64::from(frame[0]).powi(2);
+                            energy[1] += f64::from(frame[1]).powi(2);
+                            energy[2] += f64::from(frame[0]) * f64::from(frame[1]);
+                        }
+                    }
+                    active.fetch_add(
+                        frames
+                            .iter()
+                            .filter(|f| f[0].abs() > 0.05 || f[1].abs() > 0.05)
+                            .count(),
+                        Ordering::Relaxed,
+                    );
+                    same.fetch_add(
+                        frames
+                            .iter()
+                            .filter(|f| f[0].abs() > 0.05 && (f[0] - f[1]).abs() < 0.001)
+                            .count(),
+                        Ordering::Relaxed,
+                    );
+                    r.fetch_add(
+                        frames
+                            .iter()
+                            .filter(|frame| {
+                                frame[0].abs() > 0.02
+                                    && frame[1].abs() > 0.02
+                                    && frame[0] * frame[1] < 0.0
+                            })
+                            .count(),
+                        Ordering::Relaxed,
+                    );
+                }),
+            )
+            .unwrap();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(4)
+            && (capture.load(Ordering::Relaxed) < 4800 || reference.load(Ordering::Relaxed) < 4800)
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(backend.capture_channel_index(), Some(1));
+        eprintln!(
+            "native capture active samples {}, antiphase reference frames {}",
+            capture.load(Ordering::Relaxed),
+            reference.load(Ordering::Relaxed)
+        );
+        eprintln!(
+            "reference active frames {}, identical stereo {}",
+            reference_active.load(Ordering::Relaxed),
+            reference_same.load(Ordering::Relaxed)
+        );
+        eprintln!(
+            "reference total frames {}",
+            reference_total.load(Ordering::Relaxed)
+        );
+        let energy = *reference_energy.lock().unwrap();
+        let correlation = energy[2] / (energy[0] * energy[1]).sqrt().max(1e-12);
+        eprintln!("reference channel correlation {correlation:.6}");
+        // Native per-channel volumes may differ; preserve those values
+        // instead of rewriting the user's mixer balance for this test.
+        assert!(correlation < -0.995, "independent antiphase channels lost");
+        assert!(
+            capture.load(Ordering::Relaxed) > 4800,
+            "second input channel not captured"
+        );
+        assert!(
+            reference.load(Ordering::Relaxed) > 4800,
+            "antiphase reference erased"
+        );
+    }
+
+    /// The runner first feeds the left input, then only the right input.
+    #[test]
+    #[ignore = "needs the temporary virtual endpoints from tests/native_channels.py"]
+    fn native_automatic_channel_change_keeps_capture_running() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let source = std::env::var("ICU_CAPTURE_TEST_SOURCE").unwrap();
+        assert!(source.starts_with("icu-voice-test-"));
+        let samples = Arc::new(AtomicUsize::new(0));
+        let count = samples.clone();
+        let mut backend = PipeWireBackend::new().unwrap();
+        let events = backend.take_events().unwrap();
+        backend.set_capture_channel(None).unwrap();
+        backend
+            .open_capture(
+                Some(&source),
+                Box::new(move |input| {
+                    count.fetch_add(
+                        input.iter().filter(|sample| sample.abs() > 0.01).count(),
+                        Ordering::Relaxed,
+                    );
+                }),
+            )
+            .unwrap();
+        let start = std::time::Instant::now();
+        let mut saw_left = false;
+        let mut switched_at = None;
+        while start.elapsed() < Duration::from_secs(8) {
+            saw_left |= backend.capture_channel_index() == Some(0);
+            for event in events.try_iter() {
+                match event {
+                    BackendEvent::CaptureChannelChanged { channel: 1 } if saw_left => {
+                        switched_at = Some(samples.load(Ordering::Relaxed));
+                    }
+                    BackendEvent::StreamDiscontinuity { .. } | BackendEvent::StreamError { .. } => {
+                        panic!("channel selection must preserve the native stream: {event:?}");
+                    }
+                    _ => {}
+                }
+            }
+            if switched_at.is_some_and(|before| samples.load(Ordering::Relaxed) > before + 4800) {
+                assert_eq!(backend.capture_channel_index(), Some(1));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("capture did not continue after switching inputs: left={saw_left}, switch={switched_at:?}");
+    }
 
     /// The case from the review (L6): PipeWire's library is there, its
     /// daemon is not. The backend fails, and no freed context stays behind
