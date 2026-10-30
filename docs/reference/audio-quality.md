@@ -82,6 +82,11 @@ Die UDP-Sockets fordern zusätzlich einen begrenzten OS-Empfangspuffer von 1 MiB
 an, damit volle Audio-/Video-Bursts von 64 Teilnehmern nicht schon vor QUIC
 verloren gehen. Das Betriebssystem darf diesen Wert begrenzen; seine Bytegröße
 ist keine Latenzgarantie. Es werden keine globalen Netzwerkparameter verändert.
+Die QUIC-Fanout-Puffer (Server senden, Client empfangen) sind auf je 512 KiB
+begrenzt. Das deckt auch einen noch frischen 100-ms-Burst aller 63 Gegenstellen
+mit 10-ms-Paketen und maximaler Nutzlast ab. Der Server-Empfangspuffer bleibt
+bei 64 KiB, der Client-Sendepuffer bei 8 KiB; die Sende-Altersgrenze bleibt
+unabhängig davon bei 100 ms.
 Der Jitterbuffer zählt Sampledauer statt Paketanzahl und reduziert überhöhte
 Zielverzögerung auch bei Dauersprache behutsam. FEC versucht die Dauer des
 tatsächlich fehlenden Pakets; Diagnosezähler trennen Versuch, enthaltene LBRR-

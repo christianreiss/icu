@@ -153,6 +153,15 @@ Der WASAPI-Test bestätigt Aufnahme, Wiedergabe und nicht-stille Loopback-
 Referenz; absichtlich angehaltene Capture-/Render-Streams werden erkannt.
 Die VM ersetzt keine physische Windows-Hardware- oder Hörprüfung.
 
+Auch das tatsächlich installierte NSIS-Paket wurde geprüft: Seine EXE stimmt
+mit der portablen ZIP überein. Der paketierte Guardian besteht Aus, Leicht,
+Mittel, Stark und den Windows-Auto-Fallback, Heartbeat-Ablauf, EOF sowie
+Wächterabbruch mit Wiederherstellung aus dem Journal nach Neustart. Das native
+Einladungsfenster wurde mit privatem leerem Profil über DX12-Software-Rendering
+sichtbar geprüft. Produktionsidentitäten wurden nicht in den Gast kopiert.
+Unter Linux bestand die tatsächliche Fedora-Paket-EXE die isolierten PipeWire-
+Modus-, manuellen Pegel- und Crash-/Restore-Prüfungen ebenfalls.
+
 Die native Prüfung fand weitere Fehler, die vor Veröffentlichung behoben wurden:
 
 - Ein beendeter Windows-Prozess kann noch ein COM-Volume-Objekt hinterlassen,
@@ -185,6 +194,11 @@ Histogramm mit konservativen 0,1-ms-Obergrenzen. Dadurch wachsen die Messdaten
 während eines Langlaufs nicht mehr. Alle Leser werden vor dem gemeinsamen
 Start initialisiert; der Videogenerator kennzeichnet regelmäßig Keyframes.
 Die strikten Zustellungs-, Duplikat- und Latenzprüfungen bleiben erhalten.
+Die Testclients verwenden nun dieselben Transportgrenzen wie echte Clients:
+132 Video-Streams, 100-ms-Datagramm-Altersgrenze und COM-kompatible MTU-Suche.
+Zuvor begrenzte der gemeinsame Testhelfer trotz 64 Teilnehmern noch auf die
+36 Streams des 16er-Defaults. Der absichtlich blockierte Empfänger überschreibt
+nur die Streamzahl mit null und behält die übrigen Clientgrenzen bei.
 
 Vorher verlor ein zehnsekündiger Lauf 4.076 von 32.000 Audio-Eingangspaketen;
 der Kernel zählte 48.475 übergelaufene UDP-Empfangspakete. Kein Client-Datagramm
@@ -192,11 +206,28 @@ war an seiner QUIC-Deadline verfallen. Im identischen Test mit angefordertem
 1-MiB-Empfangspuffer verschwanden diese Kernel-Verluste und alle Zustellungs-
 prüfungen bestanden. Die Änderung begrenzt ausschließlich ICU-Sockets.
 
+Ein anschließender 180-s-Diagnoselauf zeigte zusätzlich 158 durch den
+QUIC-Sendepuffer verdrängte und 581 im Client-Empfangspuffer verdrängte
+Audiopakete, bei null verfallenen Datagrammen und null QUIC-Paketverlusten auf
+dem Serverpfad. Beide 64-KiB-Fanout-Puffer waren für kurze Bursts aller Sprecher
+zu klein. Sie sind jetzt auf 512 KiB begrenzt; die 100-ms-Sendefrist bleibt
+unverändert. Ein deterministischer Transporttest legt 630 maximale Audiopakete
+vor dem ersten Scheduler-Yield ein und prüft anschließend deren vollständige
+Zustellung durch beide Warteschlangen, einschließlich Sequenz und Nutzlast.
+
 Mit dem tatsächlichen Produktionscode bestanden anschließend je 30 Sekunden
 mit und ohne blockierten Videoempfänger: jeweils 6.048.000 Audiopakete vollständig
 zugestellt, Audio-p99 17,124 / 17,499 ms; sämtliche erwarteten Videoframes kamen
 bei gesunden Empfängern an. Referenz ist der oben genannte Linux-Host über
 Loopback; dies belegt keine WAN-Kapazität oder Mund-zu-Ohr-Latenz des Servers.
+
+## Blindhörprobe
+
+Ein achtsekündiger Ausschnitt Sprache mit Tastaturgeräuschen (Sekunden 12–20,
+10-ms-Profil) wurde bei unverändertem Abhörpegel blind vorgelegt. A war die neue,
+B die bisherige Verarbeitung. Die Rückmeldung lautete **„Kein klarer Unterschied“**.
+Für dieses Beispiel wird kein subjektiv hörbarer Qualitätsgewinn behauptet;
+diese einzelne Bewertung ersetzt keine breit angelegte Hörabnahme.
 
 ## Physischer Geräteweg
 
@@ -221,7 +252,7 @@ weitergeführt; aus diesem Aufbau wird kein bestandenes 150-ms-Ziel abgeleitet.
 
 ## Automatisierter integrierter Stand
 
-`cargo test --locked --workspace`: **1043 bestanden, 0 fehlgeschlagen,
+`cargo test --locked --workspace`: **1044 bestanden, 0 fehlgeschlagen,
 16 ignorierte native/optionale Tests, 46 Suites**. Die oben genannten nativen
 Linux-Tests wurden separat bewusst ausgeführt. Workspace-Clippy mit
 `--all-targets -- -D warnings`, Formatprüfung, CPAL-Featureprüfung sowie Windows-
@@ -272,7 +303,7 @@ Die verbleibende physische/hörbezogene Abnahme ist konkret:
    vergleichen. Zusätzliche bewusst aufgenommene Flüster-, Lach-, Atem-,
    Konsonanten-/Wortende- und verschiedene Tonhöhen-Beispiele ergänzen. Verständ-
    lichkeit und Natürlichkeit mit und ohne gleichzeitiges Tippen bewerten.
-3. Auf Windows den obigen isolierten Test ausführen, danach alle fünf Modi mit
+3. Die isolierten Windows-Paketprüfungen bestanden; zusätzlich alle fünf Modi mit
    Musik/Spiel, mehreren Sessions, zweitem Ausgang, manueller Lautstärke/Mute,
    zwei ICU-Instanzen, Hauptprozess- und Wächterabbruch prüfen. Aktuelle Baseline
    vor jedem Test erfassen; nach Ende, App-Neustart und Service-Neustart vergleichen.

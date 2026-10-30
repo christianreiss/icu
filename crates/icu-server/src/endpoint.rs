@@ -89,7 +89,7 @@ pub fn server_config(
     ));
     // Asymmetric signatures, see A3: receive takes an Option, send does not.
     transport.datagram_receive_buffer_size(Some(pl::DATAGRAM_BUFFER_BYTES));
-    transport.datagram_send_buffer_size(pl::DATAGRAM_BUFFER_BYTES);
+    transport.datagram_send_buffer_size(pl::FANOUT_DATAGRAM_BUFFER_BYTES);
     transport.datagram_send_max_age(Some(Duration::from_millis(pl::AUDIO_QUEUE_MAX_AGE_MS)));
     transport.max_concurrent_uni_streams(VarInt::from_u32(pl::max_uni_streams(
         config.server.max_users,

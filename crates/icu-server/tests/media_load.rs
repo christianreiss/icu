@@ -51,7 +51,7 @@ async fn participant(server: &TestServer, index: usize, blocked_video: bool) -> 
     let mut config =
         common::client_config(server.ca(), Some(identity), icu_proto::limits::ALPN_MAIN);
     if blocked_video {
-        let mut transport = quinn::TransportConfig::default();
+        let mut transport = common::client_transport();
         transport.max_concurrent_uni_streams(0u32.into());
         config.transport_config(Arc::new(transport));
     }
@@ -81,6 +81,53 @@ async fn participant(server: &TestServer, index: usize, blocked_video: bool) -> 
         .await
         .expect("Welcome");
     client
+}
+
+/// A full room's 100-ms, 10-ms-frame burst must fit both queues before the
+/// reader runs. A single-thread runtime makes the initial send burst atomic.
+#[tokio::test]
+async fn full_room_fresh_audio_burst_fits_both_quic_queues() {
+    let server = TestServer::start().await;
+    let client = participant(&server, 0, false).await;
+    let (_, relay) = server
+        .handle
+        .server()
+        .room
+        .video_receivers(0)
+        .pop()
+        .unwrap();
+    const PACKETS: u64 = 63 * 10;
+    for seq in 0..PACKETS {
+        let header = AudioHeader {
+            speaker: 2 + (seq % 63) as u16,
+            seq: seq as u16,
+            ..Default::default()
+        };
+        relay
+            .send_datagram(header.datagram(&[42; AUDIO_MAX_PAYLOAD]).unwrap().into())
+            .unwrap();
+    }
+    // Let transport run without consuming application datagrams, testing the
+    // receive queue as well as the relay queue. Count wire frames, not enqueues.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while client.conn.stats().frame_rx.datagram < PACKETS {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the entire fresh burst reached the client transport");
+    assert_eq!(relay.stats().datagrams_expired, 0);
+    for seq in 0..PACKETS {
+        let packet = tokio::time::timeout(Duration::from_secs(1), client.conn.read_datagram())
+            .await
+            .expect("no receive-buffer eviction")
+            .unwrap();
+        let (header, payload) = AudioHeader::decode(&packet).unwrap();
+        assert_eq!(header.seq, seq as u16);
+        assert_eq!(payload, &[42; AUDIO_MAX_PAYLOAD]);
+    }
+    client.conn.close(icu_proto::error::SHUTDOWN.into(), b"");
+    server.shutdown().await;
 }
 
 async fn soak(blocked_video: bool) {
@@ -286,6 +333,34 @@ async fn soak(blocked_video: bool) {
         "the filter dropped tagged traffic"
     );
     let c = &server.handle.server().counters;
+    let server_connections = server.handle.server().room.video_receivers(0);
+    println!(
+        "relay transport: server_tx={} server_expired={} server_lost={} client_rx={}",
+        server_connections
+            .iter()
+            .map(|(_, x)| x.stats().frame_tx.datagram)
+            .sum::<u64>(),
+        server_connections
+            .iter()
+            .map(|(_, x)| x.stats().datagrams_expired)
+            .sum::<u64>(),
+        server_connections
+            .iter()
+            .map(|(_, x)| x.stats().path.lost_packets)
+            .sum::<u64>(),
+        connections
+            .iter()
+            .map(|x| x.stats().frame_rx.datagram)
+            .sum::<u64>(),
+    );
+    println!(
+        "transport: client_tx={} client_expired={} client_lost={} server_in={} server_out={} video_slow={}",
+        connections.iter().map(|x| x.stats().frame_tx.datagram).sum::<u64>(),
+        connections.iter().map(|x| x.stats().datagrams_expired).sum::<u64>(),
+        connections.iter().map(|x| x.stats().path.lost_packets).sum::<u64>(),
+        Counters::get(&c.datagrams_in), Counters::get(&c.datagrams_out),
+        Counters::get(&c.video_dropped_slow_receiver)
+    );
     assert_eq!(Counters::get(&c.datagrams_in), sent_audio);
     assert_eq!(
         Counters::get(&c.datagrams_out),

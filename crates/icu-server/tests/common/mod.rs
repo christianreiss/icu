@@ -635,6 +635,13 @@ pub fn client_config_with_chain(
     let mut config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client config"),
     ));
+    config.transport_config(Arc::new(client_transport()));
+    config
+}
+
+/// Keep the fixture aligned with the real client's transport, including the
+/// maximum room size it must accept before learning the server's configuration.
+pub fn client_transport() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(
         icu_proto::limits::KEEP_ALIVE_INTERVAL_S,
@@ -644,13 +651,16 @@ pub fn client_config_with_chain(
             .try_into()
             .unwrap(),
     ));
-    transport.datagram_receive_buffer_size(Some(icu_proto::limits::DATAGRAM_BUFFER_BYTES));
+    transport.datagram_receive_buffer_size(Some(icu_proto::limits::FANOUT_DATAGRAM_BUFFER_BYTES));
     transport.datagram_send_buffer_size(icu_proto::limits::CLIENT_DATAGRAM_SEND_BUFFER_BYTES);
+    transport.datagram_send_max_age(Some(Duration::from_millis(
+        icu_proto::limits::AUDIO_QUEUE_MAX_AGE_MS,
+    )));
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(
-        icu_proto::limits::max_uni_streams(icu_proto::limits::DEFAULT_MAX_USERS),
+        icu_proto::limits::max_uni_streams(icu_proto::limits::MAX_MAX_USERS),
     ));
-    config.transport_config(Arc::new(transport));
-    config
+    transport.mtu_discovery_config(Some(icu_proto::com::mtu_discovery()));
+    transport
 }
 
 /// Connects on ALPN `icu/1` and opens the control stream.

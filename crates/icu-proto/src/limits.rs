@@ -94,9 +94,14 @@ pub const VIDEO_UNACKED_PER_PAIR: usize = 2;
 /// Seconds a video frame may take to arrive, header and payload, before the
 /// server stops its stream with `RATE_LIMITED`.
 pub const VIDEO_FRAME_TIMEOUT_S: u64 = 5;
-/// Datagram receive buffer size on both sides, and the server's send buffer
-/// (its send queue carries every speaker's audio to one receiver).
+/// Server receive buffer: one speaker's audio per connection.
 pub const DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
+/// Server send / client receive buffers carry all other speakers. Reserve a
+/// 100-ms burst at the 64-user, 110-packet/s ceiling, including 414-byte wire
+/// packets and Quinn's per-packet bookkeeping. 64 KiB dropped still-fresh
+/// audio during short scheduling gaps. The send age limit remains 100 ms;
+/// the receiver's jitter buffer discards stale media independently.
+pub const FANOUT_DATAGRAM_BUFFER_BYTES: usize = 512 * 1024;
 /// The client's datagram send buffer: only its own audio queues here, and
 /// quinn drops the oldest datagram once it is full. 8 KiB is 20–50 packets
 /// (0.4–1 s); the receiver's jitter buffer caps at 200 ms and drains any
