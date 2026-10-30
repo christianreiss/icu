@@ -4234,7 +4234,7 @@ mod tests {
         use egui_kittest::{kittest::Queryable, Harness};
 
         let (state, mut view) = capture_fixture();
-        view.draft.ui.show_advanced = true;
+        view.details.insert("keys");
         let original = view.draft.hotkeys.ptt.clone();
         let capture = pending_capture();
         let late_result = capture.slot.clone();
