@@ -721,7 +721,7 @@ fn privacy_camera_settings_lock_and_stop_preview() {
             .click();
         h.run();
         let preview_label = "Vorschau";
-        h.get_by_label(&preview_label).click();
+        h.get_by_label(preview_label).click();
         h.run();
         assert!(output.borrow().as_ref().unwrap().camera_preview);
 
@@ -733,10 +733,7 @@ fn privacy_camera_settings_lock_and_stop_preview() {
             .get_by_role_and_label(egui::accesskit::Role::CheckBox, "Kamera einschalten")
             .accesskit_node()
             .is_disabled());
-        assert!(h
-            .get_by_label(&preview_label)
-            .accesskit_node()
-            .is_disabled());
+        assert!(h.get_by_label(preview_label).accesskit_node().is_disabled());
         h.get_by_label_contains("Privacy ist an: Einschalten und Vorschau sind gesperrt.");
         assert!(output.borrow().as_ref().unwrap().overflow <= 0.5);
         shot(&mut h, &format!("settings-camera-privacy-{theme_name}"));
@@ -748,11 +745,8 @@ fn privacy_camera_settings_lock_and_stop_preview() {
             .get_by_role_and_label(egui::accesskit::Role::CheckBox, "Kamera einschalten")
             .accesskit_node()
             .is_disabled());
-        assert!(!h
-            .get_by_label(&preview_label)
-            .accesskit_node()
-            .is_disabled());
-        h.get_by_label(&preview_label).click();
+        assert!(!h.get_by_label(preview_label).accesskit_node().is_disabled());
+        h.get_by_label(preview_label).click();
         h.run();
         assert!(output.borrow().as_ref().unwrap().camera_preview);
     }
@@ -1408,7 +1402,7 @@ fn mic_test_stays_on_the_klang_page() {
         .click();
     h.run();
     assert!(*on_test_page.borrow(), "Klang stops the mic test");
-    h.get_by_role_and_label(egui::accesskit::Role::Button, &test)
+    h.get_by_role_and_label(egui::accesskit::Role::Button, test)
         .click();
     h.run();
     assert!(
@@ -1451,10 +1445,10 @@ fn no_hotkey_backend_offers_voice_activation() {
     if cfg!(target_os = "linux") {
         h.get_by_label_contains("sudo usermod -aG input $USER");
     }
-    h.get_by_role_and_label(egui::accesskit::Role::Button, &switch)
+    h.get_by_role_and_label(egui::accesskit::Role::Button, switch)
         .scroll_to_me();
     h.run();
-    h.get_by_role_and_label(egui::accesskit::Role::Button, &switch)
+    h.get_by_role_and_label(egui::accesskit::Role::Button, switch)
         .click();
     h.run();
     assert_eq!(last_update(&cmds.borrow()).audio.mode, ModeSetting::Vad);

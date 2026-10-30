@@ -1082,7 +1082,7 @@ fn immediate_window(
                 let panel = egui::CentralPanel::default();
                 if id == "icu-settings" {
                     panel
-                        .frame(egui::Frame::central_panel(&vctx.style()).inner_margin(0))
+                        .frame(egui::Frame::central_panel(vctx.style()).inner_margin(0))
                         .show(vctx, body);
                 } else {
                     panel.show(vctx, body);

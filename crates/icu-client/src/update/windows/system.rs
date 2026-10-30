@@ -242,6 +242,12 @@ pub(super) fn creation() -> Result<u64, String> {
 }
 /// Quote one Windows CRT argument, including trailing backslashes and quotes.
 fn quote(arg: &OsStr) -> Vec<u16> {
+    let wide: Vec<_> = arg.encode_wide().collect();
+    // NSIS parses /S before its CRT-compatible option helpers and ignores a
+    // quoted "/S". Leave simple arguments literal; this still invokes no shell.
+    if !wide.is_empty() && !wide.iter().any(|c| matches!(c, 9..=13 | 32 | 34)) {
+        return wide;
+    }
     let mut result = vec![b'"' as u16];
     let mut slashes = 0;
     for c in arg.encode_wide() {
@@ -470,5 +476,16 @@ mod tests {
             LocalFree(Some(HLOCAL(pointer.cast())));
         }
         assert_eq!(actual, args);
+    }
+    #[test]
+    fn nsis_silent_switch_is_not_hidden_inside_quotes() {
+        let args = [
+            "/S".into(),
+            "/ICUUpdate=0123456789abcdef0123456789abcdef".into(),
+        ];
+        assert_eq!(
+            parameters(&args).to_string_lossy(),
+            "/S /ICUUpdate=0123456789abcdef0123456789abcdef"
+        );
     }
 }

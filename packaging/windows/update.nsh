@@ -70,6 +70,8 @@ Function UpdateInit
     !insertmacro OpenUpdateEvent healthy $EventHealthy
     !insertmacro OpenUpdateEvent rollback $EventRollback
     !insertmacro OpenUpdateEvent failed $EventFailed
+    ; A validated broker transaction never requires a second setup wizard.
+    SetSilent silent
   ${Else}
     StrCpy $UpdateNonce ""
   ${EndIf}

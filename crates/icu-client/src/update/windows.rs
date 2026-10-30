@@ -558,18 +558,40 @@ fn broker(path: &Path, status: &progress::Status) -> Result<(), String> {
         }
         let _ = events.rollback.set();
         let recovery = worker.wait(30);
-        if loaded.parent.exited() {
-            // No shell and no import arguments; preserve the original profile.
-            let _ = Command::new(&loaded.job.exe)
-                .args(launch_args(&loaded.job))
-                .spawn();
-        }
-        return Err(match recovery {
+        let restart = if loaded.parent.exited() && worker.poll().is_some() {
+            restart_previous(loaded, events)
+        } else {
+            Ok(())
+        };
+        let mut message = match recovery {
             Ok(()) => format!("{error} Die bisherige Installation wurde wiederhergestellt."),
             Err(detail) => format!("{error} {detail}"),
-        });
+        };
+        if let Err(detail) = restart {
+            message.push_str(&format!(" Automatischer Neustart nicht möglich: {detail}"));
+        }
+        return Err(message);
     }
     Ok(())
+}
+fn restart_previous(loaded: Loaded, events: Events) -> Result<(), String> {
+    // Never relaunch a partially installed candidate as the restored version.
+    let helper = std::env::current_exe().map_err(|e| e.to_string())?;
+    if transaction::digest(&loaded.job.exe)? != transaction::digest(&helper)? {
+        return Err("Die bisherige EXE wurde noch nicht vollständig wiederhergestellt.".into());
+    }
+    let exe = loaded.job.exe.clone();
+    let args = loaded.job.args.clone();
+    // This is a normal start, after the finished worker and broker have released
+    // the installation lease. --update-ready would race the soon-closed events
+    // and join the failed transaction instead of acquiring a new instance.
+    drop(events);
+    drop(loaded);
+    Command::new(exe)
+        .args(args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 /// Called before Clap, profile loading, single-instance IPC or the audio engine.
 pub fn special_entry() -> Option<Result<(), String>> {

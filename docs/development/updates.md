@@ -86,6 +86,9 @@ Programmordner. Ein UAC-Abbruch lässt den ursprünglichen Prozess laufen.
 Der Dateiaustausch wartet auf das konkrete Prozesshandle. Der unelevierte
 Helfer startet anschließend den neuen Client mit dem bisherigen Profil und
 relevanten Startoptionen; Einladungen werden nicht erneut importiert.
+Nach einer Wiederherstellung prüft er die alte EXE erneut und gibt die
+Installationssperre frei, bevor er sie als normalen Client startet. Der
+Neustart verwendet keine Ereignisse der bereits gescheiterten Update-Sitzung.
 
 Drei UI-Durchläufe und eine anschließende kurze Lebensprüfung bestätigen den
 Start. Erst dann dürfen die Sicherungen verschwinden. Der Kandidat wird vor
