@@ -19,12 +19,13 @@ use std::{
 use windows::{
     core::{implement, Interface, BOOL, GUID, HSTRING, PCWSTR, PWSTR},
     Win32::{
-        Foundation::CloseHandle,
+        Foundation::{CloseHandle, STILL_ACTIVE},
         Media::Audio::{
             eConsole, eRender, AudioSessionDisconnectReason, AudioSessionState,
-            AudioSessionStateActive, Endpoints::IAudioMeterInformation, IAudioSessionControl2,
-            IAudioSessionEvents, IAudioSessionEvents_Impl, IAudioSessionManager2, IMMDevice,
-            IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+            AudioSessionStateActive, AudioSessionStateExpired, Endpoints::IAudioMeterInformation,
+            IAudioSessionControl2, IAudioSessionEvents, IAudioSessionEvents_Impl,
+            IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume,
+            MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
         },
         System::{
             Com::{
@@ -32,7 +33,7 @@ use windows::{
                 COINIT_MULTITHREADED,
             },
             Threading::{
-                OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+                GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
                 PROCESS_QUERY_LIMITED_INFORMATION,
             },
         },
@@ -184,7 +185,20 @@ struct Live {
     meter: Option<IAudioMeterInformation>,
     events: IAudioSessionEvents,
     changes: Arc<Changes>,
+    /// Validated in the latest scan. A retained COM object can outlive its
+    /// process and acknowledge writes that no longer restore persisted gain.
+    available: bool,
     active: bool,
+}
+impl Live {
+    fn can_restore(&self) -> bool {
+        self.available
+            && unsafe { self.control.GetState() }.is_ok_and(|s| s != AudioSessionStateExpired)
+            && unsafe { self.control.GetProcessId() }
+                .ok()
+                .and_then(process_exe)
+                .is_some()
+    }
 }
 impl Drop for Live {
     fn drop(&mut self) {
@@ -276,6 +290,7 @@ impl Native {
             return Err("Zu viele Audiositzungen für sichere Absenkung".into());
         }
         for session in self.live.values_mut().filter(|s| s.route == route) {
+            session.available = false;
             session.active = false;
         }
         for i in 0..count {
@@ -314,8 +329,15 @@ impl Native {
                 continue;
             }
             let id = key(route, &instance);
-            let active = unsafe { control.GetState() }.is_ok_and(|s| s == AudioSessionStateActive);
+            let Ok(state) = (unsafe { control.GetState() }) else {
+                continue;
+            };
+            if state == AudioSessionStateExpired {
+                continue;
+            }
+            let active = state == AudioSessionStateActive;
             if let Some(existing) = self.live.get_mut(&id) {
+                existing.available = true;
                 existing.active = active;
                 continue;
             }
@@ -351,6 +373,7 @@ impl Native {
                     meter,
                     events,
                     changes,
+                    available: true,
                     active,
                 },
             );
@@ -359,17 +382,16 @@ impl Native {
     }
     fn recovery_live(&self, record: &Record) -> Option<String> {
         let id = record.key();
-        if self.live.get(&id).is_some_and(|s| s.active) {
+        if self.live.get(&id).is_some_and(|s| s.available && s.active) {
             return Some(id);
         }
-        let mut active = self
-            .live
-            .iter()
-            .filter(|(_, s)| s.active && s.route == record.route && s.session == record.session);
+        let mut active = self.live.iter().filter(|(_, s)| {
+            s.available && s.active && s.route == record.route && s.session == record.session
+        });
         if let Some(first) = active.next() {
             return active.next().is_none().then(|| first.0.clone());
         }
-        if self.live.contains_key(&id) {
+        if self.live.get(&id).is_some_and(|s| s.available) {
             return Some(id);
         }
         // Windows persists a session's gain into a new process instance. Never
@@ -378,7 +400,7 @@ impl Native {
         let mut candidates = self
             .live
             .iter()
-            .filter(|(_, s)| s.route == record.route && s.session == record.session);
+            .filter(|(_, s)| s.available && s.route == record.route && s.session == record.session);
         let first = candidates.next()?;
         candidates.next().is_none().then(|| first.0.clone())
     }
@@ -405,6 +427,9 @@ impl Native {
                 continue;
             };
             let session = &self.live[&live_id];
+            if !session.can_restore() {
+                continue;
+            }
             let Ok(current) = (unsafe { session.volume.GetMasterVolume() }) else {
                 continue;
             };
@@ -441,6 +466,7 @@ impl Native {
             .is_ok()
                 && unsafe { session.volume.GetMasterVolume() }
                     .is_ok_and(|v| same(&[v], &record.gain.baseline))
+                && session.can_restore()
             {
                 self.records.remove(&id);
                 self.recovering.remove(&id);
@@ -533,7 +559,15 @@ impl Native {
             return Err("Ungültige Absenkung".into());
         }
         if db <= 0.0 {
-            return if self.restore() {
+            let restored = self.restore();
+            // Yield for the current speech interval. Once attenuation ends,
+            // a future interval starts from the user's new absolute volume.
+            for (id, session) in &self.live {
+                if !self.records.contains_key(id) {
+                    session.changes.manual.store(false, Ordering::Release);
+                }
+            }
+            return if restored {
                 Ok(0)
             } else {
                 Err("Wiederherstellung wartet auf Audiositzung".into())
@@ -650,6 +684,9 @@ fn process_exe(pid: u32) -> Option<String> {
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
     let mut buffer = vec![0u16; 32768];
     let mut size = buffer.len() as u32;
+    let mut exit_code = 0;
+    let alive = unsafe { GetExitCodeProcess(handle, &mut exit_code) }.is_ok()
+        && exit_code == STILL_ACTIVE.0 as u32;
     let result = unsafe {
         QueryFullProcessImageNameW(
             handle,
@@ -660,6 +697,9 @@ fn process_exe(pid: u32) -> Option<String> {
     };
     unsafe {
         let _ = CloseHandle(handle);
+    }
+    if !alive {
+        return None;
     }
     result.ok()?;
     Some(String::from_utf16_lossy(&buffer[..size as usize]).to_lowercase())
@@ -778,7 +818,162 @@ mod tests {
                 }),
             )
             .unwrap();
-        std::thread::sleep(Duration::from_secs(20));
+        std::thread::sleep(Duration::from_secs(60));
+    }
+    /// Exercises the installed guardian binary in an otherwise quiet, dedicated
+    /// Windows test account. ICU_TEST_EXE must name the package's actual icu.exe.
+    #[test]
+    #[ignore = "needs a dedicated Windows desktop, output endpoint and ICU_TEST_EXE"]
+    fn live_packaged_guardian_modes_heartbeat_eof_and_crash_recovery() {
+        use crate::audio::ducking::{Input, Mode};
+        use std::os::windows::process::CommandExt;
+        use std::{
+            io::Write,
+            process::{Command, Stdio},
+        };
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct Baseline(ISimpleAudioVolume, f32);
+        impl Drop for Baseline {
+            fn drop(&mut self) {
+                // Also restore on a failed assertion, after killing our worker.
+                let _ = unsafe { self.0.SetMasterVolume(self.1, &GUID::zeroed()) };
+            }
+        }
+        let exe = std::env::var_os("ICU_TEST_EXE").expect("package executable required");
+        let directory = tempfile::tempdir().unwrap();
+        let foreign = directory.path().join("icu-ducking-background-fixture.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &foreign).unwrap();
+        let fixture = Child(
+            Command::new(foreign)
+                .args([
+                    "--exact",
+                    "audio::ducking::windows::tests::background_fixture",
+                    "--ignored",
+                ])
+                .env("ICU_DUCKING_FIXTURE", "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let mut observer = Native::with_journal(directory.path().join("observer.json")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let volume = loop {
+            observer.measure(None).unwrap();
+            if let Some(s) = observer.live.values().find(|s| {
+                s.active && unsafe { s.control.GetProcessId() }.ok() == Some(fixture.0.id())
+            }) {
+                assert_eq!(
+                    observer.live.values().filter(|s| s.active).count(),
+                    1,
+                    "this acceptance needs an otherwise quiet test account"
+                );
+                break s.volume.clone();
+            }
+            assert!(Instant::now() < deadline, "fixture did not start");
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let baseline = Baseline(volume.clone(), unsafe { volume.GetMasterVolume() }.unwrap());
+        assert!(baseline.1 > 0.01);
+        let journal = crate::audio::ducking::worker::state_dir()
+            .unwrap()
+            .join("windows-sessions-v1.json");
+        assert!(
+            load(&journal).unwrap().is_empty(),
+            "preserve existing recovery obligations"
+        );
+        let spawn = || {
+            let mut child = Command::new(&exe)
+                .arg("--ducking-worker")
+                .creation_flags(0x08000000)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap();
+            let mut output = child.stdout.take().unwrap();
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut output, &mut std::io::sink());
+            });
+            Child(child)
+        };
+        let drive = |child: &mut Child, mode: Mode, db: f32| {
+            let input = Input {
+                mode,
+                online: true,
+                transmitting_voice: true,
+                ..Input::default()
+            };
+            let mut line = serde_json::to_vec(&input).unwrap();
+            line.push(b'\n');
+            let until = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < until {
+                assert!(child.0.try_wait().unwrap().is_none(), "guardian exited");
+                child.0.stdin.as_mut().unwrap().write_all(&line).unwrap();
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            let actual = unsafe { volume.GetMasterVolume() }.unwrap();
+            assert!(
+                (actual - baseline.1 * 10.0f32.powf(-db / 20.0)).abs() < 0.002,
+                "{mode:?}: expected {db} dB, gain {actual} from {}",
+                baseline.1
+            );
+            eprintln!(
+                "packaged guardian {mode:?}: gain={actual}, baseline={}",
+                baseline.1
+            );
+        };
+        let finish = |child: &mut Child| {
+            drop(child.0.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while child.0.try_wait().unwrap().is_none() {
+                assert!(Instant::now() < deadline, "EOF must restore and exit");
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            assert!(same(
+                &[unsafe { volume.GetMasterVolume() }.unwrap()],
+                &[baseline.1]
+            ));
+        };
+        let mut child = spawn();
+        for (mode, db) in [
+            (Mode::Light, 6.0),
+            (Mode::Medium, 12.0),
+            (Mode::Strong, 18.0),
+            (Mode::Auto, 12.0),
+            (Mode::Off, 0.0),
+        ] {
+            drive(&mut child, mode, db);
+        }
+        drive(&mut child, Mode::Medium, 12.0);
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            same(
+                &[unsafe { volume.GetMasterVolume() }.unwrap()],
+                &[baseline.1]
+            ),
+            "lost heartbeat must restore without closing the pipe"
+        );
+        drive(&mut child, Mode::Strong, 18.0);
+        finish(&mut child);
+        let mut child = spawn();
+        drive(&mut child, Mode::Medium, 12.0);
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        assert!(
+            !load(&journal).unwrap().is_empty(),
+            "crash retains durable recovery"
+        );
+        let mut recovered = spawn();
+        drive(&mut recovered, Mode::Off, 0.0);
+        finish(&mut recovered);
+        assert!(load(&journal).unwrap().is_empty());
     }
     /// Native Windows acceptance, deliberately opt-in and confined to a copied
     /// synthetic background process. Never modifies another application's gain.
@@ -862,6 +1057,21 @@ mod tests {
             same(&[unsafe { volume.GetMasterVolume() }.unwrap()], &[manual]),
             "manual slider wins"
         );
+        native.apply(0.0).unwrap();
+        native.live.retain(|id, _| *id == fixture);
+        native.apply(6.0).unwrap();
+        assert!(
+            same(
+                &[unsafe { volume.GetMasterVolume() }.unwrap()],
+                &[manual * 10.0f32.powf(-6.0 / 20.0)]
+            ),
+            "a new speech interval uses the manual volume as its baseline"
+        );
+        assert!(native.restore());
+        assert!(same(
+            &[unsafe { volume.GetMasterVolume() }.unwrap()],
+            &[manual]
+        ));
         unsafe { volume.SetMasterVolume(baseline, &GUID::zeroed()) }.unwrap();
         drop(native);
         // Simulate loss after a completed native write, before normal Drop.
@@ -887,7 +1097,11 @@ mod tests {
         restarted.apply(12.0).unwrap();
         child.0.kill().unwrap();
         child.0.wait().unwrap();
-        restarted.restore(); // May remain pending until the endpoint responds.
+        assert!(
+            !restarted.restore(),
+            "an exited process cannot confirm restoration of persisted gain"
+        );
+        assert!(!restarted.records.is_empty());
         child.0 = Command::new(&foreign)
             .args([
                 "--exact",

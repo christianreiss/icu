@@ -11,6 +11,10 @@ pub const DEFAULT_MAX_USERS: u16 = 16;
 /// Hard upper bound for `max_users`.
 pub const MAX_MAX_USERS: u16 = 64;
 
+/// Requested OS UDP receive buffer for concurrent full-room media bursts.
+/// The OS may cap this; unlike the QUIC audio queue it is not a time bound.
+pub const UDP_RECV_BUFFER_BYTES: usize = 1024 * 1024;
+
 /// Control messages per second and client.
 pub const CONTROL_MSGS_PER_S: u32 = 50;
 /// `SetState` messages per second and client.

@@ -1466,8 +1466,48 @@ pub fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<(), Confi
     use io::Write;
     file.write_all(data)?;
     file.as_file().sync_all()?;
-    file.persist(path).map_err(|e| e.error)?;
+    // Close our handle before publishing: on Windows another writer cannot
+    // replace a destination still held open by the preceding persist call.
+    let temporary = file.into_temp_path();
+    #[cfg(not(windows))]
+    temporary.persist(path).map_err(|e| e.error)?;
+    #[cfg(windows)]
+    persist_windows(temporary, path)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn persist_windows(mut temporary: tempfile::TempPath, path: &Path) -> io::Result<()> {
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    };
+    // Replacing a file can briefly leave its old name delete-pending on
+    // Windows, even after our own handle is closed. Other writers and file
+    // scanners can also hold a transient sharing lock. Retain the complete
+    // private temporary file; never remove the destination to force a rename.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        match temporary.persist(path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let transient = error.error.raw_os_error().is_some_and(|code| {
+                    [
+                        ERROR_ACCESS_DENIED,
+                        ERROR_LOCK_VIOLATION,
+                        ERROR_SHARING_VIOLATION,
+                    ]
+                    .iter()
+                    .any(|expected| expected.0 as i32 == code)
+                });
+                if !transient || Instant::now() >= deadline || path.is_dir() {
+                    return Err(error.error);
+                }
+                temporary = error.path;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

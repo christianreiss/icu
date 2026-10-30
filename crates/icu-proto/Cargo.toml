@@ -21,6 +21,7 @@ unicode-general-category.workspace = true
 quinn.workspace = true
 ring.workspace = true
 subtle.workspace = true
+socket2.workspace = true
 
 [lints.rust]
 missing_docs = "warn"

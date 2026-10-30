@@ -327,6 +327,11 @@ pub fn endpoint(
     server_config: Option<quinn::ServerConfig>,
     dropped: Arc<AtomicU64>,
 ) -> io::Result<quinn::Endpoint> {
+    // A synchronized 64-peer video burst exceeds common 208 KiB OS defaults
+    // before quinn can drain it, losing voice alongside the video fragments.
+    // Bound this socket's receive allocation; never change a host sysctl.
+    // The OS may clamp the request to its configured per-socket maximum.
+    socket2::SockRef::from(&socket).set_recv_buffer_size(crate::limits::UDP_RECV_BUFFER_BYTES)?;
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime found for quinn"))?;
     let inner = runtime.wrap_udp_socket(socket)?;

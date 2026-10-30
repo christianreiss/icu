@@ -6802,7 +6802,19 @@ mod tests {
         for i in 0..100 {
             tx.send(volume(i as f32)).unwrap();
         }
-        tokio::time::sleep(SETTINGS_QUIET * 3).await;
+        // Completion also includes a real filesystem flush on a blocking
+        // thread. A busy native Windows guest can take longer than three
+        // debounce periods; wait for the result, retaining a strict deadline.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if Settings::load(&paths).is_ok_and(|s| s.audio.output_volume == 99.0) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the debounced write must finish");
         assert_eq!(Settings::load(&paths).unwrap().audio.output_volume, 99.0);
         tx.send(volume(7.0)).unwrap();
         drop(tx);

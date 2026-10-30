@@ -2563,6 +2563,7 @@ dependencies = [
  "quinn",
  "ring",
  "serde",
+ "socket2",
  "subtle",
  "unicode-general-category",
  "unicode-normalization",

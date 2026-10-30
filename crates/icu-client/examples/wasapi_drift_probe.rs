@@ -55,8 +55,8 @@ fn main() {
     backend
         .open_reference(
             Some(&output.id),
-            Box::new(move |s| {
-                r.fetch_add(s.len() as u64, Ordering::Relaxed);
+            Box::new(move |s, channels| {
+                r.fetch_add((s.len() / channels) as u64, Ordering::Relaxed);
             }),
         )
         .expect("reference");

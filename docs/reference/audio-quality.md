@@ -78,6 +78,10 @@ Geräterate; ein begrenzter Streaming-Resampler verbindet abweichende Raten mit
 QUIC verwirft Datagramme älter als 100 ms auch bei der Paketkonstruktion, wenn
 nach einem Stall keine neuen Datagramme eintreffen. Der kleine lokale Patch in
 `vendor/quinn-proto` ist absichtlich auf Queue-Alterung und deren Tests begrenzt.
+Die UDP-Sockets fordern zusätzlich einen begrenzten OS-Empfangspuffer von 1 MiB
+an, damit volle Audio-/Video-Bursts von 64 Teilnehmern nicht schon vor QUIC
+verloren gehen. Das Betriebssystem darf diesen Wert begrenzen; seine Bytegröße
+ist keine Latenzgarantie. Es werden keine globalen Netzwerkparameter verändert.
 Der Jitterbuffer zählt Sampledauer statt Paketanzahl und reduziert überhöhte
 Zielverzögerung auch bei Dauersprache behutsam. FEC versucht die Dauer des
 tatsächlich fehlenden Pakets; Diagnosezähler trennen Versuch, enthaltene LBRR-
@@ -146,7 +150,13 @@ dem im Journal erfassten vorherigen Wert entspricht. Eine fremde Lautstärke-
 bevor es einen neuen Ausgangswert verwendet. Windows nutzt zusätzlich den
 Notification-Kontext, damit manuelle Hin-und-zurück-Änderungen erkannt werden.
 Unlesbare Journale führen zu keiner neuen Absenkung. Offene Restore-Verantwortung
-wird nicht wegen eines temporären API-Fehlers als erledigt markiert.
+wird nicht wegen eines temporären API-Fehlers als erledigt markiert. Bereits
+beendete Windows-Prozesse und abgelaufene Sessions können eine Wiederherstellung
+nicht bestätigen, selbst wenn ihr verbliebenes COM-Objekt einen Schreibzugriff
+akzeptiert. Der Eintrag bleibt für die nächste eindeutige, lebende Instanz
+erhalten. Startet diese erst nach Ende des Wächters, erfolgt die Wiederherstellung
+beim nächsten ICU-Start. Manuelle Änderungen gelten während des aktuellen
+Sprechintervalls; das nächste verwendet den neuen Benutzerwert als Baseline.
 
 Die normale UI zeigt Modus, aktuelle dB, betroffene Anwendungen und einen
 Fallback-/Fehlergrund. Erweiterte Diagnose ergänzt Sprachquelle, Kanal, Policy,

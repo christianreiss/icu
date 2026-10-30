@@ -30,7 +30,7 @@ Baseline bestand 996 Workspace-Tests (13 ignorierte Hardware/Bench-Tests).
 | Zusätzlich | Privacy-/Denoise-Wechsel können altes Ducking-Sprachbit behalten | Engine verwirft Partials und Sprachdetektor zusammen | Engine-Integration, Muting/PTT/Mikrofontest und Codepfadprüfung |
 | Zusätzlich | Große Callback-Batches sehen fälschlich zu wenig Jitterreserve | Engine / `pop_quiet_at`: bereits geplante Wiedergabezeit berücksichtigen | 3 reale Engine-Playouttests ohne Glitches, Dropouts oder künstliche Stretches; eigene Jitterregression |
 | Zusätzlich | Automatischer Kanalwechsel löst Reopen aus und setzt die Auswahl zurück | Nichtterminales `CaptureChannelChanged`; native Streams bleiben offen, alte DSP-/Profil-Evidenz verfällt | Selector-Regression und Engine-Test: kein Reopen nach Kanalwechsel, Mute erhalten |
-| Neu: Ducking | Native temporäre Absenkung mit korrektem Besitz fehlt | Gemeinsame Hüllkurve, eigener Wächter, bedingtes Journal-Restore, Linux/Windows-Adapter, UI | Engine→echtes QUIC→Decoder→Fake-DAC; native Linux-Abbruchtests; Windows-Liveabnahme offen |
+| Neu: Ducking | Native temporäre Absenkung mit korrektem Besitz fehlt | Gemeinsame Hüllkurve, eigener Wächter, bedingtes Journal-Restore, Linux/Windows-Adapter, UI | Engine→echtes QUIC→Decoder→Fake-DAC; native Linux-Abbruchtests und Windows-11-Session-Abnahme |
 | Zusätzlich | Terminal-Ctrl+C kann Hauptprozess und Wächter gemeinsam beenden | `audio/ducking/worker.rs`: eigene Unix-Prozessgruppe für den Wächter | Regression mit echtem Kindprozess: vorher falsche PGID, nachher eigene PGID; EOF-Pfad bleibt erhalten |
 | Zusätzlich | Paralleler Prozessstart kann eine beendete Profilsperre kurz weiterhalten | `audio/calibration.rs`: explizites Unlock beim Ende der Schreibtransaktion, auch auf Fehlerpfaden | Reproduktion mit dupliziertem Dateideskriptor; vorher blockierte Folgesperre, nachher sofort verfügbar |
 
@@ -145,13 +145,79 @@ während Absenkung mit anschließendem App-Neustart wurden erfolgreich geprüft.
 Der Senderabbruchtest verwendet einen echten separaten IPC-Senderprozess;
 die grafische Anwendung selbst wurde dabei nicht beendet.
 
-Windows-Nativecode einschließlich opt-in Sitzungstest cross-kompiliert.
-Ein vorhandener dedizierter Windows-11-Testgast wurde gestartet, war mit den
-verfügbaren Zugängen nicht erreichbar und anschließend wieder heruntergefahren.
-**Windows-Session-Laufzeit, dortiges Crash-Restore und reale Geräte bleiben offen.**
+Die native Abnahme läuft nun auf dem dedizierten Gast `ICU-WIN11-GATE`,
+Windows 11, interaktive Konsolensitzung 1. Die vorhandene Testkonfiguration
+ermöglichte den Zugang. 357 Windows-Unit-Tests bestanden; der Schreibkonflikt
+wurde zusätzlich 20-mal, Session-Restore fünfmal ohne Fehler wiederholt.
+Der WASAPI-Test bestätigt Aufnahme, Wiedergabe und nicht-stille Loopback-
+Referenz; absichtlich angehaltene Capture-/Render-Streams werden erkannt.
+Die VM ersetzt keine physische Windows-Hardware- oder Hörprüfung.
+
+Die native Prüfung fand weitere Fehler, die vor Veröffentlichung behoben wurden:
+
+- Ein beendeter Windows-Prozess kann noch ein COM-Volume-Objekt hinterlassen,
+  das einen Restore bestätigt, obwohl die nächste Instanz die Absenkung erbt.
+  Nur verfügbare, lebende Sessions bestätigen jetzt Restore; ungelöste Journale
+  bleiben erhalten. Der reale App-Neustart-Test bestand anschließend fünfmal.
+- Eine manuelle Session-Lautstärke beendete bisher die Absenkung für die gesamte
+  Lebensdauer der Session. Nach Ende des Sprechintervalls dient sie nun als neue
+  Baseline; während des Intervalls bleibt der manuelle Eingriff maßgeblich.
+- Gleichzeitiges atomisches Ersetzen von Dateien kann unter Windows kurzzeitig
+  mit `ACCESS_DENIED` scheitern. Der temporäre Handle wird vor Veröffentlichung
+  geschlossen, die vollständige temporäre Datei bei transienten Sperren bis zu
+  250 ms erneut atomisch veröffentlicht. Die Zieldatei wird dabei niemals vorher
+  gelöscht. Die bestehende Parallel-Writer-Regression wurde nativ wiederholt.
+- Die Windows-Driftprobe zählte die neue mehrkanalige Referenz noch wie Mono.
+  Sie akzeptiert nun die Kanalzahl und zählt Frames statt interleavter Samples.
+
 Auto fällt unter Windows sichtbar auf Mittel zurück, da Peak allein kein
 belastbares fremdes RMS liefert. Exclusive-/ASIO-Streams können über diese
 Shared-Mode-Schnittstelle nicht gesteuert werden.
+
+## Ergänzende 64-Teilnehmer-Abnahme
+
+Der reale mTLS-/QUIC-Relaytest verwendet 64 gleichzeitige Sender, je 50 Audio-
+Pakete/s mit 400-Byte-Payload und 15 Video-Frames/s mit 3.000 Byte. Es sind
+Codec-große Testdaten, keine 64 grafischen Clients oder akustischen Endgeräte.
+Die bestehende opt-in Suite ist jetzt über `ICU_MEDIA_CLIENTS` auf 2…64 skalierbar.
+Ihre Duplikatprüfung verwendet feste Sequenz-Bitmaps, die Latenzmessung ein
+Histogramm mit konservativen 0,1-ms-Obergrenzen. Dadurch wachsen die Messdaten
+während eines Langlaufs nicht mehr. Alle Leser werden vor dem gemeinsamen
+Start initialisiert; der Videogenerator kennzeichnet regelmäßig Keyframes.
+Die strikten Zustellungs-, Duplikat- und Latenzprüfungen bleiben erhalten.
+
+Vorher verlor ein zehnsekündiger Lauf 4.076 von 32.000 Audio-Eingangspaketen;
+der Kernel zählte 48.475 übergelaufene UDP-Empfangspakete. Kein Client-Datagramm
+war an seiner QUIC-Deadline verfallen. Im identischen Test mit angefordertem
+1-MiB-Empfangspuffer verschwanden diese Kernel-Verluste und alle Zustellungs-
+prüfungen bestanden. Die Änderung begrenzt ausschließlich ICU-Sockets.
+
+Mit dem tatsächlichen Produktionscode bestanden anschließend je 30 Sekunden
+mit und ohne blockierten Videoempfänger: jeweils 6.048.000 Audiopakete vollständig
+zugestellt, Audio-p99 17,124 / 17,499 ms; sämtliche erwarteten Videoframes kamen
+bei gesunden Empfängern an. Referenz ist der oben genannte Linux-Host über
+Loopback; dies belegt keine WAN-Kapazität oder Mund-zu-Ohr-Latenz des Servers.
+
+## Physischer Geräteweg
+
+Nach ausdrücklicher Freigabe wurde auf `biest.eulie.de` Buffear (Bose-Bluetooth-Kopfhörer) vor die Kapsel des C-Media-USB-Mikrofons
+gelegt. Die 48-kHz-Stereoaufnahme wurde nur im RAM verarbeitet; es wurde keine
+Mikrofonaufnahme gespeichert und kein Systempegel verändert.
+
+Unterschiedliche, leise 60-ms-Bandrauschsignale verhindern eine Verwechslung
+wiederholter Töne. Zunächst wurden 20/20, anschließend 94/100 Signale eindeutig
+korreliert. Der zweite Lauf ergibt unter den auswertbaren Signalen p50/p95
+gerundet **270/270 ms** vom Pulse-Ausgabemonitor über den Kopfhörer und die Luft
+bis zur USB-Aufnahme. Sechs Signale waren nicht zuverlässig auswertbar.
+Die Streuung der zugrunde liegenden Stream-Zeitachsen lag bei etwa 7 bzw. 5 ms;
+die Messung beansprucht keine Genauigkeit unter einer Millisekunde.
+
+Das ist eine Gerätewegmessung mit PipeWire/Pulse-Zeitbezug, keine vollständige
+ICU-Mund-zu-Ohr-Abnahme: ICU-DSP, Codec und Netzwerk fehlen. Der zunächst
+wiederholte Chirp lieferte einen falschen Versatz um eine ganze Wiederholung;
+dieser Wert wurde verworfen und durch eindeutige Testsignale überprüft.
+Die verbleibende Ende-zu-Ende- und subjektive Hörprüfung wird unten ausdrücklich
+weitergeführt; aus diesem Aufbau wird kein bestandenes 150-ms-Ziel abgeleitet.
 
 ## Automatisierter integrierter Stand
 
@@ -185,6 +251,10 @@ ffmpeg -i target/audio-quality/after/speech-12-10ms-heard.wav \
 cargo build --locked --release -p icu-client --example audio_quality --no-default-features
 target/release/examples/audio_quality target/audio-quality/release
 
+# 64 gleichzeitige A/V-Teilnehmer, jeweils zehn Minuten:
+ICU_MEDIA_CLIENTS=64 ICU_MEDIA_SECONDS=600 cargo test --locked --release \
+  -p icu-server --test media_load -- --ignored --nocapture --test-threads=1
+
 # Auf einem nativen Windows-Rechner im Checkout:
 cargo test --locked -p icu-client --lib audio::ducking::windows::tests::live_native_session_restore_and_manual_override -- --exact --ignored --nocapture
 
@@ -210,12 +280,13 @@ Die verbleibende physische/hörbezogene Abnahme ist konkret:
    Suspend/Resume, Audio-Service-Neustart und akustischen AEC-Double-Talk während
    Ducking prüfen. Virtuelle Endpunkte beweisen die Kanal-/Steuerlogik, nicht diese
    Hardwarekombinationen oder jede externe System-Ducking-Politik. Ein voller
-   64-Client-Langlauf mit gleichzeitigem Video sowie eine akustische Verlust-/
-   Reordering-/Burstmatrix bleibt zusätzlich offen; 64 virtuelle QUIC-Sprecher
-   beweisen nur die Transportqueue-Grenze.
+   64-Client-Langlauf mit gleichzeitigem Video wird mit dem obigen Befehl
+   separat protokolliert. Eine akustische Verlust-/Reordering-/Burstmatrix
+   bleibt offen; synthetische QUIC-Teilnehmer ersetzen keine akustischen Endgeräte.
 
-Es wurden keine produktiven Dienste ausgerollt, keine regulären Gespräche
-aufgenommen und keine globalen Audio-/WirePlumber-/Windows-Policies geändert.
+Paketinstallation und Betriebsabnahme werden nach dem Build getrennt protokolliert.
+Für diese Implementierungsprüfung wurden keine regulären Gespräche aufgenommen
+und keine globalen Audio-/WirePlumber-/Windows-Policies geändert.
 
 Primärquellen: [RMS-/AGC-Bezug RFC 7874 §4](https://datatracker.ietf.org/doc/html/rfc7874#section-4),
 [Windows-Sessionpersistenz und Shared-Mode-Grenze](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-isimpleaudiovolume),

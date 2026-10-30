@@ -4,18 +4,46 @@ mod common;
 
 use common::{Client, TestServer};
 use icu_proto::{
-    header::{AUDIO_MAX_PAYLOAD, VIDEO_CODEC_H264, VIDEO_HEADER_LEN},
+    header::{AUDIO_MAX_PAYLOAD, VIDEO_CODEC_H264, VIDEO_FLAG_KEYFRAME, VIDEO_HEADER_LEN},
     AudioHeader, UserFlags, VideoHeader,
 };
 use icu_server::room::Counters;
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-const CLIENTS: usize = 16;
 const VIDEO_BYTES: usize = 3000; // 360 kbit/s at 15 fps, below the 400 kbit/s ceiling.
+const LATENCY_BUCKET_NS: u64 = 100_000;
+const LATENCY_BUCKETS: usize = 10_001; // 0.1-ms buckets; last bucket includes overflow.
+
+// The soak is shorter than one sequence wrap. Fixed bitmaps avoid synchronized
+// multi-million-entry HashSet reallocations pausing the readers during a long run.
+struct Seen {
+    bits: Vec<u64>,
+    count: usize,
+}
+
+impl Seen {
+    fn new(peers: usize) -> Self {
+        Self {
+            bits: vec![0; peers * 1024],
+            count: 0,
+        }
+    }
+
+    fn insert(&mut self, peer: usize, seq: u16) -> bool {
+        let word = &mut self.bits[peer * 1024 + usize::from(seq) / 64];
+        let mask = 1u64 << (seq % 64);
+        if *word & mask != 0 {
+            return false;
+        }
+        *word |= mask;
+        self.count += 1;
+        true
+    }
+}
 
 async fn participant(server: &TestServer, index: usize, blocked_video: bool) -> Client {
     let name = format!("media{index:02}");
@@ -56,25 +84,36 @@ async fn participant(server: &TestServer, index: usize, blocked_video: bool) -> 
 }
 
 async fn soak(blocked_video: bool) {
+    let clients_count: usize = std::env::var("ICU_MEDIA_CLIENTS")
+        .ok()
+        .map(|s| s.parse().expect("clients"))
+        .unwrap_or(icu_proto::limits::DEFAULT_MAX_USERS as usize);
+    assert!((2..=icu_proto::limits::MAX_MAX_USERS as usize).contains(&clients_count));
     let seconds: u64 = std::env::var("ICU_MEDIA_SECONDS")
         .ok()
         .map(|s| s.parse().expect("seconds"))
         .unwrap_or(30);
     assert!((10..=600).contains(&seconds));
     let server = TestServer::start_with(|c| {
-        // Only registration/handshake setup bursts differ from production.
+        c.server.max_users = clients_count as u16;
+        // Only registration/handshake setup rates differ from production.
         c.limits.handshakes_per_ip_per_s = 10_000;
         c.limits.enroll_per_ip_per_min = 10_000;
         c.limits.enroll_global_per_min = 10_000;
     })
     .await;
     let mut clients = Vec::new();
-    for i in 0..CLIENTS {
-        clients.push(participant(&server, i, blocked_video && i == CLIENTS - 1).await);
+    for i in 0..clients_count {
+        clients.push(participant(&server, i, blocked_video && i == clients_count - 1).await);
     }
-    let sessions: Arc<HashSet<_>> = Arc::new(clients.iter().map(|c| c.session).collect());
-    let start = Instant::now();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+    let sessions: Arc<HashMap<_, _>> = Arc::new(
+        clients
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.session, i))
+            .collect(),
+    );
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(None::<Instant>);
     let mut endpoints = Vec::new();
     let mut controls = Vec::new();
     let mut control_readers = Vec::new();
@@ -99,40 +138,47 @@ async fn soak(blocked_video: bool) {
         }));
         let peer = conn.clone();
         let known = sessions.clone();
+        let mut ready = ready_rx.clone();
+        let mut seen = Seen::new(clients_count);
+        let mut latencies = vec![0u64; LATENCY_BUCKETS];
         readers.push(tokio::spawn(async move {
-            let mut seen = HashSet::new();
-            let mut latencies = Vec::new();
+            let start = ready.wait_for(Option::is_some).await.unwrap().unwrap();
             while let Ok(packet) = peer.read_datagram().await {
                 let (h, payload) = AudioHeader::decode(&packet).unwrap();
-                assert!(h.speaker != session && known.contains(&h.speaker));
+                assert!(h.speaker != session && known.contains_key(&h.speaker));
                 assert_eq!(payload.len(), AUDIO_MAX_PAYLOAD);
                 assert!(payload[8..].iter().all(|b| *b == h.seq as u8));
-                assert!(seen.insert((h.speaker, h.seq)), "duplicate audio");
+                assert!(seen.insert(known[&h.speaker], h.seq), "duplicate audio");
                 let sent = u64::from_le_bytes(payload[..8].try_into().unwrap());
-                latencies.push((start.elapsed().as_nanos() as u64).saturating_sub(sent));
+                let elapsed = (start.elapsed().as_nanos() as u64).saturating_sub(sent);
+                let bucket = (elapsed / LATENCY_BUCKET_NS).min((LATENCY_BUCKETS - 1) as u64);
+                latencies[bucket as usize] += 1;
             }
-            (false, seen.len(), latencies)
+            (false, seen.count, latencies)
         }));
-        if !(blocked_video && index == CLIENTS - 1) {
+        if !(blocked_video && index == clients_count - 1) {
             let peer = conn.clone();
             let known = sessions.clone();
+            let mut seen = Seen::new(clients_count);
             readers.push(tokio::spawn(async move {
-                let mut seen = HashSet::new();
                 while let Ok(mut recv) = peer.accept_uni().await {
                     let frame = recv
                         .read_to_end(VIDEO_HEADER_LEN + VIDEO_BYTES)
                         .await
                         .expect("whole video frame");
                     let h = VideoHeader::decode(&frame[..VIDEO_HEADER_LEN]).unwrap();
-                    assert!(h.speaker != session && known.contains(&h.speaker));
+                    assert!(h.speaker != session && known.contains_key(&h.speaker));
                     assert_eq!(frame.len(), VIDEO_HEADER_LEN + VIDEO_BYTES);
                     assert!(frame[VIDEO_HEADER_LEN..].iter().all(|b| *b == h.seq as u8));
-                    assert!(seen.insert((h.speaker, h.seq)), "duplicate video");
+                    assert!(seen.insert(known[&h.speaker], h.seq), "duplicate video");
                 }
-                (true, seen.len(), Vec::new())
+                (true, seen.count, Vec::new())
             }));
         }
+        let mut ready = ready_rx.clone();
         senders.push(tokio::spawn(async move {
+            let start = ready.wait_for(Option::is_some).await.unwrap().unwrap();
+            let deadline = tokio::time::Instant::from_std(start + Duration::from_secs(seconds));
             let mut audio = tokio::time::interval(Duration::from_millis(20));
             let mut video = tokio::time::interval(Duration::from_nanos(1_000_000_000 / 15));
             audio.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -150,7 +196,10 @@ async fn soak(blocked_video: bool) {
                         a += 1;
                     }
                     _ = video.tick() => {
-                        let header = VideoHeader { flags: 0, speaker: 0, seq: v, ts: u32::from(v)*3200, codec: VIDEO_CODEC_H264 };
+                        // Model an actual encoder's periodic IDR so a pair can
+                        // recover after pressure instead of losing video forever.
+                        let flags = if v % 30 == 0 { VIDEO_FLAG_KEYFRAME } else { 0 };
+                        let header = VideoHeader { flags, speaker: 0, seq: v, ts: u32::from(v)*3200, codec: VIDEO_CODEC_H264 };
                         let mut frame = header.encode().to_vec();
                         frame.resize(VIDEO_HEADER_LEN + VIDEO_BYTES, v as u8);
                         tokio::time::timeout(Duration::from_secs(1), async {
@@ -167,6 +216,10 @@ async fn soak(blocked_video: bool) {
             (index, u64::from(a), u64::from(v), conn)
         }));
     }
+    // Allocate every reader before starting the common measurement clock.
+    let start = Instant::now();
+    let deadline = tokio::time::Instant::from_std(start + Duration::from_secs(seconds));
+    ready_tx.send(Some(start)).unwrap();
     // ICU_MEDIA_JUNK_PPS: datagrams without the com key's tag at the
     // server's port for the whole soak, rounded up to whole packets per
     // millisecond. The filter in front of quinn drops them; the room must not
@@ -204,10 +257,10 @@ async fn soak(blocked_video: bool) {
     for task in senders {
         let (index, audio, video, conn) = task.await.expect("sender task");
         sent_audio += audio;
-        let receivers = if blocked_video && index != CLIENTS - 1 {
-            CLIENTS - 2
+        let receivers = if blocked_video && index != clients_count - 1 {
+            clients_count - 2
         } else {
-            CLIENTS - 1
+            clients_count - 1
         };
         expected_video += video * receivers as u64;
         connections.push(conn);
@@ -236,7 +289,7 @@ async fn soak(blocked_video: bool) {
     assert_eq!(Counters::get(&c.datagrams_in), sent_audio);
     assert_eq!(
         Counters::get(&c.datagrams_out),
-        sent_audio * (CLIENTS as u64 - 1)
+        sent_audio * (clients_count as u64 - 1)
     );
     assert_eq!(Counters::get(&c.dropped_rate), 0);
     assert_eq!(Counters::get(&c.video_dropped_rate), 0);
@@ -252,28 +305,40 @@ async fn soak(blocked_video: bool) {
     for conn in connections {
         conn.close(icu_proto::error::SHUTDOWN.into(), b"");
     }
-    let (mut audio, mut video, mut latencies) = (0, 0, Vec::new());
+    let (mut audio, mut video) = (0, 0);
+    let mut latencies = vec![0u64; LATENCY_BUCKETS];
     for reader in readers {
         let (is_video, count, samples) = reader.await.expect("reader task");
         if is_video {
             video += count as u64;
         } else {
             audio += count as u64;
-            latencies.extend(samples);
+            for (bucket, count) in latencies.iter_mut().zip(samples) {
+                *bucket += count;
+            }
         }
     }
     for task in control_readers {
         task.await.unwrap();
     }
-    latencies.sort_unstable();
-    let p99_ms = latencies[latencies.len() * 99 / 100] as f64 / 1_000_000.0;
+    assert_eq!(latencies.iter().sum::<u64>(), audio);
+    let mut cumulative = 0;
+    let p99_bucket = latencies
+        .iter()
+        .position(|count| {
+            cumulative += count;
+            cumulative > audio * 99 / 100
+        })
+        .expect("audio latency samples");
+    // Conservative upper edge, never round a slow sample down across the gate.
+    let p99_ms = (p99_bucket + 1) as f64 * LATENCY_BUCKET_NS as f64 / 1_000_000.0;
     // Junk the socket took, and what the filter in front of quinn saw of
     // it: the rate the room was actually under.
     let (junk_rate, dropped_rate) = (junk_sent / seconds, com_dropped / seconds);
-    println!("{seconds}s, {CLIENTS} clients, blocked_video={blocked_video}: audio {audio}, video {video}, expected_video {expected_video}, audio p99 {p99_ms:.3}ms, junk sent {junk_sent} ({junk_rate}/s), com_dropped {com_dropped} ({dropped_rate}/s)");
+    println!("{seconds}s, {clients_count} clients, blocked_video={blocked_video}: audio {audio}, video {video}, expected_video {expected_video}, audio p99 {p99_ms:.3}ms, junk sent {junk_sent} ({junk_rate}/s), com_dropped {com_dropped} ({dropped_rate}/s)");
     assert_eq!(
         audio,
-        sent_audio * (CLIENTS as u64 - 1),
+        sent_audio * (clients_count as u64 - 1),
         "all audio delivered with concurrent video"
     );
     assert_eq!(
