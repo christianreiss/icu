@@ -2,6 +2,13 @@ ICU @VERSION@ für Windows 10/11 (64 Bit)
 
 Entpacken, icu.exe starten. Keine Installation, keine Administratorrechte.
 
+Ab 0.1.20 meldet ICU neue stabile Versionen. „Jetzt aktualisieren“ lädt und
+prüft das passende Update; erst nach deiner Bestätigung wird ICU neu gestartet.
+Portable Kopien bleiben portabel, Einstellungen und Zugangsdaten bleiben erhalten.
+Unter Einstellungen → App kannst du auch selbst nach Updates suchen.
+Ein Setup-Update kann die Windows-Freigabe (UAC) benötigen; bei Abbruch bleibt
+der bisherige Client geöffnet.
+
 Einen Eintrag im Startmenü legt ICU ohne Installation nicht an. Wer ihn
 möchte: icu.exe dorthin legen, wo es bleiben soll, dann Rechtsklick auf
 icu.exe → „An „Start“ anheften“. Alternativ gibt es auf der Release-Seite

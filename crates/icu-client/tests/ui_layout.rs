@@ -1469,8 +1469,11 @@ fn no_hotkey_backend_offers_voice_activation() {
     h.get_by_role_and_label(egui::accesskit::Role::Button, &next_label())
         .click();
     h.run();
-    h.get_by_role_and_label(egui::accesskit::Role::Button, &switch)
-        .click();
+    h.get_by_role_and_label(
+        egui::accesskit::Role::Button,
+        &format!("{}  {switch}", egui_phosphor::regular::WAVEFORM),
+    )
+    .click();
     h.run();
     assert_eq!(last_update(&cmds.borrow()).audio.mode, ModeSetting::Vad);
 }

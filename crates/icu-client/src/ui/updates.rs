@@ -42,17 +42,26 @@ pub fn settings(
     connected: bool,
     confirm: &mut bool,
 ) -> Option<Action> {
-    let mut action = None;
-    ui.label(state.status());
-    ui.add_enabled_ui(!state.busy(), |ui| {
-        if design::button(ui, widgets::ButtonKind::Neutral, "", "Nach Updates suchen").clicked() {
-            action = Some(Action::Check);
-        }
-    });
-    if state.available.is_some() {
-        action = available(ui, state, connected, confirm, false).or(action);
-    }
-    action
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width().min(260.0), 34.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            let mut action = None;
+            ui.label(state.status());
+            ui.add_enabled_ui(!state.busy(), |ui| {
+                if design::button(ui, widgets::ButtonKind::Neutral, "", "Nach Updates suchen")
+                    .clicked()
+                {
+                    action = Some(Action::Check);
+                }
+            });
+            if state.available.is_some() {
+                action = available(ui, state, connected, confirm, false).or(action);
+            }
+            action
+        },
+    )
+    .inner
 }
 fn available(
     ui: &mut egui::Ui,
