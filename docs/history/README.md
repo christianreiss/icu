@@ -4,6 +4,7 @@ Ergebnisse, Entscheidungen und offene Punkte gelten für den jeweils genannten
 Stand. Aktuelle Referenzen stehen unter [reference/](../README.md).
 Die frühen Wire-Entwürfe sind durch [protocol.md](../reference/protocol.md) ersetzt.
 
+- [Release 0.1.20 — Client-Updates, Oberfläche und Tray, 2026-10-30](release-0.1.20-2026-10-30.md)
 - [Release 0.1.18 — 2026-10-24](release-0.1.18-2026-10-24.md)
 - [Privacy-Modus — 2026-10-24](privacy-mode-2026-10-24.md)
 - [Deep-Review: Nachprüfung des integrierten Clients — 2026-10-24](deep-review-follow-up-2026-10-24.md)
