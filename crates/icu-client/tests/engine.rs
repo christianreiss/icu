@@ -992,8 +992,8 @@ async fn a_default_endpoint_change_reopens_the_audio_group_once() {
         *opened.lock().unwrap(),
         vec![
             (StreamKind::Capture, None),
-            (StreamKind::Reference, None),
-            (StreamKind::Playback, None)
+            (StreamKind::Playback, None),
+            (StreamKind::Reference, None)
         ]
     );
     events
@@ -1045,8 +1045,8 @@ async fn capture_discontinuities_restart_the_audio_group_and_preserve_mute() {
             *opened.lock().unwrap(),
             vec![
                 (StreamKind::Capture, None),
-                (StreamKind::Reference, None),
                 (StreamKind::Playback, None),
+                (StreamKind::Reference, None),
             ],
         );
         let state = engine.snapshot();
@@ -1058,10 +1058,11 @@ async fn capture_discontinuities_restart_the_audio_group_and_preserve_mute() {
 }
 
 /// A backend whose microphone does not open while `mic` is off — a
-/// desktop without one — recording every open like [`Devices`]. No audio
-/// flows.
+/// desktop without one — recording every open like [`Devices`]. Its reference
+/// also requires a running render clock, as WASAPI loopback does. No audio flows.
 struct NoMic {
     mic: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    playback_open: bool,
     opened: Opened,
     events: Option<std::sync::mpsc::Receiver<icu_client::audio::BackendEvent>>,
 }
@@ -1099,7 +1100,11 @@ impl icu_client::audio::AudioBackend for NoMic {
             .lock()
             .unwrap()
             .push((kind, sink.map(str::to_string)));
-        Ok(())
+        if self.playback_open {
+            Ok(())
+        } else {
+            Err("loopback needs a running render clock".into())
+        }
     }
     fn open_playback(
         &mut self,
@@ -1107,13 +1112,18 @@ impl icu_client::audio::AudioBackend for NoMic {
         _cb: icu_client::audio::PlaybackCallback,
     ) -> Result<(), icu_client::audio::BackendError> {
         let kind = icu_client::audio::StreamKind::Playback;
+        self.playback_open = true;
         self.opened
             .lock()
             .unwrap()
             .push((kind, device.map(str::to_string)));
         Ok(())
     }
-    fn close(&mut self, _stream: icu_client::audio::StreamKind) {}
+    fn close(&mut self, stream: icu_client::audio::StreamKind) {
+        if stream == icu_client::audio::StreamKind::Playback {
+            self.playback_open = false;
+        }
+    }
     fn take_events(
         &mut self,
     ) -> Option<std::sync::mpsc::Receiver<icu_client::audio::BackendEvent>> {
@@ -1137,6 +1147,7 @@ async fn a_microphone_that_does_not_open_is_retried_alone() {
     let (_events, events_rx) = std::sync::mpsc::channel();
     let backend = NoMic {
         mic: mic.clone(),
+        playback_open: false,
         opened: opened.clone(),
         events: Some(events_rx),
     };
@@ -1145,6 +1156,10 @@ async fn a_microphone_that_does_not_open_is_retried_alone() {
     let mut cfg = icu_client::engine::EngineConfig::new(identity, settings, paths);
     cfg.server_addr = Some(server.addr());
     let engine = icu_client::engine::Engine::start(cfg, Box::new(backend)).expect("engine starts");
+    assert!(
+        engine.snapshot().aec_reference,
+        "render clock must run before the initial reference opens"
+    );
     let count = |kind| {
         opened
             .lock()

@@ -176,8 +176,44 @@ Die native Prüfung fand weitere Fehler, die vor Veröffentlichung behoben wurde
   geschlossen, die vollständige temporäre Datei bei transienten Sperren bis zu
   250 ms erneut atomisch veröffentlicht. Die Zieldatei wird dabei niemals vorher
   gelöscht. Die bestehende Parallel-Writer-Regression wurde nativ wiederholt.
-- Die Windows-Driftprobe zählte die neue mehrkanalige Referenz noch wie Mono.
-  Sie akzeptiert nun die Kanalzahl und zählt Frames statt interleavter Samples.
+- Die Windows-Driftprobe zählt die Länge der Referenz als Frames: Jedes Element
+  enthält bereits alle Kanäle. Eine erneute Division durch die Kanalzahl würde
+  einen künstlichen Taktdrift erzeugen. Gerätewechsel und Zeitsprünge brechen
+  eine Driftmessung jetzt ausdrücklich ab.
+- Die Engine öffnet Wiedergabe vor Loopback, auch beim vollständigen Reopen.
+  Eine Referenz, die einen laufenden Ausgabetakt benötigt, steht dadurch schon
+  beim initialen Start bereit. Der portable Engine-Test erzwingt diese echte
+  Abhängigkeit; er scheiterte vor und bestand nach der Korrektur.
+- Auf der Windows-HDA-VM sind Renderperiode und Puffer 256 bzw. 562 Frames.
+  Der Renderer rundete freie Frames auf 240er-Blöcke ab und ließ bis zu 239
+  Frames der knappen Zeitreserve leer. Er füllt nun alle verfügbaren Frames;
+  Mixer-Callback und Kanalabbildung sind auch für 1, 256 und 562 Frames geprüft.
+  Zwischenstände der rohen Backend-Probe meldeten weiterhin Start-Zeitsprünge,
+  auch mit verbundenem SPICE-Audioclient. Startreihenfolge und Pufferfüllung
+  allein werden nicht als Behebung sämtlicher Treiberereignisse ausgegeben.
+- Die Stream-Metadaten wurden erst **nach** `IAudioClient::Start` synchron in
+  die Logdatei geschrieben. Ein gezielt um 40 ms verzögerter Logger reproduzierte
+  einen Capture-Abbruch nach 720 Samples (15 ms). Die Meldung wird jetzt vor dem
+  Start geschrieben. Derselbe native Test bestand danach ohne Streamereignisse
+  mit 150.000 Capture- und 146.432 Referenzframes; auch die vollständige Engine
+  bestand den verzögerten Logger und beide injizierten Unterbrechungen. Die
+  strengen Grenzwerte bleiben erhalten, fehlgeschlagene Zwischenstände ebenfalls.
+
+Die funktionale native WASAPI-Abnahme prüft zusätzlich die vollständige
+Produktions-Engine, die den Wiederanlauf tatsächlich besitzt. Sie startet mit
+privater temporärer Testidentität, reserviertem inaktivem Loopback-UDP-Endpunkt,
+Mute, ausgeschaltetem Ducking und ausgeschalteter Systemmikrofon-Regelung. Eine
+leise lokale Sinusprobe macht die echte Referenz beobachtbar. Nach Initialisierung
+sowie absichtlichem Stoppen von Capture und Referenz muss jeweils eine neue,
+stabile gemeinsame Epoche mindestens 48.000 frische Capture-, Render- und
+Referenzframes sowie 24.000 nicht-stille Referenzframes liefern. Alte Epochen
+zählen nicht; ein Wiederanlaufkreis scheitert nach zehn Sekunden. Mute und
+fehlerfreier Gerätezustand werden ebenfalls geprüft. Der erste native Lauf bestand
+in 4,84 s, einschließlich natürlicher Startunterbrechungen und beider injizierten
+Fehler. Anschließend bestanden zehn weitere Durchläufe ohne Fehler: 30 stabile
+frische Epochen einschließlich 20 absichtlich unterbrochener nativer Streams.
+Die VM verwendet eine stumme virtuelle Host-Audiosenke; dies ist keine physische
+Windows-Hörabnahme.
 
 Auto fällt unter Windows sichtbar auf Mittel zurück, da Peak allein kein
 belastbares fremdes RMS liefert. Exclusive-/ASIO-Streams können über diese
@@ -220,6 +256,20 @@ mit und ohne blockierten Videoempfänger: jeweils 6.048.000 Audiopakete vollstä
 zugestellt, Audio-p99 17,124 / 17,499 ms; sämtliche erwarteten Videoframes kamen
 bei gesunden Empfängern an. Referenz ist der oben genannte Linux-Host über
 Loopback; dies belegt keine WAN-Kapazität oder Mund-zu-Ohr-Latenz des Servers.
+
+Die abschließenden Zehnminutenläufe mit 64 Teilnehmern bestanden beide:
+
+| Szenario | Audio vollständig zugestellt | Video bei gesunden Empfängern | Audio-p99 |
+|---|---:|---:|---:|
+| Ein blockierter Videoempfänger | 120.960.000 | 35.721.000 | 19,1 ms |
+| Alle Empfänger lesen | 120.960.000 | 36.288.000 | 17,6 ms |
+
+Beide Läufe verzeichneten null abgelaufene oder verlorene Audio-Datagramme.
+Im normalen Lauf wurden auch keine Videoframes wegen langsamer Empfänger
+verworfen. Ein vorheriger normaler Langlauf unter gleichzeitigem Paketbau und
+VM-Start scheiterte mit 199.189 Video-Verwerfungen. Dieser Fehler bleibt
+protokolliert; der abschließende normale Lauf erfolgte bei ausgeschalteter VM
+und ohne parallelen Build. Das ist keine Zusage unter beliebiger Hostüberlast.
 
 ## Blindhörprobe
 
@@ -287,6 +337,7 @@ ICU_MEDIA_CLIENTS=64 ICU_MEDIA_SECONDS=600 cargo test --locked --release \
   -p icu-server --test media_load -- --ignored --nocapture --test-threads=1
 
 # Auf einem nativen Windows-Rechner im Checkout:
+cargo test -p icu-client --lib live_wasapi_engine_recovers_native_discontinuities -- --ignored --nocapture
 cargo test --locked -p icu-client --lib audio::ducking::windows::tests::live_native_session_restore_and_manual_override -- --exact --ignored --nocapture
 
 # Alle sieben Pakete, inklusive kanonischer Packaging-/Smokeprüfungen:
@@ -310,9 +361,8 @@ Die verbleibende physische/hörbezogene Abnahme ist konkret:
 4. Auf beiden Plattformen tatsächliche Default-Device-Wechsel, Hotplug,
    Suspend/Resume, Audio-Service-Neustart und akustischen AEC-Double-Talk während
    Ducking prüfen. Virtuelle Endpunkte beweisen die Kanal-/Steuerlogik, nicht diese
-   Hardwarekombinationen oder jede externe System-Ducking-Politik. Ein voller
-   64-Client-Langlauf mit gleichzeitigem Video wird mit dem obigen Befehl
-   separat protokolliert. Eine akustische Verlust-/Reordering-/Burstmatrix
+   Hardwarekombinationen oder jede externe System-Ducking-Politik. Die beiden oben protokollierten
+   64-Client-Langläufe mit gleichzeitigem Video bestanden. Eine akustische Verlust-/Reordering-/Burstmatrix
    bleibt offen; synthetische QUIC-Teilnehmer ersetzen keine akustischen Endgeräte.
 
 Paketinstallation und Betriebsabnahme werden nach dem Build getrennt protokolliert.
@@ -321,6 +371,7 @@ und keine globalen Audio-/WirePlumber-/Windows-Policies geändert.
 
 Primärquellen: [RMS-/AGC-Bezug RFC 7874 §4](https://datatracker.ietf.org/doc/html/rfc7874#section-4),
 [Windows-Sessionpersistenz und Shared-Mode-Grenze](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-isimpleaudiovolume),
+[WASAPI-Puffer und verfügbare Frames](https://learn.microsoft.com/en-us/windows/win32/coreaudio/rendering-a-stream),
 [WirePlumber Stream-Restore](https://pipewire.pages.freedesktop.org/wireplumber/daemon/configuration/stream.html).
 Die konkrete libopus-Version und CTLs wurden zusätzlich direkt im gebauten
 `opusic-sys`-Quellbaum und ICU-Wrapper geprüft.

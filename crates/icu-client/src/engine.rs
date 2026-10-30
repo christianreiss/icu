@@ -1796,32 +1796,34 @@ fn open_streams(backend: &mut dyn AudioBackend, settings: &Settings, shared: &Ar
             .state
             .send_modify(|s| s.banner = Some(crate::problem::audio("Das Mikrofon", &e)));
     }
+    // Start the render clock before its loopback. Starting playback after the
+    // reference can flag a WASAPI discontinuity and immediately kill the AEC
+    // timeline again on every coordinated reopen. Match the retry order.
+    if let Err(e) = open_playback_stream(backend, output.as_deref(), shared) {
+        tracing::warn!(error = %e, "cannot open playback");
+        failed |= FAILED_PLAYBACK;
+        shared
+            .state
+            .send_modify(|s| s.banner = Some(crate::problem::audio("Der Lautsprecher", &e)));
+    }
     let mut reference_open = false;
     if settings.audio.aec {
-        match open_reference_stream(backend, output.as_deref(), shared) {
-            Ok(()) => reference_open = true,
-            Err(e) => {
-                tracing::warn!(error = %e, "cannot open AEC reference");
-                failed |= FAILED_REFERENCE;
+        if failed & FAILED_PLAYBACK != 0 && reference_needs_playback(backend) {
+            backend.close(StreamKind::Reference);
+            failed |= FAILED_REFERENCE;
+        } else {
+            match open_reference_stream(backend, output.as_deref(), shared) {
+                Ok(()) => reference_open = true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot open AEC reference");
+                    failed |= FAILED_REFERENCE;
+                }
             }
         }
     }
     shared
         .reference_open
         .store(reference_open, Ordering::Relaxed);
-    if let Err(e) = open_playback_stream(backend, output.as_deref(), shared) {
-        tracing::warn!(error = %e, "cannot open playback");
-        failed |= FAILED_PLAYBACK;
-        if reference_open && reference_needs_playback(backend) {
-            backend.close(StreamKind::Reference);
-            reference_open = false;
-            shared.reference_open.store(false, Ordering::Relaxed);
-            failed |= FAILED_REFERENCE;
-        }
-        shared
-            .state
-            .send_modify(|s| s.banner = Some(crate::problem::audio("Der Lautsprecher", &e)));
-    }
     shared.failed_streams.store(failed, Ordering::Relaxed);
     // Published last: whoever sees the devices of this attempt sees every
     // one of its streams opened.

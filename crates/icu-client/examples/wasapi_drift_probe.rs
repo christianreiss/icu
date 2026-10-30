@@ -51,19 +51,19 @@ fn main() {
             }),
         )
         .expect("capture");
-    let r = reference.clone();
-    backend
-        .open_reference(
-            Some(&output.id),
-            Box::new(move |s, channels| {
-                r.fetch_add((s.len() / channels) as u64, Ordering::Relaxed);
-            }),
-        )
-        .expect("reference");
     // Keep the render endpoint active, without playing a tone or capturing content.
     backend
         .open_playback(Some(&output.id), Box::new(|s| s.fill(0.0)))
         .expect("playback");
+    let r = reference.clone();
+    backend
+        .open_reference(
+            Some(&output.id),
+            Box::new(move |s, _channels| {
+                r.fetch_add(s.len() as u64, Ordering::Relaxed);
+            }),
+        )
+        .expect("reference");
     let events = backend.take_events().unwrap();
     std::thread::sleep(Duration::from_secs(5));
     let start = Instant::now();
@@ -73,9 +73,15 @@ fn main() {
     let mut previous = (c0, r0);
     loop {
         for event in events.try_iter() {
-            if let BackendEvent::StreamError { stream, message } = event {
-                panic!("{stream:?}: {message}");
-            }
+            assert!(
+                !matches!(
+                    event,
+                    BackendEvent::StreamError { .. }
+                        | BackendEvent::StreamDiscontinuity { .. }
+                        | BackendEvent::DefaultDeviceChanged
+                ),
+                "drift measurement lost its continuous device timeline: {event:?}"
+            );
         }
         std::thread::sleep(Duration::from_secs(1));
         let t = start.elapsed().as_secs_f64();

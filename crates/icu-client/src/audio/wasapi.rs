@@ -728,9 +728,6 @@ fn run_stream(
         }
     };
     let _ = ready.send(Ok(stream.device_id.clone()));
-    tracing::info!(stream = spec.name(), device = %stream.device_name,
-        channels = stream.channels, period = stream.period, mode = stream.mode,
-        "wasapi stream open");
     let ended = stream.pump(&mut callback, &stop, &events, || {
         spec.device.is_none() && defaults.of(spec.flow()).load(Ordering::SeqCst) != generation
     });
@@ -1033,6 +1030,12 @@ impl Stream {
                     let _ = render.ReleaseBuffer(buffer_frames, 0);
                 }
             }
+            // The application's log writer can block on a file. Finish this
+            // before Start: after that the device must be serviced immediately.
+            tracing::info!(stream = spec.name(), device = %stream.device_name,
+                channels = stream.channels, period = stream.period,
+                buffer_frames = stream.buffer_frames, mode = stream.mode,
+                "wasapi stream open");
             stream.client.Start().map_err(|e| format!("Start: {e}"))?;
             Ok(stream)
         }
@@ -1211,7 +1214,7 @@ impl Stream {
         Ok(Some(received))
     }
 
-    /// Fills the free part of the endpoint buffer, whole blocks only, the
+    /// Fills the entire free part of the endpoint buffer, the
     /// mono voice on the front pair (or center), silence elsewhere.
     fn write(&mut self, cb: &mut PlaybackCallback) -> windows::core::Result<usize> {
         let Some(render) = &self.render else {
@@ -1221,8 +1224,11 @@ impl Stream {
         // exactly the `frames × channels` f32 asked for.
         unsafe {
             let padding = self.client.GetCurrentPadding()?;
-            let free = self.buffer_frames.saturating_sub(padding) as usize;
-            let frames = free / BLOCK_SAMPLES * BLOCK_SAMPLES;
+            // Native periods need not divide our 5-ms capture block (the
+            // Windows HDA gate uses 256-frame periods and a 562-frame buffer).
+            // Rounding down leaves up to 239 frames of the device's already
+            // small scheduling margin empty. Playback accepts arbitrary frames.
+            let frames = self.buffer_frames.saturating_sub(padding) as usize;
             if frames == 0 {
                 return Ok(0);
             }
@@ -1266,6 +1272,9 @@ fn set_properties(client: &IAudioClient, kind: StreamKind) {
 }
 
 #[cfg(test)]
+mod live_engine;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1275,7 +1284,10 @@ mod tests {
     #[ignore = "needs Windows audio endpoints; plays a quiet test tone"]
     fn live_wasapi_capture_playback_and_loopback() {
         use std::sync::atomic::AtomicUsize;
+        let writes = super::live_engine::slow_log();
+        let log_start = writes.load(Ordering::Relaxed);
         let mut backend = WasapiBackend::new().unwrap();
+        let events = backend.take_events().unwrap();
         let devices = backend.devices();
         assert!(devices.iter().any(|d| d.kind == DeviceKind::Input));
         assert!(devices.iter().any(|d| d.kind == DeviceKind::Output));
@@ -1289,6 +1301,19 @@ mod tests {
                 Box::new(move |samples| {
                     assert!(samples.iter().all(|x| x.is_finite()));
                     counter.fetch_add(samples.len(), Ordering::Relaxed);
+                }),
+            )
+            .unwrap();
+        let mut phase = 0.0f32;
+        backend
+            .open_playback(
+                None,
+                Box::new(move |samples| {
+                    for sample in samples {
+                        *sample = phase.sin() * 0.02;
+                        phase = (phase + std::f32::consts::TAU * 997.0 / SAMPLE_RATE as f32)
+                            % std::f32::consts::TAU;
+                    }
                 }),
             )
             .unwrap();
@@ -1308,20 +1333,9 @@ mod tests {
                 }),
             )
             .unwrap();
-        let mut phase = 0.0f32;
-        backend
-            .open_playback(
-                None,
-                Box::new(move |samples| {
-                    for sample in samples {
-                        *sample = phase.sin() * 0.02;
-                        phase = (phase + std::f32::consts::TAU * 997.0 / SAMPLE_RATE as f32)
-                            % std::f32::consts::TAU;
-                    }
-                }),
-            )
-            .unwrap();
         std::thread::sleep(Duration::from_secs(3));
+        let events = events.try_iter().collect::<Vec<_>>();
+        eprintln!("WASAPI events: {events:?}");
         drop(backend);
         let (cap, reference, audible) = (
             cap.load(Ordering::Relaxed),
@@ -1329,9 +1343,17 @@ mod tests {
             audible.load(Ordering::Relaxed),
         );
         eprintln!("WASAPI: capture={cap} reference={reference} nonzero_reference={audible}");
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                BackendEvent::StreamDiscontinuity { .. } | BackendEvent::StreamError { .. }
+            )),
+            "native audio streams must keep a continuous timeline"
+        );
         assert!(cap > 48_000, "capture did not keep running");
         assert!(reference > 48_000, "loopback did not keep running");
         assert!(audible > 24_000, "rendered tone did not reach loopback");
+        assert!(writes.load(Ordering::Relaxed) - log_start >= 3);
     }
 
     /// Stops actual clients without invalidating their endpoints. This models

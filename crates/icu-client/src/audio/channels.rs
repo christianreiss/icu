@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn large_endpoint_request_reaches_mixer_whole_and_preserves_channel_routing() {
-        for frames in [240, 480, 1440, 1920] {
+        for frames in [1, 240, 256, 480, 562, 1440, 1920] {
             let mut mono = vec![9.0; frames];
             let mut out = vec![9.0; frames * 6];
             let voice = voice_channels(6, Some(SURROUND_5_1));
