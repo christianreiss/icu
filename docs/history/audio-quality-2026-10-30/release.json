@@ -1,0 +1,11 @@
+{
+  "commit": "36b9454153e0ea9ab6b4bbab918e981fd6520989",
+  "host": "biest.eulie.de",
+  "cpu": "AMD Ryzen 9 7950X3D",
+  "build": "cargo build --locked --release -p icu-client --example audio_quality --no-default-features",
+  "cases": 18,
+  "max_p99_dsp_encode_ms": 0.308,
+  "scope": "Offline SendChain, gate and Opus encode/decode; excludes AEC, receive AGC/mix, hardware callbacks, transport, runtime ducking classifier and scheduling deadline validation; package build active on host.",
+  "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Fedora 1.99.1-2.fc43)",
+  "measurement_finished_utc": "2026-10-30T10:43:04.067194+00:00"
+}

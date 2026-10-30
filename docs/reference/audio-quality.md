@@ -124,7 +124,9 @@ garantieren.
 
 ## Restore und Ausfälle
 
-Ein einzelner separater Wächter pro Benutzer hält die nativen Sessions. Der
+Ein einzelner separater Wächter pro Benutzer hält die nativen Sessions. Unter
+Unix läuft er in einer eigenen Prozessgruppe, damit ein Terminal-Ctrl+C oder
+ein Signal an die Hauptprozessgruppe nicht beide Prozesse beendet. Der
 Hauptprozess liefert alle 40 ms ein kleines Kontrollpaket, kein PCM. Nach 750 ms
 ohne frischen Heartbeat wird die Absenkung aufgehoben. EOF, Disconnect, Aus,
 Gerätewechsel und suspendähnliche Zeitlücken veranlassen ebenfalls Restore.

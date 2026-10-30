@@ -40,11 +40,7 @@ impl Service {
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
                         .stderr(Stdio::null());
-                    #[cfg(windows)]
-                    {
-                        use std::os::windows::process::CommandExt;
-                        command.creation_flags(0x08000000);
-                    }
+                    configure_worker(&mut command);
                     let mut child = command.spawn().map_err(|e| e.to_string())?;
                     let mut pipe = child.stdin.take().ok_or("Ducking-Steuerkanal fehlt")?;
                     let output = child.stdout.take().ok_or("Ducking-Statuskanal fehlt")?;
@@ -116,6 +112,21 @@ impl Drop for Service {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+fn configure_worker(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Terminal/group signals must not kill the restore guardian with the GUI.
+        // The inherited control pipe still closes when the GUI exits.
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
     }
 }
 
@@ -295,6 +306,22 @@ pub fn run_worker() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guardian_has_its_own_process_group() {
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "read line || :"]);
+        command.stdin(std::process::Stdio::piped());
+        super::configure_worker(&mut command);
+        let mut child = command.spawn().unwrap();
+        // The child is waiting on its pipe, so it cannot exit before this query.
+        let group = unsafe { libc::getpgid(child.id() as libc::pid_t) };
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        assert_eq!(group, child.id() as libc::pid_t);
+    }
+
     #[test]
     fn ipc_is_bounded_and_requires_complete_lines() {
         assert_eq!(bounded_line(&mut &b"{}\n"[..]), Some(b"{}\n".to_vec()));

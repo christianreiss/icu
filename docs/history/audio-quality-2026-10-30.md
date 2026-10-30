@@ -31,6 +31,8 @@ Baseline bestand 996 Workspace-Tests (13 ignorierte Hardware/Bench-Tests).
 | Zusätzlich | Große Callback-Batches sehen fälschlich zu wenig Jitterreserve | Engine / `pop_quiet_at`: bereits geplante Wiedergabezeit berücksichtigen | 3 reale Engine-Playouttests ohne Glitches, Dropouts oder künstliche Stretches; eigene Jitterregression |
 | Zusätzlich | Automatischer Kanalwechsel löst Reopen aus und setzt die Auswahl zurück | Nichtterminales `CaptureChannelChanged`; native Streams bleiben offen, alte DSP-/Profil-Evidenz verfällt | Selector-Regression und Engine-Test: kein Reopen nach Kanalwechsel, Mute erhalten |
 | Neu: Ducking | Native temporäre Absenkung mit korrektem Besitz fehlt | Gemeinsame Hüllkurve, eigener Wächter, bedingtes Journal-Restore, Linux/Windows-Adapter, UI | Engine→echtes QUIC→Decoder→Fake-DAC; native Linux-Abbruchtests; Windows-Liveabnahme offen |
+| Zusätzlich | Terminal-Ctrl+C kann Hauptprozess und Wächter gemeinsam beenden | `audio/ducking/worker.rs`: eigene Unix-Prozessgruppe für den Wächter | Regression mit echtem Kindprozess: vorher falsche PGID, nachher eigene PGID; EOF-Pfad bleibt erhalten |
+| Zusätzlich | Paralleler Prozessstart kann eine beendete Profilsperre kurz weiterhalten | `audio/calibration.rs`: explizites Unlock beim Ende der Schreibtransaktion, auch auf Fehlerpfaden | Reproduktion mit dupliziertem Dateideskriptor; vorher blockierte Folgesperre, nachher sofort verfügbar |
 
 ## Identische Vorher-/Nachher-Messung
 
@@ -102,6 +104,14 @@ Ethernet, Coalescing und variierende QUIC-Header fehlen: kein gemessener Linkdur
 CPU-Werte dieser CSV stammen aus Debug-Builds unter paralleler Buildlast und
 belegen kein p99-<5-ms-Echtzeitziel.
 
+Eine zusätzliche optimierte Probe ergibt über 18 Fälle maximal **0,308 ms**
+Fall-p99 pro 10-ms-Iteration für SendChain, Gate und Opus-Encode/Decode. AEC,
+Receive-AGC/Mix, Gerätecallbacks, Transport, Ducking-Klassifikation und echte
+Scheduling-Deadlines liegen außerhalb dieser Messung. Sie lief parallel zum
+Paketbau auf demselben Host; Details mit Quellcommit unter
+[Messaufbau](audio-quality-2026-10-30/release.json) und
+[Release-Metriken](audio-quality-2026-10-30/release.csv).
+
 Kurze Antworten mit Pausen ergeben erstmals bei 2 s Wallclock einen verwertbaren
 Bericht. Die isolierte geschlossene Feedback-Kette benötigt für 200/400/800-ms-
 Antworten 40/24/24 s Wallclock beziehungsweise 4,0/4,8/9,6 s geeignete Sprache,
@@ -145,7 +155,7 @@ Shared-Mode-Schnittstelle nicht gesteuert werden.
 
 ## Automatisierter integrierter Stand
 
-`cargo test --locked --workspace`: **1041 bestanden, 0 fehlgeschlagen,
+`cargo test --locked --workspace`: **1043 bestanden, 0 fehlgeschlagen,
 16 ignorierte native/optionale Tests, 46 Suites**. Die oben genannten nativen
 Linux-Tests wurden separat bewusst ausgeführt. Workspace-Clippy mit
 `--all-targets -- -D warnings`, Formatprüfung, CPAL-Featureprüfung sowie Windows-
@@ -171,6 +181,9 @@ cargo test --locked --manifest-path /tmp/icu-audio-before/Cargo.toml --workspace
 python3 experiments/audio-quality.py --baseline /tmp/icu-audio-before
 ffmpeg -i target/audio-quality/after/speech-12-10ms-heard.wav \
   -af ebur128=peak=true -f null -
+# Optimierte Teilpfad-Laufzeitmessung, kein vollständiger Echtzeitnachweis:
+cargo build --locked --release -p icu-client --example audio_quality --no-default-features
+target/release/examples/audio_quality target/audio-quality/release
 
 # Auf einem nativen Windows-Rechner im Checkout:
 cargo test --locked -p icu-client --lib audio::ducking::windows::tests::live_native_session_restore_and_manual_override -- --exact --ignored --nocapture

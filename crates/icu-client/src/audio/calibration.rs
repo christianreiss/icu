@@ -10,6 +10,15 @@ use std::{
 const MAX_PROFILES: usize = 16;
 const MAX_AGE: u64 = 30 * 24 * 3600;
 
+struct ProfileLease(fs::File);
+impl Drop for ProfileLease {
+    fn drop(&mut self) {
+        // Closing alone can retain flock until a concurrently forked child execs.
+        // Release the completed transaction even if it inherited this descriptor.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Processing only: restoring a profile cannot unmute, change PTT, or select devices.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessingSettings {
@@ -192,6 +201,7 @@ impl Store {
         lease
             .try_lock()
             .map_err(|e| ConfigError::Io(std::io::Error::other(e.to_string())))?;
+        let _lease = ProfileLease(lease);
         let mut latest = Self::load(paths);
         latest.profiles.retain(|p| {
             p.valid(now)
@@ -385,6 +395,34 @@ mod tests {
         lease.try_lock().unwrap();
         assert!(first.save_profile(&paths, p, now).is_err());
         assert!(Store::load(&paths).profile(&second_key, now).is_some());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn profile_lease_releases_with_an_inherited_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        file.try_lock().unwrap();
+        // A fork before exec temporarily retains the same open file description.
+        let inherited = file.try_clone().unwrap();
+        drop(ProfileLease(file));
+        let next = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let acquired = next.try_lock();
+        drop(inherited);
+        assert!(
+            acquired.is_ok(),
+            "the completed writer must release its lease"
+        );
     }
     #[test]
     fn policy_and_actual_channel_are_part_of_profile_compatibility() {
