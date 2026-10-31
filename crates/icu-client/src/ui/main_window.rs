@@ -135,6 +135,7 @@ struct App {
     state: AppState,
     cmd: tokio::sync::mpsc::UnboundedSender<Command>,
     settings: Option<SettingsView>,
+    email_joke: super::email_joke::EmailJoke,
     /// The Verbindung window, opened from the status pill in the header.
     connection: Option<ConnectionView>,
     /// The per-user window, opened by clicking someone in the list.
@@ -332,6 +333,7 @@ impl App {
             state_rx,
             cmd,
             settings: None,
+            email_joke: Default::default(),
             connection: None,
             user: None,
             setup,
@@ -683,6 +685,7 @@ impl eframe::App for App {
         let self_video = None;
         // After `self_video` — resolving the local user needs it.
         self.user_window(&ctx);
+        self.email_joke.show(&ctx);
 
         let videos = &self.videos;
         let env = MainEnv {
@@ -698,6 +701,9 @@ impl eframe::App for App {
         let out = self.view.ui(root, &self.state, &env);
         self.updater.act(out.update_action);
 
+        if out.open_email {
+            self.email_joke.open(&ctx);
+        }
         if out.toggle_settings {
             self.settings = match self.settings.take() {
                 Some(_) => None,
@@ -1049,7 +1055,7 @@ const USER_ID: &str = "icu-user";
 /// One of the app's secondary windows, drawn into its own immediate
 /// viewport with `body` as its central panel. `min_size` makes it
 /// resizable. Returns `false` once the user closed it.
-fn immediate_window(
+pub(super) fn immediate_window(
     ctx: &egui::Context,
     id: &str,
     title: &str,
@@ -1142,6 +1148,7 @@ pub struct MainOutput {
     pub update_action: Option<crate::update::Action>,
     /// The gear was clicked: open or close the settings.
     pub toggle_settings: bool,
+    pub open_email: bool,
     /// The connection status was clicked: open or close its window.
     pub toggle_connection: bool,
     /// The header's theme button picked this theme.
@@ -1238,7 +1245,12 @@ impl MainView {
                     .filter(|_| connected);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 2.0;
-                    let text_width = (ui.available_width() - 102.0).max(24.0);
+                    let email_width = if super::email_joke::EMAIL_JOKE_ENABLED {
+                        58.0
+                    } else {
+                        0.0
+                    };
+                    let text_width = (ui.available_width() - 102.0 - email_width).max(24.0);
                     let status = ui.allocate_ui_with_layout(
                         egui::vec2(text_width, design::ACTION_SIZE),
                         egui::Layout::top_down(egui::Align::Min),
@@ -1301,6 +1313,9 @@ impl MainView {
                         out.toggle_connection = true;
                     }
                     ui.add_space(10.0);
+                    if super::email_joke::EMAIL_JOKE_ENABLED && ui.button("Email").clicked() {
+                        out.open_email = true;
+                    }
                     if design::header_action(ui, Icon::Settings, "Einstellungen", env.settings_open)
                         .clicked()
                     {

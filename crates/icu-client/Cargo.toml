@@ -27,7 +27,7 @@ default = ["aec", "gui", "camera", "overlay", "tray"]
 # abseil headers and the rust-objcopy symlink (docs/reference/client.md §12).
 aec = ["dep:webrtc-audio-processing", "dep:webrtc-audio-processing-config"]
 # egui main window and settings. Without it only `--headless` works.
-gui = ["dep:winit", "dep:wayland-client", "dep:wayland-protocols", "dep:eframe", "dep:egui", "dep:egui-phosphor", "dep:egui_extras", "dep:raw-window-handle", "dep:arboard"]
+gui = ["dep:rfd", "dep:winit", "dep:wayland-client", "dep:wayland-protocols", "dep:eframe", "dep:egui", "dep:egui-phosphor", "dep:egui_extras", "dep:raw-window-handle", "dep:arboard"]
 # eframe glow backend in addition to the default wgpu one.
 glow = ["eframe?/glow"]
 # Camera capture and H.264.
@@ -42,6 +42,7 @@ tray = ["dep:tray-icon"]
 cpal-fallback = ["dep:cpal"]
 
 [dependencies]
+rfd = { version = "0.15", optional = true }
 rand.workspace = true
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"], optional = true }
 raw-window-handle = { version = "0.6.2", optional = true }
