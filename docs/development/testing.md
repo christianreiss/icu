@@ -4,6 +4,28 @@ Gepflegte Checkliste, zuletzt ergänzt 2026-09-28. Datierte VM-Ergebnisse sind k
 
 Was sich ohne Hardware prüfen lässt, prüfen die Tests (`cargo test --workspace`); dieses Dokument ist für das, was Ohren, Augen und Hände braucht.
 
+## Fest ausgewähltes Systemstandard-Mikrofon (2026-10-31)
+
+WirePlumbers Default-Target-Rescan muss auch dann funktionieren, wenn in ICU
+genau das aktuelle Systemstandard-Mikrofon explizit gewählt wurde. Vor dem
+Fix löschte WirePlumber diesen Stream mit `defined target not found`.
+Explizite Geräte verwenden jetzt zusätzlich `node.dont-move=true`; die
+Auswahl „Systemstandard“ folgt weiterhin der Systemvorgabe.
+
+Der folgende opt-in Test öffnet das angegebene reale Mikrofon für zwei
+Sekunden und zählt nur Samples; er speichert und sendet keine Aufnahme.
+Er prüft zunächst, dass der angegebene `node.name` tatsächlich der aktuelle
+Systemstandard ist. Er verändert weder Standardgeräte noch Pegel.
+
+```sh
+ICU_DEFAULT_MIC_TEST_SOURCE='<node.name des Standardmikrofons>' \
+  cargo test --locked -p icu-client --lib \
+  native_explicit_default_microphone_stays_connected -- --ignored --nocapture
+```
+
+Zusätzlich prüft `python3 crates/icu-client/tests/native_channels.py` explizite
+virtuelle Geräte, unabhängige Referenzkanäle und laufende Kanalwechsel.
+
 ## 0. Bauen
 
 ```sh

@@ -641,6 +641,12 @@ fn open_stream(
     if let Some(target) = device {
         props.insert(*pw::keys::TARGET_OBJECT, target);
         props.insert("node.dont-fallback", "true");
+        // Keep an explicit ICU choice authoritative over session-manager
+        // routing metadata. WirePlumber can otherwise rewrite a selected
+        // system-default device to target.node=-1, then destroy this stream
+        // because dont-fallback forbids resolving that replacement target.
+        // Streams without an explicit device still follow system defaults.
+        props.insert("node.dont-move", "true");
     }
 
     let stream = pw::stream::StreamRc::new(core, name, props)
@@ -855,6 +861,59 @@ fn open_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Explicitly opting in opens the named microphone briefly, discarding
+    /// every sample. This reproduces the WirePlumber default-target rescan.
+    #[test]
+    #[ignore = "needs ICU_DEFAULT_MIC_TEST_SOURCE naming the actual system default microphone"]
+    fn native_explicit_default_microphone_stays_connected() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let source = std::env::var("ICU_DEFAULT_MIC_TEST_SOURCE").unwrap();
+        assert!(!source.is_empty());
+        let dump = std::process::Command::new("pw-dump").output().unwrap();
+        assert!(dump.status.success());
+        let objects: serde_json::Value = serde_json::from_slice(&dump.stdout).unwrap();
+        let default = objects.as_array().unwrap().iter().find_map(|object| {
+            if object["props"]["metadata.name"] != "default" {
+                return None;
+            }
+            object["metadata"].as_array()?.iter().find_map(|entry| {
+                (entry["key"] == "default.audio.source")
+                    .then(|| entry["value"]["name"].as_str())
+                    .flatten()
+            })
+        });
+        assert_eq!(
+            default,
+            Some(source.as_str()),
+            "test requires the system default"
+        );
+        let samples = Arc::new(AtomicUsize::new(0));
+        let count = samples.clone();
+        let mut backend = PipeWireBackend::new().unwrap();
+        let events = backend.take_events().unwrap();
+        backend
+            .open_capture(
+                Some(&source),
+                Box::new(move |input| {
+                    count.fetch_add(input.len(), Ordering::Relaxed);
+                }),
+            )
+            .unwrap();
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            for event in events.try_iter() {
+                if let BackendEvent::StreamError { .. } = event {
+                    panic!("explicit default microphone disconnected: {event:?}");
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            samples.load(Ordering::Relaxed) >= 4800,
+            "no capture callbacks"
+        );
+    }
 
     /// Feed a task-owned stereo loopback (L=-R) from pw-cat before this
     /// test. It exercises actual PipeWire format negotiation and callbacks,
