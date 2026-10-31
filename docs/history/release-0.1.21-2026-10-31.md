@@ -32,13 +32,16 @@ Das nachträglich ergänzte Auslieferungsprotokoll verändert die Pakete nicht.
   ausschließlich Linux betreffenden Fix nicht erneut ausgeführt. Die
   native Updater-Abnahme gehört zum [Release 0.1.20](release-0.1.20-2026-10-30.md).
 - **biest.eulie.de:** Fedora-43-RPM über DNF auf 0.1.21 aktualisiert,
-  `rpm -V icu-client` ohne Abweichung. Der laufende Prozess verwendet
-  nachweislich die installierte EXE. Die ursprüngliche feste Auswahl des
-  C-Media-USB-Mikrofons wurde wiederhergestellt; beide Eingangskanäle sind
+  `rpm -V icu-client` ohne Abweichung. Der Prozess verwendete bei der Abnahme
+  nachweislich die installierte Programmdatei. Die ursprüngliche feste Auswahl
+  des C-Media-USB-Mikrofons wurde wiederhergestellt; beide Eingangskanäle waren
   aktiv, `node.dont-move=true`, Verbindung zu lab.uggs.io hergestellt und
   kein Mikrofonfehler im Log oder Fenster. Acht Profil-/Identitätsdateien
   blieben bytegleich; die zwischenzeitliche Einstellung „Systemstandard“
   wurde gezielt zurückgenommen, andere Einstellungen dabei erhalten.
+  Bei der späteren Abschlussprüfung war der Client bereits beendet, ohne
+  protokollierten Audiostreamfehler. Er wurde nicht nochmals gestartet;
+  der Laufzeitnachweis bezieht sich auf die vorherige erfolgreiche Abnahme.
 - **twingo.alpha-labs.net:** vollständigen Paketsatz übertragen, signiertes
   Manifest zuletzt atomisch veröffentlicht, bestehendes Webseitenlayout
   erhalten. Alle sieben öffentlichen HTTPS-Downloads vollständig gegen
