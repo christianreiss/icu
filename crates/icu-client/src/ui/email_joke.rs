@@ -59,7 +59,7 @@ impl EmailJoke {
             ctx,
             ID,
             "ICU PRO — BUY NOW — Zawinski Compliance Edition",
-            [720.0, 720.0],
+            [720.0, 840.0],
             Some([360.0, 380.0]),
             |ui| close = self.ui(ui),
         );
@@ -72,50 +72,27 @@ impl EmailJoke {
 
     fn ui(&mut self, ui: &mut egui::Ui) -> bool {
         self.poll_licence();
-        let full = ui.available_rect_before_wrap();
-        let top = Rect::from_min_size(full.min, Vec2::new(full.width(), MARQUEE_H));
-        let bottom = Rect::from_min_size(
-            Pos2::new(full.left(), full.bottom() - MARQUEE_H),
-            Vec2::new(full.width(), MARQUEE_H),
-        );
-        paint_marquee(
+        ui.spacing_mut().item_spacing.y = 4.0;
+        marquee_bar(
             ui,
-            top,
             TOP_LINE,
             180.0,
             false,
             Color32::from_rgb(180, 0, 120),
             Color32::WHITE,
         );
-        paint_marquee(
+        ui.spacing_mut().item_spacing.y = 12.0;
+        let close = self.offers(ui);
+        ui.spacing_mut().item_spacing.y = 4.0;
+        marquee_bar(
             ui,
-            bottom,
             BOTTOM_LINE,
             140.0,
             true,
             Color32::from_rgb(12, 8, 20),
             Color32::from_rgb(0, 255, 255),
         );
-        let mid = Rect::from_min_max(
-            Pos2::new(full.left(), top.bottom() + 4.0),
-            Pos2::new(full.right(), bottom.top() - 4.0),
-        );
-        let mut close = false;
-        if mid.height() > 40.0 {
-            let mut mid_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(mid)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-            );
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .id_salt("icu-email-carnival")
-                .show(&mut mid_ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 12.0;
-                    close = self.offers(ui);
-                });
-        }
-        ui.advance_cursor_after_rect(full);
+        fit_to_content(ui);
         close
     }
 
@@ -367,6 +344,35 @@ fn sticker(ui: &egui::Ui, center: Pos2, text: &str, angle: f32, fill: Color32, i
     );
 }
 
+fn marquee_bar(ui: &mut egui::Ui, text: &str, speed: f32, reverse: bool, bg: Color32, fg: Color32) {
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), MARQUEE_H), Sense::hover());
+    paint_marquee(ui, rect, text, speed, reverse, bg, fg);
+}
+
+/// Grow or shrink this viewport so the offer is fully visible and has no
+/// leftover gap. Width stays whatever the user set.
+fn fit_to_content(ui: &egui::Ui) {
+    let used = ui.min_rect().height();
+    if used < 1.0 {
+        return;
+    }
+    let Some(inner) = ui.ctx().input(|i| i.viewport().inner_rect) else {
+        return;
+    };
+    let chrome = (inner.height() - ui.clip_rect().height()).max(0.0);
+    let target = (used + chrome).ceil();
+    let width = inner.width().max(360.0);
+    ui.ctx()
+        .send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+            360.0, target,
+        )));
+    if (target - inner.height()).abs() > 1.5 || (width - inner.width()).abs() > 1.5 {
+        ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(width, target)));
+    }
+}
+
 fn paint_marquee(
     ui: &egui::Ui,
     rect: Rect,
@@ -427,6 +433,31 @@ fn reject_file(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offer_fits_the_default_width() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use egui_kittest::Harness;
+        for width in [360.0, 720.0] {
+            let mut view = EmailJoke::default();
+            let height = Rc::new(Cell::new(0.0));
+            let slot = height.clone();
+            let mut h = Harness::builder()
+                .with_size(egui::vec2(width, 1600.0))
+                .build_ui(move |ui| {
+                    view.ui(ui);
+                    slot.set(ui.min_rect().height());
+                });
+            h.run();
+            let height = height.get();
+            assert!(
+                (760.0..=830.0).contains(&height),
+                "offer at {width}px is {height}px; resize the window with it"
+            );
+        }
+    }
 
     #[test]
     fn window_renders_in_both_themes_and_narrow_sizes() {
