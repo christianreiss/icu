@@ -355,8 +355,14 @@ fn sticker(ui: &egui::Ui, center: Pos2, text: &str, angle: f32, fill: Color32, i
         fill,
         Stroke::new(2.0, Color32::BLACK),
     ));
+    // `with_angle_and_anchor` keeps the anchor where the unrotated text
+    // already placed it. The galley origin has to put that anchor on `center`
+    // first; passing `center` itself shifts the letters by half a line.
+    let anchor = egui::Align2::CENTER_CENTER
+        .pos_in_rect(&galley.rect)
+        .to_vec2();
     ui.painter().add(
-        egui::epaint::TextShape::new(center, galley, ink)
+        egui::epaint::TextShape::new(center - anchor, galley, ink)
             .with_angle_and_anchor(angle, egui::Align2::CENTER_CENTER),
     );
 }
