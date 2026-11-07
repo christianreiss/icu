@@ -64,4 +64,65 @@ Der letzte geschätzte Decode-/Audioziel-Abstand betrug −619 µs und ist kein
 physischer Lip-Sync-Nachweis. Native Linux-/Windows-Clippy-Prüfungen bestanden;
 481 Client-Unit-Tests und die gezielten Video-/Medienzeitprüfungen bestanden.
 
-Auslieferung und endgültige Build-Evidenz werden nach dem Paketgate dokumentiert.
+## Release-Performance
+
+Der optimierte Release-Client lief am 2026-11-07 für 25 Sekunden mit derselben
+UVC-Kamera und isoliertem Loopback-Server: 315 Frames weitergeleitet, 299
+Korrektur-Messungen, Mittel 1,06 ms, p95-Obergrenze 1,5 ms, Maximum 1,57 ms.
+Keine Budget-Bypässe und keine Late-Drops. Audio war synthetisch mit Fake-Ausgabe;
+der geschätzte Decode-/Audioziel-Abstand von −6698 µs bleibt deshalb ausdrücklich
+kein physischer Lip-Sync-Nachweis. Es wurden keine Bilder aufgezeichnet.
+
+Die geprüfte Binärdatei ist bytegleich mit `/usr/bin/icu` aus dem ausgelieferten
+Fedora-43-RPM (SHA-256
+`642b67373f39227a38d71b5eefbde2dc5e4cd178893c6d72edf3db913647c61e`).
+
+## Auslieferung am 2026-11-07
+
+Version 0.1.27 wurde aus dem sauberen Source-Commit
+`1a2e8fe748c125af0bb9fc85ae730a39bd6a64fc` gebaut. Das vollständige
+`./build.sh --plain` bestand: 46 Testsuiten mit 1072 bestandenen, null
+fehlgeschlagenen und 18 ignorierten Tests; Installations-Smokes für Fedora
+42/43, Debian 12/13 und AlmaLinux 10; Windows-ZIP und NSIS-Installer. Alle sieben
+Pakete und drei BUILDINFO-Dateien bestanden die SHA-256-Prüfung. Linux- und
+Windows-Clippy sowie Formatprüfung bestanden ebenfalls.
+
+Auf `lab.uggs.io` wurde das Debian-Serverpaket von 0.1.20 auf 0.1.27
+aktualisiert. Unmittelbar vor dem vom Paket ausgelösten Service-Neustart gab
+es keine Nutzer, Verbindungen oder Handshakes. Der laufende Server meldet
+0.1.27; `doctor --json` meldet null Fehler und null Warnungen. Konfiguration,
+CA, Server- und COM-Schlüssel blieben bytegleich; die semantische Nutzerdatenbank
+blieb ohne ihren erwartbar fortgeschriebenen CRL-Zähler gleich.
+
+Auf `biest.eulie.de` wurde das Fedora-43-Clientpaket von 0.1.26 auf 0.1.27
+aktualisiert. `rpm -V icu-client` ist sauber. Die tatsächlich installierte
+`/usr/bin/icu` läuft im vorhandenen Desktop und ist per bestehender mTLS-Identität
+mit dem Produktionsserver verbunden; live bestätigt: ein Online-Client.
+Identität und Einstellungen sind erhalten, nur die gecachte CRL wurde erneuert.
+
+Alle sieben Pakete liegen unter
+`https://misc.alpha-labs.net/icu/downloads/0.1.27/`. Das signierte Update-Manifest
+wurde erst nach vollständigem Upload und Hash-/Signaturprüfung atomar aktiviert.
+Ein frischer HTTPS-Abruf prüfte die Manifest- und Checksum-Signaturen sowie
+Größe und SHA-256 jedes Pakets. Die Download-Seite selbst blieb bytegleich;
+ältere Versionen sind erhalten. Hängende SSH-Transporte wurden nach
+Bestätigung der Remote-Ergebnisse beendet; die Wiederholung der Veröffentlichung
+wurde erfolgreich geprüft. Source-Commit und veröffentlichter Manifest-Commit
+sind identisch; spätere Dokumentationscommits ändern diese Provenienz nicht.
+
+## Rückweg und Aufräumen
+
+Rollback benötigt das kompatible Paar: Server 0.1.20 und Client 0.1.26.
+Auf `lab.uggs.io` liegen vorheriges Debian-Paket sowie Konfigurations- und
+State-Backups in `/root/icu-rollback-0.1.27/`. Lokal bleiben das 0.1.26-RPM
+unter `dist/0.1.26/` und das Profilbackup unter
+`target/release-0.1.27/local-config-before.tgz` erhalten. Beim Paket-Downgrade
+Schlüssel und Nutzerdaten weiterverwenden; Backups nur bei tatsächlich
+beschädigtem State zurückspielen. Der bisherige Download-Kanal ist auf
+`twingo.alpha-labs.net` als
+`/root/icu-rollback-0.1.27/latest-before.json` gesichert und kann atomar
+zurückgeschaltet werden.
+
+Wegwerfidentitäten, Probeprozesse, temporäre Release-Helfer und Upload-Staging
+wurden entfernt. Pakete, Build-/Verifikationsevidenz und Rückweg bleiben erhalten.
+Es wurde kein zusätzlicher Git-Worktree angelegt.
