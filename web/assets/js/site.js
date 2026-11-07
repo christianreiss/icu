@@ -13,11 +13,16 @@ const store = {
 
 /* -------------------------------------------------------------- reveal */
 
-if (document.documentElement.classList.contains('js')) {
+if ('IntersectionObserver' in window) {
   const io = new IntersectionObserver(entries => {
     entries.forEach(en => { if (en.isIntersecting) { en.target.classList.add('in'); io.unobserve(en.target); } });
   }, { threshold: 0.12, rootMargin: '0px 0px -6% 0px' });
-  $$('.reveal').forEach(el => {
+  /* hide-until-reveal is armed only now, so a failing or blocked script leaves everything visible;
+     content already on screen is shown right away to avoid a flash */
+  const vh = innerHeight;
+  $$('.reveal').forEach(el => { if (el.getBoundingClientRect().top < vh) el.classList.add('in'); });
+  document.documentElement.classList.add('reveal-ready');
+  $$('.reveal:not(.in)').forEach(el => {
     const sibs = [...el.parentElement.children].filter(c => c.classList.contains('reveal'));
     el.style.setProperty('--d', Math.min(sibs.indexOf(el), 6));
     io.observe(el);
@@ -28,14 +33,13 @@ if (document.documentElement.classList.contains('js')) {
 
 const EN = {
   skip: 'Skip to content',
-  'nav.label': 'Main navigation', 'nav.features': 'Features', 'nav.views': 'Screenshots', 'nav.start': 'Get started', 'nav.limits': 'On purpose not', 'nav.download': 'Download',
+  'nav.label': 'Main navigation', 'nav.features': 'Features', 'nav.views': 'Screenshots', 'nav.start': 'Get started', 'nav.limits': 'On purpose not', 'nav.download': 'Download', 'motion.label': 'Pause decorative animations',
   'hero.tag': 'Room 01 · 1 server · 0 channels',
   'hero.title': 'One crew.<br>One room.<br><em>No&nbsp;noise.</em>',
   'hero.lead': 'ICU is what is left of Mumble and TeamSpeak once you strip out everything a fixed group does not need. In return you get Opus voice quality, echo and noise suppression, a camera overlay for your game and mutual TLS instead of a password.',
   'hero.cta': 'Download', 'hero.cta2': 'See the features', 'hero.platforms': 'Linux (Fedora, Debian) &amp; Windows 10/11',
   'hero.eye': 'Transmit demo: press and hold', 'hero.tx': 'Transmitting', 'hero.rx': 'Listening', 'hero.hint': '↓ hold the eye = push-to-talk',
-  'hero.alt1': 'ICU window with two participants, camera status, signal strength and the buttons Mute, Deafen, Camera and Overlay',
-  'hero.alt2': 'ICU main window: connected, one participant, push-to-talk key F12',
+  'hero.alt2': 'ICU main window: connected, room list with participants, push-to-talk and control buttons',
   'idx.principle': 'Principle',
   'p.h': 'Leaving things out is the feature.',
   'p.p1': 'No server browser, no channel hierarchy, no roles beyond admin. A fixed group does not need them, and whatever is missing cannot break or be misconfigured.',
@@ -62,30 +66,33 @@ const EN = {
   'v.h': 'This is what it looks like.', 'v.label': 'Screenshots',
   'v.t1': 'Main window', 'v.t2': 'Camera', 'v.t3': 'Overlay', 'v.t4': 'Invitation', 'v.t5': 'Connection path',
   'v.1.h': 'One room, everybody in it.',
-  'v.1.a': 'Push-to-talk key (here F12) and level meter right in the window',
-  'v.1.b': 'Mute, deafen, camera and overlay are one click each',
+  'v.1.alt': 'ICU main window: connected to icu.example.org, six people in the room, Anna speaking, icons for muted, deafened and camera, push-to-talk and control buttons at the bottom',
+  'v.1.a': 'Room list with speaker highlight, signal strength and mute, deafen and camera status per person',
+  'v.1.b': 'Push-to-talk with its key shown, and the control buttons at the bottom of the window',
   'v.1.c': 'The tray icon shows connected, muted and deafened',
   'v.1.d': 'Setup assistant on first launch: devices, talking, sound',
+  'v.2.alt': 'Earlier version: ICU with two participants, speaking indicator, camera status and signal strength',
+  'v.2.note': 'Image from an earlier version of the app',
   'v.2.h': 'Video call with camera tiles.',
   'v.2.a': 'Speaking indicator, signal strength and camera status per participant',
   'v.2.b': 'Camera on and off with a preview first; H.264 via openh264',
   'v.2.c': 'Video is only sent while somebody is watching',
-  'v.3.note': 'Schematic: the real overlay tile above a game window',
+  'v.3.note': 'Schematic, tile from an earlier version of the app, above a game window',
   'v.3.h': 'Overlay in your game.',
   'v.3.a': 'Click-through and always on top, with speaker highlight and camera image',
   'v.3.b': 'A window of its own instead of render hooking — so borderless games only, exclusive fullscreen covers it',
   'v.3.c': 'Linux: Wayland layer-shell (KDE, wlroots); not available on GNOME',
-  'v.4.alt': 'Dialog “Connect to ICU” with an input field for the invitation',
+  'v.4.alt': 'Dialog “Connect to ICU”: server, address and CA fingerprint of the invitation, a field for your name, buttons Back and Join',
   'v.4.h': 'An invitation instead of a password.',
-  'v.4.a': 'Paste the invitation or drag the <code>.icu</code> file into the window',
+  'v.4.a': 'Paste the invitation or open the <code>.icu</code> file with a double-click',
   'v.4.b': 'Server, address and CA fingerprint are shown before you join',
-  'v.4.c': '“Join” fetches your client certificate in the same step',
-  'v.5.alt1': 'Connection path in the dark theme: user, server and you, with RTT, packet loss and certificate chain',
-  'v.5.alt2': 'Connection path in the light theme',
+  'v.4.c': 'You choose your name; it ends up in your certificate',
+  'v.5.alt1': 'Connection details, “Who” tab, dark theme: participant list with latency, packet loss and status per person',
+  'v.5.alt2': 'Connection details, “Who” tab, light theme',
   'v.5.dark': 'Dark', 'v.5.light': 'Light',
   'v.5.h': 'Who talks to whom — and what it rests on.',
-  'v.5.a': 'RTT to the server and audio packet loss per participant',
-  'v.5.b': 'Certificate chain and trust anchor from your passport',
+  'v.5.a': 'Latency to the server and packet loss (in ‰, measured at your own jitter buffer) per participant',
+  'v.5.b': 'More tabs: Server, Network, Crypto, Audio and Video, plus “Copy report”',
   'v.5.c': 'Moderation for admins: mute, deafen, kick, ban',
   'v.5.d': 'Honestly labelled: both legs are transport-encrypted, and the server can read the media it relays',
   'idx.start': 'Get started',
@@ -137,7 +144,9 @@ const RT = {
     unsigned: 'Unsigniert. SmartScreen: „Weitere Informationen“ → „Trotzdem ausführen“.',
     dlOther: 'Alle Pakete ansehen', winSetup: 'Windows 10/11 · Setup', winZip: 'Windows 10/11 · Portable ZIP',
     fmt: { setup: 'Setup', zip: 'ZIP', rpm: 'RPM', deb: 'DEB' },
-    copied: 'Kopiert', error: 'Die Paketliste konnte nicht geladen werden.', empty: 'Noch keine Pakete veröffentlicht.',
+    kickerPick: 'Wähle deine Distribution', kickerChosen: 'Deine Auswahl',
+    pickHint: 'Wir konnten deine Distribution nicht erkennen. Wähle sie aus, dann erscheinen Paket und Installationsbefehl.',
+    copied: 'Kopiert', copyFail: 'Kopieren nicht möglich – Text markiert, bitte manuell kopieren (Strg+C)', error: 'Die Paketliste konnte nicht geladen werden.', empty: 'Noch keine Pakete veröffentlicht.',
     version: 'Version {v}', build: 'Build aus Commit {c}', dirty: 'Arbeitsverzeichnis mit uncommitteten Änderungen', sig: 'signiert: SHA256SUMS.sig',
     heroCta: { windows: 'Download für Windows', linux: 'Download für Linux', other: 'Download' },
     dlBtn: 'Herunterladen', x64: 'x86_64', mb: 'MB',
@@ -153,7 +162,9 @@ const RT = {
     unsigned: 'Unsigned. SmartScreen: “More info” → “Run anyway”.',
     dlOther: 'See all packages', winSetup: 'Windows 10/11 · Setup', winZip: 'Windows 10/11 · Portable ZIP',
     fmt: { setup: 'Setup', zip: 'ZIP', rpm: 'RPM', deb: 'DEB' },
-    copied: 'Copied', error: 'The package list could not be loaded.', empty: 'No packages published yet.',
+    kickerPick: 'Choose your distribution', kickerChosen: 'Your selection',
+    pickHint: 'We could not detect your distribution. Select it and the matching package and install command will appear.',
+    copied: 'Copied', copyFail: 'Copy not possible – text selected, please copy manually (Ctrl+C)', error: 'The package list could not be loaded.', empty: 'No packages published yet.',
     version: 'Version {v}', build: 'Built from commit {c}', dirty: 'working tree with uncommitted changes', sig: 'signed: SHA256SUMS.sig',
     heroCta: { windows: 'Download for Windows', linux: 'Download for Linux', other: 'Download' },
     dlBtn: 'Download', x64: 'x86_64', mb: 'MB',
@@ -254,27 +265,62 @@ function pkgLabel(f) {
 const distroLabel = f => pkgLabel(f);
 const installCmd = f => (f.format === 'rpm' ? 'sudo dnf install ./' : 'sudo apt install ./') + f.name;
 
-async function copyText(text, el) {
-  try { await navigator.clipboard.writeText(text); }
+/* manual-copy fallback: stays until dismissed (Escape, click elsewhere, focus leaves, a new copy attempt, navigation) */
+let manualFail = null;
+function clearManual() {
+  if (!manualFail) return;
+  const m = manualFail; manualFail = null;
+  m.el.classList.remove('fail'); delete m.el.dataset.msg;
+  if (m.undo) m.undo();
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') clearManual(); });
+document.addEventListener('click', e => { if (manualFail && !manualFail.el.contains(e.target)) clearManual(); });
+addEventListener('hashchange', clearManual);
+addEventListener('pagehide', clearManual);
+
+async function copyText(text, el, sel, reveal) {
+  clearManual();
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; }
   catch {
     const t = h('textarea', { 'aria-hidden': 'true' });
     t.value = text; t.style.position = 'fixed'; t.style.opacity = '0';
     document.body.append(t); t.select();
-    try { document.execCommand('copy'); } catch { /* nothing more to try */ }
+    try { ok = document.execCommand('copy') === true; } catch { ok = false; }
     t.remove();
   }
-  el.classList.add('done');
-  setTimeout(() => el.classList.remove('done'), 1600);
+  if (ok) {
+    el.classList.remove('fail'); el.classList.add('done');
+    clearTimeout(el._doneTimer);
+    el._doneTimer = setTimeout(() => el.classList.remove('done'), 1600);
+    return true;
+  }
+  /* manual fallback: select the visible text and say so */
+  clearManual();
+  const undo = reveal && reveal();
+  if (sel) { const r = document.createRange(); r.selectNodeContents(sel); const g = getSelection(); g.removeAllRanges(); g.addRange(r); }
+  el.dataset.msg = rt().copyFail;
+  el.classList.add('fail');
+  manualFail = { el, undo };
+  el.addEventListener('focusout', () => { if (manualFail && manualFail.el === el && document.hasFocus()) clearManual(); }, { once: true });
+  return false;
 }
 
 function hashButton(f, full) {
   const label = h('span', { text: full ? f.sha256 : shortHash(f.sha256) });
   const b = h('button', { class: 'sha', type: 'button', title: 'SHA-256: ' + f.sha256, 'aria-label': 'SHA-256 ' + f.sha256 }, label, icon('i-copy'));
   b.addEventListener('click', async () => {
-    await copyText(f.sha256, b);
-    const old = label.textContent;
+    clearManual();   /* restores the short label before it is read below */
+    clearTimeout(b._okTimer);
+    const old = full ? f.sha256 : shortHash(f.sha256);
+    /* on failure show the full hash so the manual-copy selection is the real 64 hex chars */
+    const ok = await copyText(f.sha256, b, label, () => {
+      label.textContent = f.sha256; b.classList.add('revealed');
+      return () => { label.textContent = old; b.classList.remove('revealed'); };
+    });
+    if (!ok) return;
     label.textContent = rt().copied;
-    setTimeout(() => { label.textContent = old; }, 1600);
+    b._okTimer = setTimeout(() => { label.textContent = old; }, 1600);
   });
   return b;
 }
@@ -306,20 +352,30 @@ function renderPrimary() {
   if (det.os === 'linux') {
     const linux = clients.filter(f => f.os !== 'windows');
     if (linux.length) {
-      if (!ui.pick || !linux.some(f => f.name === ui.pick)) {
-        const pref = linux.filter(f => f.os.startsWith(det.distro || 'fedora')).sort((a, b) => b.os.localeCompare(a.os))[0] || linux[0];
-        ui.pick = pref.name;
+      if (ui.pick && !linux.some(f => f.name === ui.pick)) ui.pick = null;
+      /* only a detected distribution preselects a package; otherwise the user must choose */
+      if (!ui.pick && det.distro) {
+        const pref = linux.filter(f => f.os.startsWith(det.distro)).sort((a, b) => b.os.localeCompare(a.os))[0];
+        if (pref) ui.pick = pref.name;
       }
       const cur = linux.find(f => f.name === ui.pick);
+      kicker.lastChild.textContent = (!cur ? t.kickerPick : det.distro && cur.os.startsWith(det.distro) ? t.kicker : t.kickerChosen) + ' · Linux';
       const seg = h('div', { class: 'seg dl-distros', role: 'group', 'aria-label': 'Distribution' },
-        linux.map(f => h('button', { type: 'button', 'aria-pressed': String(f.name === ui.pick), text: distroLabel(f), onclick: () => { ui.pick = f.name; renderPrimary(); } })));
+        linux.map(f => h('button', { type: 'button', 'aria-pressed': String(f.name === ui.pick), text: distroLabel(f), onclick: () => { ui.pick = f.name; renderPrimary(); $$('.dl-distros button')[linux.indexOf(f)].focus(); } })));
+      if (!cur) {
+        box.append(kicker,
+          h('h3', { class: 'dl-title', text: fill(t.forLinux, { v }) }),
+          h('p', { class: 'dl-sub', text: t.pickHint }),
+          seg);
+        return;
+      }
       box.append(kicker,
         h('h3', { class: 'dl-title', text: fill(t.forLinux, { v }) }),
         h('p', { class: 'dl-sub', text: t.subLinux }),
         seg,
         h('div', { class: 'dl-actions' },
           h('a', { class: 'btn btn-lg', href: url(cur), download: '' }, icon('i-download'), h('span', { text: t.get + ' · ' + fmtSize(cur.size) }))),
-        h('div', { class: 'code' }, h('button', { class: 'copy', type: 'button', 'aria-label': lang === 'en' ? EN.copy : 'Kopieren', onclick: e => copyText(installCmd(cur), e.currentTarget) }, icon('i-copy')), h('pre', {}, h('code', { text: installCmd(cur) }))),
+        h('div', { class: 'code' }, h('button', { class: 'copy', type: 'button', 'aria-label': lang === 'en' ? EN.copy : 'Kopieren', onclick: e => copyText(installCmd(cur), e.currentTarget, e.currentTarget.nextElementSibling) }, icon('i-copy')), h('pre', {}, h('code', { text: installCmd(cur) }))),
         h('div', { class: 'dl-hash' }, h('span', { text: 'SHA-256' }), hashButton(cur, true)));
       return;
     }
@@ -371,7 +427,7 @@ function renderDownloads() {
 
 $$('.seg button[data-kind]').forEach(b => b.addEventListener('click', () => {
   ui.kind = b.dataset.kind;
-  $$('.seg button[data-kind]').forEach(x => x.setAttribute('aria-selected', String(x === b)));
+  $$('.seg button[data-kind]').forEach(x => x.setAttribute('aria-pressed', String(x === b)));
   if (manifest) renderList();
 }));
 
@@ -386,7 +442,7 @@ fetch('downloads/latest.json', { cache: 'no-cache' })
 /* copy buttons in static code blocks */
 $$('.code .copy').forEach(b => b.addEventListener('click', () => {
   const pre = $('pre', b.parentElement);
-  if (pre) copyText(pre.textContent.trim(), b);
+  if (pre) copyText(pre.textContent.trim(), b, pre);
 }));
 
 /* ----------------------------------------------------------- hero eye */
@@ -414,6 +470,20 @@ eye.addEventListener('pointerdown', e => { eye.setPointerCapture(e.pointerId); t
 eye.addEventListener('keydown', e => { if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) { e.preventDefault(); tx(true); } });
 eye.addEventListener('keyup', e => { if (e.key === ' ' || e.key === 'Enter') tx(false); });
 eye.addEventListener('blur', () => tx(false));
+
+/* pause / play for continuous decorative motion (ticker, rings, equalizer); remembered for this session only */
+const motionBtn = $('#motion');
+if (motionBtn) {
+  const setMotion = paused => {
+    document.documentElement.classList.toggle('motion-off', paused);
+    motionBtn.setAttribute('aria-pressed', String(paused));
+    try { sessionStorage.setItem('icu-motion', paused ? 'off' : 'on'); } catch { /* private mode */ }
+  };
+  let saved = null;
+  try { saved = sessionStorage.getItem('icu-motion'); } catch { /* private mode */ }
+  setMotion(saved === 'off');
+  motionBtn.addEventListener('click', () => setMotion(motionBtn.getAttribute('aria-pressed') !== 'true'));
+}
 
 /* card spotlight */
 $$('.card').forEach(c => c.addEventListener('pointermove', e => {

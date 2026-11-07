@@ -1308,6 +1308,8 @@ pub fn status_pill(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
         galley.size().y.max(PILL_DOT) + 7.0,
     );
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), text));
     if !ui.is_rect_visible(rect) {
         return response;
     }
@@ -1576,6 +1578,8 @@ pub fn badge(ui: &mut Ui, text: &str, kind: BadgeKind) -> egui::Response {
     );
     let size = egui::vec2(galley.size().x + 14.0, galley.size().y + 6.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), text));
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         painter.rect_filled(rect, CornerRadius::same(R_CHIP), fill);

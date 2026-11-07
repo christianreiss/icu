@@ -1435,9 +1435,10 @@ impl MainView {
                         else { "Sendet, wenn du sprichst".into() }, ui.visuals().text_color())
                 };
                 let mut ptt_response = None;
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = design::ACTION_GAP;
-                    let width = (ui.available_width() - 280.0).max(44.0);
+                ui.spacing_mut().item_spacing.y = design::ACTION_GAP;
+                {
+                    // Own full-width row so the complete push-to-talk binding stays readable.
+                    let width = ui.available_width();
                     let mode = design::mode_button(ui, width, title, &hint, ink)
                         .on_hover_text(format!("{title} · {hint}\nKlicken: Sendemodus wechseln.\nRechtsklick oder Umschalt+F10: Bildschirm-Sprechtaste."));
                     if mode.clicked() { send(Command::ToggleMode); }
@@ -1454,6 +1455,9 @@ impl MainView {
                             design::button(ui, widgets::ButtonKind::Primary, "", "Sprechen")
                         }).inner.on_disabled_hover_text("Benötigt Push-to-Talk, eine Verbindung und jemanden im Raum; das Mikrofon muss freigegeben sein."));
                     });
+                }
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = design::ACTION_GAP;
                     let mic_state = if muted && !state.deafened { ActionState::Muted }
                         else if sending { ActionState::Sending } else { ActionState::Off };
                     let mic = ui.add_enabled_ui(!state.privacy_active, |ui| design::action(ui,

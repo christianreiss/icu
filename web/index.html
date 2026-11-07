@@ -65,6 +65,7 @@
         <button type="button" data-lang="de" aria-pressed="true">DE</button>
         <button type="button" data-lang="en" aria-pressed="false">EN</button>
       </div>
+      <button type="button" class="motion" id="motion" aria-pressed="false" aria-label="Dekorative Animationen pausieren" title="Dekorative Animationen pausieren" data-i18n-attr="aria-label:motion.label;title:motion.label"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path class="m-pause" d="M7 5v14M17 5v14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path class="m-play" d="M8 5l11 7-11 7z" fill="currentColor"/></svg></button>
       <a class="btn btn-sm" href="#download" aria-label="Download"><svg class="ic"><use href="#i-download"/></svg><span data-i18n="nav.download">Download</span></a>
     </div>
   </div>
@@ -98,8 +99,7 @@
         <span class="eye-state" aria-hidden="true"><b class="on" data-i18n="hero.tx">Sendet</b><b class="off" data-i18n="hero.rx">Hört zu</b></span>
       </button>
       <p class="eye-hint mono" data-i18n="hero.hint">↓ Auge gedrückt halten = PTT</p>
-      <figure class="shot shot-a"><img src="assets/img/shots/video-call.png" width="430" height="380" alt="ICU-Fenster mit zwei Teilnehmern, Kamerastatus, Signalstärke und den Tasten Stumm, Taub, Kamera und Overlay" data-i18n-attr="alt:hero.alt1"></figure>
-      <figure class="shot shot-b"><img src="assets/img/shots/call-window.png" width="430" height="445" alt="ICU-Hauptfenster: verbunden, ein Teilnehmer, Sende-Taste F12" data-i18n-attr="alt:hero.alt2"></figure>
+      <figure class="shot shot-b"><img src="assets/img/shots/room-main.png" width="400" height="580" alt="ICU-Hauptfenster: verbunden, Raumliste mit Teilnehmern, Push-to-Talk und Steuertasten" data-i18n-attr="alt:hero.alt2"></figure>
     </div>
   </div>
 </section>
@@ -205,12 +205,12 @@
       </div>
 
       <div class="panel" role="tabpanel" id="pan-main" aria-labelledby="tab-main">
-        <div class="frame"><img src="assets/img/shots/call-window.png" width="430" height="445" alt="ICU-Hauptfenster: verbunden, ein Teilnehmer, Sende-Taste F12, Tasten Stumm, Taub, Kamera und Overlay" loading="lazy" data-i18n-attr="alt:hero.alt2"></div>
+        <div class="frame"><img src="assets/img/shots/room-main.png" width="400" height="580" alt="ICU-Hauptfenster: verbunden mit icu.example.org, sechs Personen im Raum, Anna spricht, Symbole für stumm, taub und Kamera, unten Push-to-Talk und Steuertasten" loading="lazy" data-i18n-attr="alt:v.1.alt"></div>
         <div class="cap">
           <h3 data-i18n="v.1.h">Ein Raum, alle Teilnehmer.</h3>
           <ul>
-            <li data-i18n="v.1.a">PTT-Taste (hier F12) und Pegelanzeige direkt im Fenster</li>
-            <li data-i18n="v.1.b">Stumm, Taub, Kamera und Overlay sind je ein Klick</li>
+            <li data-i18n="v.1.a">Raumliste mit Sprecher-Markierung, Signalstärke sowie Stumm-, Taub- und Kamera-Status je Person</li>
+            <li data-i18n="v.1.b">Push-to-Talk mit Tastenangabe und die Steuertasten unten im Fenster</li>
             <li data-i18n="v.1.c">Tray-Icon zeigt Verbunden, Mute und Deafen</li>
             <li data-i18n="v.1.d">Einrichtungsassistent beim ersten Start: Geräte, Sprechen, Klang</li>
           </ul>
@@ -218,7 +218,7 @@
       </div>
 
       <div class="panel" role="tabpanel" id="pan-cam" aria-labelledby="tab-cam" hidden>
-        <div class="frame"><img src="assets/img/shots/video-call.png" width="430" height="380" alt="ICU mit zwei Teilnehmern, Sprecher-Indikator, Kamerastatus und Signalstärke" loading="lazy" data-i18n-attr="alt:hero.alt1"></div>
+        <div class="frame"><img src="assets/img/shots/video-call.png" width="430" height="380" alt="Frühere Programmversion: ICU mit zwei Teilnehmern, Sprecher-Indikator, Kamerastatus und Signalstärke" loading="lazy" data-i18n-attr="alt:v.2.alt"><small data-i18n="v.2.note">Bild aus einer früheren Programmversion</small></div>
         <div class="cap">
           <h3 data-i18n="v.2.h">Videocall mit Kamerakacheln.</h3>
           <ul>
@@ -230,7 +230,7 @@
       </div>
 
       <div class="panel" role="tabpanel" id="pan-ovl" aria-labelledby="tab-ovl" hidden>
-        <div class="frame frame-game"><div class="game" aria-hidden="true"><span class="game-tile"><img src="assets/img/shots/overlay.png" width="155" height="145" alt="" loading="lazy"></span></div><small data-i18n="v.3.note">Schematisch: die echte Overlay-Kachel über einem Spielfenster</small></div>
+        <div class="frame frame-game"><div class="game" aria-hidden="true"><span class="game-tile"><img src="assets/img/shots/overlay.png" width="155" height="145" alt="" loading="lazy"></span></div><small data-i18n="v.3.note">Schematisch, Kachel aus einer früheren Programmversion, über einem Spielfenster</small></div>
         <div class="cap">
           <h3 data-i18n="v.3.h">Overlay im Spiel.</h3>
           <ul>
@@ -242,21 +242,21 @@
       </div>
 
       <div class="panel" role="tabpanel" id="pan-inv" aria-labelledby="tab-inv" hidden>
-        <div class="frame"><img src="assets/img/shots/invite.png" width="590" height="635" alt="Dialog „Mit ICU verbinden“ mit Eingabefeld für die Einladung" loading="lazy" data-i18n-attr="alt:v.4.alt"></div>
+        <div class="frame"><img src="assets/img/shots/join-invite.png" width="560" height="600" alt="Dialog „Mit ICU verbinden“: Server, Adresse und CA-Fingerabdruck der Einladung, Feld für deinen Namen, Tasten Zurück und Beitreten" loading="lazy" data-i18n-attr="alt:v.4.alt"></div>
         <div class="cap">
           <h3 data-i18n="v.4.h">Einladung statt Passwort.</h3>
           <ul>
-            <li data-i18n="v.4.a">Einladung einfügen oder die <code>.icu</code>-Datei ins Fenster ziehen</li>
+            <li data-i18n="v.4.a">Einladung einfügen oder die <code>.icu</code>-Datei per Doppelklick öffnen</li>
             <li data-i18n="v.4.b">Server, Adresse und CA-Fingerabdruck stehen vor dem Beitreten da</li>
-            <li data-i18n="v.4.c">„Beitreten“ holt im selben Schritt dein Client-Zertifikat</li>
+            <li data-i18n="v.4.c">Du wählst deinen Namen; er steht später in deinem Zertifikat</li>
           </ul>
         </div>
       </div>
 
       <div class="panel" role="tabpanel" id="pan-con" aria-labelledby="tab-con" hidden>
         <div class="frame frame-tall">
-          <img class="theme-dark" src="assets/img/shots/connection-details-dark.png" width="900" height="914" alt="Verbindungspfad im dunklen Theme: Nutzer, Server und du, mit RTT, Paketverlust und Zertifikatskette" loading="lazy" data-i18n-attr="alt:v.5.alt1">
-          <img class="theme-light" src="assets/img/shots/connection-details-light.png" width="900" height="914" alt="Verbindungspfad im hellen Theme" loading="lazy" data-i18n-attr="alt:v.5.alt2">
+          <img class="theme-dark" src="assets/img/shots/connection-who-dark.png" width="720" height="780" alt="Verbindungsdetails, Reiter „Wer“, im dunklen Theme: Teilnehmerliste mit Laufzeit, Paketverlust und Status je Person" loading="lazy" data-i18n-attr="alt:v.5.alt1">
+          <img class="theme-light" src="assets/img/shots/connection-who-light.png" width="720" height="780" alt="Verbindungsdetails, Reiter „Wer“, im hellen Theme" loading="lazy" data-i18n-attr="alt:v.5.alt2">
           <div class="theme-switch" role="group" aria-label="Theme">
             <button type="button" data-theme-shot="dark" aria-pressed="true" data-i18n="v.5.dark">Dunkel</button>
             <button type="button" data-theme-shot="light" aria-pressed="false" data-i18n="v.5.light">Hell</button>
@@ -265,8 +265,8 @@
         <div class="cap">
           <h3 data-i18n="v.5.h">Wer mit wem spricht — und worauf das beruht.</h3>
           <ul>
-            <li data-i18n="v.5.a">RTT zum Server und Audio-Paketverlust je Teilnehmer</li>
-            <li data-i18n="v.5.b">Zertifikatskette und Vertrauensanker aus deinem Passport</li>
+            <li data-i18n="v.5.a">Laufzeit zum Server und Paketverlust (in ‰, am eigenen Jitterpuffer gemessen) je Teilnehmer</li>
+            <li data-i18n="v.5.b">Weitere Reiter: Server, Netz, Krypto, Audio und Video, dazu „Bericht kopieren“</li>
             <li data-i18n="v.5.c">Moderation für Admins: stumm, taub, rauswerfen, sperren</li>
             <li data-i18n="v.5.d">Ehrlich beschriftet: Beide Strecken sind transportverschlüsselt, der Server kann die weitergeleiteten Medien lesen</li>
           </ul>
@@ -381,9 +381,9 @@ sudo apt install ./icu_<span class="ver">0.1.4</span>-1+deb13_amd64.deb  # Debia
     <div class="dl-all reveal">
       <div class="dl-all-head">
         <h3 data-i18n="d.all">Alle Pakete</h3>
-        <div class="seg" role="tablist" aria-label="Client oder Server" data-i18n-attr="aria-label:d.kind">
-          <button type="button" role="tab" data-kind="client" aria-selected="true" data-i18n="d.client">Client</button>
-          <button type="button" role="tab" data-kind="server" aria-selected="false" data-i18n="d.server">Server</button>
+        <div class="seg" role="group" aria-label="Client oder Server" data-i18n-attr="aria-label:d.kind">
+          <button type="button" data-kind="client" aria-pressed="true" data-i18n="d.client">Client</button>
+          <button type="button" data-kind="server" aria-pressed="false" data-i18n="d.server">Server</button>
         </div>
       </div>
       <ul class="pkgs" id="pkgs"></ul>
