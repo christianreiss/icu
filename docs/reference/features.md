@@ -36,7 +36,7 @@ Alle abgerufen am 2026-09-20.
 - Mumble GitHub README: https://github.com/mumble-voip/mumble
 - TeamSpeak Features Overview: https://www.teamspeak.com/en/features/overview/
 - xdg-desktop-portal GlobalShortcuts (für Hotkey-Bindung unter Wayland): https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.GlobalShortcuts.html
-- ICU README: /home/chris/Documents/ICU/README.md
+- ICU README: /home/chris/Documents/Projects/Apps/ICU/README.md
 
 Nicht erreichbar (kein Inhalt): Mumble-Wiki-Seiten zu Whisper und Priority Speaker (leiten auf den Doku-Index um), `https://www.teamspeak.com/en/features/` und `/features/security/` (404). Whisper/Priority Speaker sind daher nur aus der Aufgabenstellung und allgemeinem Wissen beschrieben — unbelegt per Vendor-Doku.
 

@@ -29,7 +29,7 @@ virtuelle Geräte, unabhängige Referenzkanäle und laufende Kanalwechsel.
 ## 0. Bauen
 
 ```sh
-cd ~/Documents/ICU
+cd ~/Documents/Projects/Apps/ICU
 cargo build --release -p icu-client                   # Debug geht auch, dann target/debug/…
 cargo build --profile release-server -p icu-server    # wie im Paket: ein Panic beendet nur eine Sitzung
 ```
@@ -47,7 +47,7 @@ server_name = "localhost"
 public_host = "127.0.0.1:4711"
 
 [paths]
-state_dir = "/home/chris/Documents/ICU/.local/dev-server/state"
+state_dir = "/home/chris/Documents/Projects/Apps/ICU/.local/dev-server/state"
 runtime_dir = "/run/user/1000/icu-live"
 ```
 
