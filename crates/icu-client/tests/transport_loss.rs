@@ -35,6 +35,8 @@ fn ten_and_twenty_ms_frames_survive_zero_to_ten_percent_loss() {
                     (
                         seq as u64 * frame_ms + 25 + (seq * 29 % 7) as u64,
                         Packet {
+                            media_time: 0,
+                            media_epoch: 0,
                             gain_epoch: 0,
                             seq: seq as u16,
                             ts: (seq * samples) as u32,

@@ -13,7 +13,7 @@ pub const KIND_AUDIO_V1: u8 = 0x01;
 pub const KIND_VIDEO_V1: u8 = 0x02;
 
 /// Audio header size in bytes.
-pub const AUDIO_HEADER_LEN: usize = 14;
+pub const AUDIO_HEADER_LEN: usize = 26;
 /// Smallest valid audio datagram: header plus one Opus byte.
 pub const AUDIO_MIN_DATAGRAM: usize = AUDIO_HEADER_LEN + 1;
 /// Largest Opus payload in one datagram.
@@ -22,7 +22,7 @@ pub const AUDIO_MAX_PAYLOAD: usize = 400;
 pub const AUDIO_MAX_DATAGRAM: usize = AUDIO_HEADER_LEN + AUDIO_MAX_PAYLOAD;
 
 /// Video header size in bytes.
-pub const VIDEO_HEADER_LEN: usize = 12;
+pub const VIDEO_HEADER_LEN: usize = 24;
 /// Largest video frame payload (`docs/reference/protocol.md` §4, §7).
 pub const VIDEO_MAX_FRAME: usize = 512 * 1024;
 /// Largest picture a receiver decodes, in pixels (`docs/reference/protocol.md` §4): twice
@@ -34,6 +34,9 @@ pub const VIDEO_MAX_HEIGHT: usize = 480;
 /// Most reference frames an SPS may ask for; the decoder's picture buffer
 /// grows with it. The encoder uses one.
 pub const VIDEO_MAX_REF_FRAMES: u32 = 4;
+
+/// bit1 of either media header: timing is estimated, not device-derived.
+pub const MEDIA_FLAG_TIMING_ESTIMATED: u8 = 1 << 1;
 
 /// bit0 of the audio `flags`: last packet of a talk spurt.
 pub const AUDIO_FLAG_END: u8 = 1 << 0;
@@ -61,6 +64,10 @@ pub struct AudioHeader {
     pub ts: u32,
     /// Applied sender gain generation (protocol minor 6).
     pub gain_epoch: u32,
+    /// Capture time in microseconds on the sender's shared monotonic media clock.
+    pub media_time: u64,
+    /// Media clock generation; zero means legacy/unknown timing.
+    pub media_epoch: u32,
 }
 
 impl AudioHeader {
@@ -78,6 +85,8 @@ impl AudioHeader {
         out[4..6].copy_from_slice(&self.seq.to_le_bytes());
         out[6..10].copy_from_slice(&self.ts.to_le_bytes());
         out[10..14].copy_from_slice(&self.gain_epoch.to_le_bytes());
+        out[14..22].copy_from_slice(&self.media_time.to_le_bytes());
+        out[22..26].copy_from_slice(&self.media_epoch.to_le_bytes());
         out
     }
 
@@ -95,7 +104,7 @@ impl AudioHeader {
     /// Parses a datagram and returns header plus the Opus payload slice.
     ///
     /// Enforces the length window from `docs/reference/protocol.md` §3: the server drops
-    /// datagrams below 15 or above 414 bytes.
+    /// datagrams below 27 or above 426 bytes.
     pub fn decode(buf: &[u8]) -> Result<(AudioHeader, &[u8]), ProtoError> {
         if buf.len() < AUDIO_MIN_DATAGRAM || buf.len() > AUDIO_MAX_DATAGRAM {
             return Err(ProtoError::BadPayloadLen(buf.len()));
@@ -109,6 +118,8 @@ impl AudioHeader {
             seq: u16::from_le_bytes([buf[4], buf[5]]),
             ts: u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]),
             gain_epoch: u32::from_le_bytes([buf[10], buf[11], buf[12], buf[13]]),
+            media_time: u64::from_le_bytes(buf[14..22].try_into().unwrap()),
+            media_epoch: u32::from_le_bytes(buf[22..26].try_into().unwrap()),
         };
         Ok((header, &buf[AUDIO_HEADER_LEN..]))
     }
@@ -123,15 +134,21 @@ pub struct VideoHeader {
     pub speaker: Session,
     /// Per sender frame counter, wraps.
     pub seq: u16,
-    /// Same 48 kHz clock as audio.
+    /// Legacy 48 kHz video pacing clock; A/V alignment uses `media_time`.
     pub ts: u32,
     /// [`VIDEO_CODEC_H264`] or [`VIDEO_CODEC_MJPEG`].
     pub codec: u8,
+    /// Capture time in microseconds on the sender's shared monotonic media clock.
+    pub media_time: u64,
+    /// Media clock generation; zero means legacy/unknown timing.
+    pub media_epoch: u32,
 }
 
 impl Default for VideoHeader {
     fn default() -> Self {
         VideoHeader {
+            media_time: 0,
+            media_epoch: 0,
             flags: 0,
             speaker: 0,
             seq: 0,
@@ -157,6 +174,8 @@ impl VideoHeader {
         out[6..10].copy_from_slice(&self.ts.to_le_bytes());
         out[10] = self.codec;
         out[11] = 0;
+        out[12..20].copy_from_slice(&self.media_time.to_le_bytes());
+        out[20..24].copy_from_slice(&self.media_epoch.to_le_bytes());
         out
     }
 
@@ -174,6 +193,8 @@ impl VideoHeader {
             seq: u16::from_le_bytes([buf[4], buf[5]]),
             ts: u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]),
             codec: buf[10],
+            media_time: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
+            media_epoch: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
         })
     }
 }
@@ -213,6 +234,8 @@ mod tests {
         for header in [
             AudioHeader::default(),
             AudioHeader {
+                media_time: 0x1122_3344_5566_7788,
+                media_epoch: 0x99aa_bbcc,
                 gain_epoch: 0,
                 flags: AUDIO_FLAG_END,
                 speaker: 0xBEEF,
@@ -220,6 +243,8 @@ mod tests {
                 ts: 0xDEAD_BEEF,
             },
             AudioHeader {
+                media_time: 0,
+                media_epoch: 0,
                 gain_epoch: 0,
                 flags: 0,
                 speaker: u16::MAX,
@@ -243,6 +268,8 @@ mod tests {
     #[test]
     fn video_header_roundtrip_and_reserved_byte_ignored() {
         let header = VideoHeader {
+            media_time: 0x1122_3344_5566_7788,
+            media_epoch: 0x99aa_bbcc,
             flags: VIDEO_FLAG_KEYFRAME,
             speaker: 3,
             seq: 1234,
@@ -270,17 +297,17 @@ mod tests {
         assert_eq!(payload, &[1, 2, 3]);
     }
 
-    /// `docs/reference/protocol.md` §3: drop below 15 and above 414 bytes.
+    /// `docs/reference/protocol.md` §3: drop below 27 and above 426 bytes.
     #[test]
     fn audio_length_window() {
         let ok_min = AudioHeader::default().datagram(&[0]).unwrap();
-        assert_eq!(ok_min.len(), 15);
+        assert_eq!(ok_min.len(), AUDIO_MIN_DATAGRAM);
         assert!(AudioHeader::decode(&ok_min).is_ok());
 
         let ok_max = AudioHeader::default()
             .datagram(&[0; AUDIO_MAX_PAYLOAD])
             .unwrap();
-        assert_eq!(ok_max.len(), 414);
+        assert_eq!(ok_max.len(), AUDIO_MAX_DATAGRAM);
         assert!(AudioHeader::decode(&ok_max).is_ok());
 
         assert!(matches!(
@@ -291,7 +318,7 @@ mod tests {
         too_big.push(0);
         assert!(matches!(
             AudioHeader::decode(&too_big),
-            Err(ProtoError::BadPayloadLen(415))
+            Err(ProtoError::BadPayloadLen(427))
         ));
         assert!(matches!(
             AudioHeader::default().datagram(&[]),
@@ -326,6 +353,8 @@ mod tests {
     #[test]
     fn speaker_overwrite_in_place() {
         let mut dg = AudioHeader {
+            media_time: 0,
+            media_epoch: 0,
             gain_epoch: 0,
             speaker: 0,
             seq: 42,

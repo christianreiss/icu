@@ -97,7 +97,7 @@ pub const VIDEO_FRAME_TIMEOUT_S: u64 = 5;
 /// Server receive buffer: one speaker's audio per connection.
 pub const DATAGRAM_BUFFER_BYTES: usize = 64 * 1024;
 /// Server send / client receive buffers carry all other speakers. Reserve a
-/// 100-ms burst at the 64-user, 110-packet/s ceiling, including 414-byte wire
+/// 100-ms burst at the 64-user, 110-packet/s ceiling, including 426-byte wire
 /// packets and Quinn's per-packet bookkeeping. 64 KiB dropped still-fresh
 /// audio during short scheduling gaps. The send age limit remains 100 ms;
 /// the receiver's jitter buffer discards stale media independently.

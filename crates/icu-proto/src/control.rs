@@ -25,12 +25,13 @@ use crate::{
 /// generations and extends the audio header to 14 bytes; both ends update together.
 /// Minor 7 makes feedback policy 2 mandatory: short speech-only RMS windows,
 /// raw target error, independently consumed reporter windows and matched hints.
-pub const MINOR: u16 = 7;
+/// Minor 8 adds shared capture time and clock epochs to both media headers.
+pub const MINOR: u16 = 8;
 
 /// Lowest protocol minor this build talks to, in both directions: the server
 /// closes a `Hello` below it with `VERSION_UNSUPPORTED`, the client a
 /// `Welcome` whose `server_minor` is below it (`docs/reference/protocol.md` §8).
-pub const MIN_PEER_MINOR: u16 = 7;
+pub const MIN_PEER_MINOR: u16 = 8;
 
 /// Peer-assisted audio measurements and hints (bit 0).
 pub const CAP_AUDIO_FEEDBACK: u32 = 1;

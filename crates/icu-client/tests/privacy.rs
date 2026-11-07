@@ -140,6 +140,8 @@ async fn privacy_replaces_sent_and_self_video_and_releases_the_camera() {
         fn next_frame(&mut self) -> Result<RgbFrame, String> {
             std::thread::sleep(Duration::from_millis(66));
             Ok(RgbFrame {
+                captured_at: None,
+                timing_accurate: false,
                 width: 320,
                 height: 240,
                 rgb: [220, 20, 20].repeat(320 * 240),

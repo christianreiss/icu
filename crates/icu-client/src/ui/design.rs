@@ -204,7 +204,12 @@ pub fn mode_button(ui: &mut Ui, width: f32, title: &str, hint: &str, ink: Color3
 pub fn mode_text_fits(ui: &Ui, width: f32, title: &str, hint: &str) -> bool {
     let measure = |text: &str, font: FontId| {
         egui::WidgetText::from(RichText::new(text).font(font))
-            .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body)
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                egui::TextStyle::Body,
+            )
             .size()
             .x
     };

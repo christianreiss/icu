@@ -4,6 +4,7 @@ Ergebnisse, Entscheidungen und offene Punkte gelten für den jeweils genannten
 Stand. Aktuelle Referenzen stehen unter [reference/](../README.md).
 Die frühen Wire-Entwürfe sind durch [protocol.md](../reference/protocol.md) ersetzt.
 
+- [Automatische Videoklarheit und Medienzeit — 2026-11-07](video-quality-2026-11-07.md)
 - [Release 0.1.20 — Client-Updates, Oberfläche und Tray, 2026-10-30](release-0.1.20-2026-10-30.md)
 - [Release 0.1.18 — 2026-10-24](release-0.1.18-2026-10-24.md)
 - [Privacy-Modus — 2026-10-24](privacy-mode-2026-10-24.md)

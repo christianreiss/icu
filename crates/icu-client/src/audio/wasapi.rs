@@ -60,14 +60,16 @@ use windows::{
                 StructuredStorage::PropVariantToStringAlloc, CLSCTX_ALL, COINIT_MULTITHREADED,
                 STGM_READ,
             },
+            Performance::{QueryPerformanceCounter, QueryPerformanceFrequency},
             Threading::{CreateEventW, WaitForSingleObject},
         },
     },
 };
 
 use super::backend::{
-    AudioBackend, BackendError, BackendEvent, CaptureCallback, DeviceInfo, DeviceKind,
-    PlaybackCallback, ReferenceCallback, ReferenceFrame, StreamKind, BLOCK_SAMPLES, SAMPLE_RATE,
+    AudioBackend, AudioTiming, BackendError, BackendEvent, CaptureCallback, DeviceInfo, DeviceKind,
+    PlaybackCallback, ReferenceCallback, ReferenceFrame, StreamKind, TimedCaptureCallback,
+    TimedPlaybackCallback, BLOCK_SAMPLES, SAMPLE_RATE,
 };
 
 /// How long a stream thread waits for its event before looking at the stop
@@ -496,7 +498,14 @@ impl AudioBackend for WasapiBackend {
     fn open_capture(
         &mut self,
         device: Option<&str>,
-        cb: CaptureCallback,
+        mut cb: CaptureCallback,
+    ) -> Result<(), BackendError> {
+        self.open_capture_timed(device, Box::new(move |samples, _| cb(samples)))
+    }
+    fn open_capture_timed(
+        &mut self,
+        device: Option<&str>,
+        cb: TimedCaptureCallback,
     ) -> Result<(), BackendError> {
         self.selected_channel.store(u16::MAX, Ordering::Relaxed);
         self.open(StreamKind::Capture, device, Callback::Capture(cb))
@@ -513,7 +522,14 @@ impl AudioBackend for WasapiBackend {
     fn open_playback(
         &mut self,
         device: Option<&str>,
-        cb: PlaybackCallback,
+        mut cb: PlaybackCallback,
+    ) -> Result<(), BackendError> {
+        self.open_playback_timed(device, Box::new(move |samples, _| cb(samples)))
+    }
+    fn open_playback_timed(
+        &mut self,
+        device: Option<&str>,
+        cb: TimedPlaybackCallback,
     ) -> Result<(), BackendError> {
         self.open(StreamKind::Playback, device, Callback::Playback(cb))
     }
@@ -648,9 +664,9 @@ fn endpoint_level(
 }
 
 enum Callback {
-    Capture(CaptureCallback),
+    Capture(TimedCaptureCallback),
     Reference(ReferenceCallback),
-    Playback(PlaybackCallback),
+    Playback(TimedPlaybackCallback),
 }
 
 /// What a stream thread opens.
@@ -776,6 +792,7 @@ struct Stream {
     device_id: String,
     /// Captured samples not yet handed on as a whole block.
     pending: Vec<f32>,
+    pending_at: Option<AudioTiming>,
     reference: Vec<ReferenceFrame>,
     selector: Option<super::channels::CaptureSelector>,
     selected_channel: Arc<AtomicU16>,
@@ -1017,6 +1034,7 @@ impl Stream {
                 pending: Vec::with_capacity(
                     buffer_frames as usize + period as usize + BLOCK_SAMPLES * 2,
                 ),
+                pending_at: None,
                 reference: vec![[0.0; 8]; 1024],
                 selector,
                 selected_channel: spec.selected_channel.clone(),
@@ -1108,7 +1126,7 @@ impl Stream {
     /// Takes microphone packets and selects one native input channel.
     fn read(
         &mut self,
-        cb: &mut CaptureCallback,
+        cb: &mut TimedCaptureCallback,
         events: &mpsc::Sender<BackendEvent>,
     ) -> windows::core::Result<Option<usize>> {
         let Some(capture) = &self.capture else {
@@ -1123,7 +1141,8 @@ impl Stream {
                 let mut data = std::ptr::null_mut();
                 let mut frames = 0u32;
                 let mut flags = 0u32;
-                capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
+                let mut qpc = 0u64;
+                capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
                 if self.capture_timeline.begin_packet(
                     &mut self.pending,
                     flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
@@ -1132,6 +1151,12 @@ impl Stream {
                     return Ok(None);
                 }
                 let n = frames as usize;
+                if self.pending.is_empty() {
+                    self.pending_at = Some(
+                        capture_qpc_time(qpc, flags)
+                            .unwrap_or_else(|| AudioTiming::estimated_capture(n)),
+                    );
+                }
                 received += n;
                 if self.pending.len() + n > self.pending.capacity() {
                     capture.ReleaseBuffer(frames)?;
@@ -1144,6 +1169,10 @@ impl Stream {
                     let selector = self.selector.as_mut().expect("capture selector");
                     if selector.update(samples, &self.selected_channel, events) {
                         self.pending.clear();
+                        self.pending_at = Some(
+                            capture_qpc_time(qpc, flags)
+                                .unwrap_or_else(|| AudioTiming::estimated_capture(n)),
+                        );
                     }
                     self.pending.extend(
                         samples
@@ -1157,7 +1186,11 @@ impl Stream {
                 let min = (self.period as usize).div_ceil(BLOCK_SAMPLES).max(2) * BLOCK_SAMPLES;
                 let whole = self.pending.len() / BLOCK_SAMPLES * BLOCK_SAMPLES;
                 if whole >= min {
-                    cb(&self.pending[..whole]);
+                    let timing = self
+                        .pending_at
+                        .unwrap_or_else(|| AudioTiming::estimated_capture(self.pending.len()));
+                    cb(&self.pending[..whole], timing);
+                    self.pending_at = Some(timing.shifted(whole));
                     self.pending.drain(..whole);
                 }
             }
@@ -1216,7 +1249,7 @@ impl Stream {
 
     /// Fills the entire free part of the endpoint buffer, the
     /// mono voice on the front pair (or center), silence elsewhere.
-    fn write(&mut self, cb: &mut PlaybackCallback) -> windows::core::Result<usize> {
+    fn write(&mut self, cb: &mut TimedPlaybackCallback) -> windows::core::Result<usize> {
         let Some(render) = &self.render else {
             return Ok(0);
         };
@@ -1234,11 +1267,46 @@ impl Stream {
             }
             let data = render.GetBuffer(frames as u32)?;
             let out = std::slice::from_raw_parts_mut(data as *mut f32, frames * self.channels);
-            super::channels::render_voice(&mut self.block[..frames], out, &self.voice, cb);
+            let timing = AudioTiming {
+                at: Instant::now() + Duration::from_secs_f64(f64::from(padding) / 48_000.0),
+                accurate: false,
+            };
+            super::channels::render_voice(
+                &mut self.block[..frames],
+                out,
+                &self.voice,
+                &mut |samples| cb(samples, timing),
+            );
             render.ReleaseBuffer(frames as u32, 0)?;
             Ok(frames)
         }
     }
+}
+
+// WASAPI reports QPC positions in 100-ns units, not raw performance ticks.
+fn capture_qpc_time(qpc: u64, flags: u32) -> Option<AudioTiming> {
+    if qpc == 0 || flags & 4 != 0 {
+        return None;
+    }
+    let mut ticks = 0i64;
+    let mut frequency = 0i64;
+    // SAFETY: writable scalar outputs; APIs have no lifetime requirements.
+    unsafe {
+        QueryPerformanceCounter(&mut ticks).ok()?;
+        QueryPerformanceFrequency(&mut frequency).ok()?;
+    }
+    if frequency <= 0 {
+        return None;
+    }
+    let current = i128::from(ticks) * 10_000_000 / i128::from(frequency);
+    let age = current - i128::from(qpc);
+    if !(0..=10_000_000).contains(&age) {
+        return None;
+    }
+    Some(AudioTiming {
+        at: Instant::now().checked_sub(Duration::from_nanos(age as u64 * 100))?,
+        accurate: true,
+    })
 }
 
 /// Stream category and, for the microphone, RAW (no system effects in
@@ -1383,8 +1451,10 @@ mod tests {
                 end.store(true, Ordering::SeqCst);
             });
             let mut callback = match kind {
-                StreamKind::Playback => Callback::Playback(Box::new(|samples| samples.fill(0.0))),
-                StreamKind::Capture => Callback::Capture(Box::new(|_| {})),
+                StreamKind::Playback => {
+                    Callback::Playback(Box::new(|samples, _| samples.fill(0.0)))
+                }
+                StreamKind::Capture => Callback::Capture(Box::new(|_, _| {})),
                 StreamKind::Reference => Callback::Reference(Box::new(|_, _| {})),
             };
             let ended = stream.pump(&mut callback, &stop, &mpsc::channel().0, || false);

@@ -12,6 +12,7 @@ pub mod dsp;
 pub mod engine;
 pub mod hotkey;
 pub mod instance;
+pub mod media;
 pub mod net;
 pub mod netcond;
 pub mod notify;

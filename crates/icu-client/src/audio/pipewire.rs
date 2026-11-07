@@ -39,8 +39,9 @@ use pipewire as pw;
 use pw::{properties::properties, spa};
 
 use super::backend::{
-    AudioBackend, BackendError, BackendEvent, CaptureCallback, DeviceInfo, DeviceKind,
-    PlaybackCallback, ReferenceCallback, ReferenceFrame, StreamKind, BLOCK_SAMPLES, SAMPLE_RATE,
+    AudioBackend, AudioTiming, BackendError, BackendEvent, CaptureCallback, DeviceInfo, DeviceKind,
+    PlaybackCallback, ReferenceCallback, ReferenceFrame, StreamKind, TimedCaptureCallback,
+    TimedPlaybackCallback, BLOCK_SAMPLES, SAMPLE_RATE,
 };
 use crate::sync::lock;
 
@@ -66,9 +67,9 @@ enum Cmd {
 }
 
 enum Handler {
-    Capture(CaptureCallback),
+    Capture(TimedCaptureCallback),
     Reference(ReferenceCallback),
-    Playback(PlaybackCallback),
+    Playback(TimedPlaybackCallback),
 }
 
 /// Per stream user data living inside the PipeWire callbacks.
@@ -203,7 +204,14 @@ impl AudioBackend for PipeWireBackend {
     fn open_capture(
         &mut self,
         device: Option<&str>,
-        cb: CaptureCallback,
+        mut cb: CaptureCallback,
+    ) -> Result<(), BackendError> {
+        self.open_capture_timed(device, Box::new(move |samples, _| cb(samples)))
+    }
+    fn open_capture_timed(
+        &mut self,
+        device: Option<&str>,
+        cb: TimedCaptureCallback,
     ) -> Result<(), BackendError> {
         self.selected_channel.store(u16::MAX, Ordering::Relaxed);
         self.open(StreamKind::Capture, device, Handler::Capture(cb))
@@ -220,7 +228,14 @@ impl AudioBackend for PipeWireBackend {
     fn open_playback(
         &mut self,
         device: Option<&str>,
-        cb: PlaybackCallback,
+        mut cb: PlaybackCallback,
+    ) -> Result<(), BackendError> {
+        self.open_playback_timed(device, Box::new(move |samples, _| cb(samples)))
+    }
+    fn open_playback_timed(
+        &mut self,
+        device: Option<&str>,
+        cb: TimedPlaybackCallback,
     ) -> Result<(), BackendError> {
         self.open(StreamKind::Playback, device, Handler::Playback(cb))
     }
@@ -722,6 +737,13 @@ fn open_stream(
             data.channels = channels;
         })
         .process(|stream, data| {
+            let timing = stream.time().ok().and_then(|time| {
+                let rate=time.rate();
+                if rate.denom == 0 {return None;}
+                let delay=(time.delay() as f64 * f64::from(rate.num) / f64::from(rate.denom) * 1e9) as i64;
+                let stamp=if matches!(data.handler, Handler::Capture(_)) {time.now().saturating_sub(delay.max(0))} else {time.now().saturating_add(delay.max(0)).saturating_add((time.queued() / 4 * 1_000_000_000 / 48_000) as i64)};
+                AudioTiming::monotonic_ns(stamp)
+            });
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -744,7 +766,7 @@ fn open_stream(
                     };
                     let offset = offset.min(bytes.len());
                     let size = size.min(bytes.len() - offset);
-                    for raw in bytes[offset..offset + size].chunks(1024 * channels * 4) {
+                    for (part, raw) in bytes[offset..offset + size].chunks(1024 * channels * 4).enumerate() {
                         let frames = raw.len() / (channels * 4);
                         let count = frames * channels;
                         for (sample, raw) in
@@ -762,7 +784,7 @@ fn open_stream(
                         {
                             *sample = frame[selector.channel()];
                         }
-                        cb(&data.mono[..frames]);
+                        cb(&data.mono[..frames], timing.unwrap_or_else(|| AudioTiming::estimated_capture(size / (channels * 4))).shifted(part * 1024));
                     }
                 }
                 Handler::Reference(cb) => {
@@ -797,10 +819,11 @@ fn open_stream(
                     } else {
                         requested.min(capacity)
                     };
-                    for raw in bytes[..n * 4].chunks_mut(data.mono.len() * 4) {
+                    let chunk_frames=data.mono.len();
+                    for (part, raw) in bytes[..n * 4].chunks_mut(chunk_frames * 4).enumerate() {
                         let frames = raw.len() / 4;
                         data.mono[..frames].fill(0.0);
-                        cb(&mut data.mono[..frames]);
+                        cb(&mut data.mono[..frames], timing.unwrap_or_else(AudioTiming::estimated_playback).shifted(part * chunk_frames));
                         for (dst, sample) in raw.as_chunks_mut::<4>().0.iter_mut().zip(&data.mono[..frames]) {
                             dst.copy_from_slice(&sample.to_le_bytes());
                         }

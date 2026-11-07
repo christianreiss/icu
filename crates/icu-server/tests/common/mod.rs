@@ -480,6 +480,8 @@ impl Client {
     /// Sends one audio datagram with explicit flags.
     pub fn send_audio_flags(&self, seq: u16, ts: u32, payload: &[u8], flags: u8) {
         let header = AudioHeader {
+            media_time: 0,
+            media_epoch: 0,
             gain_epoch: 0,
             flags,
             speaker: 0,
@@ -503,6 +505,8 @@ impl Client {
     /// Sends one video frame on its own unidirectional stream.
     pub async fn send_video(&self, seq: u16, ts: u32, keyframe: bool, payload: &[u8]) {
         let header = VideoHeader {
+            media_time: 0,
+            media_epoch: 0,
             flags: if keyframe {
                 icu_proto::header::VIDEO_FLAG_KEYFRAME
             } else {

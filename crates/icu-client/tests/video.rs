@@ -52,6 +52,10 @@ async fn keyframe_request_produces_an_idr() {
     let (first, _) = bob.recv_video(SOON).await.expect("a video frame arrives");
     assert_eq!(first.speaker, alice);
     assert_eq!(first.codec, icu_proto::header::VIDEO_CODEC_H264);
+    assert!(
+        first.media_epoch > 0 && first.media_time > 0,
+        "capture timing survives relay"
+    );
 
     let forced_before = DebugStats::get(&engine.stats().keyframes_forced);
     let mut bob = bob;
@@ -148,6 +152,10 @@ async fn received_video_is_decoded_per_speaker() {
     let frames = engine_b.video_frames();
     let (_, f) = frames.iter().find(|(s, _)| *s == alice).unwrap();
     assert_eq!(f.rgba.len(), 320 * 240 * 4);
+    assert!(
+        f.stamp.micros > 0 && f.stamp.epoch > 0,
+        "decode retains original capture time"
+    );
     assert!(f.rgba.iter().any(|b| *b != 0));
     assert!(DebugStats::get(&engine_b.stats().video_received) >= 1);
 
@@ -392,4 +400,89 @@ async fn a_failed_camera_is_switched_off_with_a_reason() {
 
     engine.shutdown();
     server.handle.shutdown().await;
+}
+
+/// Camera startup is independent of audio startup: transmitted capture time
+/// still belongs to the engine clock, not a newly zeroed camera clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_camera_start_keeps_the_audio_engine_clock() {
+    let server = TestServer::start().await;
+    let (backend, _) = FakeBackend::silent();
+    let (engine, _dir) = server.engine("alice", Box::new(backend), false).await;
+    wait_connected(&engine).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    engine.command(Command::SetCamera(true));
+    wait_for(&engine, SOON, |s| s.camera_on).await;
+    let mut camera = CameraHandle::new(engine.camera_link());
+    camera.start_with(Box::new(SyntheticSource::new()));
+    let bob = server.raw_client("bob").await;
+    let (first, _) = bob.recv_video(SOON).await.expect("camera sends");
+    assert!(
+        first.media_time >= 500_000,
+        "camera must not reset capture time: {first:?}"
+    );
+    let epoch = first.media_epoch;
+    camera.stop();
+    camera.start_with(Box::new(SyntheticSource::new()));
+    let (again, _) = bob.recv_video(SOON).await.expect("camera resumes");
+    assert_eq!(again.media_epoch, epoch);
+    assert!(again.media_time >= first.media_time);
+    camera.stop();
+    engine.shutdown();
+    server.handle.shutdown().await;
+}
+
+/// Opt-in local hardware evidence: camera images remain in memory and travel
+/// only through the loopback test server. Audio is synthetic, never a microphone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs ICU_VIDEO_TEST_CAMERA; local camera, no image recording"]
+async fn native_camera_processing_and_timing_remain_live() {
+    let index: u32 = std::env::var("ICU_VIDEO_TEST_CAMERA")
+        .expect("camera index")
+        .parse()
+        .unwrap();
+    let server = TestServer::start().await;
+    let (backend, _) = FakeBackend::silent();
+    let (a, _ad) = server
+        .engine("native-camera-source", Box::new(backend), true)
+        .await;
+    let (backend, _) = FakeBackend::silent();
+    let (b, _bd) = server
+        .engine("local-only-viewer", Box::new(backend), false)
+        .await;
+    let state = wait_connected(&a).await;
+    wait_connected(&b).await;
+    let session = state.me.unwrap().session;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    a.command(Command::SetCamera(true));
+    wait_for(&a, SOON, |s| s.camera_on).await;
+    let mut camera = CameraHandle::new(a.camera_link());
+    camera.start_with(Box::new(
+        icu_client::camera::NokhwaSource::open(index).expect("open native camera"),
+    ));
+    let mut count = 0;
+    let mut last = 0;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(20) {
+        if let Some((seq, picture)) = b.video_frames_source().picture(session) {
+            if seq != last {
+                assert!(picture.stamp.micros > 500_000);
+                assert!(picture.stamp.epoch > 0);
+                count += 1;
+                last = seq;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let stats = a.stats();
+    let receive = b.stats();
+    eprintln!("native camera decoded={count} processing={} budget_bypasses={} camera_timing_estimated={} decode_offset_us={} queue={}",stats.video_processing.lock().unwrap().summary(),DebugStats::get(&stats.video_processing_bypassed),DebugStats::get(&stats.video_timing_estimated),receive.av_offset_us.load(Ordering::Relaxed),receive.video_queue_age.lock().unwrap().summary());
+    camera.stop();
+    a.shutdown();
+    b.shutdown();
+    server.handle.shutdown().await;
+    assert!(
+        count >= 100,
+        "native camera pipeline did not remain live: {count}"
+    );
 }

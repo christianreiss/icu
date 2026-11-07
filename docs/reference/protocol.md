@@ -17,10 +17,10 @@ Stand 2026-09-20. Abgeleitet aus `docs/research/transport.md`, `docs/history/wir
 | Idle / Keepalive | `max_idle_timeout` 60 s beidseitig; Client `keep_alive_interval` 15 s. |
 | Migration | quinn-Default (erlaubt). |
 | OS-Empfangspuffer | Client und Server fordern je UDP-Socket 1 MiB an, um volle 64-Teilnehmer-Audio-/Video-Bursts aufnehmen zu können. Der OS-Höchstwert kann die Anforderung begrenzen. Kein globales Sysctl-Tuning, keine Erweiterung der QUIC-Sendequeues oder ihrer 100-ms-TTL; die Größe ist keine Zeitgarantie. |
-| Datagram-Puffer | Server empfangen **64 KiB**, senden **512 KiB**; Client empfangen **512 KiB**, senden **8 KiB**. Die beiden Fanout-Puffer tragen bis zu 63 Sprecher und fassen einen noch frischen 100-ms-Burst mit maximalen 414-Byte-Paketen einschließlich Quinn-Verwaltung. Die frühere 64-KiB-Fanout-Grenze verdrängte bei 64 Teilnehmern bereits während kurzer Scheduling-Pausen frische Pakete. Unabhängig von der Bytegrenze verfallen ausgehende Datagramme nach **100 ms**, auch ohne neue Einlieferung. `send_datagram` verwirft bei vollem Puffer das älteste Datagramm; der Empfänger begrenzt seine Jitter-Warteschlange zusätzlich anhand der Sampledauer (`drain_backlog`, Klemme 200 ms). |
+| Datagram-Puffer | Server empfangen **64 KiB**, senden **512 KiB**; Client empfangen **512 KiB**, senden **8 KiB**. Die beiden Fanout-Puffer tragen bis zu 63 Sprecher und fassen einen noch frischen 100-ms-Burst mit maximalen 426-Byte-Paketen einschließlich Quinn-Verwaltung. Die frühere 64-KiB-Fanout-Grenze verdrängte bei 64 Teilnehmern bereits während kurzer Scheduling-Pausen frische Pakete. Unabhängig von der Bytegrenze verfallen ausgehende Datagramme nach **100 ms**, auch ohne neue Einlieferung. `send_datagram` verwirft bei vollem Puffer das älteste Datagramm; der Empfänger begrenzt seine Jitter-Warteschlange zusätzlich anhand der Sampledauer (`drain_backlog`, Klemme 200 ms). |
 | Streams | Client eröffnet genau einen bidirektionalen Control-Stream (der Server lässt nur einen zu, `max_concurrent_bidi_streams` = 1). Video: ein unidirektionaler Stream pro Frame, in beide Richtungen. `max_concurrent_uni_streams` = `2 × max_users + 4` pro Richtung: der Server setzt ihn aus seiner Config (bei `max_users` = 16 also 36), der Client mit der Obergrenze 64, also 132 — beim Handshake kennt er `max_users` noch nicht (2026-09-27 an den Code angeglichen). Server→Client-Uni-Streams trägt nur Video, und der Server hält je Sender und Empfänger höchstens `VIDEO_UNACKED_PER_PAIR` (2) Frames unbestätigt (§4); mehr als 2 × (Sender) Streams braucht ein Empfänger also nur kurz, bis er gelesene Streams freigibt. Das Protokoll deckelt die Zahl gleichzeitig aktiver Kameras nicht. |
 | Flusskontrolle | Server: `stream_receive_window` 64 KiB, `receive_window` 1 MiB je Verbindung, `send_window` 1 MiB (2026-09-26; quinns Defaults waren 1,25 MB je Stream und unbegrenzt je Verbindung, ein Teilnehmer konnte mit 36 Video-Streams ~47 MB Serverspeicher binden). Das ist Flusskontrolle, keine Größengrenze: ein Video-Frame von 512 KiB fließt fensterweise. Streams, die der Server nie liest (renew-only- und Registrierungssitzungen, §2.3), zählen gegen das Verbindungsfenster. |
-| Datagram-Größe | Laufzeitwert `max_datagram_size()` (Spike 2: 1162 B nach Handshake, 1414 B nach MTU-Discovery; mit dem Com-Tag endet die MTU-Discovery 16 B früher, also bei 1398 B, 2026-09-27). Audio-Datagrams sind ≤ 414 B. |
+| Datagram-Größe | Laufzeitwert `max_datagram_size()` (Spike 2: 1162 B nach Handshake, 1426 B nach MTU-Discovery; mit dem Com-Tag endet die MTU-Discovery 16 B früher, also bei 1398 B, 2026-09-27). Audio-Datagrams sind ≤ 426 B. |
 
 **Verbunden heißt `Welcome` empfangen.** Auf Client-Seite liefert `connect().await` auch dann `Ok`, wenn der Server das Client-Cert gleich darauf ablehnt (Spike 2). Der Client darf vor `Welcome` weder Audio senden noch „verbunden“ anzeigen.
 
@@ -162,7 +162,7 @@ Varianten 19–28 (und 31, 33) sind die ersten C→S-Nachrichten, bei denen der 
 
 Fehlercodes kommen wie Varianten additiv hinzu (§6, zuletzt `SERVER_ERROR` 2026-09-26); ein Client, der einen Code nicht kennt, behandelt ihn als nicht fatal.
 
-Capability-Bits (`caps`): Bit 0 (`CAP_AUDIO_FEEDBACK = 1`) für optionale Varianten 36/37. Diese werden nur bei gegenseitiger Unterstützung gesendet. v1-Baseline war `minor = 1`, aktuell ist `minor = 7` (Sprachmessung Policy 2, 2026-10-30); ein Minor 0 existiert nicht, und alle 44 Variantennummern (0–43) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
+Capability-Bits (`caps`): Bit 0 (`CAP_AUDIO_FEEDBACK = 1`) für optionale Varianten 36/37. Diese werden nur bei gegenseitiger Unterstützung gesendet. v1-Baseline war `minor = 1`, aktuell ist `minor = 8` (gemeinsame Medienzeit, 2026-11-07); ein Minor 0 existiert nicht, und alle 44 Variantennummern (0–43) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
 ### 2.3 Registrierung (revidiert 2026-09-24, nur Zertifikate)
 
@@ -234,19 +234,21 @@ Hält der Server das Zertifikat für abgelaufen, der Client (wegen Uhrzeitabweic
 
 ## 3. Audio-Datagram
 
-Genau ein Opus-Paket pro Datagram. Header 14 Byte, little-endian:
+Genau ein Opus-Paket pro Datagram. Header 26 Byte, little-endian:
 
 | Offset | Größe | Feld | Inhalt |
 | --- | --- | --- | --- |
 | 0 | 1 | `kind` | `0x01` = Audio v1. Andere Werte verwerfen. |
-| 1 | 1 | `flags` | bit0 `END` (letztes Paket eines Talk-Spurts), bit1–7 = 0 |
+| 1 | 1 | `flags` | bit0 `END` (letztes Paket eines Talk-Spurts), bit1 `TIMING_ESTIMATED`, bit2–7 = 0 |
 | 2 | 2 | `speaker` | Session-ID des Sprechers. **Client sendet 0, Server überschreibt in place.** |
 | 4 | 2 | `seq` | pro Sender +1 je Paket, Wrap |
 | 6 | 4 | `ts` | 48-kHz-Sample-Clock des Senders, +960 je 20-ms-Frame (+480 bei 10 ms); springt bei PTT-Pausen, `seq` nicht |
 | 10 | 4 | `gain_epoch` | Kennung der angewandten Pegelkorrektur; ab Minor 6 |
-| 14 | n | `opus` | Opus-Paket (TOC enthalten), 1 ≤ n ≤ 400 |
+| 14 | 8 | `media_time` | Aufnahmezeit in µs auf einer gemeinsamen monotonen Senderclock; vor DSP/Encode |
+| 22 | 4 | `media_epoch` | Generation dieser Clock; 0 = unbekannt, Wechsel entwertet alte Zuordnungen |
+| 26 | n | `opus` | Opus-Paket (TOC enthalten), 1 ≤ n ≤ 400 |
 
-Regeln: Server verwirft Datagrams < 15 B oder > 414 B; Empfänger unterscheidet Pause (`ts`-Sprung bei lückenloser `seq`) von Verlust (`seq`-Lücke). **Wrap:** `seq` und `ts` laufen über (bei 20 ms nach ~22 min bzw. ~24,8 h). Alle Vergleiche sind vorzeichenbehaftete Differenzen modulo 2^16 bzw. 2^32 (`(a.wrapping_sub(b)) as i16` bzw. `as i32`); eine Differenz jenseits der halben Wertebereichsbreite ist ein Rücksprung, kein Vorwärtssprung. Jitter-Buffer, Verlusterkennung und Re-Anchor rechnen ausschließlich so. Opus-Profil: 48 kHz mono, VOIP, Frame 20 ms Default (10 ms Client-Option ohne Protokolländerung, TOC trägt die Dauer), 48 kbit/s constrained VBR (unter 64 kbit/s, darüber wechselt Opus für Sprache mono auf CELT-only ohne FEC), FEC an mit `PACKET_LOSS_PERC` ≥ 3 % (sonst codiert libopus kein LBRR), DTX aus, Complexity 10. Empfänger: Decoder-Complexity 5 (Deep PLC), Jitter-Buffer mindestens 1 Frame.
+Regeln: Server verwirft Datagrams < 27 B oder > 426 B; Empfänger unterscheidet Pause (`ts`-Sprung bei lückenloser `seq`) von Verlust (`seq`-Lücke). **Wrap:** `seq` und `ts` laufen über (bei 20 ms nach ~22 min bzw. ~24,8 h). Alle Vergleiche sind vorzeichenbehaftete Differenzen modulo 2^16 bzw. 2^32 (`(a.wrapping_sub(b)) as i16` bzw. `as i32`); eine Differenz jenseits der halben Wertebereichsbreite ist ein Rücksprung, kein Vorwärtssprung. Jitter-Buffer, Verlusterkennung und Re-Anchor rechnen ausschließlich so. Opus-Profil: 48 kHz mono, VOIP, Frame 20 ms Default (10 ms Client-Option ohne Protokolländerung, TOC trägt die Dauer), 48 kbit/s constrained VBR (unter 64 kbit/s, darüber wechselt Opus für Sprache mono auf CELT-only ohne FEC), FEC an mit `PACKET_LOSS_PERC` ≥ 3 % (sonst codiert libopus kein LBRR), DTX aus, Complexity 10. Empfänger: Decoder-Complexity 5 (Deep PLC), Jitter-Buffer mindestens 1 Frame.
 
 Server-Relay pro Datagram: Länge/`kind` prüfen → Absender `Active` und nicht `muted` → Rate ≤ 110/s → `speaker` setzen → `send_datagram` an alle anderen `Active`, nicht `deafened`; Sendefehler pro Empfänger zählen, nie blockieren.
 
@@ -254,17 +256,19 @@ Allein im Raum (die `Welcome`-Liste leer und seither kein `UserJoined`, oder der
 
 ## 4. Video-Frame (unidirektionaler Stream)
 
-Header 12 Byte, dann Frame-Bytes bis Stream-FIN. Empfänger `read_to_end(512 KiB)`. Der Server gibt einem Frame 5 s für Header und Nutzlast zusammen und stoppt den Stream danach mit `stop(RATE_LIMITED)`; je Sender nimmt er höchstens 4 Frames gleichzeitig an, einen weiteren Stream stoppt er sofort ungelesen mit `stop(RATE_LIMITED)` (2026-09-26).
+Header 24 Byte, dann Frame-Bytes bis Stream-FIN. Empfänger `read_to_end(512 KiB)`. Der Server gibt einem Frame 5 s für Header und Nutzlast zusammen und stoppt den Stream danach mit `stop(RATE_LIMITED)`; je Sender nimmt er höchstens 4 Frames gleichzeitig an, einen weiteren Stream stoppt er sofort ungelesen mit `stop(RATE_LIMITED)` (2026-09-26).
 
 | Offset | Größe | Feld | Inhalt |
 | --- | --- | --- | --- |
 | 0 | 1 | `kind` | `0x02` = Video v1 |
-| 1 | 1 | `flags` | bit0 `KEYFRAME` (IDR), bit1–7 = 0 |
+| 1 | 1 | `flags` | bit0 `KEYFRAME` (IDR), bit1 `TIMING_ESTIMATED`, bit2–7 = 0 |
 | 2 | 2 | `speaker` | Client sendet 0, Server setzt |
 | 4 | 2 | `seq` | Frame-Zähler pro Sender |
-| 6 | 4 | `ts` | dieselbe 48-kHz-Clock wie Audio |
+| 6 | 4 | `ts` | bisherige 48-kHz-Video-Pacingclock; A/V verwendet `media_time` |
 | 10 | 1 | `codec` | `1` = H.264 Constrained Baseline (Annex-B-NALs, SPS/PPS vor jedem IDR), `2` = MJPEG (Baseline JFIF). v1-Clients müssen 1 decodieren; **`2` ist reserviert: v1 sendet und dekodiert es nicht, Empfänger verwerfen solche Frames** (keine Aushandlung; das frühere Client-Feature `mjpeg` ohne Dekodierpfad ist seit 2026-09-27 entfernt). |
 | 11 | 1 | reserviert | 0 |
+| 12 | 8 | `media_time` | Aufnahmezeit in µs auf derselben monotonen Senderclock wie Audio |
+| 20 | 4 | `media_epoch` | Clock-Generation wie Audio |
 
 Profil: 320×240 @ 15 fps, Ziel 150 kbit/s, IDR alle 2 s und auf `KeyframeRequest`. Empfänger decodieren höchstens 640×480 (`VIDEO_MAX_WIDTH`/`VIDEO_MAX_HEIGHT`) mit höchstens 4 Referenzbildern und nur Profil Baseline/Main ohne SVC/MVC-NALs (14, 15, 20): das SPS wird **vor** dem Decoder gelesen, ein Frame darüber gilt als Decode-Fehler (warten auf IDR + `KeyframeRequest`). Der Encoder eines veränderten Clients ist nicht an das Profil gebunden, und der Server liest keine Nutzlast. Server-Relay: Header lesen, `camera_on` und `Active` prüfen, `speaker` setzen, Chunks durchreichen, `finish()`. Empfänger sind nur Teilnehmer mit `viewing` (§2.1), die kein Admin taubgeschaltet hat (§2.2 Nr. 33); ohne solche wird der Frame geleert und verworfen. Pro **Sender-Empfänger-Paar** max. `VIDEO_UNACKED_PER_PAIR` = 2 Frames, die der Empfänger noch nicht quittiert hat (QUIC-ACK aller Daten des beendeten Streams), + 1 wartend (noch ohne eigenen Stream; revidiert 2026-09-27: vorher zählte „1 beim Schreiben“ Frames, die an quinn übergeben waren, und ein Zuschauer mit zu schmalem Downlink staute bis zu Stream-Kredit und Sendefenster, rund 9–18 s Video). Ein Zuschauer mit zu wenig Bandbreite verliert so Frames und bleibt nahe live, statt hinterherzuhängen; die Verwürfe fließen in `VideoCongestionHint` (§2.2 Nr. 16). Bei 15 fps decken 2 Frames eine RTT samt ACK-Verzögerung bis ≈ 130 ms verlustfrei ab. Ein neuer **Keyframe** (`VIDEO_FLAG_KEYFRAME`) ersetzt den wartenden Frame; ein neues **Delta** wird verworfen, wenn schon einer wartet — ein wartender Keyframe weicht also nie einem Delta. Nach jedem Verwurf eines Paars gehen bis zum nächsten Keyframe nur Keyframes durch, weil ein Delta hinter einem fehlenden Frame nicht decodierbar ist (2026-09-27); der Empfänger fordert ihn wie bei jeder Lücke per `KeyframeRequest` an. Stream-Eröffnung, Schreiben und Quittung haben zusammen höchstens `timing.video_frame_timeout_ms` (Default 5 s); ein Stream wird danach mit `reset(0x09)` beendet, auch der letzte vor einer Pause, wenn weniger als 2 unterwegs sind, und einer, dessen Frist abläuft, während der Stream des nächsten Frames noch eröffnet oder beschrieben wird (2026-09-27, zweite Runde). Verlassen des Senders oder Schließen des Slots bricht auch blockierte Schreibvorgänge ab und setzt noch unquittierte Frames zurück, statt sie weiter zu senden (2026-09-27, externes Review). Kamera-Flag und aktive Sitzung werden nach dem vollständigen Empfang erneut geprüft. Die Drop-Entscheidung fällt je Empfänger, damit ein langsamer Empfänger die übrigen nicht ausbremst. Video-Streams `set_priority(-1)`, Control-Stream `set_priority(1)`.
 
@@ -324,7 +328,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 | --- | --- |
 | Control-Frame | ≤ 16 KiB |
 | Control-Messages | ≤ 50/s pro Client |
-| Audio-Datagrams | ≤ 110/s pro Client, ≤ 414 B |
+| Audio-Datagrams | ≤ 110/s pro Client, ≤ 426 B |
 | Video-Frames | ≤ 20/s pro Nutzer (über Reconnects hinweg), ≤ 512 KiB; nur bei `camera_on`; ≤ 4 gleichzeitig je Sender, ≤ 5 s je Frame (`timing.video_frame_timeout_ms`) |
 | Video-Bitrate | ≤ 400 kbit/s pro Nutzer (gleitend über 2 s, über Reconnects hinweg). Entschieden wird **vor** der Nutzlast: steht das Budget im Minus, stoppt der Server den Stream nach dem Header mit `RATE_LIMITED` und liest nichts weiter; ein angenommener Frame wird beim Eintreffen abgebucht, auch ins Minus, damit ein IDR größer als der 2-s-Burst durchgeht. Bewusste Festlegung als Missbrauchs-Deckel, nicht aus dem Research hergeleitet: Zielbitrate ist 150 kbit/s (§4), der Abstand fängt CBR-Spitzen bei 15 fps ab. |
 | Users | `max_users` (Default 16, Obergrenze 64); beim Erreichen `close(SERVER_FULL)` |
@@ -344,7 +348,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 
 - Major = ALPN-String (`icu/1`). Inkompatible Änderung → `icu/2`, Server bietet ggf. beide.
 - Minor: der Client nennt sein Protokoll-Minor in `Hello.minor`, der Server seins in `Welcome.server_minor`; `Welcome.minor` ist das ausgehandelte `min(client, server)`. Varianten oberhalb des ausgehandelten Minors werden nie gesendet. Ein Minor 0 gibt es nicht; aktuell ist `minor = 6`. Minor 5 hängt `UserInfo.corona_color` an, und `UserInfo` steckt mitten in `Welcome`: Client und Server von vor Minor 5 sind mit Minor-5-Gegenstellen nicht kompatibel und werden über das Mindest-Minor abgewiesen.
-- Mindestversionen, beidseitig durchgesetzt (2026-09-26). Jede Seite hat ein Mindest-Minor für die Gegenseite (`icu_proto::MIN_PEER_MINOR`, derzeit 7):
+- Mindestversionen, beidseitig durchgesetzt (2026-09-26). Jede Seite hat ein Mindest-Minor für die Gegenseite (`icu_proto::MIN_PEER_MINOR`, derzeit 8):
   - Der Server schließt mit `VERSION_UNSUPPORTED`, wenn `Hello.minor` darunter liegt, oder wenn die SemVer in `Hello.client` (`<name>/<semver> <os>`, Pre-Release-Suffix zählt nicht) unter `server.min_client` liegt oder sich nicht lesen lässt. Das gilt für jede Sitzung, Registrierung und renew-only eingeschlossen.
   - Der Client schließt selbst mit `VERSION_UNSUPPORTED`, wenn `Welcome.server_minor` darunter liegt, fatal, mit dem Hinweis, dass der Server aktualisiert werden muss.
   - Ein Client von vor Minor 2 dekodiert das längere `Welcome` ohne Fehler (postcard ignoriert überzählige Bytes); deshalb weist ihn der Server über `Hello.minor` ab. Umgekehrt kann ein Client ab Minor 2 das kürzere `Welcome` eines älteren Servers nicht dekodieren und zeigt das allgemeine „Update nötig“ — hingenommen, weil Client und Server im Lockstep ausgeliefert werden (§2.2).
@@ -365,3 +369,26 @@ Aus `docs/history/verification.md` und den Research-Dokumenten: In-place-`speake
 Minor 3 erfordert ein gemeinsames Update von Server und Clients; beide Seiten weisen Minor 2 und älter über die bestehende Versionsprüfung ab. Die Zertifikatsabfrage erfolgt beim Öffnen der Nutzeransicht, nicht im Raum-Broadcast. Antworten werden nach Sitzung zugeordnet und beim Verlassen/Neuverbinden verworfen. Die aktuelle PKI stellt Nutzer- und Server-Leaves direkt durch die im Passport hinterlegte CA aus.
 
 CA-Signatur, Gültigkeitszeitraum, Widerruf laut signierter CRL und Server-Authentifizierung sind getrennte Aussagen. Eine fehlende oder veraltete CRL ist kein Beleg gegen Widerruf. Die weitergereichte Nutzeridentität bleibt eine Aussage des Servers, auch wenn die Leaf-Signatur lokal geprüft wurde. Beide Medien-Transportstrecken sind verschlüsselt; der Relay-Server kann die Medien lesen. RTTs gelten pro Verbindung zum Server; Audio-Empfangsverlust eines Nutzers ist eine Messung des gesamten Empfangspfads.
+
+## Medienzeit und automatische Videoklarheit (Minor 8)
+
+`ts` von Audio bleibt der bisherige Samplezähler für Jitter und Kalibrierung.
+`media_time` ist die Zeit des ersten Samples beziehungsweise der Kameraaufnahme,
+nicht DSP-/Encode-/Decode-Abschluss. Sender brauchen keine synchronisierten
+Host-Uhren: jeder Empfänger ordnet die gemeinsame Senderzeit seiner eigenen
+Audiowiedergabe zu. Native Capture-Timestamps werden bevorzugt; geschätzte Zeiten
+tragen Flagbit 1. Geräte-/Clock-Diskontinuitäten wechseln `media_epoch`; verspätete
+ältere Generationen werden verworfen. Kamera-Aus/Ein startet keine neue Audiozeit.
+
+Kameracapture hält nur das neueste Rohbild. Verarbeitung, Stream-Eröffnung und
+Schreiben haben beim Sender zusammen 100 ms ab Aufnahme; Eröffnung allein höchstens
+50 ms. Empfangslesevorgänge und Decode-Wartezeit sind ebenfalls auf 100 ms begrenzt.
+Die Decode-Warteschlange hält höchstens zwei Access Units je Sprecher, 64 insgesamt
+und 8 MiB. Referenzlücken warten auf ein IDR. Der Server behält seine unabhängigen
+Relay-/ACK-Grenzen; diese sind keine Lip-Sync-Garantie.
+
+Die Präsentation folgt je Sprecher den tatsächlich aus dem App-Ausgabering
+verbrauchten Audiosamples plus nativer beziehungsweise geschätzter Geräteverzögerung.
+Frühe Bilder warten begrenzt, über 100 ms verspätete Bilder werden nicht angezeigt.
+Audio wird dafür nie verzögert. Ohne frische Audiozuordnung ist Video best effort.
+Alle Videooberflächen lesen denselben monoton fortschreitenden Präsentationsstand.

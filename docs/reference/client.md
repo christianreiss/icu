@@ -619,3 +619,30 @@ im jeweiligen Fachabschnitt dokumentiert.
 Die HTTPS-Vertrauensanker aus `webpki-roots` stehen unter CDLA-Permissive-2.0.
 Dafür gilt eine auf dieses Daten-Crate begrenzte Ausnahme in `deny.toml`; der
 Lizenztext wird über `cargo-about` in `THIRD-PARTY-LICENSES` mitgeliefert.
+
+## Automatische Videoklarheit und Synchronität (2026-11-07)
+
+Kamerabilder werden ohne zusätzliche Einstellungen automatisch vorsichtig
+entrauscht und in dunklen Bereichen aufgehellt; zuverlässige neutrale Bildanteile
+erlauben eine kleine Weißabgleichkorrektur (höchstens ±4 %). Korrekturparameter
+folgen langsam, ohne zukünftige Bilder zu puffern. Hardware-Kameraregler bleiben
+unverändert. Vorschau und Encoder erhalten dasselbe bearbeitete Bild.
+Auflösung, H.264 und Netzwerkstufen bleiben erhalten.
+
+Drei anhaltende Überschreitungen des 5-ms-Verarbeitungsbudgets pausieren optionale
+Bildkorrektur für fünf Sekunden. Danach folgt ein automatischer Wiederanlauf.
+Capture läuft getrennt von Encode/Send weiter und überschreibt einen Latest-Slot.
+Es gibt keine Effekt-, Helligkeits-, Schärfe- oder Sync-Regler.
+
+Minor 8 trägt gemeinsame Capture-Zeit und Epochen in beiden Medienheadern.
+Audio-Samplezähler und Pegel-Epochen behalten ihre Zuständigkeiten. Die gemeinsame
+Videopräsentation orientiert sich an Audiowiedergabe, Ringverbrauch und
+Gerätevorlauf; die Sprachlatenz wird nicht künstlich erhöht. Audio ohne native
+Timingdaten und Kamera ohne plausible Zeitstempel sind ausdrücklich Schätzungen.
+`--debug-stats` zeigt Verarbeitungs-/Queue-Zeiten, Budget-Bypässe, späte Bilder,
+Timing-Schätzungen und den Decode-Abstand zum geschätzten Audioziel. Dieser
+Decode-Abstand ist keine Messung von Display- oder Schalllaufzeit.
+
+Die bisherigen Aussagen „neuestes dekodiertes Bild sofort“ und „64 Frames dürfen
+mehrere Sekunden warten“ sind durch die begrenzte Präsentation/Queue ersetzt.
+Physische Lip-Sync-Abnahme bleibt ein eigener Linux-/Windows-Hardwaretest.

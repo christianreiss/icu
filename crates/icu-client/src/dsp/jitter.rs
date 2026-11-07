@@ -28,6 +28,8 @@ use icu_proto::{seq_diff, ts_diff};
 /// A packet as queued in the buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
+    pub media_time: u64,
+    pub media_epoch: u32,
     /// Sender sequence number.
     pub seq: u16,
     /// Sender sample clock.
@@ -837,6 +839,8 @@ mod tests {
     fn queued_playback_counts_as_margin_without_inventing_missing_packets() {
         let t0 = Instant::now();
         let make = |seq: u16| Packet {
+            media_time: 0,
+            media_epoch: 0,
             gain_epoch: 0,
             seq,
             ts: seq as u32 * 960,
@@ -876,6 +880,8 @@ mod tests {
 
     fn pkt(seq: u16, ts: u32, end: bool) -> Packet {
         Packet {
+            media_time: 0,
+            media_epoch: 0,
             gain_epoch: 0,
             seq,
             ts,

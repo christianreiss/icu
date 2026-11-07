@@ -86,7 +86,7 @@ fn skip_capture(acc: &mut Vec<f32>, ts: &mut u32, skipped: usize) {
 }
 
 /// Discard exactly the observed backlog; callbacks may append concurrently.
-fn discard_capture(cap: &mut HeapCons<f32>, acc: &mut Vec<f32>, ts: &mut u32, lost: usize) {
+fn discard_capture<T>(cap: &mut HeapCons<T>, acc: &mut Vec<f32>, ts: &mut u32, lost: usize) {
     let queued = cap.occupied_len();
     cap.skip(queued);
     skip_capture(acc, ts, queued + lost);
@@ -686,6 +686,9 @@ struct Speaker {
     jitter: JitterBuffer,
     decoder: opus::Decoder,
     pending: VecDeque<f32>,
+    pending_times: VecDeque<Option<crate::media::Stamp>>,
+    next_stamp: Option<crate::media::Stamp>,
+    media_epoch: u32,
     last_packet: Option<Instant>,
     volume: f32,
     /// Loudness normalization, ahead of `volume`.
@@ -748,7 +751,10 @@ impl Speaker {
                 ..JitterConfig::default()
             }),
             decoder: opus::Decoder::new()?,
-            pending: VecDeque::with_capacity(4 * BLOCK),
+            pending: VecDeque::with_capacity(5760 + BLOCK),
+            pending_times: VecDeque::with_capacity(5760 + BLOCK),
+            next_stamp: None,
+            media_epoch: 0,
             last_packet: None,
             ended: false,
             indicator: None,
@@ -998,6 +1004,7 @@ struct Shared {
     state: watch::Sender<AppState>,
     dsp: Arc<DspControl>,
     stats: Arc<DebugStats>,
+    media: Arc<crate::media::Clock>,
     speakers: Mutex<HashMap<Session, Speaker>>,
     /// The live connection for `send_datagram` from the DSP thread.
     conn: Mutex<Option<quinn::Connection>>,
@@ -1035,7 +1042,7 @@ struct Shared {
     /// Ring buffer ends the backend callbacks write/read. Behind a mutex so
     /// streams can be reopened with a fresh closure; the callbacks only
     /// `try_lock`, which is uncontended in practice.
-    cap_prod: Arc<Mutex<HeapProd<f32>>>,
+    cap_prod: Arc<Mutex<HeapProd<crate::media::CaptureSample>>>,
     /// Samples callbacks could not enqueue, consumed by the DSP clock.
     capture_dropped: Arc<AtomicUsize>,
     ref_prod: Arc<Mutex<HeapProd<crate::audio::backend::ReferenceFrame>>>,
@@ -1236,7 +1243,7 @@ impl Engine {
         };
         let (state_tx, state_rx) = watch::channel(initial);
         // Ring buffers between backend callbacks and the DSP/mixer threads.
-        let (cap_prod, cap_cons) = HeapRb::<f32>::new(48_000).split();
+        let (cap_prod, cap_cons) = HeapRb::<crate::media::CaptureSample>::new(48_000).split();
         let (ref_prod, ref_cons) =
             HeapRb::<crate::audio::backend::ReferenceFrame>::new(48_000).split();
         // The playback ring only ever holds `lead` (2 blocks, or one graph
@@ -1251,6 +1258,7 @@ impl Engine {
             state: state_tx,
             dsp: dsp.clone(),
             stats: stats.clone(),
+            media: Arc::new(crate::media::Clock::default()),
             speakers: Mutex::new(HashMap::new()),
             conn: Mutex::new(None),
             deafened: AtomicBool::new(false),
@@ -1664,14 +1672,27 @@ fn open_capture_stream(
     let dropped = shared.capture_dropped.clone();
     let cycle = shared.cycle.clone();
     backend.set_capture_channel(channel)?;
-    backend.open_capture(
+    let media = shared.media.clone();
+    backend.open_capture_timed(
         input,
-        Box::new(move |block| {
+        Box::new(move |block, timing| {
             // A failed `try_lock` (stream reopen in flight) loses the block
             // like a full ring does; count both.
             let pushed = cap_prod
                 .try_lock()
-                .map(|mut p| p.push_slice(block))
+                .map(|mut p| {
+                    let stamp = media.stamp(timing.at);
+                    p.push_iter(block.iter().enumerate().map(|(i, value)| {
+                        crate::media::CaptureSample {
+                            value: *value,
+                            stamp: crate::media::Stamp {
+                                micros: stamp.micros + i as u64 * 1_000_000 / 48_000,
+                                ..stamp
+                            },
+                            accurate: timing.accurate,
+                        }
+                    }))
+                })
                 .unwrap_or(0);
             if pushed < block.len() {
                 DebugStats::inc(&stats.capture_overruns);
@@ -1724,9 +1745,12 @@ fn open_playback_stream(
     // The new device may run a smaller quantum; let the mixer's lead shrink
     // back to it instead of keeping the old device's for the session.
     play_request.store(0, Ordering::Relaxed);
-    backend.open_playback(
+    shared.media.playback_gap.fetch_add(1, Ordering::Relaxed);
+    lock(&shared.video).clear_audio_playout();
+    let media = shared.media.clone();
+    backend.open_playback_timed(
         output,
-        Box::new(move |out| {
+        Box::new(move |out, timing| {
             play_request.fetch_max(out.len(), Ordering::Relaxed);
             // Audio and its speech power travel in the same ring item. A stalled
             // output therefore cannot duck on audio it has not actually played.
@@ -1745,6 +1769,21 @@ fn open_playback_stream(
                 }
                 Err(_) => 0,
             };
+            let start = media.consumed.fetch_add(n as u64, Ordering::Relaxed);
+            if n < out.len() {
+                media.playback_gap.fetch_add(1, Ordering::Relaxed);
+            }
+            media.playback.store(crate::media::Rendered {
+                version: 0,
+                start,
+                count: n as u64,
+                micros: media.micros(timing.at),
+                gap: media.playback_gap.load(Ordering::Relaxed),
+                complete: n == out.len(),
+            });
+            stats
+                .audio_playout_timing_estimated
+                .store(u64::from(!timing.accurate), Ordering::Relaxed);
             ctl.output_rms
                 .store(10.0 * (output_power / out.len().max(1) as f32).max(1e-10).log10());
             if speech_power > 0.0 && !out.is_empty() {
@@ -1963,7 +2002,7 @@ impl StreamRetry {
 
 fn dsp_thread(
     shared: Arc<Shared>,
-    mut cap: HeapCons<f32>,
+    mut cap: HeapCons<crate::media::CaptureSample>,
     mut reference: HeapCons<crate::audio::backend::ReferenceFrame>,
     mut mic_test: HeapProd<f32>,
     test_tone: bool,
@@ -2009,6 +2048,7 @@ fn dsp_thread(
     };
     let mut tone_pos = 0usize;
     let mut block = vec![0.0f32; BLOCK];
+    let mut captured_block = [crate::media::CaptureSample::default(); BLOCK];
     let mut ref_block = vec![[0.0f32; crate::audio::backend::MAX_REFERENCE_CHANNELS]; BLOCK];
     let mut frame_acc: Vec<f32> = Vec::with_capacity(960);
     // The frame length `frame_acc` is being collected for.
@@ -2050,7 +2090,8 @@ fn dsp_thread(
         if ctl.stop.load(Ordering::Relaxed) {
             return;
         }
-        // 1. Obtain one capture block.
+        // 1. Obtain one capture block, retaining its own acquisition time.
+        let mut capture_time = None;
         if test_tone {
             tone_ticks += 1;
             let deadline = start + Duration::from_millis(10 * tone_ticks);
@@ -2063,10 +2104,8 @@ fn dsp_thread(
                 tone_pos = (tone_pos + 1) % tone.len();
             }
             // Drain whatever the real capture delivered so it does not pile up.
-            let mut sink = [0.0f32; BLOCK];
-            while cap.occupied_len() >= BLOCK {
-                cap.pop_slice(&mut sink);
-            }
+            let queued = cap.occupied_len();
+            cap.skip(queued);
             reference.clear();
             ref_block.fill([0.0; crate::audio::backend::MAX_REFERENCE_CHANNELS]);
         } else {
@@ -2083,6 +2122,7 @@ fn dsp_thread(
                     a.reinitialize();
                 }
                 if reopened {
+                    shared.media.reset();
                     chain.restart();
                     last_input_clip = None;
                     applied_send = None;
@@ -2172,12 +2212,20 @@ fn dsp_thread(
                     }
                     refalign::Step::Pair { drop_ref } => {
                         reference.skip(drop_ref);
-                        cap.pop_slice(&mut block);
+                        cap.pop_slice(&mut captured_block);
+                        for (sample, captured) in block.iter_mut().zip(&captured_block) {
+                            *sample = captured.value;
+                        }
+                        capture_time = Some((captured_block[0].stamp, captured_block[0].accurate));
                         reference.pop_slice(&mut ref_block);
                         break;
                     }
                     refalign::Step::Silent { underrun } => {
-                        cap.pop_slice(&mut block);
+                        cap.pop_slice(&mut captured_block);
+                        for (sample, captured) in block.iter_mut().zip(&captured_block) {
+                            *sample = captured.value;
+                        }
+                        capture_time = Some((captured_block[0].stamp, captured_block[0].accurate));
                         ref_block.fill([0.0; crate::audio::backend::MAX_REFERENCE_CHANNELS]);
                         if underrun {
                             DebugStats::inc(&stats.reference_underruns);
@@ -2232,6 +2280,19 @@ fn dsp_thread(
             crate::dsp::sanitize(frame);
         }
         let t_block = Instant::now();
+        let (block_media, accurate) = if test_tone {
+            (shared.media.stamp(t_block), false)
+        } else {
+            capture_time.unwrap_or((shared.media.stamp(t_block), false))
+        };
+        if block_media.epoch != shared.media.epoch.load(Ordering::Acquire) {
+            skip_capture(&mut frame_acc, &mut ts, BLOCK);
+            continue;
+        }
+        shared
+            .stats
+            .audio_timing_estimated
+            .store(u64::from(!accurate), Ordering::Relaxed);
         let input_clipped = raw_capture.iter().any(|x| x.is_finite() && x.abs() >= 0.99);
         if !test_tone && input_clipped {
             last_input_clip = Some(t_block);
@@ -2499,11 +2560,22 @@ fn dsp_thread(
                                 send_audio(
                                     &shared,
                                     &stats,
-                                    0,
+                                    if accurate {
+                                        0
+                                    } else {
+                                        icu_proto::header::MEDIA_FLAG_TIMING_ESTIMATED
+                                    },
                                     seq,
                                     ts.wrapping_sub((n - i as u32) * frame_samples as u32),
                                     packet,
-                                    (t_block, block_epoch),
+                                    (
+                                        t_block,
+                                        block_epoch,
+                                        block_media.before_samples(
+                                            frame_samples.saturating_sub(BLOCK)
+                                                + (n - i as u32) as usize * frame_samples,
+                                        ),
+                                    ),
                                 );
                                 seq = seq.wrapping_add(1);
                             }
@@ -2528,11 +2600,20 @@ fn dsp_thread(
                         let sent = send_audio(
                             &shared,
                             &stats,
-                            flags,
+                            flags
+                                | if accurate {
+                                    0
+                                } else {
+                                    icu_proto::header::MEDIA_FLAG_TIMING_ESTIMATED
+                                },
                             seq,
                             ts,
                             packet,
-                            (t_block, block_epoch),
+                            (
+                                t_block,
+                                block_epoch,
+                                block_media.before_samples(frame_samples.saturating_sub(BLOCK)),
+                            ),
                         );
                         if sent && frame_has_duck_voice && !muted && !test_tone {
                             shared.ducking.transmitted();
@@ -2695,10 +2776,12 @@ fn send_audio(
     seq: u16,
     ts: u32,
     packet: &[u8],
-    captured: (Instant, usize),
+    captured: (Instant, usize, crate::media::Stamp),
 ) -> bool {
-    let (t_block, epoch) = captured;
+    let (t_block, epoch, stamp) = captured;
     let header = AudioHeader {
+        media_time: stamp.micros,
+        media_epoch: stamp.epoch,
         gain_epoch: shared.gain_epoch.load(Ordering::Relaxed),
         flags,
         speaker: 0,
@@ -2756,6 +2839,12 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test:
     // speakers lock is released; sized for `MAX_MAX_USERS` speakers.
     let mut indicator_changes: Vec<(Session, Option<bool>)> =
         Vec::with_capacity(pl::MAX_MAX_USERS as usize);
+    let mut output_frames = 0u64;
+    let mut rendered_spans: VecDeque<(u64, Session, crate::media::Stamp)> =
+        VecDeque::with_capacity(pl::MAX_MAX_USERS as usize * 128);
+    let mut render_version = 0;
+    let mut render_gap = 0;
+    let mut media_spans = Vec::with_capacity(pl::MAX_MAX_USERS as usize);
     let mut stalled_since: Option<Instant> = None;
     let mut request = RecentRequest::new(Instant::now());
     // 120 ms, the longest frame Opus allows: a peer picks its frame length.
@@ -2763,6 +2852,40 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test:
     loop {
         if shared.dsp.stop.load(Ordering::Relaxed) {
             return;
+        }
+        // Only an output callback can confirm that a source sample was
+        // consumed. Future queued spans never become provisional AV anchors.
+        if let Some(report) = shared.media.playback.load() {
+            if report.version != render_version {
+                if let Ok(mut video) = shared.video.try_lock() {
+                    if report.gap != render_gap
+                        || !report.complete
+                        || report.gap != shared.media.playback_gap.load(Ordering::Relaxed)
+                    {
+                        video.clear_audio_playout();
+                    }
+                    while let Some((position, session, stamp)) = rendered_spans.front().copied() {
+                        if position >= report.start.saturating_add(report.count) {
+                            break;
+                        }
+                        rendered_spans.pop_front();
+                        if report.gap != shared.media.playback_gap.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        if let Some(time) = report.sample_time(position) {
+                            video.audio_playout(
+                                session,
+                                crate::media::Playout {
+                                    stamp,
+                                    at: shared.media.instant(time),
+                                },
+                            );
+                        }
+                    }
+                    render_version = report.version;
+                    render_gap = report.gap;
+                }
+            }
         }
         // Keep two blocks (20 ms) ahead of the playback callback, or one
         // callback plus a block when the graph quantum is larger than that.
@@ -2783,6 +2906,9 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test:
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
+            if let Ok(mut video) = shared.video.try_lock() {
+                video.clear_audio_playout();
+            }
             // Nobody consumes: discard at playback pace, not CPU speed, or the
             // jitter buffers drain instantly and report fake losses.
             std::thread::sleep(Duration::from_millis(10));
@@ -2796,6 +2922,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test:
         let normalize = shared.normalize_incoming.load(Ordering::Relaxed);
         let mut n_inputs = 0;
         speech_mix.fill(0.0);
+        media_spans.clear();
         {
             let mut speakers = lock(&shared.speakers);
             for (session, sp) in speakers.iter_mut() {
@@ -2827,6 +2954,10 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test:
                                     .observe_at(&fec_scratch[..n], None, p.gain_epoch, p.ts);
                             }
                             sp.quiet = frame_quiet(&fec_scratch[..n]);
+                            sp.next_stamp = Some(crate::media::Stamp {
+                                micros: p.media_time,
+                                epoch: p.media_epoch,
+                            });
                             queue_decoded(sp, n, &fec_scratch, false);
                         }
                         Pop::Lost {
@@ -2866,11 +2997,13 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test:
                                 }
                             };
                             sp.quiet = frame_quiet(&fec_scratch[..n]);
+                            sp.next_stamp = None;
                             queue_decoded(sp, n, &fec_scratch, true);
                         }
                         Pop::Silence => {
                             sp.quiet = true;
                             sp.pending.extend(std::iter::repeat_n(0.0, BLOCK));
+                            sp.pending_times.extend(std::iter::repeat_n(None, BLOCK));
                         }
                     }
                 }
@@ -2886,6 +3019,15 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test:
                 let (buf, gain) = &mut inputs[n_inputs];
                 n_inputs += 1;
                 let have = sp.pending.len().min(BLOCK);
+                let mut first = None;
+                for (offset, stamp) in sp.pending_times.drain(..have).enumerate() {
+                    if first.is_none() {
+                        first = stamp.map(|stamp| (offset, stamp));
+                    }
+                }
+                if let Some((offset, stamp)) = first {
+                    media_spans.push((*session, offset, stamp));
+                }
                 for (dst, src) in buf.iter_mut().zip(sp.pending.drain(..have)) {
                     *dst = src;
                 }
@@ -2972,6 +3114,16 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test:
                 *item = [*sample, speech.clamp(-1.0, 1.0).powi(2)];
             }
             let n = play.push_slice(&played);
+            media_spans.sort_unstable_by_key(|(_, offset, _)| *offset);
+            for (session, offset, stamp) in &media_spans {
+                if *offset < n {
+                    if rendered_spans.len() == rendered_spans.capacity() {
+                        rendered_spans.pop_front();
+                    }
+                    rendered_spans.push_back((output_frames + *offset as u64, *session, *stamp));
+                }
+            }
+            output_frames += n as u64;
             DebugStats::add(&stats.samples_played, n as u64);
         }
 
@@ -3051,6 +3203,17 @@ fn local_indicator(last_packet: Option<Instant>, ended: bool, now: Instant) -> O
 /// timeline keeps its shape rather than gaining a block. `concealed`
 /// marks PLC/FEC output, which the normalizer must not learn from.
 fn queue_decoded(sp: &mut Speaker, n: usize, scratch: &[f32], concealed: bool) {
+    let count = if n == 0 {
+        sp.jitter.frame_samples() as usize
+    } else {
+        n
+    };
+    sp.pending_times.extend((0..count).map(|i| {
+        sp.next_stamp.map(|mut stamp| {
+            stamp.micros = stamp.micros.saturating_add(i as u64 * 1_000_000 / 48_000);
+            stamp
+        })
+    }));
     if n == 0 {
         sp.pending
             .extend(std::iter::repeat_n(0.0, sp.jitter.frame_samples() as usize));
@@ -5132,7 +5295,32 @@ impl crate::video::VideoSink for SessionVideo {
         else {
             return;
         };
-        let picture = crate::video::decode(&mut decoder, &frame.data);
+        let mut picture = crate::video::decode(&mut decoder, &frame.data);
+        if let Some(picture) = picture.as_mut() {
+            picture.stamp = crate::media::Stamp {
+                micros: frame.header.media_time,
+                epoch: frame.header.media_epoch,
+            };
+        }
+        if let Some(target) = lock(&self.shared.video).timing_target(
+            session,
+            crate::media::Stamp {
+                micros: frame.header.media_time,
+                epoch: frame.header.media_epoch,
+            },
+        ) {
+            let now = Instant::now();
+            let offset = if now >= target {
+                now.duration_since(target).as_micros() as i64
+            } else {
+                -(target.duration_since(now).as_micros() as i64)
+            };
+            stats.av_offset_us.store(offset, Ordering::Relaxed);
+            if !(-100_000..=100_000).contains(&offset) {
+                picture = None;
+                DebugStats::inc(&stats.video_late_dropped);
+            }
+        }
         let new_picture = picture.is_some();
         lock(&self.shared.video).finish_for(self.generation, session, decoder, picture);
         if new_picture {
@@ -5144,6 +5332,32 @@ impl crate::video::VideoSink for SessionVideo {
 
     fn overflow(&self) {
         DebugStats::inc(&self.shared.stats.video_decode_dropped);
+    }
+    fn stale(&self, session: Session) {
+        DebugStats::inc(&self.shared.stats.video_late_dropped);
+        let mut video = lock(&self.shared.video);
+        if video.generation == self.generation {
+            video.invalidate(session);
+        }
+    }
+    fn queued(&self, age: Duration) {
+        self.shared
+            .stats
+            .video_queue_age
+            .lock()
+            .unwrap()
+            .record(age);
+    }
+    fn tick(&self) {
+        let pending = {
+            let video = lock(&self.shared.video);
+            video.generation == self.generation && video.presentation_pending()
+        };
+        if pending {
+            if let Some(wake) = lock(&self.shared.video_waker).as_ref() {
+                wake();
+            }
+        }
     }
 }
 
@@ -5304,6 +5518,21 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                 let Some(sp) = speakers.get_mut(&header.speaker) else {
                     continue;
                 };
+                if header.media_epoch != sp.media_epoch {
+                    if sp.media_epoch != 0
+                        && header.media_epoch.wrapping_sub(sp.media_epoch) as i32 <= 0
+                    {
+                        continue;
+                    }
+                    sp.media_epoch = header.media_epoch;
+                    sp.jitter = JitterBuffer::new(JitterConfig {
+                        frame_samples,
+                        ..JitterConfig::default()
+                    });
+                    sp.pending.clear();
+                    sp.pending_times.clear();
+                    sp.next_stamp = None;
+                }
                 sp.last_packet = Some(now);
                 sp.ended = header.end();
                 // The TOC byte gives the peer's frame length (no decode).
@@ -5311,6 +5540,8 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                 let late = sp.jitter.stats().late;
                 sp.jitter.push_with_duration(
                     Packet {
+                        media_time: header.media_time,
+                        media_epoch: header.media_epoch,
                         gain_epoch: header.gain_epoch,
                         seq: header.seq,
                         ts: header.ts,
@@ -5928,6 +6159,28 @@ pub struct CameraLink {
 }
 
 impl CameraLink {
+    pub(crate) fn media_stamp(&self, at: Instant) -> crate::media::Stamp {
+        self.shared.media.stamp(at)
+    }
+    #[cfg(feature = "camera")]
+    pub(crate) fn report_processing(&self, report: crate::video::enhance::Report, accurate: bool) {
+        if !report.bypassed {
+            self.shared
+                .stats
+                .video_processing
+                .lock()
+                .unwrap()
+                .record(report.elapsed);
+        }
+        if report.bypassed {
+            DebugStats::inc(&self.shared.stats.video_processing_bypassed);
+        }
+        self.shared
+            .stats
+            .video_timing_estimated
+            .store(u64::from(!accurate), Ordering::Relaxed);
+    }
+
     #[cfg(feature = "camera")]
     pub(crate) fn shared_epoch(&self) -> usize {
         self.shared.state.borrow().privacy_epoch
@@ -5969,6 +6222,16 @@ impl CameraLink {
     /// Sends one encoded frame on the live connection; `Err` when not
     /// connected or when flow control dropped it.
     pub fn send_frame(&self, keyframe: bool, ts: u32, data: &[u8]) -> Result<(), String> {
+        let at = Instant::now();
+        self.send_captured_frame(keyframe, ts, data, (self.media_stamp(at), at, false))
+    }
+    pub(crate) fn send_captured_frame(
+        &self,
+        keyframe: bool,
+        ts: u32,
+        data: &[u8],
+        captured: (crate::media::Stamp, Instant, bool),
+    ) -> Result<(), String> {
         // A frame encoded just before the camera went off stays here.
         if !self.send_allowed() {
             return Err("camera off".into());
@@ -5990,9 +6253,12 @@ impl CameraLink {
                 }
             }
         };
-        let r = self
-            .runtime
-            .block_on(sender.send_until(keyframe, ts, data, cancelled, |send| {
+        let r = self.runtime.block_on(sender.send_captured_until(
+            keyframe,
+            ts,
+            data,
+            cancelled,
+            |send| {
                 let _gate = lock(&self.shared.conn);
                 if !self.send_allowed() {
                     let _ = send.reset(0u32.into());
@@ -6000,7 +6266,9 @@ impl CameraLink {
                 } else {
                     send.finish().map_err(|e| e.to_string())
                 }
-            }));
+            },
+            captured,
+        ));
         match &r {
             Ok(()) => {
                 DebugStats::inc(&self.shared.stats.video_sent);
@@ -6630,6 +6898,8 @@ mod tests {
     fn video_of_an_earlier_connection_is_dropped() {
         let frame = || crate::video::EncodedFrame {
             header: icu_proto::VideoHeader {
+                media_time: 0,
+                media_epoch: 0,
                 flags: icu_proto::header::VIDEO_FLAG_KEYFRAME,
                 speaker: 3,
                 seq: 1,

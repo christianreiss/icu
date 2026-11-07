@@ -488,6 +488,8 @@ async fn a_self_deafened_viewer_can_still_request_a_keyframe() {
 /// there, without a FIN: a sender that stalls mid-frame.
 async fn stalled_frame(client: &common::Client, bytes: usize) -> quinn::SendStream {
     let header = VideoHeader {
+        media_time: 0,
+        media_epoch: 0,
         flags: 0,
         speaker: 0,
         seq: 1,
@@ -591,6 +593,8 @@ async fn send_frame(
     finish: bool,
 ) -> quinn::SendStream {
     let header = VideoHeader {
+        media_time: 0,
+        media_epoch: 0,
         flags: 0,
         speaker: 0,
         seq,

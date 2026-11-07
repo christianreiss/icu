@@ -23,7 +23,7 @@ tray-icon = { path = "vendor/tray-icon-0.25.1" }
 quinn-proto = { path = "vendor/quinn-proto" }
 
 [workspace.package]
-version = "0.1.26"
+version = "0.1.27"
 edition = "2021"
 rust-version = "1.98"
 license = "Apache-2.0"

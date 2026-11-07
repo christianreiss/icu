@@ -50,6 +50,9 @@ pub struct RgbFrame {
     pub height: usize,
     /// RGB8, row major.
     pub rgb: Vec<u8>,
+    /// Monotonic acquisition time, before RGB decode and enhancement.
+    pub captured_at: Option<Instant>,
+    pub timing_accurate: bool,
 }
 
 impl RgbFrame {
@@ -81,6 +84,8 @@ impl RgbFrame {
         }
         rgb.truncate(w * h * 3);
         Ok(RgbFrame {
+            captured_at: None,
+            timing_accurate: false,
             width: w,
             height: h,
             rgb,
@@ -199,6 +204,7 @@ pub fn list() -> Vec<(u32, String)> {
 /// nokhwa V4L2/MSMF source.
 pub struct NokhwaSource {
     camera: nokhwa::Camera,
+    time: crate::media::CameraTime,
 }
 
 impl NokhwaSource {
@@ -244,7 +250,10 @@ impl NokhwaSource {
         };
         camera.open_stream().map_err(|e| e.to_string())?;
         tracing::info!(format = ?camera.camera_format(), "camera opened");
-        Ok(NokhwaSource { camera })
+        Ok(NokhwaSource {
+            camera,
+            time: Default::default(),
+        })
     }
 }
 
@@ -327,6 +336,8 @@ fn fit_capture(frame: RgbFrame) -> RgbFrame {
         width: tw,
         height: th,
         rgb,
+        captured_at: frame.captured_at,
+        timing_accurate: frame.timing_accurate,
     }
 }
 
@@ -334,6 +345,11 @@ impl FrameSource for NokhwaSource {
     fn next_frame(&mut self) -> Result<RgbFrame, String> {
         use nokhwa::{pixel_format::RgbFormat, utils::FrameFormat};
         let buffer = self.camera.frame().map_err(|e| e.to_string())?;
+        let (captured_at, accurate) = self.time.convert(
+            buffer.capture_timestamp(),
+            Instant::now(),
+            std::time::SystemTime::now(),
+        );
         let img = buffer
             .decode_image::<RgbFormat>()
             .map_err(|e| e.to_string())?;
@@ -351,7 +367,10 @@ impl FrameSource for NokhwaSource {
                 }
             }
         }
-        RgbFrame::checked(width, height, rgb).map(fit_capture)
+        let mut frame = RgbFrame::checked(width, height, rgb)?;
+        frame.captured_at = Some(captured_at);
+        frame.timing_accurate = accurate;
+        Ok(fit_capture(frame))
     }
 }
 
@@ -397,6 +416,8 @@ impl FrameSource for SyntheticSource {
             }
         }
         Ok(RgbFrame {
+            captured_at: None,
+            timing_accurate: false,
             width: w,
             height: h,
             rgb,
@@ -479,6 +500,8 @@ impl PrivacySource {
             }
         }
         RgbFrame {
+            captured_at: None,
+            timing_accurate: false,
             width: w,
             height: h,
             rgb,
@@ -581,6 +604,80 @@ fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1u64 << failures.saturating_sub(1).min(5)).min(Duration::from_secs(30))
 }
 
+/// Latest-only acquisition worker: camera buffering cannot grow behind a send.
+type CaptureSlot = (Mutex<Option<Result<RgbFrame, String>>>, std::sync::Condvar);
+struct FreshSource {
+    slot: Arc<CaptureSlot>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+impl FreshSource {
+    fn start(mut source: Box<dyn FrameSource>, stop: Arc<AtomicBool>) -> Result<Self, String> {
+        let slot = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
+        let target = slot.clone();
+        let halted = stop.clone();
+        let worker = std::thread::Builder::new()
+            .name("icu-camera-capture".into())
+            .spawn(move || {
+                while !halted.load(Ordering::Relaxed) {
+                    let result = source.next_frame().map(|mut frame| {
+                        if frame.captured_at.is_none() {
+                            frame.captured_at = Some(Instant::now());
+                        }
+                        frame
+                    });
+                    let failed = result.is_err();
+                    *target.0.lock().unwrap() = Some(result);
+                    target.1.notify_one();
+                    if failed {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                }
+                target.1.notify_one();
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            slot,
+            stop,
+            worker: Some(worker),
+        })
+    }
+}
+impl FrameSource for FreshSource {
+    fn next_frame(&mut self) -> Result<RgbFrame, String> {
+        let mut slot = self.slot.0.lock().unwrap();
+        loop {
+            if let Some(frame) = slot.take() {
+                return frame;
+            }
+            if self.stop.load(Ordering::Relaxed) {
+                return Err("capture stopped".into());
+            }
+            slot = self
+                .slot
+                .1
+                .wait_timeout(slot, Duration::from_millis(50))
+                .unwrap()
+                .0;
+            if self.worker.as_ref().is_some_and(|w| w.is_finished()) && slot.is_none() {
+                return Err("capture worker ended".into());
+            }
+        }
+    }
+}
+impl Drop for FreshSource {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // A driver may still be blocked. It owns its source until it returns;
+        // privacy revocation is enforced independently by CameraLink.
+        if let Some(worker) = self.worker.take() {
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+        }
+    }
+}
+
 /// Encoder thread loop: capture → encode → send. `preview` receives every
 /// captured picture for the settings preview, regardless of tier, so the
 /// settings preview keeps working even while video is paused for everyone
@@ -599,12 +696,14 @@ fn backoff(failures: u32) -> Duration {
 /// Returns once `stop` is set, or with the last error after
 /// [`MAX_FAILED_FRAMES`] failed frames in a row.
 pub fn run_sender(
-    mut source: Box<dyn FrameSource>,
+    source: Box<dyn FrameSource>,
     link: CameraLink,
     stop: Arc<AtomicBool>,
     live: Arc<AtomicBool>,
     preview: Arc<PreviewSlot>,
 ) -> Result<(), String> {
+    let mut source = FreshSource::start(source, stop.clone())?;
+    let mut enhancer = crate::video::enhance::Enhancer::default();
     // No encoder while paused: `run_sender` stops encoding rather than
     // building one with a zero bitrate.
     let build = |tier: VideoTier| -> Result<Option<Encoder>, String> {
@@ -629,8 +728,8 @@ pub fn run_sender(
     // it, so the receivers see a broken picture until the next IDR.
     let mut lost = false;
     while !stop.load(Ordering::Relaxed) {
-        let frame = match source.next_frame() {
-            Ok(f) if f.is_valid() => Arc::new(f),
+        let mut frame = match source.next_frame() {
+            Ok(f) if f.is_valid() => f,
             result => {
                 let e = result.map_or_else(
                     |e| e,
@@ -658,7 +757,12 @@ pub fn run_sender(
         };
         // When the picture arrived: the wire timestamp, and what openh264's
         // rate control measures the real frame spacing with.
-        let captured = start.elapsed();
+        let acquired = frame.captured_at.unwrap_or_else(Instant::now);
+        if acquired.elapsed() > Duration::from_millis(100) {
+            continue;
+        }
+        let captured = acquired.saturating_duration_since(start);
+        let stamp = link.media_stamp(acquired);
         if failed > 0 {
             tracing::info!(failed, "camera frames again");
             failed = 0;
@@ -668,6 +772,9 @@ pub fn run_sender(
         if !link.source_current() {
             return Ok(());
         }
+        let report = enhancer.process(&mut frame, Instant::now());
+        link.report_processing(report, frame.timing_accurate);
+        let frame = Arc::new(frame);
         preview.put(frame.clone());
 
         let new_tier = if live.load(Ordering::Relaxed) {
@@ -722,7 +829,12 @@ pub fn run_sender(
                 if data.is_empty() {
                     continue;
                 }
-                if let Err(e) = link.send_frame(keyframe, ts, &data) {
+                if let Err(e) = link.send_captured_frame(
+                    keyframe,
+                    ts,
+                    &data,
+                    (stamp, acquired, frame.timing_accurate),
+                ) {
                     tracing::debug!(%e, "video frame not sent");
                     // Not while offline: there is nobody to repair for.
                     lost |= link.connected();
@@ -1255,6 +1367,8 @@ mod tests {
     #[test]
     fn a_larger_capture_is_cut_to_4_3_and_scaled_down() {
         let solid = |w: usize, h: usize, v: u8| RgbFrame {
+            captured_at: None,
+            timing_accurate: false,
             width: w,
             height: h,
             rgb: vec![v; w * h * 3],
@@ -1422,12 +1536,16 @@ mod tests {
         );
         // And a hand-made frame is caught by the last check.
         let bad = RgbFrame {
+            captured_at: None,
+            timing_accurate: false,
             width: 5,
             height: 3,
             rgb: pattern(5, 3),
         };
         assert!(!bad.is_valid(), "odd sides");
         let bad = RgbFrame {
+            captured_at: None,
+            timing_accurate: false,
             width: 4,
             height: 2,
             rgb: pattern(4, 3),

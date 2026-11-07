@@ -6,7 +6,10 @@
 //! (usually real-time) thread and must be lock free; the engine only pushes
 //! into ring buffers there.
 
-use std::fmt;
+use std::{
+    fmt,
+    time::{Duration, Instant},
+};
 
 /// Sample rate every backend delivers and expects.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -80,6 +83,60 @@ pub type ReferenceCallback = Box<dyn FnMut(&[ReferenceFrame], usize) + Send + 's
 /// Called to fill each playback block (mono f32, ±1.0); the slice is zeroed.
 pub type PlaybackCallback = Box<dyn FnMut(&mut [f32]) + Send + 'static>;
 
+/// Time of the first capture/presentation sample. `accurate` distinguishes
+/// device timing from callback estimates; it does not imply physical AV proof.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioTiming {
+    pub at: Instant,
+    pub accurate: bool,
+}
+impl AudioTiming {
+    pub fn shifted(self, samples: usize) -> Self {
+        Self {
+            at: self.at + Duration::from_secs_f64(samples as f64 / 48_000.0),
+            ..self
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub fn monotonic_ns(ns: i64) -> Option<Self> {
+        let at = Instant::now();
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: valid writable timespec; CLOCK_MONOTONIC matches PipeWire.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
+            return None;
+        }
+        let current = i128::from(ts.tv_sec) * 1_000_000_000 + i128::from(ts.tv_nsec);
+        let delta = i128::from(ns) - current;
+        if delta.abs() > 1_000_000_000 {
+            return None;
+        }
+        let duration = Duration::from_nanos(delta.unsigned_abs() as u64);
+        let at = if delta < 0 {
+            at.checked_sub(duration)?
+        } else {
+            at.checked_add(duration)?
+        };
+        Some(Self { at, accurate: true })
+    }
+    pub fn estimated_capture(samples: usize) -> Self {
+        Self {
+            at: Instant::now() - Duration::from_secs_f64(samples as f64 / 48_000.0),
+            accurate: false,
+        }
+    }
+    pub fn estimated_playback() -> Self {
+        Self {
+            at: Instant::now(),
+            accurate: false,
+        }
+    }
+}
+pub type TimedCaptureCallback = Box<dyn FnMut(&[f32], AudioTiming) + Send + 'static>;
+pub type TimedPlaybackCallback = Box<dyn FnMut(&mut [f32], AudioTiming) + Send + 'static>;
+
 /// Backend failure.
 #[derive(Debug, Clone)]
 pub struct BackendError(pub String);
@@ -134,6 +191,29 @@ pub trait AudioBackend: Send {
         device: Option<&str>,
         cb: CaptureCallback,
     ) -> Result<(), BackendError>;
+
+    /// Timing-aware capture; portable backends explicitly report an estimate.
+    fn open_capture_timed(
+        &mut self,
+        device: Option<&str>,
+        mut cb: TimedCaptureCallback,
+    ) -> Result<(), BackendError> {
+        self.open_capture(
+            device,
+            Box::new(move |samples| cb(samples, AudioTiming::estimated_capture(samples.len()))),
+        )
+    }
+    /// Timing-aware playback; native implementations include device buffering.
+    fn open_playback_timed(
+        &mut self,
+        device: Option<&str>,
+        mut cb: TimedPlaybackCallback,
+    ) -> Result<(), BackendError> {
+        self.open_playback(
+            device,
+            Box::new(move |samples| cb(samples, AudioTiming::estimated_playback())),
+        )
+    }
 
     /// Opens the AEC reference stream on the active output sink's monitor.
     /// `None` follows the default sink.

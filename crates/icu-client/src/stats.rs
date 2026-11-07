@@ -118,6 +118,17 @@ pub fn fmt_ms(v: f64) -> String {
 /// Everything the engine counts. Cheap to share; read by the UI and tests.
 #[derive(Debug, Default)]
 pub struct DebugStats {
+    /// Current timing confidence: one means callback/arrival estimate.
+    pub audio_timing_estimated: AtomicU64,
+    pub audio_playout_timing_estimated: AtomicU64,
+    pub video_timing_estimated: AtomicU64,
+    /// Automatic processing, including budget bypasses.
+    pub video_processing: Mutex<Histogram>,
+    pub video_processing_bypassed: AtomicU64,
+    pub video_late_dropped: AtomicU64,
+    pub video_queue_age: Mutex<Histogram>,
+    pub av_offset_us: AtomicI64,
+
     /// Audio datagrams sent.
     pub datagrams_sent: AtomicU64,
     /// Audio datagrams received (any speaker).
@@ -235,7 +246,7 @@ impl DebugStats {
         let jitter_delay = self.jitter_delay.lock().unwrap().summary();
         let capture_to_send = self.capture_to_send.lock().unwrap().summary();
         format!(
-            "icu stats: sent={} recv={} bad={} decoded={} fec={} fec_attempted={} fec_samples={} fec_fallback={} plc={} played={} play_underruns={} jb_late={} jb_underruns={} jb_stretched={} jb_skipped={} jb_dropped={} jb_lost={} dsp_blocks={} ref_underruns={} cap_overruns={} ref_overruns={} cap_backlog={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}",
+            "icu stats: sent={} recv={} bad={} decoded={} fec={} fec_attempted={} fec_samples={} fec_fallback={} plc={} played={} play_underruns={} jb_late={} jb_underruns={} jb_stretched={} jb_skipped={} jb_dropped={} jb_lost={} dsp_blocks={} ref_underruns={} cap_overruns={} ref_overruns={} cap_backlog={} loss_perc={} rtt={} reconnects={} video_tx={} video_rx={} idr_forced={} video_tier={} video_tier_changes={} video_open_uni_drops={}\n  dsp block      {}\n  jitter delay   {}\n  capture→send   {}\n  video processing {}\n  video queue      {}\n  video bypass={} late={} estimated_capture={} estimated_camera={} estimated_playout={} av_decode_offset_us={}",
             Self::get(&self.datagrams_sent),
             Self::get(&self.datagrams_received),
             Self::get(&self.datagrams_bad),
@@ -270,6 +281,14 @@ impl DebugStats {
             dsp_block,
             jitter_delay,
             capture_to_send,
+            self.video_processing.lock().unwrap().summary(),
+            self.video_queue_age.lock().unwrap().summary(),
+            Self::get(&self.video_processing_bypassed),
+            Self::get(&self.video_late_dropped),
+            Self::get(&self.audio_timing_estimated),
+            Self::get(&self.video_timing_estimated),
+            Self::get(&self.audio_playout_timing_estimated),
+            self.av_offset_us.load(Ordering::Relaxed),
         )
     }
 }

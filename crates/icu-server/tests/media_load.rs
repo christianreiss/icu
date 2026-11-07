@@ -246,7 +246,9 @@ async fn soak(blocked_video: bool) {
                         // Model an actual encoder's periodic IDR so a pair can
                         // recover after pressure instead of losing video forever.
                         let flags = if v % 30 == 0 { VIDEO_FLAG_KEYFRAME } else { 0 };
-                        let header = VideoHeader { flags, speaker: 0, seq: v, ts: u32::from(v)*3200, codec: VIDEO_CODEC_H264 };
+                        let header = VideoHeader {
+            media_time: 0,
+            media_epoch: 0, flags, speaker: 0, seq: v, ts: u32::from(v)*3200, codec: VIDEO_CODEC_H264 };
                         let mut frame = header.encode().to_vec();
                         frame.resize(VIDEO_HEADER_LEN + VIDEO_BYTES, v as u8);
                         tokio::time::timeout(Duration::from_secs(1), async {

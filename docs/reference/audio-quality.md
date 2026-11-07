@@ -1,6 +1,6 @@
 # Audioqualität und Absenkung anderer Anwendungen
 
-Stand: 2026-10-30, Audio-Policy 2, Protokoll-Minor 7. Client und Server müssen
+Stand: 2026-10-30, Audio-Policy 2, Protokoll-Minor 8. Client und Server müssen
 gemeinsam aktualisiert werden. [Messbericht und Grenzen](../history/audio-quality-2026-10-30.md).
 
 ## Signalwege und Zuständigkeiten

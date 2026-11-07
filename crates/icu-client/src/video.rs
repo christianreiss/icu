@@ -2,10 +2,10 @@
 //! receive, decode per speaker, `KeyframeRequest` bookkeeping.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicU16, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -15,6 +15,8 @@ use icu_proto::{
     limits as pl, Session, VideoHeader,
 };
 
+#[cfg(feature = "camera")]
+pub mod enhance;
 #[cfg_attr(not(feature = "camera"), allow(dead_code))]
 mod h264;
 
@@ -144,6 +146,8 @@ pub struct Frame {
     pub rgba: Arc<Vec<u8>>,
     /// When it was decoded.
     pub at: Instant,
+    /// Original capture time; decode completion never replaces this.
+    pub stamp: crate::media::Stamp,
 }
 
 /// The per-speaker H.264 decoder. Remembers when an access unit failed to
@@ -224,6 +228,7 @@ pub fn decode(decoder: &mut Decoder, data: &[u8]) -> Option<Frame> {
         height: h,
         rgba: Arc::new(rgba),
         at: Instant::now(),
+        stamp: crate::media::Stamp::default(),
     })
 }
 
@@ -249,6 +254,9 @@ pub trait VideoSink: Send + Sync + Clone + 'static {
     fn deliver(&self, session: Session, frame: EncodedFrame);
     /// A frame was dropped because the decode thread is behind.
     fn overflow(&self) {}
+    fn stale(&self, _session: Session) {}
+    fn queued(&self, _age: Duration) {}
+    fn tick(&self) {}
 }
 
 /// How far a frame's `seq` may lag behind the newest one and still count as
@@ -272,41 +280,117 @@ const DECODE_QUEUE: usize = 64;
 /// thread also keeps a speaker's frames in arrival order, which
 /// `spawn_blocking` per frame would not.
 pub async fn accept_loop<S: VideoSink>(conn: quinn::Connection, sink: S) {
-    let (tx, rx) = std::sync::mpsc::sync_channel::<(Session, EncodedFrame)>(DECODE_QUEUE);
+    let queue = Arc::new((
+        Mutex::new(DecodeQueue::default()),
+        std::sync::Condvar::new(),
+    ));
+    let worker = queue.clone();
     let decode_sink = sink.clone();
     if let Err(e) = std::thread::Builder::new()
         .name("icu-video-decode".into())
-        .spawn(move || {
-            while let Ok((session, frame)) = rx.recv() {
-                decode_sink.deliver(session, frame);
+        .spawn(move || loop {
+            let mut q = worker.0.lock().unwrap();
+            if q.frames.is_empty() && !q.closed {
+                q = worker
+                    .1
+                    .wait_timeout(q, Duration::from_millis(16))
+                    .unwrap()
+                    .0;
+            }
+            let item = q.pop();
+            let closed = q.closed;
+            drop(q);
+            decode_sink.tick();
+            if let Some((session, frame, at)) = item {
+                let age = at.elapsed();
+                decode_sink.queued(age);
+                if age > Duration::from_millis(100) {
+                    decode_sink.stale(session);
+                } else {
+                    decode_sink.deliver(session, frame);
+                }
+            } else if closed {
+                return;
             }
         })
     {
-        tracing::warn!(error = %e, "cannot spawn video decode thread");
+        tracing::warn!(error=%e,"cannot spawn video decode thread");
         return;
     }
+    let reads = Arc::new(tokio::sync::Semaphore::new(32));
     loop {
-        let mut recv = match conn.accept_uni().await {
-            Ok(r) => r,
-            Err(_) => return,
+        let Ok(mut recv) = conn.accept_uni().await else {
+            break;
         };
-        let tx = tx.clone();
+        let at = Instant::now();
+        let queue = queue.clone();
         let sink = sink.clone();
+        let Ok(permit) = reads.clone().acquire_owned().await else {
+            break;
+        };
         tokio::spawn(async move {
-            let mut data = match recv.read_to_end(VIDEO_HEADER_LEN + VIDEO_MAX_FRAME).await {
-                Ok(b) => b,
-                Err(_) => return,
+            let _permit = permit;
+            let Ok(Ok(mut data)) = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(at + Duration::from_millis(100)),
+                recv.read_to_end(VIDEO_HEADER_LEN + VIDEO_MAX_FRAME),
+            )
+            .await
+            else {
+                return;
             };
             let Ok(header) = VideoHeader::decode(&data) else {
                 return;
             };
-            // The header is dropped in place; the frame body is not copied.
             data.drain(..VIDEO_HEADER_LEN);
             let frame = EncodedFrame { header, data };
-            if tx.try_send((header.speaker, frame)).is_err() {
+            let dropped = queue.0.lock().unwrap().push(header.speaker, frame, at);
+            for _ in 0..dropped {
                 sink.overflow();
             }
+            queue.1.notify_one();
         });
+    }
+    queue.0.lock().unwrap().closed = true;
+    queue.1.notify_one();
+}
+
+/// At most two waiting access units per speaker, 64 total and 8 MiB.
+/// Dropping a reference is detected by the ordinary sequence/IDR machinery.
+#[derive(Default)]
+struct DecodeQueue {
+    frames: VecDeque<(Session, EncodedFrame, Instant)>,
+    bytes: usize,
+    closed: bool,
+}
+impl DecodeQueue {
+    fn pop(&mut self) -> Option<(Session, EncodedFrame, Instant)> {
+        let item = self.frames.pop_front()?;
+        self.bytes -= item.1.data.len();
+        Some(item)
+    }
+    fn push(&mut self, session: Session, frame: EncodedFrame, at: Instant) -> usize {
+        if self.closed {
+            return 1;
+        }
+        let mut dropped = 0;
+        while self.frames.iter().filter(|item| item.0 == session).count() >= 2 {
+            let index = self
+                .frames
+                .iter()
+                .position(|item| item.0 == session)
+                .unwrap();
+            self.bytes -= self.frames.remove(index).unwrap().1.data.len();
+            dropped += 1;
+        }
+        while self.frames.len() >= DECODE_QUEUE || self.bytes + frame.data.len() > 8 * 1024 * 1024 {
+            if self.pop().is_none() {
+                break;
+            }
+            dropped += 1;
+        }
+        self.bytes += frame.data.len();
+        self.frames.push_back((session, frame, at));
+        dropped
     }
 }
 
@@ -359,12 +443,42 @@ impl Sender {
         cancelled: impl std::future::Future<Output = ()>,
         finish: impl FnOnce(&mut quinn::SendStream) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.send_captured_until(
+            keyframe,
+            ts,
+            data,
+            cancelled,
+            finish,
+            (crate::media::Stamp::default(), Instant::now(), false),
+        )
+        .await
+    }
+
+    pub(crate) async fn send_captured_until(
+        &self,
+        keyframe: bool,
+        ts: u32,
+        data: &[u8],
+        cancelled: impl std::future::Future<Output = ()>,
+        finish: impl FnOnce(&mut quinn::SendStream) -> Result<(), String>,
+        captured: (crate::media::Stamp, Instant, bool),
+    ) -> Result<(), String> {
         tokio::pin!(cancelled);
+        let deadline = tokio::time::Instant::from_std(captured.1 + Duration::from_millis(100));
+        if tokio::time::Instant::now() >= deadline {
+            return Err("flow control: frame dropped".into());
+        }
         let header = VideoHeader {
+            media_time: captured.0.micros,
+            media_epoch: captured.0.epoch,
             flags: if keyframe {
                 icu_proto::header::VIDEO_FLAG_KEYFRAME
             } else {
                 0
+            } | if captured.2 {
+                0
+            } else {
+                icu_proto::header::MEDIA_FLAG_TIMING_ESTIMATED
             },
             speaker: 0,
             seq: self.seq.fetch_add(1, Ordering::Relaxed),
@@ -374,7 +488,7 @@ impl Sender {
         let send = tokio::select! {
             biased;
             () = &mut cancelled => return Err("camera source changed".into()),
-            opened = tokio::time::timeout(Duration::from_millis(50), self.conn.open_uni()) => match opened {
+            opened = tokio::time::timeout_at(deadline.min(tokio::time::Instant::now()+Duration::from_millis(50)), self.conn.open_uni()) => match opened {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => return Err(e.to_string()),
                 Err(_) => return Err("flow control: frame dropped".into()),
@@ -394,10 +508,10 @@ impl Sender {
                 let _ = send.reset(0u32.into());
                 return Err("camera source changed".into());
             }
-            result = async {
+            result = tokio::time::timeout_at(deadline, async {
                 send.write_all(&header.encode()).await?;
                 send.write_all(data).await
-            } => result,
+            }) => match result {Ok(result)=>result,Err(_)=>return Err("flow control: frame dropped".into())},
         };
         written.map_err(|e| e.to_string())?;
         let result = finish(send);
@@ -411,7 +525,10 @@ struct Receiver {
     /// `None` while [`Receivers::accept`] has lent it to the decode thread,
     /// or when no decoder could be created.
     decoder: Option<Decoder>,
-    latest: Option<Frame>,
+    pictures: VecDeque<(u64, Frame)>,
+    shown: Mutex<Option<(u64, Frame)>>,
+    audio: Option<crate::media::Playout>,
+    media_epoch: u32,
     /// Counts decoded pictures, mirroring `crate::camera::PreviewSlot::seq`:
     /// a viewer that already uploaded `seq` knows the pixels have not changed
     /// and can skip both the clone and the texture upload.
@@ -435,7 +552,10 @@ impl Receiver {
             decoder: Decoder::new().ok(),
             #[cfg(not(feature = "camera"))]
             decoder: Some(Decoder),
-            latest: None,
+            pictures: VecDeque::with_capacity(3),
+            shown: Mutex::new(None),
+            audio: None,
+            media_epoch: 0,
             seq: 0,
             got_keyframe: false,
             last_seq: None,
@@ -445,11 +565,33 @@ impl Receiver {
         }
     }
 
-    /// Whether [`Receiver::latest`] is fresh enough to put on screen.
-    fn fresh(&self) -> bool {
-        self.latest
+    fn selected(&self, now: Instant) -> Option<(u64, Frame)> {
+        let mut shown = self.shown.lock().unwrap();
+        for (seq, frame) in self.pictures.iter().rev() {
+            if shown.as_ref().is_some_and(|(old, _)| old >= seq) {
+                break;
+            }
+            if now.saturating_duration_since(frame.at) > FRESH {
+                continue;
+            }
+            if let Some(target) = self.audio.and_then(|a| a.target(frame.stamp, now)) {
+                if target > now
+                    || target.saturating_duration_since(frame.at) > Duration::from_millis(100)
+                {
+                    continue;
+                }
+                // A picture decoded after its useful slot is never presented.
+                if frame.at.saturating_duration_since(target) > Duration::from_millis(100) {
+                    continue;
+                }
+            }
+            *shown = Some((*seq, frame.clone()));
+            break;
+        }
+        shown
             .as_ref()
-            .is_some_and(|f| f.at.elapsed() <= FRESH)
+            .filter(|(_, frame)| now.saturating_duration_since(frame.at) <= FRESH)
+            .cloned()
     }
 }
 
@@ -483,6 +625,19 @@ impl Receivers {
         let r = self.map.entry(session).or_insert_with(Receiver::new);
         r.frames += 1;
         r.last_frame = Some(Instant::now());
+        if frame.header.media_epoch != r.media_epoch {
+            if r.media_epoch != 0
+                && frame.header.media_epoch.wrapping_sub(r.media_epoch) as i32 <= 0
+            {
+                return None;
+            }
+            r.media_epoch = frame.header.media_epoch;
+            r.pictures.clear();
+            *r.shown.lock().unwrap() = None;
+            r.got_keyframe = false;
+            r.last_seq = None;
+            r.audio = None;
+        }
         let seq = frame.header.seq;
         if let Some(last) = r.last_seq {
             // Modulo 2^16 (`docs/reference/protocol.md` §3): a step past half the range is
@@ -523,8 +678,11 @@ impl Receivers {
         }
         r.decoder = Some(decoder);
         if let Some(picture) = picture {
-            r.latest = Some(picture);
             r.seq += 1;
+            if r.pictures.len() == 3 {
+                r.pictures.pop_front();
+            }
+            r.pictures.push_back((r.seq, picture));
         }
     }
 
@@ -561,40 +719,52 @@ impl Receivers {
     /// Latest decoded frame per session; tiles older than [`FRESH`] are
     /// hidden.
     pub fn latest(&self) -> Vec<(Session, Frame)> {
+        let now = Instant::now();
         self.map
             .iter()
-            .filter_map(|(s, r)| {
-                let f = r.latest.clone()?;
-                if f.at.elapsed() > FRESH {
-                    None
-                } else {
-                    Some((*s, f))
-                }
-            })
+            .filter_map(|(session, r)| r.selected(now).map(|(_, frame)| (*session, frame)))
             .collect()
     }
-
-    /// `(session, seq)` for every session with a picture fresh enough to
-    /// show. Copies no pixels, so a UI drawing at its own frame rate can ask
-    /// on every repaint and fetch only what it has not uploaded yet. A
-    /// session that stopped sending drops out of the list — that is what
-    /// makes a stale picture disappear instead of freezing.
+    /// Sequence of the picture due for presentation, shared by every surface.
     pub fn seqs(&self) -> Vec<(Session, u64)> {
+        let now = Instant::now();
         self.map
             .iter()
-            .filter(|(_, r)| r.fresh())
-            .map(|(s, r)| (*s, r.seq))
+            .filter_map(|(session, r)| r.selected(now).map(|(seq, _)| (*session, seq)))
             .collect()
     }
-
-    /// One session's latest picture and its `seq`. Clones exactly that one
-    /// picture, unlike [`Receivers::latest`], which clones everybody's.
     pub fn picture(&self, session: Session) -> Option<(u64, Frame)> {
-        let r = self.map.get(&session)?;
-        if !r.fresh() {
-            return None;
+        self.map.get(&session)?.selected(Instant::now())
+    }
+    pub fn audio_playout(&mut self, session: Session, anchor: crate::media::Playout) {
+        if let Some(r) = self.map.get_mut(&session) {
+            if r.media_epoch == anchor.stamp.epoch {
+                r.audio = Some(anchor);
+            }
         }
-        Some((r.seq, r.latest.clone()?))
+    }
+    pub fn timing_target(&self, session: Session, stamp: crate::media::Stamp) -> Option<Instant> {
+        self.map.get(&session)?.audio?.target(stamp, Instant::now())
+    }
+    pub fn clear_audio_playout(&mut self) {
+        for r in self.map.values_mut() {
+            r.audio = None;
+        }
+    }
+    pub fn invalidate(&mut self, session: Session) {
+        if let Some(r) = self.map.get_mut(&session) {
+            r.got_keyframe = false;
+        }
+    }
+    pub fn presentation_pending(&self) -> bool {
+        let now = Instant::now();
+        self.map.values().any(|r| {
+            r.pictures.iter().any(|(_, f)| {
+                r.audio
+                    .and_then(|a| a.target(f.stamp, now))
+                    .is_some_and(|t| t + Duration::from_millis(32) >= now)
+            })
+        })
     }
 
     /// Frames received for a session (tests).
@@ -723,7 +893,7 @@ mod tests {
             tokio::join!(connect, async { server.accept().await.unwrap().await });
         let outgoing = outgoing.unwrap();
         let incoming = incoming.unwrap();
-        for abort_task in [false, true] {
+        for mode in 0..3 {
             let sender = Sender::new(outgoing.clone());
             let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
             let task = tokio::spawn(async move {
@@ -749,7 +919,13 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(!task.is_finished(), "body is blocked by the receive window");
-            if abort_task {
+            if mode == 2 {
+                let result = tokio::time::timeout(Duration::from_millis(500), task)
+                    .await
+                    .expect("full-frame deadline")
+                    .unwrap();
+                assert_eq!(result, Err("flow control: frame dropped".into()));
+            } else if mode == 1 {
                 task.abort();
                 assert!(task.await.unwrap_err().is_cancelled());
             } else {
@@ -771,9 +947,74 @@ mod tests {
         incoming.close(0u32.into(), b"done");
     }
 
+    #[test]
+    fn presentation_waits_for_audio_and_never_moves_backwards() {
+        let now = Instant::now();
+        let mut r = Receiver::new();
+        r.audio = Some(crate::media::Playout {
+            stamp: crate::media::Stamp {
+                micros: 1_000_000,
+                epoch: 1,
+            },
+            at: now,
+        });
+        let picture = Frame {
+            width: 2,
+            height: 2,
+            rgba: Arc::new(vec![0; 16]),
+            at: now,
+            stamp: crate::media::Stamp {
+                micros: 1_040_000,
+                epoch: 1,
+            },
+        };
+        r.pictures.push_back((1, picture.clone()));
+        assert!(r.selected(now).is_none(), "early picture must wait");
+        assert_eq!(r.selected(now + Duration::from_millis(40)).unwrap().0, 1);
+        r.audio.as_mut().unwrap().at += Duration::from_millis(20);
+        assert_eq!(
+            r.selected(now + Duration::from_millis(40)).unwrap().0,
+            1,
+            "a corrected anchor cannot undo presentation"
+        );
+        let mut late = picture;
+        late.at = now + Duration::from_millis(300);
+        r.pictures.push_back((2, late));
+        assert_eq!(
+            r.selected(now + Duration::from_millis(300)).unwrap().0,
+            1,
+            "a very late decode does not replace the picture"
+        );
+        assert!(r.selected(now + Duration::from_secs(4)).is_none());
+    }
+
+    #[test]
+    fn decode_queue_bounds_bytes_and_a_single_speakers_share() {
+        let mut q = DecodeQueue::default();
+        let now = Instant::now();
+        for speaker in 0..64 {
+            for _ in 0..4 {
+                let mut f = frame(true);
+                f.data = vec![0; VIDEO_MAX_FRAME];
+                q.push(speaker, f, now);
+            }
+        }
+        assert!(q.frames.len() <= DECODE_QUEUE);
+        assert!(q.bytes <= 8 * 1024 * 1024);
+        for speaker in 0..64 {
+            assert!(q.frames.iter().filter(|f| f.0 == speaker).count() <= 2);
+        }
+        assert_eq!(
+            q.bytes,
+            q.frames.iter().map(|f| f.1.data.len()).sum::<usize>()
+        );
+    }
+
     fn frame(keyframe: bool) -> EncodedFrame {
         EncodedFrame {
             header: VideoHeader {
+                media_time: 0,
+                media_epoch: 0,
                 flags: if keyframe { 1 } else { 0 },
                 speaker: 3,
                 seq: 0,
@@ -827,6 +1068,8 @@ mod tests {
                 let keyframe = matches!(bs.frame_type(), FrameType::IDR | FrameType::I);
                 EncodedFrame {
                     header: VideoHeader {
+                        media_time: 0,
+                        media_epoch: 0,
                         flags: u8::from(keyframe),
                         speaker: 3,
                         seq: i as u16,
