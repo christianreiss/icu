@@ -447,9 +447,9 @@ dependencies = [
 
 [[package]]
 name = "async-executor"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
+checksum = "f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37"
 dependencies = [
  "async-task",
  "concurrent-queue",
@@ -2783,7 +2783,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "icu-client"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "ab_glyph",
  "arboard",
@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "icu-proto"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "base64 0.22.1",
  "postcard",
@@ -2862,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "icu-server"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "bytes",
  "clap",
