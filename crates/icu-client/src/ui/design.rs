@@ -200,6 +200,19 @@ pub fn mode_button(ui: &mut Ui, width: f32, title: &str, hint: &str, ink: Color3
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Whether `title` and `hint` fit untruncated inside a `mode_button` of `width`.
+pub fn mode_text_fits(ui: &Ui, width: f32, title: &str, hint: &str) -> bool {
+    let measure = |text: &str, font: FontId| {
+        egui::WidgetText::from(RichText::new(text).font(font))
+            .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body)
+            .size()
+            .x
+    };
+    let room = (width - 20.0).max(0.0);
+    measure(title, FontId::new(13.0, fonts::semibold())) <= room
+        && measure(hint, FontId::proportional(11.5)) <= room
+}
+
 /// Plain 34px text actions from the Settings artboard. Existing action labels,
 /// enabled states and confirmations remain at the call site.
 pub fn button(ui: &mut Ui, kind: widgets::ButtonKind, glyph: &str, label: &str) -> Response {

@@ -472,6 +472,18 @@ fn main_window_fits() {
             s.peers.clear();
             s
         }),
+        ("alone-vad", {
+            // The everyday Automatisch state: short labels keep the single row.
+            let mut s = state();
+            s.settings.audio.mode = ModeSetting::Vad;
+            s.peers.clear();
+            s
+        }),
+        ("four-vad", {
+            let mut s = four();
+            s.settings.audio.mode = ModeSetting::Vad;
+            s
+        }),
         ("fatal", {
             let mut s = state();
             s.conn = ConnStatus::Fatal(Problem::plain(
