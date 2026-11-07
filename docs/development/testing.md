@@ -321,3 +321,14 @@ Physische Freigabe bleibt separat offen:
   Zweites ICU regelt dasselbe Device nicht gleichzeitig.
 - [ ] Stumm, PTT losgelassen, längere Stille, Hotplug und Fehler-Rückfall testen;
   Crash-Wiederherstellung ist ausdrücklich nicht garantiert.
+
+## Kamera-Notfallfix 0.1.28 (2026-11-07)
+
+Beide Teilnehmer mit 0.1.28 verbinden, Kamera und Overlay einschalten.
+Während Sprache, Sprechpausen und Spielbetrieb bleiben beide Kamerabilder
+sichtbar. Auch bei `av_decode_offset_us` außerhalb ±100000 dürfen frische
+Bilder nicht verschwinden; `late` darf nicht allein durch den Audiozielwert
+steigen. Kamera aus und Verlassen müssen das Bild weiterhin entfernen.
+Bildkorrektur, H.264-Recovery und begrenzte Empfangsqueues bleiben aktiv.
+Die Quellregression prüft fortlaufende Präsentation bei ±421 ms, ±101 ms,
+±40 ms und 0 ms sowie das Auslaufen eines gestoppten Streams.

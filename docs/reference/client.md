@@ -635,14 +635,16 @@ Capture läuft getrennt von Encode/Send weiter und überschreibt einen Latest-Sl
 Es gibt keine Effekt-, Helligkeits-, Schärfe- oder Sync-Regler.
 
 Minor 8 trägt gemeinsame Capture-Zeit und Epochen in beiden Medienheadern.
-Audio-Samplezähler und Pegel-Epochen behalten ihre Zuständigkeiten. Die gemeinsame
-Videopräsentation orientiert sich an Audiowiedergabe, Ringverbrauch und
-Gerätevorlauf; die Sprachlatenz wird nicht künstlich erhöht. Audio ohne native
+Audio-Samplezähler und Pegel-Epochen behalten ihre Zuständigkeiten. Seit dem Notfallfix 0.1.28 zeigt die gemeinsame Videopräsentation wieder
+das neueste frische dekodierte Bild sofort. Audioanker und Medienzeit bleiben
+für Diagnosen erhalten, steuern aber weder Bildfreigabe noch Wartezeiten;
+die Sprachlatenz wird nicht künstlich erhöht. Audio ohne native
 Timingdaten und Kamera ohne plausible Zeitstempel sind ausdrücklich Schätzungen.
 `--debug-stats` zeigt Verarbeitungs-/Queue-Zeiten, Budget-Bypässe, späte Bilder,
 Timing-Schätzungen und den Decode-Abstand zum geschätzten Audioziel. Dieser
 Decode-Abstand ist keine Messung von Display- oder Schalllaufzeit.
 
-Die bisherigen Aussagen „neuestes dekodiertes Bild sofort“ und „64 Frames dürfen
-mehrere Sekunden warten“ sind durch die begrenzte Präsentation/Queue ersetzt.
+Die Decode-Queue bleibt zeitlich und mengenmäßig begrenzt. Die mit 0.1.27
+eingeführte A/V-Präsentationsfilterung wurde in 0.1.28 entfernt: ein unpassender
+Audiozielwert darf einen gesunden Kamerastream nicht ausblenden.
 Physische Lip-Sync-Abnahme bleibt ein eigener Linux-/Windows-Hardwaretest.

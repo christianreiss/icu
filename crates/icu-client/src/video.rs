@@ -574,17 +574,8 @@ impl Receiver {
             if now.saturating_duration_since(frame.at) > FRESH {
                 continue;
             }
-            if let Some(target) = self.audio.and_then(|a| a.target(frame.stamp, now)) {
-                if target > now
-                    || target.saturating_duration_since(frame.at) > Duration::from_millis(100)
-                {
-                    continue;
-                }
-                // A picture decoded after its useful slot is never presented.
-                if frame.at.saturating_duration_since(target) > Duration::from_millis(100) {
-                    continue;
-                }
-            }
+            // Present the latest fresh decode immediately. Audio anchors are
+            // retained for diagnostics, never for gating camera visibility.
             *shown = Some((*seq, frame.clone()));
             break;
         }
@@ -756,17 +747,6 @@ impl Receivers {
             r.got_keyframe = false;
         }
     }
-    pub fn presentation_pending(&self) -> bool {
-        let now = Instant::now();
-        self.map.values().any(|r| {
-            r.pictures.iter().any(|(_, f)| {
-                r.audio
-                    .and_then(|a| a.target(f.stamp, now))
-                    .is_some_and(|t| t + Duration::from_millis(32) >= now)
-            })
-        })
-    }
-
     /// Frames received for a session (tests).
     pub fn frames(&self, session: Session) -> u64 {
         self.map.get(&session).map(|r| r.frames).unwrap_or(0)
@@ -948,44 +928,50 @@ mod tests {
     }
 
     #[test]
-    fn presentation_waits_for_audio_and_never_moves_backwards() {
+    fn fresh_video_ignores_audio_offset_and_never_moves_backwards() {
         let now = Instant::now();
-        let mut r = Receiver::new();
-        r.audio = Some(crate::media::Playout {
-            stamp: crate::media::Stamp {
-                micros: 1_000_000,
-                epoch: 1,
-            },
-            at: now,
-        });
-        let picture = Frame {
-            width: 2,
-            height: 2,
-            rgba: Arc::new(vec![0; 16]),
-            at: now,
-            stamp: crate::media::Stamp {
-                micros: 1_040_000,
-                epoch: 1,
-            },
-        };
-        r.pictures.push_back((1, picture.clone()));
-        assert!(r.selected(now).is_none(), "early picture must wait");
-        assert_eq!(r.selected(now + Duration::from_millis(40)).unwrap().0, 1);
-        r.audio.as_mut().unwrap().at += Duration::from_millis(20);
-        assert_eq!(
-            r.selected(now + Duration::from_millis(40)).unwrap().0,
-            1,
-            "a corrected anchor cannot undo presentation"
-        );
-        let mut late = picture;
-        late.at = now + Duration::from_millis(300);
-        r.pictures.push_back((2, late));
-        assert_eq!(
-            r.selected(now + Duration::from_millis(300)).unwrap().0,
-            1,
-            "a very late decode does not replace the picture"
-        );
-        assert!(r.selected(now + Duration::from_secs(4)).is_none());
+        for offset_ms in [-421i64, -101, -40, 0, 40, 101, 421] {
+            let mut r = Receiver::new();
+            r.audio = Some(crate::media::Playout {
+                stamp: crate::media::Stamp {
+                    micros: 1_000_000,
+                    epoch: 1,
+                },
+                at: if offset_ms >= 0 {
+                    now + Duration::from_millis(offset_ms as u64)
+                } else {
+                    now - Duration::from_millis((-offset_ms) as u64)
+                },
+            });
+            for seq in 1..=30 {
+                let at = now + Duration::from_millis(seq * 66);
+                let picture = Frame {
+                    width: 2,
+                    height: 2,
+                    rgba: Arc::new(vec![0; 16]),
+                    at,
+                    stamp: crate::media::Stamp {
+                        micros: 1_000_000 + seq * 66_000,
+                        epoch: 1,
+                    },
+                };
+                if r.pictures.len() == 3 {
+                    r.pictures.pop_front();
+                }
+                r.pictures.push_back((seq, picture));
+                assert_eq!(
+                    r.selected(at).unwrap().0,
+                    seq,
+                    "audio offset {offset_ms} ms"
+                );
+                // A later render cannot move back to an older picture.
+                assert_eq!(r.selected(at + Duration::from_millis(10)).unwrap().0, seq);
+            }
+            assert!(
+                r.selected(now + Duration::from_secs(6)).is_none(),
+                "stalled video still expires"
+            );
+        }
     }
 
     #[test]

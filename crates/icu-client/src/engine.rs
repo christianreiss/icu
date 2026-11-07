@@ -5316,10 +5316,8 @@ impl crate::video::VideoSink for SessionVideo {
                 -(target.duration_since(now).as_micros() as i64)
             };
             stats.av_offset_us.store(offset, Ordering::Relaxed);
-            if !(-100_000..=100_000).contains(&offset) {
-                picture = None;
-                DebugStats::inc(&stats.video_late_dropped);
-            }
+            // Diagnostic only: an audio timing estimate must never suppress
+            // fresh camera pictures (0.1.27 could black out both peers).
         }
         let new_picture = picture.is_some();
         lock(&self.shared.video).finish_for(self.generation, session, decoder, picture);
@@ -5347,17 +5345,6 @@ impl crate::video::VideoSink for SessionVideo {
             .lock()
             .unwrap()
             .record(age);
-    }
-    fn tick(&self) {
-        let pending = {
-            let video = lock(&self.shared.video);
-            video.generation == self.generation && video.presentation_pending()
-        };
-        if pending {
-            if let Some(wake) = lock(&self.shared.video_waker).as_ref() {
-                wake();
-            }
-        }
     }
 }
 
