@@ -711,6 +711,62 @@ fn speak_surface_reflects_transmission_and_all_mute_sources() {
     }
 }
 
+/// Speech can change the labels, but must never move the controls under the pointer.
+#[test]
+fn speech_keeps_control_positions_stable() {
+    for theme_name in THEMES {
+        for mode in [ModeSetting::Ptt, ModeSetting::Vad] {
+            for width in [400.0, 420.0, 440.0, 460.0, 480.0, 520.0, 640.0] {
+                let mut s = four();
+                s.settings.audio.mode = mode;
+                s.sending = false;
+                let shared = Rc::new(RefCell::new(s));
+                let frame_state = shared.clone();
+                let (cmd, _rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+                let mut view = MainView::default();
+                let mut h = harness([width, MAIN[1]], theme_name, false, move |root| {
+                    view.ui(
+                        root,
+                        &frame_state.borrow(),
+                        &MainEnv {
+                            cmd: &cmd,
+                            video_tier: icu_client::video::VideoTier::T0,
+                            video: &|_| None,
+                            self_video: None,
+                            settings_open: false,
+                            user_open: None,
+                            overlay_available: true,
+                        },
+                    );
+                });
+                let positions = |h: &Harness<'_, _>| {
+                    [
+                        h.get_by_label_contains("Sendemodus wechseln:").rect(),
+                        h.get_by_label("Stumm").rect(),
+                        h.get_by_label("Privacy").rect(),
+                    ]
+                };
+                let idle = positions(&h);
+                for sending in [true, false, true, false] {
+                    shared.borrow_mut().sending = sending;
+                    h.run();
+                    assert_eq!(
+                        positions(&h),
+                        idle,
+                        "{theme_name}/{mode:?}/{width}/sending={sending}"
+                    );
+                }
+                if width == 640.0 {
+                    assert_eq!(idle[0].top(), idle[1].top(), "wide window stays one row");
+                }
+                if width == 440.0 {
+                    shot(&mut h, &format!("speech-stable-{mode:?}-{theme_name}"));
+                }
+            }
+        }
+    }
+}
+
 /// The settings page follows the same Privacy guard as the main window and
 /// ends an existing preview instead of silently restarting it after Privacy.
 #[cfg(feature = "camera")]

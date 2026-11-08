@@ -1404,6 +1404,10 @@ impl MainView {
                 let sending = online && !state.peers.is_empty() && !muted && state.sending;
                 let key = super::ptt_key_label(&state.settings.hotkeys, &state.hotkey_backend);
                 let mode = if ptt_mode { "Push-to-Talk" } else { "Automatisch" };
+                let idle_hint = if state.peers.is_empty() { "Allein im Raum".into() }
+                    else if ptt_mode { format!("Taste {key}") }
+                    else { "Sendet, wenn du sprichst".into() };
+                let sending_hint = if ptt_mode { format!("Push-to-Talk · {key}") } else { mode.into() };
                 let (title, hint, ink) = if state.privacy_active {
                     ("Privacy an", "Mikro aus · Bild verrauscht".into(), tok.error)
                 } else if state.deafened {
@@ -1413,14 +1417,20 @@ impl MainView {
                 } else if !online {
                     ("Nicht verbunden", "Es wird nichts gesendet".into(), tok.muted_text)
                 } else if sending {
-                    ("Sendet", if ptt_mode { format!("Push-to-Talk · {key}") } else { mode.into() }, tok.accent)
+                    ("Sendet", sending_hint.clone(), tok.accent)
                 } else {
-                    (mode, if state.peers.is_empty() { "Allein im Raum".into() }
-                        else if ptt_mode { format!("Taste {key}") }
-                        else { "Sendet, wenn du sprichst".into() }, ui.visuals().text_color())
+                    (mode, idle_hint.clone(), ui.visuals().text_color())
                 };
                 let mut ptt_response = None;
-                let stack = !design::mode_text_fits(ui, (ui.available_width() - 280.0).max(44.0), title, &hint);
+                let mode_width = (ui.available_width() - 280.0).max(44.0);
+                // Reserve both speech states: a VAD edge or PTT press must not
+                // move the buttons or change the panel height under the pointer.
+                let stack = if online && !state.peers.is_empty() && !muted && !state.deafened {
+                    !design::mode_text_fits(ui, mode_width, mode, &idle_hint)
+                        || !design::mode_text_fits(ui, mode_width, "Sendet", &sending_hint)
+                } else {
+                    !design::mode_text_fits(ui, mode_width, title, &hint)
+                };
                 let mut mode_part = |ui: &mut egui::Ui| {
                     // Stacked only when the label does not fit beside the icons.
                     let width = if stack { ui.available_width() } else { (ui.available_width() - 280.0).max(44.0) };
