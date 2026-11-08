@@ -22,9 +22,9 @@ established. Serial regression rendering succeeded. The quick slop review had
 zero findings but scanned zero Rust files, so it provides no native UI coverage.
 Screenshots are under `target/speech-layout-shots/`.
 
-No release packages or deployment are part of this source fix. The installed and
-published release remains 0.1.29. Rollback is a revert of this change; no saved
-configuration or identity data changes.
+Initially verified as a source-only fix; subsequently shipped in
+[0.1.30](release-0.1.30-2026-11-08.md). No saved configuration or identity data
+changes. A source rollback is a revert; a package rollback uses 0.1.29.
 
 Final `cargo test --locked --workspace`: 1,070 passed, zero failed, 18 ignored
 across 46 suites, including all 43 native UI layout tests without screenshots.
