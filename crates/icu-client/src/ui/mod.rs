@@ -3,7 +3,6 @@
 
 pub mod connection;
 pub mod design;
-pub(crate) mod email_joke;
 pub mod fonts;
 pub mod main_window;
 pub(crate) mod native;

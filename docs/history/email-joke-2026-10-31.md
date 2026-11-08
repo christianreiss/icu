@@ -1,4 +1,4 @@
-# Unreleased — ICU Pro email joke (2026-10-31)
+# ICU Pro email joke (2026-10-31; removed in 0.1.29)
 
 The desktop header now has an Email button opening a deliberately gaudy
 ICU Lite/Pro upsell. Upgrade fails locally; loading any licence always fails.
@@ -16,11 +16,10 @@ Checked 2026-11-02 in this checkout: `cargo test -p icu-client --lib ui::email_j
 
 ## Removal
 
-Set `EMAIL_JOKE_ENABLED` to `false` in
-`crates/icu-client/src/ui/email_joke.rs` and rebuild to hide the button and window.
-The module owns all joke copy, temporary state, and file loading. Full removal
-also removes its small main-window hooks, module declaration, and GUI-only `rfd`
-dependency. No configuration migration or saved licence cleanup is needed.
+Completely removed in 0.1.29 on 2026-11-08: the module, header button,
+window state and hooks, and GUI-only `rfd` dependency are deleted. No
+configuration migration or saved licence cleanup is needed. The remaining
+sections describe historical behavior.
 
 ## Licence handling
 
