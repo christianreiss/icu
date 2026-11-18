@@ -416,14 +416,18 @@ impl JitterBuffer {
                     "jitter spike"
                 );
             }
-        } else if self.prefill_since.is_none() {
-            self.prefill_since = Some(now);
         }
         // Late: its slot has been consumed already — inside the spurt, or in
         // a spurt that has since ended (`played_hwm` outlives `next`).
         if self.played_hwm.is_some_and(|h| u <= h) || self.next.is_some_and(|n| u < n) {
             self.stats.late += 1;
             return;
+        }
+        // The prefill clock starts with the first packet that is queued. A
+        // late straggler between two spurts used to start it: the next
+        // spurt then found its prefill long over and began with none.
+        if self.anchor.is_none() && self.prefill_since.is_none() {
+            self.prefill_since = Some(now);
         }
         if ts_diff(packet.ts, self.last_ts.unwrap_or(packet.ts)) >= 0 {
             self.last_ts = Some(packet.ts);
@@ -1383,6 +1387,32 @@ mod tests {
         jb.push(pkt(4, 4 * 960 + 48_000, false), t0 + ms(1200));
         jb.push(pkt(5, 5 * 960 + 48_000, false), t0 + ms(1220));
         assert!(matches!(jb.pop(t0 + ms(1240)), Pop::Packet(p) if p.seq == 4));
+        assert_eq!(jb.stats().spurts, 2);
+    }
+
+    /// A straggler between two spurts must not start the prefill clock.
+    /// Usually the pause detection (gapless `seq`, jumped `ts`) restarts it
+    /// with the next spurt's first packet. When that packet is lost, the
+    /// clock was the straggler's: the spurt played at once, with no cushion.
+    #[test]
+    fn a_straggler_does_not_use_up_the_next_prefill() {
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        jb.push(pkt(0, 0, false), t0);
+        jb.push(pkt(1, 960, false), t0 + ms(20));
+        jb.push(pkt(3, 3 * 960, true), t0 + ms(60));
+        for at in [60, 80, 100, 120] {
+            jb.pop(t0 + ms(at));
+        }
+        assert!(!jb.active(), "END ended the spurt");
+        jb.push(pkt(2, 2 * 960, false), t0 + ms(130));
+        assert_eq!(jb.pop(t0 + ms(140)), Pop::Silence);
+        assert_eq!(jb.stats().late, 1);
+        // The next spurt, its first packet (4) lost on the way.
+        jb.push(pkt(5, 5 * 960 + 48_000, false), t0 + ms(1200));
+        assert_eq!(jb.pop(t0 + ms(1205)), Pop::Silence, "prefill first");
+        jb.push(pkt(6, 6 * 960 + 48_000, false), t0 + ms(1220));
+        assert!(matches!(jb.pop(t0 + ms(1240)), Pop::Packet(p) if p.seq == 5));
         assert_eq!(jb.stats().spurts, 2);
     }
 
