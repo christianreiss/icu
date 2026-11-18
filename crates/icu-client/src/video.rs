@@ -519,6 +519,17 @@ impl Reorder {
         out: &mut Vec<(Session, EncodedFrame)>,
     ) {
         let seq = frame.header.seq;
+        if let Some(order) = self.speakers.get(&session) {
+            if frame.header.media_epoch != order.media_epoch {
+                if order.media_epoch != 0
+                    && frame.header.media_epoch.wrapping_sub(order.media_epoch) as i32 <= 0
+                {
+                    return;
+                }
+                // A new epoch may also begin with a P-frame overtaking its IDR.
+                self.speakers.remove(&session);
+            }
+        }
         let Some(order) = self.speakers.get_mut(&session) else {
             let mut order = Order {
                 next: seq.wrapping_add(1),
@@ -543,7 +554,7 @@ impl Reorder {
         };
         order.seen = now;
         let step = seq.wrapping_sub(order.next) as i16;
-        if frame.header.media_epoch != order.media_epoch || step <= -REORDER_DEPTH {
+        if step <= -REORDER_DEPTH {
             // Another stream (the camera restarted, or a new peer on a
             // reused session id): nothing held belongs in front of it.
             order.release(session, out);
@@ -646,11 +657,29 @@ impl DecodeQueue {
         }
         let mut dropped = 0;
         while self.frames.iter().filter(|item| item.0 == session).count() >= 2 {
-            let index = self
-                .frames
-                .iter()
-                .position(|item| item.0 == session)
-                .unwrap();
+            // Keep a queued recovery IDR and its direct successor together.
+            // Dropping the IDR to admit a third P-frame makes both remaining
+            // frames undecodable, even if the decode thread catches up now.
+            let protected = self.frames.iter().find(|(s, f, _)| {
+                *s == session
+                    && f.header.keyframe()
+                    && f.header.media_epoch == frame.header.media_epoch
+            });
+            let index = if let Some((_, idr, _)) = protected.filter(|_| !frame.header.keyframe()) {
+                let next = idr.header.seq.wrapping_add(1);
+                let replace = self.frames.iter().position(|(s, f, _)| {
+                    *s == session && !f.header.keyframe() && f.header.seq != next
+                });
+                match replace {
+                    Some(i) if frame.header.seq == next => i,
+                    _ => return dropped + 1,
+                }
+            } else {
+                self.frames
+                    .iter()
+                    .position(|item| item.0 == session)
+                    .unwrap()
+            };
             self.bytes -= self.frames.remove(index).unwrap().1.data.len();
             dropped += 1;
         }
@@ -867,6 +896,11 @@ impl Receiver {
                     -(picture.at.duration_since(target).as_micros() as i64)
                 }
             });
+        let hint = if self.audio.is_some() && !self.audio_accurate {
+            Some(Duration::ZERO)
+        } else {
+            hint
+        };
         let due = self.hold.due(picture.at, lead, hint);
         if self.pictures.len() == PICTURES {
             // More pictures than the hold can ever cover (a frame rate far
@@ -1097,6 +1131,9 @@ impl Receivers {
             if r.media_epoch == anchor.stamp.epoch {
                 r.audio = Some(anchor);
                 r.audio_accurate = accurate;
+                if !accurate {
+                    r.hold.forget_sound();
+                }
             }
         }
     }
@@ -1108,6 +1145,7 @@ impl Receivers {
             r.audio = None;
             r.hold.forget_sound();
         }
+        self.hold_hint = None;
     }
     pub fn invalidate(&mut self, session: Session) {
         if let Some(r) = self.map.get_mut(&session) {
@@ -1136,6 +1174,7 @@ impl Receivers {
     /// Drops everything (reconnect).
     pub fn clear(&mut self) {
         self.map.clear();
+        self.hold_hint = None;
     }
 }
 
@@ -1429,6 +1468,34 @@ mod tests {
         assert_eq!(r.selected(end).unwrap().0, r.seq);
     }
 
+    #[test]
+    fn switching_to_estimated_output_releases_a_previous_device_hold() {
+        let mut receivers = Receivers::default();
+        let mut r = Receiver::new();
+        let t = Instant::now();
+        let end = play(&mut r, t, 90, 66, true, |_| Some(340));
+        r.media_epoch = 1;
+        receivers.hold_hint = Some(r.hold.delay);
+        receivers.map.insert(7, r);
+        receivers.clear_audio_playout();
+        assert!(receivers.hold_hint.is_none());
+        for i in 1..=60 {
+            let micros = i * 66_000;
+            let at = end + Duration::from_micros(micros);
+            let picture = picture_at(at, micros);
+            receivers.audio_playout(
+                7,
+                crate::media::Playout {
+                    stamp: picture.stamp,
+                    at,
+                },
+                false,
+            );
+            receivers.map.get_mut(&7).unwrap().present(picture, None);
+        }
+        assert_eq!(receivers.hold(7), Some(Duration::ZERO));
+    }
+
     /// The speaker stops talking, the output device changes, the timing
     /// returns with another value: the hold stays while nothing is known
     /// and follows when something is, and the picture is there throughout.
@@ -1513,6 +1580,20 @@ mod tests {
             q.bytes,
             q.frames.iter().map(|f| f.1.data.len()).sum::<usize>()
         );
+    }
+
+    #[test]
+    fn decoder_backlog_keeps_the_recovery_frame_and_its_successor() {
+        for sequence in [[0, 1, 2], [0, 2, 1]] {
+            let mut q = DecodeQueue::default();
+            for seq in sequence {
+                let mut f = frame(seq == 0);
+                f.header.seq = seq;
+                q.push(7, f, Instant::now());
+            }
+            assert_eq!(q.pop().unwrap().1.header.seq, 0);
+            assert_eq!(q.pop().unwrap().1.header.seq, 1);
+        }
     }
 
     fn frame(keyframe: bool) -> EncodedFrame {
@@ -1761,6 +1842,19 @@ mod tests {
         restarted.header.media_epoch = 9;
         reorder.push(3, restarted, t0, &mut out);
         assert_eq!(passed(&out), [5000, 0, 1, 700]);
+
+        // A delayed old-epoch frame must not release the new epoch's delta
+        // before the new IDR arrives.
+        let mut restarted_delta = numbered(delta, 711);
+        restarted_delta.header.media_epoch = 10;
+        reorder.push(3, restarted_delta, t0, &mut out);
+        let mut old = numbered(delta, 701);
+        old.header.media_epoch = 9;
+        reorder.push(3, old, t0, &mut out);
+        let mut restarted = numbered(idr, 710);
+        restarted.header.media_epoch = 10;
+        reorder.push(3, restarted, t0, &mut out);
+        assert_eq!(passed(&out), [5000, 0, 1, 700, 710, 711]);
 
         // `seq` wraps.
         let mut reorder = Reorder::default();

@@ -505,6 +505,51 @@ async fn late_camera_start_keeps_the_audio_engine_clock() {
     server.handle.shutdown().await;
 }
 
+/// Camera exposure and driver buffering can precede delivery by more than
+/// the entire local write deadline while still producing fresh moving video.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_camera_keeps_sending_its_original_capture_time() {
+    struct BufferedCamera(SyntheticSource);
+    impl icu_client::camera::FrameSource for BufferedCamera {
+        fn next_frame(&mut self) -> Result<icu_client::camera::RgbFrame, String> {
+            let mut frame = self.0.next_frame()?;
+            frame.captured_at = Some(std::time::Instant::now() - Duration::from_millis(250));
+            frame.timing_accurate = true;
+            Ok(frame)
+        }
+    }
+
+    let server = TestServer::start().await;
+    let (a, _ad) = server
+        .engine("sender", Box::new(FakeBackend::silent().0), false)
+        .await;
+    let sender_started = std::time::Instant::now();
+    let (b, _bd) = server
+        .engine("viewer", Box::new(FakeBackend::silent().0), false)
+        .await;
+    let session = wait_connected(&a).await.me.unwrap().session;
+    wait_connected(&b).await;
+    a.command(Command::SetCamera(true));
+    wait_for(&a, SOON, |s| s.camera_on).await;
+    let mut camera = CameraHandle::new(a.camera_link());
+    camera.start_with(Box::new(BufferedCamera(SyntheticSource::new())));
+    let frames = b.video_frames_source();
+    assert!(
+        wait_until(SOON, || frames.picture(session).is_some_and(|(seq, f)| {
+            seq >= 8
+                && f.stamp.micros > 1
+                && (f.at.saturating_duration_since(sender_started).as_micros() as u64)
+                    .saturating_sub(f.stamp.micros)
+                    >= 220_000
+        }))
+        .await
+    );
+    camera.stop();
+    a.shutdown();
+    b.shutdown();
+    server.handle.shutdown().await;
+}
+
 /// Opt-in local hardware evidence: camera images remain in memory and travel
 /// only through the loopback test server. Audio is synthetic, never a microphone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

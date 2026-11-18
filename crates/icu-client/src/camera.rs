@@ -759,7 +759,10 @@ fn backoff(failures: u32) -> Duration {
 }
 
 /// Latest-only acquisition worker: camera buffering cannot grow behind a send.
-type CaptureSlot = (Mutex<Option<Result<RgbFrame, String>>>, std::sync::Condvar);
+type CaptureSlot = (
+    Mutex<Option<Result<(RgbFrame, Instant), String>>>,
+    std::sync::Condvar,
+);
 struct FreshSource {
     slot: Arc<CaptureSlot>,
     stop: Arc<AtomicBool>,
@@ -775,10 +778,9 @@ impl FreshSource {
             .spawn(move || {
                 while !halted.load(Ordering::Relaxed) {
                     let result = source.next_frame().map(|mut frame| {
-                        if frame.captured_at.is_none() {
-                            frame.captured_at = Some(Instant::now());
-                        }
-                        frame
+                        let delivered = Instant::now();
+                        frame.captured_at.get_or_insert(delivered);
+                        (frame, delivered)
                     });
                     let failed = result.is_err();
                     *target.0.lock().unwrap() = Some(result);
@@ -796,25 +798,31 @@ impl FreshSource {
             worker: Some(worker),
         })
     }
-}
-impl FrameSource for FreshSource {
-    fn next_frame(&mut self) -> Result<RgbFrame, String> {
+
+    /// A driver may block inside capture without returning an error. Give
+    /// the supervisor a chance to reopen it, including during preview.
+    fn next_frame(&mut self, timeout: Duration) -> Option<Result<(RgbFrame, Instant), String>> {
+        let deadline = Instant::now() + timeout;
         let mut slot = self.slot.0.lock().unwrap();
         loop {
             if let Some(frame) = slot.take() {
-                return frame;
+                return Some(frame);
             }
             if self.stop.load(Ordering::Relaxed) {
-                return Err("capture stopped".into());
+                return Some(Err("capture stopped".into()));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
             }
             slot = self
                 .slot
                 .1
-                .wait_timeout(slot, Duration::from_millis(50))
+                .wait_timeout(slot, remaining.min(Duration::from_millis(50)))
                 .unwrap()
                 .0;
             if self.worker.as_ref().is_some_and(|w| w.is_finished()) && slot.is_none() {
-                return Err("capture worker ended".into());
+                return Some(Err("capture worker ended".into()));
             }
         }
     }
@@ -890,15 +898,18 @@ pub fn run_sender(
     // it, so the receivers see a broken picture until the next IDR.
     let mut lost = false;
     while !stop.load(Ordering::Relaxed) {
-        let mut frame = match source.next_frame() {
-            Ok(f) if f.is_valid() => f,
+        let next = source
+            .next_frame(Duration::from_secs(5))
+            .ok_or("camera delivered no frame for 5 s")?;
+        let (mut frame, delivered) = match next {
+            Ok((f, delivered)) if f.is_valid() => (f, delivered),
             // Stopping: the source ending is not a failed frame to warn
             // about and sleep on — `stop` joins this thread from the UI.
             Err(_) if stop.load(Ordering::Relaxed) => break,
             result => {
                 let e = result.map_or_else(
                     |e| e,
-                    |f| {
+                    |(f, _)| {
                         format!(
                             "unusable camera frame {}×{}, {} bytes",
                             f.width,
@@ -922,8 +933,10 @@ pub fn run_sender(
         };
         // When the picture arrived: the wire timestamp, and what openh264's
         // rate control measures the real frame spacing with.
-        let acquired = frame.captured_at.unwrap_or_else(Instant::now);
-        if acquired.elapsed() > Duration::from_millis(100) {
+        let acquired = frame.captured_at.unwrap_or(delivered);
+        // A camera can deliver a continuous stream with a fixed driver delay.
+        // Bound time in ICU's slot and encoder separately from capture time.
+        if delivered.elapsed() > Duration::from_millis(100) {
             continue;
         }
         let captured = acquired.saturating_duration_since(start);
@@ -998,7 +1011,7 @@ pub fn run_sender(
                     keyframe,
                     ts,
                     &data,
-                    (stamp, acquired, frame.timing_accurate),
+                    (stamp, delivered, frame.timing_accurate),
                 ) {
                     tracing::debug!(%e, "video frame not sent");
                     // Not while offline: there is nobody to repair for.
@@ -1392,6 +1405,26 @@ mod tests {
 
     /// The encoder produces an IDR on `force_intra_frame` and SPS/PPS come
     /// with it.
+    #[test]
+    fn stalled_capture_returns_control_to_the_camera_supervisor() {
+        struct Blocked(std::sync::mpsc::Receiver<()>);
+        impl FrameSource for Blocked {
+            fn next_frame(&mut self) -> Result<RgbFrame, String> {
+                self.0.recv().map_err(|e| e.to_string())?;
+                Err("camera unplugged".into())
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut source = FreshSource::start(Box::new(Blocked(rx)), Arc::default()).unwrap();
+        assert!(source.next_frame(Duration::from_millis(30)).is_none());
+        tx.send(()).unwrap();
+        assert!(matches!(
+            source.next_frame(Duration::from_secs(1)),
+            Some(Err(_))
+        ));
+    }
+
     #[test]
     fn encoder_emits_idr_on_request() {
         let mut enc = encoder(VideoTier::T0).unwrap();

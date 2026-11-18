@@ -41,10 +41,11 @@ use windows::{
             Audio::{
                 eCapture, eConsole, eRender, AudioCategory_GameChat, AudioCategory_Other,
                 AudioClientProperties, EDataFlow, ERole, IAudioCaptureClient, IAudioClient,
-                IAudioClient2, IAudioClient3, IAudioClientDuckingControl, IAudioRenderClient,
-                IMMDevice, IMMDeviceEnumerator, IMMNotificationClient, IMMNotificationClient_Impl,
-                MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY,
-                AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
+                IAudioClient2, IAudioClient3, IAudioClientDuckingControl, IAudioClock,
+                IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
+                IMMNotificationClient_Impl, MMDeviceEnumerator,
+                AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
+                AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
                 AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
                 AUDCLNT_STREAMOPTIONS_NONE, AUDCLNT_STREAMOPTIONS_RAW,
@@ -775,6 +776,9 @@ struct Stream {
     // Declaration order is drop order: clients before the audio client.
     capture: Option<IAudioCaptureClient>,
     render: Option<IAudioRenderClient>,
+    render_clock: Option<(IAudioClock, u64)>,
+    /// Includes the initial silence queued before Start.
+    frames_written: u64,
     client: IAudioClient,
     event: Option<HANDLE>,
     channels: usize,
@@ -1015,7 +1019,14 @@ impl Stream {
                     .map_err(|e| format!("IAudioCaptureClient: {e}"))?;
                 (Some(capture), None)
             };
-            let stream = Stream {
+            let render_clock = render.as_ref().and_then(|_| {
+                let clock: IAudioClock = client.GetService().ok()?;
+                let frequency = clock.GetFrequency().ok()?;
+                (frequency != 0).then_some((clock, frequency))
+            });
+            let mut stream = Stream {
+                render_clock,
+                frames_written: 0,
                 capture,
                 render,
                 client,
@@ -1045,7 +1056,9 @@ impl Stream {
                 // Start on silence so the first period is not a gap.
                 if let Ok(data) = render.GetBuffer(buffer_frames) {
                     std::ptr::write_bytes(data, 0, buffer_frames as usize * stream.channels * 4);
-                    let _ = render.ReleaseBuffer(buffer_frames, 0);
+                    if render.ReleaseBuffer(buffer_frames, 0).is_ok() {
+                        stream.frames_written = u64::from(buffer_frames);
+                    }
                 }
             }
             // The application's log writer can block on a file. Finish this
@@ -1267,10 +1280,27 @@ impl Stream {
             }
             let data = render.GetBuffer(frames as u32)?;
             let out = std::slice::from_raw_parts_mut(data as *mut f32, frames * self.channels);
-            let timing = AudioTiming {
-                at: Instant::now() + Duration::from_secs_f64(f64::from(padding) / 48_000.0),
-                accurate: false,
-            };
+            let timing = self
+                .render_clock
+                .as_ref()
+                .and_then(|(clock, frequency)| {
+                    let (mut position, mut qpc) = (0, 0);
+                    // The projected method discards S_FALSE (an inaccurate reading).
+                    let status =
+                        (clock.vtable().GetPosition)(clock.as_raw(), &mut position, &mut qpc);
+                    if status != windows::Win32::Foundation::S_OK {
+                        return None;
+                    }
+                    let queued =
+                        super::packet::render_lead(self.frames_written, position, *frequency)?;
+                    let sample = capture_qpc_time(qpc, 0)?;
+                    let at = sample.at.checked_add(queued)?;
+                    (at >= Instant::now()).then_some(AudioTiming { at, accurate: true })
+                })
+                .unwrap_or_else(|| AudioTiming {
+                    at: Instant::now() + Duration::from_secs_f64(f64::from(padding) / 48_000.0),
+                    accurate: false,
+                });
             super::channels::render_voice(
                 &mut self.block[..frames],
                 out,
@@ -1278,6 +1308,7 @@ impl Stream {
                 &mut |samples| cb(samples, timing),
             );
             render.ReleaseBuffer(frames as u32, 0)?;
+            self.frames_written += frames as u64;
             Ok(frames)
         }
     }
@@ -1345,6 +1376,31 @@ mod live_engine;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercises device position, frame accounting and QPC together on an
+    /// endpoint with a functioning IAudioClock. No capture or audible tone.
+    #[test]
+    #[ignore = "needs an active Windows playback endpoint with a render clock"]
+    fn live_wasapi_render_clock() {
+        use std::sync::atomic::AtomicUsize;
+        let mut backend = WasapiBackend::new().unwrap();
+        let counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let results = counts.clone();
+        backend
+            .open_playback_timed(
+                None,
+                Box::new(move |samples, timing| {
+                    samples.fill(0.0);
+                    results[usize::from(timing.accurate)].fetch_add(1, Ordering::Relaxed);
+                }),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        drop(backend);
+        let [estimated, accurate] = counts.each_ref().map(|c| c.load(Ordering::Relaxed));
+        eprintln!("WASAPI render clock: accurate={accurate} estimated={estimated}");
+        assert!(accurate >= 10, "no sustained device-clock readings");
+    }
 
     /// Run in an interactive Windows desktop session, with a default input
     /// and output. Plays a quiet tone for three seconds and measures loopback.

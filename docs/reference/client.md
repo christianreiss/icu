@@ -644,7 +644,12 @@ Auflösung, H.264 und Netzwerkstufen bleiben erhalten.
 Drei anhaltende Überschreitungen des 5-ms-Verarbeitungsbudgets pausieren optionale
 Bildkorrektur für fünf Sekunden. Danach folgt ein automatischer Wiederanlauf.
 Capture läuft getrennt von Encode/Send weiter und überschreibt einen Latest-Slot.
+Das 100-ms-Budget für Verarbeitung und Versand beginnt bei der Übergabe durch
+den Kameratreiber. Der Zeitstempel für die Synchronisation bleibt die Aufnahmezeit.
 Es gibt keine Effekt-, Helligkeits-, Schärfe- oder Sync-Regler.
+Nach einem Routenwechsel läuft die frühere RTT-Untergrenze binnen 60 s aus.
+Beim Start einer Medienepoche wartet ein überholendes P-Bild auf sein IDR.
+Bei Decoder-Rückstau haben ein wartendes IDR und sein direkter Nachfolger Vorrang.
 
 Minor 8 trägt gemeinsame Capture-Zeit und Epochen in beiden Medienheadern.
 Audio-Samplezähler und Pegel-Epochen behalten ihre Zuständigkeiten. Die
@@ -664,9 +669,11 @@ voraus. Jetzt wartet ein dekodiertes Bild, bis sein Ton zu hören ist:
   600 ms. Fehlt die Zuordnung (der Sprecher schweigt, Gerätewechsel, Unterlauf),
   bleibt sie stehen. Ein Sprecher ohne eigene Messung übernimmt die eines
   anderen: das Ausgabegerät ist dasselbe.
-- Nur eine vom Gerät selbst gemeldete Wiedergabezeit zählt (PipeWire). Eine
-  geschätzte (WASAPI, cpal) kennt die Geräteverzögerung nicht und hält nichts
-  zurück: dort bleibt es beim sofortigen Anzeigen.
+- PipeWire berücksichtigt den Gerätepfad, den Resampler und ausstehende
+  Wiedergabeframes. Unter Windows bestimmt WASAPI den Präsentationszeitpunkt
+  anhand der Geräteposition, ihres QPC-Zeitstempels und der geschriebenen Frames.
+  Fehlt eine plausible Messung, baut ICU eine vorhandene Haltezeit schrittweise ab.
+  Nach einem Gerätewechsel werden alte Messungen und gemeinsame Schätzwerte verworfen.
 - Kein Bild wird je deswegen verworfen oder ausgeblendet. Die Meldung des Tons
   verschiebt nur diese eine Zahl; jedes Bild erscheint in Reihenfolge, spätestens
   600 ms nach dem Decode. 0.1.27 hatte jedes Bild einzeln gegen den Audiozielwert

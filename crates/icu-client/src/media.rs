@@ -32,6 +32,7 @@ pub struct Rendered {
     pub micros: u64,
     pub gap: u64,
     pub complete: bool,
+    pub accurate: bool,
 }
 impl Rendered {
     pub fn sample_time(self, position: u64) -> Option<u64> {
@@ -54,6 +55,7 @@ pub struct Position {
     count: AtomicU64,
     gap: AtomicU64,
     complete: AtomicBool,
+    accurate: AtomicBool,
 }
 impl Position {
     pub fn store(&self, report: Rendered) {
@@ -63,6 +65,7 @@ impl Position {
         self.count.store(report.count, Ordering::Relaxed);
         self.gap.store(report.gap, Ordering::Relaxed);
         self.complete.store(report.complete, Ordering::Relaxed);
+        self.accurate.store(report.accurate, Ordering::Relaxed);
         self.version.fetch_add(1, Ordering::Release);
     }
     pub fn load(&self) -> Option<Rendered> {
@@ -77,6 +80,7 @@ impl Position {
             count: self.count.load(Ordering::Relaxed),
             gap: self.gap.load(Ordering::Relaxed),
             complete: self.complete.load(Ordering::Relaxed),
+            accurate: self.accurate.load(Ordering::Relaxed),
         };
         std::sync::atomic::fence(Ordering::Acquire);
         (v == self.version.load(Ordering::Relaxed) && report.micros > 0).then_some(report)
@@ -205,6 +209,7 @@ mod tests {
             micros: 1_000_000,
             gap: 0,
             complete: true,
+            accurate: true,
         };
         assert_eq!(report.sample_time(100), Some(1_000_000));
         assert_eq!(report.sample_time(220), Some(1_002_500));

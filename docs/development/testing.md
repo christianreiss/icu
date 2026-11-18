@@ -338,8 +338,9 @@ Zwei Teilnehmer, Kamera an; der Zuschauer unter Linux mit Bluetooth-Headset,
   `av_hold_us` auf wenige 10 000 oder 0.
 - [ ] Das Bild verschwindet dabei nie und läuft nie rückwärts; beim Anpassen
   läuft es für Sekunden unmerklich langsamer oder schneller.
-- [ ] Windows-Zuschauer: `av_hold_us` bleibt 0 (`estimated_playout=1`), das
-  Bild erscheint wie bisher sofort.
+- [ ] Auf dem Windows-Zuschauer denselben Klatsch- und Gerätewechseltest
+  ausführen. Bei gültiger WASAPI-Geräteposition meldet ICU gemessene Wiedergabe.
+  Im Schätzbetrieb fällt eine vorherige Haltezeit mit bis zu 8 ms je Bild auf null.
 
 Quelltests: `pictures_wait_for_their_sound_and_never_disappear` (−5000 bis
 +5000 ms), `the_hold_survives_silence_and_follows_a_new_device`,

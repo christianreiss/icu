@@ -24,7 +24,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     rc::Rc,
     sync::{
         atomic::{AtomicU16, Ordering},
@@ -77,6 +77,7 @@ struct StreamData {
     handler: Handler,
     scratch: Vec<f32>,
     mono: Vec<f32>,
+    playback_blocks: VecDeque<u64>,
     reference: Vec<ReferenceFrame>,
     capture_channel: Option<u16>,
     selected_channel: Arc<AtomicU16>,
@@ -676,6 +677,7 @@ fn open_stream(
         // graph quanta are handled in bounded chunks, without Vec growth.
         scratch: vec![0.0; 1024 * 64],
         mono: vec![0.0; 8192],
+        playback_blocks: VecDeque::with_capacity(64),
         reference: vec![[0.0; 8]; 1024],
         capture_channel,
         selected_channel,
@@ -742,10 +744,29 @@ fn open_stream(
         .process(|stream, data| {
             super::rt::note_callback_thread();
             let timing = stream.time().ok().and_then(|time| {
-                let rate=time.rate();
-                if rate.denom == 0 {return None;}
-                let delay=(time.delay() as f64 * f64::from(rate.num) / f64::from(rate.denom) * 1e9) as i64;
-                let stamp=if matches!(data.handler, Handler::Capture(_)) {time.now().saturating_sub(delay.max(0))} else {time.now().saturating_add(delay.max(0)).saturating_add((time.queued() / 4 * 1_000_000_000 / 48_000) as i64)};
+                let rate = time.rate();
+                if rate.num == 0 || rate.denom == 0 {
+                    return None;
+                }
+                let delay = (time.delay().max(0) as f64 * f64::from(rate.num)
+                    / f64::from(rate.denom) * 1e9) as i64;
+                let stamp = match data.handler {
+                    Handler::Capture(_) => {
+                        let ns = time.buffered().checked_mul(1_000_000_000)? / u64::from(SAMPLE_RATE);
+                        time.now().saturating_sub(delay).checked_sub(i64::try_from(ns).ok()?)?
+                    },
+                    Handler::Playback(_) => {
+                        // The safe Buffer API does not set pw_buffer.size, so
+                        // pw_time.queued is not a byte or sample count here.
+                        let count = time.queued_buffers() as usize;
+                        let start = data.playback_blocks.len().checked_sub(count)?;
+                        let queued = data.playback_blocks.range(start..).sum::<u64>();
+                        let frames = time.buffered().checked_add(queued)?;
+                        let ns = frames.checked_mul(1_000_000_000)? / u64::from(SAMPLE_RATE);
+                        time.now().saturating_add(delay).checked_add(i64::try_from(ns).ok()?)?
+                    }
+                    Handler::Reference(_) => return None,
+                };
                 AudioTiming::monotonic_ns(stamp)
             });
             let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -823,6 +844,10 @@ fn open_stream(
                     } else {
                         requested.min(capacity)
                     };
+                    if data.playback_blocks.len() == data.playback_blocks.capacity() {
+                        data.playback_blocks.pop_front();
+                    }
+                    data.playback_blocks.push_back(n as u64);
                     let chunk_frames=data.mono.len();
                     for (part, raw) in bytes[..n * 4].chunks_mut(chunk_frames * 4).enumerate() {
                         let frames = raw.len() / 4;

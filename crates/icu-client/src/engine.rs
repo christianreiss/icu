@@ -1807,6 +1807,7 @@ fn open_playback_stream(
                 micros: media.micros(timing.at),
                 gap: media.playback_gap.load(Ordering::Relaxed),
                 complete: n == out.len(),
+                accurate: timing.accurate,
             });
             stats
                 .audio_playout_timing_estimated
@@ -2908,7 +2909,7 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test:
                                 },
                                 // Only a time the device reported itself
                                 // may hold pictures back for the sound.
-                                stats.audio_playout_timing_estimated.load(Ordering::Relaxed) == 0,
+                                report.accurate,
                             );
                         }
                     }

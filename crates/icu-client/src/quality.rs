@@ -12,7 +12,10 @@
 //! Pure state machine, `Instant`-injected, so the hysteresis/threshold logic
 //! is testable without a live connection or camera.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use crate::{netcond::NetworkCondition, video::VideoTier};
 
@@ -26,13 +29,10 @@ const UP_BACKOFF_MAX_TICKS: u32 = 24;
 /// requires twice as many clean ticks (capped at [`UP_BACKOFF_MAX_TICKS`]).
 const FLAP_WINDOW: Duration = Duration::from_secs(30);
 
-/// How slowly the "good" RTT baseline drifts. Only updated on ticks judged
-/// not-bad, so sustained congestion cannot drag the baseline up and mask
-/// itself.
-const RTT_BASELINE_ALPHA: f32 = 0.05;
-/// RTT rise over the rolling baseline that counts as bufferbloat-under-load.
+/// Keep a minute of path RTTs. QUIC's lifetime minimum can predate a route
+/// change and must not keep a healthy camera at 3 fps for the whole call.
+const RTT_WINDOW: Duration = Duration::from_secs(60);
 const RTT_STEP_DOWN_MS: f32 = 100.0;
-/// Queuing delay (`rtt - min_rtt`) that counts as pre-loss pressure.
 const QUEUING_DELAY_ELEVATED_MS: f32 = 30.0;
 /// Own-audio loss (`LossHint`) that counts as a step-down trigger.
 const AUDIO_LOSS_STEP_DOWN_PERMILLE: u16 = 30;
@@ -58,7 +58,7 @@ const LOCAL_DROP_WINDOW: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct QualityController {
     tier: VideoTier,
-    rtt_baseline_ms: Option<f32>,
+    rtt_floor: VecDeque<(Instant, f32)>,
     bad_ticks: u32,
     good_ticks: u32,
     up_confirm_needed: u32,
@@ -77,7 +77,7 @@ impl QualityController {
     pub fn new(now: Instant) -> QualityController {
         QualityController {
             tier: VideoTier::T0,
-            rtt_baseline_ms: None,
+            rtt_floor: VecDeque::new(),
             bad_ticks: 0,
             good_ticks: 0,
             up_confirm_needed: UP_CONFIRM_TICKS,
@@ -119,9 +119,30 @@ impl QualityController {
         let local_burst =
             self.local_drops_in_window >= LOCAL_DROP_BURST && !self.local_burst_reported;
 
-        let baseline = *self.rtt_baseline_ms.get_or_insert(cond.rtt_ms);
-        let rtt_bad = cond.rtt_ms - baseline > RTT_STEP_DOWN_MS;
-        let queuing_bad = cond.queuing_delay_ms > QUEUING_DELAY_ELEVATED_MS;
+        // A monotone queue retains only possible minima. Seed it from QUIC
+        // once, then let even a very low handshake RTT age out.
+        if self.rtt_floor.is_empty() {
+            self.rtt_floor
+                .push_back((now, (cond.rtt_ms - cond.queuing_delay_ms).max(0.0)));
+        }
+        while self
+            .rtt_floor
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= RTT_WINDOW)
+        {
+            self.rtt_floor.pop_front();
+        }
+        while self
+            .rtt_floor
+            .back()
+            .is_some_and(|(_, rtt)| *rtt >= cond.rtt_ms)
+        {
+            self.rtt_floor.pop_back();
+        }
+        self.rtt_floor.push_back((now, cond.rtt_ms));
+        let rise = cond.rtt_ms - self.rtt_floor[0].1;
+        let rtt_bad = rise > RTT_STEP_DOWN_MS;
+        let queuing_bad = rise.min(cond.queuing_delay_ms) > QUEUING_DELAY_ELEVATED_MS;
         let loss_bad = cond.audio_loss_hint_permille >= AUDIO_LOSS_STEP_DOWN_PERMILLE;
         // A viewer whose downlink cannot keep up makes the server drop our
         // frames for them. That steps down too, but never into the pause:
@@ -170,7 +191,6 @@ impl QualityController {
             self.good_ticks = 0;
         } else {
             self.bad_ticks = 0;
-            self.rtt_baseline_ms = Some(baseline + RTT_BASELINE_ALPHA * (cond.rtt_ms - baseline));
 
             if self.tier != VideoTier::T0 {
                 self.good_ticks += 1;
@@ -330,6 +350,7 @@ mod tests {
                 ..calm()
             },
             NetworkCondition {
+                rtt_ms: 80.0,
                 queuing_delay_ms: 60.0,
                 ..calm()
             },
@@ -349,6 +370,25 @@ mod tests {
             }
             assert_eq!(qc.tier(), VideoTier::T3);
         }
+    }
+
+    #[test]
+    fn healthy_new_route_recovers_even_with_an_old_quic_minimum() {
+        let start = Instant::now();
+        let mut qc = QualityController::new(start);
+        qc.tick(&calm(), 0, start);
+        let route = NetworkCondition {
+            rtt_ms: 170.0,
+            queuing_delay_ms: 150.0,
+            ..calm()
+        };
+        for tick in 1..=60 {
+            qc.tick(&route, 0, start + Duration::from_secs(2 * tick));
+            if tick == 8 {
+                assert_eq!(qc.tier(), VideoTier::T3);
+            }
+        }
+        assert_eq!(qc.tier(), VideoTier::T0);
     }
 
     #[test]
