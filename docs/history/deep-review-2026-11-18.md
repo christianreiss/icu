@@ -35,7 +35,7 @@ arbeiten zusammen.
   ungehörte Folgepaket: nach einer kurzen Pause die ersten 20 ms des nächsten
   Worts. Jetzt dekodiert der Mixer das Paket und lässt es nur aus, wenn dieser
   Frame selbst leise ist. (`4fc3ef7`)
-- **Wortanfang 18 dB zu leise.** Die Dämpfung anhaltender Nicht-Sprache im
+- **Wortanfang bis zu 18 dB zu leise.** Die Dämpfung anhaltender Nicht-Sprache im
   VAD-Nachlauf lief auch bei geschlossenem Gate weiter. Zu hören war davon nur
   das Pre-Roll vor dem nächsten Wort — genau der Anlaut, den die Erkennung
   niedrig bewertet. Gezählt wird jetzt nur bei offenem Gate. (`530ecbb`)
@@ -135,6 +135,21 @@ Gefunden, nachvollzogen, aber nicht behoben — mit Begründung:
   aufgeräumt; die Netz-Stufe (`netcond`) vergleicht gegen die kleinste je
   gemessene RTT und kann dadurch auf einer niedrigen Videostufe hängen bleiben;
   der NSIS-Rückweg des Windows-Updaters ließ sich hier nicht prüfen.
+- **Ducking (Linux) lässt einen Stream aus**, dessen Lautstärke der Nutzer
+  zwischen zwei Absenkungen verstellt hat (`ducking/linux.rs`: nach einer
+  bestätigten Wiederherstellung ist `known_soft` leer, die abweichende
+  Soft-Lautstärke gilt dann als fremder Eingriff). Betrifft keine Streams auf
+  100 %. Aus dem Code gelesen, PipeWires Verhalten dabei nicht nachgestellt.
+- **Ein Videoframe darf beliebig viele Bilder tragen** (`video/h264.rs`,
+  `sanitize` begrenzt die Zahl der VCL-NALs je Frame nicht). Ein böswilliges
+  Mitglied könnte damit den Dekodier-Thread aller Zuschauer auslasten. Der
+  eigene Encoder erzeugt das nie; in einer Runde aus Freunden ohne Belang,
+  als Härtung offen.
+- **Pegelregler des Mikrofons springt an der Blockgrenze**, wenn die
+  Aussteuerungsreserve greift (`dsp/normalize.rs`, `start.min(safe)`). Ob das
+  hörbar ist, wurde nicht gemessen.
+- Beim Neustart des AEC (`engine.rs`, `cap.clear()`) fallen bis zu 10 ms
+  Aufnahme weg, ohne dass der Zeitstempel weiterläuft. Bewusst belassen.
 
 ## Prüfungen
 
