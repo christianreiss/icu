@@ -5,7 +5,7 @@
 //   GET    api/v1/releases                       all releases on disk, newest first
 //   GET    api/v1/releases/latest                the release latest.json points to
 //   GET    api/v1/releases/<ver>                 one release
-// Token (Authorization: Bearer <token>):
+// Token (Authorization: Bearer <token>), and only from config write_networks:
 //   POST   api/v1/uploads          {"version": "x.y.z"}   -> {"id": ...}
 //   PUT    api/v1/uploads/<id>/<file>   raw body, one file per request
 //   POST   api/v1/uploads/<id>/commit   {"latest": true}  verify and publish
@@ -39,6 +39,9 @@ function json_body(): array
 
 function require_token(): void
 {
+    if (!icu_write_network_allowed()) {
+        throw new ReleaseError('write access only from the VPN', 403);
+    }
     if (!icu_authorized()) {
         header('WWW-Authenticate: Bearer realm="icu-release"');
         throw new ReleaseError('authentication required', 401);

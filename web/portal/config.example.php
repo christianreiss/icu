@@ -8,4 +8,6 @@ return [
     // 'allowed_signers' => __DIR__ . '/allowed_signers',  // copy of packaging/allowed_signers
     // 'ssh_keygen' => '/usr/bin/ssh-keygen',
     'server_note' => 'Server: lab.uggs.io',
+    // Writes (uploads, notes) only from these networks (REMOTE_ADDR); empty = any.
+    // 'write_networks' => ['10.2.0.0/24', '2a01:1f8:2000:5::1/128'],  // owlan + NAT66 of aurora
 ];

@@ -55,6 +55,8 @@ function icu_config(): array
             'allowed_signers' => dirname($file) . '/allowed_signers',
             'ssh_keygen' => '/usr/bin/ssh-keygen',
             'server_note' => '',
+            // CIDRs allowed to write (uploads, notes); empty = any address.
+            'write_networks' => [],
         ], is_array($loaded) ? $loaded : []);
     }
     return $config;
@@ -194,6 +196,50 @@ function icu_set_notes(string $version, string $text): void
 }
 
 // ---- authentication -----------------------------------------------------
+
+/** Whether $ip lies in $cidr (IPv4 or IPv6; IPv4-mapped IPv6 counts as IPv4). */
+function icu_ip_in(string $ip, string $cidr): bool
+{
+    [$net, $bits] = array_pad(explode('/', $cidr, 2), 2, null);
+    $a = @inet_pton($ip);
+    $b = @inet_pton((string) $net);
+    if ($a !== false && strlen($a) === 16 && str_starts_with($a, str_repeat("\0", 10) . "\xff\xff")) {
+        $a = substr($a, 12);
+    }
+    if ($a === false || $b === false || strlen($a) !== strlen($b)) {
+        return false;
+    }
+    $bits = $bits === null ? strlen($b) * 8 : (int) $bits;
+    if ($bits < 0 || $bits > strlen($b) * 8) {
+        return false;
+    }
+    $bytes = intdiv($bits, 8);
+    $rest = $bits % 8;
+    if (substr($a, 0, $bytes) !== substr($b, 0, $bytes)) {
+        return false;
+    }
+    if ($rest === 0) {
+        return true;
+    }
+    $mask = (0xff << (8 - $rest)) & 0xff;
+    return (ord($a[$bytes]) & $mask) === (ord($b[$bytes]) & $mask);
+}
+
+/** Writes come only from the configured networks (VPN). REMOTE_ADDR, no proxy headers. */
+function icu_write_network_allowed(): bool
+{
+    $networks = (array) icu_config()['write_networks'];
+    if ($networks === []) {
+        return true;
+    }
+    $ip = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
+    foreach ($networks as $cidr) {
+        if (icu_ip_in($ip, (string) $cidr)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 function icu_authorized(): bool
 {

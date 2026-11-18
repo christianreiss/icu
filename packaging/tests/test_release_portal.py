@@ -249,6 +249,19 @@ class PortalTests(unittest.TestCase):
         status, body = self.call("GET", "/api/v1/releases/5.0.0", token=None)
         self.assertEqual(json.loads(body)["notes"], "Neu in fünf")
 
+    def test_7_writes_only_from_write_networks(self):
+        config = self.data / "config.php"
+        original = config.read_text()
+        self.addCleanup(config.write_text, original)
+        for networks, allowed in [("'10.0.0.0/8', '2a01:1f8:2000::/48'", False), ("'10.0.0.0/8', '127.0.0.0/8'", True)]:
+            config.write_text(original.replace("'server_note'", f"'write_networks' => [{networks}], 'server_note'"))
+            status, body = self.call("POST", "/api/v1/uploads", b'{"version":"7.0.0"}')
+            self.assertEqual(status, 201 if allowed else 403, body)
+            status, _ = self.call("PUT", "/api/v1/releases/1.4.0/notes", b"x", ctype="text/plain")
+            self.assertIn(status, (200, 404) if allowed else (403,))
+            self.assertEqual(self.call("GET", "/api/v1/releases", token=None)[0], 200)
+            self.assertEqual(self.call("GET", "/", token=None)[0], 200)
+
 
 @unittest.skipUnless(shutil.which("php") and shutil.which("ssh-keygen"), "needs php and ssh-keygen")
 class RealReleaseTests(unittest.TestCase):

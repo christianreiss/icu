@@ -78,6 +78,13 @@ API unter `api/v1/` (Antworten JSON):
 | `DELETE uploads/<id>` | ja | Upload verwerfen (verwaiste nach 24 h automatisch) |
 | `PUT releases/<ver>/notes` | ja | Klartext „Neu in …“ setzen |
 
+Schreibende Aufrufe (Token-Spalte) nimmt der Server nur aus den Netzen in
+`write_networks` an (`config.php`, geprüft gegen `REMOTE_ADDR`; Apache steht
+ohne Proxy davor), sonst `403`. Produktiv sind das `10.2.0.0/24` und die NAT66-Adresse von aurora
+`2a01:1f8:2000:5::1/128` (owlan/kids/guests → DC), weil
+Releases nur über VPN hochgeladen werden. Lesen und die Seite bleiben
+öffentlich. Leere Liste = keine Beschränkung.
+
 Der Token (`Authorization: Bearer …`) entscheidet nur, wer hochladen darf.
 Was sichtbar wird, entscheiden die Signaturen: Beim Commit prüft der Server
 `SHA256SUMS.sig` (`icu-release`) und den `authenticated`-Payload von
