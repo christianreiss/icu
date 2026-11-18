@@ -204,8 +204,17 @@ async fn video_over_the_frame_rate_limit_is_dropped() {
         "at most the burst of 3 (plus refill) passes, got {received}"
     );
     assert!(Counters::get(&server.handle.server().counters.video_dropped_rate) > 0);
-    // The sender is still connected.
-    assert!(alice.recv_timeout(BRIEFLY).await.is_none());
+    // The sender is still connected. The burst displaced a frame on the
+    // viewer's pair, which asks the sender for a keyframe; nothing else
+    // comes back.
+    let reply = alice.recv_timeout(BRIEFLY).await;
+    assert!(
+        matches!(
+            reply,
+            None | Some(ControlMsg::KeyframeRequest { speaker: 0 })
+        ),
+        "{reply:?}"
+    );
     server.shutdown().await;
 }
 

@@ -279,7 +279,16 @@ struct Waiting {
     /// picture the receiver never gets, so only a keyframe passes until one
     /// is taken in (`VIDEO_FLAG_KEYFRAME`).
     need_keyframe: bool,
+    /// When this pair last lost a frame ([`Slot::ask_keyframe`]).
+    last_loss: Option<Instant>,
 }
+
+/// A pair's loss asks the sender for a keyframe only when none was lost for
+/// this long before it. A hiccup is repaired at once; a viewer that is
+/// permanently too slow asks once and then waits for the periodic keyframe
+/// like before, instead of making the sender produce one — the largest
+/// frame there is, for everybody — every second.
+const KEYFRAME_ASK_QUIET: Duration = Duration::from_secs(2);
 
 impl Slot {
     fn new(conn_id: usize) -> Slot {
@@ -326,6 +335,22 @@ impl Slot {
 
     fn take(&self) -> Option<Bytes> {
         lock(&self.waiting).frame.take().map(|(frame, _)| frame)
+    }
+
+    /// Books a lost frame of this pair at `now` and says whether the sender
+    /// is to be asked for a keyframe ([`KEYFRAME_ASK_QUIET`]).
+    ///
+    /// The receiver cannot ask: after a drop only keyframes pass, so it
+    /// sees a gap-free sequence that simply stops and has nothing to miss.
+    /// Without this the picture stood still until the sender's periodic
+    /// keyframe, up to 2 s, where a request repairs it within a round trip.
+    fn ask_keyframe(&self, now: Instant) -> bool {
+        let mut waiting = lock(&self.waiting);
+        let quiet = waiting
+            .last_loss
+            .is_none_or(|last| now.saturating_duration_since(last) >= KEYFRAME_ASK_QUIET);
+        waiting.last_loss = Some(now);
+        quiet
     }
 
     /// A frame of this pair was lost after it left the slot (not written or
@@ -502,6 +527,8 @@ pub async fn video(
     // One clock read and one lock for the whole fan-out.
     let now = Instant::now();
     let mut hint = None;
+    // Receivers whose pair just lost a frame after a quiet time.
+    let mut ask = Vec::new();
     {
         let mut state = lock(&state);
         // Receivers that left take their slot with them, and so does an id
@@ -525,7 +552,13 @@ pub async fn video(
                     let slot = Arc::new(Slot::new(conn.stable_id()));
                     crate::spawn_logged(
                         "video forwarder",
-                        forward_frames(server.clone(), conn.clone(), slot.clone(), *session),
+                        forward_frames(
+                            server.clone(),
+                            conn.clone(),
+                            slot.clone(),
+                            *session,
+                            sender,
+                        ),
                     );
                     slot
                 })
@@ -535,6 +568,11 @@ pub async fn video(
                 // A frame that never had a stream of its own is dropped, so
                 // nothing has to be reset.
                 Counters::inc(&server.counters.video_dropped_slow_receiver);
+                // A keyframe that displaced a waiting frame repairs the
+                // pair by itself.
+                if !keyframe && slot.ask_keyframe(now) {
+                    ask.push(*session);
+                }
             }
             let displaced = offer == Offer::Displaced;
             // At most one window closes per frame, so at most one hint.
@@ -547,6 +585,13 @@ pub async fn video(
         server
             .room
             .send_to(sender, &ControlMsg::VideoCongestionHint { drop_permille });
+    }
+    for receiver in ask {
+        server.room.keyframe_request(
+            receiver,
+            sender,
+            server.config.timing.keyframe_min_interval(),
+        );
     }
 }
 
@@ -563,9 +608,12 @@ struct InFlight {
 
 /// How a frame in flight ended.
 enum Settled {
-    /// The receiver acknowledged all of it, or stopped it.
+    /// The receiver acknowledged all of it.
     Acked,
-    /// Past its deadline; it was reset.
+    /// Past its deadline (it was reset), or the receiver stopped it: the
+    /// client gives a frame 100 ms to arrive and drops the stream after
+    /// that. Booked as delivered, such a viewer got deltas behind a frame
+    /// it never had and the sender no congestion hint.
     Late,
     /// The connection is gone.
     Gone,
@@ -579,7 +627,8 @@ impl InFlight {
         tokio::select! {
             biased;
             acked = &mut self.acked => match acked {
-                Ok(_) => Settled::Acked,
+                Ok(None) => Settled::Acked,
+                Ok(Some(_)) => Settled::Late,
                 Err(_) => Settled::Gone,
             },
             _ = tokio::time::sleep_until(self.deadline) => {
@@ -659,6 +708,7 @@ async fn forward_frames(
     conn: quinn::Connection,
     slot: Arc<Slot>,
     session: Session,
+    sender: Session,
 ) {
     let closed = conn.closed();
     let shutdown = server.shutdown_requested();
@@ -668,6 +718,13 @@ async fn forward_frames(
         Counters::inc(&server.counters.video_dropped_slow_receiver);
         if slot.lost() {
             Counters::inc(&server.counters.video_dropped_slow_receiver);
+        }
+        if slot.ask_keyframe(Instant::now()) {
+            server.room.keyframe_request(
+                session,
+                sender,
+                server.config.timing.keyframe_min_interval(),
+            );
         }
     };
     loop {
@@ -848,6 +905,23 @@ mod tests {
         assert!(slot.lost(), "a waiting delta goes with the loss");
         assert!(slot.take().is_none());
         assert_eq!(offer(b"d5", DELTA), Offer::Skipped);
+    }
+
+    /// The first loss after a quiet time asks for a keyframe; the losses of
+    /// a viewer that keeps falling behind do not.
+    #[test]
+    fn only_the_first_loss_after_a_quiet_time_asks_for_a_keyframe() {
+        let slot = Slot::new(0);
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        assert!(slot.ask_keyframe(t0), "the first loss");
+        assert!(!slot.ask_keyframe(t0 + ms(66)));
+        assert!(!slot.ask_keyframe(t0 + ms(1900)), "still losing");
+        assert!(
+            !slot.ask_keyframe(t0 + ms(3800)),
+            "1.9 s after the last loss"
+        );
+        assert!(slot.ask_keyframe(t0 + ms(3800) + KEYFRAME_ASK_QUIET));
     }
 
     /// The sender left: every forwarder it spawned must be able to end
