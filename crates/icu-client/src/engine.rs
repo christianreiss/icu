@@ -2422,7 +2422,7 @@ fn dsp_thread(
         }
         // Voice optimizer, outbound normalization and limiter.
         if ctl.vad_mode.load(Ordering::Relaxed) {
-            chain.finish_vad(&mut block, voice, &send);
+            chain.finish_vad(&mut block, voice, gate.is_open(), &send);
         } else {
             chain.finish(&mut block, voice, &send);
         }

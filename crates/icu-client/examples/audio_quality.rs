@@ -139,7 +139,7 @@ fn run(input: &[f32], frame: usize) -> Run {
         #[cfg(icu_legacy_audio)]
         chain.finish(&mut block, voice, &settings);
         #[cfg(not(icu_legacy_audio))]
-        chain.finish_vad(&mut block, voice, &settings);
+        chain.finish_vad(&mut block, voice, gate.is_open(), &settings);
         voice_in_frame |= voice;
         acc.extend_from_slice(&block);
         if acc.len() == frame {

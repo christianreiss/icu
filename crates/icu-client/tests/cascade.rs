@@ -124,7 +124,7 @@ fn send(mic: &Mic, settings: &SendSettings, loss_permille: u16) -> Stream {
         let a = chain.analyze(&mut block, settings);
         let (_, voice) = a.classify(&mut auto, now, gate.is_open(), None);
         voice_in_frame |= voice;
-        chain.finish_vad(&mut block, voice, settings);
+        chain.finish_vad(&mut block, voice, true, settings);
         stream.gains.push(chain.gains_db());
         stream.voice.push(voice);
         stream
@@ -798,7 +798,7 @@ fn peer_feedback_through_opus_is_bounded_and_independent_of_playback_volume() {
             chain.tune(tuner.offset_db, 0.0);
             let a = chain.analyze(&mut block, &settings);
             let (_, speech) = a.classify(&mut auto, now + BLOCK_DT * i as u32, false, Some(0.5));
-            chain.finish_vad(&mut block, speech, &settings);
+            chain.finish_vad(&mut block, speech, true, &settings);
             for sample in &mut block {
                 *sample *= post_gain;
             }

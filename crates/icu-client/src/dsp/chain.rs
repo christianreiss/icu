@@ -262,9 +262,14 @@ impl SendChain {
     /// During a VAD hangover, attenuate only sustained low-confidence
     /// non-speech. Consonants/short pauses retain 120 ms of protection and
     /// all candidate speech immediately restores unity. PTT uses `finish`.
-    pub fn finish_vad(&mut self, block: &mut [f32], voice: bool, s: &SendSettings) {
+    ///
+    /// `open`: the gate is open, so this block is being sent. While it is
+    /// closed nothing counts as sustained non-speech: what is heard of
+    /// those blocks is the pre-roll in front of the next word, whose onset
+    /// the detector scores low — it went out 18 dB down.
+    pub fn finish_vad(&mut self, block: &mut [f32], voice: bool, open: bool, s: &SendSettings) {
         self.finish(block, voice, s);
-        let certain_noise = !voice && self.probability.is_some_and(|p| p < 0.15);
+        let certain_noise = open && !voice && self.probability.is_some_and(|p| p < 0.15);
         if certain_noise {
             self.nonspeech_samples = self.nonspeech_samples.saturating_add(block.len());
         } else {
@@ -381,6 +386,30 @@ impl SendChain {
 
 #[cfg(test)]
 mod tests {
+    /// Sustained noise is turned down while the gate is open (the hangover)
+    /// and left alone while it is closed: those blocks are only ever heard
+    /// as the pre-roll of the next word.
+    #[test]
+    fn noise_is_attenuated_in_the_hangover_only() {
+        use crate::dsp::testsignal::Rng;
+        let settings = SendSettings::default();
+        let run = |open: bool| {
+            let mut chain = SendChain::new();
+            let mut rng = Rng::new(7);
+            for _ in 0..60 {
+                let mut block = [0.0f32; 480];
+                for sample in &mut block {
+                    *sample = 0.003 * rng.uniform();
+                }
+                chain.analyze(&mut block, &settings);
+                chain.finish_vad(&mut block, false, open, &settings);
+            }
+            chain.nonspeech_gain
+        };
+        assert!(run(true) < 0.2, "hangover: {}", run(true));
+        assert_eq!(run(false), 1.0, "gate closed");
+    }
+
     #[test]
     fn denoise_reenable_discards_audio_before_bypass() {
         let mut chain = SendChain::new();

@@ -68,7 +68,7 @@ fn run_with(samples: &[f32], attack_ms: u32, attenuate: bool) -> Run {
         let (_, voice) = a.classify(&mut auto, now, gate.is_open(), None);
         voice_in_frame |= voice;
         if attenuate {
-            chain.finish_vad(&mut block, voice, &settings);
+            chain.finish_vad(&mut block, voice, gate.is_open(), &settings);
         } else {
             chain.finish(&mut block, voice, &settings);
         }
