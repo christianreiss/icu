@@ -91,10 +91,14 @@
       <div class="rings" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
       <button class="eye" id="eye" type="button" aria-pressed="false" aria-label="Sende-Demo: gedrückt halten" data-i18n-attr="aria-label:hero.eye">
         <svg viewBox="0 0 64 64" width="220" height="220" aria-hidden="true">
-          <defs><clipPath id="eyeclip"><path d="M10 32c6-9 13-14 22-14s16 5 22 14c-6 9-13 14-22 14S16 41 10 32z"/></clipPath></defs>
+          <defs><clipPath id="eyeclip"><path d="M6 32Q32 0 58 32Q32 64 6 32Z"/></clipPath></defs>
           <circle class="eye-disc" cx="32" cy="32" r="30"/>
-          <path class="eye-lid" d="M10 32c6-9 13-14 22-14s16 5 22 14c-6 9-13 14-22 14S16 41 10 32z"/>
-          <g clip-path="url(#eyeclip)"><g class="eye-iris"><circle class="iris" cx="32" cy="32" r="8"/><circle class="pupil" cx="32" cy="32" r="3.5"/></g></g>
+          <path class="eye-lid" d="M6 32Q32 0 58 32Q32 64 6 32Z"/>
+          <g clip-path="url(#eyeclip)"><g class="eye-iris iris">
+            <rect x="20" y="27" width="5" height="10" rx="2.5"/>
+            <rect x="29" y="21" width="6" height="22" rx="3"/>
+            <rect x="39" y="26" width="5" height="12" rx="2.5"/>
+          </g></g>
         </svg>
         <span class="eye-state" aria-hidden="true"><b class="on" data-i18n="hero.tx">Sendet</b><b class="off" data-i18n="hero.rx">Hört zu</b></span>
       </button>

@@ -18,20 +18,6 @@ W, H, S = 1200, 630, 2  # canvas, supersampling
 INK, BLUE, HI, AMBER = (5, 15, 26), (46, 155, 255), (143, 208, 255), (255, 181, 71)
 
 
-def bezier(p0, p1, p2, p3, n=24):
-    pts = []
-    for i in range(n + 1):
-        t = i / n
-        a, b, c, d = (1 - t) ** 3, 3 * (1 - t) ** 2 * t, 3 * (1 - t) * t**2, t**3
-        pts.append((a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0], a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]))
-    return pts
-
-
-# the eye of packaging/files/icu.svg, in its 64x64 space
-EYE = (bezier((10, 32), (16, 23), (23, 18), (32, 18)) + bezier((32, 18), (41, 18), (48, 23), (54, 32))[1:]
-       + bezier((54, 32), (48, 41), (41, 46), (32, 46))[1:] + bezier((32, 46), (23, 46), (16, 41), (10, 32))[1:])
-
-
 def font(path, size):
     return ImageFont.truetype(path, size * S)
 
@@ -56,14 +42,11 @@ def main():
     for i, r in enumerate((190, 260, 340, 430)):
         d.ellipse(((cx - r) * S, (cy - r) * S, (cx + r) * S, (cy + r) * S), outline=(46, 155, 255, 120 - i * 26), width=2 * S)
 
-    # the eye
-    k = 4.6
-    ox, oy = cx - 32 * k, cy - 32 * k
-    at = lambda x, y: ((ox + x * k) * S, (oy + y * k) * S)
-    d.ellipse((*at(2, 2), *at(62, 62)), fill=BLUE)
-    d.polygon([at(x, y) for x, y in EYE], fill=INK)
-    d.ellipse((*at(24, 24), *at(40, 40)), fill=BLUE)
-    d.ellipse((*at(28.5, 28.5), *at(35.5, 35.5)), fill=INK)
+    # Use the same logo as the website and desktop client.
+    size = round(64 * 4.6 * S)
+    with Image.open(OUT.with_name("icu-256.png")) as source:
+        logo = source.convert("RGBA").resize((size, size), Image.LANCZOS)
+    img.paste(logo, (cx * S - size // 2, cy * S - size // 2), logo)
 
     # copy
     x = 80

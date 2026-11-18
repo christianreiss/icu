@@ -111,7 +111,7 @@ body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opa
 .eye:active,.tx .eye{scale:.96}
 .eye svg{display:block;width:100%;height:auto;overflow:visible}
 .eye-disc,.iris{fill:var(--blue);transition:fill .25s}
-.eye-lid,.pupil{fill:#06121f}
+.eye-lid{fill:#06121f}
 .eye-iris{transform:translate(calc(var(--ex,0)*1px),calc(var(--ey,0)*1px));transition:transform .12s ease-out}
 .eye-state{position:absolute;left:0;right:0;top:236px;text-align:center;font:600 .78rem/1 var(--mono);letter-spacing:.2em;text-transform:uppercase}
 .eye-state b{display:block;font-weight:600}
