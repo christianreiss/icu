@@ -1981,6 +1981,42 @@ fn user_path_keeps_volume_moderation_and_certificate_copy() {
     );
 }
 
+/// „Wieder hören“ returns to the volume that was set before muting, not
+/// to a flat 100 %.
+#[test]
+fn unmute_restores_the_previous_volume() {
+    let s = Rc::new(RefCell::new(state()));
+    s.borrow_mut().peers[0].volume = 25.0;
+    let current = s.clone();
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let captured = sent.clone();
+    let mut view = UserView::new(2);
+    let mut h = harness(USER, "dark", true, move |ui| {
+        view.ui(ui, &current.borrow(), &|_| None, &|c| {
+            captured.borrow_mut().push(c)
+        });
+    });
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Für mich stummschalten")
+        .click();
+    h.run();
+    assert!(sent
+        .borrow()
+        .iter()
+        .any(|c| matches!(c, Command::SetVolume(2, v) if *v == 0.0)));
+    s.borrow_mut().peers[0].volume = 0.0;
+    h.run();
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "Wieder hören")
+        .click();
+    h.run();
+    assert!(
+        sent.borrow()
+            .iter()
+            .any(|c| matches!(c, Command::SetVolume(2, v) if *v == 25.0)),
+        "unmute restores 25 %"
+    );
+}
+
 #[test]
 fn moderation_waits_for_loaded_restrictions_and_preserves_deafen() {
     for theme_name in THEMES {

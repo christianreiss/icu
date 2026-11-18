@@ -26,6 +26,9 @@ pub struct UserView {
     moderation_requested: Option<Instant>,
     selected: Option<Certificate>,
     copied: Option<(String, Instant)>,
+    /// The last audible volume seen for this person, which „Wieder hören“
+    /// returns to instead of a flat 100 %.
+    last_audible: Option<f32>,
 }
 
 #[derive(Debug, Default)]
@@ -50,6 +53,7 @@ impl UserView {
             moderation_requested: None,
             selected: None,
             copied: None,
+            last_audible: None,
         }
     }
     /// Selected stable user identity.
@@ -143,7 +147,7 @@ impl UserView {
                     self.hero(ui, &p, own, send);
                     ui.add_space(14.0);
                     if let Some(v) = p.volume {
-                        volume_section(ui, &p, v, send);
+                        volume_section(ui, &p, v, &mut self.last_audible, send);
                     }
                     path_section(ui, state, &p, &me, own);
                     let link = self.certificate_section(
@@ -937,7 +941,16 @@ fn path_diagram(ui: &mut Ui, nodes: &[Node<'_>], links: &[Option<u16>]) {
 
 /// The playback volume this client applies to this person: mute toggle,
 /// slider and the value on one line.
-fn volume_section(ui: &mut Ui, p: &Participant<'_>, mut v: f32, send: &impl Fn(Command)) {
+fn volume_section(
+    ui: &mut Ui,
+    p: &Participant<'_>,
+    mut v: f32,
+    last_audible: &mut Option<f32>,
+    send: &impl Fn(Command),
+) {
+    if v > 0.0 {
+        *last_audible = Some(v);
+    }
     let tok = theme::tokens(ui.visuals());
     section(
         ui,
@@ -963,7 +976,11 @@ fn volume_section(ui: &mut Ui, p: &Participant<'_>, mut v: f32, send: &impl Fn(C
                         if mute.clicked() {
                             send(Command::SetVolume(
                                 p.user_id,
-                                if muted { 100.0 } else { 0.0 },
+                                if muted {
+                                    last_audible.unwrap_or(100.0)
+                                } else {
+                                    0.0
+                                },
                             ));
                         }
                         let value_w = 52.0;
