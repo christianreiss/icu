@@ -45,12 +45,13 @@ use windows::{
                 IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
                 IMMNotificationClient_Impl, MMDeviceEnumerator,
                 AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY, AUDCLNT_BUFFERFLAGS_SILENT,
-                AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                AUDCLNT_STREAMOPTIONS_NONE, AUDCLNT_STREAMOPTIONS_RAW,
-                AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS, DEVICE_STATE, DEVICE_STATE_ACTIVE,
-                WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
+                AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR, AUDCLNT_E_DEVICE_INVALIDATED,
+                AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+                AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, AUDCLNT_STREAMOPTIONS_NONE,
+                AUDCLNT_STREAMOPTIONS_RAW, AUDIO_DUCKING_OPTIONS_DO_NOT_DUCK_OTHER_STREAMS,
+                DEVICE_STATE, DEVICE_STATE_ACTIVE, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+                WAVEFORMATEXTENSIBLE_0,
             },
             KernelStreaming::WAVE_FORMAT_EXTENSIBLE,
             Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT},
@@ -1043,10 +1044,13 @@ impl Stream {
                 device_name,
                 device_id: device_id(&device)?,
                 pending: Vec::with_capacity(
-                    buffer_frames as usize + period as usize + BLOCK_SAMPLES * 2,
+                    buffer_frames as usize
+                        + period as usize
+                        + BLOCK_SAMPLES * 2
+                        + super::packet::MAX_GAP,
                 ),
                 pending_at: None,
-                reference: vec![[0.0; 8]; 1024],
+                reference: vec![[0.0; 8]; 1024.max(super::packet::MAX_GAP)],
                 selector,
                 selected_channel: spec.selected_channel.clone(),
                 capture_timeline: Default::default(),
@@ -1155,37 +1159,52 @@ impl Stream {
                 let mut frames = 0u32;
                 let mut flags = 0u32;
                 let mut qpc = 0u64;
-                capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
-                if self.capture_timeline.begin_packet(
-                    &mut self.pending,
+                let mut position = 0;
+                capture.GetBuffer(
+                    &mut data,
+                    &mut frames,
+                    &mut flags,
+                    Some(&mut position),
+                    Some(&mut qpc),
+                )?;
+                let Some(repair) = self.capture_timeline.begin_packet(
+                    (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0).then_some(position),
+                    frames,
                     flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
-                ) {
+                ) else {
                     capture.ReleaseBuffer(frames)?;
                     return Ok(None);
-                }
-                let n = frames as usize;
-                if self.pending.is_empty() {
-                    self.pending_at = Some(
-                        capture_qpc_time(qpc, flags)
-                            .unwrap_or_else(|| AudioTiming::estimated_capture(n)),
-                    );
-                }
+                };
+                let n = frames as usize - repair.skip;
+                let packet_time = || {
+                    capture_qpc_time(qpc, flags)
+                        .unwrap_or_else(|| AudioTiming::estimated_capture(frames as usize))
+                        .shifted(repair.skip)
+                };
                 received += n;
-                if self.pending.len() + n > self.pending.capacity() {
+                if self.pending.len() + repair.silence + n > self.pending.capacity() {
                     capture.ReleaseBuffer(frames)?;
                     return Ok(None);
                 }
+                if self.pending.is_empty() {
+                    let mut timing = packet_time();
+                    timing.at -=
+                        Duration::from_secs_f64(repair.silence as f64 / f64::from(SAMPLE_RATE));
+                    self.pending_at = Some(timing);
+                }
+                self.pending
+                    .resize(self.pending.len() + repair.silence, 0.0);
                 if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data.is_null() {
                     self.pending.resize(self.pending.len() + n, 0.0);
                 } else {
-                    let samples = std::slice::from_raw_parts(data as *const f32, n * channels);
+                    let samples = std::slice::from_raw_parts(
+                        (data as *const f32).add(repair.skip * channels),
+                        n * channels,
+                    );
                     let selector = self.selector.as_mut().expect("capture selector");
                     if selector.update(samples, &self.selected_channel, events) {
                         self.pending.clear();
-                        self.pending_at = Some(
-                            capture_qpc_time(qpc, flags)
-                                .unwrap_or_else(|| AudioTiming::estimated_capture(n)),
-                        );
+                        self.pending_at = Some(packet_time());
                     }
                     self.pending.extend(
                         samples
@@ -1226,13 +1245,26 @@ impl Stream {
                 let mut data = std::ptr::null_mut();
                 let mut frames = 0;
                 let mut flags = 0;
-                capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)?;
-                if self.capture_timeline.begin_packet(
-                    &mut self.pending,
+                let mut position = 0;
+                capture.GetBuffer(
+                    &mut data,
+                    &mut frames,
+                    &mut flags,
+                    Some(&mut position),
+                    None,
+                )?;
+                let Some(repair) = self.capture_timeline.begin_packet(
+                    (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 == 0).then_some(position),
+                    frames,
                     flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0,
-                ) {
+                ) else {
                     capture.ReleaseBuffer(frames)?;
                     return Ok(None);
+                };
+                if repair.silence > 0 {
+                    let silence = &mut self.reference[..repair.silence];
+                    silence.fill([0.0; 8]);
+                    cb(silence, self.channels);
                 }
                 let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 || data.is_null();
                 let samples = if silent {
@@ -1240,7 +1272,7 @@ impl Stream {
                 } else {
                     std::slice::from_raw_parts(data as *const f32, frames as usize * self.channels)
                 };
-                for start in (0..frames as usize).step_by(self.reference.len()) {
+                for start in (repair.skip..frames as usize).step_by(self.reference.len()) {
                     let count = (frames as usize - start).min(self.reference.len());
                     for (i, frame) in self.reference[..count].iter_mut().enumerate() {
                         frame.fill(0.0);
@@ -1316,7 +1348,7 @@ impl Stream {
 
 // WASAPI reports QPC positions in 100-ns units, not raw performance ticks.
 fn capture_qpc_time(qpc: u64, flags: u32) -> Option<AudioTiming> {
-    if qpc == 0 || flags & 4 != 0 {
+    if qpc == 0 || flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32 != 0 {
         return None;
     }
     let mut ticks = 0i64;

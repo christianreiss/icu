@@ -102,10 +102,13 @@ CPAL gibt Stimme ebenfalls nur auf dem ersten Kanalpaar aus und meldet
 Streamfehler an die automatische Wiederöffnung. Der Capture-Fallback setzt
 weiterhin einen vom Backend unterstützten float32/48-kHz-Eingang voraus.
 
-Meldet WASAPI eine Zeitlücke in einem bereits laufenden Capture- oder
-Referenzstream, verwirft ICU dessen gepufferte Samples und öffnet Mikrofon,
-AEC-Referenz und Wiedergabe gemeinsam neu. Ein Startflag im ersten Paket
-löst diese Wiederöffnung nicht aus. Mute und Gerätewahl bleiben erhalten.
+Bei einer von WASAPI gemeldeten Unterbrechung vergleicht ICU die Gerätepositionen
+der Capture- oder Referenzpakete. Bei bis zu 20 ms Differenz füllt ICU fehlende
+Frames mit Stille auf oder überspringt den überlappenden Teil eines Pakets.
+Die Wiedergabe und ihre Uhr laufen dabei weiter. Größere, zeitlich unbestimmte
+oder vollständig wiederholte Pakete lösen einen gemeinsamen Neustart von
+Mikrofon, AEC-Referenz und Wiedergabe aus. Das Startflag im ersten Paket ist
+erlaubt. Mute und Gerätewahl bleiben erhalten.
 
 ### Verarbeitung und Senden
 

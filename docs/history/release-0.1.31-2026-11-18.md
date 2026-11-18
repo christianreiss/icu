@@ -12,6 +12,9 @@ change.
 The viewer uses PipeWire or WASAPI playback timing to align each speaker's
 picture with their voice. Changing output devices clears previous timing
 observations. Estimated output timing gradually releases an existing hold.
+On Windows, a short gap with known device positions is filled with silence.
+Overlapping samples are skipped. Both preserve the playback clock when a
+microphone or loopback packet is late.
 
 On Fedora, a physical C270 delivered 239 decoded pictures through a local
 relay in 20 seconds. A simulated 300 ms output delay produced a 321 ms picture
@@ -19,7 +22,9 @@ hold compared with 19 ms on direct output. The Windows 11 virtual audio endpoint
 returned 566 measured presentation times in a three-second run. In a separate
 Windows 11 capture, all 642 camera frames in 45 seconds carried a measured
 device timestamp, and the camera closed cleanly. A two-minute Windows-to-Fedora
-call decoded 1,422 frames. These tests
+call decoded 1,422 frames. In the opposite direction, Windows received 992 camera
+frames and decoded 3,330 audio packets without a stream restart or jitter-buffer
+drop. Before the audio fix, the same route restarted WASAPI 108 times. These tests
 measure capture, decode and device clock behavior. Physical display-to-speaker
 lip sync requires a clap test at the receiving device.
 
