@@ -212,7 +212,7 @@ fn jpeg_decodable(data: &[u8]) -> Result<(), &'static str> {
                     return Err("unusable frame header");
                 }
                 let mut list = [(0, 0); 4];
-                for (slot, component) in list.iter_mut().zip(rest.chunks_exact(3)) {
+                for (slot, component) in list.iter_mut().zip(rest.as_chunks::<3>().0) {
                     let (h, v, table) = (component[1] >> 4, component[1] & 15, component[2]);
                     if !(1..=4).contains(&h) || !(1..=4).contains(&v) || table > 3 {
                         return Err("unusable frame component");
@@ -250,7 +250,7 @@ fn jpeg_decodable(data: &[u8]) -> Result<(), &'static str> {
                 if !(1..=4).contains(&scan_count) || rest.len() != 2 * scan_count + 3 {
                     return Err("unusable scan header");
                 }
-                for component in rest[..2 * scan_count].chunks_exact(2) {
+                for component in rest[..2 * scan_count].as_chunks::<2>().0 {
                     let Some((_, table)) = list[..count].iter().find(|(id, _)| *id == component[0])
                     else {
                         return Err("scan of an unknown component");
