@@ -478,6 +478,13 @@ impl Settings {
                 Ok(settings)
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Settings::default()),
+            // Not text at all (a torn write, a stray binary): unreadable in
+            // the same sense as text that is not TOML, and recovered from
+            // the same way. As an I/O error it kept the client from
+            // starting until somebody deleted the file by hand.
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                Err(ConfigError::Parse(e.to_string()))
+            }
             Err(e) => Err(ConfigError::Io(e)),
         }
     }
@@ -2350,6 +2357,15 @@ mod tests {
         );
         // A good file, or none, reads as before, without a problem.
         assert_eq!(Settings::load_or_recover(&paths).unwrap().1, None);
+
+        // A file that is not even text is recovered from the same way,
+        // instead of keeping the client from starting.
+        fs::write(paths.settings(), [0xFF, 0xFE, 0x00, 0x80]).unwrap();
+        assert!(matches!(Settings::load(&paths), Err(ConfigError::Parse(_))));
+        let (settings, problem) = Settings::load_or_recover(&paths).unwrap();
+        assert_eq!(settings, Settings::default());
+        assert!(problem.is_some());
+        assert!(!paths.settings().exists());
     }
 
     /// Settings on one machine, with devices, camera and the rest of what

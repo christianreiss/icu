@@ -547,7 +547,7 @@ stummen Audiopfad durch eine nicht endliche Verstärkung und begrenzt etwa den
 VAD-Nachlauf auf 3 s. Stummschaltung, PTT-Modus und Gerätewahl bleiben erhalten;
 die ursprüngliche Datei wird dafür weder verschoben noch sofort überschrieben.
 
-`settings.toml` unter `$XDG_CONFIG_HOME/icu/` bzw. `%APPDATA%\icu\config\`, geschrieben entprellt (2026-09-26: 500 ms nach der letzten Änderung, über `spawn_blocking` statt auf einem der beiden Netz-Worker, beim Beenden sofort — ein Schieberegler löste vorher je UI-Frame ein `fsync` aus). Lässt sie sich nicht lesen, legt der Client sie als `settings.toml.broken-<Unix-Zeit>` beiseite, startet mit den Vorgaben und sagt es im ersten Banner (`EngineConfig.banner`), statt mit einer Zeile auf stderr zu enden, die beim Start vom Desktop niemand sieht (2026-09-26):
+`settings.toml` unter `$XDG_CONFIG_HOME/icu/` bzw. `%APPDATA%\icu\config\`, geschrieben entprellt (2026-09-26: 500 ms nach der letzten Änderung, über `spawn_blocking` statt auf einem der beiden Netz-Worker, beim Beenden sofort — ein Schieberegler löste vorher je UI-Frame ein `fsync` aus). Lässt sie sich nicht lesen — kein gültiges TOML oder, seit 2026-11-18, gar kein Text (kein UTF-8) —, legt der Client sie als `settings.toml.broken-<Unix-Zeit>` beiseite, startet mit den Vorgaben und sagt es im ersten Banner (`EngineConfig.banner`), statt mit einer Zeile auf stderr zu enden, die beim Start vom Desktop niemand sieht (2026-09-26):
 
 ```toml
 # Serverkoordinaten stehen ausschließlich in identity/server.toml (siehe §5), nicht hier.
