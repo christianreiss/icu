@@ -31,7 +31,7 @@ gui = ["dep:winit", "dep:wayland-client", "dep:wayland-protocols", "dep:eframe",
 # eframe glow backend in addition to the default wgpu one.
 glow = ["eframe?/glow"]
 # Camera capture and H.264.
-camera = ["dep:nokhwa", "dep:openh264"]
+camera = ["dep:nokhwa", "dep:openh264", "dep:zune-jpeg"]
 # Wayland layer-shell overlay. Needs `gui`: it is started by the main window
 # and draws names with the window's font (ab_glyph).
 overlay = ["gui", "dep:smithay-client-toolkit", "dep:wayland-client", "dep:calloop", "dep:calloop-wayland-source", "dep:ab_glyph"]
@@ -86,6 +86,7 @@ arboard = { version = "3.6.1", default-features = false, optional = true }
 
 # Camera / video
 nokhwa = { version = "0.10.11", features = ["input-native", "camera-sync-impl"], optional = true }
+zune-jpeg = { version = "0.5.15", optional = true }
 openh264 = { version = "0.9.8", features = ["source"], optional = true }
 
 # Paths

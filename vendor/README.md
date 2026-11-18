@@ -26,3 +26,12 @@ QUIC queue residence, not propagation time or bytes already handed to the OS.
 Rebase this small patch when upgrading Quinn; do not silently replace it with
 a byte-limit-only queue. Run the vendored crate tests as well as ICU transport
 integration tests after rebasing.
+
+## Windows camera lifetime
+
+`nokhwa-bindings-windows-0.4.6/` comes from the crates.io archive
+SHA-256 `5be28886bad8abcec3655c1f24b965b4cb596a72b23164c910c54439ce55d2a4`.
+The ICU patch pairs each locked sample with an unlock, releases enumeration
+allocations, dates frames from the device QPC timestamp when available, and
+releases the source reader before shutting down Media Foundation and its COM apartment. ICU opens, reads and closes the camera on its acquisition
+thread. Recheck the native camera soak including camera closure when upgrading.

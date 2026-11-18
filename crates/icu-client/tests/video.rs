@@ -575,9 +575,9 @@ async fn native_camera_processing_and_timing_remain_live() {
     a.command(Command::SetCamera(true));
     wait_for(&a, SOON, |s| s.camera_on).await;
     let mut camera = CameraHandle::new(a.camera_link());
-    camera.start_with(Box::new(
-        icu_client::camera::NokhwaSource::open(index).expect("open native camera"),
-    ));
+    camera
+        .start(Some(&index.to_string()))
+        .expect("open native camera");
     let mut count = 0;
     let mut last = 0;
     let start = std::time::Instant::now();

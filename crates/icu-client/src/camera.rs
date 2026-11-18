@@ -109,64 +109,14 @@ impl RgbFrame {
     }
 }
 
-/// Width and height from a JPEG's frame header (SOF*n*), `None` without one.
-/// nokhwa labels every decoded picture with the negotiated size, but decodes
-/// an MJPEG frame at the size the frame itself says.
-fn jpeg_size(data: &[u8]) -> Option<(usize, usize)> {
-    if !data.starts_with(&[0xFF, 0xD8]) {
-        return None;
-    }
-    let mut i = 2;
-    loop {
-        if *data.get(i)? != 0xFF {
-            return None;
-        }
-        let marker = *data.get(i + 1)?;
-        match marker {
-            // Fill byte before a marker.
-            0xFF => {
-                i += 1;
-                continue;
-            }
-            // Markers without a length.
-            0x01 | 0xD0..=0xD8 => {
-                i += 2;
-                continue;
-            }
-            // End of image, or the scan starts: no frame header before it.
-            0xD9 | 0xDA => return None,
-            _ => {}
-        }
-        let len = usize::from(u16::from_be_bytes([*data.get(i + 2)?, *data.get(i + 3)?]));
-        // SOF0–SOF15, except DHT (C4), JPG (C8) and DAC (CC): length,
-        // precision, height, width.
-        if (0xC0..=0xCF).contains(&marker) && ![0xC4, 0xC8, 0xCC].contains(&marker) {
-            let height = u16::from_be_bytes([*data.get(i + 5)?, *data.get(i + 6)?]);
-            let width = u16::from_be_bytes([*data.get(i + 7)?, *data.get(i + 8)?]);
-            return Some((usize::from(width), usize::from(height)));
-        }
-        if len < 2 {
-            return None;
-        }
-        i += 2 + len;
-    }
-}
-
-/// Refuses an MJPEG frame whose headers libjpeg would not survive.
-///
-/// nokhwa decodes MJPEG with mozjpeg, and libjpeg reports a fatal error by
-/// unwinding out of C. A release build aborts on that: one frame without a
-/// start marker, cut off inside its headers or with a damaged table — what
-/// a USB hiccup or a camera being unplugged produces — ended the whole
-/// client. Damage *behind* the headers is harmless (libjpeg warns and pads
-/// the picture), so only the headers are walked here, the way libjpeg's own
-/// marker reader does: stray bytes between segments are skipped, and
-/// whatever it would decode is let through.
-fn jpeg_decodable(data: &[u8]) -> Result<(), &'static str> {
+/// Validate the camera's frame, scan and table headers. USB MJPEG also
+/// permits omitted Huffman tables; return whether the stream supplies them.
+fn jpeg_tables(data: &[u8]) -> Result<bool, &'static str> {
     const CUT: &str = "cut off inside its headers";
     if !data.starts_with(&[0xFF, 0xD8]) {
         return Err("no start marker");
     }
+    let mut has_dht = false;
     let mut i = 2;
     // Component id and quantization table of the frame header's components.
     let mut components: Option<([(u8, u8); 4], usize)> = None;
@@ -221,7 +171,10 @@ fn jpeg_decodable(data: &[u8]) -> Result<(), &'static str> {
                 }
                 components = Some((list, count));
             }
-            0xC4 => huffman_tables_decodable(segment)?,
+            0xC4 => {
+                huffman_tables_decodable(segment)?;
+                has_dht = true;
+            }
             0xDB => {
                 let mut rest = segment;
                 while let [head, tail @ ..] = rest {
@@ -262,7 +215,7 @@ fn jpeg_decodable(data: &[u8]) -> Result<(), &'static str> {
                         return Err("unusable scan component");
                     }
                 }
-                return Ok(());
+                return Ok(has_dht);
             }
             // DNL, APPn, COM: skipped by libjpeg as well.
             0xDC | 0xE0..=0xEF | 0xFE => {}
@@ -492,6 +445,36 @@ fn fit_capture(frame: RgbFrame) -> RgbFrame {
     }
 }
 
+/// Decode each USB frame independently. A JPEG decoder error must be a
+/// dropped camera frame, including in the panic-abort release profile.
+fn decode_mjpeg(data: &[u8]) -> Result<RgbFrame, String> {
+    use zune_jpeg::{
+        zune_core::{bytestream::ZCursor, options::DecoderOptions},
+        JpegDecoder,
+    };
+
+    let with_defaults;
+    let bytes = if jpeg_tables(data)? {
+        data
+    } else {
+        // AVI1 selects the standard MJPEG tables in zune. Some UVC cameras
+        // omit both the tables and that marker.
+        with_defaults = [b"\xff\xd8\xff\xe0\x00\x07AVI1\0".as_slice(), &data[2..]].concat();
+        &with_defaults
+    };
+    let options = DecoderOptions::default().set_strict_mode(true);
+    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
+    decoder.decode_headers().map_err(|e| e.to_string())?;
+    let info = decoder.info().ok_or("missing image dimensions")?;
+    let (width, height) = (usize::from(info.width), usize::from(info.height));
+    // Account for 8K cameras while bounding a corrupt frame's allocation.
+    if width * height > 8192 * 4320 {
+        return Err("camera image exceeds 8K".into());
+    }
+    let rgb = decoder.decode().map_err(|e| e.to_string())?;
+    RgbFrame::checked(width, height, rgb)
+}
+
 impl FrameSource for NokhwaSource {
     fn next_frame(&mut self) -> Result<RgbFrame, String> {
         use nokhwa::{pixel_format::RgbFormat, utils::FrameFormat};
@@ -501,27 +484,14 @@ impl FrameSource for NokhwaSource {
             Instant::now(),
             std::time::SystemTime::now(),
         );
-        if buffer.source_frame_format() == FrameFormat::MJPEG {
-            jpeg_decodable(buffer.buffer()).map_err(|e| format!("damaged MJPEG frame: {e}"))?;
-        }
-        let img = buffer
-            .decode_image::<RgbFormat>()
-            .map_err(|e| e.to_string())?;
-        let (mut width, mut height) = (img.width() as usize, img.height() as usize);
-        // `into_raw` hands back the whole decoded buffer, which is longer than
-        // the image's (negotiated) size when an MJPEG frame is larger: take
-        // the frame's own size when it explains the byte count.
-        let rgb = img.into_raw();
-        if buffer.source_frame_format() == FrameFormat::MJPEG
-            && width.saturating_mul(height).saturating_mul(3) != rgb.len()
-        {
-            if let Some((w, h)) = jpeg_size(buffer.buffer()) {
-                if w.saturating_mul(h).saturating_mul(3) == rgb.len() {
-                    (width, height) = (w, h);
-                }
-            }
-        }
-        let mut frame = RgbFrame::checked(width, height, rgb)?;
+        let mut frame = if buffer.source_frame_format() == FrameFormat::MJPEG {
+            decode_mjpeg(buffer.buffer()).map_err(|e| format!("damaged MJPEG frame: {e}"))?
+        } else {
+            let img = buffer
+                .decode_image::<RgbFormat>()
+                .map_err(|e| e.to_string())?;
+            RgbFrame::checked(img.width() as usize, img.height() as usize, img.into_raw())?
+        };
         frame.captured_at = Some(captured_at);
         frame.timing_accurate = accurate;
         Ok(fit_capture(frame))
@@ -769,13 +739,30 @@ struct FreshSource {
     worker: Option<JoinHandle<()>>,
 }
 impl FreshSource {
-    fn start(mut source: Box<dyn FrameSource>, stop: Arc<AtomicBool>) -> Result<Self, String> {
+    fn open(
+        open: impl FnOnce() -> Result<Box<dyn FrameSource>, String> + Send + 'static,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        let (ready, opened) = std::sync::mpsc::sync_channel(1);
         let slot = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
         let target = slot.clone();
         let halted = stop.clone();
         let worker = std::thread::Builder::new()
             .name("icu-camera-capture".into())
             .spawn(move || {
+                // Keep device creation, reads and final release in one COM
+                // apartment. Report open errors to the supervisor immediately.
+                let mut source = match open() {
+                    Ok(source) => source,
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                if ready.send(Ok(())).is_err() {
+                    return;
+                }
+                let mut previous_failed = false;
                 while !halted.load(Ordering::Relaxed) {
                     let result = source.next_frame().map(|mut frame| {
                         let delivered = Instant::now();
@@ -785,18 +772,25 @@ impl FreshSource {
                     let failed = result.is_err();
                     *target.0.lock().unwrap() = Some(result);
                     target.1.notify_one();
-                    if failed {
+                    // Resume immediately after one bad USB frame. Pace repeated
+                    // driver errors so a missing camera cannot spin.
+                    if failed && previous_failed {
                         std::thread::sleep(Duration::from_millis(200));
                     }
+                    previous_failed = failed;
                 }
                 target.1.notify_one();
             })
             .map_err(|e| e.to_string())?;
-        Ok(Self {
+        let capture = Self {
             slot,
             stop,
             worker: Some(worker),
-        })
+        };
+        opened
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|e| format!("opening camera: {e}"))??;
+        Ok(capture)
     }
 
     /// A driver may block inside capture without returning an error. Give
@@ -822,7 +816,7 @@ impl FreshSource {
                 .unwrap()
                 .0;
             if self.worker.as_ref().is_some_and(|w| w.is_finished()) && slot.is_none() {
-                return Some(Err("capture worker ended".into()));
+                return None;
             }
         }
     }
@@ -872,7 +866,17 @@ pub fn run_sender(
     live: Arc<AtomicBool>,
     preview: Arc<PreviewSlot>,
 ) -> Result<(), String> {
-    let mut source = FreshSource::start(source, stop.clone())?;
+    let source = FreshSource::open(move || Ok(source), stop)?;
+    send_frames(source, link, live, preview)
+}
+
+fn send_frames(
+    mut source: FreshSource,
+    link: CameraLink,
+    live: Arc<AtomicBool>,
+    preview: Arc<PreviewSlot>,
+) -> Result<(), String> {
+    let stop = source.stop.clone();
     let mut enhancer = crate::video::enhance::Enhancer::default();
     // No encoder while paused: `run_sender` stops encoding rather than
     // building one with a zero bitrate.
@@ -900,7 +904,7 @@ pub fn run_sender(
     while !stop.load(Ordering::Relaxed) {
         let next = source
             .next_frame(Duration::from_secs(5))
-            .ok_or("camera delivered no frame for 5 s")?;
+            .ok_or("camera stalled or capture worker ended")?;
         let (mut frame, delivered) = match next {
             Ok((f, delivered)) if f.is_valid() => (f, delivered),
             // Stopping: the source ending is not a failed frame to warn
@@ -927,7 +931,6 @@ pub fn run_sender(
                 } else {
                     tracing::debug!(%e, failed, "camera frame");
                 }
-                std::thread::sleep(Duration::from_millis(200));
                 continue;
             }
         };
@@ -1097,7 +1100,7 @@ pub struct CameraHandle {
     link: CameraLink,
     thread: Option<Capture>,
     preview: Arc<PreviewSlot>,
-    opener: Opener,
+    opener: Arc<Mutex<Opener>>,
     /// Capture for the local preview while the camera is off.
     preview_wanted: bool,
     retry: Retry,
@@ -1117,7 +1120,7 @@ impl CameraHandle {
             link,
             thread: None,
             preview: Arc::new(PreviewSlot::default()),
-            opener,
+            opener: Arc::new(Mutex::new(opener)),
             preview_wanted: false,
             retry: Retry::default(),
             last: (false, false, None),
@@ -1132,25 +1135,22 @@ impl CameraHandle {
         } else {
             source
         };
-        self.spawn(source, None, true, epoch);
+        match FreshSource::open(move || Ok(source), Arc::default()) {
+            Ok(source) => self.spawn(source, None, true, epoch),
+            Err(error) => self.failed(error),
+        }
     }
 
-    fn spawn(
-        &mut self,
-        source: Box<dyn FrameSource>,
-        device: Option<String>,
-        live: bool,
-        epoch: usize,
-    ) {
+    fn spawn(&mut self, source: FreshSource, device: Option<String>, live: bool, epoch: usize) {
         self.stop();
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = source.stop.clone();
         let live = Arc::new(AtomicBool::new(live));
         let link = self.link.for_epoch(epoch);
         let preview = self.preview.clone();
-        let (stop_t, live_t) = (stop.clone(), live.clone());
+        let live_t = live.clone();
         let thread = std::thread::Builder::new()
             .name("icu-camera".into())
-            .spawn(move || run_sender(source, link, stop_t, live_t, preview))
+            .spawn(move || send_frames(source, link, live_t, preview))
             .expect("camera thread");
         self.thread = Some(Capture {
             thread,
@@ -1166,13 +1166,27 @@ impl CameraHandle {
     /// sending from it.
     pub fn start(&mut self, device: Option<&str>) -> Result<(), String> {
         let epoch = self.link.shared_epoch();
-        let source = if epoch % 2 == 1 {
-            Box::new(PrivacySource::default()) as Box<dyn FrameSource>
-        } else {
-            (self.opener)(device)?
-        };
+        self.stop();
+        let source = self.open_source(device, epoch % 2 == 1)?;
         self.spawn(source, device.map(str::to_owned), true, epoch);
         Ok(())
+    }
+
+    fn open_source(&self, device: Option<&str>, privacy: bool) -> Result<FreshSource, String> {
+        let opener = self.opener.clone();
+        let device = device.map(str::to_owned);
+        FreshSource::open(
+            move || {
+                if privacy {
+                    return Ok(Box::new(PrivacySource::default()));
+                }
+                let mut open = opener
+                    .try_lock()
+                    .map_err(|e| format!("opening camera: {e}"))?;
+                open(device.as_deref())
+            },
+            Arc::default(),
+        )
     }
 
     /// Stops the thread.
@@ -1266,12 +1280,7 @@ impl CameraHandle {
             if !self.retry.may_try(Instant::now()) {
                 return;
             }
-            let source = if state.privacy_active {
-                Ok(Box::new(PrivacySource::default()) as Box<dyn FrameSource>)
-            } else {
-                (self.opener)(device.as_deref())
-            };
-            match source {
+            match self.open_source(device.as_deref(), state.privacy_active) {
                 Ok(source) => self.spawn(source, device, camera_on, state.privacy_epoch),
                 Err(e) => {
                     self.failed(e);
@@ -1403,8 +1412,82 @@ impl CameraPreview {
 mod tests {
     use super::*;
 
-    /// The encoder produces an IDR on `force_intra_frame` and SPS/PPS come
-    /// with it.
+    #[test]
+    #[ignore = "needs ICU_VIDEO_TEST_CAMERA, no image recording"]
+    fn native_camera_delivers_frames_without_unwinding() {
+        let index = std::env::var("ICU_VIDEO_TEST_CAMERA")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut camera = NokhwaSource::open(index).unwrap();
+        let start = Instant::now();
+        let mut frames = 0;
+        let mut accurate = 0;
+        let mut errors = 0;
+        while start.elapsed() < Duration::from_secs(45) {
+            // Surface fatal foreign-decoder errors even when the library
+            // resumes an unwind without calling Rust's panic hook.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| camera.next_frame())) {
+                Ok(Ok(frame)) => {
+                    assert!(frame.is_valid());
+                    frames += 1;
+                    accurate += usize::from(frame.timing_accurate);
+                }
+                Ok(Err(error)) => {
+                    errors += 1;
+                    if errors == 1 {
+                        eprintln!("Camera read: {error}");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(payload) => {
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("foreign error");
+                    panic!("camera decoder unwound after {frames} frames: {message}");
+                }
+            }
+        }
+        eprintln!(
+            "native camera: {frames} frames, {accurate} measured timestamps, {errors} read errors"
+        );
+        assert!(frames >= 100);
+    }
+
+    #[test]
+    fn the_acquisition_thread_opens_reads_and_releases_the_device() {
+        struct OwnedDevice(std::thread::ThreadId, std::sync::mpsc::Sender<bool>);
+        impl FrameSource for OwnedDevice {
+            fn next_frame(&mut self) -> Result<RgbFrame, String> {
+                assert_eq!(self.0, std::thread::current().id());
+                Err("end of test frame".into())
+            }
+        }
+        impl Drop for OwnedDevice {
+            fn drop(&mut self) {
+                let _ = self.1.send(self.0 == std::thread::current().id());
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut capture = FreshSource::open(
+            move || Ok(Box::new(OwnedDevice(std::thread::current().id(), tx))),
+            Arc::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            capture
+                .next_frame(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err(),
+            "end of test frame"
+        );
+        drop(capture);
+        assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
     #[test]
     fn stalled_capture_returns_control_to_the_camera_supervisor() {
         struct Blocked(std::sync::mpsc::Receiver<()>);
@@ -1416,7 +1499,8 @@ mod tests {
         }
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut source = FreshSource::start(Box::new(Blocked(rx)), Arc::default()).unwrap();
+        let mut source =
+            FreshSource::open(move || Ok(Box::new(Blocked(rx))), Arc::default()).unwrap();
         assert!(source.next_frame(Duration::from_millis(30)).is_none());
         tx.send(()).unwrap();
         assert!(matches!(
@@ -1425,6 +1509,7 @@ mod tests {
         ));
     }
 
+    /// The encoder produces an IDR on request with SPS/PPS.
     #[test]
     fn encoder_emits_idr_on_request() {
         let mut enc = encoder(VideoTier::T0).unwrap();
@@ -1787,17 +1872,15 @@ mod tests {
         jpeg.windows(2).position(|w| w == [0xFF, marker]).unwrap() + 4
     }
 
-    /// What libjpeg ends the process over is refused before it gets there;
-    /// what it decodes passes, damaged picture data included.
     #[test]
-    fn a_damaged_mjpeg_frame_is_refused_before_libjpeg_sees_it() {
+    fn damaged_mjpeg_headers_are_rejected() {
         let good = jpeg_headers();
-        assert_eq!(jpeg_decodable(&good), Ok(()));
+        assert_eq!(jpeg_tables(&good), Ok(true));
         let mut with_data = good.clone();
         with_data.extend_from_slice(&[0x12, 0x34, 0xFF, 0x00, 0x56]);
         assert_eq!(
-            jpeg_decodable(&with_data),
-            Ok(()),
+            jpeg_tables(&with_data),
+            Ok(true),
             "no end marker: a warning"
         );
         // Stray bytes and fill bytes between segments, an APP0, a comment.
@@ -1806,18 +1889,18 @@ mod tests {
         ];
         padded.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x03, b'x']);
         padded.extend_from_slice(&good[2..]);
-        assert_eq!(jpeg_decodable(&padded), Ok(()));
+        assert_eq!(jpeg_tables(&padded), Ok(true));
 
-        assert!(jpeg_decodable(&[]).is_err(), "empty");
-        assert!(jpeg_decodable(b"not a jpeg").is_err());
-        assert!(jpeg_decodable(&good[2..]).is_err(), "the start is missing");
+        assert!(jpeg_tables(&[]).is_err(), "empty");
+        assert!(jpeg_tables(b"not a jpeg").is_err());
+        assert!(jpeg_tables(&good[2..]).is_err(), "the start is missing");
         for cut in 2..good.len() {
-            assert!(jpeg_decodable(&good[..cut]).is_err(), "cut at {cut}");
+            assert!(jpeg_tables(&good[..cut]).is_err(), "cut at {cut}");
         }
         let broken = |change: &dyn Fn(&mut Vec<u8>)| {
             let mut jpeg = good.clone();
             change(&mut jpeg);
-            jpeg_decodable(&jpeg)
+            jpeg_tables(&jpeg)
         };
         let (dqt, sof, dht, sos) = (
             payload(&good, 0xDB),
@@ -1853,32 +1936,27 @@ mod tests {
         // The scan before the frame header.
         let mut early = vec![0xFF, 0xD8];
         early.extend_from_slice(&good[sos - 4..]);
-        assert!(jpeg_decodable(&early).is_err());
+        assert!(jpeg_tables(&early).is_err());
     }
 
     #[test]
-    fn jpeg_size_reads_the_frame_header() {
-        // SOI, APP0 (JFIF, 16 bytes), DQT (a stub), then SOF0 640×480.
-        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
-        jpeg.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
-        jpeg.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x04, 0x00, 0x00]);
-        let sof = [
-            0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0xE0, 0x02, 0x80, 0x03, 0x01, 0x22, 0x00, 0x02,
-            0x11, 0x01, 0x03, 0x11, 0x01,
-        ];
-        jpeg.extend_from_slice(&sof);
-        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08]);
-        assert_eq!(jpeg_size(&jpeg), Some((640, 480)));
-        // Progressive (SOF2), with a fill byte before the marker.
-        let mut progressive = vec![0xFF, 0xD8, 0xFF];
-        progressive.extend_from_slice(&sof);
-        progressive[4] = 0xC2;
-        assert_eq!(jpeg_size(&progressive), Some((640, 480)));
-        // A DHT (C4) is not a frame header.
-        let dht = [0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x03, 0x00, 0xFF, 0xD9];
-        assert_eq!(jpeg_size(&dht), None);
-        assert_eq!(jpeg_size(b"not a jpeg"), None);
-        assert_eq!(jpeg_size(&jpeg[..jpeg.len() - 20]), None, "cut short");
-        assert_eq!(jpeg_size(&[0xFF, 0xD8, 0xFF, 0xDA]), None, "scan first");
+    fn an_abbreviated_camera_jpeg_decodes_with_standard_tables() {
+        // One 8x8 gray block, zero DC difference and end-of-block using
+        // the standard luminance codes. These UVC frames do not carry DHT.
+        let mut jpeg = jpeg_headers();
+        let sof = payload(&jpeg, 0xC0);
+        jpeg[sof + 1..sof + 5].copy_from_slice(&[0, 8, 0, 8]);
+        let dht = payload(&jpeg, 0xC4) - 4;
+        let sos = payload(&jpeg, 0xDA) - 4;
+        jpeg.drain(dht..sos);
+        jpeg.extend_from_slice(&[0x2B, 0xFF, 0xD9]);
+        let frame = decode_mjpeg(&jpeg).unwrap();
+        assert_eq!((frame.width, frame.height), (8, 8));
+        assert_eq!(frame.rgb, vec![128; 8 * 8 * 3]);
+
+        // Structurally valid headers can still refer to an undefined table.
+        let sos = payload(&jpeg, 0xDA);
+        jpeg[sos + 2] = 0x33;
+        assert!(decode_mjpeg(&jpeg).is_err());
     }
 }
