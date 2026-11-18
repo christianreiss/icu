@@ -14,9 +14,11 @@
 //! cover, plus two frames (a stall that recurs, as Wi-Fi power saving and
 //! congested links produce). Inside a spurt the depth follows a grown
 //! target by concealing extra frames — while an underrun is being concealed
-//! anyway, or at a quiet frame — and sheds excess by skipping a packet
-//! before decode (RFC 6716 §4.4.1), so a monologue adapts without waiting
-//! for a pause; between spurts the prefill sets the depth outright.
+//! anyway, or at a quiet frame — and sheds excess by leaving out one frame:
+//! one the mixer has decoded and found quiet ([`JitterBuffer::shed_decoded`]),
+//! or, when underruns grew the delay or no quiet frame came, a packet before
+//! decode (RFC 6716 §4.4.1). A monologue so adapts without waiting for a
+//! pause; between spurts the prefill sets the depth outright.
 
 use std::{
     collections::BTreeMap,
@@ -195,6 +197,9 @@ pub struct JitterBuffer {
     grown: u32,
     /// Consecutive pops that found more than target + 2 frames queued.
     excess_time: Duration,
+    /// The packet the last pop returned may be left out if it decodes to a
+    /// quiet frame ([`JitterBuffer::shed_decoded`]).
+    shed_offered: bool,
     /// Pops a due stretch has waited for a quiet frame.
     stretch_wait: Duration,
     /// The last pop concealed a frame without advancing (underrun or
@@ -235,6 +240,7 @@ impl JitterBuffer {
             last_delay: None,
             grown: 0,
             excess_time: Duration::ZERO,
+            shed_offered: false,
             stretch_wait: Duration::ZERO,
             concealing: false,
             played_hwm: None,
@@ -622,12 +628,44 @@ impl JitterBuffer {
         self.pop_quiet(now, true)
     }
 
-    /// [`JitterBuffer::pop`] told whether the frame last decoded for this
-    /// speaker was quiet: a stretch (an extra concealed frame) or a skip
-    /// that is due waits up to `QUIET_PATIENCE` pops for one, so the
-    /// adjustment lands in a pause instead of a word.
+    /// [`JitterBuffer::pop`] told whether the speaker is quiet: a stretch
+    /// (an extra concealed frame) or a shed that is due waits up to
+    /// [`QUIET_TIME`] for that, so the adjustment lands in a pause instead
+    /// of a word. Plays the mixer's part as well: a packet offered for
+    /// shedding is left out when `quiet`, and the one after it returned.
     pub fn pop_quiet(&mut self, now: Instant, quiet: bool) -> Pop {
-        self.pop_quiet_at(now, now, quiet)
+        loop {
+            let pop = self.pop_quiet_at(now, now, quiet);
+            if !(matches!(pop, Pop::Packet(_)) && self.shed_decoded(quiet)) {
+                return pop;
+            }
+        }
+    }
+
+    /// After a [`Pop::Packet`]: whether the frame just decoded from it,
+    /// `quiet` or not, is to be left out of the playout to shed excess
+    /// delay. The caller then drops the decoded samples and pops again.
+    ///
+    /// The frame to go is judged by its own level. Deciding before decode,
+    /// from the frame played before it, took the first 20 ms of a word
+    /// whenever the shed fell on the end of a pause — and a VAD sender's
+    /// pre-roll burst makes one due in most spurts on a clean link. Having
+    /// decoded it also keeps the decoder's state exact, which a packet
+    /// skipped unheard does not.
+    pub fn shed_decoded(&mut self, quiet: bool) -> bool {
+        if !(std::mem::take(&mut self.shed_offered) && quiet) {
+            return false;
+        }
+        tracing::debug!(
+            target_ms = self.target.as_millis() as u64,
+            excess_ms = self.excess_time.as_millis() as u64,
+            played = self.stats.played,
+            "jitter skip (quiet frame)"
+        );
+        self.excess_time = Duration::ZERO;
+        self.stats.skipped += 1;
+        self.stats.played = self.stats.played.saturating_sub(1);
+        true
     }
 
     /// Decode ahead of a native playback callback. Audio already queued after
@@ -636,6 +674,7 @@ impl JitterBuffer {
     /// Only proactive stretching uses this deadline. Packet availability,
     /// prefill and measured arrival-to-decode latency still use real `now`.
     pub fn pop_quiet_at(&mut self, now: Instant, playout_at: Instant, quiet: bool) -> Pop {
+        self.shed_offered = false;
         if let Some((_, (_, _, samples))) = self
             .queue
             .iter()
@@ -683,15 +722,17 @@ impl JitterBuffer {
             );
         }
         let mut next = self.next.unwrap_or(0);
-        // Delay beyond what the target asks for is shed by skipping one
-        // packet before decode (RFC 6716 §4.4.1): at once when underruns
-        // grew it (`grown`); otherwise — a burst at spurt start, a sender
-        // whose clock runs fast — only once more than target + 2 frames
-        // has been queued for `EXCESS_TIME` pops, so a jitter spike the
-        // target is still absorbing is not mistaken for it, and preferably
-        // at a quiet frame. Two frames, because the playout sits up to a
-        // frame past the target after a prefill or stretch, and the queue
-        // is measured in whole frames.
+        // Delay beyond what the target asks for is shed by leaving out one
+        // frame: at once when underruns grew it (`grown`); otherwise — a
+        // burst at spurt start, a sender whose clock runs fast — only once
+        // more than target + 2 frames has been queued for `EXCESS_TIME`
+        // pops, so a jitter spike the target is still absorbing is not
+        // mistaken for it. Then the packet is offered to the caller, who
+        // leaves it out if it decodes to a quiet frame (`shed_decoded`);
+        // only when none came for `QUIET_TIME` is one skipped here, before
+        // decode (RFC 6716 §4.4.1). Two frames, because the playout sits up
+        // to a frame past the target after a prefill or stretch, and the
+        // queue is measured in whole frames.
         let queued = self.queued_duration(next);
         let excess = queued > self.target + 2 * frame;
         self.excess_time = if excess {
@@ -699,10 +740,8 @@ impl JitterBuffer {
         } else {
             Duration::ZERO
         };
-        let shed = excess
-            && (self.grown > 0
-                || (self.excess_time >= EXCESS_TIME
-                    && (quiet || self.excess_time >= EXCESS_TIME + QUIET_TIME)));
+        let shed = excess && (self.grown > 0 || self.excess_time >= EXCESS_TIME + QUIET_TIME);
+        let offer = excess && !shed && self.excess_time >= EXCESS_TIME;
         if let Some((skipped, _, samples)) = shed.then(|| self.queue.remove(&next)).flatten() {
             self.next_ts = Some(skipped.ts.wrapping_add(samples));
             tracing::debug!(
@@ -776,6 +815,7 @@ impl JitterBuffer {
             if end {
                 self.end_spurt();
             }
+            self.shed_offered = offer && !end;
             return Pop::Packet(pkt);
         }
         // Slot `next` is empty.
@@ -1344,6 +1384,49 @@ mod tests {
         jb.push(pkt(5, 5 * 960 + 48_000, false), t0 + ms(1220));
         assert!(matches!(jb.pop(t0 + ms(1240)), Pop::Packet(p) if p.seq == 4));
         assert_eq!(jb.stats().spurts, 2);
+    }
+
+    /// A VAD sender's spurt starts with its pre-roll: four packets at once.
+    /// With a small target that is excess depth, shed half a second later
+    /// at a quiet frame. The frame left out is the quiet one itself — not,
+    /// as before, the packet after it, which here is the next word's first
+    /// 20 ms.
+    #[test]
+    fn a_shed_leaves_out_the_quiet_frame_not_the_word_after_it() {
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        jb.target = ms(20);
+        // Speech, one quiet frame every 40 (a short pause), speech again.
+        let quiet = |seq: u16| seq % 40 == 39;
+        for i in 0..4u16 {
+            jb.push(pkt(i, i as u32 * 960, false), t0);
+        }
+        let mut t = t0;
+        let mut left_out = Vec::new();
+        let mut played = Vec::new();
+        for i in 0..120u16 {
+            // The mixer: pop, decode, ask, and pop again after a drop.
+            loop {
+                match jb.pop_quiet_at(t, t, played.last().is_some_and(|s| quiet(*s))) {
+                    Pop::Packet(p) if jb.shed_decoded(quiet(p.seq)) => left_out.push(p.seq),
+                    Pop::Packet(p) => {
+                        played.push(p.seq);
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            t += ms(20);
+            let seq = 4 + i;
+            jb.push(pkt(seq, seq as u32 * 960, false), t);
+            jb.target = ms(20);
+        }
+        let st = jb.stats();
+        assert_eq!(left_out, [39], "{st:?}");
+        assert!(played.contains(&40), "the word after the pause is whole");
+        assert_eq!(st.skipped, 1, "{st:?}");
+        assert_eq!(st.lost + st.late + st.underruns + st.stretched, 0, "{st:?}");
+        assert_eq!(st.played as usize, played.len(), "{st:?}");
     }
 
     #[test]

@@ -171,7 +171,11 @@ neuen Sprechabschnitt, statt minutenlang fehlende Frames zu verdecken.
 
 Die Tiefe kann in Sprechpausen sinken; während eines Spurts wächst sie mit
 begrenzten Stretch-Schritten. Überschüsse werden bevorzugt an leisen Frames
-gekürzt. Der Wiedergabe-Vorlauf folgt den jüngsten Callback-Größen und fällt
+gekürzt: der Mixer lässt einen Frame aus, den er dekodiert und selbst als leise
+gemessen hat (seit 2026-11-18; vorher fiel das ungehörte Folgepaket weg, nach
+einer Pause also mitunter die ersten 20 ms des nächsten Worts). Erst nach einer
+weiteren Sekunde ohne leisen Frame wird ein Paket vor dem Decode übersprungen.
+Der Wiedergabe-Vorlauf folgt den jüngsten Callback-Größen und fällt
 nach 2–4 s wieder, wenn ein großes Quantum vorbei ist. Unbekannte Sprecher
 bleiben stumm, bis die Teilnehmerliste ihre Lautstärke zuordnet.
 

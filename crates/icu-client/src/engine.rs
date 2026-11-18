@@ -2954,6 +2954,12 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test:
                                     .observe_at(&fec_scratch[..n], None, p.gain_epoch, p.ts);
                             }
                             sp.quiet = frame_quiet(&fec_scratch[..n]);
+                            // Excess delay goes with a frame that is itself
+                            // quiet: decoded, so the decoder stays exact,
+                            // and then not played.
+                            if sp.jitter.shed_decoded(sp.quiet) {
+                                continue;
+                            }
                             sp.next_stamp = Some(crate::media::Stamp {
                                 micros: p.media_time,
                                 epoch: p.media_epoch,
