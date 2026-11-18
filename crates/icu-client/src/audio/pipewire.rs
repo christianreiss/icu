@@ -331,6 +331,9 @@ fn pw_thread(
     // that the context is connected; declared after it, so the registration
     // is dropped first whenever this thread ends.
     let _rt = super::rt::register_context(context.as_raw_ptr() as *mut std::ffi::c_void);
+    // The data loop running the stream callbacks is module-rt's to promote
+    // as well; where that goes unanswered, this helper asks RTKit for it.
+    let _rt_callback = super::rt::watch_callback_thread();
 
     // Device list from the registry: every Audio/Source and Audio/Sink node.
     // The "default" metadata object separately tracks which node id is the
@@ -737,6 +740,7 @@ fn open_stream(
             data.channels = channels;
         })
         .process(|stream, data| {
+            super::rt::note_callback_thread();
             let timing = stream.time().ok().and_then(|time| {
                 let rate=time.rate();
                 if rate.denom == 0 {return None;}

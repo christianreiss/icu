@@ -153,8 +153,13 @@ mod imp {
     /// module-rt set `SCHED_RESET_ON_FORK` with it, and the kernel reports
     /// that flag in the same value.
     pub fn is_realtime() -> bool {
-        // SAFETY: a plain syscall on the calling thread.
-        let policy = unsafe { libc::sched_getscheduler(0) };
+        thread_is_realtime(0)
+    }
+
+    /// [`is_realtime`] for kernel thread `thread`; 0 is the caller.
+    pub fn thread_is_realtime(thread: u32) -> bool {
+        // SAFETY: a plain syscall; an unknown thread id is an error value.
+        let policy = unsafe { libc::sched_getscheduler(thread as libc::pid_t) };
         policy >= 0
             && matches!(
                 policy & !libc::SCHED_RESET_ON_FORK,
@@ -211,11 +216,22 @@ mod rtkit {
     /// starts, so a hung bus must not hold the audio back for long.
     const TIMEOUT: Duration = Duration::from_millis(500);
 
+    /// The kernel thread id of the calling thread.
+    pub fn current_thread() -> u32 {
+        // SAFETY: a plain syscall without arguments.
+        (unsafe { libc::syscall(libc::SYS_gettid) }) as u32
+    }
+
     /// Asks RTKit to make the calling thread real-time at `priority`
     /// (clamped to what RTKit allows) and waits for its answer.
     pub fn make_realtime(priority: i32) -> Result<(), String> {
-        // SAFETY: a plain syscall; the kernel thread id of the caller.
-        let thread = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
+        make_thread_realtime(current_thread(), priority)
+    }
+
+    /// [`make_realtime`] for thread `thread` of this process. RTKit takes
+    /// the thread id, so any thread may ask for another.
+    pub fn make_thread_realtime(thread: u32, priority: i32) -> Result<(), String> {
+        let thread = u64::from(thread);
         let process = u64::from(std::process::id());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -371,6 +387,103 @@ pub fn register_context(context: *mut std::ffi::c_void) -> ContextRegistration {
     ContextRegistration(imp::register_context(context))
 }
 
+/// Priority for the backend's callback thread (PipeWire's data loop): what
+/// module-rt asks RTKit for on a stock desktop, above the workers'
+/// [`PRIORITY`].
+#[cfg(target_os = "linux")]
+pub const CALLBACK_PRIORITY: i32 = 20;
+
+/// The callback thread that announced itself last and has not been looked
+/// at yet ([`note_callback_thread`]); 0 when none.
+#[cfg(target_os = "linux")]
+static CALLBACK_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Called at the top of the backend's real-time callback. The first call
+/// on a thread hands its id to the helper started by
+/// [`watch_callback_thread`]; every later one is a thread-local read.
+/// Real-time safe: no lock, no allocation, one system call per thread.
+#[cfg(target_os = "linux")]
+#[inline]
+pub fn note_callback_thread() {
+    thread_local! {
+        static NOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if !NOTED.with(|noted| noted.replace(true)) {
+        CALLBACK_THREAD.store(
+            rtkit::current_thread(),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
+/// Stops the helper of [`watch_callback_thread`] when dropped.
+#[cfg(target_os = "linux")]
+#[must_use = "the helper stops when this is dropped"]
+pub struct CallbackWatch(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(target_os = "linux")]
+impl Drop for CallbackWatch {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Starts a helper thread that gives the backend's callback thread its
+/// real-time priority when module-rt did not.
+///
+/// The data loop that runs the stream callbacks gets its priority from
+/// module-rt like any thread it creates — through the same request that
+/// goes unanswered where the desktop portal refuses it (`imp::promote`).
+/// It then ran best effort, and with `icu-dsp` and `icu-mixer` promoted it
+/// would even rank *below* the threads it feeds. The callback cannot ask
+/// for itself (a bus round trip on the real-time path), so it only
+/// announces its thread id and this helper asks RTKit for it.
+#[cfg(target_os = "linux")]
+pub fn watch_callback_thread() -> CallbackWatch {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let stopped = stop.clone();
+    let spawned = std::thread::Builder::new()
+        .name("icu-rt-helper".into())
+        .spawn(move || {
+            while !stopped.load(Ordering::Acquire) {
+                let thread = CALLBACK_THREAD.swap(0, Ordering::AcqRel);
+                if thread != 0 {
+                    promote_callback_thread(thread);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, "cannot start the real-time helper thread");
+    }
+    CallbackWatch(stop)
+}
+
+/// Makes callback thread `thread` real-time unless it already is, and logs
+/// the outcome.
+#[cfg(target_os = "linux")]
+fn promote_callback_thread(thread: u32) {
+    if imp::thread_is_realtime(thread) {
+        tracing::info!(thread, "audio callback thread runs with real-time priority");
+        return;
+    }
+    let asked = rtkit::make_thread_realtime(thread, CALLBACK_PRIORITY);
+    if imp::thread_is_realtime(thread) {
+        tracing::info!(
+            thread,
+            priority = CALLBACK_PRIORITY,
+            "real-time priority acquired for the audio callback thread"
+        );
+    } else {
+        let error = asked
+            .err()
+            .unwrap_or_else(|| "accepted, not applied".into());
+        tracing::info!(thread, %error,
+            "no real-time priority for the audio callback thread; running best effort");
+    }
+}
+
 /// Asks for real-time priority for the calling thread and logs the outcome.
 /// Never fails the caller.
 pub fn promote_current_thread(name: &str) -> PriorityGuard {
@@ -439,6 +552,34 @@ mod tests {
         assert_eq!((lowered.rlim_cur, lowered.rlim_max), (150_000, 200_000));
         assert!(rtkit::rttime_limit(limit(150_000, 200_000), 200_000).is_none());
         assert!(rtkit::rttime_limit(limit(libc::RLIM_INFINITY, libc::RLIM_INFINITY), 0).is_none());
+    }
+
+    /// A callback thread announces itself once; the helper then promotes
+    /// it from outside. With `ICU_TEST_REQUIRE_RT=1` it must end up
+    /// real-time.
+    #[test]
+    fn the_helper_promotes_a_thread_that_announced_itself() {
+        use std::sync::mpsc;
+        let _watch = watch_callback_thread();
+        let (tid_tx, tid_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let callback = std::thread::spawn(move || {
+            note_callback_thread();
+            note_callback_thread();
+            tid_tx.send(rtkit::current_thread()).unwrap();
+            let _ = done_rx.recv();
+            imp::is_realtime()
+        });
+        let tid = tid_rx.recv().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !imp::thread_is_realtime(tid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(done_tx);
+        let realtime = callback.join().unwrap();
+        if std::env::var_os("ICU_TEST_REQUIRE_RT").is_some() {
+            assert!(realtime, "the helper promotes the announced thread");
+        }
     }
 
     /// Whatever the host grants, the outcome reported is the scheduler's.
