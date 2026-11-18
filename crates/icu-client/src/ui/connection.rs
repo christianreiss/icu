@@ -1360,7 +1360,79 @@ fn block_row(ui: &mut Ui, row: &Row, copied: &mut Option<(String, Instant)>) {
         });
 }
 
-/// The same certificate fields and copy behaviour in both windows.
+/// Height of one [`certificate_details`] row.
+const CERT_ROW_H: f32 = 26.0;
+/// Width of the label column in [`certificate_details`], icon included.
+const CERT_LABEL_W: f32 = 148.0;
+/// Rows every non-CA certificate shows; the CA shows fewer but reserves the
+/// same height, so switching certificates never moves what is below.
+const CERT_ROWS: f32 = 7.0;
+
+/// The height [`certificate_details`] always takes: its rows, the
+/// fingerprint block and the frame around them.
+pub(super) fn certificate_details_height(ui: &Ui) -> f32 {
+    // Frame margin top + bottom, the rows, the fingerprint's header row, a
+    // gap and its two lines.
+    2.0 * 14.0 + CERT_ROWS * CERT_ROW_H + CERT_ROW_H + 2.0 + fingerprint_lines_height(ui)
+}
+
+fn fingerprint_font() -> egui::FontId {
+    egui::FontId::monospace(11.5)
+}
+
+/// The two monospace lines of a fingerprint, measured the way they are laid
+/// out.
+fn fingerprint_lines_height(ui: &Ui) -> f32 {
+    ui.painter()
+        .layout_no_wrap("0\n0".to_string(), fingerprint_font(), egui::Color32::WHITE)
+        .size()
+        .y
+}
+
+/// One icon-led line of [`certificate_details`]: pictogram, label, then the
+/// value on a single line (elided, full text on hover).
+fn cert_row(ui: &mut Ui, glyph: &str, label: &str, value: RichText) {
+    let tok = theme::tokens(ui.visuals());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), CERT_ROW_H),
+        egui::Sense::hover(),
+    );
+    let icon_rect = egui::Rect::from_min_size(rect.min, egui::vec2(20.0, rect.height()));
+    ui.painter().text(
+        icon_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::proportional(15.0),
+        tok.muted_text,
+    );
+    let label_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 28.0, rect.top()),
+        egui::pos2(rect.left() + CERT_LABEL_W, rect.bottom()),
+    );
+    put_left(
+        ui,
+        label_rect,
+        egui::Label::new(RichText::new(label).color(tok.muted_text)).truncate(),
+    );
+    let value_rect =
+        egui::Rect::from_min_max(egui::pos2(rect.left() + CERT_LABEL_W, rect.top()), rect.max);
+    put_left(ui, value_rect, egui::Label::new(value).truncate());
+}
+
+/// `ui.put`, but left-aligned and vertically centered in `rect` (`put`
+/// centers horizontally too).
+fn put_left(ui: &mut Ui, rect: egui::Rect, widget: impl egui::Widget) {
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        |ui| ui.add(widget),
+    );
+}
+
+/// The same certificate fields and copy behaviour in both windows: one
+/// pictogram per fact instead of a column of sentences, and a fixed height
+/// whichever certificate it shows.
 pub(super) fn certificate_details(
     ui: &mut Ui,
     cert: &CertInfo,
@@ -1370,65 +1442,138 @@ pub(super) fn certificate_details(
 ) {
     let now = crate::net::conn::unix_now();
     let tok = theme::tokens(ui.visuals());
-    egui::Frame::new().inner_margin(12).show(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 5.0;
-        ui.add(egui::Label::new(theme::strong_text(&cert.subject).size(19.0)).wrap());
-        ui.weak(format!("Aussteller · {}", cert.issuer));
-        ui.label(format!("{}  –  {}", cert.not_before, cert.not_after));
+    let height = certificate_details_height(ui);
+    egui::Frame::new().inner_margin(14).show(ui, |ui| {
+        ui.set_min_height(height - 28.0);
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let tone = |color| move |text: &str| RichText::new(text).color(color);
+        let plain = tone(ui.visuals().text_color());
+        let bad = tone(tok.error);
+        cert_row(ui, icon::USER, "Inhaber", plain(&cert.subject));
+        cert_row(ui, icon::SEAL_CHECK, "Ausgestellt von", plain(&cert.issuer));
         let validity = cert.validity_label(now);
-        let color = match validity {
-            "Zeitlich gültig" => tok.connected,
-            "Läuft bald ab" => tok.connecting,
-            "Abgelaufen" | "Noch nicht gültig" => tok.error,
-            _ => tok.muted_text,
-        };
-        widgets::status_pill(ui, color, validity);
-        if is_ca {
-            ui.label("Vertrauensanker aus deinem Passport");
-        } else {
-            ui.colored_label(
-                match cert.signature_valid {
-                    Some(false) => tok.error,
-                    _ => tok.muted_text,
-                },
-                match cert.signature_valid {
-                    Some(true) => "Signatur gegen deine CA geprüft",
-                    Some(false) => "Signatur passt nicht zu deiner CA",
-                    None => "Signatur nicht prüfbar",
-                },
-            );
-            ui.colored_label(
-                if matches!(
-                    cert.revocation,
-                    crate::conninfo::Revocation::Checked { revoked: true, .. }
-                ) {
-                    tok.error
-                } else {
-                    tok.muted_text
-                },
-                cert.revocation.label(now),
-            );
-            if let Some(server) = server {
-                ui.label(format!("Im TLS-Handshake geprüfter Servername: {server}"));
-            } else {
-                ui.label("Nutzersitzung vom Server authentifiziert");
+        let period = format!("{}  bis  {}", cert.not_before, cert.not_after);
+        let period = match validity {
+            "Läuft bald ab" => RichText::new(format!(
+                "{period}  ·  noch {} Tage",
+                cert.expires_in_days.max(0)
+            ))
+            .color(tok.connecting),
+            "Abgelaufen" | "Noch nicht gültig" => {
+                RichText::new(format!("{period}  ·  {validity}")).color(tok.error)
             }
+            _ => plain(&period),
+        };
+        cert_row(ui, icon::CALENDAR_CHECK, "Gültig", period);
+        if is_ca {
+            cert_row(
+                ui,
+                icon::KEY,
+                "Rolle",
+                plain("Vertrauensanker aus deinem Passport"),
+            );
+        } else {
+            let signature = match cert.signature_valid {
+                Some(true) => plain("Gegen deine CA geprüft"),
+                Some(false) => bad("Passt nicht zu deiner CA"),
+                None => plain("Nicht prüfbar"),
+            };
+            cert_row(ui, icon::SHIELD_CHECK, "Signatur", signature);
+            let revoked = matches!(
+                cert.revocation,
+                crate::conninfo::Revocation::Checked { revoked: true, .. }
+            );
+            // The row is already called „Widerruf"; don't say it twice.
+            let revocation = match cert.revocation.label(now) {
+                "Widerruf nicht geprüft" => "Nicht geprüft",
+                other => other,
+            };
+            cert_row(
+                ui,
+                icon::PROHIBIT,
+                "Widerruf",
+                if revoked {
+                    bad(revocation)
+                } else {
+                    plain(revocation)
+                },
+            );
+            let check = match server {
+                Some(server) => format!("Servername {server} im TLS-Handshake geprüft"),
+                None => "Nutzersitzung vom Server authentifiziert".to_string(),
+            };
+            cert_row(ui, icon::HANDSHAKE, "Prüfung", plain(&check));
+        }
+        cert_row(ui, icon::CODE, "Algorithmus", plain(&cert.sig_alg));
+        fingerprint_block(ui, &cert.fingerprint, copied);
+        if is_ca {
+            // The CA has no signature, revocation or session check of its
+            // own; keep their room so the next certificate opens in place.
+            ui.add_space(2.0 * CERT_ROW_H);
         }
     });
-    block_row(
-        ui,
-        &Row::mono(
-            "Fingerabdruck (SHA-256)",
-            wrap_fingerprint(&cert.fingerprint),
-        )
-        .copyable(&cert.fingerprint),
-        copied,
+}
+
+/// The fingerprint: label row with the copy button, the two monospace lines
+/// under the value column's start.
+fn fingerprint_block(ui: &mut Ui, fingerprint: &str, copied: &mut Option<(String, Instant)>) {
+    const LABEL: &str = "Fingerabdruck (SHA-256)";
+    let tok = theme::tokens(ui.visuals());
+    let (row, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), CERT_ROW_H),
+        egui::Sense::hover(),
     );
-    egui::Frame::new().inner_margin(12).show(ui, |ui| {
-        ui.collapsing("Technische Details", |ui| {
-            ui.label(format!("Signaturalgorithmus · {}", cert.sig_alg));
-        });
-    });
+    ui.painter().text(
+        egui::pos2(row.left() + 10.0, row.center().y),
+        egui::Align2::CENTER_CENTER,
+        icon::FINGERPRINT,
+        egui::FontId::proportional(15.0),
+        tok.muted_text,
+    );
+    put_left(
+        ui,
+        egui::Rect::from_min_max(egui::pos2(row.left() + 28.0, row.top()), row.max),
+        egui::Label::new(RichText::new(LABEL).color(tok.muted_text)),
+    );
+    let actions = egui::Rect::from_min_max(egui::pos2(row.right() - 120.0, row.top()), row.max);
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(actions)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        |ui| {
+            let copy = widgets::icon_button(ui, icon::COPY, "Fingerabdruck kopieren", 24.0, false)
+                .on_hover_text("In die Zwischenablage");
+            if copy.clicked() {
+                ui.ctx().copy_text(fingerprint.to_string());
+                *copied = Some((LABEL.to_string(), Instant::now()));
+            }
+            if copied
+                .as_ref()
+                .is_some_and(|(l, t)| l == LABEL && t.elapsed() < COPY_FEEDBACK)
+            {
+                ui.label(
+                    RichText::new(format!("{} Kopiert", icon::CHECK))
+                        .size(11.5)
+                        .color(tok.connected),
+                );
+            }
+        },
+    );
+    ui.add_space(2.0);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), fingerprint_lines_height(ui)),
+        egui::Sense::hover(),
+    );
+    put_left(
+        ui,
+        egui::Rect::from_min_max(egui::pos2(rect.left() + 28.0, rect.top()), rect.max),
+        egui::Label::new(
+            RichText::new(wrap_fingerprint(fingerprint))
+                .font(fingerprint_font())
+                .color(tok.muted_text),
+        )
+        .selectable(true),
+    );
 }
 
 #[cfg(test)]

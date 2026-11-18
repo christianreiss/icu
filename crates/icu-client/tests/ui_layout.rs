@@ -1796,15 +1796,19 @@ fn user_path_details_and_missing_data() {
                 ("own", "Dein Zertifikat"),
                 ("ca", "CA"),
             ];
-            let glyph = egui_phosphor::regular::CERTIFICATE;
             let mut tab_rects = None;
             let mut connection = None;
             let mut pane_overflow = None;
             for (name, label) in tabs {
-                h.get_by_label(&format!("{glyph} {label}")).click();
+                // A short window keeps the list below the fold: scroll to
+                // it once, the way a pointer would.
+                if tab_rects.is_none() {
+                    h.get_by_label(label).scroll_to_me();
+                    h.run();
+                }
+                h.get_by_label(label).click();
                 h.run();
-                let positions =
-                    tabs.map(|(_, label)| h.get_by_label(&format!("{glyph} {label}")).rect());
+                let positions = tabs.map(|(_, label)| h.get_by_label(label).rect());
                 assert_eq!(*tab_rects.get_or_insert(positions), positions);
                 let link = h.get_by_label("Alle Verbindungsdetails").rect();
                 assert_eq!(*connection.get_or_insert(link), link);
@@ -1816,7 +1820,7 @@ fn user_path_details_and_missing_data() {
                 let expected = *pane_overflow.get_or_insert(height);
                 assert!(
                     (height - expected).abs() <= 0.5,
-                    "certificate pane changed height"
+                    "{case}/{name}: certificate pane changed height ({height} vs {expected})"
                 );
                 assert!(!h.output().viewport_output.values().any(|v| v
                     .commands
@@ -1824,7 +1828,7 @@ fn user_path_details_and_missing_data() {
                     .any(|command| matches!(command, egui::ViewportCommand::InnerSize(_)))));
                 shot(&mut h, &format!("user-path-{case}-{name}-{theme_name}"));
             }
-            h.get_by_label(&format!("{glyph} CA")).click();
+            h.get_by_label("CA").click();
             h.run();
             assert!(h.query_by_label("Fingerabdruck (SHA-256)").is_none());
         }
@@ -1856,12 +1860,7 @@ fn user_profile_hierarchy_with_wrapping_and_scaling() {
             h.run();
             let heading = h.get_by_label("Mitglied").rect();
             let volume = h.get_by_label("Wiedergabelautstärke").rect();
-            let selector = h
-                .get_by_label(&format!(
-                    "{} Nutzerzertifikat",
-                    egui_phosphor::regular::CERTIFICATE
-                ))
-                .rect();
+            let selector = h.get_by_label("Nutzerzertifikat").rect();
             assert!(heading.bottom() < volume.top());
             assert!(volume.bottom() < selector.top());
             assert!(h.query_by_label("Fingerabdruck (SHA-256)").is_none());
@@ -1954,7 +1953,8 @@ fn user_path_keeps_volume_moderation_and_certificate_copy() {
         .borrow()
         .iter()
         .any(|c| matches!(c, Command::SetVolume(2, v) if *v == 100.0)));
-    h.get_by_label("Moderation").click();
+    h.get_by_label(&format!("{}  Moderation", egui_phosphor::regular::GAVEL))
+        .click();
     h.run();
     h.get_by_label(&format!(
         "{}  Stummschalten",
@@ -1970,11 +1970,7 @@ fn user_path_keeps_volume_moderation_and_certificate_copy() {
             deafened: false
         }
     )));
-    h.get_by_label(&format!(
-        "{} Nutzerzertifikat",
-        egui_phosphor::regular::CERTIFICATE
-    ))
-    .click();
+    h.get_by_label("Nutzerzertifikat").click();
     h.run();
     h.get_by_role_and_label(egui::accesskit::Role::Button, "Fingerabdruck kopieren")
         .click();
@@ -2003,7 +1999,8 @@ fn moderation_waits_for_loaded_restrictions_and_preserves_deafen() {
                     captured.borrow_mut().push(c)
                 });
             });
-            h.get_by_label("Moderation").click();
+            h.get_by_label(&format!("{}  Moderation", egui_phosphor::regular::GAVEL))
+                .click();
             h.run();
             assert!(sent
                 .borrow()
