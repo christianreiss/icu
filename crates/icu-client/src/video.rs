@@ -288,29 +288,40 @@ pub async fn accept_loop<S: VideoSink>(conn: quinn::Connection, sink: S) {
     let decode_sink = sink.clone();
     if let Err(e) = std::thread::Builder::new()
         .name("icu-video-decode".into())
-        .spawn(move || loop {
-            let mut q = worker.0.lock().unwrap();
-            if q.frames.is_empty() && !q.closed {
-                q = worker
-                    .1
-                    .wait_timeout(q, Duration::from_millis(16))
-                    .unwrap()
-                    .0;
-            }
-            let item = q.pop();
-            let closed = q.closed;
-            drop(q);
-            decode_sink.tick();
-            if let Some((session, frame, at)) = item {
-                let age = at.elapsed();
-                decode_sink.queued(age);
-                if age > Duration::from_millis(100) {
-                    decode_sink.stale(session);
-                } else {
+        .spawn(move || {
+            let mut reorder = Reorder::default();
+            let mut ready = Vec::new();
+            loop {
+                let mut q = worker.0.lock().unwrap();
+                if q.frames.is_empty() && !q.closed {
+                    q = worker
+                        .1
+                        .wait_timeout(q, Duration::from_millis(16))
+                        .unwrap()
+                        .0;
+                }
+                let item = q.pop();
+                let closed = q.closed;
+                drop(q);
+                decode_sink.tick();
+                let now = Instant::now();
+                let last = item.is_none() && closed;
+                if let Some((session, frame, at)) = item {
+                    let age = now.saturating_duration_since(at);
+                    decode_sink.queued(age);
+                    if age > Duration::from_millis(100) {
+                        decode_sink.stale(session);
+                    } else {
+                        reorder.push(session, frame, now, &mut ready);
+                    }
+                }
+                reorder.release_due(now, &mut ready);
+                for (session, frame) in ready.drain(..) {
                     decode_sink.deliver(session, frame);
                 }
-            } else if closed {
-                return;
+                if last {
+                    return;
+                }
             }
         })
     {
@@ -352,6 +363,154 @@ pub async fn accept_loop<S: VideoSink>(conn: quinn::Connection, sink: S) {
     }
     queue.0.lock().unwrap().closed = true;
     queue.1.notify_one();
+}
+
+/// How long a frame that arrived ahead of its predecessor waits for it.
+/// Each frame is a stream of its own, so one lost packet of frame N lets
+/// frame N+1 finish first; the retransmission follows within about one
+/// round trip. Less than a frame interval at 15 fps, and only frames that
+/// really came out of order pay it.
+const REORDER_HOLD: Duration = Duration::from_millis(60);
+
+/// Frames waiting for a predecessor, per speaker. One more means the
+/// predecessor is lost, not late.
+const REORDER_HELD: usize = 3;
+
+/// A speaker's place in its frame sequence, for [`Reorder`].
+struct Order {
+    /// The `seq` that continues the stream.
+    next: u16,
+    media_epoch: u32,
+    /// Frames ahead of `next`, with when the first of them began to wait.
+    held: Vec<EncodedFrame>,
+    since: Option<Instant>,
+    seen: Instant,
+}
+
+/// Puts each speaker's frames back into `seq` order before they are
+/// decoded.
+///
+/// [`Receivers::accept`] decodes strictly in order: a frame ahead of its
+/// predecessor is a gap (everything waits for an IDR), and the predecessor,
+/// arriving a moment later, is dropped as late. The worst case is the
+/// P-frame after an IDR overtaking it — the IDR is many packets, the
+/// P-frame one, so a single lost packet is enough: the IDR was thrown
+/// away, the picture froze until the next requested one, and that one
+/// could be overtaken again. Holding the early frame for [`REORDER_HOLD`] costs nothing while
+/// frames arrive in order and turns a reordering into no loss at all.
+#[derive(Default)]
+struct Reorder {
+    speakers: HashMap<Session, Order>,
+}
+
+impl Reorder {
+    /// Takes a frame as it arrived at `now`; what may be decoded now is
+    /// appended to `out`, in order.
+    fn push(
+        &mut self,
+        session: Session,
+        frame: EncodedFrame,
+        now: Instant,
+        out: &mut Vec<(Session, EncodedFrame)>,
+    ) {
+        let seq = frame.header.seq;
+        let Some(order) = self.speakers.get_mut(&session) else {
+            self.speakers.insert(
+                session,
+                Order {
+                    next: seq.wrapping_add(1),
+                    media_epoch: frame.header.media_epoch,
+                    held: Vec::new(),
+                    since: None,
+                    seen: now,
+                },
+            );
+            out.push((session, frame));
+            return;
+        };
+        order.seen = now;
+        let step = seq.wrapping_sub(order.next) as i16;
+        if frame.header.media_epoch != order.media_epoch || step <= -REORDER_DEPTH {
+            // Another stream (the camera restarted, or a new peer on a
+            // reused session id): nothing held belongs in front of it.
+            order.release(session, out);
+            order.media_epoch = frame.header.media_epoch;
+            order.next = seq.wrapping_add(1);
+            out.push((session, frame));
+        } else if step < 0 {
+            // Older than what was passed on already: `accept` drops it.
+            out.push((session, frame));
+        } else if step == 0 {
+            order.next = seq.wrapping_add(1);
+            out.push((session, frame));
+            order.release_consecutive(session, out);
+        } else if order.held.iter().any(|f| f.header.seq == seq) {
+            // The same frame twice; one waits already.
+        } else if frame.header.keyframe()
+            || step as usize > REORDER_HELD
+            || order.held.len() >= REORDER_HELD
+        {
+            // An IDR needs no predecessor; a frame this far ahead, or one
+            // more than may wait, means the missing one is lost.
+            order.held.push(frame);
+            order.release(session, out);
+        } else {
+            order.held.push(frame);
+            order.since.get_or_insert(now);
+        }
+    }
+
+    /// Passes on what has waited [`REORDER_HOLD`] for a predecessor that
+    /// did not come, and forgets speakers that stopped.
+    fn release_due(&mut self, now: Instant, out: &mut Vec<(Session, EncodedFrame)>) {
+        for (session, order) in &mut self.speakers {
+            if order
+                .since
+                .is_some_and(|t| now.saturating_duration_since(t) >= REORDER_HOLD)
+            {
+                order.release(*session, out);
+            }
+        }
+        self.speakers
+            .retain(|_, order| now.saturating_duration_since(order.seen) <= FRESH);
+    }
+}
+
+impl Order {
+    /// Held frames in stream order.
+    fn sort(&mut self) {
+        let next = self.next;
+        self.held
+            .sort_by_key(|f| f.header.seq.wrapping_sub(next) as i16);
+    }
+
+    /// Passes on everything held; the stream continues after the newest.
+    fn release(&mut self, session: Session, out: &mut Vec<(Session, EncodedFrame)>) {
+        self.sort();
+        for frame in self.held.drain(..) {
+            self.next = frame.header.seq.wrapping_add(1);
+            out.push((session, frame));
+        }
+        self.since = None;
+    }
+
+    /// Passes on the held frames that follow without a gap.
+    fn release_consecutive(&mut self, session: Session, out: &mut Vec<(Session, EncodedFrame)>) {
+        self.sort();
+        let ready = self
+            .held
+            .iter()
+            .zip(0u16..)
+            .take_while(|(f, i)| f.header.seq == self.next.wrapping_add(*i))
+            .count();
+        for frame in self.held.drain(..ready) {
+            self.next = frame.header.seq.wrapping_add(1);
+            out.push((session, frame));
+        }
+        if self.held.is_empty() {
+            self.since = None;
+        }
+    }
 }
 
 /// At most two waiting access units per speaker, 64 total and 8 MiB.
@@ -1126,6 +1285,134 @@ mod tests {
         r.push(3, frames[6].clone());
         assert_eq!(pictures(&r), 4, "decoding again from the IDR on");
         assert!(r.has_keyframe(3));
+    }
+
+    /// The sequence numbers `Reorder` passes on for session 3.
+    #[cfg(feature = "camera")]
+    fn passed(out: &[(Session, EncodedFrame)]) -> Vec<u16> {
+        out.iter().map(|(_, f)| f.header.seq).collect()
+    }
+
+    /// The P-frame after an IDR is one packet, the IDR many: one lost
+    /// packet and the P-frame arrives first. It waits for the IDR; nothing
+    /// is lost and no IDR has to be asked for.
+    #[cfg(feature = "camera")]
+    #[test]
+    fn a_frame_that_overtook_its_predecessor_waits_for_it() {
+        let frames = encoded(6, &[3]);
+        assert!(frames[3].header.keyframe());
+        let t0 = Instant::now();
+        let mut reorder = Reorder::default();
+        let mut out = Vec::new();
+        for i in [0, 1, 2, 4, 3, 5] {
+            reorder.push(3, frames[i].clone(), t0, &mut out);
+        }
+        assert_eq!(passed(&out), [0, 1, 2, 3, 4, 5]);
+        let mut r = Receivers::default();
+        for (session, frame) in out {
+            r.push(session, frame);
+        }
+        assert_eq!(pictures(&r), 6, "every frame decoded");
+        assert!(r.has_keyframe(3));
+        assert!(r.take_keyframe_requests().is_empty());
+
+        // Without the hold: the IDR is dropped as late and the picture
+        // waits for another one.
+        let mut r = Receivers::default();
+        for i in [0, 1, 2, 4, 3, 5] {
+            r.push(3, frames[i].clone());
+        }
+        assert_eq!(pictures(&r), 3);
+        assert!(!r.has_keyframe(3));
+    }
+
+    /// A predecessor that never comes holds its successors for
+    /// `REORDER_HOLD` and no longer; then the gap is real.
+    #[cfg(feature = "camera")]
+    #[test]
+    fn a_lost_frame_delays_its_successors_only_briefly() {
+        let frames = encoded(5, &[]);
+        let t0 = Instant::now();
+        let mut reorder = Reorder::default();
+        let mut out = Vec::new();
+        reorder.push(3, frames[0].clone(), t0, &mut out);
+        reorder.push(3, frames[2].clone(), t0, &mut out);
+        reorder.release_due(t0 + REORDER_HOLD - Duration::from_millis(1), &mut out);
+        assert_eq!(passed(&out), [0], "still waiting for 1");
+        reorder.release_due(t0 + REORDER_HOLD, &mut out);
+        assert_eq!(passed(&out), [0, 2]);
+        // The stream goes on after the gap without waiting again.
+        reorder.push(3, frames[3].clone(), t0 + REORDER_HOLD, &mut out);
+        assert_eq!(passed(&out), [0, 2, 3]);
+        // The straggler is passed on for `accept` to drop.
+        reorder.push(3, frames[1].clone(), t0 + REORDER_HOLD, &mut out);
+        assert_eq!(passed(&out), [0, 2, 3, 1]);
+    }
+
+    /// What cannot be a reordering is not held: an IDR, a frame far ahead,
+    /// more frames than may wait, another stream.
+    #[cfg(feature = "camera")]
+    #[test]
+    fn only_a_plausible_reordering_is_held() {
+        let frames = encoded(2, &[]);
+        let (idr, delta) = (&frames[0], &frames[1]);
+        let t0 = Instant::now();
+
+        // An IDR ahead releases what waited and itself.
+        let mut reorder = Reorder::default();
+        let mut out = Vec::new();
+        reorder.push(3, numbered(delta, 10), t0, &mut out);
+        reorder.push(3, numbered(delta, 12), t0, &mut out);
+        reorder.push(3, numbered(idr, 13), t0, &mut out);
+        assert_eq!(passed(&out), [10, 12, 13]);
+
+        // Far ahead: a loss burst, not a reordering.
+        let mut reorder = Reorder::default();
+        let mut out = Vec::new();
+        reorder.push(3, numbered(delta, 10), t0, &mut out);
+        reorder.push(
+            3,
+            numbered(delta, 11 + REORDER_HELD as u16 + 1),
+            t0,
+            &mut out,
+        );
+        assert_eq!(passed(&out), [10, 15]);
+
+        // One more than may wait, in whatever order they came.
+        let mut reorder = Reorder::default();
+        let mut out = Vec::new();
+        reorder.push(3, numbered(delta, 10), t0, &mut out);
+        for seq in [14, 12, 13] {
+            reorder.push(3, numbered(delta, seq), t0, &mut out);
+        }
+        assert_eq!(passed(&out), [10], "three wait");
+        reorder.push(3, numbered(delta, 12), t0, &mut out);
+        assert_eq!(passed(&out), [10], "a duplicate is not a fourth");
+        reorder.push(3, numbered(delta, 11), t0, &mut out);
+        assert_eq!(passed(&out), [10, 11, 12, 13, 14]);
+
+        // A new stream on a reused session id, and a new media epoch.
+        let mut reorder = Reorder::default();
+        let mut out = Vec::new();
+        reorder.push(3, numbered(delta, 5000), t0, &mut out);
+        reorder.push(3, numbered(idr, 0), t0, &mut out);
+        reorder.push(3, numbered(delta, 1), t0, &mut out);
+        let mut restarted = numbered(idr, 700);
+        restarted.header.media_epoch = 9;
+        reorder.push(3, restarted, t0, &mut out);
+        assert_eq!(passed(&out), [5000, 0, 1, 700]);
+
+        // `seq` wraps.
+        let mut reorder = Reorder::default();
+        let mut out = Vec::new();
+        reorder.push(3, numbered(delta, u16::MAX - 1), t0, &mut out);
+        reorder.push(3, numbered(delta, 0), t0, &mut out);
+        reorder.push(3, numbered(delta, u16::MAX), t0, &mut out);
+        assert_eq!(passed(&out), [u16::MAX - 1, u16::MAX, 0]);
+
+        // A speaker that stopped is forgotten.
+        reorder.release_due(t0 + FRESH + Duration::from_millis(1), &mut out);
+        assert!(reorder.speakers.is_empty());
     }
 
     /// The frames' streams complete in any order: a frame older than one
