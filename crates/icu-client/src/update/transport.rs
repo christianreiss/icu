@@ -23,7 +23,10 @@ pub(super) fn agent(timeout: Duration) -> ureq::Agent {
         .https_only(true)
         .max_redirects(0)
         .timeout_global(Some(timeout))
-        .timeout_recv_body(Some(Duration::from_secs(20)))
+        // Per read, not for the body as a whole: `timeout_recv_body` is one
+        // budget for the entire download, and 20 s of it ended every update
+        // on a line that needs longer for the installer.
+        .timeout_per_read(Some(Duration::from_secs(20)))
         .user_agent(concat!("ICU/", env!("CARGO_PKG_VERSION")))
         .build()
         .into()

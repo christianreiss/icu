@@ -62,7 +62,7 @@ sha2.workspace = true
 time.workspace = true
 tempfile.workspace = true
 # Background release checks; TLS validation and signed metadata are mandatory.
-ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
 ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
 semver = "1"
 base64 = "0.22"
