@@ -9,8 +9,9 @@
 //! gap. PipeWire's client context loads `module-rt`, which promotes threads
 //! directly when `RLIMIT_RTPRIO` allows and otherwise sends a request to the
 //! desktop portal or RTKit; this module asks it to do the same for the
-//! calling thread, and asks RTKit itself when that did not take effect
-//! (`imp::promote`).
+//! calling thread. Where that request goes unanswered, a helper thread asks
+//! RTKit itself, for the workers and for the callback thread
+//! ([`watch_callback_thread`]).
 //!
 //! RTKit enforces `RLIMIT_RTTIME` (200 ms of CPU without blocking kills the
 //! process), so every loop on a promoted thread must sleep or block well
@@ -167,39 +168,28 @@ mod imp {
             )
     }
 
-    /// Promotes the calling thread and reports what the scheduler says, not
-    /// what was asked for.
+    /// Asks module-rt for the calling thread and reports what the scheduler
+    /// says, not what was asked for.
     ///
-    /// module-rt first: with the rlimits (`@pipewire` group) it switches the
-    /// policy itself, at once. Without them it only *sends* a request and
-    /// answers 0 — to the desktop portal's `Realtime` interface when the
-    /// session bus has one, else to RTKit — and never reads the reply.
-    /// Measured 2026-11-18 (Fedora 43, xdg-desktop-portal 1.20.4): the
-    /// portal refuses every such request ("Could not get pidns"), so the
-    /// thread stayed `SCHED_OTHER` on every start and rtkit-daemon's journal
-    /// never saw ICU, while RTKit itself granted the same request at once.
-    /// So when the thread is not real-time after module-rt, RTKit is asked
-    /// directly and its answer awaited.
+    /// With the rlimits (`@pipewire` group) module-rt switches the policy
+    /// itself, at once. Without them it only *sends* a request and answers
+    /// 0 — to the desktop portal's `Realtime` interface when the session
+    /// bus has one, else to RTKit — and never reads the reply. Measured
+    /// 2026-11-18 (Fedora 43, xdg-desktop-portal 1.20.4): the portal
+    /// refuses every such request ("Could not get pidns"), so the thread
+    /// stayed `SCHED_OTHER` on every start and rtkit-daemon's journal never
+    /// saw ICU, while RTKit itself granted the same request at once. A
+    /// thread that is not real-time after this is therefore handed to the
+    /// helper, which asks RTKit directly (`super::watch_callback_thread`).
     pub fn promote(priority: c_int) -> Result<(), String> {
-        let module_rt = module_rt(priority);
+        let asked = module_rt(priority);
         if is_realtime() {
             return Ok(());
         }
-        let rtkit = super::rtkit::make_realtime(priority);
-        if is_realtime() {
-            return Ok(());
-        }
-        Err(format!(
-            "module-rt: {}; RTKit: {}",
-            match module_rt {
-                Ok(()) => "accepted, not applied".into(),
-                Err(error) => error,
-            },
-            match rtkit {
-                Ok(()) => "accepted, not applied".into(),
-                Err(error) => error,
-            },
-        ))
+        Err(match asked {
+            Ok(()) => "module-rt took the request, the thread is still SCHED_OTHER".into(),
+            Err(error) => format!("module-rt: {error}"),
+        })
     }
 }
 
@@ -212,9 +202,9 @@ mod rtkit {
 
     const SERVICE: &str = "org.freedesktop.RealtimeKit1";
     const PATH: &str = "/org/freedesktop/RealtimeKit1";
-    /// The whole exchange; it runs on the audio worker before its loop
-    /// starts, so a hung bus must not hold the audio back for long.
-    const TIMEOUT: Duration = Duration::from_millis(500);
+    /// The whole exchange. It runs on the helper thread, never on an audio
+    /// thread; a hung bus only delays the promotion.
+    const TIMEOUT: Duration = Duration::from_secs(2);
 
     /// The kernel thread id of the calling thread.
     pub fn current_thread() -> u32 {
@@ -222,14 +212,9 @@ mod rtkit {
         (unsafe { libc::syscall(libc::SYS_gettid) }) as u32
     }
 
-    /// Asks RTKit to make the calling thread real-time at `priority`
-    /// (clamped to what RTKit allows) and waits for its answer.
-    pub fn make_realtime(priority: i32) -> Result<(), String> {
-        make_thread_realtime(current_thread(), priority)
-    }
-
-    /// [`make_realtime`] for thread `thread` of this process. RTKit takes
-    /// the thread id, so any thread may ask for another.
+    /// Asks RTKit to make thread `thread` of this process real-time at
+    /// `priority` (clamped to what RTKit allows) and waits for its answer.
+    /// RTKit takes the thread id, so any thread may ask for another.
     pub fn make_thread_realtime(thread: u32, priority: i32) -> Result<(), String> {
         let thread = u64::from(thread);
         let process = u64::from(std::process::id());
@@ -398,6 +383,16 @@ pub const CALLBACK_PRIORITY: i32 = 20;
 #[cfg(target_os = "linux")]
 static CALLBACK_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Worker threads module-rt left best effort, waiting for the helper: thread
+/// id and name.
+#[cfg(target_os = "linux")]
+static WORKERS: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Helpers running ([`watch_callback_thread`]). Without one nobody asks
+/// RTKit: tests and runs on the fake backend stay best effort, as before.
+#[cfg(target_os = "linux")]
+static HELPERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Called at the top of the backend's real-time callback. The first call
 /// on a thread hands its id to the helper started by
 /// [`watch_callback_thread`]; every later one is a thread-local read.
@@ -428,59 +423,67 @@ impl Drop for CallbackWatch {
     }
 }
 
-/// Starts a helper thread that gives the backend's callback thread its
-/// real-time priority when module-rt did not.
+/// Starts the helper thread that asks RTKit for the audio threads module-rt
+/// left best effort, for as long as the returned guard lives.
 ///
-/// The data loop that runs the stream callbacks gets its priority from
-/// module-rt like any thread it creates — through the same request that
-/// goes unanswered where the desktop portal refuses it (`imp::promote`).
-/// It then ran best effort, and with `icu-dsp` and `icu-mixer` promoted it
-/// would even rank *below* the threads it feeds. The callback cannot ask
-/// for itself (a bus round trip on the real-time path), so it only
-/// announces its thread id and this helper asks RTKit for it.
+/// Two kinds of threads reach it. `icu-dsp` and `icu-mixer` hand themselves
+/// over in [`promote_current_thread`]. The data loop that runs the stream
+/// callbacks gets its priority from module-rt like any thread it creates —
+/// through the same unanswered request — and cannot ask for itself (a bus
+/// round trip on the real-time path), so it only announces its thread id
+/// ([`note_callback_thread`]). RTKit takes a thread id, so the helper asks
+/// for all of them and no audio thread ever waits for the bus.
+///
+/// Started by the PipeWire backend only: without a real audio graph there
+/// is nothing to be on time for, and a test run starting dozens of engines
+/// would spend RTKit's per-user request allowance.
 #[cfg(target_os = "linux")]
 pub fn watch_callback_thread() -> CallbackWatch {
     use std::sync::atomic::{AtomicBool, Ordering};
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let stopped = stop.clone();
+    HELPERS.fetch_add(1, Ordering::AcqRel);
     let spawned = std::thread::Builder::new()
         .name("icu-rt-helper".into())
         .spawn(move || {
             while !stopped.load(Ordering::Acquire) {
-                let thread = CALLBACK_THREAD.swap(0, Ordering::AcqRel);
-                if thread != 0 {
-                    promote_callback_thread(thread);
+                let workers = std::mem::take(&mut *WORKERS.lock().unwrap());
+                for (thread, name) in workers {
+                    promote_from_outside(thread, &name, PRIORITY);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                let callback = CALLBACK_THREAD.swap(0, Ordering::AcqRel);
+                if callback != 0 {
+                    promote_from_outside(callback, "audio callback", CALLBACK_PRIORITY);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if HELPERS.fetch_sub(1, Ordering::AcqRel) == 1 {
+                WORKERS.lock().unwrap().clear();
             }
         });
     if let Err(error) = spawned {
+        HELPERS.fetch_sub(1, Ordering::AcqRel);
         tracing::warn!(%error, "cannot start the real-time helper thread");
     }
     CallbackWatch(stop)
 }
 
-/// Makes callback thread `thread` real-time unless it already is, and logs
-/// the outcome.
+/// Asks RTKit for thread `thread` unless it is real-time already, and logs
+/// what the scheduler says afterwards.
 #[cfg(target_os = "linux")]
-fn promote_callback_thread(thread: u32) {
+fn promote_from_outside(thread: u32, name: &str, priority: i32) {
+    let asked = if imp::thread_is_realtime(thread) {
+        Ok(())
+    } else {
+        rtkit::make_thread_realtime(thread, priority)
+    };
     if imp::thread_is_realtime(thread) {
-        tracing::info!(thread, "audio callback thread runs with real-time priority");
-        return;
-    }
-    let asked = rtkit::make_thread_realtime(thread, CALLBACK_PRIORITY);
-    if imp::thread_is_realtime(thread) {
-        tracing::info!(
-            thread,
-            priority = CALLBACK_PRIORITY,
-            "real-time priority acquired for the audio callback thread"
-        );
+        tracing::info!(thread = name, priority, "real-time priority acquired");
     } else {
         let error = asked
             .err()
             .unwrap_or_else(|| "accepted, not applied".into());
-        tracing::info!(thread, %error,
-            "no real-time priority for the audio callback thread; running best effort");
+        tracing::info!(thread = name, %error, "no real-time priority (RTKit); running best effort");
     }
 }
 
@@ -501,6 +504,17 @@ pub fn promote_current_thread(name: &str) -> PriorityGuard {
             guard
         }
         Err(error) => {
+            // The helper asks RTKit and logs the outcome; without one the
+            // thread stays best effort.
+            #[cfg(target_os = "linux")]
+            if HELPERS.load(std::sync::atomic::Ordering::Acquire) > 0 {
+                tracing::debug!(thread = name, %error, "asking RTKit for real-time priority");
+                WORKERS
+                    .lock()
+                    .unwrap()
+                    .push((rtkit::current_thread(), name.to_string()));
+                return PriorityGuard::default();
+            }
             tracing::info!(thread = name, %error, "no real-time priority; running best effort");
             PriorityGuard::default()
         }
@@ -554,49 +568,63 @@ mod tests {
         assert!(rtkit::rttime_limit(limit(libc::RLIM_INFINITY, libc::RLIM_INFINITY), 0).is_none());
     }
 
-    /// A callback thread announces itself once; the helper then promotes
-    /// it from outside. With `ICU_TEST_REQUIRE_RT=1` it must end up
-    /// real-time.
+    /// On a desktop with RTKit (`ICU_TEST_REQUIRE_RT=1`; skipped otherwise,
+    /// so an ordinary test run asks RTKit for nothing): with the helper
+    /// running, a worker that hands itself over and a callback thread that
+    /// announces itself both end up real-time, without either of them
+    /// touching the bus.
     #[test]
-    fn the_helper_promotes_a_thread_that_announced_itself() {
-        use std::sync::mpsc;
-        let _watch = watch_callback_thread();
-        let (tid_tx, tid_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel::<()>();
+    fn the_helper_promotes_workers_and_the_callback_thread() {
+        if std::env::var_os("ICU_TEST_REQUIRE_RT").is_none() {
+            return;
+        }
+        let watch = watch_callback_thread();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let done_rx = std::sync::Arc::new(std::sync::Mutex::new(done_rx));
+        let wait = |rx: std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !imp::is_realtime() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = rx.lock().unwrap().recv();
+            imp::is_realtime()
+        };
+        let rx = done_rx.clone();
+        let worker = std::thread::spawn(move || {
+            assert!(!imp::is_realtime(), "threads start best effort");
+            let _priority = promote_current_thread("icu-test-worker");
+            wait(rx)
+        });
+        let rx = done_rx.clone();
         let callback = std::thread::spawn(move || {
             note_callback_thread();
             note_callback_thread();
-            tid_tx.send(rtkit::current_thread()).unwrap();
-            let _ = done_rx.recv();
-            imp::is_realtime()
+            wait(rx)
         });
-        let tid = tid_rx.recv().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while !imp::thread_is_realtime(tid) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
         drop(done_tx);
-        let realtime = callback.join().unwrap();
-        if std::env::var_os("ICU_TEST_REQUIRE_RT").is_some() {
-            assert!(realtime, "the helper promotes the announced thread");
-        }
+        assert!(worker.join().unwrap(), "the worker was promoted");
+        assert!(callback.join().unwrap(), "the callback thread was promoted");
+        drop(watch);
     }
 
-    /// Whatever the host grants, the outcome reported is the scheduler's.
-    /// With `ICU_TEST_REQUIRE_RT=1` (a desktop with RTKit) the promotion
-    /// itself must succeed.
+    /// Without a helper nobody is asked and the thread stays what it was.
     #[test]
-    fn a_promotion_reports_the_real_policy() {
-        let (promoted, realtime) = std::thread::spawn(|| {
-            assert!(!imp::is_realtime(), "threads start best effort");
-            let promoted = imp::promote(PRIORITY);
-            (promoted, imp::is_realtime())
+    fn without_a_helper_a_thread_stays_best_effort() {
+        if std::env::var_os("ICU_TEST_REQUIRE_RT").is_some() {
+            return;
+        }
+        let realtime = std::thread::spawn(|| {
+            let _priority = promote_current_thread("icu-test-worker");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            imp::is_realtime()
         })
         .join()
-        .expect("promotion never panics");
-        assert_eq!(promoted.is_ok(), realtime, "{promoted:?}");
-        if std::env::var_os("ICU_TEST_REQUIRE_RT").is_some() {
-            promoted.expect("real-time priority on a host with RTKit");
-        }
+        .unwrap();
+        assert!(!realtime);
+        assert!(
+            WORKERS.lock().unwrap().is_empty(),
+            "nothing queued for nobody"
+        );
     }
 }

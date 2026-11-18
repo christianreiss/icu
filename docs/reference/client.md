@@ -39,10 +39,15 @@ Die öffentliche Bibliothek ermöglicht Tests ohne ein laufendes Fenster.
 `watch<AppState>` verteilt Zustand, `mpsc` trägt Befehle; Audio nutzt `ringbuf`.
 Callbacks warten nicht auf Sperren; der Playback-Zugriff verwendet `try_lock`.
 Audio-Threads fordern unter Linux Echtzeit-Priorität an – zuerst über
-PipeWires module-rt, und wenn der Thread danach nicht tatsächlich in
-`SCHED_RR`/`SCHED_FIFO` läuft, direkt bei RTKit auf dem Systembus – und unter
-Windows MMCSS „Pro Audio“. Gemeldet wird, was der Scheduler bestätigt; sonst
-gilt der protokollierte Best-Effort-Rückfall.
+PipeWires module-rt. Läuft ein Thread danach nicht tatsächlich in
+`SCHED_RR`/`SCHED_FIFO` (module-rt schickt ohne rlimits nur eine unbeantwortete
+Anfrage, die das Desktop-Portal auf Fedora 43 ablehnt), fragt der Hilfsthread
+`icu-rt-helper` RTKit auf dem Systembus direkt: für `icu-dsp` und `icu-mixer`
+(Priorität 15) und für PipeWires Callback-Thread (20), der sich dazu nur mit
+seiner Thread-ID meldet. Kein Audio-Thread wartet selbst auf den Bus. Den Helfer
+startet nur das PipeWire-Backend; Tests und das Fake-Backend fragen RTKit nie.
+Windows nutzt MMCSS „Pro Audio“. Gemeldet wird, was der Scheduler bestätigt;
+sonst gilt der protokollierte Best-Effort-Rückfall.
 Decoder werden vor dem Sprecher-Lock aufgebaut und nach dessen Freigabe zerstört.
 Blockierende Stream-Aufrufe laufen über `block_in_place`.
 
