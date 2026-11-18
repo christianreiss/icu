@@ -23,7 +23,11 @@ mod h264;
 /// Minimum spacing between two `KeyframeRequest`s for the same speaker. The
 /// server forwards at most [`pl::KEYFRAME_REQUESTS_PER_S`] per second and
 /// speaker, so asking faster only burns control budget.
-const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1)
+///
+/// A tenth longer than the server's own interval: a repeat sent exactly on
+/// time arrives a few milliseconds early as often as late, and the server
+/// drops an early one without a word — the next try was a second later.
+const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(1100)
     .checked_div(pl::KEYFRAME_REQUESTS_PER_S)
     .unwrap();
 
@@ -415,17 +419,25 @@ impl Reorder {
     ) {
         let seq = frame.header.seq;
         let Some(order) = self.speakers.get_mut(&session) else {
-            self.speakers.insert(
-                session,
-                Order {
-                    next: seq.wrapping_add(1),
-                    media_epoch: frame.header.media_epoch,
-                    held: Vec::new(),
-                    since: None,
-                    seen: now,
-                },
-            );
-            out.push((session, frame));
+            let mut order = Order {
+                next: seq.wrapping_add(1),
+                media_epoch: frame.header.media_epoch,
+                held: Vec::new(),
+                since: None,
+                seen: now,
+            };
+            if frame.header.keyframe() {
+                out.push((session, frame));
+            } else {
+                // A stream's first frame is its IDR. A P-frame first may
+                // have overtaken it (camera just switched on), so it waits
+                // like any early frame; joining mid-stream it is not
+                // decodable anyway and only asks for its IDR 60 ms later.
+                order.next = seq.wrapping_sub(1);
+                order.held.push(frame);
+                order.since = Some(now);
+            }
+            self.speakers.insert(session, order);
             return;
         };
         order.seen = now;
@@ -623,6 +635,11 @@ impl Sender {
         captured: (crate::media::Stamp, Instant, bool),
     ) -> Result<(), String> {
         tokio::pin!(cancelled);
+        // The encoder has produced this frame, so it takes its number even
+        // when it is dropped below: the receivers then see the gap and wait
+        // for an IDR instead of decoding the next P-frame against a
+        // reference they never got.
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let deadline = tokio::time::Instant::from_std(captured.1 + Duration::from_millis(100));
         if tokio::time::Instant::now() >= deadline {
             return Err("flow control: frame dropped".into());
@@ -640,7 +657,7 @@ impl Sender {
                 icu_proto::header::MEDIA_FLAG_TIMING_ESTIMATED
             },
             speaker: 0,
-            seq: self.seq.fetch_add(1, Ordering::Relaxed),
+            seq,
             ts,
             codec: VIDEO_CODEC_H264,
         };
@@ -1084,6 +1101,22 @@ mod tests {
         }
         outgoing.close(0u32.into(), b"done");
         incoming.close(0u32.into(), b"done");
+        // A frame already past its deadline is not sent, but it was
+        // encoded: its number is spent, so the receivers see the gap.
+        let sender = Sender::new(outgoing.clone());
+        let late = Instant::now() - Duration::from_millis(200);
+        let result = sender
+            .send_captured_until(
+                false,
+                0,
+                &[0x42; 16],
+                std::future::pending(),
+                |s| s.finish().map_err(|e| e.to_string()),
+                (crate::media::Stamp::default(), late, true),
+            )
+            .await;
+        assert_eq!(result, Err("flow control: frame dropped".into()));
+        assert_eq!(sender.seq.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1361,7 +1394,7 @@ mod tests {
         // An IDR ahead releases what waited and itself.
         let mut reorder = Reorder::default();
         let mut out = Vec::new();
-        reorder.push(3, numbered(delta, 10), t0, &mut out);
+        reorder.push(3, numbered(idr, 10), t0, &mut out);
         reorder.push(3, numbered(delta, 12), t0, &mut out);
         reorder.push(3, numbered(idr, 13), t0, &mut out);
         assert_eq!(passed(&out), [10, 12, 13]);
@@ -1369,7 +1402,7 @@ mod tests {
         // Far ahead: a loss burst, not a reordering.
         let mut reorder = Reorder::default();
         let mut out = Vec::new();
-        reorder.push(3, numbered(delta, 10), t0, &mut out);
+        reorder.push(3, numbered(idr, 10), t0, &mut out);
         reorder.push(
             3,
             numbered(delta, 11 + REORDER_HELD as u16 + 1),
@@ -1381,7 +1414,7 @@ mod tests {
         // One more than may wait, in whatever order they came.
         let mut reorder = Reorder::default();
         let mut out = Vec::new();
-        reorder.push(3, numbered(delta, 10), t0, &mut out);
+        reorder.push(3, numbered(idr, 10), t0, &mut out);
         for seq in [14, 12, 13] {
             reorder.push(3, numbered(delta, seq), t0, &mut out);
         }
@@ -1394,7 +1427,7 @@ mod tests {
         // A new stream on a reused session id, and a new media epoch.
         let mut reorder = Reorder::default();
         let mut out = Vec::new();
-        reorder.push(3, numbered(delta, 5000), t0, &mut out);
+        reorder.push(3, numbered(idr, 5000), t0, &mut out);
         reorder.push(3, numbered(idr, 0), t0, &mut out);
         reorder.push(3, numbered(delta, 1), t0, &mut out);
         let mut restarted = numbered(idr, 700);
@@ -1405,13 +1438,32 @@ mod tests {
         // `seq` wraps.
         let mut reorder = Reorder::default();
         let mut out = Vec::new();
-        reorder.push(3, numbered(delta, u16::MAX - 1), t0, &mut out);
+        reorder.push(3, numbered(idr, u16::MAX - 1), t0, &mut out);
         reorder.push(3, numbered(delta, 0), t0, &mut out);
         reorder.push(3, numbered(delta, u16::MAX), t0, &mut out);
         assert_eq!(passed(&out), [u16::MAX - 1, u16::MAX, 0]);
 
+        // A stream's first frame is its IDR: a P-frame that got ahead of
+        // it waits for it too, and alone it is passed on after the hold.
+        let mut reorder = Reorder::default();
+        let mut out = Vec::new();
+        reorder.push(3, numbered(delta, 1), t0, &mut out);
+        assert!(out.is_empty());
+        reorder.push(3, numbered(idr, 0), t0, &mut out);
+        reorder.push(3, numbered(delta, 2), t0, &mut out);
+        assert_eq!(passed(&out), [0, 1, 2]);
+        let mut reorder = Reorder::default();
+        let mut out = Vec::new();
+        reorder.push(3, numbered(delta, 7), t0, &mut out);
+        reorder.release_due(t0 + REORDER_HOLD, &mut out);
+        reorder.push(3, numbered(delta, 8), t0 + REORDER_HOLD, &mut out);
+        assert_eq!(passed(&out), [7, 8]);
+
         // A speaker that stopped is forgotten.
-        reorder.release_due(t0 + FRESH + Duration::from_millis(1), &mut out);
+        reorder.release_due(
+            t0 + REORDER_HOLD + FRESH + Duration::from_millis(1),
+            &mut out,
+        );
         assert!(reorder.speakers.is_empty());
     }
 
