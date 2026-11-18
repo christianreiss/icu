@@ -660,7 +660,7 @@ fn speak_surface_reflects_transmission_and_all_mute_sources() {
                             &mut Vec::new(),
                         );
                     }
-                    assert_eq!(statuses.iter().filter(|text| *text == expected).count(), 2);
+                    assert_eq!(statuses.iter().filter(|text| *text == expected).count(), 1);
                     if guard != "none" {
                         assert!(!statuses.iter().any(|text| text == "Spricht"));
                     }
@@ -1808,32 +1808,13 @@ fn user_path_details_and_missing_data() {
     }
 }
 
-/// All cards share their bounds and row baselines even when one column
-/// wraps. Inspect rendered geometry rather than duplicating layout formulas.
+/// The profile leads at every scale and its controls precede diagnostics.
 #[test]
-fn user_path_cards_align_with_wrapping_and_scaling() {
-    fn rects(shapes: &[egui::epaint::ClippedShape], out: &mut Vec<egui::Rect>) {
-        fn visit(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
-            match shape {
-                egui::Shape::Rect(r)
-                    if r.rect.width() > 150.0
-                        && r.rect.height() > 100.0
-                        && r.rect.top() < 100.0 =>
-                {
-                    out.push(r.rect)
-                }
-                egui::Shape::Vec(children) => children.iter().for_each(|s| visit(s, out)),
-                _ => {}
-            }
-        }
-        for shape in shapes {
-            visit(&shape.shape, out);
-        }
-    }
+fn user_profile_hierarchy_with_wrapping_and_scaling() {
     for theme_name in THEMES {
         for (case, width, scale) in [
             ("wide", 900.0, 1.0),
-            ("narrow", 760.0, 1.0),
+            ("narrow", 460.0, 1.0),
             ("125", 760.0, 1.25),
             ("150", 760.0, 1.5),
         ] {
@@ -1850,63 +1831,17 @@ fn user_path_cards_align_with_wrapping_and_scaling() {
                 assert!(ui.min_rect().right() <= ui.max_rect().right() + 0.5);
             });
             h.run();
-            let mut cards = Vec::new();
-            rects(&h.output().shapes, &mut cards);
-            cards.retain(|r| r.width() < width / 2.0);
-            cards.sort_by(|a, b| a.left().total_cmp(&b.left()));
-            assert_eq!(cards.len(), 3, "{case}/{theme_name}: {cards:?}");
-            for r in &cards[1..] {
-                assert!((r.width() - cards[0].width()).abs() < 0.5);
-                assert!((r.top() - cards[0].top()).abs() < 0.5);
-                assert!((r.bottom() - cards[0].bottom()).abs() < 0.5);
-            }
-            let roles = ["Mitglied", "Medienvermittlung", "Admin"]
-                .map(|label| h.get_by_label(label).rect());
-            for r in &roles[1..] {
-                assert!((r.top() - roles[0].top()).abs() < 0.5);
-            }
-            let certs: Vec<_> = h
-                .get_all_by_label_contains("CA-Signatur geprüft")
-                .map(|n| n.rect())
-                .collect();
-            assert_eq!(certs.len(), 3);
-            for r in &certs[1..] {
-                assert!((r.top() - certs[0].top()).abs() < 0.5);
-            }
-            for (i, role) in roles.iter().enumerate() {
-                assert!(cards[i].contains_rect(*role));
-            }
-            let mut name_top = None;
-            for (i, name) in [
-                "Alexandra-Christiane mit einem langen Anzeigenamen",
-                "voice-server-mit-langem-namen.example.org",
-                "Chris",
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let name = h.get_by_label(name).rect();
-                let top = *name_top.get_or_insert(name.top());
-                assert!(
-                    (name.top() - top).abs() < 0.5,
-                    "{case}: name baselines differ"
-                );
-                assert!(
-                    cards[i].contains_rect(name),
-                    "{case}: name escapes card {i}"
-                );
-                assert!(
-                    name.bottom() < roles[i].top(),
-                    "{case}: name overlaps role {i}"
-                );
-            }
-            let selectors = ["Nutzerzertifikat", "Serverzertifikat", "Dein Zertifikat"];
-            for (i, label) in selectors.into_iter().enumerate() {
-                let selector = h
-                    .get_by_label(&format!("{} {label}", egui_phosphor::regular::CERTIFICATE))
-                    .rect();
-                assert!((selector.center().x - cards[i].center().x).abs() < 1.0);
-            }
+            let heading = h.get_by_label("Mitglied").rect();
+            let volume = h.get_by_label("Wiedergabelautstärke").rect();
+            let selector = h
+                .get_by_label(&format!(
+                    "{} Nutzerzertifikat",
+                    egui_phosphor::regular::CERTIFICATE
+                ))
+                .rect();
+            assert!(heading.bottom() < volume.top());
+            assert!(volume.bottom() < selector.top());
+            assert!(h.query_by_label("Fingerabdruck (SHA-256)").is_none());
             shot(&mut h, &format!("user-grid-{case}-{theme_name}"));
         }
     }
@@ -1996,6 +1931,8 @@ fn user_path_keeps_volume_moderation_and_certificate_copy() {
         .borrow()
         .iter()
         .any(|c| matches!(c, Command::SetVolume(2, v) if *v == 100.0)));
+    h.get_by_label("Moderation").click();
+    h.run();
     h.get_by_label(&format!(
         "{}  Stummschalten",
         egui_phosphor::regular::MICROPHONE_SLASH
@@ -2043,6 +1980,8 @@ fn moderation_waits_for_loaded_restrictions_and_preserves_deafen() {
                     captured.borrow_mut().push(c)
                 });
             });
+            h.get_by_label("Moderation").click();
+            h.run();
             assert!(sent
                 .borrow()
                 .iter()

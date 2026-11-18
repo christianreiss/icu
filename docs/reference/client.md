@@ -517,9 +517,9 @@ verbleibende Desktop-Prüfungen stehen in der Live-Test-Checkliste.
 
 ### Nutzerpfad, Zertifikate und Vertrauen
 
-Die Nutzeransicht (`ui/user.rs`) zeigt links den ausgewählten Nutzer, mittig den Server und rechts den lokalen Nutzer. Standard 900×640, Minimum 760×520; lange Inhalte umbrechen, Details dürfen scrollen. Phosphor-Icons, Sprachstatus, RTT je Serverstrecke und Audio-Empfangsverlust stehen direkt im Pfad. Lautstärke und berechtigte Moderation bleiben erhalten. Die CA-Verzweigung öffnet Zertifikatsdetails im selben Fenster; Felder und Fingerabdruck-Kopieren teilen sich den Renderer mit der Verbindungsansicht.
+Die Nutzeransicht öffnet mit Avatar, Anzeigename, Rolle und Sprachstatus. Die persönliche Wiedergabelautstärke steht direkt darunter. Berechtigte Aktionen sind über „Moderation“ erreichbar. Der Verbindungspfad nennt die RTT pro Serverstrecke und den lokalen Audio-Empfangsverlust. Das Fenster startet mit 680×480 Punkten, lässt sich bis 460×400 verkleinern und ordnet die Strecke bei wenig Platz vertikal an.
 
-Die drei Karten verwenden dasselbe Raster: Überschrift, Avatar bzw. Server-Icon mit Name, Rolle, Status, Medien bzw. Adresse, Sitzungsdaten und Zertifikatsstatus. Jede Zeile übernimmt die Höhe ihrer längsten Zelle; Umbrüche verschieben alle drei Folgezellen gemeinsam. Kartenabstand und Innenrand betragen 12 px, Zeilenabstände 8 px. RTT-Anzeigen liegen unter den jeweiligen Strecken, Zertifikatsauswahl und CA-Verzweigung auf den Kartenachsen. Transporthinweis und Verbindungsdetails gehören zur Vertrauenskarte. Auch die Nutzeransicht ohne Moderation darf für die gemeinsamen Zeilen und Lautstärkeregelung wachsen; bei begrenzter Bildschirmhöhe bleibt sie scrollbar.
+Unter „Zertifikate & Vertrauen“ öffnet die Auswahl das jeweilige Zertifikat. Beide Detailfenster verwenden dieselbe Ansicht für Identität, Gültigkeit, Vertrauensnachweise, SHA-256-Fingerabdruck und technische Details. Kopieren übernimmt den vollständigen Fingerabdruck.
 
 Administrative Aktionen im Nutzerfenster und Kontextmenü warten zunächst auf
 eine neue Nutzerlisten-Antwort; eine gefüllte alte Liste gilt nicht als
@@ -528,7 +528,7 @@ aktualisiert seinen Status regelmäßig. Die andere geladene Einschränkung blei
 beim Umschalten erhalten; gleichzeitige Änderungen mehrerer Admins zwischen
 Antwort und Klick sind mit dem bestehenden Zwei-Felder-Befehl nicht atomar.
 
-`RequestPeerCertificate` fragt einmal pro Sitzung an, mit sichtbarem Lade-/Fehlerzustand und manuellem Wiederholen nach acht Sekunden. `Peer.certificate` hält geprüfte öffentliche Daten, wird beim Verlassen/Neuverbinden verworfen und bei CRL-Updates neu geprüft. Parsing läuft in der Engine. Gültigkeits- und CRL-Zeitgrenzen werden bei der Anzeige ausgewertet. Bei Auswahl des eigenen Nutzers markieren beide Außenkarten dieselbe Verbindung. Signaturprüfung ersetzt keine direkte Peer-Authentifizierung; die Sitzungszuordnung stammt vom Server.
+`RequestPeerCertificate` fragt einmal pro Sitzung an, mit sichtbarem Lade-/Fehlerzustand und manuellem Wiederholen nach acht Sekunden. `Peer.certificate` hält geprüfte öffentliche Daten, wird beim Verlassen/Neuverbinden verworfen und bei CRL-Updates neu geprüft. Parsing läuft in der Engine. Gültigkeits- und CRL-Zeitgrenzen werden bei der Anzeige ausgewertet. Im eigenen Profil erscheint die Strecke zum Server einmal. Signaturprüfung ersetzt keine direkte Peer-Authentifizierung; die Sitzungszuordnung stammt vom Server.
 
 ### Updates
 

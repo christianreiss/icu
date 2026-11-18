@@ -305,7 +305,7 @@ impl ConnectionView {
                         for card in &cards {
                             match card {
                                 Card::Plain(section) => self.draw_section(ui, section),
-                                Card::Certs(certs) => self.draw_certs(ui, certs),
+                                Card::Certs(certs) => self.draw_certs(ui, certs, state),
                             }
                         }
                         self.footer(ui, state, &jitter);
@@ -344,7 +344,7 @@ impl ConnectionView {
     }
 
     /// The three certificates in one card, one at a time.
-    fn draw_certs(&mut self, ui: &mut Ui, certs: &[Section]) {
+    fn draw_certs(&mut self, ui: &mut Ui, certs: &[Section], state: &AppState) {
         widgets::group_card(ui, "Zertifikat", |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             egui::Frame::new()
@@ -365,8 +365,21 @@ impl ConnectionView {
                         });
                     });
                 });
-            if let Some(section) = certs.get(self.cert.index()) {
-                hairline(ui);
+            hairline(ui);
+            let cert = state.conn_info.as_ref().map(|i| match self.cert {
+                CertPick::Server => &i.server_cert,
+                CertPick::Own => &i.client_cert,
+                CertPick::Ca => &i.ca_cert,
+            });
+            if let Some(cert) = cert {
+                certificate_details(
+                    ui,
+                    cert,
+                    self.cert == CertPick::Ca,
+                    (self.cert == CertPick::Server).then_some(state.server_name.as_str()),
+                    &mut self.copied,
+                );
+            } else if let Some(section) = certs.get(self.cert.index()) {
                 self.draw_rows(ui, section);
             }
         });
@@ -1343,17 +1356,79 @@ fn block_row(ui: &mut Ui, row: &Row, copied: &mut Option<(String, Instant)>) {
             if row.mono {
                 text = text.monospace();
             }
-            ui.add(egui::Label::new(text).wrap());
+            ui.add(egui::Label::new(text).wrap().selectable(true));
         });
 }
 
 /// The same certificate fields and copy behaviour in both windows.
 pub(super) fn certificate_details(
     ui: &mut Ui,
-    cert: Option<&CertInfo>,
+    cert: &CertInfo,
+    is_ca: bool,
+    server: Option<&str>,
     copied: &mut Option<(String, Instant)>,
 ) {
-    draw_rows(ui, &cert_section("Zertifikat", cert), copied);
+    let now = crate::net::conn::unix_now();
+    let tok = theme::tokens(ui.visuals());
+    egui::Frame::new().inner_margin(12).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 5.0;
+        ui.add(egui::Label::new(theme::strong_text(&cert.subject).size(19.0)).wrap());
+        ui.weak(format!("Aussteller · {}", cert.issuer));
+        ui.label(format!("{}  –  {}", cert.not_before, cert.not_after));
+        let validity = cert.validity_label(now);
+        let color = match validity {
+            "Zeitlich gültig" => tok.connected,
+            "Läuft bald ab" => tok.connecting,
+            "Abgelaufen" | "Noch nicht gültig" => tok.error,
+            _ => tok.muted_text,
+        };
+        widgets::status_pill(ui, color, validity);
+        if is_ca {
+            ui.label("Vertrauensanker aus deinem Passport");
+        } else {
+            ui.colored_label(
+                match cert.signature_valid {
+                    Some(false) => tok.error,
+                    _ => tok.muted_text,
+                },
+                match cert.signature_valid {
+                    Some(true) => "Signatur gegen deine CA geprüft",
+                    Some(false) => "Signatur passt nicht zu deiner CA",
+                    None => "Signatur nicht prüfbar",
+                },
+            );
+            ui.colored_label(
+                if matches!(
+                    cert.revocation,
+                    crate::conninfo::Revocation::Checked { revoked: true, .. }
+                ) {
+                    tok.error
+                } else {
+                    tok.muted_text
+                },
+                cert.revocation.label(now),
+            );
+            if let Some(server) = server {
+                ui.label(format!("Im TLS-Handshake geprüfter Servername: {server}"));
+            } else {
+                ui.label("Nutzersitzung vom Server authentifiziert");
+            }
+        }
+    });
+    block_row(
+        ui,
+        &Row::mono(
+            "Fingerabdruck (SHA-256)",
+            wrap_fingerprint(&cert.fingerprint),
+        )
+        .copyable(&cert.fingerprint),
+        copied,
+    );
+    egui::Frame::new().inner_margin(12).show(ui, |ui| {
+        ui.collapsing("Technische Details", |ui| {
+            ui.label(format!("Signaturalgorithmus · {}", cert.sig_alg));
+        });
+    });
 }
 
 #[cfg(test)]
