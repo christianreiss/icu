@@ -38,8 +38,11 @@ Die öffentliche Bibliothek ermöglicht Tests ohne ein laufendes Fenster.
 
 `watch<AppState>` verteilt Zustand, `mpsc` trägt Befehle; Audio nutzt `ringbuf`.
 Callbacks warten nicht auf Sperren; der Playback-Zugriff verwendet `try_lock`.
-Audio-Threads fordern unter Linux PipeWire/RTKit-Priorität und unter Windows
-MMCSS „Pro Audio“ an, mit protokolliertem Best-Effort-Rückfall.
+Audio-Threads fordern unter Linux Echtzeit-Priorität an – zuerst über
+PipeWires module-rt, und wenn der Thread danach nicht tatsächlich in
+`SCHED_RR`/`SCHED_FIFO` läuft, direkt bei RTKit auf dem Systembus – und unter
+Windows MMCSS „Pro Audio“. Gemeldet wird, was der Scheduler bestätigt; sonst
+gilt der protokollierte Best-Effort-Rückfall.
 Decoder werden vor dem Sprecher-Lock aufgebaut und nach dessen Freigabe zerstört.
 Blockierende Stream-Aufrufe laufen über `block_in_place`.
 
