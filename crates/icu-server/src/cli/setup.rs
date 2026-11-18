@@ -46,7 +46,8 @@ pub(crate) async fn run_with(
     input: &mut impl BufRead,
     out: &mut impl Write,
 ) -> Result<()> {
-    let mut config = if config_path.exists() {
+    let existed = config_path.exists();
+    let mut config = if existed {
         Config::read(config_path)?
     } else {
         Config::default()
@@ -144,7 +145,11 @@ pub(crate) async fn run_with(
 
     config.server.server_name = server_name;
     config.server.public_host = public_host;
-    config.server.listen = listen_addrs(port);
+    if !existed {
+        config.server.listen = listen_addrs(port);
+    } else if port != current_port {
+        config.server.listen = with_port(&config.server.listen, port);
+    }
     config.server.max_users = max_users;
     config.server.admin_socket_group = if admin_group.trim().is_empty() {
         None
@@ -163,8 +168,10 @@ pub(crate) async fn run_with(
     }
     let text = render(&config);
     std::fs::write(config_path, &text)?;
+    // A file that was already there keeps its owner and mode (the packages
+    // ship it `root:icu 0640`); only a new one gets the default.
     #[cfg(unix)]
-    {
+    if !existed {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o644))?;
     }
@@ -211,6 +218,23 @@ fn listen_addrs(port: u16) -> Vec<std::net::SocketAddr> {
     ]
 }
 
+/// An existing `listen` moved to `port`: the addresses the admin chose stay,
+/// so a server bound to one interface is not opened to all of them by a
+/// re-run. An empty list falls back to [`listen_addrs`].
+fn with_port(listen: &[std::net::SocketAddr], port: u16) -> Vec<std::net::SocketAddr> {
+    let mut moved: Vec<std::net::SocketAddr> = Vec::with_capacity(listen.len());
+    for addr in listen {
+        let addr = std::net::SocketAddr::new(addr.ip(), port);
+        if !moved.contains(&addr) {
+            moved.push(addr);
+        }
+    }
+    if moved.is_empty() {
+        return listen_addrs(port);
+    }
+    moved
+}
+
 /// Prints `label [default]: `, reads a line, keeps `default` on empty input,
 /// and re-prompts on a validation error (printed as `error: ...`).
 fn prompt(
@@ -241,11 +265,62 @@ fn prompt(
     }
 }
 
-/// Renders `config`'s admin-facing fields as a commented `server.toml`, in
-/// the same shape as `packaging/files/server.toml`. Deliberately not a raw
-/// `toml::to_string(config)`: that would also dump `[paths]`/`[timing]`,
-/// which exist only for tests and out-of-tree runs.
+/// The keys [`render`] writes itself, as `(section, key)`.
+const RENDERED: &[(&str, &str)] = &[
+    ("server", "listen"),
+    ("server", "server_name"),
+    ("server", "public_host"),
+    ("server", "max_users"),
+    ("server", "min_client"),
+    ("server", "admin_socket_group"),
+    ("log", "level"),
+    ("log", "format"),
+    ("backup", "keep"),
+];
+
+/// Every setting of `config` that [`render`] does not write itself and that
+/// differs from the default, as `key = value` lines per section. Without
+/// them a re-run would silently put `[limits]`, `[tls]`, `backup.dir`,
+/// `monitor_socket_group` and the rest back to their defaults.
+fn carried(config: &Config) -> std::collections::BTreeMap<String, String> {
+    let mut carried = std::collections::BTreeMap::new();
+    let (Ok(toml::Value::Table(current)), Ok(toml::Value::Table(defaults))) = (
+        toml::Value::try_from(config),
+        toml::Value::try_from(Config::default()),
+    ) else {
+        return carried;
+    };
+    for (section, values) in &current {
+        let toml::Value::Table(values) = values else {
+            continue;
+        };
+        for (key, value) in values {
+            if RENDERED.contains(&(section.as_str(), key.as_str()))
+                || defaults.get(section).and_then(|d| d.get(key)) == Some(value)
+            {
+                continue;
+            }
+            let lines: &mut String = carried.entry(section.clone()).or_default();
+            lines.push_str(&format!("{key} = {value}\n"));
+        }
+    }
+    carried
+}
+
+/// Renders `config` as a commented `server.toml`, in the same shape as
+/// `packaging/files/server.toml`: the admin-facing fields always, anything
+/// else only where it differs from the default ([`carried`]). Deliberately
+/// not a raw `toml::to_string(config)`: that would also dump the defaults of
+/// `[paths]`/`[timing]`, which exist only for tests and out-of-tree runs.
 fn render(config: &Config) -> String {
+    let mut carried = carried(config);
+    let server_extra = carried.remove("server").unwrap_or_default();
+    let log_extra = carried.remove("log").unwrap_or_default();
+    let backup_extra = carried.remove("backup").unwrap_or_default();
+    let other_sections: String = carried
+        .iter()
+        .map(|(section, lines)| format!("\n[{section}]\n{lines}"))
+        .collect();
     // Each entry needs its own TOML string quotes, e.g. `"0.0.0.0:4711"`.
     let listen = config
         .server
@@ -266,13 +341,17 @@ fn render(config: &Config) -> String {
          max_users = {max_users}\n\
          min_client = {min_client:?}\n\
          admin_socket_group = {admin_group:?}\n\
+         {server_extra}\
          \n\
          [log]\n\
          level = {log_level:?}\n\
          format = {log_format:?}\n\
+         {log_extra}\
          \n\
          [backup]\n\
-         keep = {backup_keep}\n",
+         keep = {backup_keep}\n\
+         {backup_extra}\
+         {other_sections}",
         server_name = config.server.server_name,
         public_host = config.server.public_host,
         max_users = config.server.max_users,
@@ -322,6 +401,76 @@ mod tests {
         assert_eq!(config.server.public_host, "icu.home.arpa:4711");
         assert_eq!(config.server.max_users, 8);
         assert_eq!(config.server.admin_socket_group.as_deref(), Some("icu"));
+    }
+
+    /// Re-running the wizard and pressing enter through it changes nothing:
+    /// what the admin set outside the prompts survives, and so does the
+    /// file's mode.
+    #[tokio::test]
+    async fn a_rerun_keeps_everything_the_prompts_do_not_ask_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.toml");
+        let backups = dir.path().join("offsite");
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\n\
+                 listen = [\"127.0.0.1:4720\"]\n\
+                 server_name = \"icu.home.arpa\"\n\
+                 public_host = \"icu.home.arpa:4720\"\n\
+                 max_users = 6\n\
+                 admin_socket_group = \"icu\"\n\
+                 monitor_socket_group = \"icu-monitor\"\n\
+                 \n\
+                 [limits]\n\
+                 enroll_per_ip_per_min = 3\n\
+                 max_pending_invites = 7\n\
+                 \n\
+                 [tls]\n\
+                 client_validity_days = 90\n\
+                 \n\
+                 [log]\n\
+                 level = \"debug\"\n\
+                 \n\
+                 [backup]\n\
+                 keep = 5\n\
+                 dir = {backups:?}\n\
+                 \n\
+                 [timing]\n\
+                 hello_timeout_ms = 4321\n"
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let before = toml::Value::try_from(Config::read(&path).unwrap()).unwrap();
+
+        // Enter at every prompt, then no invite.
+        let mut input = std::io::Cursor::new(b"\n\n\n\n\nn\n".to_vec());
+        let mut out = Vec::new();
+        run_with(&path, &mut input, &mut out).await.unwrap();
+
+        let after = toml::Value::try_from(Config::read(&path).unwrap()).unwrap();
+        assert_eq!(before, after, "{}", std::fs::read_to_string(&path).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o640, "an existing file keeps its mode");
+        }
+    }
+
+    #[test]
+    fn a_new_port_keeps_the_listen_hosts() {
+        let one: Vec<std::net::SocketAddr> = vec!["192.0.2.7:4711".parse().unwrap()];
+        assert_eq!(
+            with_port(&one, 4800),
+            vec!["192.0.2.7:4800".parse().unwrap()]
+        );
+        assert_eq!(with_port(&[], 4800), listen_addrs(4800));
     }
 
     #[tokio::test]
