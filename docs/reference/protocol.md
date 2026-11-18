@@ -155,7 +155,8 @@ Profile zählen ein Messfenster ebenfalls nur einmal.
 
 Die geänderte Semantik und Hint-Feldfolge erfordern **Client und Server gemeinsam
 ab Minor 7**. Minor 6 und älter werden mit `VERSION_UNSUPPORTED` abgewiesen.
-Audioheader (14 Bytes), Opus-Payload, ALPN und Passportformat bleiben unverändert.
+Audioheader (damals 14 Bytes; seit Minor 8 sind es 26, siehe unten), Opus-Payload,
+ALPN und Passportformat bleiben unverändert.
 Capability Bit 0 (`CAP_AUDIO_FEEDBACK`) steuert weiterhin die optionalen Varianten.
 
 Varianten 19–28 (und 31, 33) sind die ersten C→S-Nachrichten, bei denen der sendende Client eine **andere** `user_id` benennt als seine eigene.
@@ -347,7 +348,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 ## 8. Versionierung
 
 - Major = ALPN-String (`icu/1`). Inkompatible Änderung → `icu/2`, Server bietet ggf. beide.
-- Minor: der Client nennt sein Protokoll-Minor in `Hello.minor`, der Server seins in `Welcome.server_minor`; `Welcome.minor` ist das ausgehandelte `min(client, server)`. Varianten oberhalb des ausgehandelten Minors werden nie gesendet. Ein Minor 0 gibt es nicht; aktuell ist `minor = 6`. Minor 5 hängt `UserInfo.corona_color` an, und `UserInfo` steckt mitten in `Welcome`: Client und Server von vor Minor 5 sind mit Minor-5-Gegenstellen nicht kompatibel und werden über das Mindest-Minor abgewiesen.
+- Minor: der Client nennt sein Protokoll-Minor in `Hello.minor`, der Server seins in `Welcome.server_minor`; `Welcome.minor` ist das ausgehandelte `min(client, server)`. Varianten oberhalb des ausgehandelten Minors werden nie gesendet. Ein Minor 0 gibt es nicht; aktuell ist `minor = 8`. Minor 5 hängt `UserInfo.corona_color` an, und `UserInfo` steckt mitten in `Welcome`: Client und Server von vor Minor 5 sind mit Minor-5-Gegenstellen nicht kompatibel und werden über das Mindest-Minor abgewiesen.
 - Mindestversionen, beidseitig durchgesetzt (2026-09-26). Jede Seite hat ein Mindest-Minor für die Gegenseite (`icu_proto::MIN_PEER_MINOR`, derzeit 8):
   - Der Server schließt mit `VERSION_UNSUPPORTED`, wenn `Hello.minor` darunter liegt, oder wenn die SemVer in `Hello.client` (`<name>/<semver> <os>`, Pre-Release-Suffix zählt nicht) unter `server.min_client` liegt oder sich nicht lesen lässt. Das gilt für jede Sitzung, Registrierung und renew-only eingeschlossen.
   - Der Client schließt selbst mit `VERSION_UNSUPPORTED`, wenn `Welcome.server_minor` darunter liegt, fatal, mit dem Hinweis, dass der Server aktualisiert werden muss.
@@ -387,8 +388,9 @@ Die Decode-Warteschlange hält höchstens zwei Access Units je Sprecher, 64 insg
 und 8 MiB. Referenzlücken warten auf ein IDR. Der Server behält seine unabhängigen
 Relay-/ACK-Grenzen; diese sind keine Lip-Sync-Garantie.
 
-Die Präsentation folgt je Sprecher den tatsächlich aus dem App-Ausgabering
+Die Zuordnung je Sprecher entsteht aus den tatsächlich aus dem App-Ausgabering
 verbrauchten Audiosamples plus nativer beziehungsweise geschätzter Geräteverzögerung.
-Frühe Bilder warten begrenzt, über 100 ms verspätete Bilder werden nicht angezeigt.
-Audio wird dafür nie verzögert. Ohne frische Audiozuordnung ist Video best effort.
+Seit 0.1.28 steuert sie die Anzeige nicht mehr: das neueste frische dekodierte
+Bild wird sofort gezeigt, die Zuordnung dient der Diagnose (`docs/reference/client.md`).
+Audio wird nie verzögert.
 Alle Videooberflächen lesen denselben monoton fortschreitenden Präsentationsstand.

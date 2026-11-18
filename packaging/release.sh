@@ -61,7 +61,7 @@ mapfile -t files <<< "$list"
 (cd "$OUT" && sha256sum -c --quiet SHA256SUMS) || die "checksums in $OUT do not match"
 
 # The release key is the owner's; this script never creates it.
-publish_key="printf 'icu-release namespaces=\"icu-release\" %s\\n' \"\$(cut -d' ' -f1,2 $ICU_RELEASE_KEY.pub)\" > $ALLOWED_SIGNERS"
+publish_key="printf 'icu-release namespaces=\"icu-release,icu-update\" %s\\n' \"\$(cut -d' ' -f1,2 $ICU_RELEASE_KEY.pub)\" > $ALLOWED_SIGNERS"
 [ -f "$ICU_RELEASE_KEY" ] || die "signing key $ICU_RELEASE_KEY missing (ICU_RELEASE_KEY). Create it once
     ssh-keygen -t ed25519 -C icu-release -f $ICU_RELEASE_KEY
 and commit its public half, which users verify against:
@@ -76,13 +76,15 @@ podman run --rm --security-opt label=disable -v "$PWD":/repo:ro "$GITLEAKS_IMAGE
     git --no-banner --redact --config /repo/.gitleaks.toml \
     --gitleaks-ignore-path /repo/.gitleaksignore /repo \
     || die "gitleaks found something; check before publishing"
-if git log -p --all | grep -q 'BEGIN [A-Z ]*PRIVATE KEY'; then
+# `grep -c`, not `-q`: `-q` leaves at the first hit, git dies of SIGPIPE, and
+# under pipefail the pipeline then counts as failed — a hit read as "clean".
+if git log -p --all | grep -c 'BEGIN [A-Z ]*PRIVATE KEY' >/dev/null; then
     die "a PEM private key appears in the history"
 fi
 # A passport or registration bundle carries a private key too. The armor
 # line alone is in docs and tests; a base64 body right after it is not.
 if git log -p --all | grep -A1 -e '-----BEGIN ICU PASSPORT-----' \
-        | grep -qE '[A-Za-z0-9+/=]{40,}'; then
+        | grep -cE '[A-Za-z0-9+/=]{40,}' >/dev/null; then
     die "an ICU passport (private key) appears in the history"
 fi
 
