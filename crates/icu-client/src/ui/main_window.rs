@@ -47,9 +47,9 @@ pub const CONNECTION_SIZE: [f32; 2] = [720.0, 780.0];
 /// What the setup window opens with: every step fits without a scroll bar;
 /// only a banner about the keys may make it grow (`tests/ui_layout.rs`).
 pub const SETUP_SIZE: [f32; 2] = [600.0, 720.0];
-/// Participant profile and compact transport route. Expanded certificate
-/// details and moderation can grow the window (`tests/ui_layout.rs`).
-pub const USER_SIZE: [f32; 2] = [680.0, 480.0];
+/// Participant profile, transport route and space for certificate details.
+/// Smaller windows scroll (`tests/ui_layout.rs`).
+pub const USER_SIZE: [f32; 2] = [680.0, 780.0];
 
 /// A microphone peak at or above this reads as clipping.
 pub(super) const CLIP_DB: f32 = -1.0;

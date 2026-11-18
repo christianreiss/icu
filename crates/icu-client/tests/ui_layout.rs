@@ -973,12 +973,7 @@ fn user_window_fits() {
             });
             h.run();
             let what = format!("user/{label}/{theme_name}");
-            // Self fits the initial size. The shared card rows and peer
-            // controls may grow the window, still within a 1080p desktop.
-            overflows.check_window(&what, &h, USER, label != "self", *overflow.borrow());
-            if label == "member" {
-                assert!(h.ctx.content_rect().height() <= 780.0);
-            }
+            overflows.check_window(&what, &h, USER, false, *overflow.borrow());
             shot(&mut h, &what.replace('/', "-"));
         }
     }
@@ -1744,8 +1739,8 @@ fn setup_skip_keeps_everything_and_an_earlier_mute() {
 fn user_path_details_and_missing_data() {
     for theme_name in THEMES {
         for (case, width, missing, long) in [
-            ("normal", 900.0, false, false),
-            ("narrow-long", 760.0, false, true),
+            ("normal", USER[0], false, false),
+            ("narrow-long", 460.0, false, true),
             ("missing", 760.0, true, false),
             ("pending", 760.0, false, false),
             ("invalid", 760.0, false, false),
@@ -1776,14 +1771,18 @@ fn user_path_details_and_missing_data() {
                 _ => {}
             }
             let mut view = UserView::new(2);
-            let height = if width < 900.0 { 520.0 } else { 640.0 };
+            let server_subject = s.conn_info.as_ref().unwrap().server_cert.subject.clone();
+            let height = if long { 640.0 } else { USER[1] };
+            let overflow = Rc::new(RefCell::new(0.0));
+            let current_overflow = overflow.clone();
             let mut h = harness([width, height], theme_name, true, move |ui| {
                 ui.ctx().input_mut(|input| {
                     for viewport in input.raw.viewports.values_mut() {
                         viewport.monitor_size = Some(egui::vec2(1920.0, 1080.0));
                     }
                 });
-                user_with_refreshed_list(&mut view, ui, &mut s, &|_| {});
+                *current_overflow.borrow_mut() =
+                    user_with_refreshed_list(&mut view, ui, &mut s, &|_| {}).overflow;
                 assert!(
                     ui.min_rect().right() <= ui.max_rect().right() + 0.5,
                     "user path overflows horizontally"
@@ -1791,19 +1790,43 @@ fn user_path_details_and_missing_data() {
             });
             h.run();
             shot(&mut h, &format!("user-path-{case}-{theme_name}"));
-            for (name, label) in [
+            let tabs = [
                 ("peer", "Nutzerzertifikat"),
                 ("server", "Serverzertifikat"),
                 ("own", "Dein Zertifikat"),
-            ] {
-                let glyph = egui_phosphor::regular::CERTIFICATE;
+                ("ca", "CA"),
+            ];
+            let glyph = egui_phosphor::regular::CERTIFICATE;
+            let mut tab_rects = None;
+            let mut connection = None;
+            let mut pane_overflow = None;
+            for (name, label) in tabs {
                 h.get_by_label(&format!("{glyph} {label}")).click();
                 h.run();
+                let positions =
+                    tabs.map(|(_, label)| h.get_by_label(&format!("{glyph} {label}")).rect());
+                assert_eq!(*tab_rects.get_or_insert(positions), positions);
+                let link = h.get_by_label("Alle Verbindungsdetails").rect();
+                assert_eq!(*connection.get_or_insert(link), link);
+                if name == "server" {
+                    let subject = h.get_by_label(&server_subject).rect();
+                    assert!(h.ctx.content_rect().contains(subject.center()));
+                }
+                let height = *overflow.borrow();
+                let expected = *pane_overflow.get_or_insert(height);
+                assert!(
+                    (height - expected).abs() <= 0.5,
+                    "certificate pane changed height"
+                );
+                assert!(!h.output().viewport_output.values().any(|v| v
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::InnerSize(_)))));
                 shot(&mut h, &format!("user-path-{case}-{name}-{theme_name}"));
-                // Same button collapses the details again.
-                h.get_by_label(&format!("{glyph} {label}")).click();
-                h.run();
             }
+            h.get_by_label(&format!("{glyph} CA")).click();
+            h.run();
+            assert!(h.query_by_label("Fingerabdruck (SHA-256)").is_none());
         }
     }
 }

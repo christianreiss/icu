@@ -517,9 +517,9 @@ verbleibende Desktop-Prüfungen stehen in der Live-Test-Checkliste.
 
 ### Nutzerpfad, Zertifikate und Vertrauen
 
-Die Nutzeransicht öffnet mit Avatar, Anzeigename, Rolle und Sprachstatus. Die persönliche Wiedergabelautstärke steht direkt darunter. Berechtigte Aktionen sind über „Moderation“ erreichbar. Der Verbindungspfad nennt die RTT pro Serverstrecke und den lokalen Audio-Empfangsverlust. Das Fenster startet mit 680×480 Punkten, lässt sich bis 460×400 verkleinern und ordnet die Strecke bei wenig Platz vertikal an.
+Die Nutzeransicht öffnet mit Avatar, Anzeigename, Rolle und Sprachstatus. Die persönliche Wiedergabelautstärke steht direkt darunter. Berechtigte Aktionen sind über „Moderation“ erreichbar. Der Verbindungspfad nennt die RTT pro Serverstrecke und den lokalen Audio-Empfangsverlust. Das Fenster startet mit 680×780 Punkten, lässt sich bis 460×400 verkleinern und ordnet die Strecke bei wenig Platz vertikal an. Bei wenig Höhe lässt sich die Ansicht scrollen.
 
-Unter „Zertifikate & Vertrauen“ öffnet die Auswahl das jeweilige Zertifikat. Beide Detailfenster verwenden dieselbe Ansicht für Identität, Gültigkeit, Vertrauensnachweise, SHA-256-Fingerabdruck und technische Details. Kopieren übernimmt den vollständigen Fingerabdruck.
+Unter „Zertifikate & Vertrauen“ öffnet die Auswahl das jeweilige Zertifikat in einem gleich hohen, scrollbaren Bereich. Beim Wechsel bleiben Fenstergröße, Auswahlleiste und der Link zu den Verbindungsdetails an ihrem Platz. Ein erneuter Klick auf die aktive Auswahl schließt den Bereich. Beide Detailfenster verwenden dieselbe Ansicht für Identität, Gültigkeit, Vertrauensnachweise, SHA-256-Fingerabdruck und technische Details. Kopieren übernimmt den vollständigen Fingerabdruck.
 
 Administrative Aktionen im Nutzerfenster und Kontextmenü warten zunächst auf
 eine neue Nutzerlisten-Antwort; eine gefüllte alte Liste gilt nicht als

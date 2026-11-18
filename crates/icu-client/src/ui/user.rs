@@ -9,7 +9,9 @@ use egui::{RichText, Ui};
 use egui_phosphor::regular as icon;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+const CERTIFICATE_PANE_HEIGHT: f32 = 264.0;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum Certificate {
     Peer,
     Server,
@@ -35,7 +37,7 @@ pub struct UserOutput {
     pub open_connection: bool,
     /// The selected participant is no longer online.
     pub left: bool,
-    /// Vertical overflow used by the common window sizing policy.
+    /// Content beyond the visible height, available by scrolling.
     pub overflow: f32,
 }
 
@@ -130,13 +132,8 @@ impl UserView {
                 .and_then(|r| r.as_ref().ok())
                 .map(|c| c.as_ref())
         };
-        let certs = [
-            peer_cert,
-            info.map(|i| &i.server_cert),
-            info.map(|i| &i.client_cert),
-        ];
         let draw_page = |ui: &mut Ui| {
-            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.spacing_mut().item_spacing.y = 4.0;
             let tok = theme::tokens(ui.visuals());
             ui.horizontal_top(|ui| {
                 widgets::avatar(ui, p.name, p.user_id, p.speaking, p.ring, 52.0, p.video);
@@ -181,7 +178,8 @@ impl UserView {
                     let vertical = width < 32.0 * ui.text_style_height(&egui::TextStyle::Body);
                     let latency = |ms: Option<u16>| {
                         let arrow = if vertical { "↓" } else { "→" };
-                        let reading = ms.map_or_else(|| "RTT unbekannt".into(), |v| format!("{v} ms RTT"));
+                        let reading =
+                            ms.map_or_else(|| "RTT unbekannt".into(), |v| format!("{v} ms RTT"));
                         format!("{arrow}  {reading}  {arrow}")
                     };
                     let route = |ui: &mut Ui| {
@@ -228,52 +226,91 @@ impl UserView {
             });
             widgets::group_card(ui, "Zertifikate & Vertrauen", |ui| {
                 egui::Frame::new().inner_margin(12).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
                     ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(format!("{} QUIC · TLS 1.3 · mTLS", icon::LOCK_KEY)).small());
+                        if ui.link("Alle Verbindungsdetails").clicked() {
+                            out.open_connection = true;
+                        }
+                    });
+                    ui.label(RichText::new("Der Transport ist verschlüsselt. Der Server kann die weitergeleiteten Medien lesen.").small());
+                    ui.separator();
+                    let was_closed = self.selected.is_none();
+                    let tabs = ui.horizontal_wrapped(|ui| {
                         for (pick, label) in [
                             (Certificate::Peer, "Nutzerzertifikat"), (Certificate::Server, "Serverzertifikat"),
                             (Certificate::Own, "Dein Zertifikat"), (Certificate::Ca, "CA")
                         ] {
                             if own && pick == Certificate::Peer { continue; }
-                            if ui.selectable_label(self.selected == Some(pick), format!("{} {label}", icon::CERTIFICATE)).clicked() {
-                                self.toggle(pick);
+                            let selected = self.selected == Some(pick);
+                            // Selected and inactive buttons reserve the same
+                            // stroke and padding, so adjacent buttons stay put.
+                            let border = if selected {
+                                ui.visuals().selection.stroke.color
+                            } else {
+                                ui.visuals().widgets.inactive.bg_stroke.color
+                            };
+                            let button = egui::Button::new(format!("{} {label}", icon::CERTIFICATE))
+                                .selected(selected)
+                                .stroke(egui::Stroke::new(1.0, border))
+                                .min_size(egui::vec2(0.0, 26.0));
+                            if ui.add(button).clicked() {
+                                self.selected = (!selected).then_some(pick);
+                                self.copied = None;
                             }
                         }
                     });
-                    if !own {
-                        let error = peer_result.and_then(|r| r.as_ref().err()).map(String::as_str);
-                        if let Some(message) = error.or((peer_result.is_none() && timed_out).then_some("Zertifikatsabfrage ohne Antwort")) {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(message);
-                                if ui.button("Erneut laden").clicked() {
-                                    send(Command::RequestPeerCertificate(p.session));
-                                    self.requested = Some((p.session, Instant::now()));
-                                    ui.ctx().request_repaint_after(Duration::from_secs(8));
-                                }
-                            });
-                        } else if peer_result.is_none() {
-                            ui.label("Nutzerzertifikat wird geladen …");
-                        }
-                    }
                     if let Some(selected) = self.selected {
-                        ui.add_space(6.0);
                         let cert = match selected {
-                            Certificate::Peer => certs[0], Certificate::Server => certs[1],
-                            Certificate::Own => certs[2], Certificate::Ca => info.map(|i| &i.ca_cert),
+                            Certificate::Peer => peer_cert,
+                            Certificate::Server => info.map(|i| &i.server_cert),
+                            Certificate::Own => info.map(|i| &i.client_cert),
+                            Certificate::Ca => info.map(|i| &i.ca_cert),
                         };
                         ui.separator();
-                        if let Some(cert) = cert {
-                            certificate_details(ui, cert, selected == Certificate::Ca,
-                                (selected == Certificate::Server).then_some(state.server_name.as_str()), &mut self.copied);
-                        } else if selected != Certificate::Peer {
-                            ui.weak("Zertifikat noch nicht verfügbar");
+                        // The outer page and the selector keep their geometry as
+                        // the certificate, loading state or technical details change.
+                        let pane = egui::ScrollArea::vertical()
+                            .id_salt(("certificate", selected))
+                            .max_height(CERTIFICATE_PANE_HEIGHT)
+                            .min_scrolled_height(CERTIFICATE_PANE_HEIGHT)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if let Some(cert) = cert {
+                                    certificate_details(
+                                        ui,
+                                        cert,
+                                        selected == Certificate::Ca,
+                                        (selected == Certificate::Server).then_some(state.server_name.as_str()),
+                                        &mut self.copied,
+                                    );
+                                } else if selected == Certificate::Peer {
+                                    let error = peer_result
+                                        .and_then(|r| r.as_ref().err())
+                                        .map(String::as_str)
+                                        .or(timed_out.then_some("Zertifikatsabfrage ohne Antwort"));
+                                    if let Some(message) = error {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(message);
+                                            if ui.button("Erneut laden").clicked() {
+                                                send(Command::RequestPeerCertificate(p.session));
+                                                self.requested = Some((p.session, Instant::now()));
+                                                ui.ctx().request_repaint_after(Duration::from_secs(8));
+                                            }
+                                        });
+                                    } else {
+                                        ui.weak("Nutzerzertifikat wird geladen …");
+                                    }
+                                } else {
+                                    ui.weak("Zertifikat noch nicht verfügbar");
+                                }
+                            });
+                        if was_closed {
+                            let reveal = tabs.response.rect.union(pane.inner_rect);
+                            ui.scroll_to_rect(reveal, None);
                         }
                     }
-                    ui.separator();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(format!("{} QUIC · TLS 1.3 · mTLS", icon::LOCK_KEY)).small());
-                        if ui.link("Alle Verbindungsdetails").clicked() { out.open_connection = true; }
-                    });
-                    ui.label(RichText::new("Der Transport ist verschlüsselt. Der Server kann die weitergeleiteten Medien lesen.").small());
                 });
             });
         };
@@ -281,16 +318,7 @@ impl UserView {
             .auto_shrink([false, false])
             .show(ui, draw_page);
         out.overflow = page.content_size.y - page.inner_rect.height();
-        super::grow_to_fit(ui.ctx(), out.overflow);
         out
-    }
-
-    fn toggle(&mut self, cert: Certificate) {
-        self.selected = if self.selected == Some(cert) {
-            None
-        } else {
-            Some(cert)
-        };
     }
 }
 
