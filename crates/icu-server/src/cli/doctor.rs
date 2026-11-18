@@ -647,7 +647,7 @@ fn socket(report: &mut Report, config: &Config) {
         Some(parent) if !parent.exists() => report.info(
             "socket.dir",
             format!(
-                "{} does not exist; the unit creates it (RuntimeDirectory=icu, 0750)",
+                "{} does not exist; the unit creates it (RuntimeDirectory=icu, 0755)",
                 parent.display()
             ),
         ),

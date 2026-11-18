@@ -23,6 +23,14 @@ UMask=0077
 # the dynamic group and nobody else got through the directory. The state
 # stays private: systemd keeps it under /var/lib/private (0700 root).
 Group=icu
+# The monitoring socket is handed to `server.monitor_socket_group`
+# (`icu-monitor`, created by sysusers and the packages' preinstall). Without
+# CAP_CHOWN a process may only give a file to a group it belongs to, and
+# the dynamic user is in `icu` alone: the chgrp failed with EPERM, the
+# socket stayed `icu` (full admin) and a monitoring agent that is only in
+# `icu-monitor` could not open it. Membership grants the service nothing
+# else — no file belongs to that group but this socket.
+SupplementaryGroups=icu-monitor
 StateDirectory=icu
 # Keys and users.toml: nobody but the service. The sockets live in
 # RuntimeDirectory, so the groups keep their way in.
