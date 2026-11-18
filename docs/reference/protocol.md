@@ -390,7 +390,8 @@ Relay-/ACK-Grenzen; diese sind keine Lip-Sync-Garantie.
 
 Die Zuordnung je Sprecher entsteht aus den tatsächlich aus dem App-Ausgabering
 verbrauchten Audiosamples plus nativer beziehungsweise geschätzter Geräteverzögerung.
-Seit 0.1.28 steuert sie die Anzeige nicht mehr: das neueste frische dekodierte
-Bild wird sofort gezeigt, die Zuordnung dient der Diagnose (`docs/reference/client.md`).
+Ein Bild, dessen Ton erst später zu hören ist, wartet darauf — begrenzt auf
+600 ms, geglättet, und ohne je ein Bild zu verwerfen (`video::Hold`,
+`docs/reference/client.md`); 0.1.28 bis 0.1.30 zeigten jedes Bild sofort.
 Audio wird nie verzögert.
 Alle Videooberflächen lesen denselben monoton fortschreitenden Präsentationsstand.

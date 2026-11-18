@@ -647,16 +647,40 @@ Capture läuft getrennt von Encode/Send weiter und überschreibt einen Latest-Sl
 Es gibt keine Effekt-, Helligkeits-, Schärfe- oder Sync-Regler.
 
 Minor 8 trägt gemeinsame Capture-Zeit und Epochen in beiden Medienheadern.
-Audio-Samplezähler und Pegel-Epochen behalten ihre Zuständigkeiten. Seit dem Notfallfix 0.1.28 zeigt die gemeinsame Videopräsentation wieder
-das neueste frische dekodierte Bild sofort. Audioanker und Medienzeit bleiben
-für Diagnosen erhalten, steuern aber weder Bildfreigabe noch Wartezeiten;
-die Sprachlatenz wird nicht künstlich erhöht. Audio ohne native
-Timingdaten und Kamera ohne plausible Zeitstempel sind ausdrücklich Schätzungen.
-`--debug-stats` zeigt Verarbeitungs-/Queue-Zeiten, Budget-Bypässe, späte Bilder,
-Timing-Schätzungen und den Decode-Abstand zum geschätzten Audioziel. Dieser
-Decode-Abstand ist keine Messung von Display- oder Schalllaufzeit.
+Audio-Samplezähler und Pegel-Epochen behalten ihre Zuständigkeiten. Die
+Sprachlatenz wird nie künstlich erhöht. Audio ohne native Timingdaten und Kamera
+ohne plausible Zeitstempel sind ausdrücklich Schätzungen.
 
-Die Decode-Queue bleibt zeitlich und mengenmäßig begrenzt. Die mit 0.1.27
-eingeführte A/V-Präsentationsfilterung wurde in 0.1.28 entfernt: ein unpassender
-Audiozielwert darf einen gesunden Kamerastream nicht ausblenden.
-Physische Lip-Sync-Abnahme bleibt ein eigener Linux-/Windows-Hardwaretest.
+**Lippensynchronität (seit 2026-11-18, `video::Hold`).** Ton braucht länger als
+Bild: Jitter-Puffer, Mixer und das Ausgabegerät, das bei einem Bluetooth-Headset
+allein 150–450 ms beiträgt. Bis dahin lief das Bild dem Ton um genau diese Zeit
+voraus. Jetzt wartet ein dekodiertes Bild, bis sein Ton zu hören ist:
+
+- Der Mixer meldet je Sprecher, wann ein Moment seiner Aufnahmezeit tatsächlich
+  aus dem Gerät kommt. Für jedes dekodierte Bild ergibt das, wie viel später sein
+  Ton spielt. Der Median der letzten 15 Messungen, abzüglich 40 ms (so viel
+  Vorlauf des Bilds bemerkt niemand; ITU-R BT.1359), ist die Haltezeit.
+- Die Haltezeit ändert sich um höchstens 8 ms je Bild und beträgt höchstens
+  600 ms. Fehlt die Zuordnung (der Sprecher schweigt, Gerätewechsel, Unterlauf),
+  bleibt sie stehen. Ein Sprecher ohne eigene Messung übernimmt die eines
+  anderen: das Ausgabegerät ist dasselbe.
+- Nur eine vom Gerät selbst gemeldete Wiedergabezeit zählt (PipeWire). Eine
+  geschätzte (WASAPI, cpal) kennt die Geräteverzögerung nicht und hält nichts
+  zurück: dort bleibt es beim sofortigen Anzeigen.
+- Kein Bild wird je deswegen verworfen oder ausgeblendet. Die Meldung des Tons
+  verschiebt nur diese eine Zahl; jedes Bild erscheint in Reihenfolge, spätestens
+  600 ms nach dem Decode. 0.1.27 hatte jedes Bild einzeln gegen den Audiozielwert
+  geprüft und bei −421 ms beide Kamerabilder ausgeblendet (Notfallfix 0.1.28) —
+  das kann diese Bauart nicht.
+- Der Ton wird nie verzögert; ein Bild, das hinter seinem Ton liegt, erscheint
+  sofort.
+
+Ein gehaltenes Bild weckt die Fenster, wenn es fällig wird (`VideoSink::tick`,
+alle ≤ 16 ms). `--debug-stats` zeigt neben Verarbeitungs-/Queue-Zeiten,
+Budget-Bypässen, späten Bildern und Timing-Schätzungen den Decode-Abstand zum
+Audioziel (`av_decode_offset_us`, negativ: der Ton kommt später) und die
+Haltezeit (`av_hold_us`). Beides sind Rechenwerte aus gemeldeten Zeiten, keine
+Messung von Display- oder Schalllaufzeit; die physische Abnahme bleibt ein
+eigener Hardwaretest (`docs/development/testing.md`).
+
+Die Decode-Queue bleibt zeitlich und mengenmäßig begrenzt.

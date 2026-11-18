@@ -61,6 +61,10 @@ struct Shared {
 
 /// The fake backend.
 pub struct FakeBackend {
+    /// µs between a playback callback and the device playing its first
+    /// sample, reported as the device's own timing; `u64::MAX`: none
+    /// reported, the engine estimates ([`FakeBackend::with_output_delay`]).
+    output_delay: Arc<std::sync::atomic::AtomicU64>,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
     events: Option<mpsc::Receiver<BackendEvent>>,
@@ -106,6 +110,7 @@ impl FakeBackend {
             .expect("spawn fake audio thread");
         (
             FakeBackend {
+                output_delay: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
                 shared,
                 thread: Some(thread),
                 events: Some(rx),
@@ -118,6 +123,18 @@ impl FakeBackend {
     /// A silent backend.
     pub fn silent() -> (FakeBackend, FakeProbe) {
         Self::new(Box::new(|_, out| out.fill(0.0)))
+    }
+}
+
+impl FakeBackend {
+    /// Reports playback timing like a native backend does: each callback's
+    /// first sample is played `delay` later, and the backend says so itself
+    /// (a Bluetooth sink reports a few hundred milliseconds). Without this
+    /// the fake reports nothing and the engine estimates.
+    pub fn with_output_delay(self, delay: Duration) -> FakeBackend {
+        self.output_delay
+            .store(delay.as_micros() as u64, Ordering::Relaxed);
+        self
     }
 }
 
@@ -221,6 +238,27 @@ impl AudioBackend for FakeBackend {
     ) -> Result<(), BackendError> {
         *self.shared.playback.lock().unwrap() = Some(cb);
         Ok(())
+    }
+
+    fn open_playback_timed(
+        &mut self,
+        device: Option<&str>,
+        mut cb: super::backend::TimedPlaybackCallback,
+    ) -> Result<(), BackendError> {
+        let delay = self.output_delay.clone();
+        self.open_playback(
+            device,
+            Box::new(move |samples| {
+                let timing = match delay.load(Ordering::Relaxed) {
+                    u64::MAX => super::backend::AudioTiming::estimated_playback(),
+                    micros => super::backend::AudioTiming {
+                        at: std::time::Instant::now() + Duration::from_micros(micros),
+                        accurate: true,
+                    },
+                };
+                cb(samples, timing)
+            }),
+        )
     }
 
     fn close(&mut self, stream: StreamKind) {

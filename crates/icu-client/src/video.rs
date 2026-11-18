@@ -36,6 +36,107 @@ const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(1100)
 /// overlay drops the tile, the participant list falls back to the initials.
 const FRESH: Duration = Duration::from_secs(3);
 
+/// Longest a decoded picture is held back for its sound. Sound that plays
+/// later than this after the picture was decoded — a Bluetooth headset is
+/// 150–450 ms behind — is followed up to here and no further: a wrong
+/// audio timing can then delay the picture by this much and never hide it.
+const SYNC_MAX_HOLD: Duration = Duration::from_millis(600);
+
+/// How far a picture may run ahead of its sound and still be shown at once.
+/// Lips up to about 45 ms early are not noticed (ITU-R BT.1359), so on
+/// wired outputs nothing is held at all.
+const SYNC_LEAD: Duration = Duration::from_millis(40);
+
+/// Pictures whose measured lead the hold is the median of: a second's worth.
+const SYNC_WINDOW: usize = 15;
+
+/// Measurements before the hold follows them.
+const SYNC_MIN: usize = 5;
+
+/// How much the hold changes per picture: at 15 fps the picture runs 12 %
+/// slow or fast while it adjusts, and 400 ms are reached in 3.3 s.
+const SYNC_SLEW: Duration = Duration::from_millis(8);
+
+/// Decoded pictures kept per speaker. [`SYNC_MAX_HOLD`] holds 9 at 15 fps;
+/// one that has to make room unshown is shown, not dropped.
+const PICTURES: usize = 16;
+
+/// How long a speaker's pictures wait so that they appear with their sound
+/// instead of ahead of it.
+///
+/// Sound takes longer than pictures: jitter buffer, mixer and the output
+/// device, which on Bluetooth alone is several hundred milliseconds. The
+/// mixer reports when a moment of the speaker's capture time is heard
+/// (`crate::media::Playout`); a picture decoded before its moment waits for
+/// it. Sound is never delayed, and a picture that is late is shown at once.
+///
+/// 0.1.27 gated each picture on that report and hid the video when the
+/// report said −421 ms. Here the report only moves one number, the hold:
+/// the median of recent measurements, changed a few milliseconds per
+/// picture, at most [`SYNC_MAX_HOLD`]. Every decoded picture is shown, in
+/// order, at the latest that long after its decode.
+#[derive(Default)]
+struct Hold {
+    /// µs after their decode that the sound of the last pictures played;
+    /// negative when it had played already.
+    leads: VecDeque<i64>,
+    delay: Duration,
+    last_due: Option<Instant>,
+}
+
+impl Hold {
+    /// When the picture decoded at `at` is to be shown. `lead` is its own
+    /// measurement, if the sound's timing is known; `hint` what another
+    /// speaker's pictures are held for — the output device is the same —
+    /// for as long as this one has no measurements of its own.
+    fn due(&mut self, at: Instant, lead: Option<i64>, hint: Option<Duration>) -> Instant {
+        if let Some(lead) = lead {
+            if self.leads.len() == SYNC_WINDOW {
+                self.leads.pop_front();
+            }
+            self.leads.push_back(lead);
+        }
+        let wanted = match self.measured() {
+            Some(wanted) => Some(wanted),
+            None if self.leads.is_empty() => hint,
+            None => None,
+        };
+        if let Some(wanted) = wanted {
+            self.delay = if wanted > self.delay {
+                (self.delay + SYNC_SLEW).min(wanted)
+            } else {
+                self.delay.saturating_sub(SYNC_SLEW).max(wanted)
+            };
+        }
+        // Never before its predecessor: the pictures stay in order.
+        let due = (at + self.delay).max(self.last_due.unwrap_or(at));
+        self.last_due = Some(due);
+        due
+    }
+
+    /// The hold the measurements ask for, once there are enough of them.
+    fn measured(&self) -> Option<Duration> {
+        if self.leads.len() < SYNC_MIN {
+            return None;
+        }
+        let mut sorted: Vec<i64> = self.leads.iter().copied().collect();
+        sorted.sort_unstable();
+        let median = sorted[sorted.len() / 2];
+        Some(
+            Duration::from_micros(median.max(0) as u64)
+                .saturating_sub(SYNC_LEAD)
+                .min(SYNC_MAX_HOLD),
+        )
+    }
+
+    /// The sound's timing is no longer valid (another device, a gap): what
+    /// was measured against it is forgotten, the hold itself stays until
+    /// new measurements move it.
+    fn forget_sound(&mut self) {
+        self.leads.clear();
+    }
+}
+
 /// A quality tier for the outgoing camera stream, stepped by
 /// `crate::quality::QualityController` in response to measured network
 /// conditions (`docs/reference/client.md` §8). Video absorbs all of the
@@ -701,9 +802,16 @@ struct Receiver {
     /// `None` while [`Receivers::accept`] has lent it to the decode thread,
     /// or when no decoder could be created.
     decoder: Option<Decoder>,
-    pictures: VecDeque<(u64, Frame)>,
+    /// Decoded pictures with the time each is due ([`Hold`]).
+    pictures: VecDeque<(u64, Frame, Instant)>,
     shown: Mutex<Option<(u64, Frame)>>,
     audio: Option<crate::media::Playout>,
+    /// `audio` comes from the output device's own timing, not from an
+    /// estimate that knows nothing of the device's delay.
+    audio_accurate: bool,
+    hold: Hold,
+    /// The newest due picture the windows were woken for.
+    announced: u64,
     media_epoch: u32,
     /// Counts decoded pictures, mirroring `crate::camera::PreviewSlot::seq`:
     /// a viewer that already uploaded `seq` knows the pixels have not changed
@@ -728,9 +836,12 @@ impl Receiver {
             decoder: Decoder::new().ok(),
             #[cfg(not(feature = "camera"))]
             decoder: Some(Decoder),
-            pictures: VecDeque::with_capacity(3),
+            pictures: VecDeque::with_capacity(PICTURES),
             shown: Mutex::new(None),
             audio: None,
+            audio_accurate: false,
+            hold: Hold::default(),
+            announced: 0,
             media_epoch: 0,
             seq: 0,
             got_keyframe: false,
@@ -741,17 +852,70 @@ impl Receiver {
         }
     }
 
+    /// Takes in a decoded picture and says whether its hold rests on
+    /// measurements of this speaker's own sound.
+    fn present(&mut self, picture: Frame, hint: Option<Duration>) -> bool {
+        self.seq += 1;
+        let lead = self
+            .audio
+            .filter(|_| self.audio_accurate)
+            .and_then(|audio| audio.target(picture.stamp, picture.at))
+            .map(|target| {
+                if target >= picture.at {
+                    target.duration_since(picture.at).as_micros() as i64
+                } else {
+                    -(picture.at.duration_since(target).as_micros() as i64)
+                }
+            });
+        let due = self.hold.due(picture.at, lead, hint);
+        if self.pictures.len() == PICTURES {
+            // More pictures than the hold can ever cover (a frame rate far
+            // above the profile's): the oldest goes on screen now rather
+            // than unseen.
+            if let Some((seq, frame, _)) = self.pictures.pop_front() {
+                let mut shown = self.shown.lock().unwrap();
+                if shown.as_ref().is_none_or(|(old, _)| *old < seq) {
+                    *shown = Some((seq, frame));
+                }
+            }
+        }
+        self.pictures.push_back((self.seq, picture, due));
+        self.hold.measured().is_some()
+    }
+
+    /// The newest picture that is due, if the windows have not been woken
+    /// for it yet.
+    fn take_due(&mut self, now: Instant) -> bool {
+        let newest = self
+            .pictures
+            .iter()
+            .rev()
+            .find(|(_, _, due)| *due <= now)
+            .map(|(seq, _, _)| *seq);
+        match newest {
+            Some(seq) if seq > self.announced => {
+                self.announced = seq;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn selected(&self, now: Instant) -> Option<(u64, Frame)> {
         let mut shown = self.shown.lock().unwrap();
-        for (seq, frame) in self.pictures.iter().rev() {
+        for (seq, frame, due) in self.pictures.iter().rev() {
             if shown.as_ref().is_some_and(|(old, _)| old >= seq) {
                 break;
+            }
+            // Not yet: its sound has not played ([`Hold`]). The hold only
+            // ever postpones a picture, by a bounded time; nothing here
+            // decides whether a picture is shown at all.
+            if *due > now {
+                continue;
             }
             if now.saturating_duration_since(frame.at) > FRESH {
                 continue;
             }
-            // Present the latest fresh decode immediately. Audio anchors are
-            // retained for diagnostics, never for gating camera visibility.
             *shown = Some((*seq, frame.clone()));
             break;
         }
@@ -766,6 +930,8 @@ impl Receiver {
 #[derive(Default)]
 pub struct Receivers {
     map: HashMap<Session, Receiver>,
+    /// The hold last measured for any speaker ([`Hold::due`]).
+    hold_hint: Option<Duration>,
 }
 
 impl Receivers {
@@ -804,6 +970,8 @@ impl Receivers {
             r.got_keyframe = false;
             r.last_seq = None;
             r.audio = None;
+            r.hold.forget_sound();
+            r.hold.last_due = None;
         }
         let seq = frame.header.seq;
         if let Some(last) = r.last_seq {
@@ -845,12 +1013,25 @@ impl Receivers {
         }
         r.decoder = Some(decoder);
         if let Some(picture) = picture {
-            r.seq += 1;
-            if r.pictures.len() == 3 {
-                r.pictures.pop_front();
+            if r.present(picture, self.hold_hint) {
+                self.hold_hint = Some(r.hold.delay);
             }
-            r.pictures.push_back((r.seq, picture));
         }
+    }
+
+    /// Whether a picture became due that the windows have not been woken
+    /// for: a new one that is shown at once, or one whose hold ran out.
+    pub fn take_due(&mut self, now: Instant) -> bool {
+        let mut any = false;
+        for r in self.map.values_mut() {
+            any |= r.take_due(now);
+        }
+        any
+    }
+
+    /// How long `session`'s pictures are currently held for their sound.
+    pub fn hold(&self, session: Session) -> Option<Duration> {
+        self.map.get(&session).map(|r| r.hold.delay)
     }
 
     /// Sessions that need an IDR (none yet, or one lost since), rate limited
@@ -903,10 +1084,19 @@ impl Receivers {
     pub fn picture(&self, session: Session) -> Option<(u64, Frame)> {
         self.map.get(&session)?.selected(Instant::now())
     }
-    pub fn audio_playout(&mut self, session: Session, anchor: crate::media::Playout) {
+    /// When a moment of `session`'s capture time is heard. `accurate`: the
+    /// output device reported that time itself; an estimate is kept for the
+    /// diagnostics but holds no picture.
+    pub fn audio_playout(
+        &mut self,
+        session: Session,
+        anchor: crate::media::Playout,
+        accurate: bool,
+    ) {
         if let Some(r) = self.map.get_mut(&session) {
             if r.media_epoch == anchor.stamp.epoch {
                 r.audio = Some(anchor);
+                r.audio_accurate = accurate;
             }
         }
     }
@@ -916,6 +1106,7 @@ impl Receivers {
     pub fn clear_audio_playout(&mut self) {
         for r in self.map.values_mut() {
             r.audio = None;
+            r.hold.forget_sound();
         }
     }
     pub fn invalidate(&mut self, session: Session) {
@@ -1119,51 +1310,187 @@ mod tests {
         assert_eq!(sender.seq.load(Ordering::Relaxed), 1);
     }
 
-    #[test]
-    fn fresh_video_ignores_audio_offset_and_never_moves_backwards() {
-        let now = Instant::now();
-        for offset_ms in [-421i64, -101, -40, 0, 40, 101, 421] {
-            let mut r = Receiver::new();
-            r.audio = Some(crate::media::Playout {
-                stamp: crate::media::Stamp {
-                    micros: 1_000_000,
-                    epoch: 1,
-                },
-                at: if offset_ms >= 0 {
-                    now + Duration::from_millis(offset_ms as u64)
+    /// A decoded test picture.
+    fn picture_at(at: Instant, micros: u64) -> Frame {
+        Frame {
+            width: 2,
+            height: 2,
+            rgba: Arc::new(vec![0; 16]),
+            at,
+            stamp: crate::media::Stamp { micros, epoch: 1 },
+        }
+    }
+
+    /// Plays `frames` pictures into `r`, one every `period_ms` starting at
+    /// `start`, and renders every 16 ms in between like a window does.
+    /// `sound(i)` is how many ms after its decode picture `i`'s sound
+    /// plays, as the output device reports it; `None`: no report.
+    ///
+    /// Checked at every render, whatever the sound says: once a picture
+    /// was shown there always is one, it never goes back to an older one,
+    /// and no picture waits longer than [`SYNC_MAX_HOLD`]. Returns the
+    /// time of the last render.
+    fn play(
+        r: &mut Receiver,
+        start: Instant,
+        frames: u64,
+        period_ms: u64,
+        accurate: bool,
+        sound: impl Fn(u64) -> Option<i64>,
+    ) -> Instant {
+        let ms = Duration::from_millis;
+        let first = r.seq;
+        let mut decoded: Vec<(u64, Instant)> = Vec::new();
+        let mut last_shown = r.shown.lock().unwrap().as_ref().map(|(seq, _)| *seq);
+        let mut rendered = start;
+        for i in 0..frames {
+            let at = start + ms(i * period_ms);
+            let micros = 1_000_000 + (first + i) * period_ms * 1000;
+            r.audio = sound(i).map(|offset| crate::media::Playout {
+                stamp: crate::media::Stamp { micros, epoch: 1 },
+                at: if offset >= 0 {
+                    at + ms(offset as u64)
                 } else {
-                    now - Duration::from_millis((-offset_ms) as u64)
+                    at - ms((-offset) as u64)
                 },
             });
-            for seq in 1..=30 {
-                let at = now + Duration::from_millis(seq * 66);
-                let picture = Frame {
-                    width: 2,
-                    height: 2,
-                    rgba: Arc::new(vec![0; 16]),
-                    at,
-                    stamp: crate::media::Stamp {
-                        micros: 1_000_000 + seq * 66_000,
-                        epoch: 1,
-                    },
-                };
-                if r.pictures.len() == 3 {
-                    r.pictures.pop_front();
-                }
-                r.pictures.push_back((seq, picture));
-                assert_eq!(
-                    r.selected(at).unwrap().0,
-                    seq,
-                    "audio offset {offset_ms} ms"
+            r.audio_accurate = accurate;
+            r.present(picture_at(at, micros), None);
+            decoded.push((r.seq, at));
+            let mut now = at;
+            while now < at + ms(period_ms) {
+                let shown = r.selected(now).map(|(seq, _)| seq);
+                assert!(
+                    shown.is_some() || last_shown.is_none(),
+                    "the picture disappeared at picture {i}"
                 );
-                // A later render cannot move back to an older picture.
-                assert_eq!(r.selected(at + Duration::from_millis(10)).unwrap().0, seq);
+                assert!(shown >= last_shown, "back to an older picture at {i}");
+                // Everything decoded at least the longest hold ago is on
+                // screen or was replaced by something newer.
+                let overdue = decoded
+                    .iter()
+                    .rev()
+                    .find(|(_, t)| *t + SYNC_MAX_HOLD <= now)
+                    .map(|(seq, _)| *seq);
+                assert!(shown >= overdue, "picture {i}: {shown:?} < {overdue:?}");
+                last_shown = shown;
+                rendered = now;
+                now += ms(16);
+            }
+        }
+        rendered
+    }
+
+    /// The pictures wait for sound that plays later, as far as the hold
+    /// goes, and are never taken off the screen for it: not at the −421 ms
+    /// that blacked out 0.1.27, not by a report that is nonsense.
+    #[test]
+    fn pictures_wait_for_their_sound_and_never_disappear() {
+        let ms = Duration::from_millis;
+        let now = Instant::now();
+        for offset in [-5000i64, -421, -101, -40, 0, 40, 101, 250, 421, 900, 5000] {
+            let mut r = Receiver::new();
+            let end = play(&mut r, now, 150, 66, true, |_| Some(offset));
+            // Sound that played long ago is no timing at all; sound further
+            // away than the hold reaches is followed to its end.
+            let wanted = if offset < -2000 {
+                Duration::ZERO
+            } else {
+                ms(offset.max(0) as u64)
+                    .saturating_sub(SYNC_LEAD)
+                    .min(SYNC_MAX_HOLD)
+            };
+            assert_eq!(r.hold.delay, wanted, "sound {offset} ms after the decode");
+            let (seq, shown) = r.selected(end).unwrap();
+            if wanted.is_zero() {
+                assert_eq!(seq, r.seq, "nothing to wait for: the newest, at once");
+            } else if wanted < SYNC_MAX_HOLD {
+                // In sync: what is on screen is heard now, give or take a
+                // picture and the lead nobody notices.
+                let heard = shown.at + ms(offset as u64);
+                assert!(heard <= end + SYNC_LEAD, "sound {offset}: picture early");
+                assert!(heard + ms(66) > end, "sound {offset}: picture late");
             }
             assert!(
-                r.selected(now + Duration::from_secs(6)).is_none(),
+                r.selected(end + Duration::from_secs(6)).is_none(),
                 "stalled video still expires"
             );
         }
+    }
+
+    /// A playback time the backend only estimated says nothing about the
+    /// device's delay: it holds no picture, whatever it claims.
+    #[test]
+    fn an_estimated_playback_time_holds_nothing() {
+        let now = Instant::now();
+        let mut r = Receiver::new();
+        let end = play(&mut r, now, 60, 66, false, |_| Some(421));
+        assert_eq!(r.hold.delay, Duration::ZERO);
+        assert_eq!(r.selected(end).unwrap().0, r.seq);
+    }
+
+    /// The speaker stops talking, the output device changes, the timing
+    /// returns with another value: the hold stays while nothing is known
+    /// and follows when something is, and the picture is there throughout.
+    #[test]
+    fn the_hold_survives_silence_and_follows_a_new_device() {
+        let ms = Duration::from_millis;
+        let t0 = Instant::now();
+        let mut r = Receiver::new();
+        // Garbage in between must not move it: one report in four is off.
+        let noisy = |i: u64| Some(if i % 4 == 3 { 5000 } else { 300 });
+        let end = play(&mut r, t0, 90, 66, true, noisy);
+        assert_eq!(r.hold.delay, ms(260));
+
+        r.audio = None;
+        r.hold.forget_sound();
+        let end = play(&mut r, end + ms(66), 60, 66, true, |_| None);
+        assert_eq!(r.hold.delay, ms(260), "nothing known: kept");
+
+        // Wired speakers now: the first reports do not jump, then it goes.
+        let end = play(&mut r, end + ms(66), 3, 66, true, |_| Some(20));
+        assert_eq!(r.hold.delay, ms(260));
+        play(&mut r, end + ms(66), 60, 66, true, |_| Some(20));
+        assert_eq!(r.hold.delay, Duration::ZERO);
+    }
+
+    /// More pictures than the hold has room for are shown early, in order,
+    /// rather than dropped unseen.
+    #[test]
+    fn a_flood_of_pictures_is_shown_not_dropped() {
+        let t0 = Instant::now();
+        let mut r = Receiver::new();
+        // 125 pictures a second against a 600 ms hold: 75 would wait.
+        let end = play(&mut r, t0, 600, 8, true, |_| Some(5000));
+        assert_eq!(r.hold.delay, SYNC_MAX_HOLD);
+        assert_eq!(r.pictures.len(), PICTURES);
+        let (seq, _) = r.selected(end).unwrap();
+        assert!(r.seq - seq <= PICTURES as u64, "{seq} of {}", r.seq);
+    }
+
+    /// A speaker whose own sound has not been timed yet — silent so far, on
+    /// camera — is held like the others: the output device is the same.
+    #[test]
+    fn a_silent_speaker_is_held_like_the_others() {
+        let now = Instant::now();
+        let mut hold = Hold::default();
+        for i in 0..100u64 {
+            hold.due(
+                now + Duration::from_millis(i * 66),
+                None,
+                Some(Duration::from_millis(300)),
+            );
+        }
+        assert_eq!(hold.delay, Duration::from_millis(300));
+        // Its own measurements count once it has them.
+        for i in 100..200u64 {
+            hold.due(
+                now + Duration::from_millis(i * 66),
+                Some(140_000),
+                Some(Duration::from_millis(300)),
+            );
+        }
+        assert_eq!(hold.delay, Duration::from_millis(100));
     }
 
     #[test]

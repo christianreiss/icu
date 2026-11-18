@@ -220,6 +220,79 @@ async fn video_seq_advances_and_expires() {
     server.handle.shutdown().await;
 }
 
+/// Lip sync end to end: a viewer whose output device plays 300 ms late (a
+/// Bluetooth headset, as the backend reports it) holds the speaker's
+/// pictures back for about that long; a viewer on a direct output holds
+/// nothing. Both see moving pictures the whole time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pictures_are_held_for_a_late_output_device() {
+    let server = TestServer::start().await;
+    let (engine_a, _da) = server
+        .engine("alice", Box::new(FakeBackend::silent().0), true)
+        .await;
+    let late = FakeBackend::silent()
+        .0
+        .with_output_delay(Duration::from_millis(300));
+    let (engine_b, _db) = server.engine("bob", Box::new(late), false).await;
+    let direct = FakeBackend::silent().0.with_output_delay(Duration::ZERO);
+    let (engine_c, _dc) = server.engine("carol", Box::new(direct), false).await;
+    let alice = wait_connected(&engine_a).await.me.unwrap().session;
+    wait_connected(&engine_b).await;
+    wait_connected(&engine_c).await;
+
+    engine_a.command(Command::SetCamera(true));
+    wait_for(&engine_a, SOON, |s| s.camera_on).await;
+    let mut camera = CameraHandle::new(engine_a.camera_link());
+    camera.start_with(Box::new(SyntheticSource::new()));
+
+    let hold = |engine: &icu_client::engine::Engine| {
+        engine.stats().av_hold_us.load(Ordering::Relaxed) / 1000
+    };
+    let bob = engine_b.video_frames_source();
+    let carol = engine_c.video_frames_source();
+    assert!(
+        wait_until(Duration::from_secs(15), || hold(&engine_b) >= 200).await,
+        "bob holds alice's pictures for his headset: {} ms",
+        hold(&engine_b)
+    );
+    // Settled, and still moving for both.
+    let seq = |frames: &icu_client::engine::VideoFrames| {
+        frames
+            .seqs()
+            .iter()
+            .find(|(s, _)| *s == alice)
+            .map(|(_, seq)| *seq)
+    };
+    let (before_b, before_c) = (seq(&bob), seq(&carol));
+    assert!(before_b.is_some() && before_c.is_some());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    eprintln!(
+        "hold: late output {} ms, direct output {} ms; decode offset {} / {} µs",
+        hold(&engine_b),
+        hold(&engine_c),
+        engine_b.stats().av_offset_us.load(Ordering::Relaxed),
+        engine_c.stats().av_offset_us.load(Ordering::Relaxed),
+    );
+    assert!(seq(&bob) > before_b, "bob's picture moves");
+    assert!(seq(&carol) > before_c, "carol's picture moves");
+    assert!(
+        (200..=450).contains(&hold(&engine_b)),
+        "about the device's 300 ms plus the jitter buffer: {} ms",
+        hold(&engine_b)
+    );
+    assert!(
+        hold(&engine_c) <= 80,
+        "a direct output holds next to nothing: {} ms",
+        hold(&engine_c)
+    );
+
+    camera.stop();
+    engine_a.shutdown();
+    engine_b.shutdown();
+    engine_c.shutdown();
+    server.handle.shutdown().await;
+}
+
 /// Opens the test pattern for any device and counts how often it was asked.
 fn synthetic_opener(opened: Arc<AtomicUsize>) -> Opener {
     Box::new(

@@ -322,6 +322,31 @@ Physische Freigabe bleibt separat offen:
 - [ ] Stumm, PTT losgelassen, längere Stille, Hotplug und Fehler-Rückfall testen;
   Crash-Wiederherstellung ist ausdrücklich nicht garantiert.
 
+## Lippensynchronität (2026-11-18)
+
+Zwei Teilnehmer, Kamera an; der Zuschauer unter Linux mit Bluetooth-Headset,
+`icu --debug-stats`.
+
+- [ ] Klatschtest: der Sprecher klatscht vor der Kamera. Beim Zuschauer treffen
+  sich Hände und Knall; vorher sah man die Hände einige Zehntelsekunden vor dem
+  Knall.
+- [ ] `av_hold_us` steigt nach den ersten Worten binnen etwa 5 s auf ungefähr
+  die Latenz des Headsets (typisch 150 000–450 000) und bleibt dort, auch wenn
+  der Sprecher schweigt. `av_decode_offset_us` liegt um rund 40 000 darunter
+  (negativ).
+- [ ] Wechsel auf Lautsprecher oder Kabel: nach den nächsten Worten fällt
+  `av_hold_us` auf wenige 10 000 oder 0.
+- [ ] Das Bild verschwindet dabei nie und läuft nie rückwärts; beim Anpassen
+  läuft es für Sekunden unmerklich langsamer oder schneller.
+- [ ] Windows-Zuschauer: `av_hold_us` bleibt 0 (`estimated_playout=1`), das
+  Bild erscheint wie bisher sofort.
+
+Quelltests: `pictures_wait_for_their_sound_and_never_disappear` (−5000 bis
++5000 ms), `the_hold_survives_silence_and_follows_a_new_device`,
+`a_flood_of_pictures_is_shown_not_dropped`, `an_estimated_playback_time_holds_nothing`
+und Ende zu Ende `tests/video.rs::pictures_are_held_for_a_late_output_device`
+(gemeldete Geräteverzögerung 300 ms → Haltezeit ≈ 320 ms; 0 ms → ≈ 20 ms).
+
 ## Kamera-Notfallfix 0.1.28 (2026-11-07)
 
 Beide Teilnehmer mit 0.1.28 verbinden, Kamera und Overlay einschalten.
@@ -331,4 +356,6 @@ Bilder nicht verschwinden; `late` darf nicht allein durch den Audiozielwert
 steigen. Kamera aus und Verlassen müssen das Bild weiterhin entfernen.
 Bildkorrektur, H.264-Recovery und begrenzte Empfangsqueues bleiben aktiv.
 Die Quellregression prüft fortlaufende Präsentation bei ±421 ms, ±101 ms,
-±40 ms und 0 ms sowie das Auslaufen eines gestoppten Streams.
+±40 ms und 0 ms sowie das Auslaufen eines gestoppten Streams; seit 2026-11-18
+als `pictures_wait_for_their_sound_and_never_disappear`, das dieselben Werte
+(und ±5000 ms) gegen die Haltezeit prüft — siehe „Lippensynchronität“ oben.

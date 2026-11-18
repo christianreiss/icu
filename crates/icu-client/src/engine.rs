@@ -2879,6 +2879,9 @@ fn mixer_thread(shared: Arc<Shared>, mut play: HeapProd<[f32; 2]>, mut mic_test:
                                     stamp,
                                     at: shared.media.instant(time),
                                 },
+                                // Only a time the device reported itself
+                                // may hold pictures back for the sound.
+                                stats.audio_playout_timing_estimated.load(Ordering::Relaxed) == 0,
                             );
                         }
                     }
@@ -5286,6 +5289,15 @@ struct SessionVideo {
     generation: u64,
 }
 
+impl SessionVideo {
+    /// Has the windows repaint.
+    fn wake(&self) {
+        if let Some(wake) = lock(&self.shared.video_waker).as_ref() {
+            wake();
+        }
+    }
+}
+
 impl crate::video::VideoSink for SessionVideo {
     fn deliver(&self, session: Session, frame: crate::video::EncodedFrame) {
         let stats = &self.shared.stats;
@@ -5322,15 +5334,30 @@ impl crate::video::VideoSink for SessionVideo {
                 -(target.duration_since(now).as_micros() as i64)
             };
             stats.av_offset_us.store(offset, Ordering::Relaxed);
-            // Diagnostic only: an audio timing estimate must never suppress
-            // fresh camera pictures (0.1.27 could black out both peers).
+            // A diagnostic. What the pictures do with the sound's timing is
+            // `video::Hold`: wait a bounded time, never disappear (0.1.27
+            // gated on this value and could black out both peers).
         }
-        let new_picture = picture.is_some();
-        lock(&self.shared.video).finish_for(self.generation, session, decoder, picture);
-        if new_picture {
-            if let Some(wake) = lock(&self.shared.video_waker).as_ref() {
-                wake();
+        let due = {
+            let mut video = lock(&self.shared.video);
+            video.finish_for(self.generation, session, decoder, picture);
+            if let Some(hold) = video.hold(session) {
+                stats
+                    .av_hold_us
+                    .store(hold.as_micros() as u64, Ordering::Relaxed);
             }
+            video.take_due(Instant::now())
+        };
+        if due {
+            self.wake();
+        }
+    }
+
+    /// A picture held back for its sound is shown when its time comes, not
+    /// when the next one happens to arrive.
+    fn tick(&self) {
+        if lock(&self.shared.video).take_due(Instant::now()) {
+            self.wake();
         }
     }
 
@@ -6365,7 +6392,8 @@ impl VideoFrames {
         self.shared.video.lock().unwrap().picture(session)
     }
 
-    /// Runs `wake` on the decode thread after every new picture; replaces
+    /// Runs `wake` on the decode thread whenever a picture is due — at once
+    /// after its decode, or when its hold for the sound ran out; replaces
     /// the one set before (one window draws the participant list).
     pub fn set_waker(&self, wake: impl Fn() + Send + 'static) {
         *self.shared.video_waker.lock().unwrap() = Some(Box::new(wake));
