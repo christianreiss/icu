@@ -1499,7 +1499,8 @@ pub(super) fn certificate_details(
                 },
             );
             let check = match server {
-                Some(server) => format!("Servername {server} im TLS-Handshake geprüft"),
+                // Outcome first: a narrow window cuts the end, not the verdict.
+                Some(server) => format!("Im TLS-Handshake geprüft · {server}"),
                 None => "Nutzersitzung vom Server authentifiziert".to_string(),
             };
             cert_row(ui, icon::HANDSHAKE, "Prüfung", plain(&check));

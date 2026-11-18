@@ -594,7 +594,12 @@ impl CertSummary {
             "Abgelaufen" => (icon::X_CIRCLE, "Abgelaufen", tok.error),
             "Noch nicht gültig" => (icon::X_CIRCLE, "Noch nicht gültig", tok.error),
             "Läuft bald ab" => (icon::WARNING_CIRCLE, "Läuft bald ab", tok.connecting),
-            "Zeitlich gültig" => (icon::CHECK_CIRCLE, "Gültig", tok.connected),
+            // Green only when the signature was checked too; a date alone
+            // is no trust verdict.
+            "Zeitlich gültig" if is_ca || c.signature_valid == Some(true) => {
+                (icon::CHECK_CIRCLE, "Gültig", tok.connected)
+            }
+            "Zeitlich gültig" => (icon::CALENDAR_CHECK, "Zeitlich gültig", tok.muted_text),
             _ => (icon::QUESTION, "Unbekannt", tok.muted_text),
         };
         Self {
@@ -709,7 +714,8 @@ fn cert_list_row(
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    response
+    widgets::focus_ring(ui, &response, 0);
+    response.on_hover_text(format!("{label}: {}", s.word))
 }
 
 /// Height of the drawn connection path.
@@ -814,7 +820,20 @@ fn info_row(ui: &mut Ui, glyph: &str, label: &str, value: &str, color: egui::Col
 fn path_diagram(ui: &mut Ui, nodes: &[Node<'_>], links: &[Option<u16>]) {
     let tok = theme::tokens(ui.visuals());
     let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, PATH_H), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, PATH_H), egui::Sense::hover());
+    // The drawing has no text widgets; say the same thing to a screen reader.
+    let mut summary = String::from("Verbindungspfad: ");
+    for (i, node) in nodes.iter().enumerate() {
+        summary.push_str(match node {
+            Node::Person(_, title) => title,
+            Node::Server(name, _) => name,
+        });
+        if let Some(rtt) = links.get(i) {
+            let rtt = rtt.map_or_else(|| "RTT unbekannt".to_string(), |ms| format!("{ms} ms"));
+            summary.push_str(&format!(" – {rtt} – "));
+        }
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &summary));
     let slot = width / nodes.len() as f32;
     const R: f32 = 22.0;
     let cy = rect.top() + R + 4.0;
