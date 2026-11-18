@@ -154,6 +154,15 @@ struct Anchor {
     seq: i64,
 }
 
+/// How far a packet's `ts` may be ahead of the newest one while its `seq`
+/// is not, and still be a reordered packet of the same stream: 2 s. A
+/// datagram is not older than the sender's 100 ms send limit plus the
+/// network's reordering.
+const STRAGGLER_TS_AHEAD: i32 = 2 * 48_000;
+/// The same limit backwards. Wider, because a straggler *is* behind; past
+/// 10 s it is the far side of a `ts` wrap, not a late packet.
+const STRAGGLER_TS_BEHIND: i32 = 10 * 48_000;
+
 /// The buffer.
 #[derive(Debug)]
 pub struct JitterBuffer {
@@ -311,6 +320,28 @@ impl JitterBuffer {
             if gapless && step > 0 && step != self.last_received_samples as i32 {
                 // A pause: the spurt ended without us seeing END (or with it).
                 self.end_spurt();
+            }
+        }
+        // A `seq` that looks old on a `ts` that is nowhere near: not a
+        // straggler but a stream that ran on unheard for half the sequence
+        // range or more. While we are deafened the server relays no audio
+        // and the sender keeps counting; 11 minutes of its speech later
+        // every packet compared as "behind", was dropped as late and the
+        // speaker stayed silent until its `seq` had come all the way round
+        // — up to another 11 minutes. `ts` runs on through silence and
+        // wraps only after a day, so it tells the two apart.
+        if let (Some((last_seq, _)), Some(last_ts)) = (self.last_seen, self.last_ts) {
+            if seq_diff(packet.seq, last_seq) <= 0 {
+                let ahead = ts_diff(packet.ts, last_ts);
+                if !(-STRAGGLER_TS_BEHIND..=STRAGGLER_TS_AHEAD).contains(&ahead) {
+                    tracing::debug!(
+                        seq = packet.seq,
+                        last_seq,
+                        ts_ahead = ahead,
+                        "jitter seq wrapped unheard, starting over"
+                    );
+                    self.start_over();
+                }
             }
         }
         let u = self.unwrap_seq(packet.seq);
@@ -496,6 +527,18 @@ impl JitterBuffer {
         if self.target > self.cfg.max_delay {
             self.target = self.cfg.max_delay;
         }
+    }
+
+    /// Forgets the sequence numbering of the stream so far: the next packet
+    /// is taken as the first of a new one. Counters and the learned delay
+    /// stay (`report_base` in the engine subtracts from them).
+    fn start_over(&mut self) {
+        self.queue.clear();
+        self.end_spurt();
+        self.last_seen = None;
+        self.played_hwm = None;
+        self.last_ts = None;
+        self.last_end = false;
     }
 
     fn end_spurt(&mut self) {
@@ -1205,6 +1248,35 @@ mod tests {
         }
         assert_eq!(concealed, 0);
         assert_eq!(jb.stats().lost, 0);
+    }
+
+    /// Deafened for 13 minutes of a peer's speech: its `seq` is 40 000
+    /// further, which modulo 2^16 compares as 25 536 *behind*. `ts` says
+    /// otherwise, and the speaker is heard again at once.
+    #[test]
+    fn a_seq_that_wrapped_unheard_starts_a_new_spurt() {
+        let t0 = Instant::now();
+        let mut jb = buffer();
+        jb.push(pkt(0, 0, false), t0);
+        jb.push(pkt(1, 960, false), t0 + ms(20));
+        assert!(matches!(jb.pop(t0 + ms(40)), Pop::Packet(p) if p.seq == 0));
+        assert!(matches!(jb.pop(t0 + ms(60)), Pop::Packet(p) if p.seq == 1));
+        let later = t0 + Duration::from_secs(800);
+        let seq = 1u16.wrapping_add(40_000);
+        let ts = 960u32.wrapping_add(40_000 * 960);
+        jb.push(pkt(seq, ts, false), later);
+        jb.push(pkt(seq.wrapping_add(1), ts + 960, false), later + ms(20));
+        let mut played = Vec::new();
+        let mut t = later + ms(20);
+        for _ in 0..20 {
+            if let Pop::Packet(p) = jb.pop(t) {
+                played.push(p.seq);
+            }
+            t += ms(20);
+        }
+        assert_eq!(played, [seq, seq.wrapping_add(1)]);
+        let st = jb.stats();
+        assert_eq!((st.late, st.lost), (0, 0), "{st:?}");
     }
 
     #[test]
