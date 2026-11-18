@@ -152,6 +152,157 @@ fn jpeg_size(data: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
+/// Refuses an MJPEG frame whose headers libjpeg would not survive.
+///
+/// nokhwa decodes MJPEG with mozjpeg, and libjpeg reports a fatal error by
+/// unwinding out of C. A release build aborts on that: one frame without a
+/// start marker, cut off inside its headers or with a damaged table — what
+/// a USB hiccup or a camera being unplugged produces — ended the whole
+/// client. Damage *behind* the headers is harmless (libjpeg warns and pads
+/// the picture), so only the headers are walked here, the way libjpeg's own
+/// marker reader does: stray bytes between segments are skipped, and
+/// whatever it would decode is let through.
+fn jpeg_decodable(data: &[u8]) -> Result<(), &'static str> {
+    const CUT: &str = "cut off inside its headers";
+    if !data.starts_with(&[0xFF, 0xD8]) {
+        return Err("no start marker");
+    }
+    let mut i = 2;
+    // Component id and quantization table of the frame header's components.
+    let mut components: Option<([(u8, u8); 4], usize)> = None;
+    let mut quant = [false; 4];
+    loop {
+        while *data.get(i).ok_or(CUT)? != 0xFF {
+            i += 1;
+        }
+        while *data.get(i).ok_or(CUT)? == 0xFF {
+            i += 1;
+        }
+        let marker = data[i];
+        i += 1;
+        match marker {
+            // A stuffed zero, TEM, RSTn: no segment follows.
+            0x00 | 0x01 | 0xD0..=0xD7 => continue,
+            0xD8 => return Err("a second start marker"),
+            0xD9 => return Err("ends before its picture data"),
+            _ => {}
+        }
+        let len = usize::from(u16::from_be_bytes([
+            *data.get(i).ok_or(CUT)?,
+            *data.get(i + 1).ok_or(CUT)?,
+        ]));
+        let segment = data.get(i + 2..i + len).ok_or(CUT)?;
+        i += len;
+        match marker {
+            // SOF0–SOF2: baseline, extended and progressive Huffman.
+            0xC0..=0xC2 => {
+                if components.is_some() {
+                    return Err("two frame headers");
+                }
+                let [precision, h0, h1, w0, w1, count, rest @ ..] = segment else {
+                    return Err("short frame header");
+                };
+                let count = usize::from(*count);
+                if *precision != 8
+                    || u16::from_be_bytes([*h0, *h1]) == 0
+                    || u16::from_be_bytes([*w0, *w1]) == 0
+                    || !(1..=4).contains(&count)
+                    || rest.len() != 3 * count
+                {
+                    return Err("unusable frame header");
+                }
+                let mut list = [(0, 0); 4];
+                for (slot, component) in list.iter_mut().zip(rest.chunks_exact(3)) {
+                    let (h, v, table) = (component[1] >> 4, component[1] & 15, component[2]);
+                    if !(1..=4).contains(&h) || !(1..=4).contains(&v) || table > 3 {
+                        return Err("unusable frame component");
+                    }
+                    *slot = (component[0], table);
+                }
+                components = Some((list, count));
+            }
+            0xC4 => huffman_tables_decodable(segment)?,
+            0xDB => {
+                let mut rest = segment;
+                while let [head, tail @ ..] = rest {
+                    let (wide, table) = (usize::from(head >> 4), usize::from(head & 15));
+                    let size = 64 * (1 + wide);
+                    if wide > 1 || table > 3 || tail.len() < size {
+                        return Err("unusable quantization table");
+                    }
+                    quant[table] = true;
+                    rest = &tail[size..];
+                }
+            }
+            0xDD => {
+                if segment.len() != 2 {
+                    return Err("unusable restart interval");
+                }
+            }
+            0xDA => {
+                let Some((list, count)) = components else {
+                    return Err("picture data before the frame header");
+                };
+                let [scan_count, rest @ ..] = segment else {
+                    return Err("short scan header");
+                };
+                let scan_count = usize::from(*scan_count);
+                if !(1..=4).contains(&scan_count) || rest.len() != 2 * scan_count + 3 {
+                    return Err("unusable scan header");
+                }
+                for component in rest[..2 * scan_count].chunks_exact(2) {
+                    let Some((_, table)) = list[..count].iter().find(|(id, _)| *id == component[0])
+                    else {
+                        return Err("scan of an unknown component");
+                    };
+                    if !quant[usize::from(*table)] {
+                        return Err("no quantization table");
+                    }
+                    if component[1] >> 4 > 3 || component[1] & 15 > 3 {
+                        return Err("unusable scan component");
+                    }
+                }
+                return Ok(());
+            }
+            // DNL, APPn, COM: skipped by libjpeg as well.
+            0xDC | 0xE0..=0xEF | 0xFE => {}
+            _ => return Err("unsupported marker"),
+        }
+    }
+}
+
+/// A DHT segment libjpeg accepts: each table's index and symbol count in
+/// range, the code lengths forming a prefix code that leaves the all-ones
+/// code free (`jpeg_make_d_derived_tbl`), DC symbols at most 15.
+fn huffman_tables_decodable(mut rest: &[u8]) -> Result<(), &'static str> {
+    const BAD: &str = "unusable Huffman table";
+    while !rest.is_empty() {
+        let (head, tail) = rest.split_first_chunk::<17>().ok_or(BAD)?;
+        let (class, table, counts) = (head[0] >> 4, head[0] & 15, &head[1..]);
+        let total: usize = counts.iter().map(|&n| usize::from(n)).sum();
+        if class > 1 || table > 3 || total > 256 || tail.len() < total {
+            return Err(BAD);
+        }
+        let used = counts
+            .iter()
+            .rposition(|&n| n != 0)
+            .map_or(0, |last| last + 1);
+        let mut code = 0u32;
+        for (bits, &n) in (1u32..).zip(&counts[..used]) {
+            code += u32::from(n);
+            if code >= 1 << bits {
+                return Err(BAD);
+            }
+            code <<= 1;
+        }
+        if class == 0 && tail[..total].iter().any(|&symbol| symbol > 15) {
+            return Err(BAD);
+        }
+        rest = &tail[total..];
+    }
+    Ok(())
+}
+
 /// The capture thread's latest picture. `seq` counts frames, so a viewer
 /// can tell a new picture from a repaint of the one it already uploaded —
 /// the preview is drawn at the window's frame rate, the camera delivers at
@@ -350,6 +501,9 @@ impl FrameSource for NokhwaSource {
             Instant::now(),
             std::time::SystemTime::now(),
         );
+        if buffer.source_frame_format() == FrameFormat::MJPEG {
+            jpeg_decodable(buffer.buffer()).map_err(|e| format!("damaged MJPEG frame: {e}"))?;
+        }
         let img = buffer
             .decode_image::<RgbFormat>()
             .map_err(|e| e.to_string())?;
@@ -668,9 +822,17 @@ impl FrameSource for FreshSource {
 impl Drop for FreshSource {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // A driver may still be blocked. It owns its source until it returns;
-        // privacy revocation is enforced independently by CameraLink.
+        // The worker owns the source and is usually inside one capture: give
+        // it a few frame intervals to come back, so the device is released
+        // when the camera thread ends — the next open of the same camera
+        // (privacy off, a restart) otherwise finds it busy. A driver that
+        // stays blocked keeps its source until it returns; privacy
+        // revocation is enforced independently by CameraLink.
         if let Some(worker) = self.worker.take() {
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while !worker.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             if worker.is_finished() {
                 let _ = worker.join();
             }
@@ -730,6 +892,9 @@ pub fn run_sender(
     while !stop.load(Ordering::Relaxed) {
         let mut frame = match source.next_frame() {
             Ok(f) if f.is_valid() => f,
+            // Stopping: the source ending is not a failed frame to warn
+            // about and sleep on — `stop` joins this thread from the UI.
+            Err(_) if stop.load(Ordering::Relaxed) => break,
             result => {
                 let e = result.map_or_else(
                     |e| e,
@@ -1562,6 +1727,100 @@ mod tests {
         let mut enc = encoder(VideoTier::T0).unwrap();
         let bs = enc.encode(&yuv).unwrap();
         assert!(matches!(bs.frame_type(), FrameType::IDR));
+    }
+
+    /// The headers of a one-component baseline JPEG, up to and including
+    /// the scan header.
+    fn jpeg_headers() -> Vec<u8> {
+        let mut jpeg = vec![0xFF, 0xD8];
+        // DQT: table 0, 8 bit.
+        jpeg.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+        jpeg.extend_from_slice(&[16; 64]);
+        // SOF0: 8 bit, 240×320, one component (id 1, 1×1, table 0).
+        jpeg.extend_from_slice(&[
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0xF0, 0x01, 0x40, 0x01, 0x01, 0x11, 0x00,
+        ]);
+        // DHT: DC table 0 with one 1-bit code, AC table 0 with one 2-bit code.
+        jpeg.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x26]);
+        jpeg.extend_from_slice(&[0x00, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05]);
+        jpeg.extend_from_slice(&[0x10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xF0]);
+        // SOS: one component.
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+        jpeg
+    }
+
+    /// Position of the first `marker` segment's payload.
+    fn payload(jpeg: &[u8], marker: u8) -> usize {
+        jpeg.windows(2).position(|w| w == [0xFF, marker]).unwrap() + 4
+    }
+
+    /// What libjpeg ends the process over is refused before it gets there;
+    /// what it decodes passes, damaged picture data included.
+    #[test]
+    fn a_damaged_mjpeg_frame_is_refused_before_libjpeg_sees_it() {
+        let good = jpeg_headers();
+        assert_eq!(jpeg_decodable(&good), Ok(()));
+        let mut with_data = good.clone();
+        with_data.extend_from_slice(&[0x12, 0x34, 0xFF, 0x00, 0x56]);
+        assert_eq!(
+            jpeg_decodable(&with_data),
+            Ok(()),
+            "no end marker: a warning"
+        );
+        // Stray bytes and fill bytes between segments, an APP0, a comment.
+        let mut padded = vec![
+            0xFF, 0xD8, 0x00, 0x12, 0xFF, 0xFF, 0xE0, 0x00, 0x04, b'A', b'B',
+        ];
+        padded.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x03, b'x']);
+        padded.extend_from_slice(&good[2..]);
+        assert_eq!(jpeg_decodable(&padded), Ok(()));
+
+        assert!(jpeg_decodable(&[]).is_err(), "empty");
+        assert!(jpeg_decodable(b"not a jpeg").is_err());
+        assert!(jpeg_decodable(&good[2..]).is_err(), "the start is missing");
+        for cut in 2..good.len() {
+            assert!(jpeg_decodable(&good[..cut]).is_err(), "cut at {cut}");
+        }
+        let broken = |change: &dyn Fn(&mut Vec<u8>)| {
+            let mut jpeg = good.clone();
+            change(&mut jpeg);
+            jpeg_decodable(&jpeg)
+        };
+        let (dqt, sof, dht, sos) = (
+            payload(&good, 0xDB),
+            payload(&good, 0xC0),
+            payload(&good, 0xC4),
+            payload(&good, 0xDA),
+        );
+        assert!(
+            broken(&|j| j.splice(2..2, [0xFF, 0xD9]).for_each(drop)).is_err(),
+            "EOI first"
+        );
+        assert!(
+            broken(&|j| j.splice(2..2, [0xFF, 0xD8]).for_each(drop)).is_err(),
+            "SOI twice"
+        );
+        assert!(broken(&|j| j[dqt] = 0x04).is_err(), "quantization table 4");
+        assert!(broken(&|j| j[sof] = 12).is_err(), "12-bit samples");
+        assert!(
+            broken(&|j| j[sof + 1..sof + 3].fill(0)).is_err(),
+            "no height"
+        );
+        assert!(broken(&|j| j[sof + 7] = 0x51).is_err(), "sampling factor 5");
+        assert!(
+            broken(&|j| j[sof + 8] = 1).is_err(),
+            "table without a definition"
+        );
+        assert!(broken(&|j| j[sof - 3] = 0xC9).is_err(), "arithmetic coding");
+        assert!(broken(&|j| j[dht + 1] = 2).is_err(), "two 1-bit codes");
+        assert!(broken(&|j| j[dht + 17] = 16).is_err(), "DC symbol 16");
+        assert!(broken(&|j| j[dht] = 0x04).is_err(), "Huffman table 4");
+        assert!(broken(&|j| j[sos + 1] = 9).is_err(), "scan of component 9");
+        assert!(broken(&|j| j[sos] = 2).is_err(), "scan length");
+        // The scan before the frame header.
+        let mut early = vec![0xFF, 0xD8];
+        early.extend_from_slice(&good[sos - 4..]);
+        assert!(jpeg_decodable(&early).is_err());
     }
 
     #[test]
