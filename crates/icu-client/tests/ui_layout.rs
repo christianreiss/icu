@@ -2172,6 +2172,53 @@ fn context_moderation_waits_for_its_refresh_and_preserves_deafen() {
     ));
 }
 
+/// The moderation menu belongs to a user, not to a row: when somebody
+/// leaves while it is open, it stays with the one it was opened for instead
+/// of sitting over whoever moved into that row.
+#[test]
+fn the_moderation_menu_stays_with_its_user_when_the_list_changes() {
+    let current = Rc::new(RefCell::new(state()));
+    let state_in = current.clone();
+    let (cmd, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    let mut view = MainView::default();
+    let mut h = harness([MAIN[0], 700.0], "dark", false, move |ui| {
+        let env = MainEnv {
+            cmd: &cmd,
+            video_tier: icu_client::video::VideoTier::T0,
+            video: &|_| None,
+            self_video: None,
+            settings_open: false,
+            user_open: None,
+            overlay_available: true,
+        };
+        view.ui(ui, &state_in.borrow(), &env);
+    });
+    let mute = format!(
+        "{}  Stummschalten",
+        egui_phosphor::regular::MICROPHONE_SLASH
+    );
+    h.get_by_label("Bernd").click_secondary();
+    h.run();
+    assert!(matches!(commands.try_recv(), Ok(Command::RequestUserList)));
+    current.borrow_mut().user_list_generation += 1;
+    h.run();
+    h.get_by_label(&mute);
+
+    // Anna, the row above, leaves: Bernd moves up, Carla into his row.
+    current.borrow_mut().peers.retain(|p| p.info.user_id != 2);
+    h.run();
+    h.get_by_label(&mute).click();
+    h.run();
+    assert!(matches!(
+        commands.try_recv(),
+        Ok(Command::SetUserRestriction {
+            user_id: 3,
+            muted: true,
+            deafened: false
+        })
+    ));
+}
+
 #[test]
 fn autotune_details_keep_controls_accessible_and_independent() {
     for theme in THEMES {

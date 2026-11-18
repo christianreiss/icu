@@ -2129,14 +2129,20 @@ fn participant_row(
         let refreshed = ui
             .data(|d| d.get_temp::<u64>(refresh_id))
             .is_some_and(|generation| generation != m.generation);
-        row.response.context_menu(|ui| {
-            moderation_menu(
-                ui,
-                p.user_id,
-                refreshed.then_some(m.restriction).flatten(),
-                send,
-            )
-        });
+        // Keyed by the user, not by the row: the default id is the row's
+        // position, so when somebody joined or left while the menu was
+        // open it stayed open over whoever now stood in that place — and
+        // muted or removed them.
+        egui::Popup::context_menu(&row.response)
+            .id(egui::Id::new(("moderation", p.user_id)))
+            .show(|ui| {
+                moderation_menu(
+                    ui,
+                    p.user_id,
+                    refreshed.then_some(m.restriction).flatten(),
+                    send,
+                )
+            });
     }
     ui.data_mut(|d| d.insert_temp(rect_id, r));
     clicked

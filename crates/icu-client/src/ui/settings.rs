@@ -2471,6 +2471,21 @@ impl SettingsView {
         if divider {
             ui.separator();
         }
+        // Widget ids from the user, not from the row's place in the list:
+        // the "⋯" menu is found by its button's id, and a list that changed
+        // under an open menu left it over the next member's row.
+        ui.push_id(("member", user.user_id), |ui| {
+            self.member_row_content(ui, user, is_self, cmds);
+        });
+    }
+
+    fn member_row_content(
+        &mut self,
+        ui: &mut Ui,
+        user: &icu_proto::UserSummary,
+        is_self: bool,
+        cmds: &mut Vec<Command>,
+    ) {
         let tok = theme::tokens(ui.visuals());
         let confirming = self.confirm_revoke == Some(user.user_id);
         let row = egui::Frame::new()
