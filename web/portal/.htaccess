@@ -1,0 +1,18 @@
+# ICU download page (deployed as web20/web/icu/.htaccess on twingo).
+DirectoryIndex index.php index.html
+CGIPassAuth On
+
+RewriteEngine On
+# API front controller; downloads/ is never rewritten (updater URLs stay static).
+RewriteRule ^api/v1/?(.*)$ api.php?path=$1 [QSA,L,B]
+
+# Shared code, examples and old leftovers are not site content.
+RewriteRule ^(_lib|tests)(/|$) - [R=404,L]
+RewriteRule ^(config\.example\.php|downloads\.htaccess|README\.md)$ - [R=404,L]
+
+<IfModule mod_headers.c>
+	Header always set X-Content-Type-Options nosniff
+	<FilesMatch "^latest\.json$">
+		Header set Cache-Control "no-cache"
+	</FilesMatch>
+</IfModule>

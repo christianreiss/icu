@@ -140,16 +140,22 @@ und [Job-Object-Lebenszyklen](https://learn.microsoft.com/windows/win32/procthre
    Schlüssel, bei `DIRTY`, unvollständigen Artefakten oder falschem Quellcommit
    bricht die Veröffentlichung ab. `packaging/release.sh` verwendet denselben
    Vorbereitungsschritt für den bisherigen Release-Upload.
-3. `python3 web/tools/publish-release.py` erzeugt lokal
+3. `ICU_RELEASE_API_TOKEN=… python3 web/tools/upload-release.py --notes <datei>`
+   lädt `dist/<version>/` über die Release-API auf
+   `https://misc.alpha-labs.net/icu/` hoch (Token: Fleet-Secret
+   `icu.release-api-token`). Der Server prüft beide Signaturen
+   (`icu-release`, `icu-update`) gegen seine Kopie von
+   `packaging/allowed_signers`, jede Prüfsumme, Vollständigkeit, Dateinamen
+   und Downgrades, veröffentlicht dann das Versionsverzeichnis mit einem
+   Rename und ersetzt `downloads/latest.json` zuletzt. Veröffentlichte Bytes
+   sind unveränderlich; `--no-latest` stellt eine ältere Version nachträglich
+   bereit, ohne den Kanal umzuschalten. Die Downloadseite rendert sich aus den
+   Dateien auf dem Server; sie wird pro Release nicht mehr bearbeitet. Die
+   Notizen (`--notes`, Klartext) erscheinen als „Neu in <version>“.
+   Details: [web/README.md](../../web/README.md).
+4. Lokal ohne Server: `python3 web/tools/publish-release.py` erzeugt
    `web/downloads/<version>/` und schaltet `web/downloads/latest.json` erst nach
-   allen Dateien atomisch frei. Veröffentlichte Artefakte sind unveränderlich;
-   `latest.json` darf keine niedrigere Version bekommen.
-4. Auf dem Webserver zuerst das vollständige Versionsverzeichnis übertragen
-   und Größen/Hashes prüfen. Erst danach das vorbereitete `latest.json` atomisch
-   nach `downloads/latest.json` übernehmen. Die bestehende Webseite/deren
-   Layout erhalten und nur die Release-Verweise anpassen. Kein rekursives
-   Löschen älterer Downloads. Die produktive Auslieferung liegt derzeit unter
-   `https://misc.alpha-labs.net/icu/` auf `twingo.alpha-labs.net`.
+   allen Dateien atomisch frei; dieselben Regeln wie oben.
 5. Manifest und Artefakte über HTTPS verifizieren. Build-Erfolg, tatsächlich
    geprüften Windows-Ablauf sowie Server-/Clientinstallation getrennt im
    Auslieferungsprotokoll festhalten.
