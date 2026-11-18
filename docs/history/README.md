@@ -28,3 +28,4 @@ Die frühen Wire-Entwürfe sind durch [protocol.md](../reference/protocol.md) er
 - [Verzeichnisumzug: Prüfung vom 2026-09-28](directory-layout-verification-2026-09-28.md)
 
 - [Audioqualität und natives Ducking, 2026-10-30](audio-quality-2026-10-30.md): Findings, identische Vorher/Nachher-Messung, Linux-Abbruchnachweise und offene native Hör-/Windows-Abnahme.
+- [Tiefenprüfung 2026-11-18](deep-review-2026-11-18.md): Sprache, Video, Lippensynchronität, PKI — behobene Fehler, geprüfte Bereiche und offene Punkte.
