@@ -161,6 +161,9 @@ sudo install -m0755 target/musl/x86_64-unknown-linux-musl/release-server/icu-ser
 sudo ln -sfn icu-server /usr/bin/icu-cli   # zweiter Name für die Admin-Seite (§3)
 sudo install -m0644 deploy/icu-server.service /etc/systemd/system/
 sudo groupadd --system icu            # Gruppe für den Admin-Socket
+sudo groupadd --system icu-monitor    # Gruppe für den Monitoring-Socket; die Unit
+                                      # nennt sie (SupplementaryGroups) und startet
+                                      # ohne sie nicht
 sudo install -d -m0755 /etc/icu
 sudo install -m0640 -g icu /dev/stdin /etc/icu/server.toml <<'TOML'
 [server]
