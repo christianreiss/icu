@@ -67,6 +67,44 @@ async fn status_and_users_need_only_the_socket() {
     handle.shutdown().await;
 }
 
+/// `icu-server invite --out <path>` with a path that cannot be written: the
+/// invitation exists by then and the bundle is the only copy of its
+/// one-time key, so it is printed instead of being lost, and the command
+/// still fails.
+#[tokio::test]
+async fn an_invite_whose_out_file_cannot_be_written_prints_the_bundle() {
+    let _alone = ALONE.lock().await;
+    if common::root() {
+        return;
+    }
+    let server = TestServer::start().await;
+    let file = server.dir.path().join("server.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[paths]\nstate_dir = {:?}\nruntime_dir = {:?}\n",
+            server.dir.path().to_str().unwrap(),
+            server.dir.path().to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    let missing = server.dir.path().join("no-such-dir").join("carol.icu");
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_icu-server"))
+        .arg("--config")
+        .arg(&file)
+        .args(["invite", "--name", "carol", "--out"])
+        .arg(&missing)
+        .output()
+        .await
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("BEGIN ICU PASSPORT"), "{stdout}\n{stderr}");
+    assert!(stderr.contains("cannot write"), "{stderr}");
+    assert!(!missing.exists());
+}
+
 /// End-to-end through the real binary, not just `admin::handle` in-process
 /// (`tests/admin.rs` already covers the socket contract): `icu-server
 /// invites --json` lists an open invitation, `icu-server cancel-invite

@@ -240,13 +240,15 @@ fn print_response(value: &serde_json::Value, raw_json: bool, out: Option<&Path>)
             // Mode 0600: the bundle is a bearer credential until it is used.
             Some(path) => match crate::store::write_private_for_caller(path, bundle) {
                 Ok(()) => println!("bundle written to {}", path.display()),
+                // The invite exists by now and this is the only copy of
+                // its one-time key: show it rather than lose it.
                 Err(e) => {
                     println!(
-                        "{} cannot write {}: {e}",
+                        "{} cannot write {}: {e}; the bundle follows instead",
                         Style::current().bad("error:"),
                         path.display()
                     );
-                    return;
+                    println!("{bundle}");
                 }
             },
             None => println!("{bundle}"),

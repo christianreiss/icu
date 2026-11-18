@@ -25,9 +25,20 @@ pub async fn run(
         .get("bundle")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    let mut failed = None;
     match out {
         // Mode 0600: the bundle is a bearer credential until it is used.
-        Some(path) => crate::store::write_private_for_caller(path, bundle)?,
+        // The invite exists by now and this is the only copy of its
+        // one-time key: a path that cannot be written must not lose it.
+        Some(path) => {
+            if let Err(error) = crate::store::write_private_for_caller(path, bundle) {
+                print!("{bundle}");
+                failed = Some(crate::Error::msg(format!(
+                    "cannot write {}: {error}; the bundle was printed instead",
+                    path.display()
+                )));
+            }
+        }
         None => print!("{bundle}"),
     }
     eprintln!(
@@ -44,7 +55,7 @@ pub async fn run(
     if let Some(hint) = admin_hint(&value) {
         eprintln!("{hint}");
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 /// What to point out while no admin has confirmed a registration: not the
@@ -70,7 +81,9 @@ pub fn parse_duration(value: &str) -> Result<u64> {
     let number: u64 = digits
         .parse()
         .map_err(|_| crate::Error::msg(format!("cannot parse duration {value:?}")))?;
-    Ok(number * factor)
+    number
+        .checked_mul(factor)
+        .ok_or_else(|| crate::Error::msg(format!("duration {value:?} is too long")))
 }
 
 #[cfg(test)]
