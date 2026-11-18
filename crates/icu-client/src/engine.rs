@@ -5519,6 +5519,9 @@ async fn datagram_reader(connection: quinn::Connection, shared: Arc<Shared>) {
                     sp.pending.clear();
                     sp.pending_times.clear();
                     sp.next_stamp = None;
+                    // The new buffer counts from zero; a base from the old
+                    // one made the next loss report subtract below it.
+                    sp.report_base = (0, 0);
                 }
                 sp.last_packet = Some(now);
                 sp.ended = header.end();
@@ -5584,8 +5587,8 @@ fn collect_loss_reports(shared: &Arc<Shared>, now: Instant) -> (LossPerSpeaker, 
     let mut speakers = lock(&shared.speakers);
     for (session, sp) in speakers.iter_mut() {
         let st = sp.jitter.stats();
-        let played = st.played - sp.report_base.0;
-        let lost = st.lost - sp.report_base.1;
+        let played = st.played.saturating_sub(sp.report_base.0);
+        let lost = st.lost.saturating_sub(sp.report_base.1);
         sp.report_base = (st.played, st.lost);
         let total = played + lost;
         if total == 0 {
