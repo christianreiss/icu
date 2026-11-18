@@ -259,6 +259,10 @@ pub struct AppState {
     pub rename_pending: bool,
     /// `Welcome.is_admin`: whether `CreateInviteRequest` is allowed.
     pub is_admin: bool,
+    /// Latest server-confirmed administrative results for this session.
+    pub admin_results: std::collections::VecDeque<(u64, Arc<str>)>,
+    /// Changes when admin rights or the connection are lost.
+    pub admin_epoch: u64,
     /// The most recently issued registration bundle and its expiry, if any.
     pub last_invite: Option<(String, String)>,
     /// `CreateInviteRequest` error.
@@ -326,6 +330,17 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn admin_result(&mut self, text: String) {
+        if !self.is_admin {
+            return;
+        }
+        let seq = self.admin_results.back().map_or(1, |(n, _)| n + 1);
+        if self.admin_results.len() >= 16 {
+            self.admin_results.pop_front();
+        }
+        self.admin_results.push_back((seq, text.into()));
+    }
+
     /// The active voice detector and its threshold on a shared meter axis.
     pub fn vad_meter(&self) -> (f32, f32) {
         vad::meter_values(
@@ -389,6 +404,8 @@ fn publish_audio_profile(
 /// Commands from UI, tray and hotkeys.
 #[derive(Debug, Clone)]
 pub enum Command {
+    /// A console command belongs only to the connection and role that issued it.
+    ForAdminSession(u64, Box<Command>),
     /// A frame from this peer was presented by the overlay.
     VideoDisplayed(Session),
     /// Mute/unmute.
@@ -447,6 +464,14 @@ pub enum Command {
     RevokeUser {
         /// The affected user.
         user_id: UserId,
+    },
+    /// Query server status over the authenticated session.
+    AdminStatus,
+    /// Change one moderation flag atomically.
+    ChangeRestriction {
+        user_id: UserId,
+        deafen: bool,
+        enabled: bool,
     },
     /// Refresh the full user list for the Nutzer tab. Admin only.
     RequestUserList,
@@ -1212,6 +1237,8 @@ impl Engine {
             notice: None,
             name_error: None,
             rename_pending: false,
+            admin_results: Default::default(),
+            admin_epoch: 0,
             is_admin: false,
             last_invite: None,
             invite_error: None,
@@ -3501,6 +3528,13 @@ fn end_session(shared: &Arc<Shared>) {
     shared.state.send_modify(|s| {
         s.peers.clear();
         s.video_viewers.clear();
+        s.admin_epoch = s.admin_epoch.wrapping_add(1);
+        s.admin_results.clear();
+        s.user_list.clear();
+        s.last_invite = None;
+        s.invite_error = None;
+        s.user_action_error = None;
+        s.is_admin = false;
         s.conn_info = None;
         s.conn_stats = None;
         s.server_rtt_ms = None;
@@ -4178,12 +4212,15 @@ impl LocalState {
                 // right away when it was stored.
                 self.replace_identity(*identity, settings.map(|s| *s), shared);
             }
-            Command::CreateInvite { .. }
+            Command::ForAdminSession(..)
+            | Command::CreateInvite { .. }
             | Command::VideoDisplayed(_)
             | Command::SetUserAdmin { .. }
             | Command::SetUserDisabled { .. }
             | Command::RevokeUser { .. }
             | Command::RequestPeerCertificate(_)
+            | Command::AdminStatus
+            | Command::ChangeRestriction { .. }
             | Command::RequestUserList
             | Command::KickUser { .. }
             | Command::SetUserRestriction { .. }
@@ -4957,6 +4994,14 @@ async fn run_session(
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { break SessionEnd::Quit };
+                let cmd = match cmd {
+                    Command::ForAdminSession(epoch, action) => {
+                        let current = shared.state.borrow();
+                        if !current.is_admin || current.admin_epoch != epoch { continue; }
+                        *action
+                    }
+                    other => other,
+                };
                 match cmd {
                     Command::Quit => break SessionEnd::Quit,
                     Command::VideoDisplayed(speaker) => {
@@ -5034,6 +5079,15 @@ async fn run_session(
                             p.info.session == session && !matches!(p.certificate, Some(Ok(_))));
                         if needed && conn::write_msg(&mut send, &ControlMsg::PeerCertificateRequest { session }).await.is_err() {
                             break send_failed(&connection);
+                        }
+                    }
+                    Command::AdminStatus | Command::ChangeRestriction { .. } => {
+                        if welcome.minor >= 9 {
+                            let msg = match cmd {
+                                Command::ChangeRestriction { user_id, deafen, enabled } => ControlMsg::AdminChangeRestriction {user_id,deafen,enabled},
+                                _ => ControlMsg::AdminStatusRequest,
+                            };
+                            if conn::write_msg(&mut send, &msg).await.is_err() { break send_failed(&connection); }
                         }
                     }
                     Command::RequestUserList => {
@@ -5999,19 +6053,66 @@ async fn handle_control(
         ControlMsg::CreateInviteResponse { bundle, expires } => {
             local.invite_pending = false;
             shared.state.send_modify(|s| {
+                s.admin_result("Einladung ausgestellt.".into());
                 s.last_invite = Some((bundle, expires));
                 s.invite_error = None;
             });
         }
-        ControlMsg::AdminSetRoleOk { .. }
+        ControlMsg::AdminStatusResponse { json } => {
+            let pretty = serde_json::from_str::<serde_json::Value>(&json)
+                .and_then(|v| serde_json::to_string_pretty(&v))
+                .unwrap_or_else(|_| "Ungültige Statusantwort".into());
+            shared.state.send_modify(|s| s.admin_result(pretty));
+        }
+        ack @ (ControlMsg::AdminSetRoleOk { .. }
         | ControlMsg::AdminSetDisabledOk { .. }
         | ControlMsg::AdminRevokeUserOk { .. }
         | ControlMsg::AdminKickOk { .. }
-        | ControlMsg::AdminSetRestrictionOk { .. } => {
-            // Acks don't carry the full row; the Nutzer tab re-issues
-            // RequestUserList right after sending an action, so this just
-            // confirms no error banner is needed while that refresh lands.
-            shared.state.send_modify(|s| s.user_action_error = None);
+        | ControlMsg::AdminSetRestrictionOk { .. }) => {
+            shared.state.send_modify(|s| {
+                s.user_action_error = None;
+                let (user_id, detail) = match ack {
+                    ControlMsg::AdminSetRoleOk { user_id, is_admin } => (
+                        user_id,
+                        if is_admin {
+                            "Adminrechte erteilt"
+                        } else {
+                            "Adminrechte entzogen"
+                        }
+                        .to_owned(),
+                    ),
+                    ControlMsg::AdminSetDisabledOk { user_id, disabled } => (
+                        user_id,
+                        if disabled {
+                            "Zugang gesperrt"
+                        } else {
+                            "Zugang freigegeben"
+                        }
+                        .to_owned(),
+                    ),
+                    ControlMsg::AdminRevokeUserOk { user_id, closed } => (
+                        user_id,
+                        format!("Zertifikate widerrufen, {closed} Verbindungen geschlossen"),
+                    ),
+                    ControlMsg::AdminKickOk { user_id, closed } => {
+                        (user_id, format!("{closed} Verbindungen geschlossen"))
+                    }
+                    ControlMsg::AdminSetRestrictionOk {
+                        user_id,
+                        muted,
+                        deafened,
+                    } => (
+                        user_id,
+                        format!(
+                            "Stummsperre {}, Taubsperre {}",
+                            if muted { "aktiv" } else { "aus" },
+                            if deafened { "aktiv" } else { "aus" }
+                        ),
+                    ),
+                    _ => unreachable!(),
+                };
+                s.admin_result(format!("ID {user_id}: {detail}."));
+            });
         }
         ControlMsg::UserListResponse { users } => {
             shared.state.send_modify(|s| {
@@ -6022,14 +6123,19 @@ async fn handle_control(
         ControlMsg::AdminActionError { code, detail, .. } => {
             tracing::warn!(code, %detail, "admin action rejected");
             let text = crate::problem::from_code(code, &detail).text;
-            shared
-                .state
-                .send_modify(|s| s.user_action_error = Some(text));
+            shared.state.send_modify(|s| {
+                s.admin_result(text.clone());
+                s.user_action_error = Some(text)
+            });
         }
         ControlMsg::UserAdminChanged { is_admin } => {
             shared.state.send_modify(|s| {
                 s.is_admin = is_admin;
                 if !is_admin {
+                    s.admin_epoch = s.admin_epoch.wrapping_add(1);
+                    s.admin_results.clear();
+                    s.last_invite = None;
+                    s.invite_error = None;
                     s.user_list.clear();
                     s.user_action_error = None;
                 }
@@ -6071,6 +6177,8 @@ async fn handle_control(
         | ControlMsg::PeerCertificateRequest { .. }
         | ControlMsg::VideoDisplayed { .. }
         | ControlMsg::SetCoronaColor { .. }
+        | ControlMsg::AdminStatusRequest
+        | ControlMsg::AdminChangeRestriction { .. }
         | ControlMsg::UserListRequest
         | ControlMsg::AdminKick { .. }
         | ControlMsg::AdminSetRestriction { .. } => {

@@ -832,7 +832,7 @@ fn store_err(e: Error, failed: &str) -> AdminResponse {
 /// `open_connections`, `handshakes` and `roomless_sessions` are what is open
 /// right now (S8, readiness review 2026-09-27: `connections` used to be
 /// graphed as if it were the latter).
-fn status(server: &Arc<Server>) -> serde_json::Value {
+pub(crate) fn status(server: &Arc<Server>) -> serde_json::Value {
     use std::sync::atomic::Ordering::Relaxed;
     let c = &server.counters;
     json!({

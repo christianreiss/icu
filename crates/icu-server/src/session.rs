@@ -589,7 +589,7 @@ async fn serve(server: &Arc<Server>, conn: &quinn::Connection, identity: &Identi
         left: false,
     };
 
-    let outcome = control_loop(server, conn, session, identity, &mut recv).await;
+    let outcome = control_loop(server, conn, session, identity, minor, &mut recv).await;
 
     // 6. Leave and announce.
     seat.abort_tasks();
@@ -1097,6 +1097,7 @@ async fn control_loop(
     conn: &quinn::Connection,
     session: Session,
     identity: &Identity,
+    minor: u16,
     recv: &mut quinn::RecvStream,
 ) -> Result<()> {
     let user_id = identity.user_id;
@@ -1290,6 +1291,50 @@ async fn control_loop(
                 let answer = admin_answer(target, done, |closed| ControlMsg::AdminKickOk {
                     user_id: target,
                     closed: closed as u32,
+                });
+                server.room.send_to(session, &answer);
+            }
+            ControlMsg::AdminStatusRequest if minor >= 9 => {
+                let answer = if actor.is_admin(&*server.store.lock().await) {
+                    let json = admin::status(server).to_string();
+                    let response = ControlMsg::AdminStatusResponse { json };
+                    if response.encode().is_ok() {
+                        response
+                    } else {
+                        ControlMsg::AdminActionError {
+                            user_id: 0,
+                            code: ec::SERVER_ERROR,
+                            detail: "status exceeds frame limit".into(),
+                        }
+                    }
+                } else {
+                    ControlMsg::AdminActionError {
+                        user_id: 0,
+                        code: ec::NOT_ADMIN,
+                        detail: "not an admin".into(),
+                    }
+                };
+                server.room.send_to(session, &answer);
+            }
+            ControlMsg::AdminChangeRestriction {
+                user_id,
+                deafen,
+                enabled,
+            } if minor >= 9 => {
+                let done = admin::set_restriction(server, Some(&actor), user_id, |(m, d)| {
+                    if deafen {
+                        (m, enabled)
+                    } else {
+                        (enabled, d)
+                    }
+                })
+                .await;
+                let answer = admin_answer(user_id, done, |(muted, deafened)| {
+                    ControlMsg::AdminSetRestrictionOk {
+                        user_id,
+                        muted,
+                        deafened,
+                    }
                 });
                 server.room.send_to(session, &answer);
             }

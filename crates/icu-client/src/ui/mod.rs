@@ -2,6 +2,7 @@
 //! (`docs/reference/client.md` §10).
 
 pub mod connection;
+mod console;
 pub mod design;
 pub mod fonts;
 pub mod main_window;

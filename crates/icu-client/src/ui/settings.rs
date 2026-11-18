@@ -302,6 +302,7 @@ pub struct SettingsView {
     /// its "Entfernen" sends `Command::RevokeUser`.
     confirm_revoke: Option<UserId>,
     /// The invite form above the member list is open.
+    console: super::console::Console,
     invite_open: bool,
     /// An invite was minted while the form was open; show its result there.
     fresh_invite: bool,
@@ -495,6 +496,7 @@ impl SettingsView {
             diagnose: DiagnoseCache::default(),
             export_status: None,
             confirm_revoke: None,
+            console: Default::default(),
             invite_open: false,
             fresh_invite: false,
             show_removed: false,
@@ -587,6 +589,7 @@ impl SettingsView {
     /// the answer comes back in the output.
     pub fn ui(&mut self, ui: &mut Ui, state: &AppState, debug_window_open: bool) -> SettingsOutput {
         design::settings_style(ui);
+        self.console.sync(ui, state);
         let mut cmds = Vec::new();
         self.debug_window_open = debug_window_open;
         self.sync.adopt(&mut self.draft, &state.settings);
@@ -2327,6 +2330,18 @@ impl SettingsView {
             },
         );
 
+        let mut console_commands = Vec::new();
+        if self.console.ui(ui, state, &mut console_commands) {
+            self.invite_open = true;
+            self.fresh_invite = false;
+            self.invite_status = None;
+        }
+
+        cmds.extend(
+            console_commands
+                .into_iter()
+                .map(|cmd| Command::ForAdminSession(state.admin_epoch, Box::new(cmd))),
+        );
         if let Some(err) = &state.user_action_error {
             widgets::banner(
                 ui,
@@ -4106,6 +4121,8 @@ mod tests {
             invite_error: None,
             user_list: Vec::new(),
             user_list_generation: 0,
+            admin_results: Default::default(),
+            admin_epoch: 0,
             user_action_error: None,
             restricted_muted: false,
             restricted_deafened: false,

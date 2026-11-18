@@ -840,3 +840,53 @@ async fn an_invitation_is_not_issued_for_a_demoted_actor() {
     );
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn console_status_and_single_flag_moderation() {
+    use icu_server::{AdminRequest, AdminResponse};
+    let server = TestServer::start().await;
+    let mut alice = server.client("alice").await;
+    let mut bob = server.client("bob").await;
+
+    bob.send_msg(&ControlMsg::AdminStatusRequest).await;
+    assert!(matches!(
+        bob.recv_matching(|m| matches!(m, ControlMsg::AdminActionError { .. }))
+            .await,
+        Some(ControlMsg::AdminActionError {
+            code: ec::NOT_ADMIN,
+            ..
+        })
+    ));
+    alice.send_msg(&ControlMsg::AdminStatusRequest).await;
+    let Some(ControlMsg::AdminStatusResponse { json }) = alice
+        .recv_matching(|m| matches!(m, ControlMsg::AdminStatusResponse { .. }))
+        .await
+    else {
+        panic!("missing status")
+    };
+    let remote: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let AdminResponse::Status(local) = server.handle.admin(AdminRequest::Status).await else {
+        panic!("missing local status")
+    };
+    for field in ["version", "online", "max_users", "limits", "tls", "backup"] {
+        assert_eq!(remote.get(field).unwrap(), &local[field]);
+    }
+    for (deafen, enabled, expected) in [
+        (true, true, (false, true)),
+        (false, true, (true, true)),
+        (false, false, (false, true)),
+    ] {
+        alice
+            .send_msg(&ControlMsg::AdminChangeRestriction {
+                user_id: bob.user_id,
+                deafen,
+                enabled,
+            })
+            .await;
+        assert!(
+            matches!(alice.recv_matching(|m|matches!(m,ControlMsg::AdminSetRestrictionOk{..})).await,
+           Some(ControlMsg::AdminSetRestrictionOk{ muted,deafened,.. }) if (muted,deafened)==expected)
+        );
+    }
+    server.shutdown().await;
+}

@@ -4,6 +4,7 @@ Ergebnisse, Entscheidungen und offene Punkte gelten für den jeweils genannten
 Stand. Aktuelle Referenzen stehen unter [reference/](../README.md).
 Die frühen Wire-Entwürfe sind durch [protocol.md](../reference/protocol.md) ersetzt.
 
+- 2026-11-18 — [Serverkonsole für Windows und Linux](../reference/client.md#serverkonsole-für-admins), Statusabfrage und atomare Moderationsbefehle mit Protokoll-Minor 9.
 - [Automatische Videoklarheit und Medienzeit — 2026-11-07](video-quality-2026-11-07.md)
 - [Release 0.1.20 — Client-Updates, Oberfläche und Tray, 2026-10-30](release-0.1.20-2026-10-30.md)
 - [Release 0.1.18 — 2026-10-24](release-0.1.18-2026-10-24.md)

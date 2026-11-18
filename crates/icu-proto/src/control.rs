@@ -26,7 +26,8 @@ use crate::{
 /// Minor 7 makes feedback policy 2 mandatory: short speech-only RMS windows,
 /// raw target error, independently consumed reporter windows and matched hints.
 /// Minor 8 adds shared capture time and clock epochs to both media headers.
-pub const MINOR: u16 = 8;
+/// Minor 9 adds optional administrative status and single-flag moderation.
+pub const MINOR: u16 = 9;
 
 /// Lowest protocol minor this build talks to, in both directions: the server
 /// closes a `Hello` below it with `VERSION_UNSUPPORTED`, the client a
@@ -390,6 +391,22 @@ pub enum ControlMsg {
         /// The new color; `None` = default.
         color: Option<Rgb>,
     },
+    /// 44, C→S. Request the server's administrative status snapshot.
+    AdminStatusRequest,
+    /// 45, S→C. Same JSON object as the local status command.
+    AdminStatusResponse {
+        /// Encoded bounded status object.
+        json: String,
+    },
+    /// 46, C→S. Change one restriction under the store lock.
+    AdminChangeRestriction {
+        /// Target account.
+        user_id: UserId,
+        /// Select deafen (true) or mute (false).
+        deafen: bool,
+        /// New value of the selected restriction.
+        enabled: bool,
+    },
 }
 
 impl ControlMsg {
@@ -414,6 +431,9 @@ impl ControlMsg {
     /// Stable variant name, for logs.
     pub fn variant(&self) -> &'static str {
         match self {
+            Self::AdminStatusRequest => "AdminStatusRequest",
+            Self::AdminStatusResponse { .. } => "AdminStatusResponse",
+            Self::AdminChangeRestriction { .. } => "AdminChangeRestriction",
             ControlMsg::AudioLevelReport { .. } => "AudioLevelReport",
             ControlMsg::AudioLevelHint { .. } => "AudioLevelHint",
             ControlMsg::Hello { .. } => "Hello",
@@ -478,6 +498,8 @@ impl ControlMsg {
                 | ControlMsg::AdminRevokeUser { .. }
                 | ControlMsg::PeerCertificateRequest { .. }
                 | ControlMsg::VideoDisplayed { .. }
+                | Self::AdminStatusRequest
+                | Self::AdminChangeRestriction { .. }
                 | ControlMsg::UserListRequest
                 | ControlMsg::AdminKick { .. }
                 | ControlMsg::AdminSetRestriction { .. }
@@ -681,6 +703,13 @@ mod tests {
                 session: 7,
                 color: None,
             },
+            ControlMsg::AdminStatusRequest,
+            ControlMsg::AdminStatusResponse { json: "{}".into() },
+            ControlMsg::AdminChangeRestriction {
+                user_id: 3,
+                deafen: true,
+                enabled: false,
+            },
         ]
     }
 
@@ -688,7 +717,7 @@ mod tests {
     #[test]
     fn roundtrip_all_control_variants() {
         let variants = all_variants();
-        assert_eq!(variants.len(), 44, "44 append-only control variants");
+        assert_eq!(variants.len(), 47, "47 append-only control variants");
         for msg in variants {
             let frame = msg.encode().unwrap();
             let body = framing::split_frame(&frame, MAX_CONTROL_FRAME)
@@ -717,8 +746,8 @@ mod tests {
     /// §10 / Spike 2b: an unknown variant decodes to `Err`, never a panic.
     #[test]
     fn unknown_variant_is_an_error() {
-        // Discriminant 44 does not exist yet.
-        let body = [44u8, 0, 0];
+        // Discriminant 47 does not exist yet.
+        let body = [47u8, 0, 0];
         let err = ControlMsg::decode(&body).unwrap_err();
         assert!(
             matches!(err, ProtoError::UnknownVariant),

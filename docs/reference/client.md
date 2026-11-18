@@ -684,3 +684,22 @@ Messung von Display- oder Schalllaufzeit; die physische Abnahme bleibt ein
 eigener Hardwaretest (`docs/development/testing.md`).
 
 Die Decode-Queue bleibt zeitlich und mengenmäßig begrenzt.
+
+## Serverkonsole für Admins
+
+Unter **Einstellungen → Administration → Serverkonsole** gibst du während der Verbindung
+Befehle ein. Enter führt sie aus, ↑ und ↓ holen frühere Eingaben, `?` zeigt die Hilfe.
+
+| Befehl | Wirkung |
+| --- | --- |
+| `show users` | Aktuelle Nutzerliste mit IDs, Rollen, Präsenz und Sperren abrufen. |
+| `show status` | Betriebsdaten wie bei `icu-server status` abrufen. |
+| `invite [--name NAME] [--ttl SEKUNDEN]` | Einladung ausstellen. Den Passport findest du in der Einladungskarte. |
+| `promote`, `demote`, `disable`, `enable` | Adminrolle bzw. Zugang des angegebenen Nutzers ändern. |
+| `kick`, `revoke` | Sitzungen trennen bzw. nach Bestätigung alle Zertifikate widerrufen. |
+| `mute`, `unmute`, `deafen`, `undeafen` | Eine einzelne Moderationssperre setzen oder aufheben. |
+
+Als Ziel gilt die ID oder der vollständige Name aus der Nutzerliste. Bei mehrdeutigen Angaben verwende `id:42` oder `name:42`. Beispiel: `mute Alex Meier`.
+Status und einzelne Moderationssperren benötigen einen Server mit Protokoll-Minor 9.
+Die Konsole zeigt Serverbestätigungen an. Endet die Sitzung vorher, prüfe den Nutzerstatus nach
+dem Wiederverbinden. Bei Rollenentzug und Verbindungsende wird der Verlauf verworfen.

@@ -122,6 +122,9 @@ AudioParams { sample_rate: u32 = 48000, frame_ms: u8 = 20, max_bitrate: u32 = 64
 | 41 | `VideoViewer` | S→C | `viewer: Session` | Unicast an den Sender nach einem gültigen Bericht. Höchstens einmal je Sekunde und Sender-Empfänger-Paar; der Sender lässt einen Bericht nach drei Sekunden ohne Erneuerung verfallen. Bestätigt die Anzeige durch den empfangenden Client, nicht die Aufmerksamkeit einer Person. |
 | 42 | `SetCoronaColor` | C→S | `color: Option<[u8; 3]>` | Ab Minor 5 (2026-10-12): die eigene Coronafarbe (sRGB), `None` = Standard des Clients. Der Server speichert sie am Nutzer (`users.toml`, `UserRecord.corona_color`) und gibt sie fortan in jedem `UserInfo` dieses Nutzers mit. Eine unveränderte Farbe schreibt und sendet nichts. Eigenes Limit: Burst 3, danach 1/s; mehr ist `RATE_LIMITED` wie jede Überschreitung. Ein fehlgeschlagener Schreibvorgang antwortet `Error { SERVER_ERROR }` und ändert nichts. |
 | 43 | `UserCoronaColor` | S→C | `session: Session`, `color: Option<[u8; 3]>` | Ab Minor 5: Broadcast an alle, je Sitzung des Nutzers eine Nachricht, auch an dessen eigene Sitzungen (ein zweites Gerät übernimmt die Farbe). Store, Raum und Broadcast unter dem Store-Lock wie `AdminSetRestriction`. |
+| 44 | `AdminStatusRequest` | C→S | Ab Minor 9, nur Admins. Fordert den aktuellen Status an. |
+| 45 | `AdminStatusResponse` | S→C | `json: String`, Statusobjekt wie beim lokalen Admin-Socket, innerhalb des Control-Frame-Limits. Fehler als `AdminActionError` mit Ziel 0. |
+| 46 | `AdminChangeRestriction` | C→S | Ab Minor 9. `user_id: UserId`, `deafen: bool` (false = Stummsperre), `enabled: bool`. Ändert nach Adminprüfung genau eine Sperre unter dem Store-Lock. Antwort mit beiden Werten als `AdminSetRestrictionOk` oder `AdminActionError`. |
 
 **Empfangsfeedback, Policy 2 / Minor 7 (2026-10-30):** `AudioLevel` enthält
 `level_cdb: i16`, `correction_cdb: i16`, `peak_cdb: i16`,
@@ -163,7 +166,7 @@ Varianten 19–28 (und 31, 33) sind die ersten C→S-Nachrichten, bei denen der 
 
 Fehlercodes kommen wie Varianten additiv hinzu (§6, zuletzt `SERVER_ERROR` 2026-09-26); ein Client, der einen Code nicht kennt, behandelt ihn als nicht fatal.
 
-Capability-Bits (`caps`): Bit 0 (`CAP_AUDIO_FEEDBACK = 1`) für optionale Varianten 36/37. Diese werden nur bei gegenseitiger Unterstützung gesendet. v1-Baseline war `minor = 1`, aktuell ist `minor = 8` (gemeinsame Medienzeit, 2026-11-07); ein Minor 0 existiert nicht, und alle 44 Variantennummern (0–43) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
+Capability-Bits (`caps`): Bit 0 (`CAP_AUDIO_FEEDBACK = 1`) für optionale Varianten 36/37. Diese werden nur bei gegenseitiger Unterstützung gesendet. v1-Baseline war `minor = 1`, aktuell ist `minor = 9` (Serverkonsole, 2026-11-18); ein Minor 0 existiert nicht, und alle 47 Variantennummern (0–46) sind in v1 belegt — Nr. 14 nur noch reserviert, siehe Tabelle — (Varianten 19–28 wie zuvor `VideoCongestionHint`, und ebenso Variante 29 `UserRtt` und 31–35: neue Pflicht-Varianten ohne Minor-Bump, da Client und Server in diesem Projekt im Lockstep ausgeliefert werden). Regel für spätere Minors: eine Seite sendet nie eine Variante oberhalb des ausgehandelten Minors (= `min(Hello.minor, Server-Minor)`, siehe §8).
 
 ### 2.3 Registrierung (revidiert 2026-09-24, nur Zertifikate)
 
@@ -348,7 +351,7 @@ Identisch in CONNECTION_CLOSE (Varint), `Error.code` und `UserLeft.reason` (u8).
 ## 8. Versionierung
 
 - Major = ALPN-String (`icu/1`). Inkompatible Änderung → `icu/2`, Server bietet ggf. beide.
-- Minor: der Client nennt sein Protokoll-Minor in `Hello.minor`, der Server seins in `Welcome.server_minor`; `Welcome.minor` ist das ausgehandelte `min(client, server)`. Varianten oberhalb des ausgehandelten Minors werden nie gesendet. Ein Minor 0 gibt es nicht; aktuell ist `minor = 8`. Minor 5 hängt `UserInfo.corona_color` an, und `UserInfo` steckt mitten in `Welcome`: Client und Server von vor Minor 5 sind mit Minor-5-Gegenstellen nicht kompatibel und werden über das Mindest-Minor abgewiesen.
+- Minor: der Client nennt sein Protokoll-Minor in `Hello.minor`, der Server seins in `Welcome.server_minor`; `Welcome.minor` ist das ausgehandelte `min(client, server)`. Varianten oberhalb des ausgehandelten Minors werden nie gesendet. Ein Minor 0 gibt es nicht; aktuell ist `minor = 9`. Minor 5 hängt `UserInfo.corona_color` an, und `UserInfo` steckt mitten in `Welcome`: Client und Server von vor Minor 5 sind mit Minor-5-Gegenstellen nicht kompatibel und werden über das Mindest-Minor abgewiesen.
 - Mindestversionen, beidseitig durchgesetzt (2026-09-26). Jede Seite hat ein Mindest-Minor für die Gegenseite (`icu_proto::MIN_PEER_MINOR`, derzeit 8):
   - Der Server schließt mit `VERSION_UNSUPPORTED`, wenn `Hello.minor` darunter liegt, oder wenn die SemVer in `Hello.client` (`<name>/<semver> <os>`, Pre-Release-Suffix zählt nicht) unter `server.min_client` liegt oder sich nicht lesen lässt. Das gilt für jede Sitzung, Registrierung und renew-only eingeschlossen.
   - Der Client schließt selbst mit `VERSION_UNSUPPORTED`, wenn `Welcome.server_minor` darunter liegt, fatal, mit dem Hinweis, dass der Server aktualisiert werden muss.

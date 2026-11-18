@@ -384,6 +384,8 @@ fn state() -> AppState {
         invite_error: None,
         user_list: users,
         user_list_generation: 1,
+        admin_results: Default::default(),
+        admin_epoch: 0,
         user_action_error: None,
         restricted_muted: false,
         restricted_deafened: false,
@@ -2742,4 +2744,31 @@ fn linux_updates_are_dismissible_information_with_manual_checks_only() {
     settings.get_by_label("Nach Updates suchen").click();
     settings.run();
     assert!(checked.get());
+}
+
+#[test]
+fn admin_console_in_settings_dispatches_session_bound_status() {
+    let s = state();
+    let commands = Rc::new(RefCell::new(Vec::new()));
+    let collected = commands.clone();
+    let mut view = SettingsView::new(
+        &s,
+        Arc::new(DebugStats::default()),
+        Paths::new(Some(std::env::temp_dir().join("icu-ui-console"))),
+    );
+    let mut h = harness(SETTINGS, "dark", true, move |ui| {
+        collected.borrow_mut().extend(view.ui(ui, &s, false).cmds);
+    });
+    h.get_by_label("Administration").click();
+    h.run();
+    h.get_by_label("Serverkonsole").click();
+    h.run();
+    h.get_by_label("Konsolenbefehl").focus();
+    h.run();
+    h.get_by_label("Konsolenbefehl").type_text("show status");
+    h.run();
+    h.get_by_label("Ausführen").click();
+    h.run();
+    assert!(commands.borrow().iter().any(|cmd|matches!(cmd,Command::ForAdminSession(0,inner) if matches!(**inner,Command::AdminStatus))));
+    shot(&mut h, "admin-console");
 }
