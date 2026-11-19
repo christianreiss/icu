@@ -9,7 +9,7 @@ TOML-Dateien.
 
 ## 0. Pakete (rpm/deb)
 
-Fertige Pakete liegen auf [der ICU-Downloadseite](https://misc.alpha-labs.net/icu/):
+Fertige Pakete liegen auf [der ICU-Downloadseite](https://icu.uggs.io/#download):
 `icu-server` (ein statisches Binary, dasselbe Paket für Fedora, AlmaLinux 10+
 und Debian 12+) und der Client `icu` je Distro (Fedora 42, Fedora 43, Debian 13).
 

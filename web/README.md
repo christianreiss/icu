@@ -12,8 +12,8 @@ Sprache folgt dem Browser und lässt sich oben rechts wechseln.
 | `assets/` | CSS, JS, Schriften (woff2-Subsets), Bilder; `img/shots/` sind Kopien von `docs/assets/screenshots/` |
 | `downloads/` | Pakete und `latest.json`; **nicht im Git**, wird von `tools/publish-release.py` befüllt |
 | `tools/` | `publish-release.py` (signieren, lokal veröffentlichen), `upload-release.py` (per API auf den Downloadserver), `make-og.py` (Vorschaubild `assets/img/og.png`) |
-| `portal/` | dynamische Downloadseite und Release-API für `misc.alpha-labs.net/icu/` (PHP, siehe unten) |
-| `deploy/icu.uggs.io.caddy` | Caddy-Vhost (getestet mit `caddy validate` und einem Probelauf) |
+| `portal/` | dynamisches Release-Archiv und Release-API (PHP, siehe unten) |
+| `deploy/icu.uggs.io.caddy` | Beispiel für eine rein statische Auslieferung mit Caddy |
 
 ## Lokal ansehen
 
@@ -48,12 +48,11 @@ Versionen bleiben liegen. Beim Übertragen auf einen Webserver gilt dieselbe
 Reihenfolge: Dateien vollständig prüfen, Manifest zuletzt freischalten.
 
 Vertrauensmodell, Schlüsselwechsel, Windows-Wiederherstellung und Abnahme:
-[Client-Updates](../docs/development/updates.md). Die produktive Downloadseite ist `portal/` (nächster Abschnitt).
+[Client-Updates](../docs/development/updates.md).
 
 ## Downloadseite und Release-API (`portal/`)
 
-`https://misc.alpha-labs.net/icu/` (twingo.alpha-labs.net, ISPConfig-Site
-web20, Apache + PHP-FPM 8.3) ist seit 2026-11-18 dynamisch: `index.php` liest
+Das Release-Archiv unter `https://icu.uggs.io/icu/` ist dynamisch: `index.php` liest
 bei jedem Aufruf `downloads/latest.json` und die Manifeste aller
 `downloads/<version>/` (bei 0.1.28 `latest.json` statt `manifest.json`).
 Angezeigt werden die freigegebene Version, je Paket Größe und Prüfsumme,
@@ -61,12 +60,15 @@ die Version aus dem Dateinamen (abweichende Versionen und fehlende Dateien
 werden markiert), Server-Pakete, die Notizen „Neu in …“ und alle älteren
 Versionen. Pro Release wird nichts mehr an der Seite bearbeitet.
 
-Die Updater-Adressen `downloads/latest.json` und `downloads/<ver>/<datei>`
-bleiben statische Dateien von Apache: kein PHP, kein Rewrite, keine
-Weiterleitung. `downloads/.htaccess` (aus `portal/downloads.htaccess`)
-verbietet ausführbare Endungen.
+Die Website und die neuen Updater nutzen `/downloads/latest.json` und
+`/downloads/<ver>/<datei>` direkt unter `https://icu.uggs.io`. Der Webserver
+liefert sie aus demselben Bestand wie das Archiv aus. Ältere Clients brauchen
+denselben Feed und dieselben Pakete direkt unter
+`https://misc.alpha-labs.net/icu/downloads/`. Diese HTTPS-Endpunkte antworten
+ohne Weiterleitung. Der Webserver darf Dateien im Downloadverzeichnis nur
+statisch ausliefern und muss den Zugriff auf interne Dateien ausschließen.
 
-API unter `api/v1/` (Antworten JSON):
+API unter `https://icu.uggs.io/api/v1/` (Antworten JSON):
 
 | Methode und Pfad | Token | Wirkung |
 | --- | --- | --- |
@@ -79,11 +81,9 @@ API unter `api/v1/` (Antworten JSON):
 | `PUT releases/<ver>/notes` | ja | Klartext „Neu in …“ setzen |
 
 Schreibende Aufrufe (Token-Spalte) nimmt der Server nur aus den Netzen in
-`write_networks` an (`config.php`, geprüft gegen `REMOTE_ADDR`; Apache steht
-ohne Proxy davor), sonst `403`. Produktiv sind das `10.2.0.0/24` und die NAT66-Adresse von aurora
-`2a01:1f8:2000:5::1/128` (owlan/kids/guests → DC), weil
-Releases nur über VPN hochgeladen werden. Lesen und die Seite bleiben
-öffentlich. Leere Liste = keine Beschränkung.
+`write_networks` an (`config.php`, geprüft gegen `REMOTE_ADDR`), sonst `403`.
+Der Webserver muss PHP-FPM die tatsächliche Client-Adresse übergeben.
+Lesen und die Seite bleiben öffentlich. Leere Liste = keine Beschränkung.
 
 Der Token (`Authorization: Bearer …`) entscheidet nur, wer hochladen darf.
 Was sichtbar wird, entscheiden die Signaturen: Beim Commit prüft der Server
@@ -97,18 +97,18 @@ entsprechen. Dann wird das Versionsverzeichnis per Rename freigeschaltet und
 Downgrades, Überschreiben veröffentlichter Bytes und fremde Dateinamen werden
 abgewiesen. Der private Schlüssel bleibt auf dem Release-Rechner.
 
-Auf dem Server, außerhalb des Webroots in `web20/private/icu-portal/`:
+Auf dem Server, außerhalb des Webroots:
 `config.php` (aus `portal/config.example.php`, enthält nur den SHA-256 des
 Tokens), `allowed_signers` (Kopie von `packaging/allowed_signers`),
 `staging/` und `notes/<ver>.txt`. Den Token selbst hält das Fleet-Secret
 `icu.release-api-token`. Ein Schlüsselwechsel muss auch diese
 `allowed_signers` ersetzen.
 
-Ausrollen: Inhalt von `portal/` nach `web20/web/icu/` (ohne
-`config.example.php` und `downloads.htaccess`), `downloads.htaccess` nach
-`icu/downloads/.htaccess`; Eigentümer `web20:client1`. Die alte statische
-`index.html` bleibt als Rückfall liegen; `DirectoryIndex index.php index.html`
-bevorzugt die PHP-Seite. Rückbau: `.htaccess` und `index.php` entfernen.
+Für PHP-FPM verweist `ICU_PORTAL_CONFIG` auf die private `config.php`.
+`downloads` in dieser Konfiguration ist der gemeinsame Downloadbestand.
+Staging und Downloads brauchen dasselbe Dateisystem für den atomaren Rename.
+Der Webserver leitet `/api/v1/<pfad>` intern an `api.php` mit `path=<pfad>`
+weiter. Nur die vorgesehenen PHP-Einstiegspunkte sind öffentlich erreichbar.
 
 Test: `python3 -B -m unittest discover -s packaging/tests -p 'test_release_portal.py'`
 startet `php -S` mit einem Wegwerf-Schlüssel und prüft Veröffentlichung,
@@ -118,9 +118,9 @@ er zusätzlich das echte signierte Release gegen `packaging/allowed_signers`.
 
 ## Ausliefern
 
-`web/` ist das Wurzelverzeichnis (`root`) von `icu.uggs.io`; der Vhost
-verweigert `tools/`, `deploy/` und `*.py`. Auf crane liegen Vhosts unter
-`/etc/caddy/vhosts/<name>.caddy`. Die Seite setzt eine strikte
+Die statischen Seiten, Favicons und `assets/` aus `web/` liegen unter
+`https://icu.uggs.io/`. `tools/`, `deploy/`, `portal/` und die README gehören
+nicht zur statischen Auslieferung. Die Seite setzt eine strikte
 Content-Security-Policy per `<meta>` (nur eigene Ressourcen); wer Analytics oder
 externe Schriften ergänzt, muss sie anpassen. Rechtlich fehlt noch ein
 Impressum, falls die Seite öffentlich und nicht rein privat betrieben wird.

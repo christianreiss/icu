@@ -1,22 +1,34 @@
 use super::manifest::{self, Release, MAX_MANIFEST};
 use std::{io::Read, time::Duration};
 
-const PRODUCTION_ROOT: &str = "https://misc.alpha-labs.net/icu";
 fn root() -> Result<&'static str, String> {
+    let production = super::RELEASE_INFO.trim_end_matches('/');
     #[cfg(feature = "update-acceptance")]
-    let root = option_env!("ICU_UPDATE_ACCEPTANCE_ROOT").unwrap_or(PRODUCTION_ROOT);
+    let root = option_env!("ICU_UPDATE_ACCEPTANCE_ROOT").unwrap_or(production);
     #[cfg(not(feature = "update-acceptance"))]
-    let root = PRODUCTION_ROOT;
+    let root = production;
     let uri: ureq::http::Uri = root.parse().map_err(|_| "Ungültiger Update-Kanal.")?;
     if uri.scheme_str() != Some("https")
-        || uri.authority().map(|a| a.as_str()) != Some("misc.alpha-labs.net")
+        || uri.authority().map(|a| a.as_str()) != Some("icu.uggs.io")
         || uri.query().is_some()
-        || !uri.path().starts_with("/icu")
+        || (uri.path() != "/" && !uri.path().starts_with("/icu"))
         || root.ends_with('/')
     {
         return Err("Ungültiger Update-Kanal.".into());
     }
     Ok(root)
+}
+
+#[cfg(all(test, not(feature = "update-acceptance")))]
+mod tests {
+    #[test]
+    fn production_manifest_uses_the_new_domain_root() {
+        let root = super::root().unwrap();
+        assert_eq!(
+            format!("{root}/downloads/latest.json"),
+            "https://icu.uggs.io/downloads/latest.json"
+        );
+    }
 }
 pub(super) fn agent(timeout: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()

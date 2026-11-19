@@ -19,7 +19,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-pub const RELEASE_INFO: &str = "https://misc.alpha-labs.net/icu/";
+pub const RELEASE_INFO: &str = "https://icu.uggs.io/";
 const INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, Clone, Default)]

@@ -2,7 +2,7 @@
 """Upload a signed release from dist/<version>/ to the ICU release API.
 
     ICU_RELEASE_API_TOKEN=... web/tools/upload-release.py [version]
-        [--api https://misc.alpha-labs.net/icu/api/v1] [--notes notes.txt] [--no-latest]
+        [--api https://icu.uggs.io/api/v1] [--notes notes.txt] [--no-latest]
 
 Run web/tools/publish-release.py --prepare-only first: it signs SHA256SUMS and
 latest.json locally. This tool only transports those bytes; the server
@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_API = "https://misc.alpha-labs.net/icu/api/v1"
+DEFAULT_API = "https://icu.uggs.io/api/v1"
 
 
 def workspace_version() -> str:

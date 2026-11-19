@@ -53,8 +53,12 @@ Installation bzw. UAC weiterhin einen unbekannten Herausgeber anzeigen.
 Der integrierte Updater authentifiziert das gesamte ZIP/Setup kryptografisch,
 bevor es verarbeitet oder gestartet wird.
 
-Die Adresse ist fest auf `https://misc.alpha-labs.net/icu` begrenzt. TLS prüft
-die vollständige Zertifikatskette; Weiterleitungen werden abgewiesen.
+Ab 0.1.32 fragt der Client `https://icu.uggs.io/downloads/latest.json` ab.
+TLS prüft die vollständige Zertifikatskette; Weiterleitungen werden abgewiesen.
+Bis einschließlich 0.1.31 greifen installierte Clients weiterhin auf
+`https://misc.alpha-labs.net/icu/downloads/` zu. Dieser Pfad braucht deshalb
+gültiges TLS für den alten Hostnamen und muss Manifest und Pakete direkt per
+HTTP 200 ausliefern. So kann der alte Windows-Updater 0.1.32 beziehen.
 Metadaten liefern keine ausführbaren URLs, Pfade oder Argumente. Downloads
 haben Größenlimits und werden gegen die authentifizierte Größe und Prüfsumme
 geprüft. Ein Dateihandle verhindert anschließend Veränderungen oder Löschung
@@ -142,7 +146,7 @@ und [Job-Object-Lebenszyklen](https://learn.microsoft.com/windows/win32/procthre
    Vorbereitungsschritt für den bisherigen Release-Upload.
 3. `ICU_RELEASE_API_TOKEN=… python3 web/tools/upload-release.py --notes <datei>`
    lädt `dist/<version>/` über die Release-API auf
-   `https://misc.alpha-labs.net/icu/` hoch (Token: Fleet-Secret
+   `https://icu.uggs.io/api/v1` hoch (Token: Fleet-Secret
    `icu.release-api-token`). Der Server prüft beide Signaturen
    (`icu-release`, `icu-update`) gegen seine Kopie von
    `packaging/allowed_signers`, jede Prüfsumme, Vollständigkeit, Dateinamen
@@ -178,6 +182,6 @@ Ein als Administrator gestarteter Client belegt keinen UAC-Abbruch.
 
 Das nicht standardmäßig aktivierte Feature `update-acceptance` akzeptiert beim
 Bauen `ICU_UPDATE_ACCEPTANCE_ROOT` für einen getrennten, temporären Testkanal
-unter derselben HTTPS-Domain. Signatur-, TLS-, Pfad- und Artefaktprüfungen bleiben
+unter `https://icu.uggs.io/icu-…`. Signatur-, TLS-, Pfad- und Artefaktprüfungen bleiben
 aktiv. Es verändert keinen Produktivfeed und gehört nicht in Release-Builds.
 Nach der Abnahme Testkanal und eigene Testprozesse/-aufgaben entfernen.
