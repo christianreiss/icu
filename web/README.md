@@ -9,9 +9,9 @@ Sprache folgt dem Browser und lässt sich oben rechts wechseln.
 | Pfad | Inhalt |
 | --- | --- |
 | `index.html`, `404.html` | die Seiten |
-| `assets/` | CSS, JS, Schriften (woff2-Subsets), Bilder; `img/shots/` sind Kopien von `docs/assets/screenshots/` |
+| `assets/` | CSS, JS, Schriften (woff2-Subsets), Bilder; `img/shots/` stammen bis auf `video-call.png` und `overlay.png` (ältere Aufnahmen) aus dem Headless-Rendering in `crates/icu-client/tests/ui_layout.rs` (`ICU_UI_SHOTS=<dir>`), ebenso `docs/assets/screenshots/` für die README |
 | `downloads/` | Pakete und `latest.json`; **nicht im Git**, wird von `tools/publish-release.py` befüllt |
-| `tools/` | `publish-release.py` (signieren, lokal veröffentlichen), `upload-release.py` (per API auf den Downloadserver), `make-og.py` (Vorschaubild `assets/img/og.png`) |
+| `tools/` | `publish-release.py` (signieren, lokal veröffentlichen), `upload-release.py` (per API auf den Downloadserver), `make-og.py` (Vorschaubild `assets/img/og.png`; mit `--lang en --out docs/assets/banner-en.png` das README-Banner) |
 | `portal/` | dynamisches Release-Archiv und Release-API (PHP, siehe unten) |
 | `deploy/icu.uggs.io.caddy` | Beispiel für eine rein statische Auslieferung mit Caddy |
 

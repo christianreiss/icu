@@ -1,153 +1,239 @@
-<div align="center">
+<p align="center">
+  <a href="https://icu.uggs.io"><img src="docs/assets/banner-en.png" alt="ICU — one crew, one room, no noise" width="100%"></a>
+</p>
 
-<img src="crates/icu-client/assets/icu.png" width="96" height="96" alt="ICU-Icon" />
+<p align="center">
+  <b>Self-hosted voice chat for a fixed group. One server, one room, no channels.</b><br>
+  Opus voice, echo and noise suppression, an in-game camera overlay and mutual TLS instead of passwords.<br>
+  For Linux and Windows.
+</p>
 
-# ICU
+<p align="center">
+  <a href="https://github.com/christianreiss/icu/releases/latest"><img src="https://img.shields.io/github/v/release/christianreiss/icu?label=release&color=2e9bff" alt="Latest release"></a>
+  <a href="https://github.com/christianreiss/icu/releases"><img src="https://img.shields.io/github/downloads/christianreiss/icu/total?color=2e9bff" alt="Downloads"></a>
+  <img src="https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-2e9bff" alt="Linux and Windows">
+  <img src="https://img.shields.io/badge/built%20with-Rust-dea584" alt="Built with Rust">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-43d9a0" alt="Apache-2.0"></a>
+</p>
 
-**Minimales Voice-System für eine feste Gruppe. Ein Server, ein Raum, keine Channels.**
-
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](Cargo.toml)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-informational.svg)](#installation)
-[![Release](https://img.shields.io/github/v/release/christianreiss/icu?label=release&color=brightgreen)](https://github.com/christianreiss/icu/releases/latest)
-
-**[icu.uggs.io](https://icu.uggs.io)** · [Downloads](https://github.com/christianreiss/icu/releases/latest) · [Release-Archiv](https://icu.uggs.io/icu/)
-
-</div>
+<p align="center">
+  <a href="https://github.com/christianreiss/icu/releases/latest"><b>Download</b></a> ·
+  <a href="https://icu.uggs.io"><b>Website</b></a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#security-model">Security</a> ·
+  <a href="docs/README.md">Docs</a> ·
+  <a href="README.de.md">Deutsch</a>
+</p>
 
 ---
 
-ICU ist das, was übrig bleibt, wenn man Mumble und TeamSpeak auf genau eine
-feste Gruppe zuschneidet und alles streicht, was diese Gruppe nicht braucht.
-Kein Server-Browser, keine Channel-Hierarchie, keine Rollen außer Admin —
-dafür Opus-Sprachqualität, WebRTC-AEC, RNNoise, ein Kamera-Overlay fürs
-Spiel und mutual TLS statt Passwort.
+ICU is what is left of Mumble and TeamSpeak once you strip out everything a
+fixed group does not need. There is no server browser, no channel tree and no
+role system beyond admin. What you get instead is good voice: Opus at 48 kHz,
+WebRTC echo cancellation, RNNoise, a jitter buffer that hides packet loss, a
+camera overlay that sits on top of your game, and a certificate as your login.
 
-> Nur die Features, die wirklich gebraucht werden. Die sind dafür perfekt.
+> Only the features that are really needed. Perfected for that.
+
+Your group runs its own server: one static binary, one UDP port. Friends join
+with an invitation file. Nobody types a password, and nobody configures
+channels.
 
 ## Screenshots
 
 <table>
 <tr>
-<td width="50%">
+<td width="50%" valign="top">
 
-**Hauptfenster** — ein Raum, alle Teilnehmer, PTT und Overlay auf einen Blick
+**One room, everybody in it.** Speaking indicator, signal strength, mute, deafen and camera status per person; push-to-talk and the controls at the bottom.
 
-<img src="docs/assets/screenshots/call-window.png" alt="ICU Hauptfenster" />
+<img src="docs/assets/screenshots/room.png" alt="ICU main window with six participants" />
 
 </td>
-<td width="50%">
+<td width="50%" valign="top">
 
-**Videocall mit Kamerakacheln** — Sprecher-Indikator, Signalstärke, RTT je Teilnehmer
+**Every participant, one click away.** Your own volume for them, the connection path through your server, and the certificates behind it.
 
-<img src="docs/assets/screenshots/video-call.png" alt="ICU mit Kamera" />
+<img src="docs/assets/screenshots/participant.png" alt="Participant details with volume, connection path and certificates" />
 
 </td>
 </tr>
 <tr>
-<td width="50%">
+<td width="50%" valign="top">
 
-**In-Game-Overlay** — click-through, always-on-top, zeigt Kamera und Sprecher-Highlight über einem Borderless-Fenster-Spiel
+**An invitation instead of a password.** Open the `.icu` file or paste its text, check where it leads, pick a name, done.
 
-<img src="docs/assets/screenshots/overlay.png" alt="ICU Overlay im Spiel" />
+<img src="docs/assets/screenshots/join.png" alt="Joining ICU with an invitation" />
 
 </td>
-<td width="50%">
+<td width="50%" valign="top">
 
-**Einladung statt Passwort** — `.icu`-Datei oder Text einfügen, fertig registriert
+**Admin without a web panel.** Members, invitations, moderation and a server console, right in the client.
 
-<img src="docs/assets/screenshots/invite.png" alt="ICU Einladung" />
+<img src="docs/assets/screenshots/admin.png" alt="Administration page with members and the server console" />
 
 </td>
 </tr>
 </table>
 
-**Verbindungspfad & Zertifikate** — wer mit wem spricht, worüber, und mit welchem CA-Vertrauensanker, auf einen Blick:
-
 <p align="center">
-<img src="docs/assets/screenshots/connection-details-dark.png" width="45%" alt="Verbindungsdetails, dunkles Theme" />
-&nbsp;&nbsp;
-<img src="docs/assets/screenshots/connection-details-light.png" width="45%" alt="Verbindungsdetails, helles Theme" />
+  <img src="docs/assets/screenshots/privacy.png" width="38%" alt="Privacy mode: microphone off, camera replaced by static" />
+  &nbsp;
+  <img src="docs/assets/screenshots/room-light.png" width="38%" alt="ICU main window in the light theme" />
+  <br>
+  <sub><b>Privacy mode</b> with one click · dark and light theme</sub>
 </p>
 
 ## Features
 
-| Bereich | Was ICU macht |
+| | |
 | --- | --- |
-| **Audio** | Opus 48 kHz mono, adaptiver Jitter-Buffer mit FEC/PLC, WebRTC-AEC3-Echounterdrückung, RNNoise-Rauschunterdrückung, automatische Mikrofon- und Empfangslautstärke |
-| **Sprechen** | Push-to-Talk oder Voice-Activation, global bindbar inkl. Maustasten (Windows Raw Input, Linux Portal/evdev), Release-Delay, Sende-Cue |
-| **Teilnehmer** | Liste mit Speaking-Indicator, Mute/Deafen-Status, Kamera-Status, Lautstärke pro Person (0–200 %, persistent) |
-| **Kamera & Overlay** | Kamera an/aus mit Vorschau; Overlay als eigenes transparentes Always-on-top-Fenster über Borderless-Spielen, click-through, GPU-gerendert mit DPI-skalierter Sprecher-Hervorhebung — kein Render-Hooking |
-| **Identität & Zugang** | Mutual TLS mit server-eigener CA; Beitritt per Einladungs-Bundle (`.icu`-Datei oder Text), kein Passwort; eigenes Zertifikat sichtbar, Passport zum Exportieren/Importieren der ganzen Identität |
-| **Admin** | Einladen, befördern/entziehen, sperren/entsperren, entfernen, stumm-/taubschalten, rauswerfen — im Client und per Server-CLI/Shell |
-| **Betrieb** | Automatischer Reconnect mit Backoff, ein statisches Server-Binary, Tray-Icon, minimaler Settings-Dialog, Einrichtungsassistent beim ersten Start |
+| 🎙️ **Audio** | Opus 48 kHz mono in 20 ms frames, adaptive jitter buffer with FEC and PLC, WebRTC AEC3 echo cancellation, RNNoise noise suppression, automatic microphone and playback levels |
+| 🗣️ **Talking** | Push-to-talk or voice activation, globally bindable including mouse buttons (Windows Raw Input, Linux portal/evdev), release delay, transmit cue, keyboard-click filter for voice activation |
+| 👥 **Participants** | Speaking indicator, mute/deafen and camera status, per-person volume from 0 to 200 % that is remembered |
+| 📷 **Camera & overlay** | H.264 camera with preview; the overlay is its own transparent always-on-top window above borderless games, click-through, GPU-rendered, DPI-aware |
+| 🛡️ **Privacy mode** | One button stops your microphone and replaces your camera with TV static, without touching your other settings |
+| 🔑 **Identity** | Mutual TLS with a CA that belongs to your server; join with a single-use, time-limited invitation; export your whole identity as a passport and move it to another device |
+| 🧑‍✈️ **Admin** | Invite, promote, ban, mute, deafen and kick from the client, from the server CLI or from an interactive admin shell |
+| ⚙️ **Operations** | One static server binary, automatic reconnect with backoff, tray icon, setup assistant on first launch, signed self-updates on Windows, a read-only `icu-server doctor` |
 
-Vollständige, mit Zahlen belegte Liste inklusive bewusst abgelehnter Features:
-[`docs/reference/features.md`](docs/reference/features.md).
+The complete list, with numbers and with the features that were turned down on
+purpose, is in [`docs/reference/features.md`](docs/reference/features.md).
 
-## Nicht-Ziele
+### What is missing is deliberate
 
-- Channels, Rechteverwaltung, Rollen außer Admin, Server-Browser
-- Text-Chat, Dateitransfer, Bots, Plugins
-- Overlay in exklusivem Fullscreen (DirectX/Vulkan-Hooking)
-- Mobile Clients, Web-Client
+- Channels, server browser, permission management beyond admin
+- Text chat, file transfer, bots, plugins
+- Overlay in exclusive fullscreen (that would need DirectX/Vulkan hooking)
+- Mobile and web clients
 
-## Installation
+If you need one of these, Mumble or TeamSpeak is the better choice, and that
+is fine.
 
-Überblick und Downloads: https://icu.uggs.io (Quelle: [`web/`](web/README.md)).
-Pakete unter https://github.com/christianreiss/icu/releases: der Client für
-Fedora 42/43 (`icu-client`, `.rpm`) und Debian 13 (`icu`, `.deb`) sowie als portables, unsigniertes
-ZIP für Windows 10/11 (SmartScreen beim ersten Start: „Weitere Informationen“ →
-„Trotzdem ausführen“) oder, alternativ, ein ebenfalls unsigniertes Setup für
-alle Benutzer (Installation unter `C:\Program Files\ICU`, Startmenü-Eintrag und
-Deinstallation über Einstellungen/Systemsteuerung; benötigt Administratorrechte).
-Das portable ZIP benötigt keine Installation; SmartScreen warnt bei beiden Varianten.
-Der Server `icu-server` ist für
-Fedora, AlmaLinux 10+ (`.rpm`) und Debian 12+ (`.deb`) (Einrichtung:
-`deploy/README.md` §0), sowie eine interaktive Admin-Shell
-(`icu-server shell`, kurz `icu-cli`, [Server-Referenz](docs/reference/server.md#51-shell)) und
-eine Nur-Lese-Diagnose für Konfiguration, State, Zertifikate und Ports
-(`icu-server doctor`, §5).
+## Download
 
-## Entwicklung und Dokumentation
+Every release ships the same packages that [icu.uggs.io](https://icu.uggs.io)
+serves, plus `SHA256SUMS`, its signature and one `BUILDINFO` per build.
 
-`./build.sh` baut den aktuellen Code: Server, Linux-/Windows-Client, alle
-DEB-/RPM-Pakete und den Windows-Installer, mit Live-Dashboard und Prüfungen.
-Mit `./build.sh --bump` wird vorher die gemeinsame Patch-Version erhöht.
-`./build.sh --clean` entfernt vorher alle kompilierten Ziele und baut frisch;
-beide Optionen lassen sich kombinieren.
-`./build.sh --clean-only` gibt Build-Speicherplatz frei, ohne neu zu bauen;
-fertige Pakete, Backups und Logs bleiben erhalten.
-Details und Voraussetzungen: [Bauanleitung](docs/development/building.md).
-
-| Pfad | Inhalt |
+| You run | Get |
 | --- | --- |
-| `crates/` | Rust-Workspace: Protokoll, Server und Client |
-| [docs/](docs/README.md) | Referenz, Bauanleitung, Tests, Recherche und Verlauf |
-| [experiments/](experiments/README.md) | Eigenständige Forschungsprogramme |
-| `packaging/` | Paketbau, Cross-Toolchain und Release-Skripte |
-| [web/](web/README.md) | Webseite icu.uggs.io: Überblick, Screenshots, Download |
-| [deploy/](deploy/README.md) | Deployment-Dateien und Betriebshandbuch |
-| `target/` | Regenerierbare Build-Ausgaben und Paket-Staging |
-| `dist/<version>/` | Fertige Pakete, BUILDINFO und Prüfsummen |
-| `.local/` | Lokale Testumgebungen und aufbewahrte Belege |
+| **Windows 10/11** | `icu-<version>-windows-x86_64-setup.exe` (installs for all users) or the portable `icu-<version>-windows-x86_64.zip` |
+| **Fedora 42 / 43** | `icu-client-<version>-1.fc42.x86_64.rpm` / `.fc43.x86_64.rpm` |
+| **Debian 13** | `icu_<version>-1+deb13_amd64.deb` |
+| **Server on Fedora, AlmaLinux 10+** | `icu-server-<version>-1.x86_64.rpm` |
+| **Server on Debian 12+** | `icu-server_<version>-1_amd64.deb` |
 
-[Bauen](docs/development/building.md) · [Client](docs/reference/client.md) ·
-[Server](docs/reference/server.md) · [Wire-Protokoll](docs/reference/protocol.md) ·
-[Features](docs/reference/features.md)
+**[→ Latest release](https://github.com/christianreiss/icu/releases/latest)**
+
+The Windows builds are not code-signed yet. On first launch SmartScreen asks:
+choose “More info” → “Run anyway”. Where Smart App Control is switched on,
+Windows blocks unsigned programs.
+
+<details>
+<summary><b>Verify your download</b></summary>
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+ssh-keygen -Y verify -f packaging/allowed_signers -I icu-release -n icu-release \
+  -s SHA256SUMS.sig < SHA256SUMS
+```
+
+`packaging/allowed_signers` is in this repository. On Windows:
+`certutil -hashfile icu-<version>-windows-x86_64.zip SHA256`.
+
+</details>
+
+## Quick start
+
+**1. Set up the server.** One package, one setup dialog, one UDP port (4711 by default).
+
+```sh
+sudo dnf install ./icu-server-<version>-1.x86_64.rpm      # Fedora, AlmaLinux 10+
+sudo apt install ./icu-server_<version>-1_amd64.deb       # Debian 12+
+sudo icu-server setup
+sudo systemctl enable --now icu-server
+sudo firewall-cmd --permanent --add-service=icu && sudo firewall-cmd --reload
+```
+
+**2. Issue invitations.** Whoever registers first becomes admin. Every
+invitation works once and expires.
+
+```sh
+sudo icu-server invite --out /root/icu-admin.icu
+icu-server invite --ttl 24h --out ~/bob.icu
+```
+
+**3. Install the client and join.** Open the invitation (or drag it into the
+window), pick a name, press “Join”. The assistant sets up microphone, talk key
+and sound.
+
+```sh
+sudo dnf install ./icu-client-<version>-1.fc$(rpm -E %fedora).x86_64.rpm   # Fedora
+sudo apt install ./icu_<version>-1+deb13_amd64.deb                         # Debian 13
+```
+
+Operations manual: [`deploy/README.md`](deploy/README.md). Server reference,
+admin shell (`icu-server shell`) and diagnostics (`icu-server doctor`):
+[`docs/reference/server.md`](docs/reference/server.md).
+
+## Security model
+
+- **Your own CA, no passwords.** Every server runs its own certificate
+  authority. The invitation carries the trust anchor and a single-use
+  registration certificate; after that, your client certificate is your login.
+- **A silent port.** Audio travels as QUIC datagrams over TLS 1.3, and every
+  datagram carries an HMAC tag with the server's com key, in the spirit of
+  OpenVPN `tls-auth` (without its replay protection). Without the key the
+  port does not answer.
+- **Honest about the relay.** Both legs are encrypted, but the server relays
+  and can read the media it forwards. That is why your group runs it itself.
+  ICU is not end-to-end encrypted.
+- **Signed releases and updates.** `SHA256SUMS` and the update feed are signed
+  with Ed25519. The Windows client verifies the signature before it updates
+  itself.
+
+Wire protocol: [`docs/reference/protocol.md`](docs/reference/protocol.md).
+
+## Build from source
+
+```sh
+./build.sh            # server, Linux and Windows clients, all packages, with tests
+./build.sh --bump     # raise the shared patch version first
+```
+
+`./build.sh` builds the server (static musl), the Linux client for Fedora and
+Debian in containers, and the Windows client cross-compiled with its NSIS
+installer. It runs the workspace tests, license and supply-chain checks and
+package smoke tests, and writes everything to `dist/<version>/`. It needs a
+Linux x86-64 host with Bash, Python 3.11+, Git and Podman; the full list is in
+the [build guide](docs/development/building.md).
+
+**Stack:** Rust · QUIC ([quinn](https://github.com/quinn-rs/quinn) +
+rustls/ring) with datagrams for audio · Opus · WebRTC AEC3 · RNNoise ·
+PipeWire on Linux, WASAPI on Windows · [egui](https://github.com/emilk/egui) ·
+H.264 via OpenH264 · Wayland layer-shell and Windows layered-window overlay.
+
+| Path | Contents |
+| --- | --- |
+| `crates/` | Rust workspace: protocol, server and client |
+| [`docs/`](docs/README.md) | Reference, build guide, tests, research and history |
+| `packaging/` | Package recipes, cross toolchain and release scripts |
+| [`web/`](web/README.md) | The website icu.uggs.io and its release archive |
+| [`deploy/`](deploy/README.md) | Deployment files and operations manual |
+| [`experiments/`](experiments/README.md) | Standalone research programs |
 
 ## Status
 
-Server, Protokoll und Linux-/Windows-Client sind implementiert. Datierten
-[Prüfberichten](docs/history/README.md) stehen die offenen
-[Live-Test-Aufgaben](docs/development/testing.md) gegenüber; ein früherer Gate-Lauf
-ist keine Freigabe des aktuellen Builds. Referenzdokumente beschreiben das
-Verhalten, Prüfberichte nennen den jeweils geprüften Stand.
+ICU is young and in use by the group it was built for. Server,
+protocol and both clients are complete. The client interface and most of the
+documentation are in German for now. Still open: testing on more physical
+Windows hardware (acoustic echo, gaming mice, mixed DPI), the portal hotkey on
+KDE, and camera bitrate on more webcams. What the live tests do not cover yet
+is listed in [`docs/development/testing.md`](docs/development/testing.md).
 
-Stack (belegt in `docs/research/`, verifiziert in `docs/history/verification.md`): Rust; QUIC (quinn + rustls/ring) mit Datagrams für Audio; mutual TLS mit server-eigener CA und Registrierung per Einladungs-Bundle (`.icu`-Datei); Com-Schlüssel je Server nach dem Vorbild von OpenVPN `tls-auth` (ohne dessen Replay-Schutz) (HMAC-Tag auf jedem Datagramm, ohne ihn bleibt der Port stumm); Opus 48 kHz mono 20 ms; Server als reiner Relay; Client mit PipeWire (Linux) bzw. WASAPI IAudioClient3 (Windows), WebRTC AEC3, RNNoise, adaptivem Jitter-Buffer, egui-UI, Portal/evdev bzw. Raw-Input-Hotkeys, Layer-Shell bzw. Layered-Window-Overlay, H.264 über openh264.
+## License
 
-Offen: Windows auf physischer Zielhardware (akustische AEC/Drift, Gaming-Maus/Spiel-Overlay, gemischte DPI; SmartScreen ist auf Windows 11 geprüft, Smart App Control blockiert, wo eingeschaltet, die unsignierte Exe), interaktiver Portal-Hotkey-Test auf KDE, Kamera-Bitrate bei echten 15 fps und an YUYV-Kameras, zwei Rechner über WLAN/WAN mit ratenbegrenztem Video-Zuschauer; was der Live-Test noch nicht abdeckt, steht in `docs/development/testing.md` §6.
-
-## Lizenz
-
-Apache-2.0, siehe `LICENSE`. Die Pakete enthalten `THIRD-PARTY-LICENSES` für gebündelten Fremdcode. Der Client baut OpenH264 aus dem Quellcode ein; die Patentlizenz, die Cisco für seine eigenen Binaries übernimmt, gilt dafür nicht (`docs/research/packaging-licensing.md`, H.264-Patentlage).
+Apache-2.0, see [`LICENSE`](LICENSE). The packages include
+`THIRD-PARTY-LICENSES` for bundled third-party code. The client compiles
+OpenH264 from source; Cisco's patent license covers only Cisco's own binaries,
+not this build ([details](docs/research/packaging-licensing.md)).

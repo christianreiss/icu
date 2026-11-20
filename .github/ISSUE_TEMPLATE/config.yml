@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Website, downloads and release archive
+    url: https://icu.uggs.io
+    about: Overview, screenshots and every published package.
+  - name: Features that are left out on purpose
+    url: https://github.com/christianreiss/icu#what-is-missing-is-deliberate
+    about: Channels, text chat, bots, plugins and mobile clients are not planned.

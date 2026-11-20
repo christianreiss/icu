@@ -4,7 +4,11 @@
 Needs Pillow and the Red Hat Display / Source Code Pro fonts that
 web/assets/fonts was subset from (Fedora: redhat-display-fonts,
 adobe-source-code-pro-fonts).
+
+`--lang en --out docs/assets/banner-en.png` renders the English card used
+as the README banner and GitHub social preview.
 """
+import argparse
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -18,11 +22,33 @@ W, H, S = 1200, 630, 2  # canvas, supersampling
 INK, BLUE, HI, AMBER = (5, 15, 26), (46, 155, 255), (143, 208, 255), (255, 181, 71)
 
 
+COPY = {
+    "de": {
+        "tag": "RAUM 01 · 1 SERVER · 0 CHANNELS",
+        "lines": ("Eine Gruppe.", "Ein Raum.", "Kein Rauschen."),
+        "sub": "Minimales Voice-System für eine feste Gruppe.",
+        "underline": 560,
+    },
+    "en": {
+        "tag": "ROOM 01 · 1 SERVER · 0 CHANNELS",
+        "lines": ("One crew.", "One room.", "No noise."),
+        "sub": "Minimal voice chat for a fixed group.",
+        "underline": None,  # the width of the last line
+    },
+}
+
+
 def font(path, size):
     return ImageFont.truetype(path, size * S)
 
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--lang", choices=sorted(COPY), default="de")
+    ap.add_argument("--out", type=Path, default=OUT)
+    args = ap.parse_args()
+    copy = COPY[args.lang]
+
     img = Image.new("RGB", (W * S, H * S), INK)
 
     glow = Image.new("RGB", img.size, INK)
@@ -52,18 +78,20 @@ def main():
     x = 80
     d.rounded_rectangle((x * S, 74 * S, (x + 350) * S, 116 * S), radius=21 * S, outline=(130, 185, 255, 70), width=S)
     d.ellipse(((x + 18) * S, 90 * S, (x + 28) * S, 100 * S), fill=(67, 217, 160))
-    d.text(((x + 40) * S, 95 * S), "RAUM 01 · 1 SERVER · 0 CHANNELS", font=font(MONO, 15), fill=(147, 170, 193), anchor="lm")
+    d.text(((x + 40) * S, 95 * S), copy["tag"], font=font(MONO, 15), fill=(147, 170, 193), anchor="lm")
     big = font(DISPLAY, 96)
-    d.text((x * S, 150 * S), "Eine Gruppe.", font=big, fill=(232, 241, 251))
-    d.text((x * S, 244 * S), "Ein Raum.", font=big, fill=(232, 241, 251))
-    d.text((x * S, 338 * S), "Kein Rauschen.", font=big, fill=BLUE)
-    d.rounded_rectangle((x * S, 452 * S, (x + 560) * S, 458 * S), radius=3 * S, fill=HI)
-    d.text((x * S, 500 * S), "Minimales Voice-System für eine feste Gruppe.", font=font(TEXT, 30), fill=(195, 213, 231))
+    first, second, third = copy["lines"]
+    d.text((x * S, 150 * S), first, font=big, fill=(232, 241, 251))
+    d.text((x * S, 244 * S), second, font=big, fill=(232, 241, 251))
+    d.text((x * S, 338 * S), third, font=big, fill=BLUE)
+    line = copy["underline"] or round(d.textlength(third, font=big) / S)
+    d.rounded_rectangle((x * S, 452 * S, (x + line) * S, 458 * S), radius=3 * S, fill=HI)
+    d.text((x * S, 500 * S), copy["sub"], font=font(TEXT, 30), fill=(195, 213, 231))
     d.text((x * S, 566 * S), "icu.uggs.io", font=font(MONO, 26), fill=AMBER, anchor="ls")
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    img.resize((W, H), Image.LANCZOS).save(OUT, optimize=True)
-    print(OUT)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    img.resize((W, H), Image.LANCZOS).save(args.out, optimize=True)
+    print(args.out)
 
 
 if __name__ == "__main__":

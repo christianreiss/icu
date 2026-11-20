@@ -1,0 +1,44 @@
+name: Bug report
+description: Something in the ICU client or server does not work as it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. English or German, both are fine.
+        Security problems do not belong here: see [SECURITY.md](https://github.com/christianreiss/icu/blob/main/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: ICU version
+      description: Client and server version, e.g. 0.1.32 (client ⚙ → General, server `icu-server --version`).
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Client on Windows 10/11
+        - Client on Fedora
+        - Client on Debian
+        - Server
+        - Website or packages
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Steps to reproduce help most.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Client log: `~/.local/state/icu/icu.log` on Linux, `%LOCALAPPDATA%\icu\data\icu.log` on Windows.
+        Server: `icu-server doctor` and `journalctl -u icu-server`.
+        Please remove names and addresses you do not want to share.
+      render: text
