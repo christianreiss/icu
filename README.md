@@ -86,7 +86,7 @@ channels.
 
 ## Features
 
-| | |
+| Area | What ICU does |
 | --- | --- |
 | 🎙️ **Audio** | Opus 48 kHz mono in 20 ms frames, adaptive jitter buffer with FEC and PLC, WebRTC AEC3 echo cancellation, RNNoise noise suppression, automatic microphone and playback levels |
 | 🗣️ **Talking** | Push-to-talk or voice activation, globally bindable including mouse buttons (Windows Raw Input, Linux portal/evdev), release delay, transmit cue, keyboard-click filter for voice activation |
@@ -117,7 +117,7 @@ serves, plus `SHA256SUMS`, its signature and one `BUILDINFO` per build.
 
 | You run | Get |
 | --- | --- |
-| **Windows 10/11** | `icu-<version>-windows-x86_64-setup.exe` (installs for all users) or the portable `icu-<version>-windows-x86_64.zip` |
+| **Windows 10/11** | `icu-<version>-windows-x86_64-setup.exe` (installs for all users, needs admin rights) or the portable `icu-<version>-windows-x86_64.zip` |
 | **Fedora 42 / 43** | `icu-client-<version>-1.fc42.x86_64.rpm` / `.fc43.x86_64.rpm` |
 | **Debian 13** | `icu_<version>-1+deb13_amd64.deb` |
 | **Server on Fedora, AlmaLinux 10+** | `icu-server-<version>-1.x86_64.rpm` |

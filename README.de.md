@@ -87,7 +87,7 @@ niemand richtet Channels ein.
 
 ## Funktionen
 
-| | |
+| Bereich | Was ICU macht |
 | --- | --- |
 | 🎙️ **Audio** | Opus 48 kHz mono in 20-ms-Frames, adaptiver Jitter-Buffer mit FEC/PLC, WebRTC-AEC3-Echounterdrückung, RNNoise-Rauschunterdrückung, automatische Mikrofon- und Empfangslautstärke |
 | 🗣️ **Sprechen** | Push-to-Talk oder Voice-Activation, global bindbar inklusive Maustasten (Windows Raw Input, Linux Portal/evdev), Release-Delay, Sende-Cue, Filter gegen Tastaturklicks bei Voice-Activation |
