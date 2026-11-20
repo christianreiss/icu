@@ -9,7 +9,9 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](Cargo.toml)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows-informational.svg)](#installation)
-[![Version](https://img.shields.io/badge/version-0.1.30-brightgreen.svg)](Cargo.toml)
+[![Release](https://img.shields.io/github/v/release/christianreiss/icu?label=release&color=brightgreen)](https://github.com/christianreiss/icu/releases/latest)
+
+**[icu.uggs.io](https://icu.uggs.io)** · [Downloads](https://github.com/christianreiss/icu/releases/latest) · [Release-Archiv](https://icu.uggs.io/icu/)
 
 </div>
 

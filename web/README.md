@@ -50,6 +50,22 @@ Reihenfolge: Dateien vollständig prüfen, Manifest zuletzt freischalten.
 Vertrauensmodell, Schlüsselwechsel, Windows-Wiederherstellung und Abnahme:
 [Client-Updates](../docs/development/updates.md).
 
+### GitHub-Release
+
+Quellcode und Pakete stehen zusätzlich unter
+https://github.com/christianreiss/icu (Remote `github`; `origin` bleibt das
+Primär-Repository). Der Tag zeigt auf den Commit aus `dist/<version>/BUILDINFO.*`,
+nicht auf einen späteren Stand. Die Release-Dateien sind dieselben Bytes wie auf
+icu.uggs.io. Der Updater liest weiterhin nur `https://icu.uggs.io/downloads/`.
+
+```bash
+v=0.1.32; c=$(awk '/^commit /{print $2; exit}' dist/$v/BUILDINFO.linux)
+git push github main
+git tag -a "v$v" -m "ICU $v" "$c" && git push github "v$v"
+gh release create "v$v" --repo christianreiss/icu --verify-tag --title "ICU $v" \
+  --notes-file <notizen> dist/$v/icu* dist/$v/SHA256SUMS dist/$v/SHA256SUMS.sig dist/$v/BUILDINFO.*
+```
+
 ## Downloadseite und Release-API (`portal/`)
 
 Das Release-Archiv unter `https://icu.uggs.io/icu/` ist dynamisch: `index.php` liest

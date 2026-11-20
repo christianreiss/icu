@@ -33,11 +33,11 @@ if ('IntersectionObserver' in window) {
 
 const EN = {
   skip: 'Skip to content',
-  'nav.label': 'Main navigation', 'nav.features': 'Features', 'nav.views': 'Screenshots', 'nav.start': 'Get started', 'nav.limits': 'On purpose not', 'nav.download': 'Download', 'motion.label': 'Pause decorative animations',
+  'nav.label': 'Main navigation', 'nav.features': 'Features', 'nav.views': 'Screenshots', 'nav.start': 'Get started', 'nav.limits': 'On purpose not', 'nav.download': 'Download', 'nav.src': 'Source code on GitHub', 'motion.label': 'Pause decorative animations',
   'hero.tag': 'Room 01 · 1 server · 0 channels',
   'hero.title': 'One crew.<br>One room.<br><em>No&nbsp;noise.</em>',
   'hero.lead': 'ICU is what is left of Mumble and TeamSpeak once you strip out everything a fixed group does not need. In return you get Opus voice quality, echo and noise suppression, a camera overlay for your game and mutual TLS instead of a password.',
-  'hero.cta': 'Download', 'hero.cta2': 'See the features', 'hero.platforms': 'Linux (Fedora, Debian) &amp; Windows 10/11',
+  'hero.cta': 'Download', 'hero.cta2': 'See the features', 'hero.platforms': 'Linux (Fedora, Debian) &amp; Windows 10/11', 'hero.src': 'Source code',
   'hero.eye': 'Transmit demo: press and hold', 'hero.tx': 'Transmitting', 'hero.rx': 'Listening', 'hero.hint': '↓ hold the eye = push-to-talk',
   'hero.alt2': 'ICU main window: connected, room list with participants, push-to-talk and control buttons',
   'idx.principle': 'Principle',
@@ -115,20 +115,20 @@ const EN = {
   't.2.h': 'Nothing behind your back',
   't.2.p': 'The connection path shows who talks to whom over what. The server is a plain relay: both legs are encrypted with QUIC/TLS&nbsp;1.3, but it can read the media it forwards — which is why your group runs it itself.',
   't.3.h': 'Open and verifiable',
-  't.3.p': 'Apache-2.0. Every release carries <code>SHA256SUMS</code> and one <code>BUILDINFO</code> per build with commit and compiler. The packages ship THIRD-PARTY-LICENSES for the bundled third-party code.',
+  't.3.p': 'Apache-2.0. Every release carries <code>SHA256SUMS</code> and one <code>BUILDINFO</code> per build with commit and compiler. The packages ship THIRD-PARTY-LICENSES for the bundled third-party code. Source code and releases are on <a href="https://github.com/christianreiss/icu">GitHub</a>.',
   'idx.download': 'Download',
   'd.h': 'Get ICU.',
-  'd.loading': 'Loading package list …',
+  'd.loading': 'Loading package list …', 'd.archive': 'Release archive',
   'd.status.h': 'Status',
   'd.status.p': 'Early version: server, protocol and the Linux and Windows clients are implemented. Still open: testing on physical Windows target hardware (acoustic echo cancellation, gaming mouse, mixed DPI) and the portal hotkey on KDE.',
   'd.win.h': 'Windows &amp; SmartScreen',
   'd.win.p': 'The Windows builds are unsigned. On first launch: “More info” → “Run anyway”. Where Smart App Control is switched on, Windows blocks the file.',
   'd.all': 'All packages', 'd.kind': 'Client or server', 'd.client': 'Client', 'd.server': 'Server',
   'd.verify.h': 'Verify your download',
-  'd.verify.p': 'The SHA-256 sums are listed next to every package and in <a id="sums-link" href="downloads/">SHA256SUMS</a>. In the download folder:',
+  'd.verify.p': 'The SHA-256 sums are listed next to every package and in <a id="sums-link" href="icu/">SHA256SUMS</a>. In the download folder:',
   'foot.tag': 'A minimal voice system for a fixed group.',
   'foot.legal': 'License: Apache-2.0. This page loads nothing from third parties: no trackers, no external fonts (Red Hat Display/Text and Source Code Pro, SIL OFL, self-hosted).',
-  'foot.top': 'Back to top',
+  'foot.src': 'Source code on GitHub', 'foot.archive': 'Release archive', 'foot.top': 'Back to top',
 };
 
 /* strings built at runtime */
@@ -436,7 +436,7 @@ fetch('downloads/latest.json', { cache: 'no-cache' })
   .then(m => { manifest = m; renderDownloads(); })
   .catch(() => {
     const box = $('#dl-primary');
-    box.replaceChildren(h('p', { class: 'dl-empty', text: rt().error }, ' ', h('a', { href: 'downloads/', text: 'downloads/' })));
+    box.replaceChildren(h('p', { class: 'dl-empty', text: rt().error }, ' ', h('a', { href: 'icu/', text: lang === 'en' ? EN['d.archive'] : 'Release-Archiv' })));
   });
 
 /* copy buttons in static code blocks */
